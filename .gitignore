@@ -1,0 +1,9 @@
+citus-src/
+pg-cluster-data/
+pg-install/
+pg-partdist-src/
+postgres-src/
+.claude/
+.github/
+*.log
+*.tmp
