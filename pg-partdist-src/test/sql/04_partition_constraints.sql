@@ -1,0 +1,25 @@
+-- Test 04: partition_map constraints
+
+-- PRIMARY KEY: duplicate partition_id must fail
+INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'h', 5432);
+INSERT INTO partdist.partition_map (partition_id, primary_node) VALUES (200::oid, 1);
+
+-- Attempt duplicate
+DO $$
+BEGIN
+    INSERT INTO partdist.partition_map (partition_id, primary_node) VALUES (200::oid, 1);
+    RAISE NOTICE 'ERROR: duplicate insert should have failed';
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'OK: unique_violation raised';
+END;
+$$;
+
+-- secondary_nodes default is empty array
+SELECT secondary_nodes = '{}' FROM partdist.partition_map WHERE partition_id = 200::oid;
+
+-- version starts at 1
+SELECT version = 1 FROM partdist.partition_map WHERE partition_id = 200::oid;
+
+-- cleanup
+DELETE FROM partdist.partition_map;
+DELETE FROM partdist.node_map;

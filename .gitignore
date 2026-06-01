@@ -1,17 +1,4 @@
-# 过滤编译源码
-citus-src/
-postgres-src/
-pg-partdist-src/
-pg-install/
-
-# 过滤数据库运行数据
-pg-cluster-data/
-
-# 过滤工具/临时文件
-.claude/
-.github/
 *.log
 *.tmp
 *.swp
-__pycache__/
 .DS_Store

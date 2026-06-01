@@ -1,0 +1,6 @@
+# pg_partdist extension
+comment = 'Partition-level multi-replica distribution for Citus clusters'
+default_version = '1.0'
+module_pathname = '$libdir/pg_partdist'
+relocatable = false
+schema = partdist

@@ -1,0 +1,22 @@
+-- Test 19: concurrent-style update — row-level locking behaviour
+-- (single-session test that exercises the same UPDATE path concurrent
+--  connections would hit)
+
+INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'h', 5432);
+INSERT INTO partdist.partition_map (partition_id, primary_node)
+VALUES (2000::oid, 1);
+
+-- Perform multiple UPDATEs in sequence; each must bump version
+UPDATE partdist.partition_map SET secondary_nodes = ARRAY[2]   WHERE partition_id = 2000::oid;
+UPDATE partdist.partition_map SET secondary_nodes = ARRAY[2,3] WHERE partition_id = 2000::oid;
+UPDATE partdist.partition_map SET secondary_nodes = ARRAY[3]   WHERE partition_id = 2000::oid;
+
+SELECT version FROM partdist.partition_map WHERE partition_id = 2000::oid;
+
+-- SELECT FOR UPDATE acquires row lock (verifiable without a second session)
+BEGIN;
+SELECT version FROM partdist.partition_map WHERE partition_id = 2000::oid FOR UPDATE;
+ROLLBACK;
+
+DELETE FROM partdist.partition_map;
+DELETE FROM partdist.node_map;

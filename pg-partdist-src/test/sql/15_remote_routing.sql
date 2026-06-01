@@ -1,0 +1,18 @@
+-- Test 15: remote routing decision
+-- When primary_node does NOT match local_node_id, route must be 'remote'.
+
+INSERT INTO partdist.node_map (node_id, hostname, port, status)
+VALUES (2, 'worker1', 5433, 'active');
+INSERT INTO partdist.partition_map (partition_id, primary_node)
+VALUES (800::oid, 2);
+
+-- local_node_id = 1, primary = 2 → remote
+SET pg_partdist.local_node_id = 1;
+SELECT partdist.pg_partdist_route_write(800::oid) AS route;
+
+-- local_node_id unconfigured (-1) → always remote
+RESET pg_partdist.local_node_id;
+SELECT partdist.pg_partdist_route_write(800::oid) AS route;
+
+DELETE FROM partdist.partition_map;
+DELETE FROM partdist.node_map;

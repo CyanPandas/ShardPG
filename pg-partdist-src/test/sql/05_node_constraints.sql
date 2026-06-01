@@ -1,0 +1,50 @@
+-- Test 05: node_map constraints
+
+-- Port range check: port 0 must fail
+DO $$
+BEGIN
+    INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'h', 0);
+    RAISE NOTICE 'ERROR: bad port should have failed';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: check_violation for port 0';
+END;
+$$;
+
+-- Port range check: port 99999 must fail
+DO $$
+BEGIN
+    INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'h', 99999);
+    RAISE NOTICE 'ERROR: bad port should have failed';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: check_violation for port 99999';
+END;
+$$;
+
+-- Status check: invalid status must fail
+DO $$
+BEGIN
+    INSERT INTO partdist.node_map (node_id, hostname, port, status)
+    VALUES (1, 'h', 5432, 'invalid');
+    RAISE NOTICE 'ERROR: bad status should have failed';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: check_violation for invalid status';
+END;
+$$;
+
+-- Valid status values
+INSERT INTO partdist.node_map (node_id, hostname, port, status) VALUES (1, 'h', 5432, 'active');
+INSERT INTO partdist.node_map (node_id, hostname, port, status) VALUES (2, 'h', 5433, 'down');
+INSERT INTO partdist.node_map (node_id, hostname, port, status) VALUES (3, 'h', 5434, 'syncing');
+SELECT node_id, status FROM partdist.node_map ORDER BY node_id;
+
+-- Primary key uniqueness
+DO $$
+BEGIN
+    INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'dup', 5432);
+    RAISE NOTICE 'ERROR: duplicate node_id should have failed';
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'OK: unique_violation for node_id';
+END;
+$$;
+
+DELETE FROM partdist.node_map;
