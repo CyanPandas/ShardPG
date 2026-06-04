@@ -1,0 +1,12 @@
+SELECT pg_partdist_version();
+ pg_partdist_version 
+---------------------
+ 1.0
+(1 row)
+
+SELECT pg_partdist_version() = '1.0';
+ ?column? 
+----------
+ t
+(1 row)
+

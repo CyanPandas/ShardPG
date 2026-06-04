@@ -1,0 +1,9 @@
+INSERT INTO pg_partdist_partition_map (partition_id, primary_node_id)
+VALUES (12345::oid, 1);
+SELECT count(*) FROM pg_partdist_secondary_map WHERE partition_id = 12345::oid;
+ count 
+-------
+     0
+(1 row)
+
+DELETE FROM pg_partdist_partition_map WHERE partition_id = 12345::oid;

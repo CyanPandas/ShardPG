@@ -1,0 +1,2 @@
+/work/pg-install/bin/psql: option requires an argument -- 'f'
+psql: hint: Try "psql --help" for more information.

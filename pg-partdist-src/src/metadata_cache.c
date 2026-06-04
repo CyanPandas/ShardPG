@@ -1,5 +1,7 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
+#include "partition_wal.h"
+#include "demux_worker.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -38,6 +40,12 @@ pg_partdist_shmem_request_hook(void)
 {
     RequestAddinShmemSpace(pg_partdist_shmem_size());
     RequestNamedLWLockTranche("pg_partdist", 2);
+
+    /* Partition WAL LSN counter shmem */
+    RequestPartitionWALShmem();
+
+    /* Demux worker shared state */
+    RequestDemuxShmem();
 }
 
 void
@@ -91,6 +99,12 @@ pg_partdist_shmem_startup_hook(void)
                                 HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
 
     LWLockRelease(AddinShmemInitLock);
+
+    /* Initialise partition WAL LSN counter shmem (outside AddinShmemInitLock) */
+    PartitionWALShmemInit();
+
+    /* Initialise Demux worker shared state */
+    DemuxShmemInit();
 }
 
 /* ---- SPI helpers ---- */

@@ -1,0 +1,54 @@
+-- T2.2: read_all_headers returns correct columns and data
+SELECT partdist.reset_partition_wal_state(9902::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+-- Write 3 records
+SELECT partdist.write_partition_wal_record(9902::oid, 1) IS NOT NULL AS w1;
+ w1 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9902::oid, 1) IS NOT NULL AS w2;
+ w2 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9902::oid, 1) IS NOT NULL AS w3;
+ w3 
+----
+ t
+(1 row)
+
+-- Wait for Demux Worker
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+-- read_all_headers should return 3 rows
+SELECT count(*) = 3 AS row_count_ok FROM partdist.read_all_headers(9902::oid);
+ row_count_ok 
+--------------
+ t
+(1 row)
+
+-- All orig_node_lsn must be non-zero
+SELECT bool_and(orig_node_lsn > '0/0'::pg_lsn) AS all_lsn_nonzero
+  FROM partdist.read_all_headers(9902::oid);
+ all_lsn_nonzero 
+-----------------
+ t
+(1 row)
+
+SELECT partdist.reset_partition_wal_state(9902::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+

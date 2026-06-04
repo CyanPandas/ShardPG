@@ -1,0 +1,10 @@
+UPDATE pg_partdist_node_map SET status = 'down' WHERE node_id = 3;
+SELECT node_id, status FROM pg_partdist_node_map ORDER BY node_id;
+ node_id | status 
+---------+--------
+       1 | active
+       2 | active
+       3 | down
+(3 rows)
+
+UPDATE pg_partdist_node_map SET status = 'active' WHERE node_id = 3;

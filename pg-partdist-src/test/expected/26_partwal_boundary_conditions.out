@@ -1,0 +1,95 @@
+-- T2.1.2: WAL format validation — boundary conditions
+-- Reset state for a clean, deterministic run
+SELECT partdist.reset_partition_wal_state(26001::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+SELECT partdist.reset_partition_wal_state(26002::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+SELECT partdist.reset_partition_wal_state(26099::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+-- Empty partition: verify returns vacuously valid
+SELECT partdist.init_partition_wal(26001::oid);
+ init_partition_wal 
+--------------------
+ 
+(1 row)
+
+SELECT partdist.verify_partition_wal(26001::oid) AS empty_partition_valid;
+ empty_partition_valid 
+-----------------------
+ t
+(1 row)
+
+-- Empty partition: check returns zero rows
+SELECT COUNT(*) AS empty_count
+FROM partdist.check_partition_wal(26001::oid);
+ empty_count 
+-------------
+           0
+(1 row)
+
+-- Non-existent partition: both functions are safe
+SELECT partdist.verify_partition_wal(96099::oid) AS nonexistent_valid;
+ nonexistent_valid 
+-------------------
+ t
+(1 row)
+
+SELECT COUNT(*) AS nonexistent_count
+FROM partdist.check_partition_wal(96099::oid);
+ nonexistent_count 
+-------------------
+                 0
+(1 row)
+
+-- Single record: partition_lsn starts at 1 (after reset)
+SELECT partdist.init_partition_wal(26002::oid);
+ init_partition_wal 
+--------------------
+ 
+(1 row)
+
+SELECT partdist.write_partition_wal_record(26002::oid, 1) IS NOT NULL AS wrote;
+ wrote 
+-------
+ t
+(1 row)
+
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+SELECT partition_lsn AS first_lsn_is_one
+FROM partdist.check_partition_wal(26002::oid);
+ first_lsn_is_one 
+------------------
+                1
+(1 row)
+
+-- alloc_partition_lsn for fresh (reset) partition returns 1
+SELECT partdist.alloc_partition_lsn(26099::oid) AS lsn_starts_at_one;
+ lsn_starts_at_one 
+-------------------
+                 1
+(1 row)
+
+-- verify_partition_wal on single-record partition returns true (demux_flush already called)
+SELECT partdist.verify_partition_wal(26002::oid) AS single_record_valid;
+ single_record_valid 
+---------------------
+ t
+(1 row)
+

@@ -114,7 +114,12 @@ pg_partdist_executor_start(QueryDesc *queryDesc, int eflags)
         return;
 
     pstmt = queryDesc->plannedstmt;
-    if (pstmt == NULL || pstmt->resultRelations == NIL)
+    if (pstmt == NULL || (pstmt->resultRelations == NIL && pstmt->rtable == NIL))
+        return;
+
+    /* For Citus distributed DML, resultRelations may be NIL; skip routing
+     * check in that case (Citus handles routing itself). */
+    if (pstmt->resultRelations == NIL)
         return;
 
     in_partdist_hook = true;

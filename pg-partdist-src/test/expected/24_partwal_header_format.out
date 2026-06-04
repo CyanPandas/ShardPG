@@ -1,0 +1,75 @@
+-- T2.1.2: WAL format validation — magic and structure
+-- Reset state for a clean, deterministic run
+SELECT partdist.reset_partition_wal_state(24001::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+SELECT partdist.init_partition_wal(24001::oid);
+ init_partition_wal 
+--------------------
+ 
+(1 row)
+
+-- Write a DATA record
+SELECT partdist.write_partition_wal_record(24001::oid, 1) IS NOT NULL AS lsn_assigned;
+ lsn_assigned 
+--------------
+ t
+(1 row)
+
+-- Wait for Demux Worker to route the record to pg_parwal
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+-- All scanned records must report is_valid = true (magic OK, partition_id matches, flags valid)
+SELECT bool_and(is_valid) AS all_records_valid
+FROM partdist.check_partition_wal(24001::oid);
+ all_records_valid 
+-------------------
+ t
+(1 row)
+
+-- flags value must equal 1 (PARTWAL_FLAG_DATA)
+SELECT flags = 1 AS flag_is_data
+FROM partdist.check_partition_wal(24001::oid);
+ flag_is_data 
+--------------
+ t
+(1 row)
+
+-- orig_node_lsn must be > '0/0' (non-zero LSN was captured)
+SELECT orig_node_lsn > '0/0'::pg_lsn AS orig_lsn_nonzero
+FROM partdist.check_partition_wal(24001::oid);
+ orig_lsn_nonzero 
+------------------
+ t
+(1 row)
+
+-- Write a CHECKPOINT record (flags = 4)
+SELECT partdist.write_partition_wal_record(24001::oid, 4) IS NOT NULL AS checkpoint_written;
+ checkpoint_written 
+--------------------
+ t
+(1 row)
+
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+-- Now two records: partition_lsn 1 (DATA) and 2 (CHECKPOINT)
+SELECT partition_lsn, flags, is_valid
+FROM partdist.check_partition_wal(24001::oid)
+ORDER BY partition_lsn;
+ partition_lsn | flags | is_valid 
+---------------+-------+----------
+             1 |     1 | t
+             2 |     4 | t
+(2 rows)
+

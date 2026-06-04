@@ -1,0 +1,47 @@
+-- Test 08: schema and object existence
+SELECT nspname FROM pg_namespace WHERE nspname = 'partdist';
+ nspname  
+----------
+ partdist
+(1 row)
+
+SELECT tablename
+FROM   pg_tables
+WHERE  schemaname = 'partdist'
+ORDER BY tablename;
+   tablename   
+---------------
+ node_map
+ partition_map
+(2 rows)
+
+SELECT proname
+FROM   pg_proc
+JOIN   pg_namespace ON pg_namespace.oid = pg_proc.pronamespace
+WHERE  pg_namespace.nspname = 'partdist'
+ORDER BY proname;
+              proname              
+-----------------------------------
+ alloc_partition_lsn
+ check_partition_wal
+ cleanup_partition_wal
+ count_parwal_records
+ demux_flush
+ demux_latency_stats
+ demux_progress
+ init_partition_wal
+ partition_map_version_bump
+ partition_wal_exists
+ partition_wal_path
+ pg_partdist_bump_metadata_version
+ pg_partdist_cache_invalidate
+ pg_partdist_cache_stats
+ pg_partdist_get_primary
+ pg_partdist_route_write
+ pg_partdist_version
+ read_all_headers
+ reset_partition_wal_state
+ verify_partition_wal
+ write_partition_wal_record
+(21 rows)
+

@@ -1,0 +1,13 @@
+INSERT INTO pg_partdist_partition_map (partition_id, primary_node_id)
+VALUES (22222::oid, 1);
+INSERT INTO pg_partdist_secondary_map (partition_id, secondary_node_id)
+VALUES (22222::oid, 2), (22222::oid, 3);
+SELECT secondary_node_id FROM pg_partdist_secondary_map
+WHERE partition_id = 22222::oid ORDER BY secondary_node_id;
+ secondary_node_id 
+-------------------
+                 2
+                 3
+(2 rows)
+
+DELETE FROM pg_partdist_partition_map WHERE partition_id = 22222::oid;

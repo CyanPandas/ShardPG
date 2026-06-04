@@ -1,0 +1,21 @@
+-- Test 09: drop and recreate the extension
+DROP EXTENSION pg_partdist CASCADE;
+SELECT count(*) FROM pg_namespace WHERE nspname = 'partdist';
+ count 
+-------
+     1
+(1 row)
+
+CREATE EXTENSION pg_partdist;
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_partdist';
+   extname   | extversion 
+-------------+------------
+ pg_partdist | 1.0
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname = 'partdist';
+ nspname  
+----------
+ partdist
+(1 row)
+

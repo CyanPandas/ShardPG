@@ -76,4 +76,8 @@ extern void         InvalidatePartdistCache(void);
 /* write_router.c */
 extern RouteStatus  RouteWriteRequest(WriteRequest *req);
 
+/* partition_wal.c — forward declaration (full API in partition_wal.h) */
+struct QueryDesc;
+extern void pg_partdist_executor_finish(struct QueryDesc *queryDesc);
+
 #endif /* PG_PARTDIST_H */

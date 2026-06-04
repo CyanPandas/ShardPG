@@ -1,0 +1,18 @@
+-- Test 01: extension creation and schema setup
+DROP EXTENSION IF EXISTS pg_partdist CASCADE;
+NOTICE:  extension "pg_partdist" does not exist, skipping
+CREATE EXTENSION pg_partdist;
+-- schema must exist
+SELECT nspname FROM pg_namespace WHERE nspname = 'partdist';
+ nspname  
+----------
+ partdist
+(1 row)
+
+-- version function
+SELECT partdist.pg_partdist_version();
+ pg_partdist_version 
+---------------------
+ 1.0
+(1 row)
+

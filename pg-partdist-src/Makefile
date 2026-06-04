@@ -2,7 +2,10 @@ MODULE_big = pg_partdist
 OBJS = \
 	src/pg_partdist.o \
 	src/metadata_cache.o \
-	src/router/write_router.o
+	src/router/write_router.o \
+	src/wal/partition_wal.o \
+	src/wal/partition_wal_writer.o \
+	src/worker/demux_worker.o
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql
@@ -29,7 +32,24 @@ REGRESS = \
 	17_node_down_routing \
 	18_metadata_version \
 	19_concurrent_update \
-	20_bench_routing
+	20_bench_routing \
+	21_partwal_dir_create \
+	22_partwal_dir_permissions \
+	23_partwal_dir_cleanup \
+	24_partwal_header_format \
+	25_partwal_header_fields \
+	26_partwal_boundary_conditions \
+	27_partwal_crash_recovery \
+	28_demux_shmem \
+	29_count_parwal_records \
+	30_demux_progress \
+	31_demux_latency_stats \
+	32_read_all_headers \
+	33_partition_lsn_monotone \
+	34_writer_deduplication \
+	35_demux_worker_active \
+	36_parwal_multi_partition \
+	37_demux_full_cycle
 
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

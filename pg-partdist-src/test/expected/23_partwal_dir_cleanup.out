@@ -1,0 +1,96 @@
+-- T2.1.1: partition WAL directory management — cleanup
+-- Reset state for idempotent test runs
+SELECT partdist.reset_partition_wal_state(23001::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+SELECT partdist.reset_partition_wal_state(23002::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+-- Initialise and write some records
+SELECT partdist.init_partition_wal(23001::oid);
+ init_partition_wal 
+--------------------
+ 
+(1 row)
+
+SELECT partdist.write_partition_wal_record(23001::oid, 1) IS NOT NULL AS wrote_1;
+ wrote_1 
+---------
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(23001::oid, 1) IS NOT NULL AS wrote_2;
+ wrote_2 
+---------
+ t
+(1 row)
+
+-- Wait for Demux Worker to route records to pg_parwal
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+-- Verify two records exist before cleanup
+SELECT COUNT(*) AS before_cleanup
+FROM partdist.check_partition_wal(23001::oid);
+ before_cleanup 
+----------------
+              2
+(1 row)
+
+-- cleanup_partition_wal with LSN 'FFFFFFFF/FFFFFFFF' removes all segments
+SELECT partdist.cleanup_partition_wal(23001::oid, 'FFFFFFFF/FFFFFFFF'::pg_lsn);
+ cleanup_partition_wal 
+-----------------------
+ 
+(1 row)
+
+-- After cleanup, no records should be visible (files removed)
+SELECT COUNT(*) AS after_cleanup
+FROM partdist.check_partition_wal(23001::oid);
+ after_cleanup 
+---------------
+             0
+(1 row)
+
+-- cleanup on non-existent partition is safe (no error)
+SELECT partdist.cleanup_partition_wal(99199::oid, 'FFFFFFFF/FFFFFFFF'::pg_lsn);
+ cleanup_partition_wal 
+-----------------------
+ 
+(1 row)
+
+-- Cleanup with keep_lsn = '0/0' removes nothing (all segments end above 0/0)
+SELECT partdist.init_partition_wal(23002::oid);
+ init_partition_wal 
+--------------------
+ 
+(1 row)
+
+SELECT partdist.write_partition_wal_record(23002::oid, 1) IS NOT NULL AS wrote_3;
+ wrote_3 
+---------
+ t
+(1 row)
+
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+SELECT COUNT(*) = 1 AS record_survives
+FROM partdist.check_partition_wal(23002::oid);
+ record_survives 
+-----------------
+ t
+(1 row)
+

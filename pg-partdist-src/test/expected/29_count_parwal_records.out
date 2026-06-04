@@ -1,0 +1,67 @@
+-- T2.2: count_parwal_records function
+-- Start clean for partition 9901
+SELECT partdist.reset_partition_wal_state(9901::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+
+-- No records yet → 0
+SELECT partdist.count_parwal_records(9901::oid) = 0 AS empty_ok;
+ empty_ok 
+----------
+ t
+(1 row)
+
+-- Write 5 records (WAL only; Demux Worker routes to pg_parwal)
+SELECT partdist.write_partition_wal_record(9901::oid, 1) IS NOT NULL AS w1;
+ w1 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9901::oid, 1) IS NOT NULL AS w2;
+ w2 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9901::oid, 1) IS NOT NULL AS w3;
+ w3 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9901::oid, 1) IS NOT NULL AS w4;
+ w4 
+----
+ t
+(1 row)
+
+SELECT partdist.write_partition_wal_record(9901::oid, 1) IS NOT NULL AS w5;
+ w5 
+----
+ t
+(1 row)
+
+-- Wait for Demux Worker to route all 5 records to disk
+SELECT partdist.demux_flush();
+ demux_flush 
+-------------
+ 
+(1 row)
+
+-- Should now be 5
+SELECT partdist.count_parwal_records(9901::oid) = 5 AS five_records;
+ five_records 
+--------------
+ t
+(1 row)
+
+-- Clean up
+SELECT partdist.reset_partition_wal_state(9901::oid);
+ reset_partition_wal_state 
+---------------------------
+ 
+(1 row)
+

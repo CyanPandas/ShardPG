@@ -1,6 +1,8 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
 #include "write_router.h"
+#include "partition_wal.h"
+#include "demux_worker.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -8,6 +10,9 @@
 #include "utils/guc.h"
 #include "funcapi.h"
 #include "access/xact.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_class.h"
+#include "executor/executor.h"
 
 PG_MODULE_MAGIC;
 
@@ -15,9 +20,11 @@ PG_MODULE_MAGIC;
 int pg_partdist_local_node_id = -1;
 
 /* ---- hook save slots ---- */
-static shmem_request_hook_type  prev_shmem_request_hook  = NULL;
-static shmem_startup_hook_type  prev_shmem_startup_hook  = NULL;
-static ExecutorStart_hook_type  prev_ExecutorStart_hook  = NULL;
+static shmem_request_hook_type    prev_shmem_request_hook  = NULL;
+static shmem_startup_hook_type    prev_shmem_startup_hook  = NULL;
+static ExecutorStart_hook_type    prev_ExecutorStart_hook  = NULL;
+static ExecutorFinish_hook_type   prev_ExecutorFinish_hook = NULL;
+static object_access_hook_type    prev_object_access_hook  = NULL;
 
 /* ---- forward declarations ---- */
 void _PG_init(void);
@@ -58,6 +65,65 @@ partdist_executor_start(QueryDesc *queryDesc, int eflags)
         standard_ExecutorStart(queryDesc, eflags);
 }
 
+static void
+partdist_executor_finish(QueryDesc *queryDesc)
+{
+    /* Run the primary finish chain first */
+    if (prev_ExecutorFinish_hook)
+        prev_ExecutorFinish_hook(queryDesc);
+    else
+        standard_ExecutorFinish(queryDesc);
+
+    /* Then write partition WAL records for any partition-mapped relations */
+    pg_partdist_executor_finish(queryDesc);
+}
+
+/*
+ * partdist_object_access — object_access_hook for Goal 1 (shard creation).
+ *
+ * When Citus creates a shard table on a Worker (OAT_POST_CREATE on a
+ * relation), auto-create the pg_parwal/<shard_oid>/ directory so it's ready
+ * before the first INSERT arrives.  This is optional since
+ * WritePartitionWALRecord also calls InitPartitionWALDirectory, but it is
+ * nice to have the directory immediately after shard creation.
+ */
+static void
+partdist_object_access(ObjectAccessType access,
+                        Oid classId,
+                        Oid objectId,
+                        int subId,
+                        void *arg)
+{
+    if (prev_object_access_hook)
+        prev_object_access_hook(access, classId, objectId, subId, arg);
+
+    /* Only interested in newly created relations (not indexes, types, etc.) */
+    if (access != OAT_POST_CREATE ||
+        classId != RelationRelationId ||
+        subId != 0)
+        return;
+
+    if (!OidIsValid(objectId))
+        return;
+
+    /* Auto-init WAL directory for Citus shard tables */
+    if (!IsCitusShardTable(objectId))
+        return;
+
+    PG_TRY();
+    {
+        InitPartitionWALDirectory(objectId);
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+        ereport(WARNING,
+                (errmsg("pg_partdist: could not initialize WAL directory "
+                        "for shard OID %u", objectId)));
+    }
+    PG_END_TRY();
+}
+
 /* ---- module load ---- */
 
 void
@@ -94,9 +160,22 @@ _PG_init(void)
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = partdist_shmem_startup;
 
-    /* Chain executor hook */
+    /* Chain executor hooks */
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = partdist_executor_start;
+
+    prev_ExecutorFinish_hook = ExecutorFinish_hook;
+    ExecutorFinish_hook = partdist_executor_finish;
+
+    /* Chain object-access hook for shard table auto-detection */
+    prev_object_access_hook = object_access_hook;
+    object_access_hook = partdist_object_access;
+
+    /* Register custom WAL RMGR for partition WAL records */
+    RegisterPartitionWALRmgr();
+
+    /* Register Demux background worker */
+    RegisterDemuxWorker();
 }
 
 /* ---- SQL-callable functions ---- */

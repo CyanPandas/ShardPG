@@ -1,0 +1,12 @@
+INSERT INTO pg_partdist_node_map (node_id, hostname, port, status)
+VALUES (1, 'coordinator', 5432, 'active'),
+       (2, 'worker1', 5433, 'active'),
+       (3, 'worker2', 5434, 'active');
+SELECT node_id, hostname, port, status FROM pg_partdist_node_map ORDER BY node_id;
+ node_id |  hostname   | port | status 
+---------+-------------+------+--------
+       1 | coordinator | 5432 | active
+       2 | worker1     | 5433 | active
+       3 | worker2     | 5434 | active
+(3 rows)
+

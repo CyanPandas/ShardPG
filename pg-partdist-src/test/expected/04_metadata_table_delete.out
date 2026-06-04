@@ -1,0 +1,14 @@
+INSERT INTO pg_partdist_node_map (node_id, hostname, port) VALUES (99, 'temp', 9999);
+SELECT count(*) FROM pg_partdist_node_map;
+ count 
+-------
+     4
+(1 row)
+
+DELETE FROM pg_partdist_node_map WHERE node_id = 99;
+SELECT count(*) FROM pg_partdist_node_map;
+ count 
+-------
+     3
+(1 row)
+

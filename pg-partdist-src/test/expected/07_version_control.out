@@ -1,0 +1,38 @@
+-- Test 07: version field auto-increment trigger
+INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (1, 'h', 5432);
+INSERT INTO partdist.partition_map (partition_id, primary_node)
+VALUES (400::oid, 1);
+-- initial version is 1
+SELECT version FROM partdist.partition_map WHERE partition_id = 400::oid;
+ version 
+---------
+       1
+(1 row)
+
+-- UPDATE bumps version
+UPDATE partdist.partition_map SET secondary_nodes = ARRAY[2]
+WHERE  partition_id = 400::oid;
+SELECT version FROM partdist.partition_map WHERE partition_id = 400::oid;
+ version 
+---------
+       2
+(1 row)
+
+-- second UPDATE bumps again
+UPDATE partdist.partition_map SET primary_node = 1
+WHERE  partition_id = 400::oid;
+SELECT version FROM partdist.partition_map WHERE partition_id = 400::oid;
+ version 
+---------
+       3
+(1 row)
+
+-- updated_at is set
+SELECT updated_at IS NOT NULL FROM partdist.partition_map WHERE partition_id = 400::oid;
+ ?column? 
+----------
+ t
+(1 row)
+
+DELETE FROM partdist.partition_map;
+DELETE FROM partdist.node_map;

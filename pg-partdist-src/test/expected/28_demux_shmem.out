@@ -1,0 +1,15 @@
+-- T2.2: Test demux shared memory initialization
+-- Demux state must be accessible (shmem initialized)
+SELECT (partdist.demux_progress()).node_name = 'local' AS node_name_ok;
+ node_name_ok 
+--------------
+ t
+(1 row)
+
+-- Worker shmem reachable regardless of timing
+SELECT (partdist.demux_progress()).node_name IS NOT NULL AS progress_reachable;
+ progress_reachable 
+--------------------
+ t
+(1 row)
+

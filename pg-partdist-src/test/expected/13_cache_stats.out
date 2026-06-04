@@ -1,0 +1,31 @@
+-- Test 13: cache statistics
+-- cache_stats always returns a row (zeros when shmem not init'd)
+SELECT
+    (partition_hits   >= 0) AS hits_nonneg,
+    (partition_misses >= 0) AS misses_nonneg,
+    (node_hits        >= 0) AS node_hits_nonneg,
+    (node_misses      >= 0) AS node_misses_nonneg,
+    (metadata_generation >= 0) AS gen_nonneg
+FROM partdist.pg_partdist_cache_stats();
+ hits_nonneg | misses_nonneg | node_hits_nonneg | node_misses_nonneg | gen_nonneg 
+-------------+---------------+------------------+--------------------+------------
+ t           | t             | t                | t                  | t
+(1 row)
+
+-- bump_metadata_version increments the generation
+DO $$
+DECLARE
+    gen1 bigint;
+    gen2 bigint;
+BEGIN
+    SELECT metadata_generation INTO gen1 FROM partdist.pg_partdist_cache_stats();
+    PERFORM partdist.pg_partdist_bump_metadata_version();
+    SELECT metadata_generation INTO gen2 FROM partdist.pg_partdist_cache_stats();
+    IF gen2 > gen1 THEN
+        RAISE NOTICE 'OK: generation bumped';
+    ELSE
+        RAISE NOTICE 'FAIL: generation not bumped';
+    END IF;
+END;
+$$;
+NOTICE:  OK: generation bumped
