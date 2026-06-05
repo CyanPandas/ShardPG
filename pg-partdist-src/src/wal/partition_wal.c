@@ -403,7 +403,21 @@ partdist_wal_redo(XLogReaderState *record)
         return;
     }
 
+    /*
+     * Idempotent redo: if the demux already wrote this record to pg_parwal
+     * before the crash, skip it to avoid duplicates.  GetLastWrittenPartitionLSN
+     * scans the on-disk segment files; if partition_lsn is already present,
+     * we can safely skip the write.  If the directory or files don't exist
+     * yet, GetLastWrittenPartitionLSN returns 0 and we write normally.
+     */
+    {
+        uint64 last = GetLastWrittenPartitionLSN(header->partition_id);
+        if (header->partition_lsn <= last)
+            return;
+    }
+
     /* Re-create directory and write record during recovery */
+    InitPartitionWALDirectory(header->partition_id);
     WriteHeaderToFile(header);
 }
 
