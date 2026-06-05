@@ -13,6 +13,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "executor/executor.h"
+#include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
 
@@ -20,11 +21,12 @@ PG_MODULE_MAGIC;
 int pg_partdist_local_node_id = -1;
 
 /* ---- hook save slots ---- */
-static shmem_request_hook_type    prev_shmem_request_hook  = NULL;
-static shmem_startup_hook_type    prev_shmem_startup_hook  = NULL;
-static ExecutorStart_hook_type    prev_ExecutorStart_hook  = NULL;
-static ExecutorFinish_hook_type   prev_ExecutorFinish_hook = NULL;
-static object_access_hook_type    prev_object_access_hook  = NULL;
+static shmem_request_hook_type    prev_shmem_request_hook    = NULL;
+static shmem_startup_hook_type    prev_shmem_startup_hook    = NULL;
+static ExecutorStart_hook_type    prev_ExecutorStart_hook    = NULL;
+static ExecutorFinish_hook_type   prev_ExecutorFinish_hook   = NULL;
+static object_access_hook_type    prev_object_access_hook    = NULL;
+static ProcessUtility_hook_type   prev_ProcessUtility_hook   = NULL;
 
 /* ---- forward declarations ---- */
 void _PG_init(void);
@@ -124,6 +126,38 @@ partdist_object_access(ObjectAccessType access,
     PG_END_TRY();
 }
 
+/*
+ * partdist_process_utility — ProcessUtility_hook wrapper.
+ *
+ * Calls the previous hook (Citus + standard) first, then invokes
+ * pg_partdist_process_utility to write PartWAL records for any COPY
+ * FROM that targeted a shard table.  The pg_partdist call happens only
+ * after the previous hook returns without error, so aborted COPY
+ * operations do not generate spurious PartWAL entries.
+ */
+static void
+partdist_process_utility(PlannedStmt *pstmt,
+                          const char *queryString,
+                          bool readOnlyTree,
+                          ProcessUtilityContext context,
+                          ParamListInfo params,
+                          QueryEnvironment *queryEnv,
+                          DestReceiver *dest,
+                          QueryCompletion *qc)
+{
+    /* Execute the statement via the existing chain first */
+    if (prev_ProcessUtility_hook)
+        prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
+                                 context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+
+    /* On successful return, record any shard-targeted COPY FROM */
+    pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+}
+
 /* ---- module load ---- */
 
 void
@@ -170,6 +204,10 @@ _PG_init(void)
     /* Chain object-access hook for shard table auto-detection */
     prev_object_access_hook = object_access_hook;
     object_access_hook = partdist_object_access;
+
+    /* Chain ProcessUtility hook to intercept COPY FROM on shard tables */
+    prev_ProcessUtility_hook = ProcessUtility_hook;
+    ProcessUtility_hook = partdist_process_utility;
 
     /* Register custom WAL RMGR for partition WAL records */
     RegisterPartitionWALRmgr();

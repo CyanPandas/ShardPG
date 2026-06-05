@@ -113,11 +113,46 @@ extern void PartitionWALShmemInit(void);
  */
 extern bool IsCitusShardTable(Oid relid);
 
+/*
+ * ShouldWritePartWAL — true if a PartWAL record should be written for
+ * the given (relid, rel_alias) pair.  Checks partition_map, Citus shard
+ * naming, and pg_dist_partition membership.
+ */
+extern bool ShouldWritePartWAL(Oid relid, const char *rel_alias);
+
 /* ------------------------------------------------------------------ */
 /* ExecutorFinish hook handler                                          */
 /* ------------------------------------------------------------------ */
 
 extern void pg_partdist_executor_finish(QueryDesc *queryDesc);
+
+/* ------------------------------------------------------------------ */
+/* ProcessUtility hook handler (bulk INSERT / COPY interception)       */
+/* ------------------------------------------------------------------ */
+
+#include "tcop/utility.h"
+
+/*
+ * pg_partdist_process_utility — called after every utility statement
+ * completes successfully.  Detects COPY FROM targeting a Citus shard
+ * table and writes the corresponding PartWALHeader record so that the
+ * Demux worker can track bulk-inserted data.
+ *
+ * prev_hook: the previous hook in the chain (already invoked by the
+ *            caller; passed only for the chain-call check below).
+ *
+ * This function must be called AFTER the prev hook has returned without
+ * error so that failed/rolled-back COPY operations do not produce stale
+ * PartWAL records.
+ */
+extern void pg_partdist_process_utility(PlannedStmt *pstmt,
+                                        const char *queryString,
+                                        bool readOnlyTree,
+                                        ProcessUtilityContext context,
+                                        ParamListInfo params,
+                                        QueryEnvironment *queryEnv,
+                                        DestReceiver *dest,
+                                        QueryCompletion *qc);
 
 /* ------------------------------------------------------------------ */
 /* SQL-callable function declarations                                   */

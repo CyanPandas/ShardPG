@@ -27,6 +27,9 @@
 #include "metadata_cache.h"
 
 #include "access/rmgr.h"
+#include "catalog/namespace.h"
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
@@ -700,7 +703,7 @@ static bool in_partwal_finish = false;
  *
  * Must be called with in_partwal_finish = true so SPI queries don't re-enter.
  */
-static bool
+bool
 ShouldWritePartWAL(Oid relid, const char *rel_alias)
 {
     bool found = false;
@@ -841,6 +844,97 @@ pg_partdist_executor_finish(QueryDesc *queryDesc)
     PG_FINALLY();
     {
         in_partwal_finish = false;
+    }
+    PG_END_TRY();
+}
+
+/* ================================================================== */
+/* ProcessUtility hook (bulk INSERT / COPY interception)               */
+/* ================================================================== */
+
+static bool in_partwal_utility = false;
+
+/*
+ * pg_partdist_process_utility — write a PartWALHeader record after any
+ * COPY FROM that targets a Citus shard table or manually registered
+ * partition.
+ *
+ * Must be called AFTER the utility statement has already executed
+ * successfully (i.e., no error was raised by the previous hook in the
+ * chain).  This guarantees we only emit WAL for committed COPY data.
+ *
+ * Flow for INSERT INTO dist SELECT ... at coordinator:
+ *   The coordinator uses CitusCopyDestReceiver to send each shard's rows
+ *   to workers via COPY FROM STDIN over the protocol connection.  On the
+ *   worker the COPY is processed as a utility statement (ProcessUtility),
+ *   NOT through ExecutorFinish — so our executor hook never fires.  This
+ *   function fills that gap.
+ *
+ * partition_id = OID of the physical shard table (e.g. bulk_test_102321).
+ *   Citus hides shard tables via citus.override_table_visibility but they
+ *   are real pg_class entries; RangeVarGetRelid finds them correctly.
+ */
+void
+pg_partdist_process_utility(PlannedStmt *pstmt,
+                             const char *queryString,
+                             bool readOnlyTree,
+                             ProcessUtilityContext context,
+                             ParamListInfo params,
+                             QueryEnvironment *queryEnv,
+                             DestReceiver *dest,
+                             QueryCompletion *qc)
+{
+    Node     *parsetree;
+    CopyStmt *copyStmt;
+    Oid       relid;
+    const char *relname;
+    XLogRecPtr  orig_lsn;
+
+    if (in_partwal_utility)
+        return;
+
+    /* WAL subsystem must be ready */
+    if (!XLogInsertAllowed())
+        return;
+    if (partwal_shmem == NULL || PartWALLSNHash == NULL)
+        return;
+
+    parsetree = pstmt->utilityStmt;
+    if (!IsA(parsetree, CopyStmt))
+        return;
+
+    copyStmt = (CopyStmt *) parsetree;
+
+    /* Only interested in COPY FROM (data ingestion), not COPY TO */
+    if (!copyStmt->is_from || copyStmt->relation == NULL)
+        return;
+
+    /*
+     * Resolve the target relation OID.  We use missing_ok=true because:
+     *   a) the statement already succeeded (table must exist), and
+     *   b) we never want a lookup failure here to mask the original result.
+     */
+    relid = RangeVarGetRelid(copyStmt->relation, NoLock, true /* missing_ok */);
+    if (!OidIsValid(relid))
+        return;
+
+    relname = copyStmt->relation->relname;
+
+    in_partwal_utility = true;
+    PG_TRY();
+    {
+        if (ShouldWritePartWAL(relid, relname))
+        {
+            orig_lsn = XactLastRecEnd;
+            if (orig_lsn == InvalidXLogRecPtr)
+                orig_lsn = GetXLogInsertRecPtr();
+
+            WritePartitionWALRecord(relid, PARTWAL_FLAG_DATA, orig_lsn);
+        }
+    }
+    PG_FINALLY();
+    {
+        in_partwal_utility = false;
     }
     PG_END_TRY();
 }
