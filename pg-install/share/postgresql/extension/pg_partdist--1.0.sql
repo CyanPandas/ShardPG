@@ -119,3 +119,158 @@ CREATE OR REPLACE FUNCTION pg_partdist_route_write(partition_id OID)
 COMMENT ON FUNCTION pg_partdist_route_write(OID) IS
     'Returns the routing decision for a write to the given partition: '
     'local | remote | not_found | node_down.';
+
+-- ----------------------------------------------------------------
+-- Milestone 2.1 — partition WAL directory management & record format
+-- ----------------------------------------------------------------
+
+-- Create pg_parwal/<partition_id>/ directory under DataDir.
+CREATE OR REPLACE FUNCTION init_partition_wal(partition_id OID)
+    RETURNS void
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_init_partition_wal';
+
+COMMENT ON FUNCTION init_partition_wal(OID) IS
+    'Create pg_parwal/<partition_id>/ under DataDir (idempotent).';
+
+-- Return true if pg_parwal/<partition_id>/ exists and is a directory.
+CREATE OR REPLACE FUNCTION partition_wal_exists(partition_id OID)
+    RETURNS boolean
+    LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partition_wal_exists';
+
+COMMENT ON FUNCTION partition_wal_exists(OID) IS
+    'Return true if the pg_parwal directory for partition_id exists.';
+
+-- Return the relative path of the WAL segment file for a given segment number.
+CREATE OR REPLACE FUNCTION partition_wal_path(partition_id OID, segno BIGINT)
+    RETURNS text
+    LANGUAGE c STRICT IMMUTABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partition_wal_path';
+
+COMMENT ON FUNCTION partition_wal_path(OID, BIGINT) IS
+    'Return pg_parwal/<partition_id>/<segname> for the given segment number.';
+
+-- Remove segment files in pg_parwal/<partition_id>/ below keep_lsn.
+CREATE OR REPLACE FUNCTION cleanup_partition_wal(partition_id OID, keep_lsn PG_LSN)
+    RETURNS void
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_cleanup_partition_wal';
+
+COMMENT ON FUNCTION cleanup_partition_wal(OID, PG_LSN) IS
+    'Remove pg_parwal segment files whose end-LSN is at or below keep_lsn.';
+
+-- Allocate the next per-partition WAL sequence number (for testing/inspection).
+CREATE OR REPLACE FUNCTION alloc_partition_lsn(partition_id OID)
+    RETURNS bigint
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_alloc_partition_lsn';
+
+COMMENT ON FUNCTION alloc_partition_lsn(OID) IS
+    'Return and increment the per-partition WAL LSN counter (1-based).';
+
+-- Write a PartWALHeader record to the WAL and to pg_parwal/<partition_id>/.
+-- Returns the global WAL LSN of the written record.
+CREATE OR REPLACE FUNCTION write_partition_wal_record(
+    partition_id OID,
+    flags        INTEGER DEFAULT 1
+)
+    RETURNS pg_lsn
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_write_partition_wal_record';
+
+COMMENT ON FUNCTION write_partition_wal_record(OID, INTEGER) IS
+    'Write a PartWALHeader WAL record for partition_id; return the assigned LSN.';
+
+-- Scan pg_parwal/<partition_id>/ and return all PartWALHeader records.
+CREATE OR REPLACE FUNCTION check_partition_wal(partition_id OID)
+    RETURNS TABLE(
+        partition_lsn   BIGINT,
+        orig_node_lsn   PG_LSN,
+        flags           INTEGER,
+        is_valid        BOOLEAN
+    )
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_check_partition_wal';
+
+COMMENT ON FUNCTION check_partition_wal(OID) IS
+    'Return all PartWALHeader records from pg_parwal/<partition_id>/.';
+
+-- Verify that partition_lsn is strictly monotone and all records have valid magic.
+CREATE OR REPLACE FUNCTION verify_partition_wal(partition_id OID)
+    RETURNS boolean
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_verify_partition_wal';
+
+COMMENT ON FUNCTION verify_partition_wal(OID) IS
+    'Return true if all pg_parwal records for partition_id are internally consistent.';
+
+-- Reset pg_parwal files + shmem LSN counter for one partition (regression tests only).
+CREATE OR REPLACE FUNCTION reset_partition_wal_state(partition_id OID)
+    RETURNS void
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_reset_partition_wal_state';
+
+COMMENT ON FUNCTION reset_partition_wal_state(OID) IS
+    'Delete all pg_parwal segment files for partition_id and reset its LSN counter to 0.';
+
+-- ----------------------------------------------------------------
+-- Milestone 2.2 — Demux Worker and auxiliary functions
+-- ----------------------------------------------------------------
+
+-- Count all PartWALHeader records stored in pg_parwal/<partition_id>/.
+CREATE OR REPLACE FUNCTION count_parwal_records(partition_id OID)
+    RETURNS bigint
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_count_parwal_records';
+
+COMMENT ON FUNCTION count_parwal_records(OID) IS
+    'Return the total number of PartWALHeader records on disk for the given partition.';
+
+-- Read Demux Worker progress from shared memory.
+CREATE OR REPLACE FUNCTION demux_progress(
+    OUT node_name          TEXT,
+    OUT last_processed_lsn PG_LSN
+)
+    RETURNS record
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_demux_progress';
+
+COMMENT ON FUNCTION demux_progress() IS
+    'Return the last WAL LSN processed by the Demux Worker on this node.';
+
+-- Read rolling processing-latency statistics from the Demux Worker.
+CREATE OR REPLACE FUNCTION demux_latency_stats(
+    OUT p50_ms FLOAT,
+    OUT p99_ms FLOAT,
+    OUT avg_ms FLOAT
+)
+    RETURNS record
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_demux_latency_stats';
+
+COMMENT ON FUNCTION demux_latency_stats() IS
+    'Return p50/p99/avg Demux processing latency in milliseconds (NULL if no samples).';
+
+-- Scan all pg_parwal/<partition_id>/ records and return partition_lsn + orig_node_lsn.
+CREATE OR REPLACE FUNCTION read_all_headers(partition_id OID)
+    RETURNS TABLE(
+        partition_lsn   BIGINT,
+        orig_node_lsn   PG_LSN
+    )
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_read_all_headers';
+
+COMMENT ON FUNCTION read_all_headers(OID) IS
+    'Return (partition_lsn, orig_node_lsn) for every record in pg_parwal/<partition_id>/.';
+
+-- Block until the Demux Worker has processed all WAL to the current position.
+-- Regression tests that write records and immediately read back pg_parwal content
+-- must call this to ensure the Demux Worker has had time to process.
+CREATE OR REPLACE FUNCTION demux_flush()
+    RETURNS void
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_demux_flush';
+
+COMMENT ON FUNCTION demux_flush() IS
+    'Block until the Demux Worker has processed WAL to the current flush LSN (30 s timeout).';

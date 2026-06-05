@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "partition_wal.h"
+#include "partition_wal_writer.h"
 #include "metadata_cache.h"
 
 #include "access/rmgr.h"
@@ -126,6 +127,7 @@ AllocPartitionLSN(Oid partition_id)
     PartWALLSNEntry *entry;
     bool             found;
     uint64           result;
+    uint64           init_lsn = 1;
 
     if (partwal_shmem == NULL || PartWALLSNHash == NULL)
         ereport(ERROR,
@@ -133,17 +135,32 @@ AllocPartitionLSN(Oid partition_id)
                  errmsg("pg_partdist: partition WAL shmem not initialised — "
                         "is pg_partdist in shared_preload_libraries?")));
 
-    LWLockAcquire(partwal_shmem->lsn_lock, LW_EXCLUSIVE);
+    /*
+     * Check under a shared lock whether the entry already exists.  If it
+     * doesn't, recover the on-disk high-water mark so that partition_lsn
+     * remains strictly increasing across server restarts.  File I/O is done
+     * outside the exclusive lock to avoid holding it during disk reads.
+     */
+    LWLockAcquire(partwal_shmem->lsn_lock, LW_SHARED);
+    hash_search(PartWALLSNHash, &partition_id, HASH_FIND, &found);
+    LWLockRelease(partwal_shmem->lsn_lock);
 
+    if (!found)
+    {
+        uint64 last = GetLastWrittenPartitionLSN(partition_id);
+        if (last > 0)
+            init_lsn = last + 1;
+    }
+
+    LWLockAcquire(partwal_shmem->lsn_lock, LW_EXCLUSIVE);
     entry = (PartWALLSNEntry *)
         hash_search(PartWALLSNHash, &partition_id, HASH_ENTER, &found);
     if (!found)
     {
         entry->partition_id = partition_id;
-        entry->next_lsn     = 1;    /* first allocated LSN is 1 */
+        entry->next_lsn     = init_lsn;
     }
     result = entry->next_lsn++;
-
     LWLockRelease(partwal_shmem->lsn_lock);
     return result;
 }
