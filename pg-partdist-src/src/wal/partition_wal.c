@@ -788,6 +788,9 @@ pg_partdist_executor_finish(QueryDesc *queryDesc)
         return;
 
     orig_lsn = XactLastRecEnd;
+    /* ON CONFLICT DO NOTHING writes no heap WAL; fall back to current insert ptr */
+    if (orig_lsn == InvalidXLogRecPtr)
+        orig_lsn = GetXLogInsertRecPtr();
 
     /*
      * Set the reentrancy flag before ShouldWritePartWAL so that any SPI
