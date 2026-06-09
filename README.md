@@ -31,12 +31,14 @@ Worker1      INSERT INTO orders_102225 VALUES (1, 100)
 6. [测试二：表间隔离性测试](#测试二表间隔离性测试)
 7. [测试三：重启后连续性测试](#测试三重启后连续性测试)
 8. [测试四：崩溃恢复测试](#测试四崩溃恢复测试)
-9. [自动化回归测试](#自动化回归测试)
-10. [完整测试套件](#完整测试套件)
-11. [性能指标](#性能指标)
-12. [on-disk 布局](#on-disk-布局)
-13. [SQL 函数参考](#sql-函数参考)
-14. [已知限制](#已知限制)
+9. [测试五：批量更新](#测试五批量更新)
+10. [测试六：自动创建分区目录](#测试六自动创建分区目录)
+11. [自动化回归测试](#自动化回归测试)
+12. [完整测试套件](#完整测试套件)
+13. [性能指标](#性能指标)
+14. [on-disk 布局](#on-disk-布局)
+15. [SQL 函数参考](#sql-函数参考)
+16. [已知限制](#已知限制)
 
 ---
 
@@ -637,6 +639,198 @@ docker exec pg-citus-cluster-container \
 docker exec -u postgres pg-citus-cluster-container \
     /work/pg-partdist-src/test_crash_recovery.sh
 # 预期：总计 PASS=32  FAIL=0
+```
+
+---
+
+## 测试五：批量更新
+
+**目标**：验证 `UPDATE` 操作能正确触发 PartWAL 写入，批量更新所有行后，Worker1 各 shard 的 PartWAL 记录数随之增加，LSN 序列保持单调有效。
+
+> **说明**：Citus 13+ 采用流式复制模型，Worker 上的物理 shard 表以隐藏 OID 存在（不出现在 `pg_class` 中），`IsCitusShardName` 通过 shard 别名（如 `batch_update_test_105671`）识别，PartWAL 写入目标是这些隐藏 OID 而非逻辑表 OID。
+
+### 手动步骤
+
+**Step 1：创建分布式表并插入初始数据**
+
+```sql
+-- 连接 Coordinator（端口 5432）
+DROP TABLE IF EXISTS batch_update_test CASCADE;
+CREATE TABLE batch_update_test (id int PRIMARY KEY, val text, score int);
+SELECT create_distributed_table('batch_update_test', 'id', shard_count => 4);
+
+-- 查看 Worker1 负责的 shard ID
+SELECT shardid
+FROM pg_dist_shard s
+JOIN pg_dist_shard_placement p USING(shardid)
+WHERE s.logicalrelid = 'batch_update_test'::regclass AND p.nodeport = 5433;
+-- 示例输出：105671, 105673
+
+-- 找到路由至 Worker1 shard 的 id 值
+SELECT v FROM generate_series(1, 200) v
+WHERE get_shard_id_for_distribution_column('batch_update_test', v) IN (105671, 105673)
+LIMIT 6;
+-- 示例输出：1, 5, 6, 8, 10, 13
+
+-- 插入 6 行
+INSERT INTO batch_update_test VALUES
+  (1,'alpha',10),(5,'beta',20),(6,'gamma',30),(8,'delta',40),(10,'epsilon',50),(13,'zeta',60);
+```
+
+**Step 2：找到 Worker1 上的隐藏 shard OID**
+
+```sql
+-- 连接 Worker1（端口 5433）
+-- 用 pg_toast 技巧：有 toast 表但无对应普通表的 OID 即为隐藏 shard
+SELECT substring(t.relname FROM 'pg_toast_(.*)') AS shard_oid
+FROM pg_class t
+WHERE t.relname LIKE 'pg_toast_%' AND t.relkind = 't'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_class c
+    WHERE c.oid = substring(t.relname FROM 'pg_toast_(.*)')::int
+      AND c.relkind = 'r')
+  AND substring(t.relname FROM 'pg_toast_(.*)')::int > 50000
+ORDER BY substring(t.relname FROM 'pg_toast_(.*)')::int DESC
+LIMIT 2;
+-- 示例输出：691134
+--           691130
+```
+
+**Step 3：刷新 Demux 并记录写入前计数**
+
+```sql
+-- 连接 Worker1（端口 5433），用实际 OID 替换以下值
+SELECT partdist.demux_flush();
+
+SELECT partdist.count_parwal_records(691134::oid) AS shard1_before,
+       partdist.count_parwal_records(691130::oid) AS shard2_before;
+-- 预期各为 1（对应上面的 1 次批量 INSERT）
+```
+
+**Step 4：执行批量 UPDATE**
+
+```sql
+-- 连接 Coordinator（端口 5432）
+UPDATE batch_update_test SET score = score * 2 WHERE id IN (1,5,6,8,10,13);
+-- 预期：UPDATE 6
+```
+
+**Step 5：刷新 Demux 并验证记录数增加**
+
+```sql
+-- 连接 Worker1（端口 5433）
+SELECT partdist.demux_flush();
+
+SELECT partdist.count_parwal_records(691134::oid) AS shard1_after,
+       partdist.count_parwal_records(691130::oid) AS shard2_after;
+-- 预期各为 2（INSERT 记录 + UPDATE 记录）
+
+SELECT partdist.verify_partition_wal(691134::oid) AS shard1_valid,
+       partdist.verify_partition_wal(691130::oid) AS shard2_valid;
+-- 预期：t | t
+
+SELECT partition_lsn, is_valid
+FROM partdist.check_partition_wal(691134::oid)
+ORDER BY partition_lsn;
+```
+
+预期输出：
+
+```
+ partition_lsn | is_valid
+---------------+----------
+             1 | t
+             2 | t
+```
+
+---
+
+## 测试六：自动创建分区目录
+
+**目标**：验证 `create_distributed_table` 执行后，两个 Worker 上对应的 `pg_parwal/<shard_oid>/` 目录被自动创建，无需任何写入操作，且目录数与 shard 分配一致。
+
+### 手动步骤
+
+**Step 1：创建分布式表**
+
+```sql
+-- 连接 Coordinator（端口 5432）
+DROP TABLE IF EXISTS auto_dir_test CASCADE;
+CREATE TABLE auto_dir_test (id int, val text);
+SELECT create_distributed_table('auto_dir_test', 'id', shard_count => 4);
+```
+
+**Step 2：查找各 Worker 上的物理 shard OID**
+
+```sql
+-- 连接 Worker1（端口 5433）
+SET citus.override_table_visibility TO off;
+SELECT oid, relname FROM pg_class
+WHERE relname LIKE 'auto_dir_test_%' AND relkind = 'r'
+ORDER BY oid;
+-- 示例输出：691152 | auto_dir_test_105675
+--           691157 | auto_dir_test_105677
+```
+
+```sql
+-- 连接 Worker2（端口 5434）
+SET citus.override_table_visibility TO off;
+SELECT oid, relname FROM pg_class
+WHERE relname LIKE 'auto_dir_test_%' AND relkind = 'r'
+ORDER BY oid;
+-- 示例输出：86901 | auto_dir_test_105676
+--           86906 | auto_dir_test_105678
+```
+
+**Step 3：验证目录已自动创建**
+
+```bash
+# Worker1：应看到刚才查到的 OID 目录（如 691152 和 691157）
+docker exec pg-citus-cluster-container \
+    ls /work/pg-cluster-data/worker1/pg_parwal/ | grep -E "^691"
+# 示例输出：691152
+#           691157
+
+# Worker2：应看到对应 OID 目录（如 86901 和 86906）
+docker exec pg-citus-cluster-container \
+    ls /work/pg-cluster-data/worker2/pg_parwal/ | grep -E "^86901|^86906"
+# 示例输出：86901
+#           86906
+```
+
+**Step 4：确认目录在首次写入前为空（仅目录存在）**
+
+```bash
+docker exec pg-citus-cluster-container \
+    ls /work/pg-cluster-data/worker1/pg_parwal/691152/
+# 预期：（空，尚未有 segment 文件）
+```
+
+**Step 5：插入一行触发 Demux 写入，确认 segment 文件出现**
+
+```sql
+-- 连接 Coordinator（端口 5432）
+-- 找到路由至 shard 105675 的 id 值
+SELECT v FROM generate_series(1, 500) v
+WHERE get_shard_id_for_distribution_column('auto_dir_test', v) = 105675
+LIMIT 1;
+-- 示例返回：3
+
+INSERT INTO auto_dir_test VALUES (3, 'test-auto-dir');
+```
+
+```sql
+-- 连接 Worker1（端口 5433）
+SELECT partdist.demux_flush();
+SELECT partdist.count_parwal_records(691152::oid);
+-- 预期：1
+```
+
+```bash
+# segment 文件已生成
+docker exec pg-citus-cluster-container \
+    ls /work/pg-cluster-data/worker1/pg_parwal/691152/
+# 示例输出：000000010000000000000001
 ```
 
 ---
