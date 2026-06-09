@@ -246,9 +246,10 @@ test_performance() {
     overhead=$(awk -v h="$s_hook" -v b="$s_base" 'BEGIN{if(b==0){print "0"}else{printf "%.1f",(h-b)/b*100}}')
     echo "  Overhead: ${overhead}%"
 
+    local thr=${BULK_OVERHEAD_THRESHOLD:-10}
     local pass
-    pass=$(awk -v h="$s_hook" -v b="$s_base" 'BEGIN{if(b==0||((h-b)/b*100)<10){print "t"}else{print "f"}}')
-    check "Performance: overhead < 10%" "$pass"
+    pass=$(awk -v h="$s_hook" -v b="$s_base" -v t="$thr" 'BEGIN{if(b==0||((h-b)/b*100)<t){print "t"}else{print "f"}}')
+    check "Performance: overhead < ${thr}%" "$pass"
 
     $PSQL -U postgres -p $COORD_PORT -c "DROP TABLE perf_plain CASCADE;" >/dev/null 2>&1 || true
 }

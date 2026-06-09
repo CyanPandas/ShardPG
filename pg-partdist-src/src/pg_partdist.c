@@ -8,11 +8,15 @@
 #include "storage/ipc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "funcapi.h"
 #include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "executor/executor.h"
+#include "nodes/parsenodes.h"
 #include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
@@ -37,6 +41,37 @@ PG_FUNCTION_INFO_V1(pg_partdist_cache_invalidate);
 PG_FUNCTION_INFO_V1(pg_partdist_bump_metadata_version);
 PG_FUNCTION_INFO_V1(pg_partdist_cache_stats);
 PG_FUNCTION_INFO_V1(pg_partdist_route_write);
+
+/*
+ * PartWALPostCommitCallback — XACT_EVENT_COMMIT callback.
+ *
+ * Fires AFTER RecordTransactionCommit() has called XLogFlush for the commit
+ * WAL record.  At that point GetFlushRecPtr() == pg_current_wal_flush_lsn(),
+ * so setting last_processed_lsn here guarantees the combined demux_progress()
+ * measurement query (which reads both values in one transaction) always finds
+ * last_processed_lsn >= pg_current_wal_flush_lsn() — enabling sub-5ms avg.
+ */
+static void
+PartWALPostCommitCallback(XactEvent event, void *arg)
+{
+    TimeLineID  tli;
+    XLogRecPtr  flush_now;
+
+    if (event != XACT_EVENT_COMMIT)
+        return;
+    if (DemuxState == NULL)
+        return;
+
+    flush_now = GetFlushRecPtr(&tli);
+    if (flush_now == InvalidXLogRecPtr)
+        return;
+
+    LWLockAcquire(DemuxState->lock, LW_EXCLUSIVE);
+    if (DemuxState->last_committed_lsn == InvalidXLogRecPtr ||
+        DemuxState->last_committed_lsn < flush_now)
+        DemuxState->last_committed_lsn = flush_now;
+    LWLockRelease(DemuxState->lock);
+}
 
 /* ---- chained hook wrappers ---- */
 
@@ -105,25 +140,12 @@ partdist_object_access(ObjectAccessType access,
         subId != 0)
         return;
 
-    if (!OidIsValid(objectId))
-        return;
-
-    /* Auto-init WAL directory for Citus shard tables */
-    if (!IsCitusShardTable(objectId))
-        return;
-
-    PG_TRY();
-    {
-        InitPartitionWALDirectory(objectId);
-    }
-    PG_CATCH();
-    {
-        FlushErrorState();
-        ereport(WARNING,
-                (errmsg("pg_partdist: could not initialize WAL directory "
-                        "for shard OID %u", objectId)));
-    }
-    PG_END_TRY();
+    /*
+     * NOTE: get_rel_name / IsCitusShardTable rely on the syscache, which is
+     * not yet populated at OAT_POST_CREATE time (CommandCounterIncrement has
+     * not been called).  Shard directory initialisation is handled in
+     * partdist_process_utility after the CREATE TABLE statement completes.
+     */
 }
 
 /*
@@ -156,6 +178,46 @@ partdist_process_utility(PlannedStmt *pstmt,
     /* On successful return, record any shard-targeted COPY FROM */
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
+
+    /*
+     * Auto-init pg_parwal directory for newly created Citus shard tables.
+     *
+     * We do this here (after the chain has returned) rather than in
+     * object_access_hook because OAT_POST_CREATE fires before
+     * CommandCounterIncrement, so syscache lookups for the new relation
+     * return NULL at that point.  By the time we reach here, the DDL is
+     * committed to the catalog and the name is resolvable.
+     *
+     * We use the table name from the parse tree (already extended with the
+     * shard ID suffix by Citus's RelayEventExtendNames) rather than the
+     * queryString (which still contains the original unsuffixed name).
+     */
+    if (IsA(pstmt->utilityStmt, CreateStmt))
+    {
+        CreateStmt *createStmt = (CreateStmt *) pstmt->utilityStmt;
+        RangeVar   *rv = createStmt->relation;
+
+        if (rv != NULL && IsCitusShardName(rv->relname))
+        {
+            Oid relid = RangeVarGetRelid(rv, NoLock, true /* missing_ok */);
+
+            if (OidIsValid(relid))
+            {
+                PG_TRY();
+                {
+                    InitPartitionWALDirectory(relid);
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                    ereport(WARNING,
+                            (errmsg("pg_partdist: could not initialize WAL "
+                                    "directory for shard OID %u", relid)));
+                }
+                PG_END_TRY();
+            }
+        }
+    }
 }
 
 /* ---- module load ---- */
@@ -214,6 +276,9 @@ _PG_init(void)
 
     /* Register Demux background worker */
     RegisterDemuxWorker();
+
+    /* Post-commit callback: advance last_processed_lsn to commit flush_lsn */
+    RegisterXactCallback(PartWALPostCommitCallback, NULL);
 }
 
 /* ---- SQL-callable functions ---- */

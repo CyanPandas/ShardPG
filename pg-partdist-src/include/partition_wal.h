@@ -107,9 +107,17 @@ extern void PartitionWALShmemInit(void);
 /* ------------------------------------------------------------------ */
 
 /*
+ * IsCitusShardName — true if the name string ends with _<N> (≥4 digits).
+ * Works on raw name strings without a syscache lookup.
+ */
+extern bool IsCitusShardName(const char *name);
+
+/*
  * IsCitusShardTable — true if relid's syscache name ends with _<N>
  * where N is at least 4 decimal digits (Citus shard table naming convention).
- * Safe to call from executor hooks; uses get_rel_name (syscache lookup).
+ * NOTE: only safe AFTER CommandCounterIncrement; do NOT call from
+ * object_access_hook (OAT_POST_CREATE) as the syscache entry is not yet
+ * committed at that point.
  */
 extern bool IsCitusShardTable(Oid relid);
 

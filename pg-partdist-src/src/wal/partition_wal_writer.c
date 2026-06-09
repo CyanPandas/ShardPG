@@ -48,13 +48,9 @@ OpenWriterSegment(PartitionWALWriter *writer, XLogSegNo segno)
     char *rel;
     int   fd;
 
-    /* Close current file if different segment */
+    /* Close current file if different segment (caller already flushed buffer) */
     if (writer->fd >= 0)
     {
-        if (pg_fsync(writer->fd) != 0)
-            ereport(WARNING,
-                    (errcode_for_file_access(),
-                     errmsg("pg_partdist: could not fsync partition WAL file: %m")));
         close(writer->fd);
         writer->fd = -1;
     }
@@ -72,6 +68,25 @@ OpenWriterSegment(PartitionWALWriter *writer, XLogSegNo segno)
                 (errcode_for_file_access(),
                  errmsg("pg_partdist: could not open partition WAL segment "
                         "\"%s\": %m", abspath)));
+
+    /*
+     * Truncate to the last complete PartWALHeader boundary.  A previous ENOSPC
+     * partial write may have left an incomplete record tail; removing it ensures
+     * that subsequent O_APPEND writes start at a clean record boundary.
+     */
+    {
+        off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > 0)
+        {
+            off_t aligned = (sz / (off_t) sizeof(PartWALHeader))
+                            * (off_t) sizeof(PartWALHeader);
+            if (aligned < sz)
+            {
+                int rc = ftruncate(fd, aligned);
+                (void) rc;  /* best-effort: ignore if truncation fails */
+            }
+        }
+    }
 
     writer->fd            = fd;
     writer->current_segno = segno;
@@ -211,10 +226,12 @@ CreatePartitionWALWriter(Oid partition_id)
 
 /*
  * FlushPartitionWALWriter — write all buffered bytes to the current segment
- * file and fsync.
+ * file.  If with_fsync is true, also calls pg_fsync() for durability.
+ * Hot-path callers (segment-boundary, buffer-full) pass false to avoid
+ * blocking the demux on IO under concurrent WAL pressure.
  */
 void
-FlushPartitionWALWriter(PartitionWALWriter *writer)
+FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync)
 {
     ssize_t written;
     int     remaining;
@@ -231,14 +248,35 @@ FlushPartitionWALWriter(PartitionWALWriter *writer)
 
     while (remaining > 0)
     {
-        do {
-            written = write(writer->fd, ptr, remaining);
-        } while (written < 0 && errno == EINTR);
+        ssize_t this_written;
 
-        if (written < 0)
+        do {
+            this_written = write(writer->fd, ptr, remaining);
+        } while (this_written < 0 && errno == EINTR);
+
+        if (this_written < 0)
         {
             if (errno == ENOSPC)
             {
+                /*
+                 * Compact buffer: discard only complete records that made it
+                 * to disk (rounded down to PartWALHeader size) so the buffer
+                 * retains every unwritten record for the next flush attempt.
+                 * Close the fd so OpenWriterSegment will truncate the partial
+                 * tail on recovery and reopen cleanly.
+                 */
+                int bytes_out = (int)(ptr - writer->buffer);
+                int complete  = (bytes_out / (int)sizeof(PartWALHeader))
+                                * (int)sizeof(PartWALHeader);
+                if (complete > 0)
+                {
+                    memmove(writer->buffer,
+                            writer->buffer + complete,
+                            writer->buf_used - complete);
+                    writer->buf_used -= complete;
+                }
+                close(writer->fd);
+                writer->fd = -1;
                 ereport(ERROR,
                         (errcode(ERRCODE_DISK_FULL),
                          errmsg("pg_partdist: disk full writing partition WAL "
@@ -249,11 +287,12 @@ FlushPartitionWALWriter(PartitionWALWriter *writer)
                      errmsg("pg_partdist: could not write partition WAL: %m")));
         }
 
+        written    = this_written;
         ptr       += written;
         remaining -= (int) written;
     }
 
-    if (pg_fsync(writer->fd) != 0)
+    if (with_fsync && pg_fsync(writer->fd) != 0)
         ereport(WARNING,
                 (errcode_for_file_access(),
                  errmsg("pg_partdist: fsync failed for partition %u WAL: %m",
@@ -286,7 +325,7 @@ WritePartitionWAL(PartitionWALWriter *writer, const PartWALHeader *header)
     /* Flush and switch segment file when boundary crossed */
     if (writer->current_segno != 0 && new_segno != writer->current_segno)
     {
-        FlushPartitionWALWriter(writer);
+        FlushPartitionWALWriter(writer, false);  /* write only; fsync deferred */
         OpenWriterSegment(writer, new_segno);
     }
     else if (writer->fd < 0)
@@ -295,9 +334,9 @@ WritePartitionWAL(PartitionWALWriter *writer, const PartWALHeader *header)
         OpenWriterSegment(writer, new_segno);
     }
 
-    /* Flush if buffer is full */
+    /* Flush if buffer is full (write only; fsync deferred to FlushAllWriters) */
     if (writer->buf_used + (int) sizeof(PartWALHeader) > PARWAL_WRITER_BUFFER_SIZE)
-        FlushPartitionWALWriter(writer);
+        FlushPartitionWALWriter(writer, false);
 
     memcpy(writer->buffer + writer->buf_used, header, sizeof(PartWALHeader));
     writer->buf_used          += sizeof(PartWALHeader);
@@ -313,15 +352,10 @@ DestroyPartitionWALWriter(PartitionWALWriter *writer)
     if (writer == NULL)
         return;
 
-    FlushPartitionWALWriter(writer);
+    FlushPartitionWALWriter(writer, true);  /* final flush with fsync on shutdown */
 
     if (writer->fd >= 0)
     {
-        if (pg_fsync(writer->fd) != 0)
-            ereport(WARNING,
-                    (errcode_for_file_access(),
-                     errmsg("pg_partdist: final fsync failed for partition %u: %m",
-                            writer->partition_id)));
         close(writer->fd);
         writer->fd = -1;
     }

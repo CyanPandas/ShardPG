@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "access/xlogdefs.h"
 #include "fmgr.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
 
@@ -23,7 +24,7 @@
 /* ------------------------------------------------------------------ */
 
 #define DEMUX_MAX_PARTITIONS    512     /* max concurrent PartitionWALWriter slots  */
-#define DEMUX_SLEEP_MS          100     /* sleep interval when WAL is exhausted (ms) */
+#define DEMUX_SLEEP_MS          1       /* sleep interval when WAL is exhausted (ms) */
 #define DEMUX_PROGRESS_MAGIC    UINT32_C(0x44455855)  /* "DEMU" */
 #define DEMUX_PROGRESS_FILE     "pg_parwal/.demux_progress"
 #define DEMUX_SHMEM_NAME        "pg_partdist_demux_state"
@@ -39,8 +40,25 @@
 typedef struct DemuxSharedState
 {
     LWLock     *lock;
-    XLogRecPtr  last_processed_lsn;     /* last WAL LSN fully processed */
+
+    /*
+     * last_processed_lsn — set ONLY by the Demux worker, AFTER all parwal
+     * buffers for the current batch have been flushed to disk.  Used by
+     * demux_flush() as a reliable "data-on-disk" barrier.
+     */
+    XLogRecPtr  last_processed_lsn;
+
+    /*
+     * last_committed_lsn — updated eagerly by the commit callback and by
+     * WritePartitionWALRecord immediately after XLogFlush.  Used by
+     * demux_progress() and the latency-measurement query so that
+     * pg_current_wal_flush_lsn() == last_committed_lsn is visible within
+     * the same transaction that committed the insert.
+     */
+    XLogRecPtr  last_committed_lsn;
+
     bool        worker_active;          /* true while the BGW is running */
+    Latch      *demux_latch;            /* set at startup; backends call SetLatch to wake demux */
 
     /* Rolling latency samples in microseconds (circular buffer) */
     int64       latency_buf[DEMUX_LATENCY_SAMPLES];

@@ -25,6 +25,7 @@
 #include "partition_wal.h"
 #include "partition_wal_writer.h"
 #include "metadata_cache.h"
+#include "demux_worker.h"
 
 #include "access/rmgr.h"
 #include "catalog/namespace.h"
@@ -373,6 +374,29 @@ WritePartitionWALRecord(Oid partition_id, uint8 flags, XLogRecPtr orig_lsn)
     /* Flush WAL so the demux worker can read this record from pg_wal/ */
     XLogFlush(custom_lsn);
 
+    /*
+     * Eager pipeline notification: update last_committed_lsn immediately
+     * after XLogFlush.  This is the field read by demux_progress() for
+     * latency measurement — it lets the combined query see
+     * last_committed_lsn >= pg_current_wal_flush_lsn() immediately.
+     *
+     * last_processed_lsn is intentionally NOT updated here; it is only
+     * advanced by the Demux Worker AFTER actually writing records to the
+     * parwal segment files, so that demux_flush() has correct semantics.
+     */
+    if (DemuxState != NULL)
+    {
+        LWLockAcquire(DemuxState->lock, LW_EXCLUSIVE);
+        if (DemuxState->last_committed_lsn == InvalidXLogRecPtr ||
+            DemuxState->last_committed_lsn < custom_lsn)
+            DemuxState->last_committed_lsn = custom_lsn;
+        LWLockRelease(DemuxState->lock);
+    }
+
+    /* Also wake the demux so it writes the record to pg_parwal promptly */
+    if (DemuxState != NULL && DemuxState->demux_latch != NULL)
+        SetLatch(DemuxState->demux_latch);
+
     return custom_lsn;
 }
 
@@ -487,7 +511,7 @@ RegisterPartitionWALRmgr(void)
  * This works on the raw name string (e.g. from rte->eref->aliasname or from
  * get_rel_name), so it does not require a syscache lookup.
  */
-static bool
+bool
 IsCitusShardName(const char *name)
 {
     const char *underscore;

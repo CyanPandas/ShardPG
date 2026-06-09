@@ -8,6 +8,7 @@
 #include "postgres.h"
 #include "partition_wal_header.h"
 #include "access/xlogdefs.h"
+#include "utils/timestamp.h"
 
 /* 256 KB write buffer per partition */
 #define PARWAL_WRITER_BUFFER_SIZE   (256 * 1024)
@@ -25,6 +26,7 @@ typedef struct PartitionWALWriter
     int         buf_used;               /* bytes currently in buffer */
 
     bool        enospc_stalled;         /* true while disk is full */
+    TimestampTz last_stall_time;        /* when enospc_stalled was last set */
 } PartitionWALWriter;
 
 /*
@@ -49,9 +51,12 @@ extern void WritePartitionWAL(PartitionWALWriter *writer,
                                const PartWALHeader *header);
 
 /*
- * FlushPartitionWALWriter — write buffered data to disk and fsync.
+ * FlushPartitionWALWriter — write buffered data to disk.
+ * If with_fsync is true, also calls pg_fsync() for durability.
+ * Hot-path callers (buffer-full, segment-boundary) pass false to avoid
+ * blocking the demux on IO; periodic/shutdown callers pass true.
  */
-extern void FlushPartitionWALWriter(PartitionWALWriter *writer);
+extern void FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync);
 
 /*
  * GetLastWrittenPartitionLSN — scan pg_parwal/<partition_id>/ and return the
