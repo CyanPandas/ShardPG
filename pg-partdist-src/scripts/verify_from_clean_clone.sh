@@ -3,14 +3,16 @@
 #
 # 从一个全新 git clone 开始，端到端验证本仓库能否正常工作：
 #   clone -> 构建 Docker 镜像 -> 编译安装 pg_partdist ->
-#   初始化 3 节点 Citus 集群 (coordinator + 2 worker) -> 运行生产环境模拟测试
-#   -> 清理容器/镜像/克隆目录。
+#   初始化 3 节点 Citus 集群 (coordinator + 2 worker) -> 运行生产环境模拟测试。
 #
 # 使用独立的容器名/镜像名，不会影响任何已在运行的开发容器（如
-# pg-citus-cluster-container）。结束后（无论成功失败）都会清理，只留下日志。
+# pg-citus-cluster-container）。测试跑完（无论成功失败）不会自动清理容器/
+# 镜像/克隆目录，方便结束后手动进容器查状态、看日志；需要清理时手动执行
+# 同目录下的 verify_cleanup.sh。
 #
 # 用法（在任何一台新机器上都应该零配置直接跑）：
 #   bash verify_from_clean_clone.sh [branch]
+#   bash verify_cleanup.sh   # 测试结束后需要清理容器/镜像/克隆目录时再跑
 #
 #   REPO_URL   要验证的仓库地址。默认是不带凭据的公开 HTTPS 地址
 #              （https://github.com/CyanPandas/ShardPG.git），ShardPG 是
@@ -91,9 +93,6 @@ REPO_DIR="$WORKDIR/ShardPG"
 IMAGE_NAME="pg-partdist-verify-env"
 CONTAINER_NAME="pg-partdist-verify-container"
 
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
-
 PG=/work/pg-install/bin
 DATA=/work/pg-cluster-data
 
@@ -101,26 +100,16 @@ exec > >(tee "$LOGFILE") 2>&1
 
 FINAL_STATUS="UNKNOWN"
 
-cleanup() {
-    echo ""
-    echo "=== 清理阶段 ==="
-    if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-        # 先把 bind mount 目录属主改回宿主机用户，否则宿主机侧 rm -rf 会
-        # 因为文件属主是容器内 postgres(uid 999) 而权限不足。
-        docker exec -u root "$CONTAINER_NAME" \
-            chown -R "$HOST_UID:$HOST_GID" /work/pg-install /work/pg-cluster-data /work/pg-partdist-src \
-            >/dev/null 2>&1 || true
-        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 && echo "  容器已删除: $CONTAINER_NAME"
-    else
-        echo "  容器不存在，跳过"
-    fi
-    docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 && echo "  镜像已删除: $IMAGE_NAME" || echo "  镜像不存在或已删除"
-    rm -rf "$WORKDIR" && echo "  克隆目录已删除: $WORKDIR"
+# 测试跑完不自动清理容器/镜像/克隆目录，方便结束后手动进容器看状态、查
+# 日志。需要清理时手动执行 verify_cleanup.sh（同目录下）。
+report_status() {
     echo ""
     echo "=== 最终结果: $FINAL_STATUS ==="
     echo "=== 完整日志: $LOGFILE ==="
+    echo "=== 容器/镜像/克隆目录未清理，容器名: $CONTAINER_NAME，克隆目录: $REPO_DIR ==="
+    echo "=== 需要清理时执行: bash $(dirname "${BASH_SOURCE[0]}")/verify_cleanup.sh ==="
 }
-trap cleanup EXIT
+trap report_status EXIT
 
 banner() { echo ""; echo "======================================================"; echo "  $1"; echo "======================================================"; }
 

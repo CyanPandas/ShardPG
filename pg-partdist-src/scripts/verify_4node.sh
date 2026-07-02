@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # verify_4node.sh — 从全新 clone 验证 1 coordinator + 3 worker 拓扑：
 # clone -> docker build -> 编译安装 pg_partdist -> 初始化 4 节点 -> 配置 Citus
-# -> 一组手动测试用例 -> 清理。
+# -> 一组手动测试用例。测试跑完不会自动清理容器/镜像/克隆目录，方便结束后
+# 手动进容器查状态；需要清理时手动执行同目录下的 verify_cleanup.sh。
 #
 # 不跑现有 run_production_sim.sh（已知对"恰好 2 个 worker"有硬编码依赖，
 # 4 节点下会产生大量非环境问题的 FAIL，参考 pg-partdist-src/scripts/
@@ -14,6 +15,7 @@
 #
 # 用法（在任何一台新机器上都应该零配置直接跑）：
 #   bash verify_4node.sh [branch]
+#   bash verify_cleanup.sh   # 测试结束后需要清理容器/镜像/克隆目录时再跑
 #
 #   REPO_URL   要验证的仓库地址，默认不带凭据的公开 HTTPS 地址
 #              （https://github.com/CyanPandas/ShardPG.git），不需要 SSH
@@ -43,9 +45,6 @@ REPO_DIR="$WORKDIR/ShardPG"
 IMAGE_NAME="pg-partdist-verify4-env"
 CONTAINER_NAME="pg-partdist-verify4-container"
 
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
-
 PG=/work/pg-install/bin
 DATA=/work/pg-cluster-data
 
@@ -53,23 +52,16 @@ exec > >(tee "$LOGFILE") 2>&1
 
 FINAL_STATUS="UNKNOWN"
 
-cleanup() {
-    echo ""
-    echo "=== 清理阶段 ==="
-    if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-        docker exec -u root "$CONTAINER_NAME" \
-            chown -R "$HOST_UID:$HOST_GID" /work/pg-install /work/pg-cluster-data /work/pg-partdist-src \
-            >/dev/null 2>&1 || true
-        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 && echo "  容器已删除: $CONTAINER_NAME"
-    else
-        echo "  容器不存在，跳过"
-    fi
-    docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 && echo "  镜像已删除: $IMAGE_NAME" || echo "  镜像不存在或已删除"
-    rm -rf "$WORKDIR" && echo "  克隆目录已删除: $WORKDIR"
+# 测试跑完不自动清理容器/镜像/克隆目录，方便结束后手动进容器看状态、查
+# 日志。需要清理时手动执行 verify_cleanup.sh（同目录下）。
+report_status() {
     echo ""
     echo "=== 最终结果: $FINAL_STATUS ==="
+    echo "=== 完整日志: $LOGFILE ==="
+    echo "=== 容器/镜像/克隆目录未清理，容器名: $CONTAINER_NAME，克隆目录: $REPO_DIR ==="
+    echo "=== 需要清理时执行: bash $(dirname "${BASH_SOURCE[0]}")/verify_cleanup.sh ==="
 }
-trap cleanup EXIT
+trap report_status EXIT
 
 banner() { echo ""; echo "======================================================"; echo "  $1"; echo "======================================================"; }
 
