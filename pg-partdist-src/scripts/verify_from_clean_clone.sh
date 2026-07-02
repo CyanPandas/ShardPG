@@ -37,20 +37,23 @@
 #      CREATE EXTENSION 无关）。必须先在 worker 上 CREATE EXTENSION
 #      pg_partdist 再建 citus，否则 citus_columnar 的内部迁移语句会被钩子
 #      拦截去查询尚不存在的 partdist.partition_map 表而报错。
-#
-# ── 已知仍未解决、但已确认与本分支代码无关的测试脚本问题 ──────────────────
-#   - verify_continuity_and_crash.sh 的 newest_oids() 用硬编码 `> 50000`
-#     筛选"新建的分片表 OID"。这个阈值只在 OID 计数器已经很高的长期开发
-#     容器上成立（该容器目前 OID 水位约 290 万）。在一个刚 initdb 的新鲜
-#     集群上，OID 还在几千到几万区间，筛选结果为空，报
-#     "OIDS[0]: unbound variable"，导致 run_production_sim.sh 的测试
-#     1/10 必然失败。3 节点/4 节点拓扑下都会复现，与集群规模无关。
-#   - run_production_sim.sh 测试 3/10 对 worker1/worker2 做 kill -9 崩溃
-#     模拟后，worker1 在全新集群上未能重新恢复（后续测试报
-#     Connection refused），根因未定位；3 节点、4 节点复现一致，已排除
-#     资源竞争。
-#   综上，全新 clone 目前无法拿到生产模拟测试 10/10 全过，PASS=2 FAIL=8
-#     属于已知、已定位（部分）的测试脚本自身问题，不代表分支代码有缺陷。
+#   6. docker run 必须带 --init。容器 PID 1 是 sleep infinity，所有
+#      postgres 进程通过一次性 docker exec 启动后都会被过继给 PID 1。
+#      测试脚本里对 worker 做 kill -9 崩溃模拟时，被杀的 postmaster 会变成
+#      僵尸进程——sleep infinity 从不 wait()，僵尸永远不会被回收。新
+#      postmaster 启动时对 postmaster.pid 里旧 PID 做 kill(pid,0) 存活检测，
+#      僵尸进程仍然"存在"，于是报 "lock file already exists / Is another
+#      postmaster running?" 并立即拒绝启动，导致该 worker 之后的全部测试
+#      都是 Connection refused。--init 会引入一个真正的 init 进程（tini）
+#      负责回收僵尸，行为与长期开发容器（PID 1 是常驻 bash，本身就会回收
+#      自己的子进程）一致。这不是 pg_partdist 或 PostgreSQL 的 bug。
+#   7. verify_continuity_and_crash.sh 的 newest_oids() 和 test_crash_recovery.sh
+#      的 get_w1_shard_oids() 都曾经用硬编码 `> 50000` 筛选"新建的分片表
+#      OID"，这个阈值只在 OID 计数器已经很高的长期开发容器上成立。在一个
+#      刚 initdb 的新鲜集群上 OID 还在几千到几万区间，筛选结果为空，报
+#      "OIDS[0]: unbound variable"。已修复：两处都去掉了这个多余的下限，
+#      因为查询本身已经用 ORDER BY oid DESC LIMIT 2 取"最新的两个"，不需要
+#      额外的绝对阈值。
 #
 # ── 已知不支持的拓扑 ───────────────────────────────────────────────────
 #   现有测试脚本（尤其 test_multi_table_isolation.sh 等）对"恰好 2 个
@@ -126,6 +129,7 @@ banner "阶段 3 — 启动容器（独立命名，不影响其他已在运行�
 # ════════════════════════════════════════════════════════════════
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d \
+    --init \
     --name "$CONTAINER_NAME" \
     -v "$REPO_DIR/pg-install:/work/pg-install" \
     -v "$REPO_DIR/pg-cluster-data:/work/pg-cluster-data" \
@@ -224,7 +228,7 @@ PROD_RC=$?
 if [ "$PROD_RC" -eq 0 ]; then
     FINAL_STATUS="SUCCESS — 全新 clone 的 3 节点集群上生产模拟测试全部通过"
 else
-    FINAL_STATUS="FAIL (生产模拟测试未全部通过, exit=$PROD_RC — 参见脚本头部“已知仍未解决”的问题列表，PASS=2/10 属于已知情况)"
+    FINAL_STATUS="FAIL (生产模拟测试未全部通过, exit=$PROD_RC)"
 fi
 
 exit "$PROD_RC"

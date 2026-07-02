@@ -55,7 +55,6 @@ get_w1_shard_oids() {
               SELECT 1 FROM pg_class c
               WHERE c.oid = substring(t.relname from 'pg_toast_(.*)')::int
                 AND c.relkind = 'r')
-          AND substring(t.relname from 'pg_toast_(.*)')::int > 50000
         ORDER BY substring(t.relname from 'pg_toast_(.*)')::int DESC
         LIMIT 2;" | sort -n
 }
