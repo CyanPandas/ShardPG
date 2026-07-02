@@ -136,6 +136,37 @@ fail_exit() { FINAL_STATUS="FAIL ($1)"; exit 1; }
 # commit、几十 MB）。这里不改全局 git 配置，只在这一次 clone 上用 -c
 # 参数强制 HTTP/1.1、加大缓冲区，并失败自动重试几次（很多情况下是网络
 # 抖动，重试就过了）。
+#
+# 如果强制 HTTP/1.1 之后仍然反复报 GnuTLS recv error，大概率不是 HTTP/2
+# 协商问题，而是这台机器到 github.com 的链路存在 TCP/MTU 层面的丢包黑洞
+# （常见于某些 VPN/代理网络，ICMP 被墙导致 PMTU 发现失效，git 智能 HTTP
+# 协议的长连接大包传输容易触发）。这种情况下换一种传输方式往往能绕过：
+# 用 curl 走 codeload.github.com 下载分支 tarball（单次简单 GET + 可续
+# 传），不走 git smart-http 协议的 pack 协商，再本地解包。这里作为 git
+# clone 重试 3 次仍失败后的兜底方案，不是默认路径。
+tarball_fallback_clone() {
+    local url=$1 branch=$2 dest=$3
+    # 从 REPO_URL 提取 owner/repo（支持 https://github.com/owner/repo.git 或 owner/repo）
+    local owner_repo
+    owner_repo=$(echo "$url" | sed -E 's#^(git@|https://)github\.com[:/]##; s#\.git$##')
+    local tar_url="https://codeload.github.com/${owner_repo}/tar.gz/refs/heads/${branch}"
+    local tmp_tar
+    tmp_tar=$(mktemp)
+    echo "  尝试兜底方案：curl 下载 tarball ($tar_url) ..."
+    if ! curl -fL --retry 5 --retry-delay 3 -C - -o "$tmp_tar" "$tar_url"; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    if ! tar -xzf "$tmp_tar" -C "$dest" --strip-components=1; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+    rm -f "$tmp_tar"
+    return 0
+}
+
 robust_git_clone() {
     local url=$1 branch=$2 dest=$3 tries=0
     while [ $tries -lt 3 ]; do
@@ -149,13 +180,14 @@ robust_git_clone() {
         echo "  clone 第 $tries 次失败，${tries}/3 ..."
         sleep 3
     done
-    return 1
+    echo "  git clone 重试 3 次仍失败，改用 tarball 方式..."
+    tarball_fallback_clone "$url" "$branch" "$dest"
 }
 
 # ════════════════════════════════════════════════════════════════
 banner "阶段 1 — 全新 clone ${BRANCH} 分支"
 # ════════════════════════════════════════════════════════════════
-robust_git_clone "$REPO_URL" "$BRANCH" "$REPO_DIR" || fail_exit "clone失败（重试3次后仍失败，若持续报 GnuTLS recv error，请检查该机器的网络/代理设置，或尝试 curl -v https://github.com 排查连通性）"
+robust_git_clone "$REPO_URL" "$BRANCH" "$REPO_DIR" || fail_exit "clone失败（git clone 重试3次 + tarball 兜底均失败，请检查该机器能否访问 github.com/codeload.github.com，或是否需要配置代理：export https_proxy=...）"
 echo "clone 完成: $REPO_DIR"
 
 # ════════════════════════════════════════════════════════════════

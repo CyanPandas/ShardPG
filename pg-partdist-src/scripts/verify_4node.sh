@@ -83,6 +83,33 @@ fail_exit() { FINAL_STATUS="FAIL ($1)"; exit 1; }
 # "GnuTLS recv error (-54): Error in the pull function"，和仓库大小无关，
 # 是 curl 的 GnuTLS 后端在 HTTP/2 协商上抽风。不改全局 git 配置，只在这
 # 一次 clone 上用 -c 参数强制 HTTP/1.1、加大缓冲区，并失败自动重试。
+#
+# 如果强制 HTTP/1.1 后仍反复报 GnuTLS recv error，大概率是 TCP/MTU 层面
+# 的丢包黑洞（而非 HTTP/2 协商问题），git smart-http 的长连接大包传输容
+# 易触发。兜底改用 curl 走 codeload.github.com 下载分支 tarball（单次
+# GET + 可续传，不走 git smart-http 协议），本地解包。
+tarball_fallback_clone() {
+    local url=$1 branch=$2 dest=$3
+    local owner_repo
+    owner_repo=$(echo "$url" | sed -E 's#^(git@|https://)github\.com[:/]##; s#\.git$##')
+    local tar_url="https://codeload.github.com/${owner_repo}/tar.gz/refs/heads/${branch}"
+    local tmp_tar
+    tmp_tar=$(mktemp)
+    echo "  尝试兜底方案：curl 下载 tarball ($tar_url) ..."
+    if ! curl -fL --retry 5 --retry-delay 3 -C - -o "$tmp_tar" "$tar_url"; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    if ! tar -xzf "$tmp_tar" -C "$dest" --strip-components=1; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+    rm -f "$tmp_tar"
+    return 0
+}
+
 robust_git_clone() {
     local url=$1 branch=$2 dest=$3 tries=0
     while [ $tries -lt 3 ]; do
@@ -96,7 +123,8 @@ robust_git_clone() {
         echo "  clone 第 $tries 次失败，${tries}/3 ..."
         sleep 3
     done
-    return 1
+    echo "  git clone 重试 3 次仍失败，改用 tarball 方式..."
+    tarball_fallback_clone "$url" "$branch" "$dest"
 }
 
 # 在某个 worker 上取某张分布式表本地分片的 OID 列表。
@@ -123,7 +151,7 @@ worker_shard_oid_names() {
 # ════════════════════════════════════════════════════════════════
 banner "阶段 1 — 全新 clone ${BRANCH} 分支"
 # ════════════════════════════════════════════════════════════════
-robust_git_clone "$REPO_URL" "$BRANCH" "$REPO_DIR" || fail_exit "clone失败（重试3次后仍失败，若持续报 GnuTLS recv error，请检查该机器的网络/代理设置，或尝试 curl -v https://github.com 排查连通性）"
+robust_git_clone "$REPO_URL" "$BRANCH" "$REPO_DIR" || fail_exit "clone失败（git clone 重试3次 + tarball 兜底均失败，请检查该机器能否访问 github.com/codeload.github.com，或是否需要配置代理：export https_proxy=...）"
 echo "clone 完成: $REPO_DIR"
 
 # ════════════════════════════════════════════════════════════════
