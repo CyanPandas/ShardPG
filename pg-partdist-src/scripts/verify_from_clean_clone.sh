@@ -54,6 +54,17 @@
 #      "OIDS[0]: unbound variable"。已修复：两处都去掉了这个多余的下限，
 #      因为查询本身已经用 ORDER BY oid DESC LIMIT 2 取"最新的两个"，不需要
 #      额外的绝对阈值。
+#   8. postgresql.conf 里必须显式写 port = 5432/5433/5434，不能只靠
+#      pg_ctl start -o "-p ...".  -o 参数是一次性命令行覆盖，不会写回
+#      postgresql.conf；pg_ctl restart 会读 postmaster.opts 记住上次端口，
+#      所以"restart"可以不写端口也正常工作，但个别测试脚本（如
+#      test_bulk_insert_recovery.sh 崩溃恢复步骤、test_enospc_recovery.sh
+#      的 LD_PRELOAD 重启步骤）在 kill -9 或 fast stop 后用的是不带 -o 的
+#      纯 "pg_ctl start"，此时会退回 postgresql.conf 里的端口（默认
+#      5432），与 coordinator 抢占同一端口，报 "Address already in use"，
+#      pg_ctl start 立即失败。长期开发容器的 postgresql.conf 里手动写了
+#      port=xxxx 所以从未暴露这个问题；本脚本已在 initdb 后直接把 port
+#      写进三个节点的 postgresql.conf，从根上解决，不需要逐个改测试脚本。
 #
 # ── 已知不支持的拓扑 ───────────────────────────────────────────────────
 #   现有测试脚本（尤其 test_multi_table_isolation.sh 等）对"恰好 2 个
@@ -168,15 +179,18 @@ dexec "$PG/initdb" -D "$DATA/worker2" --encoding=UTF8 || fail_exit "worker2 init
 echo "3 个数据目录已 initdb"
 
 dexec bash -c "cat >> $DATA/master/postgresql.conf <<'EOF'
+port = 5432
 shared_preload_libraries = 'citus,pg_partdist'
 max_prepared_transactions = 200
 EOF"
 dexec bash -c "cat >> $DATA/worker1/postgresql.conf <<'EOF'
+port = 5433
 shared_preload_libraries = 'citus,pg_partdist'
 max_prepared_transactions = 200
 pg_partdist.local_node_id = 1
 EOF"
 dexec bash -c "cat >> $DATA/worker2/postgresql.conf <<'EOF'
+port = 5434
 shared_preload_libraries = 'citus,pg_partdist'
 max_prepared_transactions = 200
 pg_partdist.local_node_id = 2
