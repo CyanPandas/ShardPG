@@ -12,8 +12,13 @@
 #   阶段 8 — 表间隔离性（两张分布式表的 PartWAL 记录互不串扰）
 #   阶段 9 — PartWAL 内容完整性：独立 Perl 解析段文件原始字节 vs SQL 计数交叉验证
 #
-# 用法：
-#   REPO_URL=... bash verify_4node.sh [branch]
+# 用法（在任何一台新机器上都应该零配置直接跑）：
+#   bash verify_4node.sh [branch]
+#
+#   REPO_URL   要验证的仓库地址，默认不带凭据的公开 HTTPS 地址
+#              （https://github.com/CyanPandas/ShardPG.git），不需要 SSH
+#              key / token / known_hosts，换一台全新机器也能直接跑。
+#              需要指向别的仓库/私有仓库时再显式覆盖。
 #
 # ── 写手动用例时踩的两个坑（供以后维护参考）───────────────────────────────
 #   1. LIKE 'tablename_%' 里表名自带的下划线会被 SQL LIKE 当成"匹配任意
@@ -28,7 +33,7 @@
 
 set -uo pipefail
 
-REPO_URL="${REPO_URL:?must set REPO_URL}"
+REPO_URL="${REPO_URL:-https://github.com/CyanPandas/ShardPG.git}"
 BRANCH="${1:-shardpg-2.0}"
 
 WORKDIR="$(mktemp -d /tmp/pg-partdist-verify4.XXXXXX)"

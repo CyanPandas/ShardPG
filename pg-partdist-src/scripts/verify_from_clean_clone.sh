@@ -9,14 +9,22 @@
 # 使用独立的容器名/镜像名，不会影响任何已在运行的开发容器（如
 # pg-citus-cluster-container）。结束后（无论成功失败）都会清理，只留下日志。
 #
-# 用法：
-#   REPO_URL=git@github.com:CyanPandas/ShardPG.git \
-#       bash verify_from_clean_clone.sh [branch]
+# 用法（在任何一台新机器上都应该零配置直接跑）：
+#   bash verify_from_clean_clone.sh [branch]
 #
-#   REPO_URL   要验证的仓库地址。默认走 SSH（git@github.com:...），复用
-#              调用者自己的 SSH agent/凭据，不在脚本里硬编码 token。
-#              如果仓库是私有的且没配 SSH，改传 HTTPS 地址（自己带认证）：
-#                REPO_URL=https://<user>:<token>@github.com/CyanPandas/ShardPG.git
+#   REPO_URL   要验证的仓库地址。默认是不带凭据的公开 HTTPS 地址
+#              （https://github.com/CyanPandas/ShardPG.git），ShardPG 是
+#              公开仓库，匿名 HTTPS clone 不需要任何 SSH key / token /
+#              known_hosts 配置，换一台全新机器也能直接跑。
+#              早期版本默认用过 SSH（git@github.com:...），但那需要执行
+#              机器上已经配好、且已加到某个有权限的 GitHub 账号的 SSH
+#              key——本地开发机上有，其他机器上没有，会报
+#              "Host key verification failed" / "无法读取远程仓库"，
+#              不满足"一键在任意机器上跑"的要求，已改回 HTTPS 默认值。
+#              如果仓库以后转为私有仓库，可以显式传 SSH 或带 token 的
+#              HTTPS 覆盖默认值：
+#                REPO_URL=git@github.com:CyanPandas/ShardPG.git bash ...
+#                REPO_URL=https://<user>:<token>@github.com/CyanPandas/ShardPG.git bash ...
 #   [branch]   要验证的分支，默认 shardpg-2.0。
 #
 # ── 已知的环境搭建坑（本脚本已修复，供以后维护参考）──────────────────────
@@ -73,7 +81,7 @@
 
 set -uo pipefail
 
-REPO_URL="${REPO_URL:-git@github.com:CyanPandas/ShardPG.git}"
+REPO_URL="${REPO_URL:-https://github.com/CyanPandas/ShardPG.git}"
 BRANCH="${1:-shardpg-2.0}"
 
 WORKDIR="$(mktemp -d /tmp/pg-partdist-verify.XXXXXX)"
