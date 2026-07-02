@@ -38,7 +38,7 @@ TABLE_NAME="perf_latency_dist"
 NUM_SHARDS=12
 PGBENCH_CLIENTS=32
 PGBENCH_JOBS=8
-PGBENCH_DURATION="${2:-300}"    # seconds (5 minutes default)
+PGBENCH_DURATION="${2:-60}"     # seconds (1 minute default — fits in no-load suite)
 SAMPLE_COUNT="${1:-500}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

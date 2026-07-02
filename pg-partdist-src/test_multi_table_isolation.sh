@@ -22,15 +22,22 @@ start_node() { $PGCTL start -D "$1" -l "$1/pg.log" -o "-p $2" -w -t 30 2>&1 | ta
 stop_node()  { $PGCTL stop  -D "$1" -m fast -w 2>&1 | tail -1 || true; }
 crash_node() { kill -9 "$(head -1 "$1/postmaster.pid")" 2>/dev/null || true; }
 
+# Wait for the one-shot crash-recovery BGW to complete (max 30 s).
+# Accepts datadir or port; maps datadir→port for SQL polling.
 wait_demux() {
-    local datadir=$1 tries=0 pm_pid cnt
-    while [ $tries -lt 40 ]; do
-        pm_pid=$(head -1 "$datadir/postmaster.pid" 2>/dev/null || echo "")
-        if [ -n "$pm_pid" ]; then
-            cnt=$(ps -o pid,ppid,args --no-headers 2>/dev/null \
-                | awk -v p="$pm_pid" '$2==p && /demux/' | wc -l)
-            [ "$cnt" -ge 1 ] && return 0
-        fi
+    local arg=$1 port tries=0
+    case "$arg" in
+        "$DATA/master")  port=5432 ;;
+        "$DATA/worker1") port=5433 ;;
+        "$DATA/worker2") port=5434 ;;
+        [0-9]*)          port=$arg ;;
+        *)               port=5433 ;;
+    esac
+    while [ $tries -lt 60 ]; do
+        local ready
+        ready=$($PSQL -p "$port" -d postgres -At \
+                      -c "SELECT partdist.demux_is_ready()" 2>/dev/null || echo "f")
+        [ "$ready" = "t" ] && return 0
         sleep 0.5; tries=$((tries+1))
     done
     return 1
@@ -515,6 +522,7 @@ ghost_and_seg_check() {
         in_array "$oid" "${all_dirs[@]}" || { fail "3-missing-$worker_label: OID $oid 目录丢失"; continue; }
         for f in $(ls "$worker_data/pg_parwal/$oid/" 2>/dev/null); do
             [ "$f" = ".demux_progress" ] && continue
+            [ "$f" = "checkpoint" ] && continue
             if ! echo "$f" | grep -qE '^[0-9A-Fa-f]{24}$'; then
                 fail "3-seg-$worker_label OID$oid: 非法文件名 '$f'"
                 bad_seg=1

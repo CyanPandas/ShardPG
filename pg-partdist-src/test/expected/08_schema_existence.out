@@ -9,11 +9,12 @@ SELECT tablename
 FROM   pg_tables
 WHERE  schemaname = 'partdist'
 ORDER BY tablename;
-   tablename   
----------------
+       tablename        
+------------------------
+ follower_partition_map
  node_map
  partition_map
-(2 rows)
+(3 rows)
 
 SELECT proname
 FROM   pg_proc
@@ -27,6 +28,7 @@ ORDER BY proname;
  cleanup_partition_wal
  count_parwal_records
  demux_flush
+ demux_is_ready
  demux_latency_stats
  demux_progress
  init_partition_wal
@@ -43,5 +45,5 @@ ORDER BY proname;
  reset_partition_wal_state
  verify_partition_wal
  write_partition_wal_record
-(21 rows)
+(22 rows)
 

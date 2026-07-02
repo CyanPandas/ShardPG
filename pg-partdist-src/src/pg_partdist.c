@@ -2,6 +2,7 @@
 #include "metadata_cache.h"
 #include "write_router.h"
 #include "partition_wal.h"
+#include "partwal_sync.h"
 #include "demux_worker.h"
 
 #include "miscadmin.h"
@@ -17,6 +18,8 @@
 #include "catalog/pg_class.h"
 #include "executor/executor.h"
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
+#include "parser/parsetree.h"
 #include "tcop/utility.h"
 
 PG_MODULE_MAGIC;
@@ -28,7 +31,6 @@ int pg_partdist_local_node_id = -1;
 static shmem_request_hook_type    prev_shmem_request_hook    = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook    = NULL;
 static ExecutorStart_hook_type    prev_ExecutorStart_hook    = NULL;
-static ExecutorFinish_hook_type   prev_ExecutorFinish_hook   = NULL;
 static object_access_hook_type    prev_object_access_hook    = NULL;
 static ProcessUtility_hook_type   prev_ProcessUtility_hook   = NULL;
 
@@ -43,34 +45,55 @@ PG_FUNCTION_INFO_V1(pg_partdist_cache_stats);
 PG_FUNCTION_INFO_V1(pg_partdist_route_write);
 
 /*
- * PartWALPostCommitCallback — XACT_EVENT_COMMIT callback.
+ * PartWALXactCallback — transaction event callback.
  *
- * Fires AFTER RecordTransactionCommit() has called XLogFlush for the commit
- * WAL record.  At that point GetFlushRecPtr() == pg_current_wal_flush_lsn(),
- * so setting last_processed_lsn here guarantees the combined demux_progress()
- * measurement query (which reads both values in one transaction) always finds
- * last_processed_lsn >= pg_current_wal_flush_lsn() — enabling sub-5ms avg.
+ * PRE_COMMIT / PRE_PREPARE:
+ *   Drain PartWALCtl ring-buffer slots to pg_parwal and fsync via
+ *   PartWALFlush() — strictly before XLogFlush() writes the commit/prepare
+ *   WAL record.  This is the [A] < [B] atomicity invariant.
+ *   PRE_PREPARE handles Citus 2PC: TopTransactionContext is freed at PREPARE
+ *   time; calling PartWALFlush() here (before the context is torn down)
+ *   prevents use-after-free on the per-backend max-LSN tracker.
+ *
+ * ABORT:
+ *   Invalidate this backend's pending ring-buffer slots; no disk I/O.
+ *
+ * COMMIT:
+ *   Update last_committed_lsn for demux_progress() latency tracking.
  */
 static void
-PartWALPostCommitCallback(XactEvent event, void *arg)
+PartWALXactCallback(XactEvent event, void *arg)
 {
     TimeLineID  tli;
     XLogRecPtr  flush_now;
 
-    if (event != XACT_EVENT_COMMIT)
-        return;
-    if (DemuxState == NULL)
-        return;
+    switch (event)
+    {
+        case XACT_EVENT_PRE_COMMIT:
+        case XACT_EVENT_PRE_PREPARE:
+            PartWALFlush(InvalidXLogRecPtr);
+            break;
 
-    flush_now = GetFlushRecPtr(&tli);
-    if (flush_now == InvalidXLogRecPtr)
-        return;
+        case XACT_EVENT_ABORT:
+            PartWALAbort();
+            break;
 
-    LWLockAcquire(DemuxState->lock, LW_EXCLUSIVE);
-    if (DemuxState->last_committed_lsn == InvalidXLogRecPtr ||
-        DemuxState->last_committed_lsn < flush_now)
-        DemuxState->last_committed_lsn = flush_now;
-    LWLockRelease(DemuxState->lock);
+        case XACT_EVENT_COMMIT:
+            if (DemuxState == NULL)
+                break;
+            flush_now = GetFlushRecPtr(&tli);
+            if (flush_now == InvalidXLogRecPtr)
+                break;
+            LWLockAcquire(DemuxState->lock, LW_EXCLUSIVE);
+            if (DemuxState->last_committed_lsn == InvalidXLogRecPtr ||
+                DemuxState->last_committed_lsn < flush_now)
+                DemuxState->last_committed_lsn = flush_now;
+            LWLockRelease(DemuxState->lock);
+            break;
+
+        default:
+            break;
+    }
 }
 
 /* ---- chained hook wrappers ---- */
@@ -91,9 +114,37 @@ partdist_shmem_startup(void)
     pg_partdist_shmem_startup_hook();
 }
 
+/*
+ * partdist_executor_start — ExecutorStart hook.
+ *
+ * Lazily registers each DML target relation in the shmem relfilenode hash
+ * so the WAL insert hook can identify WAL records belonging to it.
+ * No start_lsn capture needed — the hook now buffers records directly.
+ */
 static void
 partdist_executor_start(QueryDesc *queryDesc, int eflags)
 {
+    if (queryDesc->operation == CMD_INSERT ||
+        queryDesc->operation == CMD_UPDATE ||
+        queryDesc->operation == CMD_DELETE)
+    {
+        if (queryDesc->plannedstmt != NULL &&
+            queryDesc->plannedstmt->resultRelations != NIL)
+        {
+            ListCell *lc;
+
+            foreach(lc, queryDesc->plannedstmt->resultRelations)
+            {
+                Index          rti = lfirst_int(lc);
+                RangeTblEntry *rte = rt_fetch(rti,
+                                              queryDesc->plannedstmt->rtable);
+                if (rte != NULL && OidIsValid(rte->relid))
+                    EnsurePartWALRegistered(rte->relid);
+            }
+        }
+    }
+
+    /* Call the routing check in write_router.c */
     pg_partdist_executor_start(queryDesc, eflags);
 
     if (prev_ExecutorStart_hook)
@@ -102,27 +153,8 @@ partdist_executor_start(QueryDesc *queryDesc, int eflags)
         standard_ExecutorStart(queryDesc, eflags);
 }
 
-static void
-partdist_executor_finish(QueryDesc *queryDesc)
-{
-    /* Run the primary finish chain first */
-    if (prev_ExecutorFinish_hook)
-        prev_ExecutorFinish_hook(queryDesc);
-    else
-        standard_ExecutorFinish(queryDesc);
-
-    /* Then write partition WAL records for any partition-mapped relations */
-    pg_partdist_executor_finish(queryDesc);
-}
-
 /*
- * partdist_object_access — object_access_hook for Goal 1 (shard creation).
- *
- * When Citus creates a shard table on a Worker (OAT_POST_CREATE on a
- * relation), auto-create the pg_parwal/<shard_oid>/ directory so it's ready
- * before the first INSERT arrives.  This is optional since
- * WritePartitionWALRecord also calls InitPartitionWALDirectory, but it is
- * nice to have the directory immediately after shard creation.
+ * partdist_object_access — object_access_hook for shard creation.
  */
 static void
 partdist_object_access(ObjectAccessType access,
@@ -134,28 +166,40 @@ partdist_object_access(ObjectAccessType access,
     if (prev_object_access_hook)
         prev_object_access_hook(access, classId, objectId, subId, arg);
 
-    /* Only interested in newly created relations (not indexes, types, etc.) */
     if (access != OAT_POST_CREATE ||
         classId != RelationRelationId ||
         subId != 0)
         return;
 
-    /*
-     * NOTE: get_rel_name / IsCitusShardTable rely on the syscache, which is
-     * not yet populated at OAT_POST_CREATE time (CommandCounterIncrement has
-     * not been called).  Shard directory initialisation is handled in
-     * partdist_process_utility after the CREATE TABLE statement completes.
-     */
+    if (!XLogInsertAllowed())
+        return;
+
+    if (get_rel_relkind(objectId) != RELKIND_RELATION)
+        return;
+
+    if (!IsCitusShardTable(objectId))
+        return;
+
+    PG_TRY();
+    {
+        InitPartitionWALAndRegister(objectId);
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+        ereport(WARNING,
+                (errmsg("pg_partdist: could not initialize WAL "
+                        "directory for shard OID %u", objectId)));
+    }
+    PG_END_TRY();
 }
 
 /*
  * partdist_process_utility — ProcessUtility_hook wrapper.
  *
- * Calls the previous hook (Citus + standard) first, then invokes
- * pg_partdist_process_utility to write PartWAL records for any COPY
- * FROM that targeted a shard table.  The pg_partdist call happens only
- * after the previous hook returns without error, so aborted COPY
- * operations do not generate spurious PartWAL entries.
+ * For COPY FROM statements, calls pg_partdist_process_utility BEFORE the
+ * chain so that the target shard is registered in the relfilenode hash
+ * before the COPY writes any WAL records.
  */
 static void
 partdist_process_utility(PlannedStmt *pstmt,
@@ -167,57 +211,17 @@ partdist_process_utility(PlannedStmt *pstmt,
                           DestReceiver *dest,
                           QueryCompletion *qc)
 {
-    /* Execute the statement via the existing chain first */
+    /* Register COPY FROM target BEFORE the chain writes WAL */
+    pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+
+    /* Execute the statement via the existing chain */
     if (prev_ProcessUtility_hook)
         prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
                                  context, params, queryEnv, dest, qc);
     else
         standard_ProcessUtility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
-
-    /* On successful return, record any shard-targeted COPY FROM */
-    pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
-                                context, params, queryEnv, dest, qc);
-
-    /*
-     * Auto-init pg_parwal directory for newly created Citus shard tables.
-     *
-     * We do this here (after the chain has returned) rather than in
-     * object_access_hook because OAT_POST_CREATE fires before
-     * CommandCounterIncrement, so syscache lookups for the new relation
-     * return NULL at that point.  By the time we reach here, the DDL is
-     * committed to the catalog and the name is resolvable.
-     *
-     * We use the table name from the parse tree (already extended with the
-     * shard ID suffix by Citus's RelayEventExtendNames) rather than the
-     * queryString (which still contains the original unsuffixed name).
-     */
-    if (IsA(pstmt->utilityStmt, CreateStmt))
-    {
-        CreateStmt *createStmt = (CreateStmt *) pstmt->utilityStmt;
-        RangeVar   *rv = createStmt->relation;
-
-        if (rv != NULL && IsCitusShardName(rv->relname))
-        {
-            Oid relid = RangeVarGetRelid(rv, NoLock, true /* missing_ok */);
-
-            if (OidIsValid(relid))
-            {
-                PG_TRY();
-                {
-                    InitPartitionWALDirectory(relid);
-                }
-                PG_CATCH();
-                {
-                    FlushErrorState();
-                    ereport(WARNING,
-                            (errmsg("pg_partdist: could not initialize WAL "
-                                    "directory for shard OID %u", relid)));
-                }
-                PG_END_TRY();
-            }
-        }
-    }
 }
 
 /* ---- module load ---- */
@@ -226,14 +230,7 @@ void
 _PG_init(void)
 {
     if (!process_shared_preload_libraries_in_progress)
-    {
-        /*
-         * Not in shared_preload_libraries.  The SQL functions still work
-         * (they fall back to direct SPI), but caching and routing hooks
-         * are disabled.
-         */
         return;
-    }
 
     /* GUC: local node ID */
     DefineCustomIntVariable(
@@ -241,9 +238,9 @@ _PG_init(void)
         "Node ID of the local PostgreSQL instance in the pg_partdist cluster.",
         NULL,
         &pg_partdist_local_node_id,
-        -1,         /* boot default */
-        -1,         /* min */
-        INT_MAX,    /* max */
+        -1,
+        -1,
+        INT_MAX,
         PGC_USERSET,
         0,
         NULL, NULL, NULL
@@ -256,29 +253,31 @@ _PG_init(void)
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = partdist_shmem_startup;
 
-    /* Chain executor hooks */
+    /* Chain executor start hook (lazy shard registration) */
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = partdist_executor_start;
 
-    prev_ExecutorFinish_hook = ExecutorFinish_hook;
-    ExecutorFinish_hook = partdist_executor_finish;
-
-    /* Chain object-access hook for shard table auto-detection */
+    /* Chain object-access hook */
     prev_object_access_hook = object_access_hook;
     object_access_hook = partdist_object_access;
 
-    /* Chain ProcessUtility hook to intercept COPY FROM on shard tables */
+    /* Chain ProcessUtility hook */
     prev_ProcessUtility_hook = ProcessUtility_hook;
     ProcessUtility_hook = partdist_process_utility;
 
-    /* Register custom WAL RMGR for partition WAL records */
-    RegisterPartitionWALRmgr();
+    /*
+     * Install WAL insert hook (mirrors XLogInsert role in pg_wal design).
+     * For each XLogInsert() touching a tracked partition's relfilenode,
+     * PartWALInsert() writes one slot to the PartWALCtl shared ring buffer.
+     * PartWALFlush() drains the buffer to pg_parwal at XACT_EVENT_PRE_COMMIT.
+     */
+    wal_insert_hook = PartWALInsert;
 
-    /* Register Demux background worker */
+    /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
 
-    /* Post-commit callback: advance last_processed_lsn to commit flush_lsn */
-    RegisterXactCallback(PartWALPostCommitCallback, NULL);
+    /* Transaction callback: write PartWAL at PRE_COMMIT, discard on ABORT */
+    RegisterXactCallback(PartWALXactCallback, NULL);
 }
 
 /* ---- SQL-callable functions ---- */
@@ -289,7 +288,6 @@ pg_partdist_version(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P(cstring_to_text("1.0"));
 }
 
-/* pg_partdist_get_primary(partition_id OID) → INTEGER */
 Datum
 pg_partdist_get_primary(PG_FUNCTION_ARGS)
 {
@@ -303,7 +301,6 @@ pg_partdist_get_primary(PG_FUNCTION_ARGS)
     PG_RETURN_INT32(primary);
 }
 
-/* pg_partdist_cache_invalidate() → VOID */
 Datum
 pg_partdist_cache_invalidate(PG_FUNCTION_ARGS)
 {
@@ -311,17 +308,12 @@ pg_partdist_cache_invalidate(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-/* pg_partdist_bump_metadata_version() → VOID */
 Datum
 pg_partdist_bump_metadata_version(PG_FUNCTION_ARGS)
 {
     if (PartdistState == NULL)
-        PG_RETURN_VOID();     /* shmem not initialised */
+        PG_RETURN_VOID();
 
-    /*
-     * Atomically increment the generation counter under the partition lock
-     * (either lock would do; partition_lock is arbitrarily chosen here).
-     */
     LWLockAcquire(PartdistState->partition_lock, LW_EXCLUSIVE);
     PartdistState->metadata_generation++;
     LWLockRelease(PartdistState->partition_lock);
@@ -329,7 +321,6 @@ pg_partdist_bump_metadata_version(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-/* pg_partdist_cache_stats() → TABLE(...) */
 Datum
 pg_partdist_cache_stats(PG_FUNCTION_ARGS)
 {
@@ -338,7 +329,6 @@ pg_partdist_cache_stats(PG_FUNCTION_ARGS)
     bool        nulls[5];
     HeapTuple   tuple;
 
-    /* Build result tuple descriptor */
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -346,12 +336,10 @@ pg_partdist_cache_stats(PG_FUNCTION_ARGS)
                         "that cannot accept type record")));
 
     tupdesc = BlessTupleDesc(tupdesc);
-
     memset(nulls, false, sizeof(nulls));
 
     if (PartdistState == NULL)
     {
-        /* shmem not initialised — return all zeros */
         values[0] = Int64GetDatum(0);
         values[1] = Int64GetDatum(0);
         values[2] = Int64GetDatum(0);
@@ -373,7 +361,6 @@ pg_partdist_cache_stats(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
-/* pg_partdist_route_write(partition_id OID) → TEXT */
 Datum
 pg_partdist_route_write(PG_FUNCTION_ARGS)
 {

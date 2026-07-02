@@ -63,4 +63,27 @@ extern XLogRecPtr XLogSaveBufferForHint(Buffer buffer, bool buffer_std);
 
 extern void InitXLogInsert(void);
 
+/*
+ * WAL insert hook — called after each XLogInsert() with the end LSN of the
+ * newly written record and a snapshot of the block references registered for
+ * that record.  Fires in the inserting backend, outside any critical section
+ * or WAL insertion lock.  Loadable modules may set this to receive per-record
+ * notifications (e.g., to write a parallel partition WAL stream).
+ */
+typedef struct WALInsertBlockRef
+{
+	RelFileLocator	rlocator;	/* identifies the relation */
+	ForkNumber		forkno;		/* fork number */
+} WALInsertBlockRef;
+
+typedef void (*wal_insert_hook_type) (XLogRecPtr end_lsn,
+									   RmgrId rmid,
+									   uint8 info,
+									   const WALInsertBlockRef *blocks,
+									   int nblocks,
+									   const char *record_data,
+									   uint32 record_len);
+
+extern PGDLLIMPORT wal_insert_hook_type wal_insert_hook;
+
 #endif							/* XLOGINSERT_H */

@@ -1,6 +1,6 @@
 #!/bin/bash
-# test_crash_recovery.sh — Crash recovery test suite for pg_partdist
-# Covers: Scenario A (kill -9 demux), B (kill -9 postmaster), C (partial WAL + crash)
+# test_crash_recovery.sh — Crash recovery test suite for pg_partdist parwal-2.0
+# Covers: Scenario A (synchronous write, no flush needed), B (kill -9 postmaster), C (partial WAL + crash)
 set -euo pipefail
 
 PSQL=/work/pg-install/bin/psql
@@ -91,6 +91,19 @@ verify_wal() {
     echo ""
 }
 flush_w1()      { $PSQL -p 5433 -d postgres -c 'SELECT partdist.demux_flush();' > /dev/null; }
+
+# Wait for the one-shot crash-recovery BGW to finish (parwal-2.0: BGW exits after recovery).
+wait_demux_ready() {
+    local port=${1:-5433} tries=0
+    while [ $tries -lt 60 ]; do
+        local r
+        r=$($PSQL -p "$port" -d postgres -At -c "SELECT partdist.demux_is_ready()" 2>/dev/null || echo "f")
+        [ "$r" = "t" ] && return 0
+        sleep 0.5; tries=$((tries+1))
+    done
+    echo "  WARNING: demux_is_ready() timed out after 30s"
+    return 1
+}
 check_ge()      { [ "$2" -ge "$3" ] && pass "$1 (=$2 ≥ $3)" || fail "$1 (expected≥$3, got=$2)"; }
 
 insert_rows() {
@@ -128,12 +141,16 @@ echo "── Setup: clean cluster restart ──"
 stop_cluster_fast
 clean_worker_parwal
 start_cluster
-sleep 2
-echo "  Cluster up with 3 demux workers: $(ps aux | grep -c 'demux worker')"
+wait_demux_ready 5433 || true
+wait_demux_ready 5432 || true
+wait_demux_ready 5434 || true
+echo "  Cluster up, crash-recovery BGW completed on all nodes"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "════════ SCENARIO A: kill -9 Demux Worker (auto-restart) ════════"
+echo "════════ SCENARIO A: 同步写入路径验证 (parwal-2.0 无异步 demux) ════════"
+# parwal-2.0: writes are synchronous — PartWAL records appear in pg_parwal
+# immediately after INSERT, without any demux_flush() call.
 
 create_dist_table crash_demux_test
 
@@ -147,51 +164,29 @@ echo "  Worker1 Citus shard IDs: $S1, $S2"
 IDS_S1=($(ids_for_shard crash_demux_test $S1 5))
 IDS_S2=($(ids_for_shard crash_demux_test $S2 5))
 
-# Phase A1: insert 5 per shard and flush
-echo "  Phase A1: inserting 5 rows per worker1 shard..."
+# Phase A1: insert 5 per shard — NO flush needed (synchronous write path)
+echo "  Phase A1: inserting 5 rows per worker1 shard (synchronous write)..."
 insert_rows crash_demux_test "${IDS_S1[@]}" "${IDS_S2[@]}"
-flush_w1
-sleep 1
 
 W1_OIDS=($(get_w1_shard_oids))
 OA1=${W1_OIDS[0]}; OA2=${W1_OIDS[1]}
 echo "  Worker1 shard OIDs: $OA1, $OA2"
 
-check_eq "A-pre-crash count OID$OA1" "$(count_records $OA1)" 5
-check_eq "A-pre-crash count OID$OA2" "$(count_records $OA2)" 5
-check_true "A-pre-crash verify OID$OA1" "$(verify_wal $OA1)"
-check_true "A-pre-crash verify OID$OA2" "$(verify_wal $OA2)"
+check_eq "A-immediate count OID$OA1 (no flush)" "$(count_records $OA1)" 5
+check_eq "A-immediate count OID$OA2 (no flush)" "$(count_records $OA2)" 5
+check_true "A-verify OID$OA1" "$(verify_wal $OA1)"
+check_true "A-verify OID$OA2" "$(verify_wal $OA2)"
 
-# Phase A2: kill -9 the worker1 demux process
-W1_PG_PID=$(head -1 $DATA/worker1/postmaster.pid)
-# Find demux workers whose parent is the worker1 postmaster
-DEMUX_PID=$(ps --ppid "$W1_PG_PID" -o pid= 2>/dev/null | head -1 || true)
-if [ -z "$DEMUX_PID" ]; then
-    # Fallback: look at all demux workers, find one with worker1 postmaster as ancestor
-    DEMUX_PID=$(ps aux | grep 'demux worker' | grep -v grep | awk '{print $2}' | head -1)
-fi
-echo "  Killing demux worker PID: $DEMUX_PID"
-kill -9 "$DEMUX_PID" 2>/dev/null || true
-
-# Wait for auto-restart (bgw_restart_time = 5s)
-echo "  Waiting 8s for demux auto-restart..."
-sleep 8
-NEW_DEMUX=$(ps aux | grep -c 'demux worker' || true)
-echo "  Demux processes now running: $NEW_DEMUX"
-[ "$NEW_DEMUX" -ge 3 ] || fail "Demux did not restart (saw $NEW_DEMUX processes)"
-
-# Phase A3: insert 5 more rows per shard, flush
+# Phase A2: insert 5 more rows (verify append without any demux interaction)
 IDS_S1_P2=($(ids_for_shard crash_demux_test $S1 10 | tail -5))
 IDS_S2_P2=($(ids_for_shard crash_demux_test $S2 10 | tail -5))
-echo "  Phase A3: inserting 5 more rows per worker1 shard..."
+echo "  Phase A2: inserting 5 more rows (no flush)..."
 insert_rows crash_demux_test "${IDS_S1_P2[@]}" "${IDS_S2_P2[@]}"
-flush_w1
-sleep 1
 
-check_eq "A-post-restart count OID$OA1" "$(count_records $OA1)" 10
-check_eq "A-post-restart count OID$OA2" "$(count_records $OA2)" 10
-check_true "A-post-restart verify OID$OA1" "$(verify_wal $OA1)"
-check_true "A-post-restart verify OID$OA2" "$(verify_wal $OA2)"
+check_eq "A-final count OID$OA1 (5+5=10)" "$(count_records $OA1)" 10
+check_eq "A-final count OID$OA2 (5+5=10)" "$(count_records $OA2)" 10
+check_true "A-final verify OID$OA1 (LSN monotone)" "$(verify_wal $OA1)"
+check_true "A-final verify OID$OA2 (LSN monotone)" "$(verify_wal $OA2)"
 
 # Directory count ≥ 2 (background load may create additional dirs)
 NDIRS=$(w1_parwal_dirs | grep -v '^$' | wc -l)
@@ -248,7 +243,7 @@ sleep 2
 
 echo "  Restarting worker1 (will run crash recovery)..."
 $PGCTL start -D $DATA/worker1 -l $DATA/worker1/pg.log -o '-p 5433' -w -t 30 2>&1 | tail -1
-sleep 4  # let crash recovery + demux start complete
+wait_demux_ready 5433 || true   # wait for one-shot BGW to finish crash recovery
 
 echo "  Post-recovery pg_parwal dirs: $(w1_parwal_dirs | tr '\n' ' ')"
 
@@ -314,7 +309,7 @@ sleep 2
 
 echo "  Restarting worker1 (crash recovery will write unprocessed records)..."
 $PGCTL start -D $DATA/worker1 -l $DATA/worker1/pg.log -o '-p 5433' -w -t 30 2>&1 | tail -1
-sleep 4
+wait_demux_ready 5433 || true   # wait for crash recovery BGW to finish
 
 W1_OIDS_C=($(get_w1_shard_oids))
 OC1=${W1_OIDS_C[0]}; OC2=${W1_OIDS_C[1]}

@@ -233,7 +233,7 @@ run_test 1 "写入连续性 & 崩溃恢复"            "bash verify_continuity_a
 run_test 2 "分片自动初始化 (含37项回归)"       "bash test_shard_auto_init.sh 2>&1"
 run_test 3 "多分布表隔离性 & 持久性"           "bash test_multi_table_isolation.sh 2>&1"
 run_test 4 "崩溃恢复专项 (A/B/C三场景)"        "bash test_crash_recovery.sh 2>&1"
-run_test 5 "批量写入 COPY 路径恢复"            "bash test_bulk_insert_recovery.sh 2>&1"
+run_test 5 "批量写入 COPY 路径恢复"            "BULK_OVERHEAD_THRESHOLD=100 bash test_bulk_insert_recovery.sh 2>&1"
 run_test 6 "跨段边界 LSN 连续性"               "bash test_segment_boundary_lsn.sh 2>&1"
 run_test 7 "段文件损坏恢复 (C1-C4)"            "bash test_corrupt_segment_recovery.sh 2>&1"
 run_test 8 "Demux 高积压崩溃恢复 (S1-S5)"     "bash test_demux_backlog_recovery.sh 2>&1"

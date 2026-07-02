@@ -63,6 +63,9 @@ qw1 "SELECT partdist.reset_partition_wal_state($TEST_OID::oid)" >/dev/null 2>&1 
 }
 info "OID $TEST_OID 状态重置完成"
 
+# 创建 worker1 本地辅助表，用于在段切换前写入真实 WAL（pg_switch_wal 对空段是 no-op）
+qw1 "DROP TABLE IF EXISTS _partwal_wal_gen; CREATE TABLE _partwal_wal_gen (id serial);" >/dev/null 2>&1
+
 # ===========================================================
 # 阶段 2：写入记录 + 强制段切换
 # ===========================================================
@@ -82,6 +85,8 @@ for i in $(seq 1 $TOTAL_BATCHES); do
     TOTAL_WRITTEN=$((TOTAL_WRITTEN + INSERTS_PER_BATCH))
 
     if [[ $i -lt $TOTAL_BATCHES ]]; then
+        # 写一行真实 WAL，确保当前段非空，pg_switch_wal() 才会实际切换
+        qw1 "INSERT INTO _partwal_wal_gen DEFAULT VALUES;" >/dev/null 2>&1
         # 强制 WAL 段切换
         NEW_SEG=$(qw1 "SELECT pg_switch_wal()" 2>/dev/null)
         echo "  批次 $i/$TOTAL_BATCHES: 写入 $INSERTS_PER_BATCH 条  →  段切换完成 (新段起始: $NEW_SEG)"
@@ -239,17 +244,22 @@ use strict;
 use warnings;
 use POSIX qw(floor);
 
-# PartWALHeader 布局 (小端 x86):
+# PartWALHeader 布局 (小端 x86, parwal-2.0 record version 2):
 #   uint32  magic           offset  0  (4 B)  → V
 #   uint32  partition_id    offset  4  (4 B)  → V
-#   uint64  orig_node_lsn   offset  8  (8 B)  → VV (lo, hi)
+#   uint64  orig_lsn        offset  8  (8 B)  → VV (lo, hi)
 #   uint64  partition_lsn   offset 16  (8 B)  → VV (lo, hi)
-#   uint8   flags           offset 24  (1 B)  → C
-#   padding                 offset 25  (7 B)  → x7
-#   total 32 bytes
+#   uint8   rmid            offset 24  (1 B)  → C
+#   uint8   info             offset 25  (1 B)  → C
+#   uint8   version          offset 26  (1 B)  → C
+#   uint8   flags            offset 27  (1 B)  → C
+#   uint32  data_len         offset 28  (4 B)  → V
+#   uint32  xid              offset 32  (4 B)  → V
+#   padding                  offset 36  (4 B)  → x4  (8-byte struct alignment)
+#   total 40 bytes
 my $MAGIC       = 0x50415254;
-my $RECORD_SIZE = 32;
-my $HDR_FMT     = 'VV VV VV C x7';   # 4+4+4+4+4+4+1+7 = 32
+my $RECORD_SIZE = 40;
+my $HDR_FMT     = 'VV VV VV CCCC VV x4';   # 4*6 + 1*4 + 4*2 + 4 = 40
 
 my $parwal_dir  = $ARGV[0];
 my $oid         = $ARGV[1] + 0;
@@ -280,7 +290,8 @@ for my $fname (@files) {
         my $n = read($fh, $chunk, $RECORD_SIZE);
         last unless defined($n) && $n == $RECORD_SIZE;
 
-        my ($magic, $pid, $orig_lo, $orig_hi, $plsn_lo, $plsn_hi, $flags)
+        my ($magic, $pid, $orig_lo, $orig_hi, $plsn_lo, $plsn_hi,
+            $rmid, $info, $version, $flags, $data_len, $xid)
             = unpack($HDR_FMT, $chunk);
 
         next unless $magic == $MAGIC;

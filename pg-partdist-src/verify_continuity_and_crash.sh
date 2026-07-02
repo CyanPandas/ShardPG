@@ -18,34 +18,25 @@ check_le()   { [ "$2" -le "$3" ] && pass "$1 ($2 ≤ $3)" || fail "$1 ($2 > $3)"
 check_gt()   { [ "$2" -gt "$3" ] && pass "$1 ($2 > $3)" || fail "$1 ($2 ≤ $3)"; }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-start_node()  { $PGCTL start -D "$1" -l "$1/pg.log" -o "-p $2" -w -t 30 2>&1 | tail -1; }
-stop_node()   { $PGCTL stop  -D "$1" -m fast -w 2>&1 | tail -1 || true; }
+start_node()  { $PGCTL start -D "$1" -l "$1/pg.log" -o "-p $2" -w -t 60 2>&1 | tail -1; }
+stop_node()   {
+    # Under high concurrent load fast shutdown may exceed 60 s; fall back to immediate.
+    $PGCTL stop -D "$1" -m fast -w -t 120 2>&1 | tail -1 || \
+    $PGCTL stop -D "$1" -m immediate -w -t 30 2>&1 | tail -1 || true
+    sleep 1   # ensure the port is released before caller tries to (re)start
+}
 crash_node()  { kill -9 "$(head -1 "$1/postmaster.pid")" 2>/dev/null || true; sleep 2; }
 
-# Wait for demux on a given port to become active (max 20 s).
-# The demux worker shows in 'ps' but not always in pg_stat_activity (no DB connection).
-# We identify it by: the pg_ctl data dir that matches the port, then look for
-# "pg_partdist demux worker" in ps whose parent is that postmaster PID.
+# Wait for the one-shot crash-recovery BGW to complete (max 30 s).
+# In parwal-2.0 the demux worker exits after recovery (BGW_NEVER_RESTART),
+# so we poll the demux_is_ready() SQL function instead of checking ps.
 wait_demux() {
     local port=$1; local tries=0
-    # Map port → data dir
-    local datadir
-    case "$port" in
-        5432) datadir="$DATA/master"  ;;
-        5433) datadir="$DATA/worker1" ;;
-        5434) datadir="$DATA/worker2" ;;
-        *)    datadir="" ;;
-    esac
-    while [ $tries -lt 40 ]; do
-        # Check ps for the demux process belonging to this port's postmaster
-        local pm_pid
-        pm_pid=$(head -1 "$datadir/postmaster.pid" 2>/dev/null || echo "")
-        if [ -n "$pm_pid" ]; then
-            local cnt
-            cnt=$(ps -o pid,ppid,args --no-headers 2>/dev/null \
-                | awk -v ppid="$pm_pid" '$2==ppid && /demux/' | wc -l)
-            [ "$cnt" -ge 1 ] && return 0
-        fi
+    while [ $tries -lt 60 ]; do
+        local ready
+        ready=$($PSQL -p "$port" -d postgres -At \
+                      -c "SELECT partdist.demux_is_ready()" 2>/dev/null || echo "f")
+        [ "$ready" = "t" ] && return 0
         sleep 0.5; tries=$((tries+1))
     done
     return 1
@@ -108,7 +99,20 @@ insert_for_shard() {
 }
 
 make_dist_table() {
-    local tbl=$1
+    local tbl=$1 i
+    # Retry up to 5 times: under high load the coordinator's connection pool
+    # to a just-restarted worker may still be warming up.
+    for i in 1 2 3 4 5; do
+        if $PSQL -p 5432 -d postgres -c "
+            DROP TABLE IF EXISTS $tbl CASCADE;
+            CREATE TABLE $tbl (id int PRIMARY KEY, val text);
+            SELECT create_distributed_table('$tbl','id',shard_count=>4);" \
+            >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    # Final attempt — let errors propagate
     $PSQL -p 5432 -d postgres -c "
         DROP TABLE IF EXISTS $tbl CASCADE;
         CREATE TABLE $tbl (id int PRIMARY KEY, val text);

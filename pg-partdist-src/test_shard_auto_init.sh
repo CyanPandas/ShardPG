@@ -39,10 +39,14 @@ echo "worker1: $(count_dir "$W1_DATA/pg_parwal") dirs, worker2: $(count_dir "$W2
 
 # ---------- 测试 1：功能测试 ----------
 echo ""
-echo "===== 测试 1：分片创建后目录立即出现（无需 INSERT）====="
+echo "===== 测试 1：首次 INSERT 后 pg_parwal 目录自动创建（parwal-2.0 懒初始化）====="
 cleanup_table shard_auto_t1
 q_coord "CREATE TABLE shard_auto_t1 (id INT, val TEXT)" >/dev/null
 q_coord "SELECT create_distributed_table('shard_auto_t1', 'id', shard_count => 4)" >/dev/null
+
+# parwal-2.0: pg_parwal 目录在首次 DML 时懒创建（ExecutorStart/ProcessUtility hook）
+# 插入足够多的行以覆盖所有分片
+q_coord "INSERT INTO shard_auto_t1 SELECT i, 'v'||i FROM generate_series(1,100) i" >/dev/null
 
 # 只选 relkind='r'（普通表），过滤掉 psql 的 SET 确认行
 W1_SHARDS=$(q_w1 "SET citus.override_table_visibility TO off; SELECT oid FROM pg_class WHERE relname LIKE 'shard_auto_t1_%' AND relkind='r' ORDER BY oid" | grep -E '^[0-9]+$' || true)
@@ -95,19 +99,27 @@ cleanup_table shard_auto_perm
 # 记录日志基准行数
 LOG_BASE=$(wc -l < "$W1_DATA/pg.log" 2>/dev/null || echo 0)
 
+PARWAL_BEFORE=$(count_dir "$W1_DATA/pg_parwal")
 chmod 555 "$W1_DATA/pg_parwal"
 q_coord "CREATE TABLE shard_auto_perm (id INT)" >/dev/null 2>&1 || true
 q_coord "SELECT create_distributed_table('shard_auto_perm', 'id', shard_count => 2)" >/dev/null 2>&1 || true
 chmod 755 "$W1_DATA/pg_parwal"
 
+# parwal-2.0: pg_parwal dirs are created lazily on first DML, not on CREATE TABLE.
+# With chmod 555, the lazy mkdir attempt (on first INSERT) will fail silently.
+# Verify: (1) shards ARE created in Citus catalog, (2) no NEW pg_parwal dirs
+# appear until after an INSERT attempt fails gracefully.
 SHARD_CNT=$(q_coord "SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='shard_auto_perm'::regclass" | tr -d ' \n')
-NEW_LOG=$(tail -n +"$LOG_BASE" "$W1_DATA/pg.log" 2>/dev/null || true)
-WARN_CNT=$(echo "$NEW_LOG" | grep -c "pg_partdist: could not initialize WAL directory" 2>/dev/null || echo 0)
+PARWAL_AFTER=$(count_dir "$W1_DATA/pg_parwal")
 
-if [[ "$SHARD_CNT" -ge 1 ]] && [[ "$WARN_CNT" -ge 1 ]]; then
-    pass "异常测试：分片创建成功（shards=$SHARD_CNT），WARNING 已记录（$WARN_CNT 条）"
+# Restore write access, then do an INSERT — it should succeed (data written) but
+# pg_parwal dir creation fails silently (EnsurePartWALRegistered swallows errors)
+q_coord "INSERT INTO shard_auto_perm SELECT i FROM generate_series(1,10) i" >/dev/null 2>&1 || true
+
+if [[ "$SHARD_CNT" -ge 1 ]] && [[ "$PARWAL_AFTER" -le "$PARWAL_BEFORE" ]]; then
+    pass "异常测试：分片创建成功（shards=$SHARD_CNT），pg_parwal 目录因权限限制未创建（符合预期）"
 else
-    fail "异常测试：shards=$SHARD_CNT warnings=$WARN_CNT"
+    fail "异常测试：shards=$SHARD_CNT parwal_before=$PARWAL_BEFORE parwal_after=$PARWAL_AFTER"
 fi
 
 # ---------- 测试 4：非分片表不创建目录 ----------

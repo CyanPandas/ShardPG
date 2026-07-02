@@ -24,7 +24,7 @@
 /* ------------------------------------------------------------------ */
 
 #define DEMUX_MAX_PARTITIONS    512     /* max concurrent PartitionWALWriter slots  */
-#define DEMUX_SLEEP_MS          1       /* sleep interval when WAL is exhausted (ms) */
+#define DEMUX_SLEEP_MS          50      /* sleep interval when WAL is exhausted (ms) */
 #define DEMUX_PROGRESS_MAGIC    UINT32_C(0x44455855)  /* "DEMU" */
 #define DEMUX_PROGRESS_FILE     "pg_parwal/.demux_progress"
 #define DEMUX_SHMEM_NAME        "pg_partdist_demux_state"
@@ -58,6 +58,7 @@ typedef struct DemuxSharedState
     XLogRecPtr  last_committed_lsn;
 
     bool        worker_active;          /* true while the BGW is running */
+    bool        recovery_complete;      /* set to true once crash recovery BGW has finished */
     Latch      *demux_latch;            /* set at startup; backends call SetLatch to wake demux */
 
     /* Rolling latency samples in microseconds (circular buffer) */
@@ -88,6 +89,7 @@ extern PGDLLEXPORT void DemuxWorkerMain(Datum arg);
 /* SQL-callable function declarations (registered in pg_partdist--1.0) */
 /* ------------------------------------------------------------------ */
 
+extern Datum pg_partdist_demux_is_ready(PG_FUNCTION_ARGS);
 extern Datum pg_partdist_demux_progress(PG_FUNCTION_ARGS);
 extern Datum pg_partdist_demux_latency_stats(PG_FUNCTION_ARGS);
 extern Datum pg_partdist_count_parwal_records(PG_FUNCTION_ARGS);

@@ -16,7 +16,7 @@
 PSQL=/work/pg-install/bin/psql
 PGCTL=/work/pg-install/bin/pg_ctl
 DATA=/work/pg-cluster-data
-HEADER_SIZE=32     # sizeof(PartWALHeader) = 32 字节，已在测试开头验证
+HEADER_SIZE=40     # sizeof(PartWALHeader) = 40 字节（parwal-2.0 record version 2，含 xid），已在测试开头验证
 PASS=0; FAIL=0
 LOG_START_LINE=0   # snapshot of pg.log line count at test start
 
@@ -91,7 +91,7 @@ END \$\$;"
 get_seg_file() {
     local pid=$1
     local dir="$DATA/worker1/pg_parwal/$pid"
-    ls "$dir"/ 2>/dev/null | sort | tail -1 | xargs -I{} echo "$dir/{}"
+    ls "$dir"/ 2>/dev/null | grep -v '^checkpoint$' | sort | tail -1 | xargs -I{} echo "$dir/{}"
 }
 
 no_panic_in_log() {
@@ -127,7 +127,7 @@ P_OID=$(psql1_at "SELECT oid FROM pg_class WHERE relname='corrupt_test' AND relk
 [ -n "$P_OID" ] || die "无法在 worker1 找到 corrupt_test 的 OID"
 echo "  Worker1 OID: $P_OID"
 
-# ── 验证 sizeof(PartWALHeader) = 32 ──────────────────────────────────
+# ── 验证 sizeof(PartWALHeader) = HEADER_SIZE ──────────────────────────
 echo ""
 echo "── 预检：验证 sizeof(PartWALHeader) ──"
 reset_state "$P_OID"
@@ -141,7 +141,7 @@ check_eq "sizeof(PartWALHeader)" "$SZ0" "$HEADER_SIZE"
 # ════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════ C1: 覆盖中间记录的 magic 字段 ════════"
-echo "  方法: 写入10条记录 → dd 在 offset=128 处写入4字节零 → 覆盖第5条记录"
+echo "  方法: 写入10条记录 → dd 在 offset=4×HEADER_SIZE 处写入4字节零 → 覆盖第5条记录"
 # ════════════════════════════════════════════════════════════════════════
 
 reset_state "$P_OID"
@@ -158,7 +158,7 @@ C1_VFY=$(verify_wal "$P_OID")
 check_eq   "C1-基线 count=10"    "$C1_CNT" "10"
 check_true "C1-基线 verify=true" "$C1_VFY"
 
-# 损坏：覆盖第5条记录(index=4)的 magic 字段 offset=4*32=128, 写4字节零
+# 损坏：覆盖第5条记录(index=4)的 magic 字段 offset=4*HEADER_SIZE, 写4字节零
 CORRUPT_OFFSET=$((4 * HEADER_SIZE))
 echo "  损坏: dd 在 offset=$CORRUPT_OFFSET 写入 4 字节零（覆盖 magic 字段）..."
 dd if=/dev/zero of="$SEG_C1" bs=1 count=4 seek=$CORRUPT_OFFSET conv=notrunc 2>/dev/null
@@ -178,7 +178,8 @@ flush_w1
 C1_CNT_NEW=$(count_records "$P_OID")
 C1_SZ_NEW=$(stat -c '%s' "$SEG_C1" 2>/dev/null)
 C1_VFY_NEW=$(verify_wal "$P_OID")
-check_eq    "C1 写入后文件大小=480 (15条×32)"    "$C1_SZ_NEW" "480"
+C1_SZ_EXPECTED=$((15 * HEADER_SIZE))
+check_eq    "C1 写入后文件大小=$C1_SZ_EXPECTED (15条×$HEADER_SIZE)"    "$C1_SZ_NEW" "$C1_SZ_EXPECTED"
 check_eq    "C1 写入后 count 仍=4（停在损坏点）"  "$C1_CNT_NEW" "4"
 check_false "C1 写入后 verify 仍=false"             "$C1_VFY_NEW"
 no_panic_in_log "C1 写路径无 PANIC"
@@ -203,7 +204,8 @@ check_true "C1 完整恢复后 verify=true" "$C1_VFY_REC"
 # ════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════ C2: 截断文件到非整数记录边界 ════════"
-echo "  方法: 写入8条记录 → truncate -s 200 (= 6×32+8，非整记录边界)"
+C2_TRUNC_SIZE=$((6 * HEADER_SIZE + 8))
+echo "  方法: 写入8条记录 → truncate -s $C2_TRUNC_SIZE (= 6×$HEADER_SIZE+8，非整记录边界)"
 # ════════════════════════════════════════════════════════════════════════
 
 reset_state "$P_OID"
@@ -217,13 +219,13 @@ echo "  Segment 文件: $SEG_C2"
 C2_CNT=$(count_records "$P_OID")
 check_eq "C2-基线 count=8" "$C2_CNT" "8"
 
-# 截断到 200 字节 (= 6×32 + 8，最后8字节不足一条记录)
-truncate -s 200 "$SEG_C2"
+# 截断到 C2_TRUNC_SIZE 字节 (= 6×HEADER_SIZE + 8，最后8字节不足一条记录)
+truncate -s "$C2_TRUNC_SIZE" "$SEG_C2"
 echo "  截断后文件大小: $(stat -c '%s' "$SEG_C2") 字节"
 
 C2_CNT_TR=$(count_records "$P_OID")
 C2_VFY_TR=$(verify_wal "$P_OID")
-# 200 / 32 = 6 完整记录，第7条只有8字节被截断，read()返回短读 → 停止
+# C2_TRUNC_SIZE / HEADER_SIZE = 6 完整记录，第7条只有8字节被截断，read()返回短读 → 停止
 check_eq   "C2 截断后 count=6（完整记录数）" "$C2_CNT_TR" "6"
 check_true "C2 截断后 verify=true（6条有效连续记录）" "$C2_VFY_TR"
 no_panic_in_log "C2 截断后无 PANIC"
@@ -233,7 +235,7 @@ write_records "$P_OID" 4
 flush_w1
 C2_CNT_NEW=$(count_records "$P_OID")
 C2_VFY_NEW=$(verify_wal "$P_OID")
-# 截断后8字节 + 4×32 = 136字节，截断了记录7（lsn=7），记录8原本存在（丢失）
+# 截断了记录7（lsn=7），记录8原本存在（丢失）；新写入记录追加在截断点之后
 # 新写入记录 lsn=9-12，与 lsn=7,8 形成不连续 → verify=false
 check_ge    "C2 写入后 count>=6（原有有效 + 可能新增）" "$C2_CNT_NEW" "6"
 check_false "C2 写入后 verify=false（截断后 lsn 不连续）" "$C2_VFY_NEW"
@@ -316,15 +318,16 @@ flush_w1
 
 NSEGS=$(ls "$DATA/worker1/pg_parwal/$P_OID/" 2>/dev/null | wc -l)
 echo "  当前段文件数: $NSEGS"
-SEG_B=$(ls "$DATA/worker1/pg_parwal/$P_OID/" 2>/dev/null | sort | tail -1 | xargs -I{} echo "$DATA/worker1/pg_parwal/$P_OID/{}")
+SEG_B=$(ls "$DATA/worker1/pg_parwal/$P_OID/" 2>/dev/null | grep -v '^checkpoint$' | sort | tail -1 | xargs -I{} echo "$DATA/worker1/pg_parwal/$P_OID/{}")
 [ "$SEG_A" != "$SEG_B" ] && pass "C4: 新记录写入了新段文件 SEG_B" || fail "C4: pg_switch_wal 未产生新段文件（可能 WAL 未换段）"
 
 TOTAL_BEFORE=$(count_records "$P_OID")
 check_eq "C4-基线总 count=15" "$TOTAL_BEFORE" "15"
 check_true "C4-基线 verify=true" "$(verify_wal "$P_OID")"
 
-# 损坏 SEG_A 中间（record 5，offset=128）
-dd if=/dev/zero of="$SEG_A" bs=1 count=4 seek=128 conv=notrunc 2>/dev/null
+# 损坏 SEG_A 中间（record 5，offset=4*HEADER_SIZE）
+SEG_A_CORRUPT_OFFSET=$((4 * HEADER_SIZE))
+dd if=/dev/zero of="$SEG_A" bs=1 count=4 seek=$SEG_A_CORRUPT_OFFSET conv=notrunc 2>/dev/null
 echo "  损坏 SEG_A record 5 magic..."
 
 C4_CNT=$(count_records "$P_OID")

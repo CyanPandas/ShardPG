@@ -5,6 +5,7 @@ OBJS = \
 	src/router/write_router.o \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
+	src/wal/partwal_sync.o \
 	src/worker/demux_worker.o
 
 EXTENSION = pg_partdist
@@ -51,7 +52,7 @@ REGRESS = \
 	36_parwal_multi_partition \
 	37_demux_full_cycle
 
-REGRESS_OPTS = --inputdir=test --outputdir=test
+REGRESS_OPTS = --inputdir=test --outputdir=/tmp/pg_partdist_regress
 
 PG_CONFIG = /work/pg-install/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

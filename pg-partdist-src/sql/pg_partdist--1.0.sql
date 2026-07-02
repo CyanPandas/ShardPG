@@ -227,6 +227,16 @@ CREATE OR REPLACE FUNCTION count_parwal_records(partition_id OID)
 COMMENT ON FUNCTION count_parwal_records(OID) IS
     'Return the total number of PartWALHeader records on disk for the given partition.';
 
+-- Returns true once the one-shot crash-recovery BGW has finished.
+-- Test scripts poll this instead of checking ps (BGW exits after recovery).
+CREATE OR REPLACE FUNCTION demux_is_ready()
+    RETURNS boolean
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_demux_is_ready';
+
+COMMENT ON FUNCTION demux_is_ready() IS
+    'Returns true once the crash-recovery background worker has completed and the synchronous write path is active.';
+
 -- Read Demux Worker progress from shared memory.
 CREATE OR REPLACE FUNCTION demux_progress(
     OUT node_name          TEXT,
@@ -274,3 +284,24 @@ CREATE OR REPLACE FUNCTION demux_flush()
 
 COMMENT ON FUNCTION demux_flush() IS
     'Block until the Demux Worker has processed WAL to the current flush LSN (30 s timeout).';
+
+-- ----------------------------------------------------------------
+-- Follower replay support
+-- ----------------------------------------------------------------
+
+-- follower_partition_map: tracks the mapping from logical partition_id
+-- (the primary's OID, used as directory name in pg_parwal/) to the
+-- follower's local table name, plus replay progress.
+--
+-- applied_part_lsn is updated atomically with each SPI apply batch so
+-- that a follower crash during replay is safe to resume from this offset.
+CREATE TABLE IF NOT EXISTS follower_partition_map (
+    partition_id      OID     NOT NULL,
+    local_relname     TEXT    NOT NULL,
+    applied_part_lsn  BIGINT  NOT NULL DEFAULT 0,
+    CONSTRAINT pk_follower_partition_map PRIMARY KEY (partition_id)
+);
+
+COMMENT ON TABLE follower_partition_map IS
+    'Maps primary partition OIDs to local table names for follower lazy replay. '
+    'applied_part_lsn records the last successfully committed PartWAL record.';
