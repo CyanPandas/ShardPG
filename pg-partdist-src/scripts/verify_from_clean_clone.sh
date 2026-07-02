@@ -239,10 +239,16 @@ dpsql -p 5432 -d postgres -At -c "SELECT nodename, nodeport, isactive FROM pg_di
 # ════════════════════════════════════════════════════════════════
 banner "阶段 6 — 运行生产环境模拟测试"
 # ════════════════════════════════════════════════════════════════
-# run_production_sim.sh 硬编码 CONTAINER="pg-citus-cluster-container"；
-# 这里只在【克隆副本】里改指向本次的独立容器名，不影响仓库里的真实脚本。
+# run_production_sim.sh 硬编码 CONTAINER="pg-citus-cluster-container"，
+# 测试 9（端到端延迟性能）又是单独的 perf_latency.sh，在宿主机上跑
+# （host_cmd=true），它自己也有一份独立的 CONTAINER="pg-citus-cluster-
+# container" 硬编码，不会被 run_production_sim.sh 的 sed 覆盖。如果不
+# 单独改这一份，perf_latency.sh 就会去连一个不存在（或者错误地连到宿主机
+# 上其他同名容器）的容器，报 "container is not running"。两处都只在
+# 【克隆副本】里改指向本次的独立容器名，不影响仓库里的真实脚本。
 sed -i "s/CONTAINER=\"pg-citus-cluster-container\"/CONTAINER=\"$CONTAINER_NAME\"/" \
-    "$REPO_DIR/pg-partdist-src/run_production_sim.sh"
+    "$REPO_DIR/pg-partdist-src/run_production_sim.sh" \
+    "$REPO_DIR/pg-partdist-src/perf_latency.sh"
 
 bash "$REPO_DIR/pg-partdist-src/run_production_sim.sh"
 PROD_RC=$?
