@@ -1,0 +1,136 @@
+diff --git a/src/backend/access/transam/xloginsert.c b/src/backend/access/transam/xloginsert.c
+index 258cbd7035..619264aa5b 100644
+--- a/src/backend/access/transam/xloginsert.c
++++ b/src/backend/access/transam/xloginsert.c
+@@ -100,6 +100,9 @@ static XLogRecData *mainrdata_head;
+ static XLogRecData *mainrdata_last = (XLogRecData *) &mainrdata_head;
+ static uint64 mainrdata_len;	/* total # of bytes in chain */
+ 
++/* Extension-installable WAL insert hook (see xloginsert.h) */
++wal_insert_hook_type wal_insert_hook = NULL;
++
+ /* flags for the in-progress insertion */
+ static uint8 curinsert_flags = 0;
+ 
+@@ -488,6 +491,15 @@ XLogInsert(RmgrId rmid, uint8 info)
+ 		return EndPos;
+ 	}
+ 
++	/*
++	 * wal_record_copy / wal_record_len: contiguous copy of the assembled WAL
++	 * record bytes built inside the insertion loop (where rdt is in scope)
++	 * and consumed by the hook invocation below.  NULL when no hook is set or
++	 * no block refs were registered.
++	 */
++	char   *wal_record_copy = NULL;
++	uint32  wal_record_len  = 0;
++
+ 	do
+ 	{
+ 		XLogRecPtr	RedoRecPtr;
+@@ -509,8 +521,73 @@ XLogInsert(RmgrId rmid, uint8 info)
+ 
+ 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
+ 								  topxid_included);
++
++		/*
++		 * On successful insertion, build a contiguous copy of the WAL record
++		 * by walking the rdt chain while rdt is still in scope.  The copy is
++		 * passed to the hook below so extensions can embed the full WAL record
++		 * in a secondary log (e.g. for partition-level replica replay) without
++		 * reading from pg_wal on disk.  On retry (EndPos == Invalid) discard
++		 * any previous copy and let the next iteration rebuild it.
++		 */
++		if (EndPos != InvalidXLogRecPtr &&
++			wal_insert_hook != NULL && max_registered_block_id > 0)
++		{
++			XLogRecord  *rechdr    = (XLogRecord *) hdr_scratch;
++			uint32       total_len = rechdr->xl_tot_len;
++			uint32       offset    = 0;
++			XLogRecData *cur;
++
++			if (wal_record_copy != NULL)
++				pfree(wal_record_copy);
++			wal_record_copy = palloc(total_len);
++
++			for (cur = rdt; cur != NULL && offset < total_len; cur = cur->next)
++			{
++				if (cur->data != NULL && cur->len > 0)
++				{
++					uint32 n = cur->len;
++
++					if (offset + n > total_len)
++						n = total_len - offset;
++					memcpy(wal_record_copy + offset, cur->data, n);
++					offset += n;
++				}
++			}
++			wal_record_len = offset;
++		}
+ 	} while (EndPos == InvalidXLogRecPtr);
+ 
++	/*
++	 * Fire the WAL insert hook if installed.  We do this after the insertion
++	 * loop succeeds but before XLogResetInsertion() clears registered_buffers,
++	 * so the hook can inspect the block references for the just-written record.
++	 */
++	if (wal_insert_hook != NULL && max_registered_block_id > 0)
++	{
++		WALInsertBlockRef	hook_blocks[64]; /* generous upper bound */
++		int					nblocks = 0;
++		int					i;
++
++		for (i = 0; i < max_registered_block_id; i++)
++		{
++			if (!registered_buffers[i].in_use)
++				continue;
++			if (nblocks < 64)
++			{
++				hook_blocks[nblocks].rlocator = registered_buffers[i].rlocator;
++				hook_blocks[nblocks].forkno   = registered_buffers[i].forkno;
++				nblocks++;
++			}
++		}
++		if (nblocks > 0)
++			wal_insert_hook(EndPos, rmid, info, hook_blocks, nblocks,
++							wal_record_copy, wal_record_len);
++	}
++
++	if (wal_record_copy != NULL)
++		pfree(wal_record_copy);
++
+ 	XLogResetInsertion();
+ 
+ 	return EndPos;
+diff --git a/src/include/access/xloginsert.h b/src/include/access/xloginsert.h
+index 31785dc578..7606a39197 100644
+--- a/src/include/access/xloginsert.h
++++ b/src/include/access/xloginsert.h
+@@ -63,4 +63,27 @@ extern XLogRecPtr XLogSaveBufferForHint(Buffer buffer, bool buffer_std);
+ 
+ extern void InitXLogInsert(void);
+ 
++/*
++ * WAL insert hook — called after each XLogInsert() with the end LSN of the
++ * newly written record and a snapshot of the block references registered for
++ * that record.  Fires in the inserting backend, outside any critical section
++ * or WAL insertion lock.  Loadable modules may set this to receive per-record
++ * notifications (e.g., to write a parallel partition WAL stream).
++ */
++typedef struct WALInsertBlockRef
++{
++	RelFileLocator	rlocator;	/* identifies the relation */
++	ForkNumber		forkno;		/* fork number */
++} WALInsertBlockRef;
++
++typedef void (*wal_insert_hook_type) (XLogRecPtr end_lsn,
++									   RmgrId rmid,
++									   uint8 info,
++									   const WALInsertBlockRef *blocks,
++									   int nblocks,
++									   const char *record_data,
++									   uint32 record_len);
++
++extern PGDLLIMPORT wal_insert_hook_type wal_insert_hook;
++
+ #endif							/* XLOGINSERT_H */
