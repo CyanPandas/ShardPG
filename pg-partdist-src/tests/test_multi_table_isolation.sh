@@ -179,8 +179,10 @@ readarray -t A_W2_OIDS < <(table_oids_on_worker 5434 dist_table_a)
 echo "  dist_table_a  w1 OIDs  : ${A_W1_OIDS[*]}"
 echo "  dist_table_a  w2 OIDs  : ${A_W2_OIDS[*]}"
 
-check_eq "1A-w1 shard 目录数 = 2" "${#A_W1_OIDS[@]}" 2
-check_eq "1A-w2 shard 目录数 = 2" "${#A_W2_OIDS[@]}" 2
+# 期望值取自 coordinator 的 placement 元数据，不假设 worker 数量
+# （shard_count=4 在 2-worker 下分布 2+2，3-worker 下是 2+1+1）
+check_eq "1A-w1 shard 目录数 = placement数(${#A_W1_SHARDS[@]})" "${#A_W1_OIDS[@]}" "${#A_W1_SHARDS[@]}"
+check_eq "1A-w2 shard 目录数 = placement数(${#A_W2_SHARDS[@]})" "${#A_W2_OIDS[@]}" "${#A_W2_SHARDS[@]}"
 
 for oid in "${A_W1_OIDS[@]}"; do
     check_eq "1A-w1 OID$oid count=3" "$(count_recs 5433 "$oid")" 3
@@ -225,8 +227,8 @@ readarray -t B_W2_OIDS < <(table_oids_on_worker 5434 dist_table_b)
 echo "  dist_table_b  w1 OIDs  : ${B_W1_OIDS[*]:-（无）}"
 echo "  dist_table_b  w2 OIDs  : ${B_W2_OIDS[*]:-（无）}"
 
-check_eq "1B-w1 新增目录数 = 2 (B 的分片)" "${#B_W1_OIDS[@]}" 2
-check_eq "1B-w2 新增目录数 = 2 (B 的分片)" "${#B_W2_OIDS[@]}" 2
+check_eq "1B-w1 新增目录数 = placement数(${#B_W1_SHARDS[@]}) (B 的分片)" "${#B_W1_OIDS[@]}" "${#B_W1_SHARDS[@]}"
+check_eq "1B-w2 新增目录数 = placement数(${#B_W2_SHARDS[@]}) (B 的分片)" "${#B_W2_OIDS[@]}" "${#B_W2_SHARDS[@]}"
 
 # 隔离性：A 的计数不变
 echo "  验证 A 的分片计数未被 B 的插入影响..."
@@ -262,9 +264,12 @@ done
 [ $OVERLAP_W2 -eq 0 ] && pass "1-no-overlap-w2: A 和 B 的 OID 集合无交集" \
                        || fail "1-no-overlap-w2: A 和 B 存在相同 OID！"
 
-# 总目录数 ≥ 4（每个 Worker 上 2A + 2B，背景负载可能有更多）
-check_ge "1-total-w1: 总目录数 ≥ 4（含背景负载目录）" "${#ALL_W1[@]}" 4
-check_ge "1-total-w2: 总目录数 ≥ 4（含背景负载目录）" "${#ALL_W2[@]}" 4
+# 总目录数 ≥ 本 worker 上 A+B 的分片数（背景负载可能有更多），
+# 期望值同样按 placement 动态计算，不假设 worker 数量
+W1_EXPECT=$(( ${#A_W1_OIDS[@]} + ${#B_W1_OIDS[@]} ))
+W2_EXPECT=$(( ${#A_W2_OIDS[@]} + ${#B_W2_OIDS[@]} ))
+check_ge "1-total-w1: 总目录数 ≥ ${W1_EXPECT}（含背景负载目录）" "${#ALL_W1[@]}" "$W1_EXPECT"
+check_ge "1-total-w2: 总目录数 ≥ ${W2_EXPECT}（含背景负载目录）" "${#ALL_W2[@]}" "$W2_EXPECT"
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
