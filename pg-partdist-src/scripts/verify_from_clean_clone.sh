@@ -290,10 +290,10 @@ banner "阶段 6 — 运行生产环境模拟测试"
 # 上其他同名容器）的容器，报 "container is not running"。两处都只在
 # 【克隆副本】里改指向本次的独立容器名，不影响仓库里的真实脚本。
 sed -i "s/CONTAINER=\"pg-citus-cluster-container\"/CONTAINER=\"$CONTAINER_NAME\"/" \
-    "$REPO_DIR/pg-partdist-src/run_production_sim.sh" \
-    "$REPO_DIR/pg-partdist-src/perf_latency.sh"
+    "$REPO_DIR/pg-partdist-src/sim/run_production_sim.sh" \
+    "$REPO_DIR/pg-partdist-src/tests/perf_latency.sh"
 
-bash "$REPO_DIR/pg-partdist-src/run_production_sim.sh"
+bash "$REPO_DIR/pg-partdist-src/sim/run_production_sim.sh"
 PROD_RC=$?
 
 if [ "$PROD_RC" -eq 0 ]; then

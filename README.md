@@ -413,14 +413,14 @@ SELECT partdist.verify_partition_wal(124536::oid);   -- 预期：t
 ### 自动化脚本（114 项断言，覆盖双 Worker）
 
 ```bash
-docker cp pg-partdist-src/test_multi_table_isolation.sh \
-    pg-citus-cluster-container:/work/pg-partdist-src/test_multi_table_isolation.sh
+docker cp pg-partdist-src/tests/test_multi_table_isolation.sh \
+    pg-citus-cluster-container:/work/pg-partdist-src/tests/test_multi_table_isolation.sh
 
 docker exec pg-citus-cluster-container \
-    chmod +x /work/pg-partdist-src/test_multi_table_isolation.sh
+    chmod +x /work/pg-partdist-src/tests/test_multi_table_isolation.sh
 
 docker exec -u postgres pg-citus-cluster-container \
-    /work/pg-partdist-src/test_multi_table_isolation.sh
+    /work/pg-partdist-src/tests/test_multi_table_isolation.sh
 # 预期：总计 PASS=114  FAIL=0
 ```
 
@@ -518,14 +518,14 @@ docker exec pg-citus-cluster-container ls /work/pg-cluster-data/worker1/pg_parwa
 ### 自动化脚本（31 项断言，涵盖重启 + 崩溃两种场景）
 
 ```bash
-docker cp pg-partdist-src/verify_continuity_and_crash.sh \
-    pg-citus-cluster-container:/work/pg-partdist-src/verify_continuity_and_crash.sh
+docker cp pg-partdist-src/tests/verify_continuity_and_crash.sh \
+    pg-citus-cluster-container:/work/pg-partdist-src/tests/verify_continuity_and_crash.sh
 
 docker exec pg-citus-cluster-container \
-    chmod +x /work/pg-partdist-src/verify_continuity_and_crash.sh
+    chmod +x /work/pg-partdist-src/tests/verify_continuity_and_crash.sh
 
 docker exec -u postgres pg-citus-cluster-container \
-    /work/pg-partdist-src/verify_continuity_and_crash.sh
+    /work/pg-partdist-src/tests/verify_continuity_and_crash.sh
 # 预期：总计 PASS=31  FAIL=0
 ```
 
@@ -630,14 +630,14 @@ docker exec pg-citus-cluster-container ls /work/pg-cluster-data/worker1/pg_parwa
 ### 自动化脚本（32 项断言，覆盖 3 种崩溃场景）
 
 ```bash
-docker cp pg-partdist-src/test_crash_recovery.sh \
-    pg-citus-cluster-container:/work/pg-partdist-src/test_crash_recovery.sh
+docker cp pg-partdist-src/tests/test_crash_recovery.sh \
+    pg-citus-cluster-container:/work/pg-partdist-src/tests/test_crash_recovery.sh
 
 docker exec pg-citus-cluster-container \
-    chmod +x /work/pg-partdist-src/test_crash_recovery.sh
+    chmod +x /work/pg-partdist-src/tests/test_crash_recovery.sh
 
 docker exec -u postgres pg-citus-cluster-container \
-    /work/pg-partdist-src/test_crash_recovery.sh
+    /work/pg-partdist-src/tests/test_crash_recovery.sh
 # 预期：总计 PASS=32  FAIL=0
 ```
 
@@ -854,20 +854,22 @@ docker exec -u postgres pg-citus-cluster-container bash -c "
 
 ## 完整测试套件
 
-除上述四个手动测试外，项目还内置以下自动化测试脚本，全部在容器内执行（`docker exec -u postgres pg-citus-cluster-container bash /work/pg-partdist-src/<script>`）：
+除上述四个手动测试外，项目还内置以下自动化测试脚本（均在 `pg-partdist-src/tests/` 下），全部在容器内执行（`docker exec -u postgres pg-citus-cluster-container bash /work/pg-partdist-src/tests/<script>`）：
 
 | 脚本 | 断言数 | 覆盖场景 |
 |------|--------|----------|
-| `verify_continuity_and_crash.sh` | 31 | 重启连续性 + kill -9 崩溃恢复 |
-| `test_shard_auto_init.sh` | 5 | Citus 分片自动初始化 + 37项 pg_regress 回归 |
-| `test_multi_table_isolation.sh` | 138 | 多分布表 pg_parwal 目录隔离性（双 Worker）|
-| `test_crash_recovery.sh` | 32 | A/B/C 三类崩溃场景（Demux kill / Postmaster kill / 数据目录删除）|
-| `test_bulk_insert_recovery.sh` | 9 | `INSERT INTO t SELECT ...` COPY 路径拦截 + 崩溃恢复 + 性能 |
-| `test_segment_boundary_lsn.sh` | — | 跨段边界 LSN 单调性（segment 滚动后序列号连续）|
-| `test_corrupt_segment_recovery.sh` | 44 | 段文件损坏（C1-C4：header/magic/truncate/truncate+new）|
-| `test_demux_backlog_recovery.sh` | 26 | Demux 高积压崩溃恢复（S1-S5：积压 100/500/1000/10000/重放）|
-| `test_enospc_recovery.sh` | 11 | 磁盘空间不足（ENOSPC）stall + 自动恢复 + Worker 隔离 |
-| `perf_latency.sh` | — | 端到端 p99 延迟（500 样本，32 并发，宿主机执行）|
+| `tests/verify_continuity_and_crash.sh` | 31 | 重启连续性 + kill -9 崩溃恢复 |
+| `tests/test_shard_auto_init.sh` | 5 | Citus 分片自动初始化 + 37项 pg_regress 回归 |
+| `tests/test_multi_table_isolation.sh` | 138 | 多分布表 pg_parwal 目录隔离性（双 Worker）|
+| `tests/test_crash_recovery.sh` | 32 | A/B/C 三类崩溃场景（Demux kill / Postmaster kill / 数据目录删除）|
+| `tests/test_bulk_insert_recovery.sh` | 9 | `INSERT INTO t SELECT ...` COPY 路径拦截 + 崩溃恢复 + 性能 |
+| `tests/test_segment_boundary_lsn.sh` | — | 跨段边界 LSN 单调性（segment 滚动后序列号连续）|
+| `tests/test_corrupt_segment_recovery.sh` | 44 | 段文件损坏（C1-C4：header/magic/truncate/truncate+new）|
+| `tests/test_demux_backlog_recovery.sh` | 26 | Demux 高积压崩溃恢复（S1-S5：积压 100/500/1000/10000/重放）|
+| `tests/test_enospc_recovery.sh` | 11 | 磁盘空间不足（ENOSPC）stall + 自动恢复 + Worker 隔离 |
+| `tests/perf_latency.sh` | — | 端到端 p99 延迟（500 样本，32 并发，宿主机执行）|
+
+三个入口脚本（`pg-partdist-src/sim/run_noload_sim.sh` / `run_production_sim.sh` / `run_highload_sim.sh`）依次调度以上全部脚本；克隆验证脚本在 `pg-partdist-src/scripts/`。
 
 ### 一键运行所有测试（无背景负载）
 
@@ -875,7 +877,7 @@ docker exec -u postgres pg-citus-cluster-container bash -c "
 # 无背景负载，最快速验证全部功能（约 3 分钟）
 docker exec -u postgres pg-citus-cluster-container bash -c "
   export PATH=/work/pg-install/bin:\$PATH
-  cd /work/pg-partdist-src
+  cd /work/pg-partdist-src/tests
   for s in verify_continuity_and_crash.sh \
             test_shard_auto_init.sh \
             test_multi_table_isolation.sh \
@@ -890,16 +892,16 @@ docker exec -u postgres pg-citus-cluster-container bash -c "
   done
 "
 # 延迟测试需在宿主机执行
-bash pg-partdist-src/perf_latency.sh
+bash pg-partdist-src/tests/perf_latency.sh
 ```
 
 ### 生产环境模拟（5 路并发背景负载）
 
-`run_production_sim.sh` 在宿主机执行，自动调整生产级 PostgreSQL 参数、预写 50,000 行背景数据、启动 5 路并发背景写入，然后依次运行全部 10 项测试：
+`sim/run_production_sim.sh` 在宿主机执行，自动调整生产级 PostgreSQL 参数、预写 50,000 行背景数据、启动 5 路并发背景写入，然后依次运行全部 10 项测试：
 
 ```bash
 # 在仓库根目录执行（约 10 分钟）
-bash pg-partdist-src/run_production_sim.sh | tee /tmp/prod_sim.log
+bash pg-partdist-src/sim/run_production_sim.sh | tee /tmp/prod_sim.log
 ```
 
 最近一次运行结果（2026-06-09，PostgreSQL 16 + Citus 13.1.0）：

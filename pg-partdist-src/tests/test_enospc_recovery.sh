@@ -21,7 +21,7 @@
 # routing which writes to ghost relfilenodes not trackable by pg_partdist.
 #
 # Usage: run inside the container or via:
-#   docker exec pg-citus-cluster-container bash /work/pg-partdist-src/test_enospc_recovery.sh
+#   docker exec pg-citus-cluster-container bash /work/pg-partdist-src/tests/test_enospc_recovery.sh
 
 set -euo pipefail
 export PATH=/work/pg-install/bin:$PATH

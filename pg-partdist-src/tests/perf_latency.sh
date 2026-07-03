@@ -42,7 +42,7 @@ PGBENCH_DURATION="${2:-60}"     # seconds (1 minute default — fits in no-load 
 SAMPLE_COUNT="${1:-500}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPORT_FILE="${SCRIPT_DIR}/LATENCY_P99_REPORT.md"
+REPORT_FILE="${SCRIPT_DIR}/../docs/LATENCY_P99_REPORT.md"
 TMPDIR_HOST="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_HOST"' EXIT
 

@@ -1,6 +1,6 @@
 # pg_partdist End-to-End PartWAL Latency Report
 
-**Date:** Thu Jul  2 03:41:16 UTC 2026
+**Date:** Fri Jul  3 04:18:24 UTC 2026
 **Verdict:** 延迟 p99 测试: **FAIL**
 
 ---
@@ -41,12 +41,12 @@ to 1 ms so queue_wait ≈ 0-1 ms under any load.
 | Metric | Value |
 |--------|-------|
 | Samples (n) | 500 |
-| min | 0.3091 ms |
-| p50 | 1.0564 ms |
-| p95 | 14.592 ms |
-| **p99** | **148.2306 ms** |
-| avg | 6.2023 ms |
-| max | 248.2459 ms |
+| min | 0.3795 ms |
+| p50 | 0.8617 ms |
+| p95 | 14.365 ms |
+| **p99** | **138.7562 ms** |
+| avg | 6.1361 ms |
+| max | 181.3809 ms |
 
 ## Supplementary: Demux Internal Processing Latency
 
@@ -61,7 +61,7 @@ From Demux Worker shared-memory circular buffer (measures XLogReadRecord → Flu
 
 | Criterion | Threshold | Actual | Result |
 |-----------|-----------|--------|--------|
-| p99 latency | < 10 ms | 148.2306 ms | FAIL |
-| avg latency | < 5 ms | 6.2023 ms | FAIL |
+| p99 latency | < 10 ms | 138.7562 ms | FAIL |
+| avg latency | < 5 ms | 6.1361 ms | FAIL |
 
 **延迟 p99 测试: FAIL**
