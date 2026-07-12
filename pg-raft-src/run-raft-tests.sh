@@ -39,6 +39,10 @@ node_start() {
   local port=$1
   local dir
   dir=$(raft_node_name_for_port "$port")
+  # 已在运行则跳过,避免重复 pg_ctl start 的无害 FATAL 噪声
+  if docker exec -u postgres "$CONTAINER" /work/pg-install/bin/pg_isready -q -h localhost -p "$port" 2>/dev/null; then
+    return 0
+  fi
   $PG_CTL start -D "/work/pg-cluster-data/${dir}" -o "-p ${port}" -w 2>/dev/null || true
 }
 
@@ -187,7 +191,7 @@ else
 fi
 
 # ------------------------------------------------------------------
-section "5. Raft 回归用例(8 项)"
+section "5. Raft 回归用例(9 项)"
 
 for rf in raft_01_leader_election.sql raft_03_split_brain_guard.sql; do
   if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -f "${RAFT_TEST_DIR}/${rf}" &>/dev/null; then
@@ -314,6 +318,60 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   fi
 else
   bad "raft_08_old_leader_rejoins_as_follower.sql(无法确认初始 leader)"
+fi
+
+# raft_09: HardState 崩溃恢复 — follower immediate 停机重启后 term/日志/复制必须连续
+start_all_nodes
+sleep 2
+RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
+  if $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -c "SELECT partdist.pg_raft_propose_node_status(99, 'active')" &>/dev/null; then
+    sleep 1
+    CRASH_PORT=""
+    for port in "${NODE_PORTS[@]}"; do
+      if [[ "$port" != "$RAFT_LEADER_PORT" ]]; then
+        CRASH_PORT="$port"
+        break
+      fi
+    done
+    TERM_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
+      "SELECT current_term FROM partdist.pg_raft_get_cluster_status();" 2>/dev/null || echo 0)
+    IDX_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
+      "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log;" 2>/dev/null || echo 0)
+    CRASH_DIR=$(raft_node_name_for_port "$CRASH_PORT")
+
+    $PG_CTL stop -D "/work/pg-cluster-data/${CRASH_DIR}" -m immediate 2>/dev/null || true
+    sleep 1
+
+    if docker exec -u postgres "$CONTAINER" test -f "/work/pg-cluster-data/${CRASH_DIR}/pg_raft_hardstate"; then
+      ok "raft_09 前置: ${CRASH_DIR} 崩溃后 pg_raft_hardstate 文件在盘"
+    else
+      bad "raft_09 前置: ${CRASH_DIR} 缺少 pg_raft_hardstate 持久化文件"
+    fi
+
+    node_start "$CRASH_PORT"
+    sleep 2
+
+    RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+    if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
+       $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+         -c "SELECT partdist.pg_raft_propose_node_status(99, 'down')" &>/dev/null; then
+      if $PSQL -p "$CRASH_PORT" -U postgres -v ON_ERROR_STOP=1 \
+           -v term_before="$TERM_BEFORE" -v idx_before="$IDX_BEFORE" \
+           -f "${RAFT_TEST_DIR}/raft_09_hardstate_crash_recovery.sql" &>/dev/null; then
+        ok "raft_09_hardstate_crash_recovery.sql"
+      else
+        bad "raft_09_hardstate_crash_recovery.sql"
+      fi
+    else
+      bad "raft_09_hardstate_crash_recovery.sql(重启后 leader 追加决议失败)"
+    fi
+  else
+    bad "raft_09_hardstate_crash_recovery.sql(崩溃前预热决议失败)"
+  fi
+else
+  bad "raft_09_hardstate_crash_recovery.sql(无法确认 leader)"
 fi
 
 # 清理 Raft 回归制造的临时节点/分区,避免后台 probe 与后续测试并发打架。

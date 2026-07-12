@@ -1,0 +1,40 @@
+-- Phase 2: ShardPG+ 控制面 / WAL / 2PC 接口契约（与 pg_raft 对接）
+-- 实现方：Raft 组（彭欣荣）+ WAL 组（张滋烔）+ 事务组
+
+-- =============================================================================
+-- 1. WAL / partwalmgr（Primary 切换通知）
+-- =============================================================================
+-- 当 pg_raft 提交 OP_PARTITION_PRIMARY 并 apply 后，调用：
+--
+--   void partwal_notify_primary_switch(
+--       Oid    partition_id,
+--       int    old_primary_node,
+--       int    new_primary_node,
+--       XLogRecPtr switch_orig_lsn   -- 可选：切换点全局 LSN
+--   );
+--
+-- WalSender / PartWALReceiver 根据 new_primary 重新绑定 pg_parwal/N 目录。
+
+-- =============================================================================
+-- 2. 2PC 协调者决议（控制面 Raft 日志）
+-- =============================================================================
+-- OP_PREPARE_DECISION:  { "gxid": uint64, "participants": [1,2,3], "vote": "prepared" }
+-- OP_COMMIT_DECISION:   { "gxid": uint64, "commit_ts": int64 }
+--
+-- SQL（Phase 2）:
+--   SELECT partdist.pg_raft_propose_prepare_decision(gxid, participants, 'prepared');
+--   SELECT partdist.pg_raft_propose_commit_decision(gxid, commit_ts);
+
+-- =============================================================================
+-- 3. GlobalXID（与增强 CLOG 对齐）
+-- =============================================================================
+-- typedef uint64 GlobalTransactionId;
+-- #define MakeGlobalXid(node_id, local_xid) \
+--     (((GlobalTransactionId)(node_id) << 32) | (GlobalTransactionId)(local_xid))
+
+-- =============================================================================
+-- 4. 分区级 Raft（长期）
+-- =============================================================================
+-- 评估项：每 partition 一组独立 Raft group，
+-- 由该 partition 的 primary + secondaries 组成。
+-- 控制面 pg_raft 继续负责拓扑和成员变更，数据面分区 Raft 负责日志提交。
