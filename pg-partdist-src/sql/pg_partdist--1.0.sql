@@ -305,3 +305,36 @@ CREATE TABLE IF NOT EXISTS follower_partition_map (
 COMMENT ON TABLE follower_partition_map IS
     'Maps primary partition OIDs to local table names for follower lazy replay. '
     'applied_part_lsn records the last successfully committed PartWAL record.';
+
+-- ----------------------------------------------------------------
+-- Raft control-plane boundary functions (consumed by pg_raft)
+-- ----------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
+    RETURNS BIGINT
+    LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_get_partition_flush_lsn';
+
+COMMENT ON FUNCTION get_partition_flush_lsn(OID) IS
+    'Returns the latest partition_lsn durably written in local pg_parwal/<partition_id>/.';
+
+CREATE OR REPLACE FUNCTION get_follower_applied_part_lsn(partition_id OID)
+    RETURNS BIGINT
+    LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_get_follower_applied_part_lsn';
+
+COMMENT ON FUNCTION get_follower_applied_part_lsn(OID) IS
+    'Returns the local follower applied_part_lsn for partition_id from follower_partition_map, or 0 if absent.';
+
+CREATE OR REPLACE FUNCTION partwal_notify_primary_switch(
+    partition_id OID,
+    old_primary_node INTEGER,
+    new_primary_node INTEGER,
+    switch_orig_lsn PG_LSN
+)
+    RETURNS void
+    LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_notify_primary_switch';
+
+COMMENT ON FUNCTION partwal_notify_primary_switch(OID, INTEGER, INTEGER, PG_LSN) IS
+    'Notifies pg_partdist that Raft has committed and applied a partition primary switch.';

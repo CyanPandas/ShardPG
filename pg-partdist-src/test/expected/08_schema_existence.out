@@ -31,10 +31,13 @@ ORDER BY proname;
  demux_is_ready
  demux_latency_stats
  demux_progress
+ get_follower_applied_part_lsn
+ get_partition_flush_lsn
  init_partition_wal
  partition_map_version_bump
  partition_wal_exists
  partition_wal_path
+ partwal_notify_primary_switch
  pg_partdist_bump_metadata_version
  pg_partdist_cache_invalidate
  pg_partdist_cache_stats
@@ -45,5 +48,5 @@ ORDER BY proname;
  reset_partition_wal_state
  verify_partition_wal
  write_partition_wal_record
-(22 rows)
+(25 rows)
 

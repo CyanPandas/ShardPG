@@ -6,7 +6,8 @@ OBJS = \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
 	src/wal/partwal_sync.o \
-	src/worker/demux_worker.o
+	src/worker/demux_worker.o \
+	src/raft_boundary.o
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql

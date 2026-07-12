@@ -14,3 +14,6 @@ pg-install/lib/postgresql/pg_partdist.so
 pg-partdist-src/results/
 pg-partdist-src/regression.diffs
 pg-partdist-src/regression.out
+
+# pg_raft 编译产物
+pg-install/lib/postgresql/pg_raft.so

@@ -1,0 +1,7 @@
+comment = 'ShardPG+ control-plane Raft (TopologyMonitor + metadata failover)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_raft'
+relocatable = false
+schema = partdist
+requires = 'pg_partdist'
+superuser = true
