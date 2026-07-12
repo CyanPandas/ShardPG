@@ -26,7 +26,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CONTAINER="pg-citus-cluster-container"
+CONTAINER="pg-partdist-raft4-container"
 COORD_PORT=5432
 WORKER1_PORT=5433
 WORKER2_PORT=5434
