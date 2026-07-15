@@ -284,12 +284,21 @@ Raft 还需要读取或补齐以下进度接口：
 
 ### 下一步
 
-（第 1、5 项已于 2026-07-12 在 shardpg-3.0 完成，见第 10 节）
+（第 1、5 项已于 2026-07-12、第 3 项部分与第 4 项已于 2026-07-15 在 shardpg-3.0 完成，见第 10 节）
 
 1. ~~增加 HardState 崩溃恢复回归~~ 已完成：`raft_09_hardstate_crash_recovery.sql`。
 2. 推进 follower replay / ACK 与 `applied_part_lsn` 的真实联动，而不是只读取当前占位进度。
 3. 让 `OP_PARTITION_PRIMARY` 的 `switch_partition_lsn / switch_orig_lsn` 与真实分区写入路径、切主通知逻辑进一步收敛。
-4. 评估是否补一个“旧 leader 恢复后自动 catch-up 到新 leader 最新 committed log”的更强回归，但前提是先把测试预热日志设计成稳定、无额外 shell 引号依赖的形式。
+   - ~~切换点取数源与候选选择策略~~ 已完成（2026-07-15）：切换点优先远程读旧 primary 的
+     `get_partition_flush_lsn`（真实写路径下 parwal 在承载分片的节点上），不可达回退
+     leader 本地；候选人改为在追平者中选 `applied_part_lsn` 最大者；无进度源记 WARNING。
+     回归：`raft_10_most_caught_up_secondary_promoted.sql`（并验证决议 payload 的
+     switch_partition_lsn 等于真实 flush 进度）。
+   - 剩余：切主通知从日志占位升级为真实角色切换——依赖第 2 项 follower replay 落地。
+4. ~~“旧 leader 恢复后自动 catch-up 到新 leader 最新 committed log”的更强回归~~
+   已完成（2026-07-15）：`raft_11_old_leader_log_catchup.sql`，预热/基线经 psql `-v` 变量
+   + `set_config` 传入，无 shell 引号依赖；验证旧 leader 停机期间新 leader 提交的多条
+   决议在其回归后被复制并 apply（`max(log_index)` 追平 + `node_map` 终态一致），且保持 follower。
 5. ~~整理节点启停输出噪声~~ 已完成：`run-raft-tests.sh` 的 node_start 前置 pg_isready 探测。
 
 ## 10. shardpg-3.0 集成状态与审查差距(2026-07-12)
@@ -312,6 +321,16 @@ raft4 四节点环境为准):
   follower immediate 崩溃重启后 term 不回退、已提交日志不丢、不自立为 leader、
   复制链路恢复可追平新决议;harness 同时校验 `pg_raft_hardstate` 文件在盘。
   第 5 项(启停 FATAL 噪声)已通过 node_start 前置 pg_isready 探测解决。
+- 2026-07-15 增量:"下一步"第 3 项的切换点取数/候选选择部分与第 4 项完成——
+  failover 切换点优先远程读旧 primary 的真实 flush 进度(不可达回退 leader 本地,
+  无进度源记 WARNING);候选人在追平者中选 `applied_part_lsn` 最大者。新增回归
+  `raft_10_most_caught_up_secondary_promoted.sql`(最追平副本被提升 + 决议 payload
+  的 switch_partition_lsn 等于真实写入路径 flush 进度)与
+  `raft_11_old_leader_log_catchup.sql`(旧 leader 停机期间的已提交决议在回归后
+  追平并 apply)。四节点回归基线更新为 raft_01–raft_11 共 27 项断言全过。
+  同时:根目录 RAFT2_HANDOFF.md / raft_module_revision_plan.md /
+  pg_partdist_sync_change_log.md 移入 `docs/`;
+  `docs/INTEGRATION-citus-shard-parwal.md` 按 shardpg-3.0 现状重写。
 
 ### 审查差距(留待后续,按优先级)
 

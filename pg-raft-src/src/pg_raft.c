@@ -213,6 +213,63 @@ pg_raft_remote_fetch_applied_part_lsn(int node_id, Oid partition_id,
     return ok;
 }
 
+/*
+ * 真实写路径(parwal-2.0 同步写)下,分区 parwal 与其 flush 进度位于承载该分片
+ * 的节点(即旧 primary),而不是 Raft leader 本地。切换点优先远程读旧 primary;
+ * 旧 primary 不可达(常见:宕机触发的 failover)时由调用方回退 leader 本地值。
+ */
+static bool
+pg_raft_remote_fetch_partition_switch_point(int node_id, Oid partition_id,
+                                            uint64 *flush_lsn,
+                                            char **orig_lsn_text)
+{
+    char        conninfo[512];
+    char        sql[512];
+    PGconn     *conn;
+    PGresult   *res;
+    bool        ok = false;
+
+    *flush_lsn = 0;
+    *orig_lsn_text = NULL;
+
+    if (!pg_raft_lookup_node_conninfo(node_id, conninfo, sizeof(conninfo)))
+        return false;
+
+    snprintf(sql, sizeof(sql),
+             "SELECT COALESCE(partdist.get_partition_flush_lsn(%u), 0), "
+             "       COALESCE((SELECT orig_node_lsn::text "
+             "                 FROM partdist.read_all_headers(%u) "
+             "                 ORDER BY partition_lsn DESC LIMIT 1), '0/0')",
+             partition_id, partition_id);
+
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return false;
+    }
+
+    res = PQexec(conn, sql);
+    if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+    {
+        char *lsn_val = PQgetvalue(res, 0, 0);
+        char *orig_val = PQgetvalue(res, 0, 1);
+
+        if (lsn_val != NULL && lsn_val[0] != '\0')
+        {
+            *flush_lsn = (uint64) strtoull(lsn_val, NULL, 10);
+            *orig_lsn_text = pstrdup((orig_val != NULL && orig_val[0] != '\0')
+                                     ? orig_val : "0/0");
+            ok = true;
+        }
+    }
+
+    if (res != NULL)
+        PQclear(res);
+    PQfinish(conn);
+    return ok;
+}
+
 static bool
 pg_raft_get_partition_switch_point(Oid partition_id,
                                    uint64 *switch_partition_lsn,
@@ -687,11 +744,43 @@ pg_raft_failover_partitions_for_node(int down_node_id)
         char   *switch_orig_lsn = NULL;
         char   *new_secondary_json = NULL;
 
+        uint64  chosen_applied = 0;
+
         candidate_count = pg_raft_parse_int_json_array(sec_jsons[i], candidates, lengthof(candidates));
         (void) pg_raft_get_partition_switch_point(parts[i],
                                                  &switch_partition_lsn,
                                                  &switch_orig_lsn);
 
+        /* 切换点优先取旧 primary 上的真实 flush 进度,不可达则保留 leader 本地值 */
+        {
+            uint64  remote_flush = 0;
+            char   *remote_orig = NULL;
+
+            if (pg_raft_remote_fetch_partition_switch_point(old_primaries[i], parts[i],
+                                                            &remote_flush, &remote_orig))
+            {
+                if (remote_flush > switch_partition_lsn)
+                {
+                    switch_partition_lsn = remote_flush;
+                    pfree(switch_orig_lsn);
+                    switch_orig_lsn = remote_orig;
+                    remote_orig = NULL;
+                    elog(LOG,
+                         "pg_raft: using old primary node %d flush progress as switch point for partition %u (switch_partition_lsn=%llu)",
+                         old_primaries[i], parts[i],
+                         (unsigned long long) switch_partition_lsn);
+                }
+                if (remote_orig != NULL)
+                    pfree(remote_orig);
+            }
+        }
+
+        if (switch_partition_lsn == 0)
+            elog(WARNING,
+                 "pg_raft: no partition progress source for partition %u (old primary %d unreachable and no local parwal); promotion falls back to max applied_part_lsn",
+                 parts[i], old_primaries[i]);
+
+        /* 在所有追平切换点的候选中选 applied_part_lsn 最大者(并列取先列出者) */
         for (cidx = 0; cidx < candidate_count; cidx++)
         {
             uint64 applied_part_lsn = 0;
@@ -715,9 +804,19 @@ pg_raft_failover_partitions_for_node(int down_node_id)
                      (unsigned long long) switch_partition_lsn);
                 continue;
             }
-            chosen_primary = candidates[cidx];
-            break;
+            if (chosen_primary <= 0 || applied_part_lsn > chosen_applied)
+            {
+                chosen_primary = candidates[cidx];
+                chosen_applied = applied_part_lsn;
+            }
         }
+
+        if (chosen_primary > 0)
+            elog(LOG,
+                 "pg_raft: partition %u chose most caught-up candidate node %d (applied_part_lsn=%llu, switch_partition_lsn=%llu)",
+                 parts[i], chosen_primary,
+                 (unsigned long long) chosen_applied,
+                 (unsigned long long) switch_partition_lsn);
 
         if (chosen_primary <= 0)
         {

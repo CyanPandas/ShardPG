@@ -35,6 +35,16 @@ raft_node_name_for_port() {
   esac
 }
 
+raft_node_id_for_port() {
+  case "$1" in
+    5432) echo 1 ;;
+    5433) echo 2 ;;
+    5434) echo 3 ;;
+    5435) echo 4 ;;
+    *) return 1 ;;
+  esac
+}
+
 node_start() {
   local port=$1
   local dir
@@ -191,7 +201,7 @@ else
 fi
 
 # ------------------------------------------------------------------
-section "5. Raft 回归用例(9 项)"
+section "5. Raft 回归用例(11 项)"
 
 for rf in raft_01_leader_election.sql raft_03_split_brain_guard.sql; do
   if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -f "${RAFT_TEST_DIR}/${rf}" &>/dev/null; then
@@ -374,13 +384,115 @@ else
   bad "raft_09_hardstate_crash_recovery.sql(无法确认 leader)"
 fi
 
+# raft_10: 追平副本中必须提升 applied_part_lsn 最大者,switch 点来自真实写入路径
+start_all_nodes
+sleep 2
+RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
+  CAND_PORTS=()
+  for port in "${NODE_PORTS[@]}"; do
+    if [[ "$port" != "$RAFT_LEADER_PORT" ]]; then
+      CAND_PORTS+=("$port")
+    fi
+  done
+  SEED_APPLIED=(2 5 7)   # lo=落后 / mid=恰好追平 / hi=最追平
+  SEED_OK=1
+  for i in 0 1 2; do
+    if ! $PSQL -p "${CAND_PORTS[$i]}" -U postgres -v ON_ERROR_STOP=1 -c \
+      "INSERT INTO partdist.follower_partition_map (partition_id, local_relname, applied_part_lsn) \
+       VALUES (9108, 'raft10_seed', ${SEED_APPLIED[$i]}) \
+       ON CONFLICT (partition_id) DO UPDATE SET applied_part_lsn = EXCLUDED.applied_part_lsn;" &>/dev/null; then
+      SEED_OK=0
+    fi
+  done
+  CAND_LO=$(raft_node_id_for_port "${CAND_PORTS[0]}")
+  CAND_MID=$(raft_node_id_for_port "${CAND_PORTS[1]}")
+  CAND_HI=$(raft_node_id_for_port "${CAND_PORTS[2]}")
+
+  if [[ "$SEED_OK" == "1" ]] && \
+     $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -v cand_lo="$CAND_LO" -v cand_mid="$CAND_MID" -v cand_hi="$CAND_HI" \
+       -f "${RAFT_TEST_DIR}/raft_10_most_caught_up_secondary_promoted.sql" &>/dev/null; then
+    ok "raft_10_most_caught_up_secondary_promoted.sql"
+  else
+    bad "raft_10_most_caught_up_secondary_promoted.sql"
+  fi
+
+  for port in "${CAND_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "DELETE FROM partdist.follower_partition_map WHERE partition_id = 9108;" &>/dev/null || true
+  done
+else
+  bad "raft_10_most_caught_up_secondary_promoted.sql(无法确认 leader)"
+fi
+
+# raft_11: 旧 leader 停机期间新 leader 提交多条决议,旧 leader 回归后必须追平并保持 follower
+start_all_nodes
+sleep 2
+RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
+  if $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -c "SELECT partdist.pg_raft_propose_node_status(99, 'active')" &>/dev/null; then
+    OLD_LEADER_PORT="$RAFT_LEADER_PORT"
+    node_stop "$OLD_LEADER_PORT"
+    sleep 2
+
+    NEW_LEADER_PORT=$(raft_wait_new_leader_port_excluding "$OLD_LEADER_PORT" || true)
+    if [[ -n "${NEW_LEADER_PORT:-}" ]]; then
+      # 旧 leader 缺席期间提交 3 条决议,最终 node 99 = down
+      PROPOSE_OK=1
+      for st in down active down; do
+        if ! $PSQL -p "$NEW_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+             -c "SELECT partdist.pg_raft_propose_node_status(99, '${st}')" &>/dev/null; then
+          PROPOSE_OK=0
+        fi
+      done
+      IDX_TARGET=$($PSQL -p "$NEW_LEADER_PORT" -U postgres -tAc \
+        "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log;" 2>/dev/null || echo 0)
+
+      node_start "$OLD_LEADER_PORT"
+      sleep 2
+
+      RAFT_11_OK=0
+      if [[ "$PROPOSE_OK" == "1" ]] && [[ "$IDX_TARGET" =~ ^[0-9]+$ ]] && [[ "$IDX_TARGET" -gt 0 ]]; then
+        for attempt in $(seq 1 3); do
+          if $PSQL -p "$OLD_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+               -v idx_target="$IDX_TARGET" -v expect_status=down \
+               -f "${RAFT_TEST_DIR}/raft_11_old_leader_log_catchup.sql" &>/dev/null; then
+            RAFT_11_OK=1
+            break
+          fi
+          sleep 2
+        done
+      fi
+
+      if [[ "$RAFT_11_OK" == "1" ]]; then
+        ok "raft_11_old_leader_log_catchup.sql"
+      else
+        bad "raft_11_old_leader_log_catchup.sql"
+      fi
+    else
+      node_start "$OLD_LEADER_PORT"
+      bad "raft_11_old_leader_log_catchup.sql(旧 leader 停机后未能选出新 leader)"
+    fi
+  else
+    bad "raft_11_old_leader_log_catchup.sql(停机前预热决议失败)"
+  fi
+else
+  bad "raft_11_old_leader_log_catchup.sql(无法确认 leader)"
+fi
+
 # 清理 Raft 回归制造的临时节点/分区,避免后台 probe 与后续测试并发打架。
 RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
 if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
     -c "DELETE FROM partdist.node_map WHERE node_id IN (77, 98, 99, 100);" &>/dev/null || true
   $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
-    -c "DELETE FROM partdist.partition_map WHERE partition_id = 9107::oid;" &>/dev/null || true
+    -c "DELETE FROM partdist.partition_map WHERE partition_id IN (9107::oid, 9108::oid);" &>/dev/null || true
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "DELETE FROM partdist.follower_partition_map WHERE partition_id = 9108;" &>/dev/null || true
+  done
   sleep 1
 fi
 
