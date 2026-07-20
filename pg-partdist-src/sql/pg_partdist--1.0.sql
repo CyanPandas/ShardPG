@@ -307,6 +307,177 @@ COMMENT ON TABLE follower_partition_map IS
     'applied_part_lsn records the last successfully committed PartWAL record.';
 
 -- ----------------------------------------------------------------
+-- P0: Global shard identity (阶段 4 / §11 前置)
+--
+-- 全局分片身份:以 Citus 的 shardid 作为跨节点一致的 global_shard_id
+-- (分片表命名为 <rel>_<shardid>,pg_dist_shard 在所有节点同步),建立
+-- global_shard_id <-> 本节点 (local_oid, relfilenode, relname) 的映射。
+-- 目的:让"一个分区 = 一个 Raft 组"的成员寻址,以及跨节点
+-- applied_part_lsn 比较,拥有一个良定义、各节点一致的键。
+-- global_shard_id 在承载同一逻辑分片副本的每个节点上都相同;
+-- local_oid 是每节点独立分配的,即 pg_parwal/<oid>/ 的目录名 (== partition_id)。
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS shard_identity (
+    global_shard_id  BIGINT      NOT NULL,   -- Citus shardid, 集群全局唯一
+    local_oid        OID         NOT NULL,   -- 本节点分片表 OID (== partition_id)
+    relfilenode      OID         NOT NULL,   -- 本节点分片表 relfilenode
+    local_relname    TEXT        NOT NULL,   -- 本节点分片表名 <rel>_<shardid>
+    logical_relid    OID,                    -- 本节点分布表(逻辑表)OID
+    registered_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_shard_identity PRIMARY KEY (global_shard_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shard_identity_local_oid
+    ON shard_identity(local_oid);
+
+COMMENT ON TABLE shard_identity IS
+    'Maps the cluster-global Citus shardid (global_shard_id) to this node''s local '
+    'shard-table identity (local_oid/relfilenode/relname). global_shard_id is identical '
+    'on every node hosting a replica of the same logical shard; local_oid is node-specific. '
+    'P0 prerequisite for per-partition Raft groups and cross-node applied_part_lsn comparison.';
+
+-- follower_partition_map 增加 global_shard_id 维度(可空,由 rebuild_shard_identity 回填)。
+ALTER TABLE follower_partition_map
+    ADD COLUMN IF NOT EXISTS global_shard_id BIGINT;
+
+-- 从系统目录权威解析某分片表 OID 的全局 shardid(非本节点 Citus 分片返回 NULL)。
+-- 不解析表名后缀,直接用 Citus shard_name() 反查,避免命名边界问题。
+-- 用 plpgsql:LANGUAGE sql 会在 CREATE 时对函数体做计划分析,而 Citus 在 worker 上
+-- 会对涉及 pg_dist_shard/shard_name 的计划报 "operation is not allowed on this node";
+-- 该查询在 worker 上运行时是允许的,plpgsql 体不在建函数时被计划,故可安全创建。
+CREATE OR REPLACE FUNCTION shard_global_id(p_local_oid OID)
+    RETURNS BIGINT
+    LANGUAGE plpgsql STABLE
+    SET search_path = partdist, pg_catalog, public
+AS $$
+DECLARE
+    gid BIGINT;
+BEGIN
+    SELECT s.shardid INTO gid
+    FROM pg_catalog.pg_dist_shard s
+    WHERE pg_catalog.to_regclass(pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
+          = p_local_oid
+    LIMIT 1;
+    RETURN gid;
+END;
+$$;
+
+COMMENT ON FUNCTION shard_global_id(OID) IS
+    'Resolve the cluster-global Citus shardid for a local shard-table OID, or NULL.';
+
+-- 扫描本节点所有物理存在的 Citus 分片表,(重新)填充 shard_identity,
+-- 并回填 follower_partition_map.global_shard_id。返回写入/更新的行数。
+-- 幂等:可反复调用。to_regclass(shard_name(...)) 仅对本节点物理存在的分片非空,
+-- 因此协调节点(无分片副本)执行时通常写入 0 行。
+-- override_table_visibility=false:Citus 默认对普通连接的 pg_class 扫描隐藏分片表,
+-- 隐藏后 JOIN pg_class 取不到分片行(to_regclass 不受影响但拿不到 relfilenode/relname)。
+CREATE OR REPLACE FUNCTION rebuild_shard_identity()
+    RETURNS INTEGER
+    LANGUAGE plpgsql VOLATILE
+    SET search_path = partdist, pg_catalog, public
+    SET citus.override_table_visibility = 'false'
+AS $$
+DECLARE
+    n INTEGER := 0;
+BEGIN
+    INSERT INTO shard_identity
+        (global_shard_id, local_oid, relfilenode, local_relname, logical_relid)
+    SELECT s.shardid,
+           cls.oid,
+           cls.relfilenode,
+           cls.relname,
+           s.logicalrelid
+    FROM pg_catalog.pg_dist_shard s
+    JOIN pg_catalog.pg_class cls
+      ON cls.oid = pg_catalog.to_regclass(
+                       pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
+    ON CONFLICT (global_shard_id) DO UPDATE
+       SET local_oid     = EXCLUDED.local_oid,
+           relfilenode   = EXCLUDED.relfilenode,
+           local_relname = EXCLUDED.local_relname,
+           logical_relid = EXCLUDED.logical_relid,
+           registered_at = now();
+    GET DIAGNOSTICS n = ROW_COUNT;
+
+    -- 清理已不在本节点的分片(表被删/迁走);to_regclass 不受分片隐藏影响。
+    DELETE FROM shard_identity si
+     WHERE NOT EXISTS (
+         SELECT 1 FROM pg_catalog.pg_dist_shard s
+          WHERE pg_catalog.to_regclass(
+                    pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid = si.local_oid);
+
+    -- 回填 follower 进度表的全局键
+    UPDATE follower_partition_map f
+       SET global_shard_id = si.global_shard_id
+      FROM shard_identity si
+     WHERE si.local_oid = f.partition_id
+       AND f.global_shard_id IS DISTINCT FROM si.global_shard_id;
+
+    RETURN n;
+END;
+$$;
+
+COMMENT ON FUNCTION rebuild_shard_identity() IS
+    'Scan locally-present Citus shard tables and (re)populate shard_identity; '
+    'backfill follower_partition_map.global_shard_id. Idempotent. Returns rows written.';
+
+-- 注册单个分片(供分片创建路径 / 按需调用);非本节点 Citus 分片返回 NULL。
+CREATE OR REPLACE FUNCTION register_shard_identity(p_local_oid OID)
+    RETURNS BIGINT
+    LANGUAGE plpgsql VOLATILE
+    SET search_path = partdist, pg_catalog, public
+    SET citus.override_table_visibility = 'false'
+AS $$
+DECLARE
+    gid BIGINT;
+BEGIN
+    gid := partdist.shard_global_id(p_local_oid);
+    IF gid IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    INSERT INTO shard_identity
+        (global_shard_id, local_oid, relfilenode, local_relname, logical_relid)
+    SELECT gid, cls.oid, cls.relfilenode, cls.relname,
+           (SELECT s.logicalrelid FROM pg_catalog.pg_dist_shard s
+             WHERE s.shardid = gid LIMIT 1)
+    FROM pg_catalog.pg_class cls
+    WHERE cls.oid = p_local_oid
+    ON CONFLICT (global_shard_id) DO UPDATE
+       SET local_oid     = EXCLUDED.local_oid,
+           relfilenode   = EXCLUDED.relfilenode,
+           local_relname = EXCLUDED.local_relname,
+           logical_relid = EXCLUDED.logical_relid,
+           registered_at = now();
+    RETURN gid;
+END;
+$$;
+
+COMMENT ON FUNCTION register_shard_identity(OID) IS
+    'Register/refresh one local shard in shard_identity; returns its global shardid or NULL.';
+
+-- Raft 控制面用:全局分片 id <-> 本节点 partition_id(OID)互查。
+-- 本节点不承载该分片时返回 NULL/0,调用方据此判断"本地是否有此分区副本"。
+CREATE OR REPLACE FUNCTION local_partition_for_shard(p_global_shard_id BIGINT)
+    RETURNS OID
+    LANGUAGE sql STABLE
+AS $$
+    SELECT local_oid FROM partdist.shard_identity WHERE global_shard_id = p_global_shard_id
+$$;
+
+COMMENT ON FUNCTION local_partition_for_shard(BIGINT) IS
+    'This node''s local partition_id (OID) for a global shardid, or NULL if not hosted here.';
+
+CREATE OR REPLACE FUNCTION global_id_for_partition(p_local_oid OID)
+    RETURNS BIGINT
+    LANGUAGE sql STABLE
+AS $$
+    SELECT global_shard_id FROM partdist.shard_identity WHERE local_oid = p_local_oid
+$$;
+
+COMMENT ON FUNCTION global_id_for_partition(OID) IS
+    'The global Citus shardid for a local partition_id (OID) from shard_identity, or NULL.';
+
+-- ----------------------------------------------------------------
 -- Raft control-plane boundary functions (consumed by pg_raft)
 -- ----------------------------------------------------------------
 
