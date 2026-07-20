@@ -22,7 +22,7 @@ BEGIN
   FOR i IN 1..40 LOOP
     PERFORM partdist.pg_raft_apply_committed();
 
-    SELECT max(log_index) INTO idx_now FROM partdist.raft_log;
+    SELECT max(log_index) INTO idx_now FROM partdist.raft_log WHERE group_id = 0;
 
     IF idx_now IS NOT NULL AND idx_now >= idx_target
        AND EXISTS (

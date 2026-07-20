@@ -19,6 +19,17 @@ SET citus.enable_ddl_propagation = off;
 DROP EXTENSION IF EXISTS pg_raft CASCADE;
 DROP FUNCTION IF EXISTS partdist.pg_raft_apply_committed();
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
+DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset();
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset_internal();
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_status();
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_propose(BIGINT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_create(BIGINT, INTEGER[]);
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_drop(BIGINT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_create_internal(BIGINT, INTEGER[]);
+DROP FUNCTION IF EXISTS partdist.pg_raft_group_drop_internal(BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_rpc(TEXT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_force_probe();
 DROP FUNCTION IF EXISTS partdist.pg_raft_apply_payload(TEXT, JSONB);
@@ -32,6 +43,8 @@ DROP FUNCTION IF EXISTS partdist.raft_propose_partition_primary(OID, INTEGER, IN
 DROP FUNCTION IF EXISTS partdist.raft_propose_node_status(INTEGER, TEXT);
 DROP TABLE IF EXISTS partdist.raft_snapshot CASCADE;
 DROP INDEX IF EXISTS partdist.idx_raft_log_log_index;
+DROP INDEX IF EXISTS partdist.idx_raft_log_group_index;
+DROP TABLE IF EXISTS partdist.raft_group CASCADE;
 DROP TABLE IF EXISTS partdist.raft_log CASCADE;
 DROP TABLE IF EXISTS partdist.raft_state CASCADE;
 SQL
@@ -93,6 +106,22 @@ CREATE OR REPLACE FUNCTION partdist.partwal_notify_primary_switch(
     new_primary_node INTEGER, switch_orig_lsn PG_LSN)
     RETURNS void LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_notify_primary_switch';
+-- P2 数据面 Raft 组的 parwal 边界函数(已安装的 pg_partdist 扩展不会重跑安装脚本)
+CREATE OR REPLACE FUNCTION partdist.partwal_read_record(
+    p_partition_id OID, p_partition_lsn BIGINT,
+    OUT orig_lsn PG_LSN, OUT rmid INTEGER, OUT info INTEGER,
+    OUT xid BIGINT, OUT data BYTEA)
+    RETURNS record LANGUAGE c STRICT STABLE
+    AS 'pg_partdist', 'pg_partdist_partwal_read_record';
+CREATE OR REPLACE FUNCTION partdist.partwal_follower_append(
+    p_partition_id OID, p_orig_lsn PG_LSN, p_rmid INTEGER,
+    p_info INTEGER, p_xid BIGINT, p_data BYTEA)
+    RETURNS BIGINT LANGUAGE c STRICT VOLATILE
+    AS 'pg_partdist', 'pg_partdist_partwal_follower_append';
+CREATE OR REPLACE FUNCTION partdist.follower_set_applied_part_lsn(
+    p_partition_id OID, p_applied_part_lsn BIGINT)
+    RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
+    AS 'pg_partdist', 'pg_partdist_follower_set_applied_part_lsn';
 SQL
 }
 
@@ -106,7 +135,11 @@ CREATE EXTENSION IF NOT EXISTS pg_raft;
 ALTER TABLE partdist.raft_log ADD COLUMN IF NOT EXISTS log_index BIGINT;
 UPDATE partdist.raft_log SET log_index = log_id WHERE log_index IS NULL;
 ALTER TABLE partdist.raft_log ALTER COLUMN log_index SET NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_log_index ON partdist.raft_log(log_index);
+-- P1：日志按 Raft 组分命名空间，唯一性是 (group_id, log_index) 而非 log_index。
+ALTER TABLE partdist.raft_log ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0;
+DROP INDEX IF EXISTS partdist.idx_raft_log_log_index;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_group_index
+    ON partdist.raft_log(group_id, log_index);
 SQL
   ensure_boundary_functions "$port"
 }

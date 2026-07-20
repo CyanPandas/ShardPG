@@ -31,7 +31,7 @@ BEGIN
   END IF;
 
   -- 2) 已提交日志不能丢
-  SELECT max(log_index) INTO idx_now FROM partdist.raft_log;
+  SELECT max(log_index) INTO idx_now FROM partdist.raft_log WHERE group_id = 0;
   IF idx_now IS NULL OR idx_now < idx_before THEN
     RAISE EXCEPTION
       'raft_09: committed raft_log lost after crash restart (before=%, now=%)',

@@ -106,7 +106,8 @@ BEGIN
   SELECT (payload->>'switch_partition_lsn')::bigint
     INTO payload_switch_lsn
   FROM partdist.raft_log
-  WHERE op_type = 'OP_PARTITION_PRIMARY'
+  WHERE group_id = 0
+    AND op_type = 'OP_PARTITION_PRIMARY'
     AND (payload->>'partition_id')::oid = 9108::oid
   ORDER BY log_index DESC
   LIMIT 1;

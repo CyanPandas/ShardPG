@@ -20,6 +20,7 @@ BEGIN
   SELECT log_index, term
     INTO last_idx, last_term
   FROM partdist.raft_log
+  WHERE group_id = 0
   ORDER BY log_index DESC
   LIMIT 1;
 

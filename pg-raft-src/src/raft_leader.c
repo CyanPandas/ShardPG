@@ -36,7 +36,7 @@ pg_raft_shmem_startup(void)
     LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
     RaftLeaderShmemData = (RaftLeaderShmem *)
-        ShmemInitStruct("pg_raft_leader", pg_raft_shmem_size(), &found);
+        ShmemInitStruct("pg_raft_leader", MAXALIGN(sizeof(RaftLeaderShmem)), &found);
 
     if (!found)
     {

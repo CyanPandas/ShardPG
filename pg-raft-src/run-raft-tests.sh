@@ -348,7 +348,7 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
     TERM_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
       "SELECT current_term FROM partdist.pg_raft_get_cluster_status();" 2>/dev/null || echo 0)
     IDX_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
-      "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log;" 2>/dev/null || echo 0)
+      "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log WHERE group_id = 0;" 2>/dev/null || echo 0)
     CRASH_DIR=$(raft_node_name_for_port "$CRASH_PORT")
 
     $PG_CTL stop -D "/work/pg-cluster-data/${CRASH_DIR}" -m immediate 2>/dev/null || true
@@ -448,7 +448,7 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
         fi
       done
       IDX_TARGET=$($PSQL -p "$NEW_LEADER_PORT" -U postgres -tAc \
-        "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log;" 2>/dev/null || echo 0)
+        "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log WHERE group_id = 0;" 2>/dev/null || echo 0)
 
       node_start "$OLD_LEADER_PORT"
       sleep 2
@@ -481,6 +481,227 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
 else
   bad "raft_11_old_leader_log_catchup.sql(无法确认 leader)"
 fi
+
+# raft_12: 分区级 Raft 组隔离性(P1)。在两个不同节点各建一个数据组,验证两组
+# 各自独立选举、日志按 group_id 分命名空间、且控制面 group 0 不受影响。
+# 每轮用一对**全新的** group id:组的 drop 只作用于本节点,对端会把旧组连同它
+# 记住的 term 传播回来,复用同一个 id 重建会得到起始 term 落后于对端的新组,
+# 选举被反复压制(表现为偶发的选不出 leader / 复制不出去)。
+# 不依赖任何节点在线(此刻可能正处于 raft_11 的停机窗口),否则回落到固定 id
+# 就又变成"复用旧 group id",踩上面说的 term 落后问题。
+RAFT_12_BASE=$(( 9000000 + ($(date +%s) % 900000) * 2 ))
+RAFT_12_GID_A=$RAFT_12_BASE
+RAFT_12_GID_B=$((RAFT_12_BASE + 1))
+
+raft12_cleanup_groups() {
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "SELECT partdist.pg_raft_group_reset();" &>/dev/null || true
+  done
+}
+
+# 返回某个组当前 leader 所在节点的端口
+raft12_leader_port_for_group() {
+  local gid=$1 port st
+  for port in "${NODE_PORTS[@]}"; do
+    st=$($PSQL -p "$port" -U postgres -tAc \
+      "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = ${gid};" \
+      2>/dev/null || echo "")
+    if [[ "$st" == "leader" ]]; then
+      echo "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_all_nodes
+sleep 2
+# 组是 shmem 状态,且会经 RPC 在对端自动重建;先在全节点清一遍残留
+raft12_cleanup_groups
+
+RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
+  # 在两个不同的非控制面节点各建一个组,让它们各自成为该组的 leader
+  RAFT_12_NODE_A=5433
+  RAFT_12_NODE_B=5434
+  $PSQL -p "$RAFT_12_NODE_A" -U postgres -c \
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_A});" &>/dev/null || true
+  $PSQL -p "$RAFT_12_NODE_B" -U postgres -c \
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_B});" &>/dev/null || true
+
+  # 等两组各自选出 leader(组信息经 RV/AE 自动传播到其余节点)
+  RAFT_12_LEADER_A=""
+  RAFT_12_LEADER_B=""
+  for attempt in $(seq 1 15); do
+    RAFT_12_LEADER_A=$(raft12_leader_port_for_group "$RAFT_12_GID_A" || true)
+    RAFT_12_LEADER_B=$(raft12_leader_port_for_group "$RAFT_12_GID_B" || true)
+    [[ -n "$RAFT_12_LEADER_A" && -n "$RAFT_12_LEADER_B" ]] && break
+    sleep 1
+  done
+
+  if [[ -n "$RAFT_12_LEADER_A" && -n "$RAFT_12_LEADER_B" ]]; then
+    # 只往 A 组写日志:B 组必须保持空,证明两组日志互不串扰
+    RAFT_12_PROPOSE_OK=1
+    for v in 1 2 3; do
+      if ! $PSQL -p "$RAFT_12_LEADER_A" -U postgres -v ON_ERROR_STOP=1 -tAc \
+           "SELECT partdist.pg_raft_group_propose(${RAFT_12_GID_A}, 'OP_TEST', '{\"v\":${v}}');" \
+           &>/dev/null; then
+        RAFT_12_PROPOSE_OK=0
+      fi
+    done
+    # 非 leader 节点提交必须被拒(返回 0)
+    RAFT_12_NONLEADER_PORT=""
+    for port in "${NODE_PORTS[@]}"; do
+      if [[ "$port" != "$RAFT_12_LEADER_A" ]]; then
+        RAFT_12_NONLEADER_PORT="$port"
+        break
+      fi
+    done
+    RAFT_12_NONLEADER_RC=$($PSQL -p "$RAFT_12_NONLEADER_PORT" -U postgres -tAc \
+      "SELECT partdist.pg_raft_group_propose(${RAFT_12_GID_A}, 'OP_TEST', '{\"v\":99}');" \
+      2>/dev/null || echo -1)
+    sleep 2
+
+    if [[ "$RAFT_12_PROPOSE_OK" == "1" ]] && [[ "$RAFT_12_NONLEADER_RC" == "0" ]] && \
+       $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+         -v gid_a="$RAFT_12_GID_A" -v gid_b="$RAFT_12_GID_B" \
+         -f "${RAFT_TEST_DIR}/raft_12_multi_group_isolation.sql" &>/dev/null; then
+      ok "raft_12_multi_group_isolation.sql"
+    else
+      bad "raft_12_multi_group_isolation.sql(propose_ok=${RAFT_12_PROPOSE_OK} nonleader_rc=${RAFT_12_NONLEADER_RC})"
+    fi
+  else
+    bad "raft_12_multi_group_isolation.sql(数据组未能各自选出 leader)"
+  fi
+
+  raft12_cleanup_groups
+else
+  bad "raft_12_multi_group_isolation.sql(无法确认控制面 leader)"
+fi
+
+# raft_13: 数据面 Raft 组复制 + 平凡 apply(P2)。以一个 Citus reference 表的分片
+# 为例(同一 shardid 复制在三个 worker 上,天然就是一个分区组的成员集),把 leader
+# pg_parwal 里的真实记录当作 Raft entry 复制,验证:多数派提交、字节逐字节落到
+# follower 自己的 pg_parwal、applied_part_lsn 由真实 C 写入方推进、失去多数派时
+# 写入必须失败。
+RAFT_13_TABLE=raft13_demo
+RAFT_13_MEMBER_PORTS=(5433 5434 5435)
+RAFT_13_MEMBER_IDS="ARRAY[2,3,4]"
+
+raft13_cleanup() {
+  local port
+  # 用 reset 而非 drop:drop 只作用本节点,对端会把组连同旧 term 传回来,
+  # 残留的数据组会一直参与 tick,拖慢后续依赖时序的控制面用例。
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "SELECT partdist.pg_raft_group_reset();" &>/dev/null || true
+  done
+  $PSQL -p 5432 -U postgres -c \
+    "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_13_TABLE};" &>/dev/null || true
+}
+
+start_all_nodes
+sleep 2
+
+RAFT_13_OK=0
+RAFT_13_WHY="setup"
+if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+     "SET citus.enable_ddl_propagation=on;
+      DROP TABLE IF EXISTS ${RAFT_13_TABLE};
+      CREATE TABLE ${RAFT_13_TABLE}(id int primary key, v text);
+      SELECT create_reference_table('${RAFT_13_TABLE}');
+      INSERT INTO ${RAFT_13_TABLE} SELECT g, repeat('x', 50) FROM generate_series(1, 20) g;" &>/dev/null; then
+
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c "SELECT partdist.rebuild_shard_identity();" &>/dev/null || true
+  done
+
+  RAFT_13_GID=$($PSQL -p 5432 -U postgres -tAc \
+    "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='${RAFT_13_TABLE}'::regclass;" 2>/dev/null || echo "")
+
+  if [[ -n "$RAFT_13_GID" ]]; then
+    # 组成员 = 承载该分片副本的三个 worker
+    for port in "${RAFT_13_MEMBER_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "SELECT partdist.pg_raft_group_create(${RAFT_13_GID}, ${RAFT_13_MEMBER_IDS});" &>/dev/null || true
+    done
+
+    RAFT_13_LEADER=""
+    for attempt in $(seq 1 15); do
+      for port in "${RAFT_13_MEMBER_PORTS[@]}"; do
+        st=$($PSQL -p "$port" -U postgres -tAc \
+          "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = ${RAFT_13_GID};" 2>/dev/null || echo "")
+        [[ "$st" == "leader" ]] && RAFT_13_LEADER="$port" && break
+      done
+      [[ -n "$RAFT_13_LEADER" ]] && break
+      sleep 1
+    done
+
+    if [[ -n "$RAFT_13_LEADER" ]]; then
+      # 取一个 follower,记录复制前的 parwal 进度
+      RAFT_13_FOLLOWER=""
+      for port in "${RAFT_13_MEMBER_PORTS[@]}"; do
+        [[ "$port" != "$RAFT_13_LEADER" ]] && RAFT_13_FOLLOWER="$port" && break
+      done
+      RAFT_13_BEFORE=$($PSQL -p "$RAFT_13_FOLLOWER" -U postgres -tAc \
+        "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${RAFT_13_GID}));" 2>/dev/null || echo 0)
+      RAFT_13_MD5=$($PSQL -p "$RAFT_13_LEADER" -U postgres -tAc \
+        "SELECT md5(data) FROM partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_13_GID}), 1);" 2>/dev/null || echo "")
+      RAFT_13_LEN=$($PSQL -p "$RAFT_13_LEADER" -U postgres -tAc \
+        "SELECT length(data) FROM partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_13_GID}), 1);" 2>/dev/null || echo 0)
+
+      # 把 leader pg_parwal 的第 1 条记录作为 Raft entry 提交到该组
+      RAFT_13_IDX=$($PSQL -p "$RAFT_13_LEADER" -U postgres -tAc \
+        "SELECT partdist.pg_raft_data_propose(${RAFT_13_GID}, 1);" 2>/dev/null || echo 0)
+      sleep 2
+
+      if [[ "$RAFT_13_IDX" =~ ^[0-9]+$ ]] && [[ "$RAFT_13_IDX" -gt 0 ]] && [[ -n "$RAFT_13_MD5" ]]; then
+        if $PSQL -p "$RAFT_13_FOLLOWER" -U postgres -v ON_ERROR_STOP=1 \
+             -v gid="$RAFT_13_GID" -v before_flush="$RAFT_13_BEFORE" \
+             -v leader_md5="$RAFT_13_MD5" -v leader_len="$RAFT_13_LEN" \
+             -f "${RAFT_TEST_DIR}/raft_13_data_group_replication.sql" &>/dev/null; then
+          # 失去多数派(3 成员停掉 2)后,数据写入必须失败
+          RAFT_13_STOPPED=()
+          for port in "${RAFT_13_MEMBER_PORTS[@]}"; do
+            if [[ "$port" != "$RAFT_13_LEADER" ]]; then
+              node_stop "$port"
+              RAFT_13_STOPPED+=("$port")
+            fi
+          done
+          sleep 2
+          RAFT_13_NOQUORUM=$($PSQL -p "$RAFT_13_LEADER" -U postgres -tAc \
+            "SELECT partdist.pg_raft_data_propose(${RAFT_13_GID}, 1);" 2>/dev/null || echo -1)
+          for port in "${RAFT_13_STOPPED[@]}"; do
+            node_start "$port"
+          done
+          sleep 2
+
+          if [[ "$RAFT_13_NOQUORUM" == "0" ]]; then
+            RAFT_13_OK=1
+          else
+            RAFT_13_WHY="失去多数派时 data_propose 返回 ${RAFT_13_NOQUORUM},应为 0"
+          fi
+        else
+          RAFT_13_WHY="follower 断言失败"
+        fi
+      else
+        RAFT_13_WHY="data_propose 返回 ${RAFT_13_IDX}"
+      fi
+    else
+      RAFT_13_WHY="数据组未选出 leader"
+    fi
+  else
+    RAFT_13_WHY="拿不到 reference 表 shardid"
+  fi
+fi
+
+if [[ "$RAFT_13_OK" == "1" ]]; then
+  ok "raft_13_data_group_replication.sql"
+else
+  bad "raft_13_data_group_replication.sql(${RAFT_13_WHY})"
+fi
+raft13_cleanup
 
 # 清理 Raft 回归制造的临时节点/分区,避免后台 probe 与后续测试并发打架。
 RAFT_LEADER_PORT=$(raft_wait_leader_port || true)

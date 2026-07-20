@@ -509,3 +509,50 @@ CREATE OR REPLACE FUNCTION partwal_notify_primary_switch(
 
 COMMENT ON FUNCTION partwal_notify_primary_switch(OID, INTEGER, INTEGER, PG_LSN) IS
     'Notifies pg_partdist that Raft has committed and applied a partition primary switch.';
+
+-- ------------------------------------------------------------------
+-- P2 — 数据面 Raft 组的 parwal 边界函数
+-- ------------------------------------------------------------------
+-- 分区 Raft 组以 parwal 记录为 Raft entry：leader 用 partwal_read_record 取出
+-- 记录随 AppendEntries 下发，follower 用 partwal_follower_append 原样落盘后才
+-- ack（故"多数派提交"== 多数派字节已 fsync），再由 follower_set_applied_part_lsn
+-- 推进进度游标。此阶段不做 redo —— 物理回放是 P3。
+--
+-- 注意：同一逻辑分片在各节点的本地 OID 不同，调用方必须先用 P0 的
+-- local_partition_for_shard(global_shard_id) 把组 id 解析成本节点 partition_id。
+
+CREATE OR REPLACE FUNCTION partwal_read_record(
+    p_partition_id OID,
+    p_partition_lsn BIGINT,
+    OUT orig_lsn PG_LSN,
+    OUT rmid INTEGER,
+    OUT info INTEGER,
+    OUT xid BIGINT,
+    OUT data BYTEA
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_read_record';
+
+COMMENT ON FUNCTION partwal_read_record(OID, BIGINT) IS
+    'Leader 侧：按 partition_lsn 从本节点 pg_parwal 读出一条完整 parwal 记录（头部字段 + 原始 WAL 字节）。';
+
+CREATE OR REPLACE FUNCTION partwal_follower_append(
+    p_partition_id OID,
+    p_orig_lsn PG_LSN,
+    p_rmid INTEGER,
+    p_info INTEGER,
+    p_xid BIGINT,
+    p_data BYTEA
+) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append';
+
+COMMENT ON FUNCTION partwal_follower_append(OID, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA) IS
+    'Follower 侧平凡 apply：把收到的 parwal 记录原样落盘并 fsync，返回本地写入的 partition_lsn。不做 redo。';
+
+CREATE OR REPLACE FUNCTION follower_set_applied_part_lsn(
+    p_partition_id OID,
+    p_applied_part_lsn BIGINT
+) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_follower_set_applied_part_lsn';
+
+COMMENT ON FUNCTION follower_set_applied_part_lsn(OID, BIGINT) IS
+    '推进 follower_partition_map.applied_part_lsn（单调不回退）。数据面 Raft 组是该列的第一个真实写入方。';

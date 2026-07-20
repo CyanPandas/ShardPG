@@ -152,6 +152,9 @@ PartWAL 接入链路：
 
 目标：将每个 partition replica set 演进为独立 Raft group。
 
+> 具体工程分期、共享内存/日志存储模型、调度器、全局分片身份与"运输定序层 vs
+> 回放应用层"的定位,见 §11《分区级 Raft 组落地方案(2026-07-17)》。本节仅保留方向性描述。
+
 设计方向：
 
 - 每个 partition 独占一个 Raft group，成员为该分区的 primary + secondaries。
@@ -300,6 +303,14 @@ Raft 还需要读取或补齐以下进度接口：
    + `set_config` 传入，无 shell 引号依赖；验证旧 leader 停机期间新 leader 提交的多条
    决议在其回归后被复制并 apply（`max(log_index)` 追平 + `node_map` 终态一致），且保持 follower。
 5. ~~整理节点启停输出噪声~~ 已完成：`run-raft-tests.sh` 的 node_start 前置 pg_isready 探测。
+6. **启动"分区级 Raft 组"工程(阶段 4 落地),详见 §11。** 定位纠正：分区 Raft 组是
+   物理回放的**运输+定序层**,物理回放(redo apply)是骑在其上的应用层,二者互补。
+   可立即推进且不触发物理回放的是 **P0 全局分片身份映射**(小、独立、安全,是其余各期
+   的前提,也是当前控制面跨节点比 `applied_part_lsn` 的隐含前提);P1(Raft 核心组化重构)、
+   P2(数据组复制 + 平凡 apply)为结构性工作;P3(真·物理回放 redo)按用户要求暂不启动。
+   - **P0 已完成(2026-07-17)**:`shard_identity` 映射表 + 5 个解析函数落地 pg_partdist；**P1(Raft 核心组化)与 P2(数据组复制 + 平凡 apply)已完成(2026-07-18)**，回归基线 raft_01–13 共 29/29；至此"物理回放前提"具备，P3 真回放待启动。
+     扩展(全局 id 采用 Citus shardid);回归 `tests/test_shard_identity_p0.sh` 10/10、
+     raft_01–11 仍 27/27。详见 §11.5。
 
 ## 10. shardpg-3.0 集成状态与审查差距(2026-07-12)
 
@@ -356,3 +367,211 @@ raft4 四节点环境为准):
    需要一个全局一致的分片标识与各节点本地 OID 的映射
    (`follower_partition_map.local_relname` 已为此预留)。切主决议与进度比对
    必须基于全局标识,否则跨节点 `applied_part_lsn` 比较无意义。
+
+## 11. 分区级 Raft 组落地方案(2026-07-17)
+
+本节把阶段 4 从"方向性描述"细化为可执行的工程分期,作为后续在 `shardpg-3.0`
+临时环境推进"一个分区 = 一个 Raft 组"的对照文档。所有结论基于 `9ebc091` 的代码盘点。
+
+### 11.1 定位:运输定序层 vs 回放应用层
+
+必须先纠正一个常见误解:**分区 Raft 组不是"垫在物理回放下面的一小步",而是物理回放
+的运输+定序层;物理回放(redo apply)是骑在它上面、消费其已提交条目的应用层。** 二者
+互补,做完前者不会自动得到后者。好处是二者可**解耦验证**:先用"平凡 apply"(follower
+只落盘段文件 + 把 `applied_part_lsn` 当字节游标推进)跑通 Raft 组的复制/定序/多数派提交,
+再把平凡 apply 换成真正的 `rm_redo`。
+
+### 11.2 现状盘点:Raft 侧全是"每节点单例"
+
+分区组的核心改造 = 把下列单例变成"按组 id 索引的集合":
+
+| 当前(单例) | 分区组需要 | 代码位置 |
+|------|------|------|
+| 一个 `RaftConsensusShmem`(单 state/term/leader) | 每组一份 | `raft_consensus.c` 结构体 |
+| 一个 `RaftLogShmem` + `ring[128]` + `peer_*[16]` | 每组一份日志与复制游标 | 同上 |
+| 一个 `pg_raft_hardstate` 文件 | 每组一份 term/voted_for/commit | `RaftHardStateFile` |
+| 一张 `raft_log`(`log_index` 全局 UNIQUE) | 按组分命名空间 | `pg_raft--1.0.sql` |
+| 一个 BGW tick / 一个 `election_deadline` | N 组各自的选举 + 心跳 | `pg_raft_consensus_tick` |
+| `RAFT_PAYLOAD_MAX = 768`(为 JSON 元数据设计) | 数据条目是任意长 WAL 字节流,装不下 | `#define` |
+| `RAFT_LOG_CAPACITY = 128` ring,无截断/无 snapshot install | 多组下被放大,需外部化存储 | 同上 |
+
+### 11.3 有利基础(为什么可行)
+
+- **数据面本就按分区分片**:`pg_parwal/<partition_id>/` 每分区一套段文件、
+  `PartitionWALWriter` 每分区一个写入器、`partition_lsn` 为每分区单调序号
+  (设计上即"该 shard 的 Raft log index")。**每个分区组的日志在 leader 上已物理存在。**
+- **记录格式已是自洽 entry**:`PartWALRecHeader` + 原始 `XLogRecord` 字节,本就为当
+  Raft entry 复制而设计。
+- **算法零件齐全且已验证**:选举(带日志新旧检查)、AppendEntries(`nextIndex/matchIndex`
+  + `prev_log` 一致性)、多数派 `commit_index`、HardState 落盘、更高 term 降级,均已 27/27
+  过。分区组 = 把同一套算法实例化 N 份。
+- **RPC 是无状态 libpq 调用**:`pg_raft_rpc` / `pg_raft_append_entries` 加一个 group 参数
+  是机械改动。
+
+### 11.4 目标架构:两层,不合并
+
+- **控制面 Raft(保留现状,group 0)**:管拓扑、成员集(`partition_map` 的
+  `primary_node/secondary_nodes[]`)、配置/成员变更、故障感知。**不要把控制面本身拆成
+  per-partition。**
+- **数据面 per-partition Raft 组**:成员 = 该分片的副本所在节点集,配置由控制面下发;
+  日志后端 = **parwal 段文件**(不进 shmem ring),shmem 只保存每组的
+  index/commit_index/`peer_next/match_index` 等游标与易失状态。
+- **边界**:分区组的成员/主变更结果仍回写 `partition_map` 并复用现有的切主安全线
+  (`switch_partition_lsn` + `applied_part_lsn` 过滤)。
+
+### 11.5 工程分期
+
+**P0 — 全局分片身份映射(唯一"现在就能做且不碰回放"的基础工作,必须最先落地)** ✅ 已完成 2026-07-17
+- 建立 `global_shard_id ↔ (node_id, local_oid, relfilenode)` 映射;填充
+  `follower_partition_map.local_relname` / 一张分片注册表。
+- 落地(pg_partdist 扩展 `sql/pg_partdist--1.0.sql`):**global_shard_id 直接采用
+  Citus `shardid`**(分片表命名 `<rel>_<shardid>`,`pg_dist_shard` 各节点同步,是天然
+  跨节点一致键)。新增 `partdist.shard_identity(global_shard_id PK, local_oid,
+  relfilenode, local_relname, logical_relid)`、`follower_partition_map.global_shard_id`
+  列,及 5 个函数:`shard_global_id(oid)`、`rebuild_shard_identity()`(幂等,自带剪枝)、
+  `register_shard_identity(oid)`、`local_partition_for_shard(bigint)`、
+  `global_id_for_partition(oid)`。用 Citus `shard_name()` 反查避免解析表名后缀;
+  扫描 `pg_class` 处置 `citus.override_table_visibility=false`(否则分片被 Citus 隐藏)。
+- 回归 `pg-partdist-src/tests/test_shard_identity_p0.sh`:覆盖(各 worker 注册数==本地分片数)、
+  往返(`shard_global_id`↔`local_partition_for_shard` 互逆)、跨节点(reference 表同一
+  shardid 在三 worker 有各异本地 OID、协调节点 NULL)、剪枝,共 10/10;raft_01–11 仍 27/27。
+- 理由:一个分区组的成员是"同一逻辑分片在不同节点上的副本",而各节点用**独立本地 OID**
+  命名它(`pg_parwal/<OID>`);组成员、AppendEntries 寻址、跨节点 `applied_part_lsn` 比较
+  全依赖它。**这也是当前控制面 failover 安全线跨节点比进度的隐含前提。**
+- 验收:同一逻辑分片在四节点上可由全局 id 唯一定位;`applied_part_lsn` 跨节点可比;
+  现有 raft_01–11 全绿(仅新增映射,不改控制面语义)。
+
+**P1 — Raft 核心"组化"重构** ✅ 已完成 2026-07-18
+- 单例结构 → 按 `group_id` 索引的集合：`RaftGroupTable`(定长 `RAFT_MAX_GROUPS=32` 槽位)
+  持有每组一份 `RaftConsensusShmem`(state/term/voted_for/leader_id/election_deadline)与
+  `RaftLogShmem`(ring/commit_index/`peer_next_index`/`peer_match_index`)；所有内部函数
+  改为显式接收 `RaftGroupCtx`，不留任何隐式"当前组"全局量。
+- **group 0 = 控制面**，行为与组化前逐字节一致：HardState 仍写 `$PGDATA/pg_raft_hardstate`
+  (数据组写 `pg_raft_hardstate.<gid>`)，既有 SQL API(`pg_raft_consensus_*`)全部落到 group 0。
+- 日志按组分命名空间：`partdist.raft_log` 增 `group_id` 列，唯一索引由 `(log_index)` 改为
+  `(group_id, log_index)`；新增 `partdist.raft_group` 注册表使数据组重启后可恢复。
+- 每组独立成员集(`members[]`，空=全体 peers)，多数派按本组规模算；非成员节点不参与该组
+  选举/心跳。**follower 首次从 RV/AE 里听说某组时自动建组**，故只需在一个节点建组即可引导。
+- 调度器：单 BGW tick 多路复用全部活跃组(group 0 优先)。§11.6 #2「选举风暴」的两项
+  实测必需对策(都是被回归偶发失败逼出来的)：
+  1. **按对端复用 libpq 连接**(`peer_conn[]`)。组化前每 tick 只有一组、每对端一次
+     `PQconnectdb` 尚可忍受；N 组之后建连次数是 `组数 × 对端数`，握手开销把 tick 周期
+     撑爆，进而拖慢控制面心跳，raft_04/raft_11 这类时序敏感用例开始偶发失败。
+  2. **对端级 RPC 退避**(`peer_backoff_until[]`)：某组撞到不可达对端后，同一窗口内其余
+     组直接跳过该对端，避免 N 组各吃一次 `connect_timeout`。**退避只对心跳/复制生效，
+     选举豁免** —— 候选人少收一票就可能选不出 leader，把无谓等待放大成长时间无主。
+  报文级心跳合并 / 最小堆调度 / 领导权共置仍是后续优化。
+- 新增 SQL：`pg_raft_group_create(gid, members[])` / `pg_raft_group_drop(gid)`(连带删除该组
+  HardState 文件，避免 gid 回收时继承旧 term) / `pg_raft_group_status()` / `pg_raft_group_propose()`；
+  `pg_raft_append_entries` 与 `pg_raft_rpc` 报文各加一个缺省 0 的 group 参数(向后兼容)。
+- 顺带修掉 `pg_raft_shmem_startup` 用整段大小去分配 `pg_raft_leader` 的超额分配。
+- 回归 `test/sql/raft_12_multi_group_isolation.sql`：两个数据组在不同节点各自选出 leader
+  (组间领导权独立)、日志按组隔离(数据组条目不串入 group 0)、非 leader 提交被拒、
+  数据组已提交条目 apply 追平。raft_01–11 全绿。
+
+**已知缺口(留给后续期)**：组成员集只在本节点生效，不随 RPC 传播 —— 自动建组的 follower
+成员集为空(按全体 peers 算多数派)；`pg_raft_group_drop` 也只作用于本节点，对端仍可能把
+该组重新传播回来。由此派生一条**运维/测试上的硬约束**：**不要复用已用过的 group_id** ——
+本节点丢弃后，对端仍记着该组上一轮的 term，用同一 id 重建会得到起始 term 落后于对端记忆
+的新组，选举被反复压制(回归里表现为"组选不出 leader / 条目复制不出去"的偶发失败)。
+为此提供 `pg_raft_group_reset()`(清空本节点全部数据组：shmem 状态 + HardState 文件 +
+注册表 + 日志)，回归用它在每轮开始/结束时归零。成员与组生命周期的正解仍是控制面决议
+下发(§11.6 #3)。
+
+**P2 — 数据组复制 + 平凡 apply(到达"物理回放前提"状态)** ✅ 已完成 2026-07-18
+- **entry = 描述符 + 随行字节**：Raft entry 本身是一条小 JSON 描述符
+  `{"partition_lsn","orig_lsn","rmid","info","xid","nbytes"}`(塞得进 `RAFT_PAYLOAD_MAX`)，
+  真实 WAL 字节作为 `bytea` 参数随同一次 AppendEntries 下发。这样**完整复用**了既有
+  ring / `prev_log` 一致性检查 / 多数派提交 / `raft_log` 持久化，又不必把任意长字节流塞进
+  768 字节 payload(§11.6 #1 的落地形态：字节的权威存储仍是 parwal 段文件，Raft 只搬运)。
+- **先落盘再 ack**：follower 收到条目后，先用 `partdist.partwal_follower_append()` 把字节
+  原样写入**本节点自己的** `pg_parwal/<local_oid>/` 并 fsync，成功才 ack ——
+  故"多数派提交"严格等价于"多数派已持久化"。本节点 local_oid 由 **P0 的
+  `local_partition_for_shard(global_shard_id)`** 解析(各节点 OID 不同，这正是 P0 的用处)。
+- **平凡 apply**：apply 只把 `follower_partition_map.applied_part_lsn` 推进到该条目的
+  `partition_lsn`，**不做 redo**。这是该列**第一个真实的 C 写入方** —— 在此之前它恒为
+  占位 0，切主安全线的跨节点进度比较无从谈起。
+- pg_partdist 新增三个 parwal 边界函数(`src/raft_boundary.c`)：`partwal_read_record()`
+  (leader 按 partition_lsn 读出记录) / `partwal_follower_append()`(follower 原样落盘) /
+  `follower_set_applied_part_lsn()`(单调推进进度，缺列信息从 `shard_identity` 补齐)。
+  pg_raft 新增 `pg_raft_data_propose(group_id, partition_lsn)`。
+- 取字节要 SPI，而 BGW tick 没有 SPI：数据条目只在 client backend 路径(propose /
+  `flush_replication`)下发，tick 对数据组只发心跳；落后的 follower 在下一次 propose 时追平。
+- 回归 `test/sql/raft_13_data_group_replication.sql`(以 Citus reference 表分片为组，
+  三 worker 天然是成员集)：多数派提交、**字节逐字节落到 follower 自己的 pg_parwal**
+  (md5+长度与 leader 一致，实测 1329 字节记录完全相同)、`applied_part_lsn` 真实推进到 1、
+  失去多数派(3 成员停 2)时 `data_propose` 必须返回 0 且进度不推进。
+
+**运输骨架已具备，但"物理回放前提"尚未完全满足**（2026-07-20 审查修正）：分区级 Raft 组
+确实能把真实 parwal 字节复制到多数派、按 log_index 定序、fsync 后才 ack，进度列也由真实
+写入方推进。但下列 5 项**都在运输层**，目前被"平凡 apply 是幂等且单调的"这一性质掩盖，
+一旦换成 redo 就会暴露。**P3 开工前必须先修**：
+
+1. **follower 未采用 leader 的 partition_lsn**（最关键）。`data_entry_store()` 调用
+   `partwal_follower_append()` 时不传描述符里的 `partition_lsn`，follower 侧
+   `AppendPartWALRecord` 用的是本地自增计数器；而 `data_entry_apply()` 写进
+   `applied_part_lsn` 的却是 **leader 的** plsn。两者只在"双方目录都从空开始且全程同步"
+   时才巧合相等（raft_13 正是这种情形，plsn=1）。本节点 demux worker 的任何本地写入、
+   任何重传或孤儿条目都会让两个编号空间永久错位，届时 `applied_part_lsn` 指向的记录
+   在本地并不存在。需让 `partwal_follower_append` 接受并强制 `expected == local_last + 1`。
+2. **follower append 不幂等**。`handle_append_entries` 的"条目已存在"分支会继续落到
+   `data_entry_store()`，leader 因 `peer_next_index` 回退而重传时会写入第二份物理副本。
+   redo 下即双重回放。
+3. **`last_applied` 未持久化**，重启时 `restore_persistent_log_if_needed()` 直接
+   `last_applied = commit_index`。崩溃时"已提交未 apply"的条目重启后被**跳过**而非重放，
+   redo 下就是堆表永久分叉且无告警。需持久化，或从 `applied_part_lsn` 反推。
+4. **apply 与游标推进不原子**。`last_applied = idx` 在锁内先行、`apply_one_entry()` 在锁外
+   后做，apply 失败会被吞掉且不重试，并发 caller 还可能乱序执行 apply 体。
+5. **截断不触达 parwal**。多数派不足时 `discard_uncommitted_entry()` 只回滚 leader 的 ring
+   和 SQL 行，已 ack 的 follower 上那份字节仍留在盘上，本地 LSN 空间被永久占用。
+
+次要项：fsync 失败目前只是 WARNING 仍会 ack（应升为 ERROR）；>256KB 记录走直写分支会绕过
+flush/checkpoint；描述符用 `strstr/sscanf` 解析，畸形时静默取 0。
+
+另需注意：`pg_raft_data_propose()` 目前**只有测试在调用**，尚未接入 demux/写入路径；且数据
+条目只在 propose 路径下发，没有后台追平通道 —— 无 propose 流量时落后 follower 不会自行收敛。
+
+**P3 — 真·物理回放(按用户要求暂不启动)**
+- 把 P2 的平凡 apply 换成 `DecodeXLogRecord → 改写 RelFileLocator → rm_redo`
+  (见 `FOLLOWER_REPLAY_DESIGN.md`);`partwal_notify_primary_switch` 从日志占位升级为
+  真实角色/进度切换。
+- 验收:follower 堆表与 leader 收敛一致;切主后新 primary 拥有切换点前全部已提交数据。
+
+### 11.6 关键设计问题清单(P1/P2 展开时需逐条定稿)
+
+1. **日志存储模型**:数据组 entry = 对 parwal 段文件中某 `partition_lsn` 记录的引用,
+   而非把字节塞进 `RaftLogEntry.payload`(768 上限)。需定义"以 parwal 为 Raft log
+   后端"的读写/截断接口。
+2. **调度与选举风暴**:心跳按对端节点合并;election_deadline 用最小堆;评估领导权共置。
+3. **成员变更**:分区副本集变更走 joint consensus 或"控制面决议 + 数据组配置热更"的等价
+   安全机制,避免脑裂。
+4. **跨分区 2PC**:一个事务跨多个分区组时,prepare/commit 的原子性需与阶段 3 的
+   `OP_PREPARE_DECISION/OP_COMMIT_DECISION` 对齐(独立组下更难,需协调者跨组屏障)。
+5. **崩溃恢复**:每组 HardState 与 parwal checkpoint 的一致性;重启后各组独立恢复。
+
+### 11.7 风险与对策
+
+| 风险 | 对策 |
+|------|------|
+| 单例→N 组是结构性重写,易引入回归 | 控制面保持为 group 0 且行为不变,raft_01–11 作为不回退基线;分期落地 |
+| 上千组心跳/选举风暴 | 心跳按节点合并、最小堆调度、领导权共置 / lease |
+| shmem 随组数膨胀 | 数据组日志外部化到 parwal 段文件,shmem 只留游标 |
+| 全局身份缺失导致跨节点比较无意义 | P0 先行,作为所有后续期的硬前提 |
+| 误把"分区组"当成回放本身 | 明确 P2 用平凡 apply 验证运输层,P3 才做 redo |
+
+### 11.8 测试计划增量(随分期补充)
+
+- P0:全局分片 id 唯一定位 + 跨节点 `applied_part_lsn` 可比;raft_01–11 不回退。
+- P1:N 组独立选举/复制隔离性;单组 leader 切换不影响他组;控制面基线全绿。
+  → 已落地 `raft_12_multi_group_isolation.sql`。
+- P2:数据组多数派提交前客户端不返回成功;follower `applied_part_lsn` 真实推进;
+  未追平副本不得晋升(复用切主安全线,进度改为真值)。
+  → 已落地 `raft_13_data_group_replication.sql`(含字节级一致性与失去多数派的拒写)。
+  回归基线自 27/27 提升为 **29/29**(raft_01–13)。
+- P3:follower 堆表与 leader 一致;切主后数据不丢。
+
+### 11.9 与既有阶段的映射
+
+P0/P1 对应阶段 4 的结构前置;P2 兑现阶段 2→3 过渡中"数据真正流向副本 + 进度真实化";
+P3 兑现阶段 3 的多副本同步语义与 §10 审查差距 #1(主从切换落到数据层)。§10 审查差距
+#3(全局身份)即 P0。
