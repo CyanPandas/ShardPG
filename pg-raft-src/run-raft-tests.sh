@@ -644,6 +644,14 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
       for port in "${RAFT_13_MEMBER_PORTS[@]}"; do
         [[ "$port" != "$RAFT_13_LEADER" ]] && RAFT_13_FOLLOWER="$port" && break
       done
+      # 夹具校正：reference 表在**每个**节点都是本地主写，follower 的
+      # pg_parwal/<oid>/ 里已有它自己 demux 产出的 plsn 1..N。而真实架构下
+      # 一个节点对某分区要么是 primary 要么是 secondary，secondary 不会本地
+      # 产出该分区的 WAL。这里把 follower 该分片的本地记录清空，模拟"纯
+      # secondary"，否则 leader 的 plsn=1 会撞上 follower 自己的 plsn=1。
+      # （顺带验证新增的 partwal_truncate_to。）
+      $PSQL -p "$RAFT_13_FOLLOWER" -U postgres -tAc \
+        "SELECT partdist.partwal_truncate_to(partdist.local_partition_for_shard(${RAFT_13_GID}), 0);" &>/dev/null || true
       RAFT_13_BEFORE=$($PSQL -p "$RAFT_13_FOLLOWER" -U postgres -tAc \
         "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${RAFT_13_GID}));" 2>/dev/null || echo 0)
       RAFT_13_MD5=$($PSQL -p "$RAFT_13_LEADER" -U postgres -tAc \

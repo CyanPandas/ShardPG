@@ -502,7 +502,8 @@ raft4 四节点环境为准):
   (md5+长度与 leader 一致，实测 1329 字节记录完全相同)、`applied_part_lsn` 真实推进到 1、
   失去多数派(3 成员停 2)时 `data_propose` 必须返回 0 且进度不推进。
 
-**运输骨架已具备，但"物理回放前提"尚未完全满足**（2026-07-20 审查修正）：分区级 Raft 组
+**运输骨架已具备，但"物理回放前提"尚未完全满足**（2026-07-20 审查修正；下列 5 项已在
+同日的"运输层加固"中全部落地，见 §11.5.1）：分区级 Raft 组
 确实能把真实 parwal 字节复制到多数派、按 log_index 定序、fsync 后才 ack，进度列也由真实
 写入方推进。但下列 5 项**都在运输层**，目前被"平凡 apply 是幂等且单调的"这一性质掩盖，
 一旦换成 redo 就会暴露。**P3 开工前必须先修**：
@@ -530,6 +531,66 @@ flush/checkpoint；描述符用 `strstr/sscanf` 解析，畸形时静默取 0。
 
 另需注意：`pg_raft_data_propose()` 目前**只有测试在调用**，尚未接入 demux/写入路径；且数据
 条目只在 propose 路径下发，没有后台追平通道 —— 无 propose 流量时落后 follower 不会自行收敛。
+
+#### 11.5.1 运输层加固(2026-07-20 完成，回归 29/29)
+
+上面 5 项 + fsync 语义已全部落地。**架构前提(务必先读)**：集群由多个工作节点构成，
+数据划分为若干逻辑分区并分布部署；**每个节点同时是部分分区的 primary、又是另一些分区的
+secondary**。因此没有全局"主节点"，数据面领导权是**按分区**的；只有控制面(组 0)有唯一
+leader。下面每一条都是这个前提逼出来的。
+
+1. **follower 按 leader 指定的 partition_lsn 落盘**。`partwal_follower_append` 增加
+   `p_partition_lsn` 参数，写入器新增 `AppendPartWALRecordAt()`：
+   `expected == last+1` 正常写；`expected <= last` **幂等 no-op**(重传去重)；
+   `expected > last+1` **ERROR**(不留空洞，让 leader 回退补齐)。
+   原先 follower 用本地自增计数器，而 `applied_part_lsn` 存的是 leader 的编号，
+   两个编号空间只在"双方目录都从空开始"时巧合相等。
+2. **重传幂等**：leader 因 `peer_next_index` 回退而重发时不再写入第二份物理副本。
+3. **`last_applied` 随 hardstate 持久化**(文件 v2，兼容读 v1)；重启不再无条件
+   `last_applied = commit_index`。此前崩溃时"已提交未 apply"的条目会被**跳过**，
+   redo 下即堆表静默分叉。
+4. **apply 与游标推进原子化**：`apply_in_progress` 串行化，游标只在 apply 成功后推进，
+   失败下轮重试。**控制面刻意保持旧语义(失败也推进)** —— 控制面写的是幂等元数据表，
+   一条永久失败的 payload 若卡住游标会让整个 failover 通道停摆，代价远大于漏一条；
+   数据面相反，漏一条 redo 就是分叉，所以必须重试。
+5. **截断触达 parwal**：新增 `TruncatePartWALTo()` / `partwal_truncate_to()`，
+   Raft 日志截断(多数派不足丢弃、AppendEntries 冲突)时同步截断字节。
+   必要性：切主后新 leader 会把**不同的**记录写到同一个 partition_lsn 上，旧字节若滞留，
+   第 1 条的幂等去重反而会保留错误内容。
+6. **fsync 失败由 WARNING 升为 ERROR**；并修复超过缓冲区(256KB)的记录走直写分支时
+   `FlushPartitionWALWriter` 因 `buf_used == 0` 提前返回、导致既不 fsync 也不更新
+   checkpoint(陈旧 checkpoint 会重新发放同一个 partition_lsn)的问题。
+
+**加固过程中暴露的夹具错误(重要)**：raft_13 原先用 Citus **reference 表**做夹具。
+reference 表在**每个**节点都是本地主写，follower 的 `pg_parwal/<oid>/` 里已有它自己
+demux 产出的记录，与"leader 的 plsn=1"直接相撞。旧代码"通过"是假阳性——follower 把
+leader 的字节追加到**另一个编号**上，再从那个编号读回来比 md5，测的是"我刚写的字节等于
+我刚写的字节"。真实架构下不会有此冲突(对某分区要么 primary 要么 secondary，secondary
+不本地产出该分区 WAL)，故夹具改为先 `partwal_truncate_to(oid, 0)` 清空 follower 的本地
+记录以模拟"纯 secondary"。**结论：reference 表不适合做数据组夹具**，后续应改用真正的
+"一主多从"分片放置。
+
+#### 11.5.2 P3 之前仍未解决的架构级阻断项
+
+以下**不属于运输层**，但同样是物理回放的前提，且都与"一节点多角色"直接冲突：
+
+1. **xid 与 clog 冲突(最硬)**。见 `FOLLOWER_REPLAY_DESIGN.md` §9：重放后 tuple 的
+   `xmin/xmax` 是 **leader 的 xid**，而 clog 是**节点全局**共享的。各分区 leader 独立
+   分配 xid ⇒ 一个节点托管来自**不同 leader** 的多个分区副本时，相同 xid 会在本地 clog
+   相撞(A 组已提交、B 组同值已回滚，只能记一个)。FRD 明确写着"方案 A(集群统一 xid 区间
+   批发)落地前，多 shard 共存于一个 follower 的配置**不可上线**"——**而这正是本架构的
+   默认形态**。必须先做集群级 xid 区间租约。
+2. **`RAFT_MAX_GROUPS = 32`**：每节点最多 31 个数据组，与"每节点托管几十上百分区"直接
+   冲突。单纯调大会让 shmem 随组数线性膨胀(每组一个 128 条 × 768B 的 ring)，正确解法是
+   §11.8 已列的"数据组日志外部化到 parwal 段文件，shmem 只留游标"。
+3. **组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按**全体 peers** 算多数派。
+   分区副本集是全体节点的**子集**，所以这在真实拓扑下算出的多数派是错的。成员集必须来自
+   控制面下发的 `partition_map`，而不是"从收到的报文里听说"。
+4. **单 BGW tick 多路复用全部组**：数据组数量会挤占控制面心跳(实测已导致 raft_04/11
+   偶发失败，当前靠连接复用 + 退避缓解)。组数上去后需要报文级心跳合并 + 最小堆调度。
+5. **两份 `FOLLOWER_REPLAY_DESIGN.md` 已分叉**：临时环境(3.0)里是 16KB 旧版，主仓库
+   工作区里是 28KB v2(含 §9 xid 分析)。P3 开工前必须先合并，否则设计依据不一致。
+6. FRD 仍以本节点 OID(`partition_id`)为 shard 主键，未与 P0 的 `global_shard_id` 对齐。
 
 **P3 — 真·物理回放(按用户要求暂不启动)**
 - 把 P2 的平凡 apply 换成 `DecodeXLogRecord → 改写 RelFileLocator → rm_redo`

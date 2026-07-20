@@ -56,7 +56,14 @@
 #define RAFT_OP_LEN        32
 #define RAFT_PAYLOAD_MAX   768
 #define RAFT_HARDSTATE_MAGIC   UINT32_C(0x52484654)
-#define RAFT_HARDSTATE_VERSION 1
+/*
+ * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
+ * 避免升级时丢掉 current_term/voted_for 造成任期回退。
+ */
+#define RAFT_HARDSTATE_VERSION 2
+#define RAFT_HARDSTATE_VERSION_MIN 1
+/* v1 布局 = v2 去掉末尾的 last_applied，用 offsetof 取以免手算漏掉结构体填充 */
+#define RAFT_HARDSTATE_V1_SIZE  offsetof(RaftHardStateFile, last_applied)
 
 /* group 0 = 控制面；其余为数据面分区组 */
 #define RAFT_CONTROL_GROUP  INT64CONST(0)
@@ -89,6 +96,7 @@ typedef struct RaftLogShmem
     int64        peer_next_index[RAFT_MAX_PEERS];
     int64        peer_match_index[RAFT_MAX_PEERS];
     bool         repl_inited;
+    bool         apply_in_progress;  /* 串行化 apply，保证 N 先于 N+1 生效 */
     RaftLogEntry ring[RAFT_LOG_CAPACITY];
 } RaftLogShmem;
 
@@ -138,6 +146,7 @@ typedef struct RaftHardStateFile
     int64  current_term;
     int32  voted_for;
     int64  commit_index;
+    int64  last_applied;
 } RaftHardStateFile;
 
 bool  pg_raft_raft_enabled = false;
@@ -228,6 +237,7 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.commit_index = 0;
     g->log.last_applied = 0;
     g->log.repl_inited = false;
+    g->log.apply_in_progress = false;
 }
 
 void
@@ -513,10 +523,18 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
         return false;
 
     initStringInfo(&sql);
+    /*
+     * 必须把 leader 指定的 partition_lsn 一并传下去：follower 按该编号落盘，
+     * 否则本地自增计数器会和 leader 的编号空间错位（本节点同一 pg_parwal 树下
+     * 还有它作为 primary 的本地 demux 写入），applied_part_lsn 将指向本地
+     * 不存在的记录。
+     */
     appendStringInfo(&sql,
                      "SELECT partdist.partwal_follower_append("
-                     "%u::oid, %s::pg_lsn, %d, %d, %lld::bigint, decode(%s, 'hex'))",
+                     "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %lld::bigint, "
+                     "decode(%s, 'hex'))",
                      (unsigned) local_oid,
+                     (long long) entry_partition_lsn(payload),
                      quote_literal_cstr(orig_lsn),
                      rmid, info, xid,
                      quote_literal_cstr(data_hex != NULL ? data_hex : ""));
@@ -535,15 +553,55 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
  * partition_lsn。这补上了 follower_partition_map.applied_part_lsn 长期
  * "有表无写入方"的缺口，切主安全线从此比的是真实进度而非占位 0。
  */
-static void
+static bool
 data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
 {
     StringInfoData sql;
     bool           spi_owned;
     int64          plsn = entry_partition_lsn(e->payload);
     int64          local_oid;
+    bool           ok;
 
     if (plsn <= 0)
+        return true;            /* 无进度可推，视为已应用 */
+
+    local_oid = group_local_partition(ctx);
+    if (local_oid <= 0)
+        return false;           /* P0 映射还没建好，重试而不是跳过 */
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;           /* 拿不到 SPI（如 BGW），下轮再来 */
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
+                     (unsigned) local_oid, (long long) plsn);
+    ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return ok;
+}
+
+/*
+ * 数据组的 Raft 日志截断必须同步截断 parwal 字节。
+ *
+ * 否则：被截断条目的字节仍留在本节点 pg_parwal 里占着某个 partition_lsn，
+ * 而切主后新 leader 会把**不同的**记录写到同一个编号上；此时
+ * AppendPartWALRecordAt 的重传去重（expected <= last 即跳过）反而会保留旧
+ * 字节，物理回放就会重放错误内容。
+ *
+ * keep_upto_plsn 取"截断后仍保留的最后一条数据条目的 partition_lsn"。
+ */
+static void
+data_group_truncate_parwal(RaftGroupCtx *ctx, int64 keep_upto_plsn)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int64          local_oid;
+
+    if (ctx->group_id == RAFT_CONTROL_GROUP)
+        return;
+    if (keep_upto_plsn < 0)
         return;
 
     local_oid = group_local_partition(ctx);
@@ -555,8 +613,8 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
-                     (unsigned) local_oid, (long long) plsn);
+                     "SELECT partdist.partwal_truncate_to(%u::oid, %lld)",
+                     (unsigned) local_oid, (long long) keep_upto_plsn);
     (void) SPI_execute(sql.data, false, 1);
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
@@ -575,7 +633,7 @@ hard_state_path(RaftGroupCtx *ctx, char *path, size_t pathlen)
 
 static bool
 persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
-                          int64 commit_index)
+                          int64 commit_index, int64 last_applied)
 {
     char              path[MAXPGPATH];
     char              tmppath[MAXPGPATH];
@@ -591,6 +649,7 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     hs.current_term = current_term;
     hs.voted_for = voted_for;
     hs.commit_index = commit_index;
+    hs.last_applied = last_applied;
 
     fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0)
@@ -634,6 +693,7 @@ persist_hard_state_unlocked(RaftGroupCtx *ctx)
     int64 current_term;
     int   voted_for;
     int64 commit_index;
+    int64 last_applied;
 
     SpinLockAcquire(&ctx->cons->mutex);
     current_term = ctx->cons->current_term;
@@ -642,9 +702,11 @@ persist_hard_state_unlocked(RaftGroupCtx *ctx)
 
     SpinLockAcquire(&ctx->log->mutex);
     commit_index = ctx->log->commit_index;
+    last_applied = ctx->log->last_applied;
     SpinLockRelease(&ctx->log->mutex);
 
-    (void) persist_hard_state_values(ctx, current_term, voted_for, commit_index);
+    (void) persist_hard_state_values(ctx, current_term, voted_for, commit_index,
+                                     last_applied);
 }
 
 static void
@@ -665,16 +727,28 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
     if (fd < 0)
         return;
 
+    memset(&hs, 0, sizeof(hs));
     nread = read(fd, &hs, sizeof(hs));
     close(fd);
 
-    if (nread != (ssize_t) sizeof(hs) ||
+    /*
+     * v1 文件比 v2 短一个 int64，只能按 v1 的长度读到。先做长度/魔数/版本
+     * 校验，通过之后再决定 last_applied 是否可信 —— 顺序反了就会读到未初始化
+     * 内存。memset 保证 v1 情况下 last_applied 天然为 0。
+     */
+    if (nread < (ssize_t) RAFT_HARDSTATE_V1_SIZE ||
         hs.magic != RAFT_HARDSTATE_MAGIC ||
-        hs.version != RAFT_HARDSTATE_VERSION)
+        hs.version < RAFT_HARDSTATE_VERSION_MIN ||
+        hs.version > RAFT_HARDSTATE_VERSION ||
+        (hs.version >= RAFT_HARDSTATE_VERSION &&
+         nread != (ssize_t) sizeof(hs)))
     {
         elog(WARNING, "pg_raft: 忽略损坏的 hardstate 文件 \"%s\"", path);
         return;
     }
+
+    if (hs.version < RAFT_HARDSTATE_VERSION)
+        hs.last_applied = 0;    /* v1 没有该字段，退化为"从 0 起重放" */
 
     SpinLockAcquire(&ctx->cons->mutex);
     if (hs.current_term > ctx->cons->current_term)
@@ -685,6 +759,8 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
     SpinLockAcquire(&ctx->log->mutex);
     if (hs.commit_index > ctx->log->commit_index)
         ctx->log->commit_index = hs.commit_index;
+    if (hs.last_applied > ctx->log->last_applied)
+        ctx->log->last_applied = hs.last_applied;
     if (ctx->log->last_applied > ctx->log->commit_index)
         ctx->log->last_applied = ctx->log->commit_index;
     SpinLockRelease(&ctx->log->mutex);
@@ -838,13 +914,25 @@ log_truncate_after_locked(RaftGroupCtx *ctx, int64 index)
  * 控制面（group 0）走 partdist 元数据表；数据组的 apply 在 P2 落地（平凡 apply：
  * 只落盘段文件 + 推进 applied_part_lsn），P1 阶段仅推进 last_applied 游标。
  */
-static void
+static bool
 apply_one_entry(RaftGroupCtx *ctx, const RaftLogEntry *e)
 {
     if (ctx->group_id == RAFT_CONTROL_GROUP)
-        (void) pg_raft_apply_payload_sql(e->op_type, e->payload);
-    else if (strcmp(e->op_type, RAFT_OP_PARWAL) == 0)
-        data_entry_apply(ctx, e);
+    {
+        /*
+         * 控制面**保持组化前的语义：失败也推进游标**。这里刻意不做重试 ——
+         * 控制面 apply 写的是幂等的 partdist 元数据表，而一条永久失败的
+         * payload 若卡住游标，整个 failover 通道都会停摆，代价远大于漏一条。
+         * 数据面相反：漏一条 redo 就是堆表分叉，所以下面必须重试。
+         */
+        if (!pg_raft_apply_payload_sql(e->op_type, e->payload))
+            elog(WARNING, "pg_raft: 控制面条目 %s 应用失败，按原语义跳过",
+                 e->op_type);
+        return true;
+    }
+    if (strcmp(e->op_type, RAFT_OP_PARWAL) == 0)
+        return data_entry_apply(ctx, e);
+    return true;        /* 组内的非数据条目（如 OP_TEST）无副作用 */
 }
 
 static void
@@ -1063,11 +1151,15 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
         ctx->log->last_applied = ctx->log->commit_index;
 
     /*
-     * Metadata tables are durable too. Avoid replaying old committed entries
-     * on every restart; missed entries are still appended by the current leader
-     * through AppendEntries and then applied normally.
+     * 这里**不能**再无条件 last_applied = commit_index。
+     *
+     * 原逻辑假定"元数据表也是持久的，重放没必要"。对控制面成立，对数据面不成立：
+     * 崩溃时"已提交但未 apply"的条目重启后会被直接跳过而非重放，物理回放下就是
+     * 堆表永久分叉且无任何告警。last_applied 现在随 hardstate 持久化（v2），
+     * 由 restore_hard_state_if_needed() 恢复，这里只做不越界的钳制。
      */
-    ctx->log->last_applied = ctx->log->commit_index;
+    if (ctx->log->last_applied > ctx->log->commit_index)
+        ctx->log->last_applied = ctx->log->commit_index;
     SpinLockRelease(&ctx->log->mutex);
 
     raft_persist_spi_end(spi_owned);
@@ -1083,10 +1175,17 @@ group_apply_pending(RaftGroupCtx *ctx)
     for (;;)
     {
         int64 idx;
+        bool  applied_ok;
 
         SpinLockAcquire(&ctx->log->mutex);
         if (ctx->log->last_applied >= ctx->log->commit_index)
         {
+            SpinLockRelease(&ctx->log->mutex);
+            break;
+        }
+        if (ctx->log->apply_in_progress)
+        {
+            /* 另一个 backend 正在 apply 本组，交给它按序做完 */
             SpinLockRelease(&ctx->log->mutex);
             break;
         }
@@ -1096,10 +1195,26 @@ group_apply_pending(RaftGroupCtx *ctx)
             SpinLockRelease(&ctx->log->mutex);
             break;
         }
-        ctx->log->last_applied = idx;
+        ctx->log->apply_in_progress = true;
         SpinLockRelease(&ctx->log->mutex);
 
-        apply_one_entry(ctx, &e);
+        /*
+         * **游标只在 apply 成功之后才推进**。原先是先推进再 apply，一旦
+         * apply 抛错或进程在两者之间死掉，这条就被永久标记为已应用却从未
+         * 生效；物理回放下这等于静默丢一条 redo。
+         */
+        applied_ok = apply_one_entry(ctx, &e);
+
+        SpinLockAcquire(&ctx->log->mutex);
+        ctx->log->apply_in_progress = false;
+        if (applied_ok && ctx->log->last_applied < idx)
+            ctx->log->last_applied = idx;
+        SpinLockRelease(&ctx->log->mutex);
+
+        if (!applied_ok)
+            break;      /* 下一轮 tick 重试同一条 */
+
+        persist_hard_state_unlocked(ctx);
     }
 }
 
@@ -1895,7 +2010,8 @@ flush_replication(RaftGroupCtx *ctx, int64 idx, int64 term)
 static void
 discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
 {
-    int i;
+    int   i;
+    int64 drop_plsn = -1;
 
     if (idx <= 0)
         return;
@@ -1903,6 +2019,13 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     SpinLockAcquire(&ctx->log->mutex);
     if (idx > ctx->log->commit_index && idx == ctx->log->last_log_index)
     {
+        RaftLogEntry *dropped = log_slot(ctx, idx);
+
+        /* 记下被丢弃条目的 partition_lsn，出锁后据此截断 parwal */
+        if (dropped->index == idx &&
+            strcmp(dropped->op_type, RAFT_OP_PARWAL) == 0)
+            drop_plsn = entry_partition_lsn(dropped->payload);
+
         log_truncate_after_locked(ctx, idx - 1);
         for (i = 0; i < RAFT_MAX_PEERS; i++)
         {
@@ -1913,6 +2036,10 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
         }
     }
     SpinLockRelease(&ctx->log->mutex);
+
+    /* 日志截断了，字节也必须跟着截断（SPI 不能在自旋锁内做） */
+    if (drop_plsn > 0)
+        data_group_truncate_parwal(ctx, drop_plsn - 1);
 
     delete_log_entry_sql(ctx, idx);
     persist_hard_state_unlocked(ctx);
@@ -2091,6 +2218,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     RaftLogEntry prev;
     bool         has_entry = (entry_idx > 0 && entry_op != NULL && entry_payload != NULL);
     int64        commit_to_mark;
+    int64        conflict_plsn = -1;
 
     *success = 0;
     restore_hard_state_if_needed(ctx);
@@ -2137,7 +2265,11 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                 (exist->term != entry_term ||
                  strcmp(exist->op_type, entry_op) != 0 ||
                  strcmp(exist->payload, entry_payload) != 0))
+            {
+                if (strcmp(exist->op_type, RAFT_OP_PARWAL) == 0)
+                    conflict_plsn = entry_partition_lsn(exist->payload);
                 log_truncate_after_locked(ctx, entry_idx - 1);
+            }
         }
         if (entry_idx == ctx->log->last_log_index + 1)
         {
@@ -2168,6 +2300,14 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     advance_commit_index_locked(ctx, leader_commit);
     commit_to_mark = ctx->log->commit_index;
     SpinLockRelease(&ctx->log->mutex);
+
+    /*
+     * 日志冲突截断后，必须**先**把 parwal 里对应的字节也截掉，再写新字节。
+     * 否则新 leader 复用同一个 partition_lsn 写入不同记录时，去重逻辑会把
+     * 旧字节当成"已落盘"而跳过，物理回放就会重放被截断的内容。
+     */
+    if (conflict_plsn > 0)
+        data_group_truncate_parwal(ctx, conflict_plsn - 1);
 
     /*
      * 数据组：**先把字节落盘 fsync，再 ack**。落盘失败就不 ack，leader 便无法

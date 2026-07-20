@@ -65,6 +65,29 @@ extern void AppendPartWALRecord(PartitionWALWriter *writer,
                                 TransactionId xid);
 
 /*
+ * AppendPartWALRecordAt — 按指定 partition_lsn 落盘（数据面 Raft follower 用）。
+ * expected == 0 等价于 AppendPartWALRecord（本地自增）。
+ * expected <= 本地已有 → 幂等 no-op 返回 false；出现空洞 → ERROR。
+ */
+extern bool AppendPartWALRecordAt(PartitionWALWriter *writer,
+                                  uint64 expected_partition_lsn,
+                                  XLogRecPtr orig_lsn,
+                                  uint8 rmid,
+                                  uint8 info,
+                                  const char *raw_data,
+                                  uint32 data_len,
+                                  TransactionId xid);
+
+/*
+ * TruncatePartWALTo — 丢弃 partition_lsn > keep_upto_plsn 的记录并回退
+ * checkpoint。Raft 日志截断时必须同步调用，否则被截断条目的字节会滞留，
+ * 而新 leader 会把不同记录写到同一个 partition_lsn 上。
+ */
+extern bool TruncatePartWALTo(Oid partition_id,
+                              RelFileNumber relfilenode,
+                              uint64 keep_upto_plsn);
+
+/*
  * FlushPartitionWALWriter — write buffered data to disk.
  * If with_fsync is true, also calls pg_fsync() and updates the checkpoint file.
  */

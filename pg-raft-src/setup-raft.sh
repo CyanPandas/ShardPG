@@ -22,6 +22,9 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT,
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
 DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.partwal_follower_append(OID, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
+DROP FUNCTION IF EXISTS partdist.partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
+DROP FUNCTION IF EXISTS partdist.partwal_truncate_to(OID, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset();
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset_internal();
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_status();
@@ -113,11 +116,16 @@ CREATE OR REPLACE FUNCTION partdist.partwal_read_record(
     OUT xid BIGINT, OUT data BYTEA)
     RETURNS record LANGUAGE c STRICT STABLE
     AS 'pg_partdist', 'pg_partdist_partwal_read_record';
+-- 运输层加固：follower 按 leader 指定的 partition_lsn 落盘（多了一个参数）
 CREATE OR REPLACE FUNCTION partdist.partwal_follower_append(
-    p_partition_id OID, p_orig_lsn PG_LSN, p_rmid INTEGER,
-    p_info INTEGER, p_xid BIGINT, p_data BYTEA)
+    p_partition_id OID, p_partition_lsn BIGINT, p_orig_lsn PG_LSN,
+    p_rmid INTEGER, p_info INTEGER, p_xid BIGINT, p_data BYTEA)
     RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_follower_append';
+CREATE OR REPLACE FUNCTION partdist.partwal_truncate_to(
+    p_partition_id OID, p_keep_upto_part_lsn BIGINT)
+    RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
+    AS 'pg_partdist', 'pg_partdist_partwal_truncate_to';
 CREATE OR REPLACE FUNCTION partdist.follower_set_applied_part_lsn(
     p_partition_id OID, p_applied_part_lsn BIGINT)
     RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE

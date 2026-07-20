@@ -132,6 +132,7 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_read_record);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_follower_append);
 PG_FUNCTION_INFO_V1(pg_partdist_follower_set_applied_part_lsn);
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_truncate_to);
 
 /*
  * 在 pg_parwal/<partition_id>/ 的段文件里定位 partition_lsn == target 的记录。
@@ -278,13 +279,13 @@ Datum
 pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 {
 	Oid					partition_id = PG_GETARG_OID(0);
-	XLogRecPtr			orig_lsn = PG_GETARG_LSN(1);
-	int32				rmid = PG_GETARG_INT32(2);
-	int32				info = PG_GETARG_INT32(3);
-	int64				xid = PG_GETARG_INT64(4);
-	bytea			   *data = PG_GETARG_BYTEA_PP(5);
+	int64				partition_lsn = PG_GETARG_INT64(1);
+	XLogRecPtr			orig_lsn = PG_GETARG_LSN(2);
+	int32				rmid = PG_GETARG_INT32(3);
+	int32				info = PG_GETARG_INT32(4);
+	int64				xid = PG_GETARG_INT64(5);
+	bytea			   *data = PG_GETARG_BYTEA_PP(6);
 	PartitionWALWriter *writer;
-	uint64				written_lsn;
 
 	/*
 	 * relfilenode 只用于 checkpoint 记账；follower 侧沿用 partition_id 本身，
@@ -296,20 +297,45 @@ pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 				(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
 						partition_id)));
 
-	AppendPartWALRecord(writer,
-						orig_lsn,
-						(uint8) rmid,
-						(uint8) info,
-						VARDATA_ANY(data),
-						(uint32) VARSIZE_ANY_EXHDR(data),
-						(TransactionId) xid);
+	/*
+	 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。
+	 *
+	 * 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一个
+	 * pg_parwal 目录树下既有本地 demux 写入、也有 follower 收到的复制流。
+	 * 若 follower 用本地计数器，编号空间会和 leader 的永久错位，
+	 * applied_part_lsn 指向的记录在本地根本不存在。
+	 *
+	 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
+	 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
+	 */
+	(void) AppendPartWALRecordAt(writer,
+								 (uint64) partition_lsn,
+								 orig_lsn,
+								 (uint8) rmid,
+								 (uint8) info,
+								 VARDATA_ANY(data),
+								 (uint32) VARSIZE_ANY_EXHDR(data),
+								 (TransactionId) xid);
 
 	/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
 	FlushPartitionWALWriter(writer, true);
-	written_lsn = writer->last_partition_lsn;
 	DestroyPartitionWALWriter(writer);
 
-	PG_RETURN_INT64((int64) written_lsn);
+	PG_RETURN_INT64(partition_lsn);
+}
+
+/*
+ * partwal_truncate_to — 供数据面 Raft 日志截断时同步截断 parwal。
+ */
+Datum
+pg_partdist_partwal_truncate_to(PG_FUNCTION_ARGS)
+{
+	Oid		partition_id = PG_GETARG_OID(0);
+	int64	keep_upto = PG_GETARG_INT64(1);
+
+	PG_RETURN_BOOL(TruncatePartWALTo(partition_id,
+									 (RelFileNumber) partition_id,
+									 (uint64) keep_upto));
 }
 
 Datum
