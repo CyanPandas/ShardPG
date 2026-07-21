@@ -2,56 +2,125 @@
 
 ## 1. 计划定位
 
-本计划用于替代旧的“pgraft spike + 控制面 MVP”路线，作为后续 `/home/pxr/pg-citus-cluster` 项目修改的对照文档。
+本计划用于替代旧的“pgraft spike + 控制面 MVP”路线，作为 `CyanPandas/ShardPG` 分支
+`shardpg-3.0`（raft4 四节点临时环境）的对照文档。文中凡出现 `/home/pxr/pg-citus-cluster`
+路径或“3 节点”拓扑之处，均为 2026-07-12 之前的历史环境描述，**一律以 shardpg-3.0 的
+四节点环境为准**（master:5432 + worker1-3:5433-5435，多数派 3/4）。
 
-当前主线不再恢复 pgElephant/pgraft Go bridge，而是继续推进项目内已有的纯 C `pg_raft`。`pg_partdist` 已同步到师兄 `CyanPandas/ShardPG` 的 `shardpg-2.0` 进度，后续 Raft 只做控制面共识、切主决议和与新版 PartWAL 进度/回放机制的对接，不另起一套重复的数据面复制框架。
+当前主线不再恢复 pgElephant/pgraft Go bridge，而是继续推进项目内已有的纯 C `pg_raft`。
 
-核心要求：主从切换不能只更新 `partition_map`。新的 primary 必须经由 Raft 多数派选举或多数派决议产生，并且必须拥有切换点之前的全部已提交分区日志或等价的 PartWAL 回放进度证明。
+**定位已于 2026-07-17 修订（§11）**：早期版本写的是“Raft 只做控制面共识、切主决议，不另起
+数据面复制框架”。自 P1/P2 落地后不再成立 —— Raft 现在是**两层**：控制面（组 0）管拓扑与
+决议，数据面**每分区一个 Raft 组**负责该分区 parwal 字节的复制与定序。这不是“重复造一套
+数据面”，而是把 `pg_parwal/<partition>/` 里**已经存在**的每分区单调日志直接当作该组的
+Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §11.1。
 
-## 2. 当前项目状态
+核心要求：主从切换不能只更新 `partition_map`。新的 primary 必须经由 Raft 多数派选举或多数派
+决议产生，并且必须拥有切换点之前的全部已提交分区日志或等价的 PartWAL 回放进度证明。
 
-已具备：
+## 2. 当前项目状态（2026-07-20，提交 `d06c821`）
 
-- `pg_raft` 已支持 3 节点配置，`raft_enabled=on` 可直接启用。
-- 当前控制面已具备 RequestVote、随机 election timeout、心跳、AppendEntries、`raft_log`、`raft_snapshot`、TopologyMonitor 和 failover 演示。
-- `pg_partdist` 已同步到 `shardpg-2.0`，具备 `node_map` / `partition_map`、写路由、PartWALHeader、`partwal_sync` 同步写入路径、Demux crash-recovery/flush 辅助能力和 `pg_parwal/N` 分区日志目录。
-- 新版 `pg_partdist` 已引入 `follower_partition_map(partition_id, local_relname, applied_part_lsn)`，作为 follower 回放进度的元数据基础。
-- 新版设计文档 `pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md` 明确 follower 侧倾向复用 PostgreSQL redo 机制回放 per-shard PartWAL 物理日志流。
-- `README-RAFT.md`、`setup-raft.sh`、`run-tests.sh`、`docs/interfaces/partwalmgr_raft.idl` 是后续保留并更新的主线文件。
+### 2.1 架构前提（后续所有设计必须遵守）
 
-当前缺口：
+集群由多个工作节点构成，数据被划分为若干逻辑分区（Partition）并在节点间分布式部署。
+**每个工作节点同时承担多重职责：既是部分分区的主副本（Primary Replica），也是另一些分区的
+从副本（Secondary Replica）。** 由此推出三条硬约束，贯穿全文：
 
-- RequestVote 已开始携带 `last_log_index` / `last_log_term` 并做日志新旧检查，但还需要多节点故障场景回归验证。
-- HardState（`current_term`、`voted_for`、`commit_index`）已有本地文件持久化路径，已修正持 spinlock 写 hardstate 的不安全路径；还需要补充崩溃恢复和“先持久化，再响应”的专门回归测试。
-- `raft_snapshot` 目前更像元数据快照，还不是完整的 Raft InstallSnapshot 机制。
-- `OP_PARTITION_PRIMARY` 已开始携带 `old_primary_node`、`switch_partition_lsn`、`switch_orig_lsn`，并已接入最小 follower `applied_part_lsn` 候选过滤；后续还需要把该进度与真实 follower replay / ACK 链路打通。
-- 新版 PartWAL 已有同步写入路径和 follower 回放进度表雏形，但 Raft 尚未接入 `applied_part_lsn` / ACK / 切主通知。
+1. **不存在全局“主节点”。** 数据面领导权是**按分区**的；只有控制面（组 0）有唯一 leader。
+   任何“本节点是不是 leader”的判断都必须带上分区/组限定。
+2. **一个节点会同时托管来自不同 leader 的多个分区副本。** 所有节点级共享资源（clog、xid
+   空间、shmem 组表、BGW tick 预算）都会成为跨分区的争用点 —— §11.5.2 的阻断项全部源于此。
+3. **对某个给定分区，一个节点要么是 primary 要么是 secondary，不会两者皆是。** secondary
+   不会本地产出该分区的 WAL，因此该分区的 `partition_lsn` 编号空间在副本上只由 leader 指定
+   （这是运输层加固第 1 条的依据，也是 raft_13 夹具曾经出错的原因，见 §11.5.1）。
+
+### 2.2 已具备
+
+- **控制面（组 0）**：RequestVote（带 `last_log_index/last_log_term` 日志新旧检查）、随机
+  election timeout、心跳、AppendEntries（`nextIndex/matchIndex` + `prev_log` 一致性）、
+  多数派 `commit_index`、HardState 落盘、更高 term 降级、TopologyMonitor 与 failover 决议。
+- **切主安全线**：`OP_PARTITION_PRIMARY` 携带 `old_primary_node/switch_partition_lsn/
+  switch_orig_lsn`；切换点优先远程读旧 primary 的真实 flush 进度，候选人取追平者中
+  `applied_part_lsn` 最大者，未追平副本不得晋升。
+- **全局分片身份（P0）**：`partdist.shard_identity` 以 Citus `shardid` 为
+  `global_shard_id`，可把一个组 id 解析为各节点各自的本地 OID，跨节点 `applied_part_lsn`
+  比较自此才有意义。
+- **分区级 Raft 组（P1）**：`RaftGroupTable` 每组一份共识/日志状态；组 0 = 控制面且行为与
+  组化前逐字节一致；`raft_log` 按 `(group_id, log_index)` 分命名空间。
+- **数据组复制（P2 + 运输层加固）**：真实 parwal 字节按 leader 指定的 `partition_lsn`
+  复制到多数派、fsync 后才 ack、重传幂等、截断触达字节、`last_applied` 持久化。
+- **`pg_partdist` 边界函数**（`src/raft_boundary.c`，7 个）：见 §5。
+- 回归基线：`pg-raft-src/run-raft-tests.sh` **29/29**（raft_01–13）；
+  `pg-partdist-src/tests/test_shard_identity_p0.sh` **10/10**。
+
+### 2.3 当前缺口
+
+- **物理回放（P3）未开始**：apply 仍是“平凡 apply”，只推进
+  `follower_partition_map.applied_part_lsn`，不做 `rm_redo`，follower 堆表不含数据。
+- **xid/clog 跨 leader 冲突未解**（§11.5.2 #1，最硬的阻断项）。
+- `RAFT_MAX_GROUPS = 32`，与“每节点托管几十上百分区”冲突；日志仍在定长 ring
+  （`RAFT_LOG_CAPACITY = 128`，落后超容量时靠拒写背压），未外部化到 parwal，无日志压缩。
+- **组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按全体 peers 算多数派。
+- `raft_snapshot` 仍只是控制面元数据快照表，**没有 Raft InstallSnapshot RPC**。
+- `partwal_notify_primary_switch()` 仍是日志占位，未做真实角色切换。
+- `pg_raft_data_propose()` **只有回归在调用**，未接入 demux/写入路径；且数据条目只在
+  client backend 路径下发，无后台追平通道 —— 无 propose 流量时落后 follower 不自行收敛。
 - 2PC 的 prepare / commit 决议尚未通过控制面 Raft 复制并等待 quorum ACK。
 
 ## 3. 目标架构
 
+每个节点内部都同时跑着**一个控制面组**和**若干数据面组**，其中一部分数据组它是 leader
+（该分区的 primary），另一部分它是 follower（该分区的 secondary）：
+
 ```mermaid
-flowchart LR
-  Client[Client] --> Router[pg_partdist Router]
-  Router --> Meta[partition_map / node_map]
-  Meta --> RaftCtrl[pg_raft Control Plane]
-  RaftCtrl -->|OP_NODE_STATUS / OP_PARTITION_PRIMARY| Meta
-  RaftCtrl -->|primary switch decision| PartWAL[partwal_sync / follower replay]
-  PartWAL --> ParWAL[pg_parwal partition log]
-  ParWAL --> Replay[follower_partition_map.applied_part_lsn]
-  Txn[2PC Coordinator] -->|Prepare / Commit decision| RaftCtrl
+flowchart TB
+  subgraph N1["worker1"]
+    C1["控制面 组0<br/>(follower)"]
+    D1A["数据组 shard#1<br/><b>leader</b>"]
+    D1B["数据组 shard#2<br/>follower"]
+    P1[("pg_parwal/&lt;oid&gt;")]
+    D1A --> P1
+    D1B --> P1
+  end
+  subgraph N2["worker2"]
+    C2["控制面 组0<br/><b>leader</b>"]
+    D2A["数据组 shard#1<br/>follower"]
+    D2B["数据组 shard#2<br/><b>leader</b>"]
+    P2[("pg_parwal/&lt;oid&gt;")]
+    D2A --> P2
+    D2B --> P2
+  end
+  C2 -->|OP_NODE_STATUS / OP_PARTITION_PRIMARY<br/>成员集与切主决议| C1
+  D1A -->|AppendEntries + 原始 WAL 字节| D2A
+  D2B -->|AppendEntries + 原始 WAL 字节| D1B
+  C2 -.->|下发 partition_map 成员集| D1A
+  Txn[2PC Coordinator] -->|Prepare / Commit decision| C2
 ```
+
+注意图中 worker1 对 shard#1 是 leader、对 shard#2 是 follower，worker2 恰好相反 ——
+这正是 §2.1 的架构前提，**没有哪个节点是全局主节点**。
 
 分层原则：
 
-- 控制面 Raft：负责节点状态、分区 primary 变更、2PC 决议等元数据/决议日志。
-- 数据面 PartWAL：以 `shardpg-2.0` 的 `PartWALInsert/PartWALFlush`、`pg_parwal` 和 follower replay 设计为基础，不在 `pg_raft` 内重复实现数据复制框架。
-- 切主安全线：`OP_PARTITION_PRIMARY` 必须携带切换点 LSN，只允许 `applied_part_lsn` 或等价 ACK 进度追平的副本成为新 primary。
-- 长期方向：每个 partition replica set 独立为一个 Raft group，partition primary 等同于该分区 Raft leader。
+- **控制面 Raft（组 0，全局唯一 leader）**：节点状态、分区 primary 变更与成员集下发、
+  2PC 决议等元数据/决议日志。**控制面本身不按分区拆分。**
+- **数据面 Raft（每分区一组，leader 即该分区 primary）**：负责该分区 parwal 记录的复制与
+  定序。日志内容是 `pg_parwal/<partition>/` 中已存在的每分区单调记录，Raft 只负责运输、
+  定序和多数派持久化，**不重新设计一套记录格式**。
+- **运输层 vs 应用层**：数据组给出的是“这条记录已在多数派 fsync 落盘且定序”；把字节变成
+  堆表内容的 redo 是骑在其上的应用层（P3），二者解耦验证，见 §11.1。
+- **切主安全线**：`OP_PARTITION_PRIMARY` 必须携带切换点 LSN，只允许 `applied_part_lsn` 或
+  等价 ACK 进度追平的副本成为新 primary。
+- **一致性边界**：分区组的成员/主变更结果仍回写 `partition_map`，成员集必须由控制面下发，
+  不能从收到的报文里推断（当前缺口，§11.5.2 #3）。
 
 ## 4. 阶段目标
 
-### 阶段 0：归档旧路线并清理文档
+> **阶段完成度速览（2026-07-20）**：阶段 0 ✅ / 阶段 1 ⚠️ 大部完成（缺 InstallSnapshot
+> 与日志压缩）/ 阶段 2 ✅（切主通知仍为占位）/ 阶段 3 ⚠️ 运输部分完成、redo 与 2PC 未做 /
+> 阶段 4 ⚠️ P0+P1+P2 完成、P3 未启动。
+
+### 阶段 0：归档旧路线并清理文档 ✅ 已完成
 
 目标：把 pgraft Go bridge 从当前实施路径中移除，仅保留为历史调研资料。
 
@@ -68,19 +137,25 @@ flowchart LR
 - 旧 pgraft 资料不再作为仓库入口；需要历史记录时从 Git 历史查看。
 - 过时 demo、组会展示、raft10 或备份脚本不再作为推荐入口。
 
-### 阶段 1：补齐纯 C Raft 安全语义
+### 阶段 1：补齐纯 C Raft 安全语义 ⚠️ 大部完成
 
 目标：将当前 `raft_consensus.c` 从 demo 级共识推进到“最小安全 Raft 子集”。
 
 工作项：
 
-- 扩展 RequestVote RPC：`term, candidate_id, last_log_index, last_log_term`。
-- 加入投票前的日志新旧检查，只有日志至少一样新的候选人才授票。
-- 持久化 HardState：`current_term`、`voted_for`、`commit_index` 必须先落盘，再响应 RequestVote 或 AppendEntries。
-- 完善 follower catch-up：落后 follower 恢复后通过 `nextIndex/matchIndex` 追赶。
-- 增加 snapshot install 设计：日志落后超过可追赶范围时安装 `raft_snapshot`。
-- 完善 leader 宕机重选：新 leader 必须拥有所有已提交日志，旧 leader 恢复后必须降级为 follower。
-- 替换固定 ring buffer 的长期假设，补上日志截断/压缩策略。
+- ✅ 扩展 RequestVote RPC：`term, candidate_id, last_log_index, last_log_term`。
+- ✅ 加入投票前的日志新旧检查，只有日志至少一样新的候选人才授票。
+- ✅ 持久化 HardState：`current_term`、`voted_for`、`commit_index` 必须先落盘，再响应
+  RequestVote 或 AppendEntries。（2026-07-20 升级为文件 v2，增加 `last_applied`，兼容读 v1。）
+- ✅ 完善 follower catch-up：落后 follower 恢复后通过 `nextIndex/matchIndex` 追赶。
+- ❌ **增加 snapshot install 设计**：`raft_snapshot` 至今仍只是控制面元数据快照表，
+  **没有 InstallSnapshot RPC**。日志落后超 ring 容量时目前靠“拒绝新条目”背压，
+  而不是安装快照。
+- ✅ 完善 leader 宕机重选：新 leader 必须拥有所有已提交日志，旧 leader 恢复后必须降级为
+  follower（raft_08 / raft_11）。
+- ❌ **替换固定 ring buffer 的长期假设，补上日志截断/压缩策略**：仍是
+  `RAFT_LOG_CAPACITY = 128` 定长 ring。多组之后这一项从“长期优化”变成阻断项，
+  正解见 §11.5.2 #2（数据组日志外部化到 parwal）。
 
 验收标准：
 
@@ -89,9 +164,14 @@ flowchart LR
 - 旧 leader 恢复后不会覆盖新 leader 已提交状态。
 - follower 掉线恢复后能通过日志或快照追平。
 
-### 阶段 2：控制面 failover 正确性与新版 PartWAL 进度对接
+### 阶段 2：控制面 failover 正确性与新版 PartWAL 进度对接 ✅ 已完成（切主通知仍为占位）
 
 目标：把分区 primary 切换从“改元数据”升级为“Raft 决议 + 新版 PartWAL 进度证明 + 切主通知”。
+
+> 落地情况：流程 1–6 全部完成（回归 raft_02 / raft_07 / raft_10）。**第 7 步“follower replay
+> 随新 primary 完成角色和进度刷新”未完成** —— `applied_part_lsn` 自 P2 起已是真值（由数据组
+> apply 推进），但 `partwal_notify_primary_switch()` 至今仍只写日志，不做真实角色切换；
+> 真正的角色切换依赖 P3 物理回放落地。
 
 扩展 `OP_PARTITION_PRIMARY` payload：
 
@@ -124,16 +204,26 @@ flowchart LR
 - 切主前后 `partition_lsn` 保持单调。
 - 旧 primary 恢复后只能以 secondary 身份回归。
 
-### 阶段 3：接入 shardpg-2.0 数据面同步与 2PC 决议
+### 阶段 3：接入 shardpg-2.0 数据面同步与 2PC 决议 ⚠️ 运输部分完成
 
 目标：基于 `shardpg-2.0` 已有 PartWAL 同步写入和 follower replay 设计，实现方案文档要求的真正多副本同步，而不是在 Raft 模块里重新设计一套数据面。
 
+> 落地情况：**跨节点日志传输已由分区级 Raft 组实现**（P2 + 运输层加固，§11.5/§11.5.1）——
+> 原计划设想的 WalSender/WalReceiver 流式通道**不再需要**，AppendEntries 本身就是那条通道，
+> 且天然带多数派语义。仍未完成的是 **redo 回放（P3）** 与 **2PC 决议（`OP_PREPARE_DECISION` /
+> `OP_COMMIT_DECISION` 尚未实现）**。
+
 PartWAL 接入链路：
 
-- Primary 写入本地 `pg_wal`，`wal_insert_hook` 通过 `PartWALInsert` 捕获分区相关 WAL 记录。
-- `XACT_EVENT_PRE_COMMIT` / `XACT_EVENT_PRE_PREPARE` 调用 `PartWALFlush`，保证 `pg_parwal` fsync 早于事务提交 WAL fsync。
-- follower 侧按 `FOLLOWER_REPLAY_DESIGN.md` 方向回放 `pg_parwal` 物理日志，推进 `follower_partition_map.applied_part_lsn`。
-- Raft 控制面读取 follower 进度，作为切主候选筛选和 quorum ACK 的依据。
+- ✅ Primary 写入本地 `pg_wal`，`wal_insert_hook` 通过 `PartWALInsert` 捕获分区相关 WAL 记录。
+- ✅ `XACT_EVENT_PRE_COMMIT` / `XACT_EVENT_PRE_PREPARE` 调用 `PartWALFlush`，保证 `pg_parwal` fsync 早于事务提交 WAL fsync。
+- ✅ **跨节点传输**：该分区的 Raft 组 leader 读出记录，随 AppendEntries 下发给成员；
+  follower 先按 leader 指定的 `partition_lsn` 落盘并 fsync，再 ack。
+- ❌ **follower 侧回放**：按 `FOLLOWER_REPLAY_DESIGN.md` 做 redo 尚未开始（P3）；
+  当前只推进 `follower_partition_map.applied_part_lsn`，不改堆表。
+- ✅ Raft 控制面读取 follower 进度，作为切主候选筛选的依据（进度自 P2 起为真值）。
+- ❌ **无后台追平通道**：数据条目只在 client backend 的 propose 路径下发，
+  且 `pg_raft_data_propose()` 尚未接入 demux/写入路径，目前仅回归在调用。
 
 事务语义：
 
@@ -172,65 +262,103 @@ PartWAL 接入链路：
 
 ### Raft RPC
 
-- `RequestVote(term, candidate_id, last_log_index, last_log_term)`
-- `AppendEntries(term, leader_id, prev_log_index, prev_log_term, leader_commit, entries[])`
-- `InstallSnapshot(term, leader_id, last_included_index, last_included_term, snapshot)`
+- ✅ `RequestVote(group_id, term, candidate_id, last_log_index, last_log_term)`
+- ✅ `AppendEntries(group_id, term, leader_id, prev_log_index, prev_log_term, leader_commit, entries[])`
+  —— 数据组条目额外随行一个 `bytea` 原始 WAL 字节参数。
+- ❌ `InstallSnapshot(...)` **未实现**。
+- ⚠️ 报文里的 `group_id` 缺省 0（向后兼容），但**成员集不在报文里传播**，是当前缺口。
 
 ### 控制面日志操作
 
-- `OP_NODE_STATUS`
-- `OP_PARTITION_PRIMARY`
-- `OP_PREPARE_DECISION`
-- `OP_COMMIT_DECISION`
-- 后续可扩展：`OP_CONFIG_CHANGE`
+- ✅ `OP_NODE_STATUS`
+- ✅ `OP_PARTITION_PRIMARY`
+- ❌ `OP_PREPARE_DECISION`（阶段 3，未实现）
+- ❌ `OP_COMMIT_DECISION`（阶段 3，未实现）
+- ❌ `OP_CONFIG_CHANGE`（成员集下发依赖它，见 §11.5.2 #3）
+- ✅ 数据组内部条目类型：`OP_PARWAL`（描述符 + 随行字节；数据字节的门控按 `op_type` 判定，
+  **不能**按 `group_id > 0` 判定，否则数据组里的普通条目复制不出去）
 
-### PartWAL 对接接口
+### PartWAL 对接接口（`pg-partdist-src/src/raft_boundary.c`，schema `partdist`）
 
-```c
-void partwal_notify_primary_switch(
-    Oid        partition_id,
-    int        old_primary_node,
-    int        new_primary_node,
-    XLogRecPtr switch_orig_lsn
-);
-```
+**调用约定**：所有函数都收**本节点的** `partition_id`（= 分片表本地 OID = `pg_parwal/` 目录名）。
+各节点 OID 不同，调用方必须先用 P0 的 `local_partition_for_shard(global_shard_id)` 把组 id
+解析成本节点的 OID —— 这是“一节点多角色”架构下最容易出错的一步。
 
-该接口在 `OP_PARTITION_PRIMARY` apply 成功后调用。若 `shardpg-2.0` 后续提供正式切主接口，应优先改为调用正式接口；当前保留该接口作为 Raft 与 PartWAL 角色切换的边界。
+进度与切主（阶段 2 落地）：
 
-Raft 还需要读取或补齐以下进度接口：
+| 函数 | 语义 | 状态 |
+|------|------|------|
+| `get_partition_flush_lsn(OID) → BIGINT` | 本节点该分区最新已持久化 `partition_lsn` | ✅ |
+| `get_follower_applied_part_lsn(OID) → BIGINT` | 本节点该分区 follower 的 `applied_part_lsn` | ✅ |
+| `partwal_notify_primary_switch(OID, INT, INT, PG_LSN) → void` | `OP_PARTITION_PRIMARY` apply 成功后调用 | ⚠️ 仍是日志占位 |
 
-- 本节点某分区最新已持久化 `partition_lsn`。
-- follower 某分区的 `applied_part_lsn`。
-- 某分区副本 quorum 是否已达到指定 `switch_partition_lsn`。
+数据组复制（P2 + 运输层加固落地）：
+
+| 函数 | 语义 | 状态 |
+|------|------|------|
+| `partwal_read_record(OID, BIGINT) → (orig_lsn, rmid, info, xid, data)` | leader 按 `partition_lsn` 读出整条记录 | ✅ |
+| `partwal_follower_append(OID, BIGINT, PG_LSN, INT, INT, BIGINT, BYTEA) → BIGINT` | follower **按 leader 指定的 `partition_lsn`** 落盘 + fsync；重传幂等 no-op，空洞 ERROR | ✅ |
+| `partwal_truncate_to(OID, BIGINT) → BOOLEAN` | Raft 日志截断时同步截断 parwal 字节 | ✅ |
+| `follower_set_applied_part_lsn(OID, BIGINT) → BOOLEAN` | 单调推进进度游标 | ✅ |
+
+全局分片身份（P0 落地）：`shard_global_id(OID)` / `rebuild_shard_identity()` /
+`register_shard_identity(OID)` / `local_partition_for_shard(BIGINT)` / `global_id_for_partition(OID)`。
+
+> **维护约束**：`partwal_follower_append` 的签名在运输层加固中变过一次（新增第 2 个参数
+> `p_partition_lsn`）。改签名时必须同步改 `COMMENT ON FUNCTION` 的参数列表、`setup-raft.sh`
+> 的 `ensure_boundary_functions` 与其 cleanup 段，以及 `pg-install/share/postgresql/extension/`
+> 下的已安装副本。**已装扩展不会重跑安装脚本**，所以这类不一致在回归里是静默的——
+> 只有在全新库上 `CREATE EXTENSION` 才会暴露。（2026-07-21 即因此修了一次遗漏的 COMMENT。）
 
 ## 6. 测试计划
 
-现有基线：
+现有基线：**`pg-raft-src/run-raft-tests.sh` 共 29 项断言全绿（raft_01–13）**，
+外加 `pg-partdist-src/tests/test_shard_identity_p0.sh` 10/10。
+（入口已从旧的 `run-tests.sh` 改为 `run-raft-tests.sh`；该脚本**必须在宿主机上跑**，
+它内部自己调 `docker`。）
 
-- `test/sql/raft_01_leader_election.sql`
-- `test/sql/raft_02_failover_partition.sql`
-- `test/sql/raft_03_split_brain_guard.sql`
-- `test/sql/raft_04_topology_monitor.sql`
-- `run-tests.sh`
+| 用例 | 覆盖场景 | 状态 |
+|------|------|------|
+| `raft_01_leader_election` | 选举收敛，唯一 leader | ✅ |
+| `raft_02_failover_partition` | primary 故障只切受影响分区 | ✅ |
+| `raft_03_split_brain_guard` | 脑裂防护 | ✅ |
+| `raft_04_topology_monitor` | 拓扑感知与自动 failover | ✅ |
+| `raft_05_no_majority_reject_commit` | 少于多数派拒绝提交，无脏 apply | ✅ |
+| `raft_06_stale_requestvote_rejected` | 日志落后候选人竞选失败 | ✅ |
+| `raft_07_uncaught_up_secondary_not_promoted` | 未追平副本不得晋升 | ✅ |
+| `raft_08_old_leader_rejoins_as_follower` | 旧 leader 恢复后降级 | ✅ |
+| `raft_09_hardstate_crash_recovery` | 崩溃重启 term 不回退、已提交日志不丢 | ✅ |
+| `raft_10_most_caught_up_secondary_promoted` | 最追平副本被提升，切换点=真实 flush 进度 | ✅ |
+| `raft_11_old_leader_log_catchup` | 旧 leader 回归后追平已提交决议 | ✅ |
+| `raft_12_multi_group_isolation` | 多组独立选举、日志按组隔离 | ✅ |
+| `raft_13_data_group_replication` | 数据组多数派提交、字节级一致、失多数派拒写 | ✅ |
 
-新增场景：
+仍缺的场景：
 
-- leader 宕机后重新选举，并保证只有一个 leader。
-- 日志落后节点竞选失败。
-- 少于多数派时拒绝提交。
-- follower 掉线恢复后通过日志或快照追平。
-- 旧 leader 恢复后不能覆盖新 leader 的 `partition_map`。
-- 切主前后 `partition_lsn` 保持单调，`applied_part_lsn` 未追平副本不得晋升。
-- prepare / commit 在 quorum ACK 前不能向客户端返回成功。
-- `pg_partdist` 新版同步写入路径：`PartWALFlush` 后 `pg_parwal` 记录存在且 `verify_partition_wal` 通过。
+- ❌ follower 掉线且落后超 ring 容量后通过**快照**追平（依赖 InstallSnapshot）。
+- ❌ prepare / commit 在 quorum ACK 前不能向客户端返回成功（依赖阶段 3 的 2PC 决议）。
+- ❌ **一个节点同时是 A 分区 leader、B 分区 follower 的混合角色场景**——当前所有数据组用例
+  的组成员都是全体 worker，没有覆盖“副本集是全体节点真子集”的真实拓扑，
+  而这正是 §11.5.2 #3 多数派算错的暴露条件。
+- ⚠️ **raft_13 的夹具需要重做**：现用 Citus reference 表，它在每个节点都是本地主写，
+  与“secondary 不本地产出该分区 WAL”的前提相悖（详见 §11.5.1 的假阳性教训）。
+  应改用真正的“一主多从”分片放置。
+- ❌ 全新库上 `CREATE EXTENSION pg_partdist` / `pg_raft` 的冒烟检查——回归环境总是复用
+  已装扩展，签名与 `COMMENT` 不一致这类错误在回归里完全静默（2026-07-21 已实际踩到）。
 
 ## 7. 文件清理策略
 
-保留并更新：
+保留并更新（路径以 shardpg-3.0 现状为准，旧的 `pg-citus-cluster/` 根目录布局已废弃）：
 
-- `pg-citus-cluster/README-RAFT.md`
-- `pg-citus-cluster/setup-raft.sh`
-- `pg-citus-cluster/docs/interfaces/partwalmgr_raft.idl`
+- `pg-raft-src/README-RAFT.md`
+- `pg-raft-src/setup-raft.sh`、`pg-raft-src/run-raft-tests.sh`
+- `pg-raft-src/docs/raft_module_revision_plan.md`（本文档）
+- `pg-raft-src/docs/pg_partdist_sync_change_log.md`（**对 pg-partdist-src 的每一次改动都必须
+  在此追加记录**，它是 raft 侧与 pg_partdist 侧之间的交接台账）
+- `pg-raft-src/docs/INTEGRATION-citus-shard-parwal.md`
+- `pg-raft-src/docs/interfaces/partwalmgr_raft.idl`
+- `pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md`（P3 的设计依据，**当前有两份分叉副本，
+  见 §11.5.2 #5**）
 
 归档或删除候选：
 
@@ -247,13 +375,19 @@ Raft 还需要读取或补齐以下进度接口：
 
 ## 8. 风险与对策
 
-| 风险 | 对策 |
-|------|------|
-| 纯 C Raft 仍有 demo 级实现痕迹 | 先补齐最小安全 Raft 子集，再扩大数据面 |
-| 只改 `partition_map` 会提升陈旧副本 | failover 必须绑定 `switch_partition_lsn` / `switch_orig_lsn` |
-| PartWAL 复制链路与 `shardpg-2.0` 进度接口尚未完全打通 | 优先复用 `partwal_sync`、`follower_partition_map.applied_part_lsn` 和 follower replay 设计 |
-| 2PC 决议丢失会导致部分提交 | 通过控制面 Raft 复制 prepare / commit 决议并等待 quorum |
-| 每分区 Raft group 实现成本高 | 短期采用控制面 Raft + PartWAL quorum，长期再演进 |
+| 风险 | 对策 | 状态 |
+|------|------|------|
+| 纯 C Raft 仍有 demo 级实现痕迹 | 先补齐最小安全 Raft 子集，再扩大数据面 | ✅ 已缓解（29/29 基线） |
+| 只改 `partition_map` 会提升陈旧副本 | failover 必须绑定 `switch_partition_lsn` / `switch_orig_lsn` | ✅ 已落地 |
+| PartWAL 复制链路未打通 | 由分区级 Raft 组承担运输，复用 `partwal_sync` 与 `applied_part_lsn` | ✅ 已落地 |
+| 2PC 决议丢失会导致部分提交 | 通过控制面 Raft 复制 prepare / commit 决议并等待 quorum | ❌ 未开始 |
+| 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
+| **一节点托管多分区副本 ⇒ 不同 leader 的 xid 在本地 clog 相撞** | **必须先做集群级 xid 区间租约**；在此之前多分区共存于一节点的 redo 配置不可上线 | ❌ **最硬阻断项**，见 §11.5.2 #1 |
+| **分区数超过 `RAFT_MAX_GROUPS=32` / ring 撑爆 shmem** | 数据组日志外部化到 parwal 段文件，shmem 只留游标 | ❌ 未做 |
+| **成员集不随 RPC 传播 ⇒ 多数派按全体 peers 算错** | 成员集改由控制面 `OP_CONFIG_CHANGE` 下发 | ❌ 未做 |
+| 数据组数量挤占控制面心跳 | 连接复用 + 对端级退避（已做）；报文级心跳合并 + 最小堆调度（待做） | ⚠️ 部分缓解 |
+| 边界函数签名变更在回归中静默失效 | 改签名同步改 `COMMENT`/`setup-raft.sh`/已安装副本；补全新库 `CREATE EXTENSION` 冒烟 | ⚠️ 已踩过一次 |
+| 两份 `FOLLOWER_REPLAY_DESIGN.md` 分叉导致 P3 依据不一致 | P3 开工前先合并 | ❌ 待处理 |
 
 ## 9. 近期任务清单
 
@@ -281,9 +415,10 @@ Raft 还需要读取或补齐以下进度接口：
 11. 已补齐“leader 宕机后重新选举、旧 leader 恢复后降级”为自动回归：
    - `raft_08_old_leader_rejoins_as_follower.sql` 已验证旧 leader 重启后只能以 follower 身份回归，且本地 propose 会被 `only leader` 拒绝。
    - `run-tests.sh` 已增加自动停旧 leader、等待新 leader、恢复旧 leader 的编排，并补充入口自恢复：缺失的 PostgreSQL 节点会自动拉起；缺失的 `pg_raft` 扩展或未收敛的 leader 会自动执行 `setup-raft.sh` 恢复。
-12. 当前全量验收通过：
-   - `bash /home/pxr/pg-citus-cluster/run-tests.sh`
-   - 汇总结果为 71 通过、0 失败。
+12. ~~当前全量验收通过：`bash /home/pxr/pg-citus-cluster/run-tests.sh`，71 通过、0 失败。~~
+   **该条为 2026-07-12 前的历史环境记录，已作废。** 当前口径见 §6：
+   宿主机执行 `bash pg-raft-src/run-raft-tests.sh` → **29/29**（raft_01–13）；
+   `bash pg-partdist-src/tests/test_shard_identity_p0.sh` → 10/10。
 
 ### 下一步
 
@@ -308,9 +443,13 @@ Raft 还需要读取或补齐以下进度接口：
    可立即推进且不触发物理回放的是 **P0 全局分片身份映射**(小、独立、安全,是其余各期
    的前提,也是当前控制面跨节点比 `applied_part_lsn` 的隐含前提);P1(Raft 核心组化重构)、
    P2(数据组复制 + 平凡 apply)为结构性工作;P3(真·物理回放 redo)按用户要求暂不启动。
-   - **P0 已完成(2026-07-17)**:`shard_identity` 映射表 + 5 个解析函数落地 pg_partdist；**P1(Raft 核心组化)与 P2(数据组复制 + 平凡 apply)已完成(2026-07-18)**，回归基线 raft_01–13 共 29/29；至此"物理回放前提"具备，P3 真回放待启动。
-     扩展(全局 id 采用 Citus shardid);回归 `tests/test_shard_identity_p0.sh` 10/10、
-     raft_01–11 仍 27/27。详见 §11.5。
+   - **P0 已完成(2026-07-17)**:`shard_identity` 映射表 + 5 个解析函数落地 pg_partdist
+     扩展(全局 id 采用 Citus shardid)。**P1(Raft 核心组化)与 P2(数据组复制 + 平凡 apply)
+     已完成(2026-07-18)**，回归基线 raft_01–13 共 29/29。**运输层加固已完成(2026-07-20，
+     提交 `d06c821`)**。
+   - ⚠️ **此处原写"至此物理回放前提具备"，该结论已于 2026-07-20 的审查中被推翻并更正**：
+     *运输层*前提已具备，但 xid/clog、组容量、成员集三项架构级前提仍未满足，
+     P3 不能直接开工。判定详见 §12。
 
 ## 10. shardpg-3.0 集成状态与审查差距(2026-07-12)
 
@@ -345,12 +484,21 @@ raft4 四节点环境为准):
 
 ### 审查差距(留待后续,按优先级)
 
+> **2026-07-20 复核**：#3 已由 P0 关闭；#1 已由 P2 + 运输层加固**部分**关闭
+> （字节现在真的会跨节点流动并在多数派 fsync，但仍不进堆表）；#2 的结论已被 P2 取代
+> （不再需要恢复流式分发）。逐条批注见各条末尾。
+
 1. **主从切换目前只到元数据层**:shardpg-3.0 的 follower 物理回放仍是设计稿
    (`pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md`),`follower_partition_map`
    有表无写入方,跨节点分区日志传输(WalSender/Receiver)不存在。因此
    `OP_PARTITION_PRIMARY` 决议能正确切 `partition_map.primary_node` 并满足
    切主安全线,但数据不会真正流向新 primary;`partwal_notify_primary_switch`
    仍为日志占位。对应本计划阶段 2 → 3 的过渡,依赖数据面 follower replay 落地。
+
+   → **2026-07-20 更新（部分关闭）**：跨节点分区日志传输**已经存在**了 —— 不是
+   WalSender/Receiver，而是分区级 Raft 组的 AppendEntries（P2 + 运输层加固）。
+   `follower_partition_map` 也有了真实写入方。**仍未关闭的部分**：字节只落到副本的
+   `pg_parwal/`，不进堆表（P3），且 `partwal_notify_primary_switch` 仍是占位。
 
 2. **方案文档与 3.0 实现的差异,以代码为准**:方案文档描述的是
    "Demux Worker 流式解复用 + WalSender DATA/SKIP + PartWALReceiver/PartWALApply"
@@ -361,12 +509,21 @@ raft4 四节点环境为准):
    但阶段 3 的"日志分发/接收"设计需按同步写路径重新对齐,SKIP 机制仅在
    恢复流式分发时才需要。
 
+   → **2026-07-20 更新（已被 P2 取代）**：日志分发不再走"重新对齐流式管道"这条路，
+   而是由分区 Raft 组的 AppendEntries 承担；SKIP 记录**不需要**了 —— 组成员集本身就
+   限定了哪些节点该收哪个分区，无需在流里标记跳过。
+
 3. **partition_id 的全局身份问题**:3.0 的 `pg_parwal/<partition_id>` 目录名
    使用分片表在本节点的 OID,而 OID 是每节点独立分配的;副本机制落地后,
    同一逻辑分片在不同节点上 OID 不同,Raft 元数据(`partition_map.partition_id`)
    需要一个全局一致的分片标识与各节点本地 OID 的映射
    (`follower_partition_map.local_relname` 已为此预留)。切主决议与进度比对
    必须基于全局标识,否则跨节点 `applied_part_lsn` 比较无意义。
+
+   → **✅ 2026-07-17 已关闭**：即 P0，`partdist.shard_identity` 以 Citus `shardid` 为
+   `global_shard_id`，`local_partition_for_shard()` 负责解析到各节点本地 OID。
+   遗留：`FOLLOWER_REPLAY_DESIGN.md` 仍以本地 OID 为 shard 主键，未与之对齐
+   （§11.5.2 #6）。
 
 ## 11. 分区级 Raft 组落地方案(2026-07-17)
 
@@ -636,3 +793,126 @@ leader 的字节追加到**另一个编号**上，再从那个编号读回来比
 P0/P1 对应阶段 4 的结构前置;P2 兑现阶段 2→3 过渡中"数据真正流向副本 + 进度真实化";
 P3 兑现阶段 3 的多副本同步语义与 §10 审查差距 #1(主从切换落到数据层)。§10 审查差距
 #3(全局身份)即 P0。
+
+---
+
+## 12. 物理回放(P3)交接说明(2026-07-21)
+
+本节是**做物理回放之前的交接文档**：接手的人只读本节即可知道“做到哪了、卡在哪、下一步做
+什么”。判定口径为提交 `d06c821` 的代码实测结果，不是设计意图。
+
+### 12.1 结论先行：日志复制是否已满足物理回放的前提？
+
+**运输层：是。非运输层：否。整体结论 —— P3 还不能直接开工。**
+
+这个区分很重要，因为 2026-07-18 曾经下过一个“至此物理回放前提具备”的结论，**那是错的**，
+已在 2026-07-20 的审查中推翻。当时错在只看了“字节能不能复制过去”，没看“换成 redo 后这些
+字节会不会被正确地、恰好一次地、在正确的编号上回放”。平凡 apply 恰好是**幂等且单调**的，
+把五个运输层缺陷全都掩盖了 —— 这是本项目到目前为止最值得记住的一次教训：
+**用一个过于宽容的消费者去验证运输层，会得到虚假的绿灯。**
+
+| 前提 | 要求 | 状态 |
+|------|------|------|
+| 字节能跨节点送达副本 | AppendEntries 携带原始 WAL 字节 | ✅ |
+| 送达顺序确定 | 每分区 Raft log 定序，`prev_log` 一致性检查 | ✅ |
+| 提交语义 = 持久化语义 | follower 先 fsync 到自己的 `pg_parwal` 再 ack | ✅ |
+| **副本上的编号与 leader 一致** | follower 按 leader 指定的 `partition_lsn` 落盘 | ✅ 加固后 |
+| **重复投递不产生第二份** | 重传幂等 no-op | ✅ 加固后 |
+| **崩溃后不漏放已提交条目** | `last_applied` 持久化（hardstate v2） | ✅ 加固后 |
+| **apply 失败不静默吞掉** | 游标只在 apply 成功后推进，失败重试 | ✅ 加固后（数据面） |
+| **回滚的字节不残留** | 截断触达 parwal 字节 | ✅ 加固后 |
+| **回放产生的 xid 在本地 clog 不冲突** | 集群级 xid 区间租约 | ❌ **未做，最硬** |
+| **一个节点能托管足够多的分区组** | 组数不受 32 限制、日志不占 shmem | ❌ 未做 |
+| **多数派按真实副本集计算** | 成员集由控制面下发 | ❌ 未做 |
+| **P3 设计依据唯一且与 P0 对齐** | FRD 单一副本、以 `global_shard_id` 为键 | ❌ 未做 |
+
+一句话：**“把字节安全送到副本并按正确编号落盘”这件事已经做完了；“把字节变成堆表内容”
+所依赖的节点级资源隔离还一件都没做。**
+
+### 12.2 已完成的部分
+
+**P0 全局分片身份（2026-07-17）** —— `partdist.shard_identity(global_shard_id PK, local_oid,
+relfilenode, local_relname, logical_relid)`，`global_shard_id` 直接采用 Citus `shardid`
+（`pg_dist_shard` 各节点同步，天然跨节点一致）。核心用途是把一个 Raft 组 id 解析成**本节点**
+的分片 OID —— 因为同一逻辑分区在各节点的 OID 不同，而 `pg_parwal/` 目录就是用 OID 命名的。
+没有它，跨节点比 `applied_part_lsn` 是没有意义的。
+
+**P1 Raft 核心组化（2026-07-18）** —— 单例结构变成按 `group_id` 索引的集合；**组 0 = 控制面，
+行为与组化前逐字节一致**；`raft_log` 按 `(group_id, log_index)` 分命名空间。调度上被回归实测
+逼出两项必需对策：按对端复用 libpq 连接、对端级 RPC 退避（**退避只对心跳/复制生效，选举豁免**
+—— 候选人少收一票就可能长时间无主）。
+
+**P2 数据组复制 + 平凡 apply（2026-07-18）** —— entry = 小 JSON 描述符 + 随行 `bytea` 原始字节，
+从而完整复用既有 ring / 一致性检查 / 多数派提交，又不必把任意长字节流塞进 768 字节 payload。
+follower 先落盘再 ack。apply 只推进 `applied_part_lsn`，**不做 redo**。
+
+**运输层加固（2026-07-20，`d06c821`）** —— 见 §11.5.1 六条。其中最关键的是第 1 条：
+follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地自增。原因直接来自架构前提
+（§2.1 #2/#3）：一个节点的 `pg_parwal/` 目录树下既有它作为 primary 的本地 demux 写入，也有它
+作为 secondary 的复制流，用本地计数器会让两个编号空间永久错位，届时 `applied_part_lsn` 指向的
+记录在本地根本不存在。
+
+**回归**：29/29（raft_01–13，连续三轮稳定）+ P0 10/10。
+
+### 12.3 存在的问题
+
+按“是否阻断 P3”分两类。
+
+**A. 阻断 P3，必须先解决：**
+
+1. **xid / clog 跨 leader 冲突（最硬）。** 重放后 tuple 的 `xmin/xmax` 是 **leader 的 xid**，
+   而 clog 是**节点全局**共享的。各分区 leader 独立分配 xid，所以一个节点托管来自**不同
+   leader** 的多个分区副本时，相同 xid 值会在本地 clog 相撞 —— A 组说它已提交、B 组说同值
+   已回滚，而 clog 每个 xid 只能记一个状态。`FOLLOWER_REPLAY_DESIGN.md` §9 明确写着
+   “集群统一 xid 区间批发落地前，多 shard 共存于一个 follower 的配置**不可上线**”。
+   **而按 §2.1，多 shard 共存于一个节点正是本架构的默认形态，不是边缘情况。**
+   必须先做集群级 xid 区间租约。
+2. **`RAFT_MAX_GROUPS = 32`**，即每节点最多 31 个数据组。单纯调大只会把墙往后挪 ——
+   每组一个 128 × 768B 的 shmem ring，shmem 随组数线性膨胀。正解是把数据组日志外部化到
+   parwal 段文件，shmem 只留游标（§11.8 早已列出，P1 落地时没做）。
+3. **组成员集不随 RPC 传播。** 自动建组的 follower 成员集为空，于是按**全体 peers** 算多数派。
+   真实拓扑下一个分区的副本集是全体节点的**真子集**，所以这个多数派是算错的。成员集必须来自
+   控制面下发的 `partition_map`，而不是“从收到的报文里听说”。
+4. **两份 `FOLLOWER_REPLAY_DESIGN.md` 已分叉**：临时环境（3.0）里是 16KB 旧版，主仓库工作区
+   里是 28KB v2（含 §9 xid 分析，未提交）。P3 的设计依据必须唯一。且 FRD 仍以本节点 OID 为
+   shard 主键，未与 P0 的 `global_shard_id` 对齐。
+
+**B. 不阻断 P3，但会限制可用性：**
+
+5. `pg_raft_data_propose()` **只有回归在调用**，尚未接入 demux/写入路径；数据条目只在 client
+   backend 路径下发（取字节需要 SPI，而 BGW tick 没有 SPI），**没有后台追平通道** ——
+   无 propose 流量时落后的 follower 不会自行收敛。
+6. **无 InstallSnapshot**，日志落后超 ring 容量时靠拒写背压，落后太多的副本无法追平。
+7. `partwal_notify_primary_switch()` 仍是日志占位，切主后不做真实角色切换。
+8. **raft_13 夹具用的是 Citus reference 表**，而 reference 表在每个节点都是本地主写，与
+   “secondary 不本地产出该分区 WAL”的前提相悖（§11.5.1 的假阳性教训）。数据组用例应改用
+   真正的“一主多从”分片放置，并补一个“同节点混合角色”的用例。
+9. **缺少全新库上的 `CREATE EXTENSION` 冒烟检查**。回归环境总是复用已装扩展，
+   `setup-raft.sh` 又只补建函数、不重跑安装脚本，因此安装脚本内部的不一致是**完全静默**的。
+   2026-07-21 即实测到一例：运输层加固改了 `partwal_follower_append` 的签名，但
+   `COMMENT ON FUNCTION` 仍写旧的 6 参数形式，导致全新库 `CREATE EXTENSION pg_partdist`
+   直接 ERROR，而 29/29 回归全绿。已修复。
+
+### 12.4 后续内容（建议顺序）
+
+顺序是有依据的：先统一设计依据，再拆掉节点级资源冲突，最后才动 redo。
+
+1. **合并两份 FRD**，并把其中的 shard 主键从本地 OID 改为 `global_shard_id`。
+   —— 不做这步，后面所有设计讨论都在两个不同的文本上进行。
+2. **集群级 xid 区间租约**（FRD §9 方案 A）。这是 P3 真正的门槛，工作量也最大：
+   需要一个跨集群的 xid 区间分配者，各分区 leader 只在自己租到的区间内分配 xid，
+   保证任一节点上来自不同 leader 的 xid 不重叠。**这一项完成前，P3 做出来也不可上线。**
+3. **数据组日志外部化到 parwal + 解除 `RAFT_MAX_GROUPS` 限制**。顺带解决 ring 容量与
+   日志压缩（阶段 1 遗留的两项 ❌ 也一并关闭）。
+4. **成员集经控制面下发**（`OP_CONFIG_CHANGE`），多数派按真实副本集计算。
+   完成后补“副本集是全体节点真子集”和“同节点混合角色”的回归。
+5. **接入真实写入路径**：把 `pg_raft_data_propose()` 挂到 demux/写入路径上，
+   并补一条后台追平通道（需解决 BGW 无 SPI 的取字节问题）。
+6. **P3 物理回放本体**：把平凡 apply 换成 `DecodeXLogRecord → 改写 RelFileLocator → rm_redo`。
+   验收：follower 堆表与 leader 收敛一致；切主后新 primary 拥有切换点前的全部已提交数据。
+7. 其余：InstallSnapshot、`partwal_notify_primary_switch` 真实化、2PC 决议
+   （`OP_PREPARE_DECISION` / `OP_COMMIT_DECISION`）。
+
+> **交接提示**：对 `pg-partdist-src`（即 raft 之外）的每一次改动，都必须在
+> `pg-raft-src/docs/pg_partdist_sync_change_log.md` 追加记录，写明时间、文件、目的与对
+> Raft/failover/PartWAL 行为的影响。该台账目前已记到 2026-07-21。

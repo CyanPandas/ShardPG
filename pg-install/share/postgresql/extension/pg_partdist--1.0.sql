@@ -558,8 +558,11 @@ CREATE OR REPLACE FUNCTION partwal_truncate_to(
 ) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_truncate_to';
 
-COMMENT ON FUNCTION partwal_follower_append(OID, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA) IS
-    'Follower 侧平凡 apply：把收到的 parwal 记录原样落盘并 fsync，返回本地写入的 partition_lsn。不做 redo。';
+COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA) IS
+    'Follower 侧平凡 apply：按 leader 指定的 partition_lsn 把 parwal 记录原样落盘并 fsync，返回该 partition_lsn。重传幂等，不做 redo。';
+
+COMMENT ON FUNCTION partwal_truncate_to(OID, BIGINT) IS
+    'Raft 日志截断时同步截断本节点 pg_parwal：丢弃 partition_lsn > p_keep_upto_part_lsn 的记录并重写 checkpoint。';
 
 CREATE OR REPLACE FUNCTION follower_set_applied_part_lsn(
     p_partition_id OID,
