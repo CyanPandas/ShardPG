@@ -68,6 +68,8 @@ extern int64 pg_raft_consensus_commit_index(void);
 extern int64 pg_raft_consensus_last_applied(void);
 extern int64 pg_raft_consensus_propose(const char *op_type, const char *payload);
 extern void pg_raft_consensus_apply_pending(void);
+/* prepare 接线：PartWALFlush 经 rendezvous "partdist_partwal_replicate_hook" 调用 */
+extern void pg_raft_partwal_replicate(Oid partition_id);
 
 extern RaftLeaderShmem *RaftLeaderShmemData;
 extern LWLock *RaftLeaderLock;

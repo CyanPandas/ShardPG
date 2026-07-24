@@ -971,6 +971,195 @@ else
 fi
 raft14_cleanup
 
+# raft_16: 事务 prepare 阶段接线验收(四步设计,计划文档 §4 阶段 3)。
+# 不做任何手工 propose:INSERT 经 master 路由提交时,PartWALFlush 在 [A](本地
+# parwal fsync)后、[B](pg_wal 提交 fsync)前经 rendezvous 挂钩自动把新记录逐条
+# propose 给分区组;多数派持久化才算 prepared。验证:
+#   1) 正向:仅 INSERT,follower parwal 自动出现逐字节一致、连续无洞的备份;
+#   2) 失多数派:停掉两个 follower 后 INSERT 必须失败(prepare 中止),行数不变;
+#   3) 恢复:follower 回归后再 INSERT,连同中断期间的增量自动追平,终态一致。
+RAFT_16_TABLE=raft16_demo
+RAFT_16_MEMBER_IDS="ARRAY[2,3,4]"
+RAFT_16_GID=""
+
+raft16_cleanup() {
+  local port
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "SELECT partdist.pg_raft_group_reset();" &>/dev/null || true
+  done
+  if [[ -n "$RAFT_16_GID" ]]; then
+    for port in 5433 5434 5435; do
+      $PSQL -p "$port" -U postgres -c \
+        "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS ${RAFT_16_TABLE}_${RAFT_16_GID};" &>/dev/null || true
+    done
+    for port in "${NODE_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "DELETE FROM partdist.partition_map WHERE partition_id = ${RAFT_16_GID}::oid;
+         DELETE FROM partdist.follower_partition_map WHERE global_shard_id = ${RAFT_16_GID};" &>/dev/null || true
+    done
+  fi
+  $PSQL -p 5432 -U postgres -c \
+    "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_16_TABLE};" &>/dev/null || true
+}
+
+start_all_nodes
+sleep 2
+
+RAFT_16_OK=0
+RAFT_16_WHY="setup"
+RAFT_16_LEADER=""
+RAFT_16_FOLLOWER_PORTS=()
+
+if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+     "SET citus.enable_ddl_propagation=on;
+      DROP TABLE IF EXISTS ${RAFT_16_TABLE};
+      SET citus.shard_count = 1;
+      SET citus.shard_replication_factor = 1;
+      CREATE TABLE ${RAFT_16_TABLE}(id int primary key, v text);
+      SELECT create_distributed_table('${RAFT_16_TABLE}', 'id');" &>/dev/null; then
+
+  RAFT_16_GID=$($PSQL -p 5432 -U postgres -tAc \
+    "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='${RAFT_16_TABLE}'::regclass;" 2>/dev/null || echo "")
+  RAFT_16_PRIMARY_PORT=$($PSQL -p 5432 -U postgres -tAc \
+    "SELECT n.nodeport FROM pg_dist_placement p
+       JOIN pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+      WHERE p.shardid = ${RAFT_16_GID:-0};" 2>/dev/null || echo "")
+
+  if [[ -n "$RAFT_16_GID" && -n "$RAFT_16_PRIMARY_PORT" ]]; then
+    RAFT_16_PRIMARY_ID=$(( RAFT_16_PRIMARY_PORT - 5431 ))
+
+    for port in 5433 5434 5435; do
+      if [[ "$port" != "$RAFT_16_PRIMARY_PORT" ]]; then
+        $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
+          "SET citus.enable_ddl_propagation=off;
+           CREATE TABLE IF NOT EXISTS ${RAFT_16_TABLE}_${RAFT_16_GID}
+             (LIKE ${RAFT_16_TABLE} INCLUDING ALL);" &>/dev/null \
+          && RAFT_16_FOLLOWER_PORTS+=("$port")
+      fi
+      $PSQL -p "$port" -U postgres -c "SELECT partdist.rebuild_shard_identity();" &>/dev/null || true
+    done
+
+    $PSQL -p "$RAFT_16_PRIMARY_PORT" -U postgres -c \
+      "SELECT partdist.pg_raft_group_create(${RAFT_16_GID}, ${RAFT_16_MEMBER_IDS});" &>/dev/null || true
+    for attempt in $(seq 1 15); do
+      st=$($PSQL -p "$RAFT_16_PRIMARY_PORT" -U postgres -tAc \
+        "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = ${RAFT_16_GID};" 2>/dev/null || echo "")
+      [[ "$st" == "leader" ]] && RAFT_16_LEADER="$RAFT_16_PRIMARY_PORT" && break
+      sleep 1
+    done
+    for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "SELECT partdist.pg_raft_group_create(${RAFT_16_GID}, ${RAFT_16_MEMBER_IDS});" &>/dev/null || true
+    done
+
+    if [[ -n "$RAFT_16_LEADER" ]]; then
+      # 1) 正向:只 INSERT,不做任何手工 propose
+      if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+           "INSERT INTO ${RAFT_16_TABLE} SELECT g, 'p' || g FROM generate_series(1, 4) g;" &>/dev/null; then
+        sleep 2
+        RAFT_16_NREC=$($PSQL -p "$RAFT_16_LEADER" -U postgres -tAc \
+          "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${RAFT_16_GID}));" 2>/dev/null || echo 0)
+        RAFT_16_MD5=$($PSQL -p "$RAFT_16_LEADER" -U postgres -tAc \
+          "SELECT md5(string_agg(sub.h, ',' ORDER BY sub.plsn)) FROM (
+             SELECT g AS plsn, md5(r.data) AS h
+             FROM generate_series(1, ${RAFT_16_NREC:-0}) g,
+                  LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_16_GID}), g) r
+           ) sub;" 2>/dev/null || echo "")
+
+        if [[ "$RAFT_16_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC" -gt 0 && -n "$RAFT_16_MD5" ]]; then
+          RAFT_16_OK=1
+          for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
+            if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+                   -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC" \
+                   -v leader_md5="$RAFT_16_MD5" -v primary_id="$RAFT_16_PRIMARY_ID" \
+                   -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
+                   -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+              RAFT_16_OK=0
+              RAFT_16_WHY="自动复制后 follower ${port} 断言失败"
+              break
+            fi
+          done
+        else
+          RAFT_16_WHY="自动复制后 leader 侧无记录(flush=${RAFT_16_NREC})"
+        fi
+
+        # 2) 失多数派:停两个 follower,INSERT 必须失败(prepare 中止),行数不变
+        if [[ "$RAFT_16_OK" == "1" ]]; then
+          for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
+            node_stop "$port"
+          done
+          sleep 2
+          if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+               "INSERT INTO ${RAFT_16_TABLE} VALUES (100, 'must-fail');" &>/dev/null; then
+            RAFT_16_OK=0
+            RAFT_16_WHY="失多数派时 INSERT 竟然成功(prepare 未被拒)"
+          else
+            RAFT_16_COUNT=$($PSQL -p 5432 -U postgres -tAc \
+              "SELECT count(*) FROM ${RAFT_16_TABLE};" 2>/dev/null || echo -1)
+            if [[ "$RAFT_16_COUNT" != "4" ]]; then
+              RAFT_16_OK=0
+              RAFT_16_WHY="失多数派中止后行数=${RAFT_16_COUNT},期望 4"
+            fi
+          fi
+          for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
+            node_start "$port"
+          done
+          sleep 3
+        fi
+
+        # 3) 恢复:再 INSERT,增量自动复制,终态逐字节一致
+        if [[ "$RAFT_16_OK" == "1" ]]; then
+          if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+               "INSERT INTO ${RAFT_16_TABLE} SELECT g, 'q' || g FROM generate_series(5, 6) g;" &>/dev/null; then
+            sleep 2
+            RAFT_16_NREC2=$($PSQL -p "$RAFT_16_LEADER" -U postgres -tAc \
+              "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${RAFT_16_GID}));" 2>/dev/null || echo 0)
+            RAFT_16_MD52=$($PSQL -p "$RAFT_16_LEADER" -U postgres -tAc \
+              "SELECT md5(string_agg(sub.h, ',' ORDER BY sub.plsn)) FROM (
+                 SELECT g AS plsn, md5(r.data) AS h
+                 FROM generate_series(1, ${RAFT_16_NREC2:-0}) g,
+                      LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_16_GID}), g) r
+               ) sub;" 2>/dev/null || echo "")
+            if [[ "$RAFT_16_NREC2" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC2" -gt "$RAFT_16_NREC" && -n "$RAFT_16_MD52" ]]; then
+              for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
+                if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+                       -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC2" \
+                       -v leader_md5="$RAFT_16_MD52" -v primary_id="$RAFT_16_PRIMARY_ID" \
+                       -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
+                       -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                  RAFT_16_OK=0
+                  RAFT_16_WHY="恢复后追平断言失败(follower ${port})"
+                  break
+                fi
+              done
+            else
+              RAFT_16_OK=0
+              RAFT_16_WHY="恢复后 INSERT 未产生新记录(flush ${RAFT_16_NREC} -> ${RAFT_16_NREC2})"
+            fi
+          else
+            RAFT_16_OK=0
+            RAFT_16_WHY="多数派恢复后 INSERT 仍失败"
+          fi
+        fi
+      else
+        RAFT_16_WHY="正向 INSERT 失败(prepare 挂钩误拒?)"
+      fi
+    else
+      RAFT_16_WHY="数据组 leader 未落在 placement 节点"
+    fi
+  else
+    RAFT_16_WHY="拿不到 shardid/placement"
+  fi
+fi
+
+if [[ "$RAFT_16_OK" == "1" ]]; then
+  ok "raft_16_prepare_auto_replicate"
+else
+  bad "raft_16_prepare_auto_replicate(${RAFT_16_WHY})"
+fi
+raft16_cleanup
+
 # ------------------------------------------------------------------
 section "汇总"
 echo ""

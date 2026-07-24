@@ -111,6 +111,7 @@ typedef struct RaftGroupState
     int64               group_id;
     bool                hs_loaded;      /* HardState 是否已从文件恢复进 shmem */
     bool                report_pending; /* 数据组新任 leader 尚未向控制面登记（tick 里重试投递） */
+    int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
     RaftConsensusShmem  cons;
@@ -2911,21 +2912,14 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_raft_data_propose(group_id, partition_lsn)
- *
- * 在数据组的 leader 上调用：把本节点 pg_parwal 里 partition_lsn 这条记录作为
- * Raft entry 提交到该组。返回分配到的 Raft log index，0 表示失败（非 leader /
- * 记录不存在 / 未达多数派）。
- *
- * 提交成功即意味着：该条记录的**原始字节已在多数派节点 fsync 落盘**，且各节点
- * 的 applied_part_lsn 已推进到该 partition_lsn（平凡 apply，不含 redo）。
+ * 数据条目提交核心：把本节点 pg_parwal 里 partition_lsn 这条记录作为 Raft entry
+ * 提交到 ctx 组。返回 Raft log index，0 表示失败（非 leader / 记录不存在 /
+ * 未达多数派）。成功时推进本组的 last_data_plsn（prepare 接线的增量下界）。
+ * 重复 propose 同一 plsn 无害：follower 落盘幂等，apply 单调。
  */
-Datum
-pg_raft_data_propose(PG_FUNCTION_ARGS)
+static int64
+data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
 {
-    int64        group_id = PG_GETARG_INT64(0);
-    int64        partition_lsn = PG_GETARG_INT64(1);
-    RaftGroupCtx ctx;
     StringInfoData payload;
     StringInfoData sql;
     bool         spi_owned;
@@ -2938,26 +2932,15 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
     int64        local_oid;
     int64        idx;
 
-    if (!pg_raft_raft_enabled || RaftGroups == NULL)
-        PG_RETURN_INT64(0);
-    if (group_id <= 0)
-        ereport(ERROR, (errmsg("pg_raft: 数据条目只能提交到 group_id > 0 的数据组")));
-
-    parse_peers();
-    restore_groups_if_needed();
-
-    if (!raft_group_ctx(group_id, &ctx))
-        PG_RETURN_INT64(0);
-
-    local_oid = group_local_partition(&ctx);
+    local_oid = group_local_partition(ctx);
     if (local_oid <= 0)
         ereport(ERROR,
                 (errmsg("pg_raft: group %lld 在本节点没有对应分片（先跑 partdist.rebuild_shard_identity()）",
-                        (long long) group_id)));
+                        (long long) ctx->group_id)));
 
     /* 读出记录头部字段，组装描述符 */
     if (!raft_persist_spi_begin(&spi_owned))
-        PG_RETURN_INT64(0);
+        return 0;
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
@@ -2968,7 +2951,7 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
     {
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
-        PG_RETURN_INT64(0);
+        return 0;
     }
     orig_lsn = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
                                                  SPI_tuptable->tupdesc, 1, &isnull));
@@ -2990,10 +2973,160 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
                      (long long) partition_lsn, orig_lsn, rmid, info,
                      (long long) xid, (long long) nbytes);
 
-    idx = group_propose(&ctx, RAFT_OP_PARWAL, payload.data);
+    idx = group_propose(ctx, RAFT_OP_PARWAL, payload.data);
 
     pfree(payload.data);
-    PG_RETURN_INT64(idx);
+
+    if (idx > 0 && partition_lsn > ctx->g->last_data_plsn)
+        ctx->g->last_data_plsn = partition_lsn;
+    return idx;
+}
+
+/*
+ * pg_raft_data_propose(group_id, partition_lsn)
+ *
+ * 在数据组的 leader 上调用：把本节点 pg_parwal 里 partition_lsn 这条记录作为
+ * Raft entry 提交到该组。返回分配到的 Raft log index，0 表示失败（非 leader /
+ * 记录不存在 / 未达多数派）。
+ *
+ * 提交成功即意味着：该条记录的**原始字节已在多数派节点 fsync 落盘**，且各节点
+ * 的 applied_part_lsn 已推进到该 partition_lsn（平凡 apply，不含 redo）。
+ */
+Datum
+pg_raft_data_propose(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    int64        partition_lsn = PG_GETARG_INT64(1);
+    RaftGroupCtx ctx;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT64(0);
+    if (group_id <= 0)
+        ereport(ERROR, (errmsg("pg_raft: 数据条目只能提交到 group_id > 0 的数据组")));
+
+    parse_peers();
+    restore_groups_if_needed();
+
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_INT64(0);
+
+    PG_RETURN_INT64(data_propose_one(&ctx, partition_lsn));
+}
+
+/*
+ * prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
+ *
+ * 由 pg_partdist 的 PartWALFlush 在事务 PRE_COMMIT / PRE_PREPARE 时经
+ * rendezvous variable 调用（[A] 本地 parwal fsync 之后、[B] pg_wal 提交 fsync
+ * 之前），对本事务涉及的每个分区：若其存在数据组，把新落盘的记录逐条 propose
+ * 给该组（一条 record 一次备份）。
+ *
+ * 语义：
+ *   - 分区无数据组：直接返回，行为与接线前完全一致（合成分区/未纳管分片）。
+ *   - 组存在但本节点不是 leader：ERROR —— 写栅栏。切主后旧 primary 上仍在途的
+ *     事务在 prepare 即被拒绝，不会产生分叉写入。
+ *   - 复制凑不齐多数派：ERROR —— 事务中止（步骤 4：多数派持久化才算 prepared）；
+ *     group_propose 的失败路径会连带回滚 leader 侧该条目的 ring/SQL/parwal 字节。
+ *   - 增量下界取本组 last_data_plsn（重启后从环内最后一条 OP_PARWAL 回推），
+ *     配合幂等落盘，重复/回退都无害；顺带把组建立前的历史记录自动补齐复制。
+ */
+void
+pg_raft_partwal_replicate(Oid partition_id)
+{
+    RaftGroupCtx ctx;
+    StringInfoData sql;
+    bool         spi_owned;
+    bool         isnull;
+    int64        gid = 0;
+    int64        cur = 0;
+    int64        last;
+    int64        plsn;
+    int          state;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return;
+
+    parse_peers();
+    if (n_peers == 0)
+        return;
+    restore_groups_if_needed();
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT partdist.global_id_for_partition(%u::oid)::bigint, "
+                     "       partdist.get_partition_flush_lsn(%u::oid)",
+                     (unsigned) partition_id, (unsigned) partition_id);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+            gid = DatumGetInt64(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        if (!isnull)
+            cur = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (gid <= 0)
+        return;                 /* 非全局分片（无 shard_identity）：不纳管 */
+    if (!raft_group_ctx(gid, &ctx))
+        return;                 /* 无数据组：行为与接线前一致 */
+
+    restore_hard_state_if_needed(&ctx);
+    restore_persistent_log_if_needed(&ctx);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    state = ctx.cons->state;
+    SpinLockRelease(&ctx.cons->mutex);
+    if (state != RAFT_LEADER)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld)的本地写入被拒：本节点不是该分区组的 leader",
+                        partition_id, (long long) gid),
+                 errdetail("分区主副本可能已切换，请经路由层重试。")));
+
+    if (cur <= 0)
+        return;
+
+    /* 增量下界：优先用运行期游标；重启后从环内最后一条 OP_PARWAL 回推 */
+    last = ctx.g->last_data_plsn;
+    if (last == 0)
+    {
+        int64 p;
+
+        SpinLockAcquire(&ctx.log->mutex);
+        for (p = ctx.log->last_log_index; p > 0 &&
+             p > ctx.log->last_log_index - RAFT_LOG_CAPACITY; p--)
+        {
+            RaftLogEntry e;
+
+            if (log_get_entry_locked(&ctx, p, &e) &&
+                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            {
+                last = entry_partition_lsn(e.payload);
+                break;
+            }
+        }
+        SpinLockRelease(&ctx.log->mutex);
+        if (last > 0)
+            ctx.g->last_data_plsn = last;
+    }
+
+    for (plsn = last + 1; plsn <= cur; plsn++)
+    {
+        int64 idx = data_propose_one(&ctx, plsn);
+
+        if (idx <= 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld) record %lld 复制未达多数派，prepare 失败，事务中止",
+                            partition_id, (long long) gid, (long long) plsn)));
+    }
 }
 
 /*

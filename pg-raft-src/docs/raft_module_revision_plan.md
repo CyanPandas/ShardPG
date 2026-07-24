@@ -58,7 +58,9 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
 - **`pg_partdist` 边界函数**（`src/raft_boundary.c`，7 个）：见 §5。
 - **环满安全**：follower 环满时诚实拒绝（不再假 ack 造假多数派）；控制面 apply 游标
   滑出环窗口时按"元数据持久、跳过安全"语义窗口内快进（§13.4）。
-- 回归基线：`pg-raft-src/run-raft-tests.sh` **31/31**（raft_01–15，连续两轮）；
+- **事务 prepare 接线（§14）**：写入提交前自动逐条复制到分区组（[A] 后、[B] 前），
+  多数派持久化才算 prepared，失多数派事务中止；顺带获得旧 primary 写栅栏。
+- 回归基线：`pg-raft-src/run-raft-tests.sh` **32/32**（raft_01–16）；
   `pg-partdist-src/tests/test_shard_identity_p0.sh` **10/10**；
   全新库 `CREATE EXTENSION` 冒烟通过。
 
@@ -75,9 +77,9 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
   上报路径在成员集未知时退化为"全体 peers 去掉自己与协调节点"（§13.6 #2）。
 - `raft_snapshot` 仍只是控制面元数据快照表，**没有 Raft InstallSnapshot RPC**。
 - `partwal_notify_primary_switch()` 仍是日志占位，未做真实角色切换。
-- `pg_raft_data_propose()` **只有回归在调用**，未接入 prepare/写入路径（§4 阶段 3 的
-  四步 prepare 设计即为接入目标形态）；且数据条目只在 client backend 路径下发，
-  无后台追平通道 —— 无 propose 流量时落后 follower 不自行收敛。
+- ~~`pg_raft_data_propose()` 未接入写入路径~~ **→ 2026-07-24 已接入事务 prepare 路径**
+  （§14，PartWALFlush 挂钩自动逐条 propose）。仍缺**后台追平通道** —— 无写入流量时
+  落后 follower 不自行收敛（下一次写入的挂钩会顺带补齐增量）。
 - 2PC 的 prepare / commit 决议尚未实现（用户明确暂缓）。
 
 ## 3. 目标架构
@@ -267,9 +269,9 @@ PartWAL 接入链路：
    parwal 天然只收该分区的 heap 记录，commit record 属 XACT rmgr 不入 parwal，
    "不含提交标记"自动成立。
 2. Leader 将该 DATA Record 作为 Raft Log Entry 发送给 Si 的所有 Followers。
-   → 机制已具备：`pg_raft_data_propose`（描述符 + 随行 bytea 原始字节）。
-   **尚未自动挂接**——目前逐条 propose 由调用方驱动（raft_14 即按此驱动），
-   接入事务 prepare 路径是下一步（见下）。
+   → ✅ **已自动挂接（2026-07-24 当日完成，见 §14）**：PartWALFlush 在 [A] 之后、
+   [B] 之前经 rendezvous 挂钩对本事务涉及的每个分区逐条 propose；
+   凑不齐多数派即 ERROR，事务在 prepare 中止。验收 raft_16。
 3. Leader 和 Followers 收到日志后均写入本地 `pg_parwal` 并执行 fsync。
    → 已具备并验收：follower **先 fsync 再 ack**（P2 + 运输层加固），
    leader 侧 PRE_COMMIT fsync。
@@ -374,7 +376,7 @@ PartWAL 接入链路：
 
 ## 6. 测试计划
 
-现有基线：**`pg-raft-src/run-raft-tests.sh` 共 31 项断言全绿（raft_01–15，连续两轮）**，
+现有基线：**`pg-raft-src/run-raft-tests.sh` 共 32 项断言全绿（raft_01–16）**，
 外加 `pg-partdist-src/tests/test_shard_identity_p0.sh` 10/10 与全新库
 `CREATE EXTENSION pg_partdist` + `pg_raft` 冒烟。
 （入口已从旧的 `run-tests.sh` 改为 `run-raft-tests.sh`；该脚本**必须在宿主机上跑**，
@@ -398,6 +400,7 @@ PartWAL 接入链路：
 | `raft_13_data_group_replication` | 数据组多数派提交、字节级一致、失多数派拒写（reference 夹具，保留作运输层回归） | ✅ |
 | `raft_14_hash_shard_secondary_backup` | **真实哈希分片 (a) 形态**：多记录逐条 propose、follower 逐字节指纹一致、`partition_lsn` 1..N 连续无洞、一条 record 一次备份、不回放（壳表 0 行）、初次登记（primary/term/secondaries 不含 master）、路由层一致、master 无分片身份 | ✅ |
 | `raft_15_self_election_failover` | **切主全链路**：停主 → 组内自治选举 → 上报登记 → 每节点 `partition_map`+`pg_dist_placement` 落新主（任期递增、master 不入 secondaries）→ 旧主重启以 follower 归队、登记不回退 | ✅ |
+| `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
 
 仍缺的场景：
 
@@ -1084,8 +1087,57 @@ pg_partdist` + `pg_raft` 冒烟通过（§12.3.B.9 要求的检查已入常规�
    服务读写。生产语义要等回放追平后再放行切换（§12.4 #6 的验收项）。
 2. **成员集传播仍是阻断项**（§12.3.A.3）：上报时成员集未知（hearsay 建组）会退化为
    "全体 peers 去掉自己与协调节点"，真实拓扑下需要控制面下发成员集后才严格正确。
-3. **一致性时序**：本地 parwal 落盘先于 pg_wal 提交 fsync（`[A] < [B]` 不变式）已有；
-   但复制（propose）目前仍在事务提交后由测试驱动，"复制也卡进提交前"要等 propose
-   接入写入路径（§12.4 #5）时一并做。
+3. ~~一致性时序：复制仍在事务提交后由测试驱动~~ **→ 2026-07-24 已解决（§14）**：
+   复制现在卡在 [A]（parwal 落盘）之后、[B]（pg_wal 提交 fsync）之前，
+   即"pgparwal 落盘后、pgwal 落盘前"的目标时序。
 4. master 目前是单点协调（Citus coordinator 本就如此）；master 的 HA（流复制热备）
    不在本阶段范围。
+
+## 14. 事务 prepare 阶段接线（2026-07-24）
+
+把 §4 阶段 3 的四步 prepare 设计中缺失的第 2 步（复制自动挂接）落地。至此四步全部就位：
+写入 → 本地 parwal 落盘 fsync（[A]）→ **逐条复制到分区组并等多数派**（新增）→
+pg_wal 提交 fsync（[B]）。复制严格发生在 [A] 之后、[B] 之前 ——
+即"pgparwal 落盘后、pgwal 落盘前"的一致性时序。
+
+### 14.1 机制
+
+- **挂点**：`PartWALFlush()`（事务 PRE_COMMIT / PRE_PREPARE 唯一调用方）在完成本事务
+  记录的落盘 fsync 并释放全部锁之后，对**本 backend 本事务**涉及的每个分区调用复制挂钩。
+- **跨扩展注入**：pg_partdist 不依赖 pg_raft。挂钩经 PostgreSQL rendezvous variable
+  `"partdist_partwal_replicate_hook"` 注入：pg_raft 的 `_PG_init`（shared_preload 阶段）
+  写入函数指针 `pg_raft_partwal_replicate`；未装载/未启用 raft 时指针为空，零开销、
+  行为与接线前完全一致。
+- **复制驱动**（`pg_raft_partwal_replicate(partition_oid)`）：
+  本地 OID → `global_id_for_partition` → 有无数据组（无则直接返回，未纳管分区不受影响）
+  → 增量范围 = `(组内 last_data_plsn, 当前 flush lsn]`，逐条 `data_propose_one`
+  （一条 record 一次备份）。`last_data_plsn` 随成功 propose 推进，重启后从环内最后一条
+  OP_PARWAL 回推；配合 follower 落盘幂等，重复/回退都无害，且**组建立前的历史记录会在
+  首次写入时自动补齐复制**。
+- **步骤 4 语义（quorum 即 prepared）**：任何一条记录未达多数派 → ERROR → 事务在
+  prepare 中止；`group_propose` 失败路径连带回滚 leader 侧该条目的 ring/SQL/parwal
+  字节（运输层加固 #5），中止事务不在 plsn 空间留渣。
+- **写栅栏（顺带获得）**：分区有数据组而本节点不是该组 leader 时，本地写入在 prepare
+  即被 ERROR 拒绝 —— 切主后旧 primary 上仍在途的事务无法提交，不产生分叉写入。
+
+### 14.2 验收（raft_16，全程无手工 propose）
+
+1. 正向：仅 INSERT（经 master 路由），follower parwal 自动出现逐字节一致、
+   1..N 连续无洞的备份，`applied_part_lsn` 追平，壳表 0 行（不回放）；
+2. 失多数派：停两个 follower 后 INSERT 必须失败（prepare 中止），行数不变；
+3. 恢复：follower 回归后再 INSERT，连同中断期间的增量自动追平，终态逐字节一致。
+
+### 14.3 边界（本次不解决）
+
+1. **group commit 让路窗口**：若本事务的记录被并发的其他 backend 顺带落盘
+   （`flushed_upto` 已覆盖时本 backend 提前返回），该事务不会触发复制挂钩，
+   记录延后到该分区下一次写入时才补齐复制（增量下界机制天然补漏）。并发高负载下
+   "提交返回时多数派已持久化"的保证因此弱化为"最终复制"——收紧需要把挂钩信息
+   记进共享 slot，留待与后台追平通道一并做。
+2. **raft 日志 SQL 行与用户事务同命**：propose 在 PRE_COMMIT 内经 SPI 写
+   `partdist.raft_log`，若事务在 propose 之后仍中止（后续回调 ERROR 等窄窗口），
+   leader 的 SQL 日志行随之回滚而 shmem 环仍在 —— 与既有 propose-in-txn 路径同级的
+   已知风险，正解是持久化通道与用户事务解耦（随日志外部化一并处理）。
+3. **reference 表与数据组不兼容**（既有结论的新表现）：reference 表每节点本地主写，
+   若为其建组，非 leader 节点的本地写入会被写栅栏拒绝。数据组只应服务
+   "一主多从"的哈希分片。

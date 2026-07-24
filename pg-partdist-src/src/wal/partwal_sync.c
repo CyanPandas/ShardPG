@@ -48,11 +48,27 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+
+/*
+ * 切主重构·prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
+ *
+ * pg_partdist 不依赖 pg_raft，复制动作经 PostgreSQL rendezvous variable 注入：
+ * pg_raft 的 _PG_init 把它的复制函数指针写进
+ * "partdist_partwal_replicate_hook"；PartWALFlush 在 [A]（本地 parwal fsync）
+ * 完成后、[B]（pg_wal 提交 fsync）之前，对本事务涉及的每个分区调用它。
+ * 未装载 pg_raft / 未启用 raft 时指针为空，零开销。
+ * 挂钩内部凑不齐多数派会 ERROR —— 事务在 prepare 即中止（步骤 4 语义）。
+ */
+typedef void (*PartWALReplicateHook) (Oid partition_id);
+static void **partwal_replicate_hook_rv = NULL;
+
+#define PARTWAL_FLUSH_TOUCHED_MAX 64
 
 /* ================================================================== */
 /* Shmem names / tranche                                               */
@@ -333,6 +349,8 @@ PartWALFlush(XLogRecPtr upto_lsn)
     PartitionWALWriter *cache_writer[PARTWAL_WRITER_CACHE_MAX];
     int                 ncached = 0;
     XLogRecPtr          last_lsn = InvalidXLogRecPtr;
+    Oid                 touched[PARTWAL_FLUSH_TOUCHED_MAX];
+    int                 n_touched = 0;
 
     /* Default: flush up to the per-backend tracked max LSN */
     if (upto_lsn == InvalidXLogRecPtr)
@@ -431,6 +449,18 @@ PartWALFlush(XLogRecPtr upto_lsn)
                 AppendPartWALRecord(writer, slot->orig_lsn,
                                     slot->rmid, slot->info,
                                     wal_data, wal_len, wal_xid);
+
+                /* 只登记本 backend（= 本事务）写入的分区，供末尾的复制挂钩用 */
+                if (slot->backend_id == MyBackendId)
+                {
+                    int t;
+
+                    for (t = 0; t < n_touched; t++)
+                        if (touched[t] == slot->partition_id)
+                            break;
+                    if (t == n_touched && n_touched < PARTWAL_FLUSH_TOUCHED_MAX)
+                        touched[n_touched++] = slot->partition_id;
+                }
             }
             last_lsn = slot->orig_lsn;
 
@@ -482,6 +512,26 @@ PartWALFlush(XLogRecPtr upto_lsn)
 
     FreePartWALPendingContent();
     partwal_my_max_lsn = InvalidXLogRecPtr;
+
+    /*
+     * [A] 已完成（本地 parwal 已 fsync）。在 [B]（提交/prepare 记录的
+     * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
+     * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
+     */
+    if (n_touched > 0)
+    {
+        PartWALReplicateHook fn;
+
+        if (partwal_replicate_hook_rv == NULL)
+            partwal_replicate_hook_rv =
+                find_rendezvous_variable("partdist_partwal_replicate_hook");
+        fn = (PartWALReplicateHook) *partwal_replicate_hook_rv;
+        if (fn != NULL)
+        {
+            for (i = 0; i < n_touched; i++)
+                fn(touched[i]);
+        }
+    }
 }
 
 /* ================================================================== */

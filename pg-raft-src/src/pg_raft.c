@@ -1072,6 +1072,16 @@ _PG_init(void)
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = partdist_shmem_startup;
 
+    /*
+     * prepare 接线：把复制函数注入 pg_partdist 的 rendezvous 挂点。
+     * PartWALFlush 在 [A] 本地 parwal fsync 后、[B] 提交 fsync 前逐分区调用。
+     */
+    {
+        void **rv = find_rendezvous_variable("partdist_partwal_replicate_hook");
+
+        *rv = (void *) pg_raft_partwal_replicate;
+    }
+
     register_topology_worker();
 }
 

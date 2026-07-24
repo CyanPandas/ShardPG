@@ -260,3 +260,26 @@
     合成分区无副作用。PartWAL 层无行为变化。
 - 验证：raft_14/raft_15（见 run-raft-tests.sh 新增段）+ raft_01–13 回归 + 全新库
   `CREATE EXTENSION pg_partdist` 冒烟。
+
+### 13. `PartWALFlush` 增加复制挂钩（事务 prepare 接线）
+
+- 修改时间：2026-07-24
+- 修改文件：`pg-partdist-src/src/wal/partwal_sync.c`
+- 修改内容：`PartWALFlush()` 在本事务记录落盘 fsync 完成、全部锁释放之后，
+  对本 backend 本事务涉及的每个分区调用 rendezvous 挂钩
+  `"partdist_partwal_replicate_hook"`（函数指针由 pg_raft 的 `_PG_init` 注入；
+  未装载/未启用 raft 时为空指针，零开销）。收集只统计
+  `slot->backend_id == MyBackendId` 的分区，上限 64 个/事务。
+- 目的：计划文档 §14 —— prepare 四步设计的第 2 步自动挂接。复制发生在
+  [A]（parwal fsync）之后、[B]（pg_wal 提交 fsync）之前；挂钩内部未达多数派
+  会 ERROR，事务在 prepare 中止。
+- 对 Raft/failover/PartWAL 行为的影响：
+  - 无数据组的分区（含合成分区、未纳管分片、raft_log 等普通表）行为与之前
+    完全一致（挂钩内查不到 global_shard_id 或组即返回）；
+  - 有数据组的分区：写入提交前自动逐条复制（一条 record 一次备份）；
+    本节点非组 leader 时写入被拒（写栅栏）；
+  - PartWAL 本身的落盘/fsync/编号语义无任何变化。
+- 边界：group commit 让路窗口内（记录被其他 backend 顺带落盘）本事务不触发挂钩，
+  增量在该分区下一次写入时补齐（详见计划文档 §14.3）。
+- 验证：raft_16（自动复制/失多数派拒 prepare/恢复追平）+ raft_01–15 回归 +
+  全新库 CREATE EXTENSION 冒烟。
