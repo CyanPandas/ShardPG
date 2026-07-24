@@ -18,11 +18,16 @@ CREATE TABLE partition_map (
     secondary_nodes INTEGER[]   NOT NULL DEFAULT '{}',
     version         BIGINT      NOT NULL DEFAULT 1,
     updated_at      TIMESTAMPTZ          DEFAULT now(),
+    -- 数据组自治选举出的主副本任期（任期栅栏：apply 只接受不回退的更新）。
+    -- 0 = 尚无数据组管理（历史/合成分区，仍走旧"控制面指定"通道）。
+    primary_term    BIGINT      NOT NULL DEFAULT 0,
     CONSTRAINT pk_partition_map PRIMARY KEY (partition_id)
 );
 
 COMMENT ON TABLE partition_map IS
     'Maps partition OIDs to their primary/secondary node assignments.';
+COMMENT ON COLUMN partition_map.primary_term IS
+    '分区 raft 组自治选举的主副本任期；0 表示尚未由数据组接管。迟到/重复的登记被 apply 的任期栅栏拦下。';
 
 -- node_map: tracks every node in the pg_partdist cluster.
 CREATE TABLE node_map (

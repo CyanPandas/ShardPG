@@ -65,6 +65,7 @@ PG_FUNCTION_INFO_V1(pg_raft_propose_node_status);
 PG_FUNCTION_INFO_V1(pg_raft_propose_partition_primary);
 PG_FUNCTION_INFO_V1(pg_raft_apply_payload);
 PG_FUNCTION_INFO_V1(pg_raft_force_probe);
+PG_FUNCTION_INFO_V1(pg_raft_report_data_leader);
 
 void
 pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t len)
@@ -454,7 +455,8 @@ pg_raft_propose_partition_primary_internal(Oid partition_id, int primary_node,
                                            const char *secondary_nodes_json,
                                            int old_primary_node,
                                            uint64 switch_partition_lsn,
-                                           const char *switch_orig_lsn)
+                                           const char *switch_orig_lsn,
+                                           int64 primary_term)
 {
     StringInfoData payload;
     StringInfoData ins;
@@ -471,10 +473,12 @@ pg_raft_propose_partition_primary_internal(Oid partition_id, int primary_node,
     appendStringInfo(&payload,
                      "{\"partition_id\": %u, \"primary_node\": %d, "
                      "\"old_primary_node\": %d, \"secondary_nodes\": %s, "
+                     "\"primary_term\": %lld, "
                      "\"switch_partition_lsn\": " UINT64_FORMAT ", "
                      "\"switch_orig_lsn\": ",
                      partition_id, primary_node, old_primary_node,
-                     secondary_nodes_json, switch_partition_lsn);
+                     secondary_nodes_json, (long long) primary_term,
+                     switch_partition_lsn);
     pg_raft_append_json_string(&payload, switch_orig_lsn ? switch_orig_lsn : "0/0");
     appendStringInfoChar(&payload, '}');
 
@@ -683,11 +687,17 @@ pg_raft_failover_partitions_for_node(int down_node_id)
     if (!pg_raft_spi_begin(&spi_owned))
         return;
 
+    /*
+     * 切主重构后，凡由数据组自治选举管理的分区（primary_term > 0，即新任 leader
+     * 已上报过）不再走这条"控制面指定新主"的旧通道——组内自会选出新 leader 并
+     * 上报登记。这里只对尚无数据组的历史分区（term=0，测试夹具）保留旧行为。
+     */
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "WITH affected AS ("
                      "  SELECT partition_id, primary_node, secondary_nodes "
-                     "  FROM partdist.partition_map WHERE primary_node = %d"
+                     "  FROM partdist.partition_map "
+                     "  WHERE primary_node = %d AND COALESCE(primary_term, 0) = 0"
                      ") "
                      "SELECT partition_id, primary_node, secondary_nodes::text "
                      "FROM affected "
@@ -840,7 +850,8 @@ pg_raft_failover_partitions_for_node(int down_node_id)
                                                           new_secondary_json,
                                                           old_primaries[i],
                                                           switch_partition_lsn,
-                                                          switch_orig_lsn ? switch_orig_lsn : "0/0");
+                                                          switch_orig_lsn ? switch_orig_lsn : "0/0",
+                                                          0);
         pfree(new_secondary_json);
         pfree(switch_orig_lsn);
         pfree(sec_jsons[i]);
@@ -888,6 +899,7 @@ pg_raft_rejoin_partitions_for_node(int up_node_id)
                      "FROM partdist.partition_map "
                      "WHERE primary_node <> %d "
                      "  AND NOT (%d = ANY(secondary_nodes)) "
+                     "  AND COALESCE(primary_term, 0) = 0 "
                      "ORDER BY partition_id",
                      up_node_id, up_node_id, up_node_id, up_node_id);
 
@@ -939,7 +951,8 @@ pg_raft_rejoin_partitions_for_node(int up_node_id)
                                                           sec_jsons[i],
                                                           primaries[i],
                                                           0,
-                                                          "0/0");
+                                                          "0/0",
+                                                          0);
         pfree(sec_jsons[i]);
     }
     pfree(parts);
@@ -1042,6 +1055,11 @@ _PG_init(void)
     DefineCustomIntVariable("pg_raft.election_timeout_ms",
                             "Raft election timeout base in ms (randomized up to 2x).",
                             NULL, &pg_raft_election_timeout_ms, 1500, 200, 60000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.coordinator_node_id",
+                            "Coordinator node id: preferred group-0 leader; excluded from data groups (0=none).",
+                            NULL, &pg_raft_coordinator_node_id, 1, 0, 65534,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.heartbeat_ms",
@@ -1183,9 +1201,118 @@ pg_raft_propose_partition_primary(PG_FUNCTION_ARGS)
     appendStringInfoChar(&arrlit, ']');
 
     log_id = pg_raft_propose_partition_primary_internal(part, primary, arrlit.data,
-                                                        0, 0, "0/0");
+                                                        0, 0, "0/0", 0);
     pfree(arrlit.data);
     PG_RETURN_INT64(log_id);
+}
+
+/*
+ * 切主重构：数据组新任 leader 的登记入口（在 group 0 leader——常态是 master——上执行）。
+ * 数据组自治选举出新 leader 后，由新 leader 的 BGW tick 经 libpq 调用本函数上报；
+ * 这里过任期栅栏后把 OP_PARTITION_PRIMARY 提进 group 0，apply 时每个成员节点各自
+ * 更新本地 partition_map，真实 Citus 分片还会把本地 pg_dist_placement 指向新主
+ * （路由元数据的 4 节点同步由 group 0 日志本身完成）。
+ *
+ * 返回值约定（上报方据此决定是否重试）：
+ *   >0  已提名（group 0 日志 index）
+ *   -1  无需登记（同任期已登记过，或已有更新任期的登记）——停止重试
+ *    0  本节点当前不是 group 0 leader——下个 tick 换当时的 leader 重试
+ */
+Datum
+pg_raft_report_data_leader(PG_FUNCTION_ARGS)
+{
+    int64      group_id = PG_GETARG_INT64(0);
+    int        leader_node = PG_GETARG_INT32(1);
+    int64      term = PG_GETARG_INT64(2);
+    ArrayType *sec_arr = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    StringInfoData sql;
+    StringInfoData sec_json;
+    int64      stored_term = 0;
+    int        stored_primary = 0;
+    int        ret;
+    bool       isnull;
+    bool       spi_owned;
+    int64      idx;
+
+    if (group_id <= 0)
+        ereport(ERROR, (errmsg("pg_raft: 数据组 id 必须 > 0")));
+    if (term <= 0)
+        ereport(ERROR, (errmsg("pg_raft: 上报任期必须 > 0")));
+    if (pg_raft_coordinator_node_id > 0 &&
+        leader_node == pg_raft_coordinator_node_id)
+        ereport(ERROR,
+                (errmsg("pg_raft: 协调节点 %d 不作数据副本，不能登记为分区 %lld 的主",
+                        pg_raft_coordinator_node_id, (long long) group_id)));
+
+    if (!pg_raft_is_leader_local())
+        PG_RETURN_INT64(0);
+
+    /* 任期栅栏预检：旧任期的迟到上报、同任期的重复上报，都不再进 group 0 日志 */
+    if (!pg_raft_spi_begin(&spi_owned))
+        PG_RETURN_INT64(0);
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node, COALESCE(primary_term, 0) "
+                     "FROM partdist.partition_map WHERE partition_id = %u",
+                     (Oid) group_id);
+    ret = SPI_execute(sql.data, true, 1);
+    pfree(sql.data);
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        stored_primary = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                                     SPI_tuptable->tupdesc, 1, &isnull));
+        stored_term = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 2, &isnull));
+    }
+    pg_raft_spi_end(spi_owned);
+
+    if (stored_term > term ||
+        (stored_term == term && stored_primary == leader_node))
+        PG_RETURN_INT64(-1);
+
+    /* secondaries = 上报的成员集去掉新主；协调节点若混入则剔除并告警 */
+    initStringInfo(&sec_json);
+    appendStringInfoChar(&sec_json, '[');
+    if (sec_arr != NULL)
+    {
+        Datum *elems;
+        bool  *nulls;
+        int    nelems;
+        int    i;
+        int    n = 0;
+
+        deconstruct_array(sec_arr, INT4OID, 4, true, 'i', &elems, &nulls, &nelems);
+        for (i = 0; i < nelems; i++)
+        {
+            int v;
+
+            if (nulls[i])
+                continue;
+            v = DatumGetInt32(elems[i]);
+            if (v == leader_node)
+                continue;
+            if (pg_raft_coordinator_node_id > 0 && v == pg_raft_coordinator_node_id)
+            {
+                elog(WARNING,
+                     "pg_raft: 分区 %lld 上报的从副本集包含协调节点 %d，已剔除",
+                     (long long) group_id, v);
+                continue;
+            }
+            appendStringInfo(&sec_json, "%s%d", n ? "," : "", v);
+            n++;
+        }
+    }
+    appendStringInfoChar(&sec_json, ']');
+
+    idx = pg_raft_propose_partition_primary_internal((Oid) group_id, leader_node,
+                                                     sec_json.data, stored_primary,
+                                                     0, "0/0", term);
+    pfree(sec_json.data);
+
+    if (idx > 0)
+        elog(LOG, "pg_raft: 登记数据组 %lld 新主 node=%d term=%lld (group0 idx=%lld)",
+             (long long) group_id, leader_node, (long long) term, (long long) idx);
+    PG_RETURN_INT64(idx);
 }
 
 Datum

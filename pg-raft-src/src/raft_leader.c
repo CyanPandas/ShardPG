@@ -12,6 +12,7 @@ int  pg_raft_node_id = 1;
 int  pg_raft_probe_interval_ms = 3000;
 int  pg_raft_probe_fail_threshold = 2;
 int  pg_raft_leader_lease_ms = 10000;
+int  pg_raft_coordinator_node_id = 1;
 
 RaftLeaderShmem *RaftLeaderShmemData = NULL;
 LWLock           *RaftLeaderLock = NULL;

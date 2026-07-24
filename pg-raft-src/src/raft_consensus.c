@@ -110,6 +110,7 @@ typedef struct RaftGroupState
     bool                in_use;
     int64               group_id;
     bool                hs_loaded;      /* HardState 是否已从文件恢复进 shmem */
+    bool                report_pending; /* 数据组新任 leader 尚未向控制面登记（tick 里重试投递） */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
     RaftConsensusShmem  cons;
@@ -198,6 +199,7 @@ static bool data_shipping_allowed = false;
 static bool raft_persist_spi_begin(bool *spi_owned);
 static void raft_persist_spi_end(bool spi_owned);
 static int64 entry_partition_lsn(const char *payload);
+static void data_group_try_report(RaftGroupCtx *ctx);
 
 /* ---- 共享内存 ---- */
 
@@ -1192,7 +1194,52 @@ group_apply_pending(RaftGroupCtx *ctx)
         idx = ctx->log->last_applied + 1;
         if (!log_get_entry_locked(ctx, idx, &e))
         {
+            int64 oldest = 0;
+            bool  skipped = false;
+
+            /*
+             * 环里已没有这条：重启后 SQL 日志长于环容量时，restore 只能把最新
+             * RAFT_LOG_CAPACITY 条灌回环，恢复出的 last_applied 若低于环窗口，
+             * apply 会在这里永久卡死；容量检查（last_log_index - last_applied）
+             * 随之恒满，本节点从此拒收一切新条目——环满诚实拒绝(不再假 ack)后
+             * 这条链在回归里整体停摆过一次。控制面语义本就是"元数据表持久、
+             * 跳过安全"(见 apply_one_entry)，把游标快进到环内最老一条继续。
+             * 数据面不允许跳——漏一条 redo 就是堆表分叉，维持卡住等追平通道。
+             */
+            if (ctx->group_id == RAFT_CONTROL_GROUP)
+            {
+                RaftLogEntry probe;
+                int64        lo = ctx->log->last_log_index - RAFT_LOG_CAPACITY + 1;
+                int64        p;
+
+                /*
+                 * 环不一定是满的（节点的 SQL 日志可能只覆盖它在线期间收到的
+                 * 一段），不能按容量倒推窗口起点；在 [下一条, commit] 里向前
+                 * 扫描第一条真实存在的条目（至多 CAPACITY 次探测）。
+                 */
+                if (lo < idx + 1)
+                    lo = idx + 1;
+                for (p = lo; p <= ctx->log->commit_index; p++)
+                {
+                    if (log_get_entry_locked(ctx, p, &probe))
+                    {
+                        ctx->log->last_applied = p - 1;
+                        oldest = p;
+                        skipped = true;
+                        break;
+                    }
+                }
+            }
             SpinLockRelease(&ctx->log->mutex);
+            if (skipped)
+            {
+                elog(WARNING,
+                     "pg_raft: group 0 apply 游标 %lld 已滑出环窗口，快进到 %lld"
+                     "（被跳过的控制面条目已反映在持久化元数据表/快照中）",
+                     (long long) idx, (long long) oldest);
+                persist_hard_state_unlocked(ctx);
+                continue;
+            }
             break;
         }
         ctx->log->apply_in_progress = true;
@@ -1225,6 +1272,9 @@ pg_raft_consensus_apply_pending(void)
 
     if (!raft_control_ctx(&ctx))
         return;
+    /* client backend 路径：重启后先把文件/SQL 日志里的状态恢复进 shmem 再 apply */
+    restore_hard_state_if_needed(&ctx);
+    restore_persistent_log_if_needed(&ctx);
     group_apply_pending(&ctx);
 }
 
@@ -1309,10 +1359,28 @@ static void
 reset_election_deadline_locked(RaftGroupCtx *ctx)
 {
     long base = pg_raft_election_timeout_ms;
-    long jitter = (base > 0) ? (random() % base) : 0;
+    long lo = base;          /* 缺省窗口 [base, 2*base) */
+    long span = base;
+    long jitter;
+
+    /*
+     * 控制面 leader 优先落在协调节点(master)：给它一个与其他节点完全不相交的
+     * 更短选举窗口 [2b/3, b)，其他节点仍是 [b, 2b)——协调节点在世时总是先超时、
+     * 先集齐多数派；它宕机时其他节点照常接管。这是偏好不是保证：worker 接任后
+     * 心跳会不断刷新协调节点的 deadline，领导权不会自动抢回，直到下一次改选。
+     * 下限 2b/3（缺省 1000ms）仍是心跳间隔(400ms)的 2.5 倍，不会误触发选举。
+     */
+    if (ctx->group_id == RAFT_CONTROL_GROUP &&
+        pg_raft_coordinator_node_id > 0 &&
+        pg_raft_node_id == pg_raft_coordinator_node_id)
+    {
+        lo = (base * 2) / 3;
+        span = base - lo;
+    }
+    jitter = (span > 0) ? (random() % span) : 0;
 
     ctx->cons->election_deadline =
-        GetCurrentTimestamp() + (base + jitter) * 1000L;
+        GetCurrentTimestamp() + (lo + jitter) * 1000L;
 }
 
 /* ---- libpq RPC ---- */
@@ -1734,6 +1802,120 @@ send_heartbeats(RaftGroupCtx *ctx)
 
 /* ---- 选举 ---- */
 
+/*
+ * 数据组新任 leader 向控制面登记（切主重构的上报半程）。
+ *
+ * BGW tick 上下文无 SPI，投递走 libpq：向 group 0 当前 leader（常态是 master）
+ * 调 partdist.pg_raft_report_data_leader(gid, self, term, secondaries)。返回
+ * >0（已登记）或 -1（无需登记）时清除 report_pending；0 或投递失败则保留标志，
+ * 下个 tick 重试——控制面短暂无主/换主/网络抖动都天然容错。任期栅栏保证重复
+ * 投递与迟到投递无害。
+ */
+static void
+data_group_try_report(RaftGroupCtx *ctx)
+{
+    RaftGroupCtx ctx0;
+    int          leader0;
+    int64        term;
+    int          state;
+    int          sec[RAFT_MAX_PEERS];
+    int          n_sec = 0;
+    int          i;
+    int          slot = -1;
+    char         arrbuf[192];
+    char         sql[384];
+    int          off;
+    PGconn      *conn;
+    PGresult    *res;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    state = ctx->cons->state;
+    term = ctx->cons->current_term;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (state != RAFT_LEADER)
+    {
+        ctx->g->report_pending = false;
+        return;
+    }
+
+    if (!raft_group_ctx(RAFT_CONTROL_GROUP, &ctx0))
+        return;
+    SpinLockAcquire(&ctx0.cons->mutex);
+    leader0 = ctx0.cons->leader_id;
+    SpinLockRelease(&ctx0.cons->mutex);
+    if (leader0 <= 0)
+        return;                 /* 控制面暂无主，下个 tick 重试 */
+
+    /*
+     * secondaries = 本组成员集去掉自己。成员集未知（hearsay 自动建组，members
+     * 为空）时退化为"全体 peers 去掉自己与协调节点"——协调节点永不作数据副本。
+     */
+    if (ctx->g->n_members > 0)
+    {
+        for (i = 0; i < ctx->g->n_members && n_sec < RAFT_MAX_PEERS; i++)
+            if (ctx->g->members[i] != pg_raft_node_id)
+                sec[n_sec++] = ctx->g->members[i];
+    }
+    else
+    {
+        for (i = 0; i < n_peers && n_sec < RAFT_MAX_PEERS; i++)
+            if (peers[i].node_id != pg_raft_node_id &&
+                peers[i].node_id != pg_raft_coordinator_node_id)
+                sec[n_sec++] = peers[i].node_id;
+    }
+
+    off = snprintf(arrbuf, sizeof(arrbuf), "ARRAY[");
+    for (i = 0; i < n_sec && off < (int) sizeof(arrbuf) - 16; i++)
+        off += snprintf(arrbuf + off, sizeof(arrbuf) - off, "%s%d",
+                        i ? "," : "", sec[i]);
+    snprintf(arrbuf + off, sizeof(arrbuf) - off, "]::int[]");
+
+    snprintf(sql, sizeof(sql),
+             "SELECT partdist.pg_raft_report_data_leader(%lld, %d, %lld, %s)",
+             (long long) ctx->group_id, pg_raft_node_id, (long long) term, arrbuf);
+
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == leader0)
+        {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        return;
+
+    if (peer_in_backoff(&peers[slot]))
+        return;
+    conn = peer_conn_get(&peers[slot]);
+    if (conn == NULL)
+    {
+        peer_mark_result(&peers[slot], false);
+        return;
+    }
+
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+    {
+        long long v = atoll(PQgetvalue(res, 0, 0));
+
+        if (v != 0)
+        {
+            ctx->g->report_pending = false;
+            elog(LOG,
+                 "pg_raft: group %lld leader node %d term %lld 已向控制面(node %d)登记 (ret=%lld)",
+                 (long long) ctx->group_id, pg_raft_node_id,
+                 (long long) term, leader0, v);
+        }
+        peer_mark_result(&peers[slot], true);
+    }
+    else
+    {
+        if (PQstatus(conn) != CONNECTION_OK)
+            peer_conn_reset(slot);
+        peer_mark_result(&peers[slot], false);
+    }
+    PQclear(res);
+}
+
 static void
 start_election(RaftGroupCtx *ctx)
 {
@@ -1810,6 +1992,14 @@ start_election(RaftGroupCtx *ctx)
         persist_hard_state_unlocked(ctx);
         init_leader_replication(ctx);
         send_heartbeats(ctx);
+
+        /*
+         * 切主重构：数据组自治选出新 leader 后须向控制面登记（分区副本/节点信息
+         * 上报 master，master 落到路由层）。BGW tick 无 SPI，登记走 libpq 投递，
+         * 这里只置标志，由 group_tick 重试直到送达。
+         */
+        if (ctx->group_id != RAFT_CONTROL_GROUP)
+            ctx->g->report_pending = true;
     }
 }
 
@@ -1824,6 +2014,13 @@ group_tick(RaftGroupCtx *ctx)
     /* 不是本组成员的节点不参与该组的选举/心跳 */
     if (!group_has_member(ctx, pg_raft_node_id))
         return;
+
+    /*
+     * 先从文件恢复 HardState（只读文件、无 SPI，BGW 可做）。否则重启后 BGW
+     * 可能在任何 SQL 路径触发恢复之前就发起选举，把全零的 term/commit/
+     * last_applied 持久化回文件，抹掉真实历史。
+     */
+    restore_hard_state_if_needed(ctx);
 
     now = GetCurrentTimestamp();
 
@@ -1840,6 +2037,8 @@ group_tick(RaftGroupCtx *ctx)
     if (state == RAFT_LEADER)
     {
         send_heartbeats(ctx);
+        if (ctx->group_id != RAFT_CONTROL_GROUP && ctx->g->report_pending)
+            data_group_try_report(ctx);
         return;
     }
 
@@ -2065,6 +2264,13 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     parse_peers();
     majority = cluster_majority(ctx);
 
+    /*
+     * 先把已提交的积压 apply 掉再 append：重启后恢复出的 last_applied 可能
+     * 远低于环窗口，此时容量检查(last_log_index - last_applied)会误判环满、
+     * 拒绝一切新提案；group_apply_pending 里的控制面快进会先把游标追平。
+     */
+    group_apply_pending(ctx);
+
     SpinLockAcquire(&ctx->cons->mutex);
     term = ctx->cons->current_term;
     SpinLockRelease(&ctx->cons->mutex);
@@ -2273,7 +2479,17 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
         }
         if (entry_idx == ctx->log->last_log_index + 1)
         {
-            log_append_locked(ctx, entry_term, entry_op, entry_payload);
+            /*
+             * 环满时 append 会失败；此时绝不能 ack（success 保持 0），否则
+             * leader 会把一条本节点根本没有的条目计入多数派——提交点可能
+             * 覆盖到少数派都不持有的日志，破坏 Leader Completeness。
+             * 不 ack 则 leader 按失败路径退避重试，待 apply 推进腾出环位。
+             */
+            if (log_append_locked(ctx, entry_term, entry_op, entry_payload) <= 0)
+            {
+                SpinLockRelease(&ctx->log->mutex);
+                return true;
+            }
             SpinLockRelease(&ctx->log->mutex);
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
@@ -2539,6 +2755,18 @@ pg_raft_group_create(PG_FUNCTION_ARGS)
 
     parse_peers();
     n_members = extract_members(arr, members);
+
+    /* master 只做协调与登记，不作任何分区的数据副本（主/从都不行） */
+    if (pg_raft_coordinator_node_id > 0)
+    {
+        int i;
+
+        for (i = 0; i < n_members; i++)
+            if (members[i] == pg_raft_coordinator_node_id)
+                ereport(ERROR,
+                        (errmsg("pg_raft: 协调节点 %d 不作数据副本，不能加入数据组 %lld 的成员集",
+                                pg_raft_coordinator_node_id, (long long) group_id)));
+    }
 
     if (!raft_group_ensure(group_id, members, n_members, &ctx))
         PG_RETURN_BOOL(false);

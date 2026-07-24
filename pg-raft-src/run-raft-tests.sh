@@ -597,6 +597,13 @@ raft13_cleanup() {
     $PSQL -p "$port" -U postgres -c \
       "SELECT partdist.pg_raft_group_reset();" &>/dev/null || true
   done
+  # 数据组 leader 当选时会向控制面登记(切主重构),清掉本用例夹具的登记行
+  if [[ -n "${RAFT_13_GID:-}" ]]; then
+    for port in "${NODE_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "DELETE FROM partdist.partition_map WHERE partition_id = ${RAFT_13_GID}::oid;" &>/dev/null || true
+    done
+  fi
   $PSQL -p 5432 -U postgres -c \
     "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_13_TABLE};" &>/dev/null || true
 }
@@ -724,6 +731,245 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   done
   sleep 1
 fi
+
+# raft_14 + raft_15: 切主重构验收。真实哈希分布分片,(a) 形态从副本(同构壳表+
+# shard_identity),组成员=全部 worker {2,3,4}(master 不作数据副本)。
+# raft_14 验复制半程:经 master 路由写入,逐条 propose,follower parwal 逐字节
+# 一致、连续无洞、不回放;数据组 leader 初次当选即向控制面登记(partition_map +
+# pg_dist_placement 每节点各一份)。
+# raft_15 验切主全程:停掉主副本节点 → 组内自治选举 → 新 leader 上报 master →
+# group 0 登记(任期栅栏)→ 每节点路由层落新主;旧主重启后以 follower 归队。
+RAFT_14_TABLE=raft14_demo
+RAFT_14_MEMBER_IDS="ARRAY[2,3,4]"
+RAFT_14_GID=""
+
+raft14_cleanup() {
+  local port
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -c \
+      "SELECT partdist.pg_raft_group_reset();" &>/dev/null || true
+  done
+  if [[ -n "$RAFT_14_GID" ]]; then
+    for port in 5433 5434 5435; do
+      $PSQL -p "$port" -U postgres -c \
+        "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS ${RAFT_14_TABLE}_${RAFT_14_GID};" &>/dev/null || true
+    done
+    for port in "${NODE_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "DELETE FROM partdist.partition_map WHERE partition_id = ${RAFT_14_GID}::oid;
+         DELETE FROM partdist.follower_partition_map WHERE global_shard_id = ${RAFT_14_GID};" &>/dev/null || true
+    done
+  fi
+  $PSQL -p 5432 -U postgres -c \
+    "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_14_TABLE};" &>/dev/null || true
+}
+
+start_all_nodes
+sleep 2
+
+RAFT_14_OK=0
+RAFT_14_WHY="setup"
+RAFT_14_LEADER=""
+RAFT_14_PRIMARY_ID=""
+RAFT_14_TERM=""
+RAFT_14_FOLLOWER_PORTS=()
+
+if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+     "SET citus.enable_ddl_propagation=on;
+      DROP TABLE IF EXISTS ${RAFT_14_TABLE};
+      SET citus.shard_count = 1;
+      SET citus.shard_replication_factor = 1;
+      CREATE TABLE ${RAFT_14_TABLE}(id int primary key, v text);
+      SELECT create_distributed_table('${RAFT_14_TABLE}', 'id');" &>/dev/null; then
+
+  RAFT_14_GID=$($PSQL -p 5432 -U postgres -tAc \
+    "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='${RAFT_14_TABLE}'::regclass;" 2>/dev/null || echo "")
+  RAFT_14_PRIMARY_PORT=$($PSQL -p 5432 -U postgres -tAc \
+    "SELECT n.nodeport FROM pg_dist_placement p
+       JOIN pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+      WHERE p.shardid = ${RAFT_14_GID:-0};" 2>/dev/null || echo "")
+
+  if [[ -n "$RAFT_14_GID" && -n "$RAFT_14_PRIMARY_PORT" ]]; then
+    RAFT_14_PRIMARY_ID=$(( RAFT_14_PRIMARY_PORT - 5431 ))
+
+    # (a) 形态:其余 worker 建同构壳表(表名=分片表名),rebuild 注册 shard_identity
+    for port in 5433 5434 5435; do
+      if [[ "$port" != "$RAFT_14_PRIMARY_PORT" ]]; then
+        $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
+          "SET citus.enable_ddl_propagation=off;
+           CREATE TABLE IF NOT EXISTS ${RAFT_14_TABLE}_${RAFT_14_GID}
+             (LIKE ${RAFT_14_TABLE} INCLUDING ALL);" &>/dev/null \
+          && RAFT_14_FOLLOWER_PORTS+=("$port")
+      fi
+      $PSQL -p "$port" -U postgres -c "SELECT partdist.rebuild_shard_identity();" &>/dev/null || true
+    done
+
+    # 只在 placement 节点先建组:它先发起选举,leader 落在有数据的节点;
+    # 其他成员靠 hearsay 自动建组,选出 leader 后再补 group_create 固化成员集
+    $PSQL -p "$RAFT_14_PRIMARY_PORT" -U postgres -c \
+      "SELECT partdist.pg_raft_group_create(${RAFT_14_GID}, ${RAFT_14_MEMBER_IDS});" &>/dev/null || true
+    for attempt in $(seq 1 15); do
+      st=$($PSQL -p "$RAFT_14_PRIMARY_PORT" -U postgres -tAc \
+        "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = ${RAFT_14_GID};" 2>/dev/null || echo "")
+      [[ "$st" == "leader" ]] && RAFT_14_LEADER="$RAFT_14_PRIMARY_PORT" && break
+      sleep 1
+    done
+    for port in "${RAFT_14_FOLLOWER_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -c \
+        "SELECT partdist.pg_raft_group_create(${RAFT_14_GID}, ${RAFT_14_MEMBER_IDS});" &>/dev/null || true
+    done
+
+    if [[ -n "$RAFT_14_LEADER" ]]; then
+      # 经 master 路由写入(顺带验证 Citus 平面路由);hook 在 placement worker 捕获
+      $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
+        "INSERT INTO ${RAFT_14_TABLE} SELECT g, 'r' || g FROM generate_series(1, 5) g;" &>/dev/null
+      sleep 1
+      RAFT_14_NREC=$($PSQL -p "$RAFT_14_LEADER" -U postgres -tAc \
+        "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${RAFT_14_GID}));" 2>/dev/null || echo 0)
+
+      if [[ "$RAFT_14_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_14_NREC" -gt 0 ]]; then
+        # 一条 record 一次备份:逐条 propose,保序
+        RAFT_14_PROPOSED=1
+        for lsn in $(seq 1 "$RAFT_14_NREC"); do
+          idx=$($PSQL -p "$RAFT_14_LEADER" -U postgres -tAc \
+            "SELECT partdist.pg_raft_data_propose(${RAFT_14_GID}, ${lsn});" 2>/dev/null || echo 0)
+          if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -le 0 ]]; then
+            RAFT_14_PROPOSED=0
+            RAFT_14_WHY="record ${lsn} propose 返回 ${idx}"
+            break
+          fi
+        done
+        sleep 2
+
+        RAFT_14_MD5=$($PSQL -p "$RAFT_14_LEADER" -U postgres -tAc \
+          "SELECT md5(string_agg(sub.h, ',' ORDER BY sub.plsn)) FROM (
+             SELECT g AS plsn, md5(r.data) AS h
+             FROM generate_series(1, ${RAFT_14_NREC}) g,
+                  LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_14_GID}), g) r
+           ) sub;" 2>/dev/null || echo "")
+
+        if [[ "$RAFT_14_PROPOSED" == "1" && -n "$RAFT_14_MD5" ]]; then
+          # 初次登记(become-leader 上报)应已随 group 0 落到 master
+          RAFT_14_TERM=""
+          for attempt in $(seq 1 10); do
+            RAFT_14_TERM=$($PSQL -p 5432 -U postgres -tAc \
+              "SELECT primary_term FROM partdist.partition_map
+                WHERE partition_id = ${RAFT_14_GID}::oid AND primary_term > 0
+                  AND primary_node = ${RAFT_14_PRIMARY_ID};" 2>/dev/null || echo "")
+            [[ -n "$RAFT_14_TERM" ]] && break
+            sleep 1
+          done
+
+          if [[ -n "$RAFT_14_TERM" ]]; then
+            RAFT_14_OK=1
+            for port in "${RAFT_14_FOLLOWER_PORTS[@]}"; do
+              if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+                     -v gid="$RAFT_14_GID" -v nrec="$RAFT_14_NREC" \
+                     -v leader_md5="$RAFT_14_MD5" -v primary_id="$RAFT_14_PRIMARY_ID" \
+                     -v shard_table="${RAFT_14_TABLE}_${RAFT_14_GID}" \
+                     -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                RAFT_14_OK=0
+                RAFT_14_WHY="follower ${port} 断言失败"
+                break
+              fi
+            done
+            # master 不作数据副本:全程不得有该分片的身份/parwal
+            if [[ "$RAFT_14_OK" == "1" ]]; then
+              RAFT_14_MASTER_ID=$($PSQL -p 5432 -U postgres -tAc \
+                "SELECT COALESCE(partdist.local_partition_for_shard(${RAFT_14_GID})::text, 'none');" 2>/dev/null || echo "err")
+              if [[ "$RAFT_14_MASTER_ID" != "none" ]]; then
+                RAFT_14_OK=0
+                RAFT_14_WHY="master 意外持有分片身份(${RAFT_14_MASTER_ID})"
+              fi
+            fi
+          else
+            RAFT_14_WHY="初次登记未到达 master(partition_map 无 term>0 行)"
+          fi
+        elif [[ "$RAFT_14_PROPOSED" == "1" ]]; then
+          RAFT_14_WHY="取 leader 全量指纹失败"
+        fi
+      else
+        RAFT_14_WHY="leader parwal 无记录(flush=${RAFT_14_NREC})"
+      fi
+    else
+      RAFT_14_WHY="数据组 leader 未落在 placement 节点"
+    fi
+  else
+    RAFT_14_WHY="拿不到 shardid/placement(gid=${RAFT_14_GID:-空})"
+  fi
+fi
+
+if [[ "$RAFT_14_OK" == "1" ]]; then
+  ok "raft_14_hash_shard_secondary_backup.sql"
+else
+  bad "raft_14_hash_shard_secondary_backup.sql(${RAFT_14_WHY})"
+fi
+
+# raft_15: 停掉主副本节点,验证 自治选举→上报→登记→落路由层 全链路
+RAFT_15_OK=0
+RAFT_15_WHY="依赖 raft_14 的组与登记"
+if [[ "$RAFT_14_OK" == "1" ]]; then
+  node_stop "$RAFT_14_PRIMARY_PORT"
+
+  # 等新主登记:选举超时(1.5~3s) + 上报 tick + group 0 复制,给足余量
+  RAFT_15_NEWP=""
+  for attempt in $(seq 1 30); do
+    sleep 1
+    RAFT_15_NEWP=$($PSQL -p 5432 -U postgres -tAc \
+      "SELECT primary_node FROM partdist.partition_map
+        WHERE partition_id = ${RAFT_14_GID}::oid
+          AND primary_term > ${RAFT_14_TERM}
+          AND primary_node <> ${RAFT_14_PRIMARY_ID};" 2>/dev/null || echo "")
+    [[ -n "$RAFT_15_NEWP" ]] && break
+  done
+
+  if [[ -n "$RAFT_15_NEWP" ]]; then
+    RAFT_15_OK=1
+    # master + 两个存活 worker 各自断言(partition_map / pg_dist_placement 每节点一份)
+    for port in 5432 "${RAFT_14_FOLLOWER_PORTS[@]}"; do
+      if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+             -v gid="$RAFT_14_GID" -v old_primary_id="$RAFT_14_PRIMARY_ID" \
+             -v old_term="$RAFT_14_TERM" \
+             -f "${RAFT_TEST_DIR}/raft_15_self_election_failover.sql" &>/dev/null; then
+        RAFT_15_OK=0
+        RAFT_15_WHY="节点 ${port} 断言失败"
+        break
+      fi
+    done
+
+    # 旧主重启后应以 follower 归队,且登记不回退(任期栅栏)
+    node_start "$RAFT_14_PRIMARY_PORT"
+    if [[ "$RAFT_15_OK" == "1" ]]; then
+      RAFT_15_REJOIN=""
+      for attempt in $(seq 1 20); do
+        sleep 1
+        st=$($PSQL -p "$RAFT_14_PRIMARY_PORT" -U postgres -tAc \
+          "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = ${RAFT_14_GID};" 2>/dev/null || echo "")
+        [[ "$st" == "follower" ]] && RAFT_15_REJOIN=1 && break
+      done
+      RAFT_15_STILL=$($PSQL -p 5432 -U postgres -tAc \
+        "SELECT primary_node FROM partdist.partition_map WHERE partition_id = ${RAFT_14_GID}::oid;" 2>/dev/null || echo "")
+      if [[ -z "$RAFT_15_REJOIN" ]]; then
+        RAFT_15_OK=0
+        RAFT_15_WHY="旧主重启后未以 follower 归队(state=${st:-无})"
+      elif [[ "$RAFT_15_STILL" != "$RAFT_15_NEWP" ]]; then
+        RAFT_15_OK=0
+        RAFT_15_WHY="旧主归队后登记被改写(primary=${RAFT_15_STILL},期望 ${RAFT_15_NEWP})"
+      fi
+    fi
+  else
+    RAFT_15_WHY="30s 内未见新主登记(自治选举或上报链路未走通)"
+    node_start "$RAFT_14_PRIMARY_PORT"
+    sleep 2
+  fi
+fi
+
+if [[ "$RAFT_15_OK" == "1" ]]; then
+  ok "raft_15_self_election_failover.sql"
+else
+  bad "raft_15_self_election_failover.sql(${RAFT_15_WHY})"
+fi
+raft14_cleanup
 
 # ------------------------------------------------------------------
 section "汇总"

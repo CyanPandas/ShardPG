@@ -240,3 +240,23 @@
 - 验证：在 worker1 上新建库执行 `CREATE EXTENSION pg_partdist` 成功，
   并确认 `partwal_follower_append` / `partwal_truncate_to` / `partwal_read_record`
   三个函数以正确签名注册。
+
+### 12. `partition_map` 增加 `primary_term` 列（切主重构的任期栅栏）
+
+- 修改时间：2026-07-24
+- 修改文件：
+  - `pg-partdist-src/sql/pg_partdist--1.0.sql`（`CREATE TABLE partition_map` 增列 + `COMMENT ON COLUMN`）
+  - `pg-install/share/postgresql/extension/pg_partdist--1.0.sql`（已安装副本，经容器 `make install` 同步）
+  - `pg-raft-src/setup-raft.sh`（已安装库补列：`ALTER TABLE ... ADD COLUMN IF NOT EXISTS primary_term BIGINT NOT NULL DEFAULT 0`）
+- 目的：切主机制重构（计划文档 §13）。数据组自治选举出的新 leader 上报后，
+  `OP_PARTITION_PRIMARY` 携带其选举任期；apply 端以
+  `WHERE partition_map.primary_term <= EXCLUDED.primary_term` 做任期栅栏，
+  拦下迟到/重复登记与旧"控制面指定"通道的 term=0 提案。
+- 对 Raft/failover/PartWAL 行为的影响：
+  - `primary_term = 0` 语义为"尚无数据组接管"，旧 failover/rejoin 通道只对这类分区生效
+    （`pg_raft.c` 两处查询加了 `AND COALESCE(primary_term,0)=0` 门）；
+  - `primary_term > 0` 的分区主副本变更**只**来自组内自治选举 + 上报登记；
+  - apply 在真实 Citus shardid 上还会更新本地 `pg_dist_placement`（落路由层），
+    合成分区无副作用。PartWAL 层无行为变化。
+- 验证：raft_14/raft_15（见 run-raft-tests.sh 新增段）+ raft_01–13 回归 + 全新库
+  `CREATE EXTENSION pg_partdist` 冒烟。

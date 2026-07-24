@@ -110,6 +110,19 @@ CREATE OR REPLACE FUNCTION pg_raft_force_probe()
 COMMENT ON FUNCTION pg_raft_force_probe() IS
     '手动触发一次 TopologyMonitor 循环（仅 Leader 执行）：探测节点并生成 failover 提议。';
 
+CREATE OR REPLACE FUNCTION pg_raft_report_data_leader(
+    p_group_id bigint,
+    p_leader_node integer,
+    p_term bigint,
+    p_secondary_nodes integer[]
+) RETURNS bigint LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader';
+
+COMMENT ON FUNCTION pg_raft_report_data_leader(bigint, integer, bigint, integer[]) IS
+    '数据组新任 leader 的登记入口（须在 group 0 leader 上执行）：过任期栅栏后把 '
+    'OP_PARTITION_PRIMARY 提进 group 0，apply 时各节点更新 partition_map 并把真实 '
+    'Citus 分片的 pg_dist_placement 指向新主。返回 >0=已提名 / -1=无需登记 / 0=非 group 0 leader。';
+
 COMMENT ON FUNCTION pg_raft_propose_partition_primary(oid, integer, integer[]) IS
     '提交 OP_PARTITION_PRIMARY 控制面决议；当前接口对外仍接收 partition_id / new_primary / secondary_nodes，内部日志已保留 old_primary 与切换点字段。';
 

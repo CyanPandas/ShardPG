@@ -49,6 +49,8 @@ extern int  pg_raft_node_id;
 extern int  pg_raft_probe_interval_ms;
 extern int  pg_raft_probe_fail_threshold;
 extern int  pg_raft_leader_lease_ms;
+/* 协调节点(master)：group 0 leader 优先落于此节点；且不得作为数据组成员。0=不指定 */
+extern int  pg_raft_coordinator_node_id;
 
 /* 纯 C Raft 选举共识（raft_consensus.c） */
 extern bool  pg_raft_raft_enabled;
@@ -75,7 +77,8 @@ extern int64 pg_raft_propose_partition_primary_internal(Oid partition_id, int pr
                                                         const char *secondary_nodes_json,
                                                         int old_primary_node,
                                                         uint64 switch_partition_lsn,
-                                                        const char *switch_orig_lsn);
+                                                        const char *switch_orig_lsn,
+                                                        int64 primary_term);
 extern void pg_raft_topology_probe_and_failover(void);
 extern void pg_raft_failover_partitions_for_node(int down_node_id);
 extern void pg_raft_rejoin_partitions_for_node(int up_node_id);
@@ -93,7 +96,8 @@ extern bool pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
                                             const char *secondaries_array_literal,
                                             int old_primary_node,
                                             uint64 switch_partition_lsn,
-                                            const char *switch_orig_lsn);
+                                            const char *switch_orig_lsn,
+                                            int64 primary_term);
 extern bool pg_raft_apply_payload_sql(const char *op_type, const char *payload_json);
 extern bool pg_raft_replicate_to_peers(const char *op_type, const char *payload_json);
 

@@ -35,6 +35,7 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_group_create_internal(BIGINT, INTEGER[]
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_drop_internal(BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_rpc(TEXT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_force_probe();
+DROP FUNCTION IF EXISTS partdist.pg_raft_report_data_leader(BIGINT, INTEGER, BIGINT, INTEGER[]);
 DROP FUNCTION IF EXISTS partdist.pg_raft_apply_payload(TEXT, JSONB);
 DROP FUNCTION IF EXISTS partdist.pg_raft_propose_partition_primary(OID, INTEGER, INTEGER[]);
 DROP FUNCTION IF EXISTS partdist.pg_raft_propose_node_status(INTEGER, TEXT);
@@ -90,6 +91,8 @@ pg_raft.heartbeat_ms = 400
 pg_raft.election_timeout_ms = 1500
 pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 1
+# 协调节点(master)：group 0 leader 优先落于此，且不得作为数据组成员
+pg_raft.coordinator_node_id = 1
 EOF
 }
 
@@ -148,6 +151,9 @@ ALTER TABLE partdist.raft_log ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL 
 DROP INDEX IF EXISTS partdist.idx_raft_log_log_index;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_group_index
     ON partdist.raft_log(group_id, log_index);
+-- 切主重构：数据组自治选举的主副本任期（任期栅栏）。pg_partdist 已安装时不会
+-- 重跑安装脚本，这里补列（与 pg_partdist--1.0.sql 中的定义保持一致）。
+ALTER TABLE partdist.partition_map ADD COLUMN IF NOT EXISTS primary_term BIGINT NOT NULL DEFAULT 0;
 SQL
   ensure_boundary_functions "$port"
 }

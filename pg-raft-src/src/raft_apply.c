@@ -2,9 +2,11 @@
 
 #include "pg_raft.h"
 
+#include "access/xact.h"
 #include "executor/spi.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
 static bool
@@ -105,50 +107,140 @@ pg_raft_apply_node_status(int node_id, const char *status)
     return ok;
 }
 
+/*
+ * 桥接路由层：partition_id 是真实 Citus shardid 时，把**本节点**的
+ * pg_dist_placement 指向新主所在的 Citus group（node_map.port ↔ pg_dist_node.nodeport）。
+ * group 0 的 apply 在每个成员节点各自执行，因此 4 节点路由元数据的同步由 raft
+ * 日志本身完成；UPDATE 触发 Citus 的 dist_placement_cache_invalidate 失效缓存。
+ * 合成分区（partition_id 不在 pg_dist_placement 中）自然匹配 0 行，无副作用。
+ *
+ * 注意：P3 物理回放落地前，从副本壳表还没有数据——此桥只保证"机制先行"，
+ * 切主后立即服务读写要等回放追平（见计划文档 §12）。
+ */
+static void
+raft_update_citus_placement(Oid partition_id, int primary_node)
+{
+    StringInfoData sql;
+    int            ret;
+    bool           isnull;
+    MemoryContext  oldcontext = CurrentMemoryContext;
+    ResourceOwner  oldowner = CurrentResourceOwner;
+
+    ret = SPI_execute("SELECT to_regclass('pg_dist_placement') IS NOT NULL", true, 1);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0 ||
+        !DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                    SPI_tuptable->tupdesc, 1, &isnull)))
+        return;
+
+    /*
+     * 只对**单放置**分片切路由。reference 表/rf>1 的分片在 pg_dist_placement
+     * 里同一 shardid 有多行（每个节点组一行），既没有"唯一主"的语义，直接
+     * UPDATE 还会撞 (shardid, groupid) 唯一键——raft_13 的 reference 夹具组
+     * 上报登记时实测踩中。
+     */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "UPDATE pg_dist_placement p SET groupid = n.groupid "
+                     "FROM partdist.node_map m, pg_dist_node n "
+                     "WHERE m.node_id = %d AND n.nodeport = m.port "
+                     "  AND n.noderole = 'primary' "
+                     "  AND p.shardid = %u AND p.groupid <> n.groupid "
+                     "  AND (SELECT count(*) FROM pg_dist_placement q "
+                     "       WHERE q.shardid = p.shardid) = 1",
+                     primary_node, partition_id);
+
+    /*
+     * 子事务隔离：桥接只是"锦上添花"的路由层落盘，任何意外 SQL 错误都不允许
+     * 打穿控制面 apply——否则 apply 游标会卡死在这条日志上，之后所有控制面
+     * 决议（含别的分区的登记）全部停摆（首轮回归实测到的毒丸场景）。
+     */
+    BeginInternalSubTransaction(NULL);
+    PG_TRY();
+    {
+        ret = SPI_execute(sql.data, false, 0);
+        if (ret == SPI_OK_UPDATE && SPI_processed > 0)
+            elog(LOG, "pg_raft: 路由层已切换 shard %u -> node %d (pg_dist_placement)",
+                 partition_id, primary_node);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
+    }
+    PG_CATCH();
+    {
+        MemoryContextSwitchTo(oldcontext);
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
+        elog(WARNING,
+             "pg_raft: 路由层桥接失败已跳过(shard %u -> node %d)，partition_map 登记不受影响",
+             partition_id, primary_node);
+    }
+    PG_END_TRY();
+    pfree(sql.data);
+}
+
 bool
 pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
                               const char *secondaries_array_literal,
                               int old_primary_node,
                               uint64 switch_partition_lsn,
-                              const char *switch_orig_lsn)
+                              const char *switch_orig_lsn,
+                              int64 primary_term)
 {
     StringInfoData sql;
     int            ret;
     bool           ok = false;
+    bool           applied = false;
     bool           spi_owned;
 
     if (!raft_spi_begin(&spi_owned))
         return false;
 
+    /*
+     * 任期栅栏：只接受任期不回退的更新。数据组自治选举的任期单调递增，
+     * 迟到的旧任期登记（或旧"控制面指定"通道的 term=0 提案）不能覆盖
+     * 新任期的结果。栅栏放在 apply 里，group 0 各成员按同一日志序执行，
+     * 判定结果天然一致。
+     */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "INSERT INTO partdist.partition_map (partition_id, primary_node, secondary_nodes) "
-                     "VALUES (%u, %d, %s::int[]) "
+                     "INSERT INTO partdist.partition_map (partition_id, primary_node, secondary_nodes, primary_term) "
+                     "VALUES (%u, %d, %s::int[], %lld) "
                      "ON CONFLICT (partition_id) DO UPDATE SET "
                      "primary_node = EXCLUDED.primary_node, "
-                     "secondary_nodes = EXCLUDED.secondary_nodes, updated_at = now()",
+                     "secondary_nodes = EXCLUDED.secondary_nodes, "
+                     "primary_term = EXCLUDED.primary_term, updated_at = now() "
+                     "WHERE partition_map.primary_term <= EXCLUDED.primary_term",
                      partition_id, primary_node,
-                     quote_literal_cstr(secondaries_array_literal));
+                     quote_literal_cstr(secondaries_array_literal),
+                     (long long) primary_term);
 
     ret = SPI_execute(sql.data, false, 0);
     ok = (ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
+    applied = ok && SPI_processed > 0;
     pfree(sql.data);
 
-    if (ok)
+    if (applied)
     {
         elog(LOG,
              "pg_raft: apply partition primary partition=%u old_primary=%d new_primary=%d "
-             "switch_partition_lsn=" UINT64_FORMAT " switch_orig_lsn=%s",
+             "primary_term=%lld switch_partition_lsn=" UINT64_FORMAT " switch_orig_lsn=%s",
              partition_id, old_primary_node, primary_node,
-             switch_partition_lsn,
+             (long long) primary_term, switch_partition_lsn,
              switch_orig_lsn ? switch_orig_lsn : "0/0");
         raft_notify_primary_switch(partition_id,
                                    old_primary_node,
                                    primary_node,
                                    switch_orig_lsn);
+        raft_update_citus_placement(partition_id, primary_node);
         raft_invalidate_cache();
         raft_save_metadata_snapshot(pg_raft_consensus_last_applied());
     }
+    else if (ok)
+        elog(LOG,
+             "pg_raft: partition %u 主副本更新被任期栅栏拦下 (提案任期 %lld 落后于已登记任期)",
+             partition_id, (long long) primary_term);
     raft_spi_end(spi_owned);
     return ok;
 }
@@ -187,6 +279,7 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         int     primary_node;
         int     old_primary_node;
         uint64  switch_partition_lsn;
+        int64   primary_term;
         char   *secondary_nodes_text;
         char   *switch_orig_lsn_text;
 
@@ -198,7 +291,8 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
                          "                 FROM jsonb_array_elements_text(j->'secondary_nodes') t), '{}'), "
                          "       COALESCE((j->>'old_primary_node')::int, 0), "
                          "       COALESCE((j->>'switch_partition_lsn')::bigint, 0), "
-                         "       COALESCE(j->>'switch_orig_lsn', '0/0') "
+                         "       COALESCE(j->>'switch_orig_lsn', '0/0'), "
+                         "       COALESCE((j->>'primary_term')::bigint, 0) "
                          "FROM (SELECT %s::jsonb AS j) s",
                          quote_literal_cstr(payload_json));
         ret = SPI_execute(sql.data, true, 1);
@@ -230,6 +324,8 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
                                                            SPI_tuptable->tupdesc, 4, &isnull));
             switch_partition_lsn = (uint64) DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
                                                                         SPI_tuptable->tupdesc, 5, &isnull));
+            primary_term = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                                       SPI_tuptable->tupdesc, 7, &isnull));
 
             /*
              * 解析 payload 的 SPI 查询结束后，先关闭外层 SPI，再进入真正
@@ -243,7 +339,8 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
                                                  secondary_nodes_text,
                                                  old_primary_node,
                                                  switch_partition_lsn,
-                                                 switch_orig_lsn_text);
+                                                 switch_orig_lsn_text,
+                                                 primary_term);
 
             pfree(secondary_nodes_text);
             pfree(switch_orig_lsn_text);

@@ -887,6 +887,9 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
 8. **raft_13 夹具用的是 Citus reference 表**，而 reference 表在每个节点都是本地主写，与
    “secondary 不本地产出该分区 WAL”的前提相悖（§11.5.1 的假阳性教训）。数据组用例应改用
    真正的“一主多从”分片放置，并补一个“同节点混合角色”的用例。
+   **→ 2026-07-24 已补 raft_14**：真实哈希分布分片 + 同构壳表从副本（(a) 形态），多记录
+   逐条 propose、逐字节校验、连续性与"不回放"断言（见 §13）。raft_13 保留作运输层回归；
+   "同节点混合角色"用例仍待补。
 9. **缺少全新库上的 `CREATE EXTENSION` 冒烟检查**。回归环境总是复用已装扩展，
    `setup-raft.sh` 又只补建函数、不重跑安装脚本，因此安装脚本内部的不一致是**完全静默**的。
    2026-07-21 即实测到一例：运输层加固改了 `partwal_follower_append` 的签名，但
@@ -916,3 +919,121 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
 > **交接提示**：对 `pg-partdist-src`（即 raft 之外）的每一次改动，都必须在
 > `pg-raft-src/docs/pg_partdist_sync_change_log.md` 追加记录，写明时间、文件、目的与对
 > Raft/failover/PartWAL 行为的影响。该台账目前已记到 2026-07-21。
+
+## 13. 切主机制重构：自治选举 → 上报登记 → 落路由层（2026-07-24）
+
+### 13.1 动机与职责重划
+
+此前的切主是**控制面指定式**：group 0 leader 探测到节点宕机后，由
+`pg_raft_failover_partitions_for_node()` 单方面挑选最追平的 secondary 写进
+`partition_map`。分区级数据组落地（P1/P2）之后这个机制出现两个根本问题：
+
+1. **与数据组自治选举冲突（双真相源）**。数据组用与控制面完全相同的选举逻辑，主副本所在
+   节点宕机后，组内 follower 会在选举超时内自行选出新 leader；控制面若再"指定"一个，可能
+   指定到没有赢得组内选举的节点，`partition_map` 与真实 leader 分叉。
+2. **切主结果从未到达路由层**。raft 只写 `partdist.partition_map`，而 Citus 实际路由依据
+   `pg_dist_placement` —— 两域之间没有桥。
+
+重构后的职责边界（与 TiKV/PD、YugabyteDB/YB-Master 的形态一致）：
+
+- **数据组**：自治选举（谁当 leader 由组内多数派决定，选举限制天然把主给最追平者）、
+  日志复制、以及**新任 leader 主动上报**。
+- **控制面（group 0）**：不再决定数据面 leader，只做**登记处 + 配置权威**——接收上报、
+  任期栅栏裁决、经 raft 日志把结果同步到每个节点（含路由层）；以及既有的节点状态、
+  组配置、快照职责。master 不作任何分区的数据副本。
+
+### 13.2 机制
+
+```
+主副本所在节点宕机
+  → 组内 follower 选举超时([1.5s,3s) 随机)自治选出新 leader（无控制面参与）
+  → become-leader 置 report_pending（BGW tick 无 SPI，不能就地上报）
+  → tick 经 libpq 向 group 0 当前 leader 调 partdist.pg_raft_report_data_leader(
+        gid, self, term, secondaries)，失败/暂无主则每 tick 重试
+  → 接收端（常态是 master）校验：term>0、新主不是协调节点、任期不回退（预检），
+     然后把 OP_PARTITION_PRIMARY（含 primary_term）提进 group 0
+  → group 0 多数派提交后，每个成员节点各自 apply：
+       a) 任期栅栏 upsert 本地 partition_map（WHERE primary_term <= EXCLUDED.primary_term）
+       b) partition_id 是真实 Citus shardid 时，UPDATE 本地 pg_dist_placement 指向
+          新主所在 Citus group（按 node_map.port ↔ pg_dist_node.nodeport 映射；
+          UPDATE 触发 Citus 的 dist_placement_cache_invalidate 失效缓存）
+```
+
+要点：
+
+- **任期栅栏**（`partition_map.primary_term`）：迟到的旧任期登记、重复登记、以及旧
+  "指定式"通道的 term=0 提案都被 apply 的 WHERE 拦下；栅栏在 apply 里，group 0 各成员
+  按同一日志序执行，判定天然一致。
+- **路由元数据的"每节点一份"由 raft 本身完成**：不是全节点强同步（那会让任一节点宕机
+  阻塞元数据更新——恰恰在最需要更新的时刻），而是**多数派提交 + 全员 apply**；
+  宕机节点恢复后由日志重放追平。
+- **协调节点排除**：新 GUC `pg_raft.coordinator_node_id`（缺省 1）。`pg_raft_group_create`
+  拒绝把协调节点放进数据组成员集；上报接收端拒绝把协调节点登记为主，混入 secondaries
+  时剔除并告警。
+- **group 0 leader 优先落 master**：协调节点在 group 0 用不相交的更短选举窗口
+  [2b/3, b)（缺省 [1000,1500)ms，其他节点 [1500,3000)ms），在世时总是先超时先当选。
+  **是偏好不是保证**：master 宕机时 worker 照常接管；master 回归后不会自动抢回，
+  直到下一次改选（不做主动 leader transfer，避免无谓扰动）。
+- **旧通道降级而非删除**：`pg_raft_failover_partitions_for_node()` / rejoin 只对
+  `primary_term = 0` 的分区（无数据组的历史/合成夹具）生效；有数据组的分区完全由
+  自治选举 + 上报接管。raft_02/04/07/10/11 等旧回归因此语义不变。旧通道随夹具迁移
+  逐步退役。
+- **环满静默 ack 安全修复（顺带）**：`handle_append_entries` 此前忽略 `log_append_locked`
+  的失败返回，环满时条目没落下却回 `success=1`，leader 会把不存在的复制计入多数派——
+  提交点可能覆盖到少数派都不持有的日志，破坏 Leader Completeness。现失败即不 ack，
+  leader 走退避重试，待 apply 推进腾出环位。
+
+### 13.3 验收
+
+- **raft_14（复制半程）**：单分片哈希分布表（rf=1），组成员 {2,3,4}，leader=placement
+  worker；其余 worker 建同构壳表 + `rebuild_shard_identity()`（(a) 形态）；经 master 路由
+  写入 5 行，leader parwal 逐条 propose；断言 follower：逐字节指纹一致、1..N 连续无洞、
+  一条 record 一次备份（条数==N）、`applied_part_lsn` 追平、壳表 0 行（不回放）、
+  partition_map 登记（primary/term/secondaries 不含 master）与本地 pg_dist_placement
+  一致；master 全程无该分片身份。
+- **raft_15（切主全程）**：停掉主副本节点 → 等自治选举+上报 → master 与两个存活 worker
+  各自断言：新主 ∈ worker、任期严格递增、旧主仍在 secondaries（成员集静态）、本地
+  pg_dist_placement 已切到新主；旧主重启后以 follower 归队、登记不被回退。
+
+### 13.4 验收过程中暴露并修复的历史隐患
+
+三个都是被旧行为掩盖的真问题，是环满**诚实拒绝**（不再假 ack）之后连锁显形的：
+
+1. **桥接误伤多放置分片**：reference 表同一 shardid 在 `pg_dist_placement` 有多行
+   （每节点组一行），直接 UPDATE 会撞 `(shardid, groupid)` 唯一键。raft_13 的
+   reference 夹具组当选上报时实测踩中——修复：桥接只对**单放置**分片生效，且整体
+   包在子事务里，任何意外 SQL 错误只回滚桥接自身并告警，**不允许打穿控制面 apply**
+   （否则一条毒丸日志会卡死游标，之后所有控制面决议全部停摆——首轮回归实测到）。
+2. **重启后 apply 游标滑出环窗口 → 集群拒收一切新提案**：SQL 日志长于环容量
+   （128）时，restore 只能把最新一段灌回环；恢复出的 `last_applied` 若低于环内最老
+   条目，apply 在"取下一条"处永久卡死，容量检查随之恒满。旧代码靠假 ack 掩盖；
+   现按控制面"元数据表持久、跳过安全"的既有语义，把游标**快进到环内实际存在的最
+   老条目**（窗口内向前扫描，兼容不满的环——节点的 SQL 日志可能只覆盖它在线期间
+   的一段，实测有节点只有 293..348）。数据面不快进（漏 redo 即分叉），维持卡住等
+   追平通道（InstallSnapshot，§12.4 #7）。
+3. **BGW 选举可能先于恢复、把零值写回 hardstate**：重启后 BGW tick 可能在任何
+   SQL 路径触发恢复之前就发起选举并持久化全零的 term/commit/last_applied。修复：
+   `group_tick` 先 `restore_hard_state_if_needed`（纯文件读、无 SPI，BGW 可做）；
+   `pg_raft_consensus_apply_pending` / `group_propose` 入口补齐日志恢复与先-apply-
+   后-append 的顺序。
+
+> 这一节印证 §12.1 的教训的另一半：**用一个过于宽容的运输层去伺候消费者，
+> 也会得到虚假的绿灯。** 假 ack 消失后，上面每一条都从"从未见过的问题"变成
+> "分钟级复现"。
+
+### 13.5 验收结果
+
+raft_01–15 全量 **31/31**（含新 raft_14/raft_15），全新库 `CREATE EXTENSION
+pg_partdist` + `pg_raft` 冒烟通过（§12.3.B.9 要求的检查已入常规流程）。
+
+### 13.6 诚实边界（本次不解决）
+
+1. **路由切换是"机制先行"**：P3 回放落地前，新主壳表没有历史数据，路由切过去还不能
+   服务读写。生产语义要等回放追平后再放行切换（§12.4 #6 的验收项）。
+2. **成员集传播仍是阻断项**（§12.3.A.3）：上报时成员集未知（hearsay 建组）会退化为
+   "全体 peers 去掉自己与协调节点"，真实拓扑下需要控制面下发成员集后才严格正确。
+3. **一致性时序**：本地 parwal 落盘先于 pg_wal 提交 fsync（`[A] < [B]` 不变式）已有；
+   但复制（propose）目前仍在事务提交后由测试驱动，"复制也卡进提交前"要等 propose
+   接入写入路径（§12.4 #5）时一并做。
+4. master 目前是单点协调（Citus coordinator 本就如此）；master 的 HA（流复制热备）
+   不在本阶段范围。
