@@ -51,7 +51,8 @@
 #define RAFT_CANDIDATE 1
 #define RAFT_LEADER    2
 
-#define RAFT_MAX_PEERS     16
+/* 1 coordinator + 16 worker 拓扑共 17 个 group0 成员；parse_peers 超限会静默丢弃 */
+#define RAFT_MAX_PEERS     32
 #define RAFT_LOG_CAPACITY  128
 #define RAFT_OP_LEN        32
 #define RAFT_PAYLOAD_MAX   768
