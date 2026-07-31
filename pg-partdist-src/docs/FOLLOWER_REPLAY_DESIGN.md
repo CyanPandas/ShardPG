@@ -27,6 +27,23 @@
 | ⑥ | — | 明确 `orig_lsn` 的语义 = 记录在 leader 侧的 **EndRecPtr**(end LSN),而非起始 LSN | §4.2 |
 | ⑦ | — | SMGR 类记录的 `RelFileLocator` 在 main data 而非 block ref,重映射需特判 | 附录 A |
 
+## v3.1 评审修正(2026-07-31,R1 开工前)
+
+对照 PG 16.14 源码复核 v3 后补入。①为正确性缺陷,②③为立项/排期阻断项,④⑤⑥为落地约束。
+
+| # | 修正 | 章节 |
+|---|------|------|
+| ① | **捕获侧漏掉无块引用记录**:`XLOG_SMGR_TRUNCATE/CREATE` 只有 `XLogRegisterData`,`blocks[]` 恒空,原捕获判据永不命中,而 §5.3 要求捕获它。v3 只做了 follower 侧 main-data 重映射(附录 A),**捕获侧的另一半缺失** ⇒ 副本永不截断,静默分歧 | §5.2、§5.3、§14.2 |
+| ② | **R4 硬阻断于 R3**:promoted shard 的元组 xmin 是旧 leader 的 xid,读它必须走 §9.4 规则 3(R3 实装);R3 又阻塞于本文档外的全局 MVCC 文档 ⇒ R4 验收的"继续读写"在 R3 前不可达 | §14.2 |
+| ③ | **per-shard 常驻 bgworker 撞 `max_worker_processes`**(默认 8,实测环境即 8),而每节点 shard 数为几十~上百 ⇒ 改为 worker 池 + 轮转认领;与 pg_raft 的 `RAFT_MAX_GROUPS=32` 同形状,应统一处置 | §7、§13.10 |
+| ④ | **`EB_SKIP_EXTENSION_LOCK` 写死在 `xlogutils.c:526`,不受 `InRecovery` 控制** ⇒ "单写者"不能只写在前置条件里,必须落成排他认领锁,否则并发扩展同一文件是静默堆损坏 | §13.10 |
+| ⑤ | **`decoded` 内含指向原始 `body` 的裸指针**(FPI 镜像/block data 非深拷贝) ⇒ `body` 须存活至 `rm_redo` 返回后,禁止复用缓冲区跨记录换手 | §7.4 |
+| ⑥ | **升主推进 WAL 位点的运维面空白**:跳过的段号成为永久空洞,影响归档连续性、`max_wal_size` 账目、级联备库 ⇒ R4 立项前须出处置结论 | §11 |
+
+另核实两处对本设计有利、v3 未提及的事实:`CreateFakeRelcacheEntry` 在 16.14 已不再
+`Assert(InRecovery)`(§13.3);核内 `AdvanceNextFullTransactionIdPastXid` 写 `nextXid`
+本就持 `XidGenLock`,不安全的仅是那次无锁读 ⇒ §7.5 的持锁读-改-写变体严格更安全。
+
 ---
 
 ## 0. 目标与非目标
@@ -237,10 +254,28 @@ typedef struct ShardFileSet
   (全部索引)→ `pg_class.reltoastrelid`(TOAST 堆及其索引),收齐全部 relfilenode。
 - **leader 侧反向映射**:共享内存哈希 `relfilenode → shard_oid`,由 fileset 展开而来;
   DDL 时同步刷新(§12)。
-- **捕获规则**:`wal_insert_hook` 收到的 `blocks[]` 中**任一** block 的
+- **捕获规则(块引用路径)**:`wal_insert_hook` 收到的 `blocks[]` 中**任一** block 的
   `rlocator.relNumber` 命中反向映射 ⇒ 整条 record 归入该 shard 的 ParWAL 流。
   heap/btree 记录的所有 block 必属同一关系,不会跨 shard;实现中加断言,
   violation 即 ERROR(说明 fileset 漏登记)。
+- **★ 捕获规则(无块引用路径,必须特判)**:部分记录**不注册任何 buffer**,
+  `blocks[]` 为空,上一条判据对它们恒不命中。已核实(PG 16.14 `storage.c`
+  `RelationTruncate`,`XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE` 分支):
+
+  ```c
+  XLogBeginInsert();
+  XLogRegisterData((char *) &xlrec, sizeof(xlrec));   /* ← 只有 data,无 XLogRegisterBuffer */
+  lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+  ```
+
+  `XLOG_SMGR_CREATE` 同构。二者的 `RelFileLocator` 都在 **main data** 里
+  (`xl_smgr_truncate.rlocator` / `xl_smgr_create.rlocator`)。因此捕获侧必须对
+  `rmid == RM_SMGR_ID` 单独取 main data 首字段查反向映射,与附录 A 中 follower
+  侧的 main-data 重映射特判**成对存在**——只做 follower 侧那一半,记录根本进不了流。
+
+  > 漏掉的后果是**静默的**:leader 的 VACUUM 截断尾部空页不会在 follower 发生,
+  > 副本文件长于 leader。运行期不 PANIC,只有逐页 diff 能发现;而纯 pgbench 负载
+  > 未必触发截断 ⇒ R1 验收用例必须显式制造一次 VACUUM 截断(§14.2 R1 验收)。
 - **FSM / VM**:与主关系同 relNumber、不同 fork,hook 的 block 引用带 forkno,
   天然命中,无需额外登记。
 - **gxid 填充**:hook 上下文处于事务内,顶层 gxid 在 StartTransaction 时已构造并缓存于
@@ -258,12 +293,14 @@ typedef struct ShardFileSet
 | RM_BTREE | insert / split / vacuum / delete / dedup / newroot ... | 普通索引与 TOAST 索引 |
 | RM_HASH/GIN/GIST/SPGIST/BRIN | (如 shard 用到) | 同构,按需纳入 |
 | RM_XLOG | FPI / FPI_FOR_HINT | checksum/hint 触发的全页镜像 |
-| RM_SMGR | truncate | VACUUM 截断尾部空页(重映射特判,附录 A) |
+| RM_SMGR | truncate / create | VACUUM 截断尾部空页;**无块引用,捕获侧与重映射侧均须 main-data 特判**(§5.2、附录 A) |
 | RM_XACT | commit / abort | **不进 DATA 流**,由提交路径转为 §4.3 标记记录 |
 
 注意:捕获判据是 **blocks[] 命中 fileset**,不做 DML 白名单过滤——这自动涵盖上表全部
-块级记录,包括 vacuum/prune/FPI(它们可能由 SELECT 触发的 HOT 剪枝、autovacuum、
+**块级**记录,包括 vacuum/prune/FPI(它们可能由 SELECT 触发的 HOT 剪枝、autovacuum、
 checksum hint 写盘产生,执行器层打标签覆盖不到,这正是反向映射表存在的理由)。
+**唯一的例外是无块引用的 RM_SMGR 记录**,走 §5.2 的 main-data 特判分支;
+除此之外不得再增加特判——新增特判即意味着捕获判据有洞,应在 §5.2 补全而非分散处理。
 
 ---
 
@@ -289,8 +326,17 @@ typedef uint64 (*ShardReplayBoundFn)(Oid shard_oid);   /* 返回已 committed �
 
 ## 7. Follower 回放管线(核心,对应 reply_v1 §3.3 五阶段)
 
-每 shard 一个 replay worker(bgworker,`BGWORKER_SHMEM_ACCESS`,无 DB 连接;
-文件号均来自 loc_map,不需要 relcache),串行消费该 shard 已 commit 的字节流。
+回放的**并发单位是 shard**:每个 shard 的字节流由唯一一个 replay worker 串行消费
+(bgworker,`BGWORKER_SHMEM_ACCESS`,无 DB 连接;文件号均来自 loc_map,不需要 relcache)。
+
+> **★ 不是"每 shard 常驻一个 bgworker"**。`max_worker_processes` 默认 8(本项目
+> 测试环境实测即为 8),而每节点承载的 shard 数是几十到上百量级(Citus 默认
+> `shard_count=32`,再叠加本节点作为其他分片副本持有的组)——per-shard 常驻必然撞上限。
+> 落地形态是 **worker 池**:池大小由 GUC `pg_partdist.replay_workers` 控制
+> (默认 4,上限受 `max_worker_processes` 约束),每个 worker 轮转认领一批 shard,
+> **同一 shard 在任一时刻只被一个 worker 持有**(见 §13.10 的排他不变式)。
+> 这与 pg_raft 侧 `RAFT_MAX_GROUPS=32` 是同一形状的问题(每节点分区数远超静态槽位),
+> 两处应统一为"池 + 游标复用",不要各自扩大静态数组。
 
 **前置条件**(静态不变式):
 1. *基线一致性*:本地数据文件由 leader shard 物理基线拷贝初始化,页布局逐块对齐;
@@ -409,9 +455,18 @@ ShardReplayDataRecord(ShardReplayCtx *ctx, PartWALRecord *h, char *body)
      *    内部 XLogReadBufferForRedo → smgropen(本地文件) → 按块号改页面字节 */
     GetRmgr(h->rmid).rm_redo(ctx->reader);
 
-    pfree(decoded);
+    pfree(decoded);       /* 注意:只释放 decoded;body 的生命周期见下方 ★ */
 }
 ```
+
+> **★ 实现陷阱:`decoded` 内含指向 `body` 的裸指针,不是深拷贝。**
+> `DecodeXLogRecord` 对 block data 与 FPI 镜像走的是
+> `blk->bkp_image = ptr;` / `blk->data = ptr;`——`ptr` 在**原始 record 字节**
+> (即本函数的 `body`)上滚动,只有少量定长字段被复制进 `decoded`。因此:
+> `body` 必须存活到 `rm_redo` **返回之后**,`pfree(decoded)` 不解除这个约束。
+> 最容易踩的写法是主循环"逐条读进同一个复用缓冲区"——下一条记录读入时会覆盖上一条
+> 的 FPI 镜像。落地要求:要么每条记录的 body 独立分配(记录级 memory context,
+> `rm_redo` 后整体 reset),要么复用缓冲区的换手点严格晚于 `rm_redo` 返回。
 
 注:`xl_xid` 与头部 `gxid` 内嵌的 xid **不一定相同**——子事务的记录 `xl_xid` 是
 subxid,而头部 gxid 是顶层事务的。因此第 2 步以 `xl_xid` 为键、以
@@ -777,6 +832,15 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
    新记录 LSN 小于页面现有 LSN,本地崩溃恢复时 `lsn <= PageGetLSN` 会**错误跳过
    新记录**,数据丢失。位点越过后,"页面 LSN 单调递增"不变式恢复,§8.3 的
    XLogFlush 豁免对该分区随之收敛。
+
+   > **运维面(本文档此前的空白,落地前须定方案)**:一个节点同时托管多个不同 leader
+   > 的副本,各 leader 的 LSN 坐标彼此无关;每为一个 shard 升主就把本地插入位点向前
+   > 跳一次,**跳过的 WAL 段号成为永久空洞**。LSN 是 64 位、不存在耗尽问题,但受影响的是:
+   > (a) **归档连续性**——`archive_command` 不会为跳过的段号产生文件,下游按段号连续性
+   > 校验的备份工具会报缺段,须确认所用工具容忍空洞或改用 `pg_receivewal`;
+   > (b) `max_wal_size` / `wal_keep_size` 的账目按 LSN 距离计算,一次大跳跃会让
+   > checkpoint 触发逻辑瞬间失真;(c) 已有的物理备库(如果该节点自身还带 standby)
+   > 会在位点跳跃处断流,须重建。R4 立项时必须先出这三项的处置结论。
 5. **路由切换**:`PartDistRoutePromote(shard_oid, W = max_replayed_fxid)`——
    角色置 `SHARD_PROMOTED`、登记水位,同一临界区原子生效。此后写路由切到本节点,
    `wal_insert_hook` 开始为其捕获新流,`partition_lsn` 从 Raft log index 继续。
@@ -816,6 +880,8 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
    其余 `InRecovery` / `reachedConsistency` 分支(`log_invalid_page` 在非恢复进程中
    reachedConsistency=false,会记入进程内 invalid_page_tab 而不立即 PANIC——
    追平/升主前调用 `XLogHaveInvalidPages()` 断言为空),列入 R1 验收项。
+   **已核实的反例**:`CreateFakeRelcacheEntry`(`heap_xlog_visible` 会用)在 16.14
+   **已不再** `Assert(InRecovery)`,该路径不构成障碍。
 4. **原生 clog 空洞**:nextXid 被推进但回放 xid 区间从未 `ExtendCLOG`,原生
    `TransactionIdDidCommit` 触碰这些 xid 会因 clog 文件缺失报错。必须保证:
    副本壳表 `autovacuum_enabled = off`(建表即设 + launcher 防御性校验),
@@ -831,6 +897,23 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
    同量级),shard 粒度天然并行;瓶颈实测后再谈批量优化。
 9. **撕裂页**(§8.5):sidecar 落地前,unclean shutdown 后以 checksum 校验 + 重新
    基线兜底。
+10. **★ 单写者不变式必须显式加锁,不能只写在前置条件里**。§7 前置条件 2("worker 对
+    该分区全部数据文件独占访问")在代码里**没有任何强制**。已核实
+    (`xlogutils.c:526` 扩展文件路径):
+
+    ```c
+    Assert(InRecovery);
+    buffer = ExtendBufferedRelTo(BMR_SMGR(smgr, RELPERSISTENCE_PERMANENT), forknum, NULL,
+                                 EB_PERFORMING_RECOVERY | EB_SKIP_EXTENSION_LOCK, blkno + 1, ...);
+    ```
+
+    **`EB_SKIP_EXTENSION_LOCK` 是写死在这条路径里的常量,不受 `InRecovery` 开关控制**
+    ——`InRecovery=true` 只是让断言通过,并不会为你加回关系扩展锁。所以一旦"同一 shard
+    只有一个写者"被打破(worker 池认领冲突、将来的并行回放、误启动两个 launcher),
+    两个进程会**无锁并发扩展同一个文件**,结果是静默堆损坏,不报错、不 PANIC。
+    落地要求:worker 认领 shard 时取该 shard 的排他锁(shmem 槽位 CAS 或 advisory lock),
+    释放在 worker 退出路径上;并在回放主循环入口断言"本进程持有该 shard 的认领权"。
+    这条与 §7 的 worker 池形态是配套的,不可只做池不做锁。
 
 ---
 
@@ -861,18 +944,33 @@ pg-partdist-src/
     0003-advance-wal-insert.patch            [新] §11(R4)
 ```
 
-GUC(前缀沿用 `pg_partdist.`):`replay_naptime_ms`、`replay_checkpoint_interval_ms`、
+GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)、
+`replay_naptime_ms`、`replay_checkpoint_interval_ms`、
 `replay_checkpoint_bytes`、`replay_trust_local_segments`(测试模式,§6)、
 `replay_dw_enabled`(sidecar,§8.5)。
 
 ### 14.2 阶段计划
 
-| 阶段 | 内容 | 验收 |
-|------|------|------|
-| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST);补丁 0002;replay worker:decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的 pgbench 表,leader 写入后 follower 文件与 leader **逐页 diff 一致(含 LSN 域)**;kill -9 worker 任意时刻,重启追平且 diff 一致 |
-| R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13.5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致 |
-| R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 |
-| R4 提升 | 补丁 0003;§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 |
+| 阶段 | 内容 | 验收 | 前置 |
+|------|------|------|------|
+| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的 pgbench 表,leader 写入后 follower 文件与 leader **逐页 diff 一致(含 LSN 域)**;kill -9 worker 任意时刻,重启追平且 diff 一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
+| R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13.5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致 | R1 |
+| R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
+| R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
+
+> **★ R4 硬阻断于 R3,不是"先后"而是"依赖"。** 升主后该 shard 上的元组 xmin/xmax
+> 是**旧 leader 的本地 xid**,读它们必须走 §9.4 路由规则 3(`xid ≤ W` 查该分区
+> xid_map),而规则 3 的实装在 R3。R3 未落地时,promoted shard 上的任何读都会让原生
+> `HeapTupleSatisfiesMVCC` 去查本地 clog——那里对这些 xid 是空洞(§13.4)。
+> 所以 R4 验收标准里的"**继续读写**"在 R3 之前不可能达成,R4 最多做到"可写不可读"。
+>
+> 而 R3 自身的启动条件(全局 MVCC 文档定稿)**在本文档控制范围之外** ⇒ 整条 failover
+> 路径的关键路径长度取决于那份文档。立项排期时必须把它当作外部阻塞项显式列出,
+> 不要当成可与 R1/R2 并行推进的独立工作。
+>
+> 若需要在 R3 之前就拿到可读的 failover,唯一的绕法是**升主时冻结全部回放元组**
+> (把 xmin 置 `HEAP_XMIN_FROZEN`,可见性不再依赖 xid 解析)——代价是升主时间与
+> shard 大小成正比,且丢失 MVCC 历史。本文档不推荐,仅记录为可选逃生门。
 
 ---
 
