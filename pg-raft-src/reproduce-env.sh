@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# [宿主机] 一键完整复现 shardpg-3.0 测试环境：1 coordinator + N workers（默认 16）。
+# [宿主机] 一键完整复现 shardpg-replay 测试环境：1 coordinator + N workers（默认 8）。
+#
+# 本分支（shardpg-replay）是惰性回放模块的开发分支，从 shardpg-3.0 拉出。默认值已
+# 绑定到本分支的标准开发环境 pg-citus-replay（9 节点），因此在本分支上直接
+# `./reproduce-env.sh all` 即可原样重建该环境；改分支/规模请用环境变量覆盖。
 #
 # 复现内容与 raft4 环境同构：同一镜像、容器内 /work 布局、同一套 postgresql.conf
 # 模板（pg_raft 参数与 setup-raft.sh 一致）、Citus 接线（coordinator 注册 + N 个
@@ -14,18 +18,18 @@
 #   ./reproduce-env.sh all       # up + verify
 #
 # 可覆盖的环境变量:
-#   ENV_NAME=shardpg_reply            环境名（容器名/目录名前缀）
-#   N_WORKERS=16                      worker 数（group0 成员 = N+1，须 <= RAFT_MAX_PEERS）
+#   ENV_NAME=pg-citus-replay          环境名（容器名/目录名前缀）
+#   N_WORKERS=8                       worker 数（group0 成员 = N+1，须 <= RAFT_MAX_PEERS）
 #   SRC_REPO=<url|path>               克隆源，默认 GitHub CyanPandas/ShardPG
-#   BRANCH=shardpg-3.0
+#   BRANCH=shardpg-replay
 #   IMAGE=pg-partdist-raft4-env       容器镜像；不存在则用克隆里的 Dockerfile 构建
 #   SHARED_BUFFERS=32MB               每实例 shared_buffers
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-shardpg_reply}"
-N_WORKERS="${N_WORKERS:-16}"
+ENV_NAME="${ENV_NAME:-pg-citus-replay}"
+N_WORKERS="${N_WORKERS:-8}"
 SRC_REPO="${SRC_REPO:-https://github.com/CyanPandas/ShardPG.git}"
-BRANCH="${BRANCH:-shardpg-3.0}"
+BRANCH="${BRANCH:-shardpg-replay}"
 IMAGE="${IMAGE:-pg-partdist-raft4-env}"
 SHARED_BUFFERS="${SHARED_BUFFERS:-32MB}"
 
@@ -275,7 +279,7 @@ do_verify() {
 
   echo
   if [[ "$V_FAIL" -eq 0 ]]; then
-    echo "VERIFY: 全部通过（${N_NODES} 节点环境与 shardpg-3.0 预期一致）"
+    echo "VERIFY: 全部通过（${N_NODES} 节点环境与 ${BRANCH} 预期一致）"
   else
     echo "VERIFY: 存在 FAIL 项"; exit 1
   fi
