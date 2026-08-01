@@ -205,8 +205,13 @@ check "follower1 追平（含 SMGR 截断记录）" "$([[ "$app1" -ge "$lead_pls
 app2=$(wait_caught_up $f2 "$lead_plsn" 90)
 check "follower2 追平" "$([[ "$app2" -ge "$lead_plsn" ]] && echo ok)" "ok"
 
-echo "========== [7] 刷盘 + 逐页 diff（MAIN + VM，含 LSN 域） =========="
+echo "========== [7] 刷盘 + 逐页 diff（MAIN + VM，页头/行指针/元组/special 区） =========="
+# 判据是"页内空闲空洞之外逐字节一致"而非整文件 cmp：FPI 带 BKPIMAGE_HAS_HOLE 时
+# RestoreBlockImage 会把空洞清零，主库那片区域保留旧元组残字节 —— 原生流复制备库
+# 同样如此（详见 tests/pagecmp.py 头部说明与 FRD §14.2）。
 PSQL $pport -q -c "CHECKPOINT;" >/dev/null
+docker cp "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" "$CONTAINER":/tmp/pagecmp.py >/dev/null 2>&1
+DEX chmod +x /tmp/pagecmp.py 2>/dev/null || true
 sleep 4   # > replay_checkpoint_interval_ms，等 follower 的 apply checkpoint 刷脏落盘
 
 pdata=$(PSQL $pport -Atc "SHOW data_directory")
@@ -236,8 +241,9 @@ diff_one_follower() {  # <fport> <fdata> <标签>
       lsz=$(DEX stat -c %s "$lpath"); fsz=$(DEX stat -c %s "$fpath")
       check "${tag} ${key}${fork:-.main} 大小一致(${lsz})" "$fsz" "$lsz"
       local same
-      same=$(DEX bash -c "cmp -s '$lpath' '$fpath' && echo identical || echo DIFF")
-      check "${tag} ${key}${fork:-.main} 逐字节一致" "$same" "identical"
+      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" 2>/dev/null)
+      check "${tag} ${key}${fork:-.main} 洞外逐字节一致" \
+            "$same" "IDENTICAL_OUTSIDE_HOLE"
     done
   done <<< "$lead_paths"
 }
@@ -245,9 +251,18 @@ diff_one_follower() {  # <fport> <fdata> <标签>
 diff_one_follower $f1 "$f1data" "f1"
 diff_one_follower $f2 "$f2data" "f2"
 
-echo "========== [8] follower 壳表仍不可见数据（只物理回放，不改可见性） =========="
-cnt=$(PSQL $f1 -Atc "SELECT count(*) FROM ${shard_tbl}")
-check "follower 壳表 SELECT count = 0（xid 均非本地，R2 前不可见）" "$cnt" "0"
+echo "========== [8] 内容正确性：follower 壳表行数与 leader 一致 =========="
+# 必须放在 [7] 之后：在 follower 上读会设置 hint bit，先读会污染页面比对。
+#
+# 为什么这里能读出行来（R1 阶段的边界）：用例以 VACUUM (FREEZE) 收尾，冻结元组
+# 的 xmin 是 FrozenTransactionId，可见性判定不查 clog ⇒ 无需 xid 解析即可见。
+# 未冻结的回放元组仍然不可读（xmin 是 leader 的 xid，本地 clog 是空洞，
+# FRD §13.4），那要等 R3 的 gxid 路由。所以本项测的是"物理回放内容正确"，
+# 不是"副本可服务读"——后者仍是 R1 的非目标（§0）。
+lead_cnt=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" | tail -1)
+f1_cnt=$(PSQL $f1 -Atc "SELECT count(*) FROM ${shard_tbl}")
+check "follower 壳表行数 == leader(${lead_cnt})（冻结元组可读，验证回放内容）" \
+      "$f1_cnt" "$lead_cnt"
 
 echo
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="

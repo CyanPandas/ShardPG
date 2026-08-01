@@ -39,6 +39,8 @@
 | ④ | **`EB_SKIP_EXTENSION_LOCK` 写死在 `xlogutils.c:526`,不受 `InRecovery` 控制** ⇒ "单写者"不能只写在前置条件里,必须落成排他认领锁,否则并发扩展同一文件是静默堆损坏 | §13.10 |
 | ⑤ | ~~decoded 内含指向 body 的裸指针~~ **实现时复核推翻**:PG16.14 `DecodeXLogRecord` 深拷贝全部载荷进 decoded 尾部空间,`body` 在 decode 返回后即可复用。**真正的陷阱在读取侧**:`readRecordBuf` 仅对跨页记录持有原始字节,取"原始记录字节"必须自行装配(旧 demux 崩溃恢复路径曾因此写入垃圾 payload,已随 R1 修复) | §7.4 |
 | ⑥ | **升主推进 WAL 位点的运维面空白**:跳过的段号成为永久空洞,影响归档连续性、`max_wal_size` 账目、级联备库 ⇒ R4 立项前须出处置结论 | §11 |
+| ⑦ | **R1 验收判据"逐页 diff 一致"不可达**(实测修正):FPI 恢复会把页内空闲空洞清零,主库保留残字节,原生备库亦然 ⇒ 判据改为"两侧 pd_lower/pd_upper 相同且**洞外**逐字节一致"(实测洞外差异为 0) | §14.2 |
+| ⑧ | **worker 进程初始化三要素**(实测,缺一即段错误):`BackgroundWorkerInitializeConnection(NULL)` 走 BaseInit、`CreateAuxProcessResourceOwner()` 供 buffer pin 记账、`RmgrStartup()` 建各 rmgr 的 redo 内存上下文。v3 稿"纯 `BGWORKER_SHMEM_ACCESS`、无 DB 连接"不成立 | §7 |
 
 另核实两处对本设计有利、v3 未提及的事实:`CreateFakeRelcacheEntry` 在 16.14 已不再
 `Assert(InRecovery)`(§13.3);核内 `AdvanceNextFullTransactionIdPastXid` 写 `nextXid`
@@ -970,10 +972,26 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 
 | 阶段 | 内容 | 验收 | 前置 |
 |------|------|------|------|
-| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的 pgbench 表,leader 写入后 follower 文件与 leader **逐页 diff 一致(含 LSN 域)**;kill -9 worker 任意时刻,重启追平且 diff 一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
+| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader **页内空闲空洞之外逐字节一致(含 pd_lsn)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
 | R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13.5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致 | R1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
 | R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
+
+> **★ "逐页字节级一致"必须排除页内空闲空洞(R1 实测修正)。** v3 稿写的
+> "逐页 diff 一致(含 LSN 域)"**不可达**,原因不在回放而在 FPI 机制本身:
+> 带 `BKPIMAGE_HAS_HOLE` 的全页镜像只搬 `[0, pd_lower)` 与 `[pd_upper, BLCKSZ)`
+> 两段,`RestoreBlockImage` 恢复时把中间空洞 **`MemSet(..., 0, hole_length)` 清零**,
+> 而主库那片区域保留着被删元组的残字节 ⇒ 两侧在空洞内必然不同。
+> **原生流复制备库同样如此**,与本设计无关。
+>
+> 实测数据(R1 第 8 轮,1 主 2 从,300 行 + TOAST + PK 索引 + 一次 VACUUM 尾部截断):
+> 主堆 2 页共 4356 字节不同,**其中 4356 字节全部落在 `[pd_lower, pd_upper)` 内,
+> 洞外差异为 0**;页头(含 `pd_lsn`)、行指针、元组数据、special 区逐字节一致;
+> VM fork 整文件一致。
+>
+> 修正后的判据(比对工具见 `tests/pagecmp.py`):两侧 `pd_lower`/`pd_upper` 必须
+> 相同(否则"洞"的位置不可比),且**洞外全部字节相同**。空洞按定义是未使用空间,
+> 不承载任何语义 —— 这已是物理复制能达到的最强一致性。
 
 > **★ R4 硬阻断于 R3,不是"先后"而是"依赖"。** 升主后该 shard 上的元组 xmin/xmax
 > 是**旧 leader 的本地 xid**,读它们必须走 §9.4 路由规则 3(`xid ≤ W` 查该分区
