@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-物理副本页面比对：忽略页内空闲空洞的逐字节比较。
+物理副本页面比对：排除「页内空闲空洞」与「pd_prune_xid」后的逐字节比较。
+
+物理复制能达到的最强一致性判据是**这两项之外全等**，而不是整文件 cmp ——
+两处例外都源于 PostgreSQL 自身的机制，原生流复制备库同样存在（详见下方与
+PRUNE_XID_OFF 处的说明）。判据覆盖：页头（含 pd_lsn/pd_flags/pd_lower/
+pd_upper）、全部行指针、全部元组数据、special 区。
 
 为什么不能直接 cmp 整文件（FRD §14.2 R1 验收判据的修正依据）：
 
@@ -27,6 +32,20 @@ import struct
 import sys
 
 BLCKSZ = 8192
+
+# pd_prune_xid：**内核 redo 故意不复制**，必须排除在判据之外。
+# heapam.c 的 heap_xlog_prune() 原文：
+#     heap_page_prune_execute(...);
+#     /*
+#      * Note: we don't worry about updating the page's prunability hints.
+#      * At worst this will cause an extra prune cycle to occur soon.
+#      */
+#     PageSetLSN(page, lsn);
+# 它只是"这页可能有东西可清理"的优化提示，主备分歧无害 —— 原生流复制备库
+# 同样如此。实测：leader 侧 VACUUM 后归 0，follower 侧保留 prune 前的旧值
+# （L1 验收中稳定表现为 6 字节差异，3 页各 2 字节）。
+PRUNE_XID_OFF = 20
+PRUNE_XID_LEN = 4
 
 # PageHeaderData 字段布局（src/include/storage/bufpage.h）
 _HDR = [
@@ -110,7 +129,9 @@ def main():
             return 1
 
         outside = [i for i in range(BLCKSZ)
-                   if pa[i] != pb[i] and not (lower_a <= i < upper_a)]
+                   if pa[i] != pb[i]
+                   and not (lower_a <= i < upper_a)
+                   and not (PRUNE_XID_OFF <= i < PRUNE_XID_OFF + PRUNE_XID_LEN)]
         inhole = sum(1 for i in range(lower_a, upper_a) if pa[i] != pb[i])
 
         outside_total += len(outside)
@@ -127,8 +148,8 @@ def main():
 
     if outside_total == 0:
         print("IDENTICAL_OUTSIDE_HOLE")
-        print("洞外逐字节一致（洞内 %d 字节差异属 FPI 清零，非缺陷）"
-              % hole_total, file=sys.stderr)
+        print("洞外逐字节一致（洞内 %d 字节差异属 FPI 清零；pd_prune_xid 按内核"
+              "语义豁免。二者均非缺陷）" % hole_total, file=sys.stderr)
         return 0
 
     print("DIFF %d" % outside_total)

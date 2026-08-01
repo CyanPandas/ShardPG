@@ -85,6 +85,7 @@ secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo �
 | ⑥ | **升主推进 WAL 位点的运维面空白**:跳过的段号成为永久空洞,影响归档连续性、`max_wal_size` 账目、级联备库 ⇒ R4 立项前须出处置结论 | §11 |
 | ⑦ | **R1 验收判据"逐页 diff 一致"不可达**(实测修正):FPI 恢复会把页内空闲空洞清零,主库保留残字节,原生备库亦然 ⇒ 判据改为"两侧 pd_lower/pd_upper 相同且**洞外**逐字节一致"(实测洞外差异为 0) | §14.2 |
 | ⑧ | **worker 进程初始化三要素**(实测,缺一即段错误):`BackgroundWorkerInitializeConnection(NULL)` 走 BaseInit、`CreateAuxProcessResourceOwner()` 供 buffer pin 记账、`RmgrStartup()` 建各 rmgr 的 redo 内存上下文。v3 稿"纯 `BGWORKER_SHMEM_ACCESS`、无 DB 连接"不成立 | §7 |
+| ⑨ | **`pd_prune_xid` 也必须排除在一致性判据外**(L1 实测):`heap_xlog_prune()` 原文注释 "we don't worry about updating the page's prunability hints" —— **内核 redo 故意不复制该字段**,它只是"这页可能有东西可清理"的优化提示。实测 leader 侧 VACUUM 后归 0、follower 侧保留 prune 前旧值(6 字节,3 页各 2 字节),原生备库同样如此。判据 = 空洞与 pd_prune_xid 之外全等 | §14.2 |
 
 另核实两处对本设计有利、v3 未提及的事实:`CreateFakeRelcacheEntry` 在 16.14 已不再
 `Assert(InRecovery)`(§13.3);核内 `AdvanceNextFullTransactionIdPastXid` 写 `nextXid`
@@ -1019,7 +1020,7 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 
 | 阶段 | 内容 | 验收 | 前置 |
 |------|------|------|------|
-| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader **页内空闲空洞之外逐字节一致(含 pd_lsn)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
+| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader **空洞与 `pd_prune_xid` 之外逐字节一致(含 pd_lsn)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
 | R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13.5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致 | R1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
 | R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
@@ -1036,9 +1037,16 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 > 洞外差异为 0**;页头(含 `pd_lsn`)、行指针、元组数据、special 区逐字节一致;
 > VM fork 整文件一致。
 >
+> **第二处例外:`pd_prune_xid`**(L1 实测补入)。`heap_xlog_prune()` 里内核自己写着:
+> "Note: we don't worry about updating the page's prunability hints. At worst
+> this will cause an extra prune cycle to occur soon." —— **redo 故意不复制它**。
+> 它只是"这页可能有东西可清理"的优化提示,主备分歧无害。实测 leader 侧 VACUUM
+> 后归 0、follower 侧保留 prune 前的旧值(6 字节差异,3 页各 2 字节)。
+>
 > 修正后的判据(比对工具见 `tests/pagecmp.py`):两侧 `pd_lower`/`pd_upper` 必须
-> 相同(否则"洞"的位置不可比),且**洞外全部字节相同**。空洞按定义是未使用空间,
-> 不承载任何语义 —— 这已是物理复制能达到的最强一致性。
+> 相同(否则"洞"的位置不可比),且**空洞与 `pd_prune_xid` 之外的全部字节相同**。
+> 这两处按定义都不承载语义 —— 判据覆盖页头(含 `pd_lsn`)、全部行指针、全部元组
+> 数据、special 区,已是物理复制能达到的最强一致性。
 
 > **★ R4 硬阻断于 R3,不是"先后"而是"依赖"。** 升主后该 shard 上的元组 xmin/xmax
 > 是**旧 leader 的本地 xid**,读它们必须走 §9.4 路由规则 3(`xid ≤ W` 查该分区

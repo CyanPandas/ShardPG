@@ -24,6 +24,8 @@
 #   BRANCH=shardpg-replay
 #   IMAGE=pg-partdist-raft4-env       容器镜像；不存在则用克隆里的 Dockerfile 构建
 #   SHARED_BUFFERS=32MB               每实例 shared_buffers
+#   HEARTBEAT_MS=1000                 pg_raft 心跳（小核宿主机上勿调小）
+#   ELECTION_TIMEOUT_MS=6000          pg_raft 选举超时
 set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-pg-citus-replay}"
@@ -32,6 +34,11 @@ SRC_REPO="${SRC_REPO:-https://github.com/CyanPandas/ShardPG.git}"
 BRANCH="${BRANCH:-shardpg-replay}"
 IMAGE="${IMAGE:-pg-partdist-raft4-env}"
 SHARED_BUFFERS="${SHARED_BUFFERS:-32MB}"
+# Raft 超时：原 400/1500 是给 4 节点环境调的。9 节点跑在 2 核宿主机上时，
+# 负载升高会让心跳赶不上 → 连环改选 → 数据组丢主 → leader 写入被拒，
+# 症状一路误导成"回放缺陷"（L1 验收实测踩过两次）。默认放宽。
+HEARTBEAT_MS="${HEARTBEAT_MS:-1000}"
+ELECTION_TIMEOUT_MS="${ELECTION_TIMEOUT_MS:-6000}"
 
 CLONE_ROOT="/tmp/${ENV_NAME}"
 CLONE_DIR="${CLONE_ROOT}/ShardPG"
@@ -107,8 +114,8 @@ logging_collector = off
 pg_raft.node_id = ${i}
 pg_raft.raft_enabled = on
 pg_raft.peers = '${PEERS}'
-pg_raft.heartbeat_ms = 400
-pg_raft.election_timeout_ms = 1500
+pg_raft.heartbeat_ms = ${HEARTBEAT_MS}
+pg_raft.election_timeout_ms = ${ELECTION_TIMEOUT_MS}
 pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 1
 # 协调节点(coordinator)：group 0 leader 优先落于此，且不得作为数据组成员
