@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# [宿主机] 一键完整复现 shardpg-replay 测试环境：1 coordinator + N workers（默认 8）。
+# [宿主机] 一键完整复现 shardpg-4.0 测试环境：1 coordinator + N workers（默认 8）。
 #
-# 本分支（shardpg-replay）是惰性回放模块的开发分支，从 shardpg-3.0 拉出。默认值已
-# 绑定到本分支的标准开发环境 pg-citus-replay（9 节点），因此在本分支上直接
-# `./reproduce-env.sh all` 即可原样重建该环境；改分支/规模请用环境变量覆盖。
+# 本分支（shardpg-4.0）从 shardpg-replay 尖端拉出（含 shardpg-3.0 全部 + 惰性回放
+# L1/R1 成果）。默认值已绑定到本分支的标准开发环境 pg_citus_raft（9 节点），因此在
+# 本分支上直接 `./reproduce-env.sh all` 即可原样重建该环境；改分支/规模请用环境变量
+# 覆盖。克隆目录默认在 /home/zhanhao 下（/tmp 已两次被宿主机重启清空，不再放那里）。
 #
 # 复现内容与 raft4 环境同构：同一镜像、容器内 /work 布局、同一套 postgresql.conf
 # 模板（pg_raft 参数与 setup-raft.sh 一致）、Citus 接线（coordinator 注册 + N 个
@@ -18,20 +19,21 @@
 #   ./reproduce-env.sh all       # up + verify
 #
 # 可覆盖的环境变量:
-#   ENV_NAME=pg-citus-replay          环境名（容器名/目录名前缀）
+#   ENV_NAME=pg_citus_raft            环境名（容器名/目录名前缀）
 #   N_WORKERS=8                       worker 数（group0 成员 = N+1，须 <= RAFT_MAX_PEERS）
 #   SRC_REPO=<url|path>               克隆源，默认 GitHub CyanPandas/ShardPG
-#   BRANCH=shardpg-replay
+#   BRANCH=shardpg-4.0
+#   CLONE_ROOT=/home/zhanhao/<ENV_NAME>   克隆/工作区根目录
 #   IMAGE=pg-partdist-raft4-env       容器镜像；不存在则用克隆里的 Dockerfile 构建
 #   SHARED_BUFFERS=32MB               每实例 shared_buffers
 #   HEARTBEAT_MS=1000                 pg_raft 心跳（小核宿主机上勿调小）
 #   ELECTION_TIMEOUT_MS=6000          pg_raft 选举超时
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-pg-citus-replay}"
+ENV_NAME="${ENV_NAME:-pg_citus_raft}"
 N_WORKERS="${N_WORKERS:-8}"
 SRC_REPO="${SRC_REPO:-https://github.com/CyanPandas/ShardPG.git}"
-BRANCH="${BRANCH:-shardpg-replay}"
+BRANCH="${BRANCH:-shardpg-4.0}"
 IMAGE="${IMAGE:-pg-partdist-raft4-env}"
 SHARED_BUFFERS="${SHARED_BUFFERS:-32MB}"
 # Raft 超时：原 400/1500 是给 4 节点环境调的。9 节点跑在 2 核宿主机上时，
@@ -40,7 +42,7 @@ SHARED_BUFFERS="${SHARED_BUFFERS:-32MB}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-1000}"
 ELECTION_TIMEOUT_MS="${ELECTION_TIMEOUT_MS:-6000}"
 
-CLONE_ROOT="/tmp/${ENV_NAME}"
+CLONE_ROOT="${CLONE_ROOT:-/home/zhanhao/${ENV_NAME}}"
 CLONE_DIR="${CLONE_ROOT}/ShardPG"
 CONTAINER="${ENV_NAME//_/-}-container"
 COORD_PORT=5432                       # coordinator=node1; worker i => 端口 5432+i, node_id i+1
