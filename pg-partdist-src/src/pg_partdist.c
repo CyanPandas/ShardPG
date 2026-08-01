@@ -287,6 +287,17 @@ _PG_init(void)
     DefineReplayGUCs();
     RegisterReplayLauncher();
 
+    /*
+     * 导出惰性回放的触发入口。pg_raft 在选举胜出、准备把某分区提升为
+     * primary 时取用：catchup(shard, commit_index) 同步追平后才对外服务。
+     * 经 rendezvous variable 传递，两个扩展之间无编译期依赖。
+     */
+    {
+        void **rv = find_rendezvous_variable("partdist_replay_catchup_hook");
+
+        *rv = (void *) ShardReplayCatchUp;
+    }
+
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
 

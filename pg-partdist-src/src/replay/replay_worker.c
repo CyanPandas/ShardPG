@@ -241,29 +241,105 @@ ReplayRecountReplicasLocked(void)
 }
 
 /* ================================================================== */
-/* 回放上界（FRD §6）                                                  */
+/* 触发式追平（惰性回放入口）                                          */
 /* ================================================================== */
 
-typedef uint64 (*ReplayBoundHook) (Oid shard_oid);
-static void **replay_bound_hook_rv = NULL;
-
-static uint64
-ReplayBound(Oid shard_oid)
+/*
+ * ShardReplayCatchUp — 把 shard 追平到 bound，同步等待完成。
+ *
+ * 惰性回放的全部"何时回放"逻辑就在这里：**平时一条记录都不放**，
+ * 只有被调用（升主 / 运维 / 测试）时才追。bound 由调用方给定 ——
+ * 升主场景传该组的 Raft commit_index，天然不会碰到未提交条目。
+ *
+ * bound == 0 表示"追到本地已落盘的全部字节"（测试/运维便利；
+ * 生产升主路径必须显式传 commit_index）。
+ */
+uint64
+ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
 {
-    ReplayBoundHook fn;
+    ReplayShardSlot *s;
+    uint64           gen;
+    uint64           applied = 0;
+    int              waited = 0;
+    char             errbuf[REPLAY_ERRMSG_LEN];
 
-    if (replay_bound_hook_rv == NULL)
-        replay_bound_hook_rv =
-            find_rendezvous_variable("partdist_replay_bound_hook");
-    fn = (ReplayBoundHook) *replay_bound_hook_rv;
+    if (ReplayCtl == NULL)
+        ereport(ERROR, (errmsg("replay_catchup: 回放共享内存未初始化")));
 
-    if (fn != NULL)
-        return fn(shard_oid);
+    if (bound == 0)
+        bound = GetLastWrittenPartitionLSN(shard_oid);
 
-    if (replay_trust_local_segments)
-        return GetLastWrittenPartitionLSN(shard_oid);
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    s = ReplaySlotFindLocked(shard_oid, false);
+    if (s == NULL || s->nlocs == 0)
+    {
+        LWLockRelease(ReplayCtl->lock);
+        ereport(ERROR,
+                (errmsg("replay_catchup: shard %u 尚未 replay_set_locmap",
+                        shard_oid)));
+    }
+    if (!s->armed)
+    {
+        LWLockRelease(ReplayCtl->lock);
+        ereport(ERROR,
+                (errmsg("replay_catchup: shard %u 未 armed（replay_enable）",
+                        shard_oid)));
+    }
 
-    return 0;
+    /* 已经到位：直接返回，不惊动 worker */
+    if (bound <= s->applied)
+    {
+        applied = s->applied;
+        LWLockRelease(ReplayCtl->lock);
+        return applied;
+    }
+
+    if (bound > s->target_plsn)
+        s->target_plsn = bound;
+    s->state = REPLAY_CATCHING_UP;
+    s->errmsg[0] = '\0';
+    s->generation++;
+    gen = s->generation;
+    LWLockRelease(ReplayCtl->lock);
+
+    /* worker 以 replay_naptime_ms 轮询槽位，这里同步等它把 applied 抬上去 */
+    for (;;)
+    {
+        bool done = false, failed = false;
+
+        CHECK_FOR_INTERRUPTS();
+
+        LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+        applied = s->applied;
+        if (s->state == REPLAY_FAILED && s->generation >= gen)
+        {
+            failed = true;
+            strlcpy(errbuf, s->errmsg, sizeof(errbuf));
+        }
+        else if (applied >= bound)
+            done = true;
+        LWLockRelease(ReplayCtl->lock);
+
+        if (failed)
+            ereport(ERROR,
+                    (errmsg("replay_catchup: shard %u 追平失败: %s",
+                            shard_oid, errbuf)));
+        if (done)
+            return applied;
+
+        if (timeout_ms > 0 && waited >= timeout_ms)
+            ereport(ERROR,
+                    (errmsg("replay_catchup: shard %u 追平超时 "
+                            "(%d ms, applied=%llu 目标=%llu)",
+                            shard_oid, timeout_ms,
+                            (unsigned long long) applied,
+                            (unsigned long long) bound)));
+
+        (void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         50, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        waited += 50;
+    }
 }
 
 /* ================================================================== */
@@ -328,7 +404,7 @@ LauncherRecoverSlots(void)
                  DataDir, PARTITION_WAL_DIR, shard_oid,
                  REPLAY_ENABLED_FILENAME);
         if (stat(path, &st) == 0)
-            s->enabled = true;
+            s->armed = true;    /* 只是"允许触发"，重启后不会自行回放 */
 
         ReplayRecountReplicasLocked();
         LWLockRelease(ReplayCtl->lock);
@@ -377,8 +453,12 @@ ReplayLauncherMain(Datum arg)
                                 "（PID %d 已死）", s->shard_oid,
                                 s->claimed_by)));
                 s->claimed_by = 0;
+                /* 追平中途死掉：状态置回 IDLE，等下一次触发重来
+                 * （游标在 apply_checkpoint 里，重来只补未完成的部分） */
+                if (s->state == REPLAY_CATCHING_UP)
+                    s->state = REPLAY_IDLE;
             }
-            if (s->enabled)
+            if (s->armed)
                 have_enabled = true;
         }
         LWLockRelease(ReplayCtl->lock);
@@ -536,13 +616,13 @@ ReplayWorkerMain(Datum arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        /* 认领未被认领的 enabled 槽位（CAS 语义：持锁检查 + 置位） */
+        /* 认领未被认领的 armed 槽位（CAS 语义：持锁检查 + 置位） */
         LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
         for (i = 0; i < REPLAY_MAX_SHARDS; i++)
         {
             ReplayShardSlot *s = &ReplayCtl->slots[i];
 
-            if (s->shard_oid != InvalidOid && s->enabled &&
+            if (s->shard_oid != InvalidOid && s->armed &&
                 s->claimed_by == 0)
                 s->claimed_by = MyProcPid;
         }
@@ -558,15 +638,24 @@ ReplayWorkerMain(Datum arg)
                 s->claimed_by != MyProcPid)
                 continue;
 
-            if (!s->enabled)
+            if (!s->armed)
             {
-                /* 释放已禁用的认领 */
+                /* 释放已解除的认领 */
                 LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
                 if (s->claimed_by == MyProcPid)
                     s->claimed_by = 0;
                 LWLockRelease(ReplayCtl->lock);
                 continue;
             }
+
+            /*
+             * ★ 惰性核心：没有待办就什么都不做。
+             * 平时 target_plsn 停在已追平的位置，worker 在这里直接跳过 ——
+             * 副本上一条 redo 都不会发生，字节由 P2 的平凡 apply 负责落盘。
+             * 只有 replay_catchup（升主/运维/测试）把 target 抬高才干活。
+             */
+            if (s->target_plsn <= s->applied && s->state != REPLAY_CATCHING_UP)
+                continue;
 
             /* 惰性建 ctx（阶段一：checkpoint + locmap） */
             if (ctxs[i] == NULL || ctxs[i]->shard_oid != s->shard_oid)
@@ -586,9 +675,11 @@ ReplayWorkerMain(Datum arg)
                     pfree(ctx);
                     ereport(WARNING,
                             (errmsg("pg_partdist replay: shard %u 无有效 "
-                                    "locmap，禁用", s->shard_oid)));
+                                    "locmap，解除 armed", s->shard_oid)));
                     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
-                    s->enabled = false;
+                    s->armed = false;
+                    s->state = REPLAY_FAILED;
+                    strlcpy(s->errmsg, "无有效 locmap", REPLAY_ERRMSG_LEN);
                     if (s->claimed_by == MyProcPid)
                         s->claimed_by = 0;
                     LWLockRelease(ReplayCtl->lock);
@@ -612,34 +703,81 @@ ReplayWorkerMain(Datum arg)
                 ctxs[i] = ctx;
                 MemoryContextSwitchTo(old);
 
+                /* 认领时把持久化游标同步进槽位，供 catchup 的"已到位"判定 */
+                LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                s->applied = ctx->applied_part_lsn;
+                LWLockRelease(ReplayCtl->lock);
+
                 ereport(LOG,
                         (errmsg("pg_partdist replay: 认领 shard %u，"
-                                "游标从 %llu 起", ctx->shard_oid,
+                                "游标从 %llu 起（惰性：待触发）",
+                                ctx->shard_oid,
                                 (unsigned long long) ctx->applied_part_lsn)));
             }
 
             /* 断言认领权仍在手（FRD §13.10 单写者不变式） */
             Assert(s->claimed_by == MyProcPid);
 
-            bound = ReplayBound(s->shard_oid);
+            bound = s->target_plsn;
             if (bound > ctxs[i]->applied_part_lsn)
             {
                 MemoryContext old = MemoryContextSwitchTo(work_cxt);
+                bool           ok = true;
 
-                ShardReplayRun(ctxs[i], bound);
+                /*
+                 * 追平失败不能拖垮 worker（否则整个节点连带重置）：
+                 * 捕获后落 FAILED + errmsg，等下一次触发重来。游标在
+                 * apply_checkpoint 里，重来只补未完成的部分。
+                 */
+                PG_TRY();
+                {
+                    ShardReplayRun(ctxs[i], bound);
+                }
+                PG_CATCH();
+                {
+                    ErrorData *ed;
+
+                    MemoryContextSwitchTo(old);
+                    ed = CopyErrorData();
+                    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                    s->state = REPLAY_FAILED;
+                    strlcpy(s->errmsg, ed->message, REPLAY_ERRMSG_LEN);
+                    LWLockRelease(ReplayCtl->lock);
+                    ereport(WARNING,
+                            (errmsg("pg_partdist replay: shard %u 追平失败: %s",
+                                    s->shard_oid, ed->message)));
+                    FreeErrorData(ed);
+                    FlushErrorState();
+                    ok = false;
+                }
+                PG_END_TRY();
+
                 MemoryContextSwitchTo(old);
                 MemoryContextReset(work_cxt);
-                did_work = true;
+                did_work = ok;
+
+                if (ok)
+                {
+                    /* 收尾 checkpoint：追平结束即持久化游标 */
+                    ShardReplayDoCheckpoint(ctxs[i]);
+                    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                    s->applied = ctxs[i]->applied_part_lsn;
+                    if (s->applied >= s->target_plsn)
+                        s->state = REPLAY_IDLE;     /* 回到休眠 */
+                    LWLockRelease(ReplayCtl->lock);
+
+                    ereport(LOG,
+                            (errmsg("pg_partdist replay: shard %u 追平至 %llu",
+                                    s->shard_oid,
+                                    (unsigned long long) ctxs[i]->applied_part_lsn)));
+                }
+                else
+                {
+                    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                    s->applied = ctxs[i]->applied_part_lsn;
+                    LWLockRelease(ReplayCtl->lock);
+                }
             }
-
-            /* 时间阈值 checkpoint（记录数阈值在 Run 内部处理） */
-            if (ctxs[i]->applied_part_lsn != ctxs[i]->durable_part_lsn &&
-                TimestampDifferenceExceeds(ctxs[i]->last_ckpt_time,
-                                           GetCurrentTimestamp(),
-                                           replay_checkpoint_interval_ms))
-                ShardReplayDoCheckpoint(ctxs[i]);
-
-            s->applied = ctxs[i]->applied_part_lsn;
         }
 
         (void) WaitLatch(MyLatch,
@@ -663,6 +801,7 @@ PG_FUNCTION_INFO_V1(pg_partdist_replay_set_locmap);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_enable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_disable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_status);
+PG_FUNCTION_INFO_V1(pg_partdist_replay_catchup);
 
 /*
  * register_shard_fileset(regclass) → int
@@ -860,7 +999,13 @@ pg_partdist_replay_enable(PG_FUNCTION_ARGS)
                 (errmsg("replay_enable: shard %u 尚未 replay_set_locmap",
                         relid)));
     }
-    s->enabled = true;
+    /*
+     * armed 只表示"允许被触发"，**不会**自己开始回放（惰性语义）。
+     * 真正的回放由 replay_catchup 触发。
+     */
+    s->armed = true;
+    s->state = REPLAY_IDLE;
+    s->errmsg[0] = '\0';
     LWLockRelease(ReplayCtl->lock);
 
     /* 持久化启用标记（节点重启后 launcher 自动恢复） */
@@ -883,7 +1028,7 @@ pg_partdist_replay_disable(PG_FUNCTION_ARGS)
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
     s = ReplaySlotFindLocked(relid, false);
     if (s != NULL)
-        s->enabled = false;
+        s->armed = false;
     LWLockRelease(ReplayCtl->lock);
 
     snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
@@ -902,6 +1047,7 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     int            i;
+    static const char *state_name[] = {"idle", "catching_up", "failed"};
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -910,26 +1056,30 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
     {
         ReplayShardSlot     *s = &ReplayCtl->slots[i];
         ShardApplyCheckpoint chk;
-        Datum values[6];
-        bool  nulls[6] = {false, false, false, false, false, false};
+        Datum values[8];
+        bool  nulls[8];
 
         if (s->shard_oid == InvalidOid)
             continue;
 
+        memset(nulls, 0, sizeof(nulls));
         values[0] = ObjectIdGetDatum(s->shard_oid);
-        values[1] = BoolGetDatum(s->enabled);
-        values[2] = Int32GetDatum(s->claimed_by);
-        values[3] = Int64GetDatum((int64) s->applied);
+        values[1] = BoolGetDatum(s->armed);
+        values[2] = CStringGetTextDatum(
+            (s->state >= 0 && s->state <= 2) ? state_name[s->state] : "?");
+        values[3] = Int32GetDatum(s->claimed_by);
+        values[4] = Int64GetDatum((int64) s->applied);
+        values[5] = Int64GetDatum((int64) s->target_plsn);
 
         if (ReadApplyCheckpoint(s->shard_oid, &chk))
         {
-            values[4] = Int64GetDatum((int64) chk.durable_part_lsn);
-            values[5] = LSNGetDatum(chk.max_orig_lsn);
+            values[6] = Int64GetDatum((int64) chk.durable_part_lsn);
+            values[7] = LSNGetDatum(chk.max_orig_lsn);
         }
         else
         {
-            values[4] = Int64GetDatum(0);
-            nulls[5]  = true;
+            values[6] = Int64GetDatum(0);
+            nulls[7]  = true;
         }
 
         tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
@@ -938,4 +1088,30 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
     LWLockRelease(ReplayCtl->lock);
 
     PG_RETURN_NULL();
+}
+
+/*
+ * replay_catchup(shard regclass, upto bigint DEFAULT NULL,
+ *                timeout_ms int DEFAULT 300000) → bigint
+ *
+ * 惰性回放的触发入口。upto = NULL 表示"追到本地已落盘的全部字节"；
+ * 生产升主路径必须显式传该组的 Raft commit_index。
+ */
+Datum
+pg_partdist_replay_catchup(PG_FUNCTION_ARGS)
+{
+    Oid    relid = PG_GETARG_OID(0);
+    uint64 bound = 0;
+    int    timeout_ms = PG_ARGISNULL(2) ? 300000 : PG_GETARG_INT32(2);
+
+    if (!PG_ARGISNULL(1))
+    {
+        int64 v = PG_GETARG_INT64(1);
+
+        if (v < 0)
+            ereport(ERROR, (errmsg("replay_catchup: upto 不能为负")));
+        bound = (uint64) v;
+    }
+
+    PG_RETURN_INT64((int64) ShardReplayCatchUp(relid, bound, timeout_ms));
 }

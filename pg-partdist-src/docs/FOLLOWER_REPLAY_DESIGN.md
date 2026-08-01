@@ -27,6 +27,50 @@
 | ⑥ | — | 明确 `orig_lsn` 的语义 = 记录在 leader 侧的 **EndRecPtr**(end LSN),而非起始 LSN | §4.2 |
 | ⑦ | — | SMGR 类记录的 `RelFileLocator` 在 main data 而非 block ref,重映射需特判 | 附录 A |
 
+## ★ 形态修正:本项目采用**触发式惰性回放**(2026-08-01,用户确认)
+
+> **v3 稿(以及 §7 全文)描述的是"持续回放":worker 常驻轮询,已提交的字节一到
+> 就 redo 进去。本项目实际要的不是这个 —— 是惰性回放。** 二者的差别不在回放
+> 引擎,在**何时触发**。
+
+| | 持续回放(v3 稿) | **惰性回放(本项目)** |
+|---|---|---|
+| 平时 | worker 不断消费并 redo | **一条 redo 都不做**;副本只有 P2 平凡 apply 落下的字节 |
+| 触发 | 无(始终在跑) | 升主时调 `replay_catchup(shard, commit_index)` 同步追平,之后才对外服务 |
+| 回放上界 | 需要 pg_raft 持续注入 commit_index | 触发那一刻由调用方给定 |
+| 副本状态 | 始终"热" | 平时是"冷"字节,追平后才成为可用副本 |
+| 每节点开销 | N 个分片副本 = N 条 redo 流常驻 | 零 |
+| 切主延迟 | 最小 | 与积压量成正比 |
+
+**为什么惰性更契合本架构**:每个节点同时是若干分区的 primary、又是另一些分区的
+secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo 流一直烧 CPU/IO,
+而这些副本绝大多数永远不会被提升。惰性把这笔开销挪到真正需要的那一刻。
+
+**顺带消解掉一个正确性风险**:follower 收到 AppendEntries 就先 fsync 再 ack,
+即**字节落盘早于条目提交**。持续回放若按"本地有什么就放什么"推进,会 redo 掉
+尚未达成多数派的条目,而物理 redo **不可逆** —— 一旦该条目被 Raft 截断就无法
+回滚。惰性回放的触发点(升主)恰好是确切知道提交位置的时刻,`bound` 由调用方
+传入 commit_index,天然不会越界;未提交的字节还躺在盘上没动过,截断直接删即可。
+
+**实现落点**(R1 的引擎全部复用,只改驱动层):
+- 槽位状态机 `IDLE ↔ CATCHING_UP`(失败停 `FAILED` 并留 errmsg);
+  平时 `target_plsn <= applied`,worker 在主循环里直接跳过 —— 这就是"惰性"的全部。
+- `replay_enable` 语义改为 **arm(允许被触发)**,不再意味着开始回放;
+  `armed` 标记持久化,节点重启后恢复,但**重启也不会自行回放**。
+- `replay_catchup(shard, upto, timeout_ms)`:写目标 → 唤醒 worker → 同步等待
+  → 返回 `applied`。`upto = NULL` 表示追到本地全部字节(运维/测试便利),
+  **生产升主路径必须显式传 commit_index**。
+- 触发入口经 rendezvous variable `partdist_replay_catchup_hook` 导出给 pg_raft,
+  两个扩展无编译期依赖。
+- 追平失败被 `PG_TRY` 捕获落到 `FAILED`,不拖垮 worker(shmem worker 崩溃会连带
+  整个节点重置);游标在 `apply_checkpoint` 里,下次触发只补未完成的部分。
+
+**§7 以下各节描述的回放管线本身(五阶段、loc_map、页级幂等、apply checkpoint)
+全部照旧有效**,只是"每 shard 一个 worker 串行消费"改为"每 shard 一个 worker
+串行**追平**,平时休眠"。
+
+---
+
 ## v3.1 评审修正(2026-07-31,R1 开工前)
 
 对照 PG 16.14 源码复核 v3 后补入。①为正确性缺陷,②③为立项/排期阻断项,④⑤⑥为落地约束。
@@ -841,7 +885,10 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
 ## 11. Failover:Follower 提升为 Leader(R4)
 
 1. Raft 选举胜出(日志最全者当选,Raft 保证)。
-2. **追平**:循环 §7 阶段二~四,直至 `applied_part_lsn` 达到组内 committed 上界。
+2. **追平**:调 `replay_catchup(shard, commit_index, timeout)` —— **这是惰性回放
+   唯一真正干活的时刻**(见文首"形态修正")。在此之前该副本一条 redo 都没做过,
+   积压可能很大,追平耗时与积压量成正比,须计入切主 SLA。
+   内部即循环 §7 阶段二~四,直至 `applied_part_lsn` 达到 `commit_index`。
 3. **最终 apply checkpoint**:落盘游标、`max_orig_lsn`、`max_replayed_fxid`、
    xid_map 快照;`PartDistAdvanceNextXidPastXid(max_replayed_fxid)` 拉齐 nextXid。
 4. **推进本地 WAL 插入位点**越过 `max_orig_lsn`(内核补丁 0003,

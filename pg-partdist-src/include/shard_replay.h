@@ -98,12 +98,22 @@ typedef struct ShardReplayCtx
 } ShardReplayCtx;
 
 /*
- * 回放上界回调（FRD §6）：返回该 shard 已 committed 的最大 partition_lsn。
- * 生产环境由 pg_raft 经 rendezvous variable "partdist_replay_bound_hook"
- * 注入（commit_index）；测试模式 GUC replay_trust_local_segments=on 时
- * 用本地段文件内容代替，使回放模块可脱离 Raft 独立开发验收。
+ * 触发式追平（惰性回放的入口）。
+ *
+ * pg_raft 在选举胜出、准备把该分区提升为 primary 时调用它：把 bound 设成
+ * **该组已提交的最大 partition_lsn（commit_index）**，同步等待追平完成，
+ * 之后才对外服务。这样"回放上界"在触发时刻由调用方精确给定，不需要回放
+ * 模块自己去猜 —— 持续回放形态下"可能放到未提交条目"的风险不复存在。
+ *
+ * pg_partdist 在 _PG_init 把本函数指针写进 rendezvous variable
+ * "partdist_replay_catchup_hook"，pg_raft 取用即可，二者无编译期依赖。
+ *
+ * 返回追平后的 applied_part_lsn；失败 ereport(ERROR)。
  */
-typedef uint64 (*ShardReplayBoundFn) (Oid shard_oid);
+extern uint64 ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms);
+
+typedef uint64 (*ShardReplayCatchUpFn) (Oid shard_oid, uint64 bound,
+                                        int timeout_ms);
 
 /* ------------------------------------------------------------------ */
 /* 共享内存：认领槽位 + 副本文件豁免哈希（补丁 0002 的判据）           */
@@ -111,15 +121,36 @@ typedef uint64 (*ShardReplayBoundFn) (Oid shard_oid);
 
 #define REPLAY_MAX_SHARDS 64
 
-/* replay_enable 的持久化标记文件（pg_parwal/<oid>/ 下） */
+/* replay_enable（= armed）的持久化标记文件（pg_parwal/<oid>/ 下） */
 #define REPLAY_ENABLED_FILENAME "replay_enabled"
+
+#define REPLAY_ERRMSG_LEN 160
+
+/*
+ * 回放状态机（惰性形态）。
+ *
+ * 平时停在 IDLE —— **不做任何 redo**，副本只是 P2 平凡 apply 落下来的字节。
+ * 触发（replay_catchup / 升主）把 target_plsn 抬到目标位置，worker 转入
+ * CATCHING_UP 追平，完成后回到 IDLE。追平出错停在 FAILED 并留下 errmsg。
+ */
+typedef enum ReplayState
+{
+    REPLAY_IDLE = 0,
+    REPLAY_CATCHING_UP = 1,
+    REPLAY_FAILED = 2
+} ReplayState;
 
 typedef struct ReplayShardSlot
 {
     Oid     shard_oid;      /* InvalidOid = 空槽 */
     int     claimed_by;     /* 0 = 未认领；否则为持有 worker 的 PID（§13.10） */
-    bool    enabled;
-    uint64  applied;        /* worker 单写、其他进程只读（status 展示用） */
+    bool    armed;          /* 允许被触发；false = 连触发都不受理 */
+
+    uint64  target_plsn;    /* 触发目标；<= applied 即无待办（惰性的核心） */
+    uint64  applied;        /* worker 单写、其他进程只读 */
+    int     state;          /* ReplayState */
+    uint64  generation;     /* 每次触发 +1，供调用方区分轮次 */
+    char    errmsg[REPLAY_ERRMSG_LEN];
 
     /* 本地副本文件号 —— 补丁 0002 豁免哈希的数据源 */
     int           nlocs;

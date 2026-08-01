@@ -633,20 +633,43 @@ CREATE OR REPLACE FUNCTION replay_disable(
     AS 'MODULE_PATHNAME', 'pg_partdist_replay_disable';
 
 COMMENT ON FUNCTION replay_enable(REGCLASS) IS
-    '启用该本地 shard 副本的物理回放（前提：已 replay_set_locmap）。';
+    '允许该本地 shard 副本被触发回放（前提：已 replay_set_locmap）。注意惰性语义：本函数只是 arm，不会开始回放，真正的回放由 replay_catchup 触发。';
 COMMENT ON FUNCTION replay_disable(REGCLASS) IS
-    '停用该本地 shard 副本的物理回放。';
+    '解除该本地 shard 副本的 armed 状态，此后 replay_catchup 会被拒绝。';
 
 -- 回放状态观测。
 CREATE OR REPLACE FUNCTION replay_status(
     OUT shard OID,
-    OUT enabled BOOLEAN,
+    OUT armed BOOLEAN,
+    OUT state TEXT,
     OUT claimed_by INTEGER,
     OUT applied BIGINT,
+    OUT target BIGINT,
     OUT durable BIGINT,
     OUT max_orig PG_LSN
 ) RETURNS SETOF record LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_replay_status';
 
 COMMENT ON FUNCTION replay_status() IS
-    '各回放槽位状态：applied=worker 内存游标，durable=apply_checkpoint 落盘游标，max_orig=已应用的最大 leader end LSN。';
+    '各回放槽位状态：armed=是否允许被触发（惰性：armed 不等于在回放），state=idle/catching_up/failed，applied=已回放到的 partition_lsn，target=当前触发目标，durable=apply_checkpoint 落盘游标。';
+
+-- ==================================================================
+-- 惰性回放触发入口（L1）
+-- ==================================================================
+
+-- 平时副本一条 redo 都不做（只由 partwal_follower_append 落字节）；
+-- 本函数是唯一让回放真正发生的入口，同步等待追平完成后返回。
+--
+-- p_upto = NULL：追到本地已落盘的全部字节（运维/测试便利）。
+-- 生产升主路径**必须显式传该 Raft 组的 commit_index** —— 回放上界由调用方
+-- 在确切知道提交位置的时刻给定，因此不存在"误放未提交条目"的问题
+-- （物理 redo 不可逆，这是持续回放形态才要操心的风险）。
+CREATE OR REPLACE FUNCTION replay_catchup(
+    p_local_shard REGCLASS,
+    p_upto BIGINT DEFAULT NULL,
+    p_timeout_ms INTEGER DEFAULT 300000
+) RETURNS BIGINT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_catchup';
+
+COMMENT ON FUNCTION replay_catchup(REGCLASS, BIGINT, INTEGER) IS
+    '惰性回放触发入口：把该副本追平到 p_upto（NULL=本地全部字节；升主时传 Raft commit_index），同步等待完成，返回追平后的 applied_part_lsn。';

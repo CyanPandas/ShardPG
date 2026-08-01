@@ -646,7 +646,23 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     ssize_t           written;
 
     hard_state_path(ctx, path, sizeof(path));
-    snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+
+    /*
+     * 临时文件名必须**按进程唯一**。
+     *
+     * persist_hard_state_unlocked() 在读完 term/vote 后就释放了自旋锁，文件
+     * I/O 完全没有跨进程同步：BGW tick 与走 prepare 路径的 client backend 可以
+     * 同时进入本函数。若共用固定的 "<path>.tmp"：
+     *   1. 两者 open(O_TRUNC) 到同一个文件、各写各的；
+     *   2. 先完成者 rename 走，后到者的 rename 报 ENOENT ——
+     *      **该次 hardstate 没有落盘，而 Raft 已经据其 term/vote 行动了**；
+     *      崩溃重启后可能在同一任期内重复投票。
+     *   3. 失败分支的 unlink(tmppath) 还会误删第三个写入者正在写的 tmp，
+     *      把单次丢失放大成连环丢失。
+     * 实测后果：L1 验收中 group 102027 连环改选（node2→node3→node4），
+     * 原 placement 节点丢主后写入被拒，下游误判成回放缺陷。
+     */
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d", path, (int) MyProcPid);
 
     hs.magic = RAFT_HARDSTATE_MAGIC;
     hs.version = RAFT_HARDSTATE_VERSION;

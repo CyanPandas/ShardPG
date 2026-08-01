@@ -28,6 +28,47 @@ import sys
 
 BLCKSZ = 8192
 
+# PageHeaderData 字段布局（src/include/storage/bufpage.h）
+_HDR = [
+    (0,  8, "pd_lsn"),
+    (8,  2, "pd_checksum"),
+    (10, 2, "pd_flags"),
+    (12, 2, "pd_lower"),
+    (14, 2, "pd_upper"),
+    (16, 2, "pd_special"),
+    (18, 2, "pd_pagesize_version"),
+    (20, 4, "pd_prune_xid"),
+]
+
+# HeapTupleHeaderData 前 23 字节（src/include/access/htup_details.h）
+_TUP = [
+    (0,  4, "t_xmin"),
+    (4,  4, "t_xmax"),
+    (8,  4, "t_cid/t_xvac"),
+    (12, 6, "t_ctid"),
+    (18, 2, "t_infomask2"),
+    (20, 2, "t_infomask"),
+    (22, 1, "t_hoff"),
+]
+
+
+def classify(off, lower, upper):
+    """把页内偏移定性成字段名 —— 头部字段 / 行指针 / 元组头 / 元组数据。"""
+    for base, size, name in _HDR:
+        if base <= off < base + size:
+            return "页头 %s[+%d]" % (name, off - base)
+    if 24 <= off < lower:
+        n = (off - 24) // 4
+        return "行指针 lp[%d][+%d]" % (n + 1, (off - 24) % 4)
+    if off >= upper:
+        # 元组区：定位到所属元组起点需要行指针，这里只标相对量
+        rel = off - upper
+        for base, size, name in _TUP:
+            if base <= rel < base + size:
+                return "元组区(首元组) %s[+%d]" % (name, rel - base)
+        return "元组区 +%d" % rel
+    return "空洞外未知区"
+
 
 def main():
     if len(sys.argv) != 3:
@@ -75,10 +116,14 @@ def main():
         outside_total += len(outside)
         hole_total += inhole
 
-        print("  page%d hole=[%d,%d) 洞内差异=%d 洞外差异=%d%s"
-              % (p, lower_a, upper_a, inhole, len(outside),
-                 (" 偏移=%s" % outside[:12]) if outside else ""),
-              file=sys.stderr)
+        print("  page%d hole=[%d,%d) 洞内差异=%d 洞外差异=%d"
+              % (p, lower_a, upper_a, inhole, len(outside)), file=sys.stderr)
+
+        # 洞外差异逐处定性 —— 差在哪个字段比"差了几个字节"有用得多
+        for off in outside:
+            print("    偏移 %4d  %-28s leader=0x%02X follower=0x%02X"
+                  % (off, classify(off, lower_a, upper_a), pa[off], pb[off]),
+                  file=sys.stderr)
 
     if outside_total == 0:
         print("IDENTICAL_OUTSIDE_HOLE")
