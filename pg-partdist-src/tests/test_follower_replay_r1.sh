@@ -108,13 +108,15 @@ for fp in $f1 $f2; do
 done
 
 echo "========== [4] 批次 A：INSERT/UPDATE/DELETE（含 TOAST） =========="
+# 规模按传输速率标定：同步 Raft 复制约 3 条/秒（每条一次带 fsync 的 RPC），
+# 300 行 + 30 个 TOAST 值足以覆盖 heap/btree/toast/FPI 全记录类型。
 PSQL $COORD -v ON_ERROR_STOP=1 -q <<'SQL'
 INSERT INTO r1_replay
 SELECT g, 'v'||g,
        CASE WHEN g % 10 = 0
             THEN (SELECT string_agg(md5((g*1000+i)::text), '') FROM generate_series(1,300) i)
             ELSE 'small' END
-FROM generate_series(1, 1200) g;
+FROM generate_series(1, 300) g;
 SQL
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "UPDATE r1_replay SET v = v||'-u1' WHERE id % 3 = 0;"
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "DELETE FROM r1_replay WHERE id % 17 = 0;"
@@ -138,36 +140,64 @@ wait_caught_up() {  # wait_caught_up <fport> <期望plsn> <超时s>
 app1=$(wait_caught_up $f1 "$lead_plsn" 90)
 check "follower1 追平批次 A（applied=${app1} / ${lead_plsn}）" "$([[ "$app1" -ge "$lead_plsn" ]] && echo ok)" "ok"
 
-echo "========== [5] kill -9 replay worker，批次 B 期间恢复 =========="
-wpid=$(docker exec -u postgres $CONTAINER bash -c "ps -u postgres -o pid=,cmd= | grep '[r]eplay worker' | head -1 | awk '{print \$1}'")
-check "找到 replay worker 进程" "$([[ -n "$wpid" ]] && echo ok)" "ok"
+echo "========== [5] 崩溃恢复：制造积压 → kill -9 → 节点重置 → 从游标追平 =========="
+# 注意：kill -9 挂 shmem 的 bgworker 会让 postmaster 重置**整个节点**（PG 语义），
+# 所以本步刻意避免在重置窗口内做 leader 写入（同步复制会因多数派丢失而中止）。
+# 流程：停 f1 回放 → 批次 B 完整写入（f1 仍接收字节，只是不回放 → 积压）→
+# 重新启用 → worker 开始追积压 → kill -9 → 节点重置恢复 → worker 从 durable
+# 游标重放（页级幂等覆盖已应用部分）→ 追平。
 
-PSQL $COORD -v ON_ERROR_STOP=1 -q <<'SQL' &
+PSQL $f1 -q -c "SELECT partdist.replay_disable('${shard_tbl}');" >/dev/null
+
+PSQL $COORD -v ON_ERROR_STOP=1 -q <<'SQL'
 INSERT INTO r1_replay
 SELECT g, 'b'||g,
        CASE WHEN g % 10 = 0
             THEN (SELECT string_agg(md5((g*7777+i)::text), '') FROM generate_series(1,300) i)
             ELSE 'small-b' END
-FROM generate_series(2001, 3200) g;
+FROM generate_series(2001, 2300) g;
 SQL
-WRITER_PID=$!
-sleep 2
-docker exec -u postgres $CONTAINER kill -9 "$wpid" 2>/dev/null
-echo "  已 kill -9 worker(pid=$wpid)，等待写入完成 + launcher 重拉"
-wait $WRITER_PID
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "UPDATE r1_replay SET v = v||'-u2' WHERE id % 5 = 0;"
 
+PSQL $f1 -q -c "SELECT partdist.replay_enable('${shard_tbl}');" >/dev/null
+sleep 1
+
+# 精确找 f1 节点的 replay worker（bgworker 的 cwd = 其数据目录）
+fdir="worker$((f1 - 5432))"
+wpid=$(docker exec -u postgres $CONTAINER bash -c "
+  for pid in \$(pgrep -f '[r]eplay worker'); do
+    [ \"\$(readlink /proc/\$pid/cwd 2>/dev/null)\" = \"/work/pg-cluster-data/${fdir}\" ] && { echo \$pid; break; }
+  done")
+check "找到 f1 节点的 replay worker（积压追赶中）" "$([[ -n "$wpid" ]] && echo ok)" "ok"
+docker exec -u postgres $CONTAINER kill -9 "$wpid" 2>/dev/null
+echo "  已 kill -9 worker(pid=$wpid)，节点将整体重置"
+
+wait_node_up() {  # <port> <超时s>
+  local p=$1 timeout=$2 t
+  for t in $(seq 1 "$timeout"); do
+    [[ "$(PSQL $p -Atc 'SELECT 1' 2>/dev/null)" == "1" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+wait_node_up $f1 60
+check "f1 节点从重置中恢复" "$?" "0"
+
 lead_plsn=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${leader_oid})")
-app1=$(wait_caught_up $f1 "$lead_plsn" 120)
-check "kill -9 后 follower1 重启追平（applied=${app1} / ${lead_plsn}）" "$([[ "$app1" -ge "$lead_plsn" ]] && echo ok)" "ok"
+app1=$(wait_caught_up $f1 "$lead_plsn" 180)
+check "kill -9 后 follower1 重启追平（applied=${app1} / ${lead_plsn}）" "$([[ -n "$app1" && "$app1" -ge "$lead_plsn" ]] && echo ok)" "ok"
 
 echo "========== [6] VACUUM 尾部截断（RM_SMGR 特判验收） =========="
 # 删掉尾部大段行 → VACUUM 截断尾页 → XLOG_SMGR_TRUNCATE 进流
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "DELETE FROM r1_replay WHERE id > 600;"
-before_sz=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT pg_relation_size('${shard_tbl}')")
-PSQL $pport -v ON_ERROR_STOP=1 -q -c "SET citus.override_table_visibility=false; VACUUM (FREEZE) ${shard_tbl};"
-after_sz=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT pg_relation_size('${shard_tbl}')")
-check "leader 侧 VACUUM 确实截断了尾页" "$([[ "$after_sz" -lt "$before_sz" ]] && echo ok)" "ok"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "DELETE FROM r1_replay WHERE id > 150;"
+# 注意：VACUUM 不能与 SET 同事务（psql 单 -c 是一个事务）；分开传，
+# 同一连接内 SET 会话级生效。取值处过滤 SET 命令标签（tail -1）。
+before_sz=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT pg_relation_size('${shard_tbl}')" | tail -1)
+PSQL $pport -v ON_ERROR_STOP=1 -q \
+  -c "SET citus.override_table_visibility=false;" \
+  -c "VACUUM (FREEZE) ${shard_tbl};"
+after_sz=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT pg_relation_size('${shard_tbl}')" | tail -1)
+check "leader 侧 VACUUM 确实截断了尾页(${before_sz}→${after_sz})" "$([[ -n "$after_sz" && -n "$before_sz" && "$after_sz" -lt "$before_sz" ]] && echo ok)" "ok"
 
 lead_plsn=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${leader_oid})")
 app1=$(wait_caught_up $f1 "$lead_plsn" 90)

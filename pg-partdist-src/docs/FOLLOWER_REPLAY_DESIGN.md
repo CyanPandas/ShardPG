@@ -327,7 +327,21 @@ typedef uint64 (*ShardReplayBoundFn)(Oid shard_oid);   /* 返回已 committed �
 ## 7. Follower 回放管线(核心,对应 reply_v1 §3.3 五阶段)
 
 回放的**并发单位是 shard**:每个 shard 的字节流由唯一一个 replay worker 串行消费
-(bgworker,`BGWORKER_SHMEM_ACCESS`,无 DB 连接;文件号均来自 loc_map,不需要 relcache)。
+(bgworker;文件号均来自 loc_map,不需要 relcache)。
+
+> **★ worker 进程初始化三要素(R1 实测,缺一即段错误;v3 稿"纯 SHMEM_ACCESS
+> 无 DB 连接"的说法不成立)**:
+> 1. `BGWORKER_BACKEND_DATABASE_CONNECTION` + `BackgroundWorkerInitializeConnection(NULL)`
+>    ——不是为了 catalog(dbname=NULL 不连任何库),而是为了走完 BaseInit:
+>    `InitBufferPoolAccess`/pgstat/fd.c 都在这里初始化;缺了它第一次 ReadBuffer
+>    直接段错误,且 shmem worker 崩溃会把**整个节点**拖进 crash recovery;
+> 2. `CreateAuxProcessResourceOwner()`——回放全程无事务,`CurrentResourceOwner`
+>    为 NULL 时 buffer pin 记账(`ResourceOwnerEnlargeBuffers`)段错误;与 startup
+>    进程同款做法,退出路径自动释放残留 pin;
+> 3. `RmgrStartup()`(镜像 StartupXLOG)——btree/gin/gist 的 redo 入口第一件事
+>    是 `MemoryContextSwitchTo(opCtx)`,`opCtx` 由各自的 `rm_startup` 创建;
+>    不调它,第一条 NEWROOT 记录就把 `CurrentMemoryContext` 切成 NULL,下一个
+>    palloc 即崩。heap 记录没有私有上下文——**"heap 能回放"不证明初始化完整**。
 
 > **★ 不是"每 shard 常驻一个 bgworker"**。`max_worker_processes` 默认 8(本项目
 > 测试环境实测即为 8),而每节点承载的 shard 数是几十到上百量级(Citus 默认

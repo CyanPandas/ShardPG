@@ -358,6 +358,10 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
         return;
     }
 
+    REPLAY_TRACE("TRACE data: decode plsn=%llu tot_len=%u",
+                 (unsigned long long) hdr->partition_lsn,
+                 record->xl_tot_len);
+
     /* 1) 解码原始字节；lsn 实参 = leader 的 end LSN（§4.2/§8.2） */
     decoded = palloc(DecodeXLogRecordRequiredSpace(record->xl_tot_len));
     if (!DecodeXLogRecord(ctx->reader, decoded, record, hdr->orig_lsn,
@@ -388,8 +392,14 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
     ctx->reader->ReadRecPtr = hdr->orig_lsn;
     ctx->reader->EndRecPtr  = hdr->orig_lsn;
 
+    REPLAY_TRACE("TRACE data: rm_redo plsn=%llu rmid=%u",
+                 (unsigned long long) hdr->partition_lsn, record->xl_rmid);
+
     /* 4) 派发原生 redo */
     GetRmgr(record->xl_rmid).rm_redo(ctx->reader);
+
+    REPLAY_TRACE("TRACE data: rm_redo done plsn=%llu",
+                 (unsigned long long) hdr->partition_lsn);
 
     ctx->reader->record = NULL;
     pfree(decoded);
@@ -538,16 +548,24 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
      *   2. smgrimmedsync 落到持久层；
      *   3. 之后才允许写 durable_part_lsn 的 checkpoint 文件。
      */
+    REPLAY_TRACE("TRACE ckpt: begin shard %u upto %llu", ctx->shard_oid,
+                 (unsigned long long) ctx->applied_part_lsn);
+
     for (i = 0; i < ctx->nlocal; i++)
     {
         SMgrRelation reln = smgropen(ctx->local_locs[i], InvalidBackendId);
         ForkNumber   fork;
 
+        REPLAY_TRACE("TRACE ckpt: flush rel %u/%u/%u",
+                     ctx->local_locs[i].spcOid, ctx->local_locs[i].dbOid,
+                     ctx->local_locs[i].relNumber);
         FlushRelationsAllBuffers(&reln, 1);
         for (fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
             if (smgrexists(reln, fork))
                 smgrimmedsync(reln, fork);
     }
+
+    REPLAY_TRACE("TRACE ckpt: flush done, writing cursor");
 
     memset(&chk, 0, sizeof(chk));
     chk.magic            = APPLY_CHECKPOINT_MAGIC;
@@ -585,10 +603,17 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
     if (bound <= ctx->applied_part_lsn)
         return;
 
+    REPLAY_TRACE("TRACE Run: shard %u applied=%llu bound=%llu",
+                 ctx->shard_oid,
+                 (unsigned long long) ctx->applied_part_lsn,
+                 (unsigned long long) bound);
+
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, ctx->shard_oid);
 
     BuildParwalIndex(ctx, ctx->applied_part_lsn, &idx);
+
+    REPLAY_TRACE("TRACE Run: 索引 %d 条 (files=%d)", idx.nents, idx.nfiles);
 
     while (ctx->applied_part_lsn < bound)
     {
@@ -658,7 +683,14 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
                                 (unsigned long long) expected,
                                 nb, ent->hdr.data_len)));
 
+            REPLAY_TRACE("TRACE apply: plsn=%llu rmid=%u info=0x%02X len=%u",
+                         (unsigned long long) expected,
+                         ent->hdr.rmid, ent->hdr.info, ent->hdr.data_len);
+
             ApplyDataRecord(ctx, &ent->hdr, body);
+
+            REPLAY_TRACE("TRACE apply done: plsn=%llu",
+                         (unsigned long long) expected);
         }
         else
         {

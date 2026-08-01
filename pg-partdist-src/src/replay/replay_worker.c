@@ -59,6 +59,8 @@ int  replay_naptime_ms             = 200;
 int  replay_checkpoint_interval_ms = 2000;
 int  replay_checkpoint_records     = 512;
 bool replay_trust_local_segments   = false;
+int  replay_debug_delay_ms         = 0;
+bool replay_debug_trace            = false;
 
 void
 DefineReplayGUCs(void)
@@ -86,6 +88,16 @@ DefineReplayGUCs(void)
     DefineCustomBoolVariable("pg_partdist.replay_trust_local_segments",
                              "测试模式：本地段内容即回放上界（FRD §6）",
                              NULL, &replay_trust_local_segments,
+                             false,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pg_partdist.replay_debug_delay_ms",
+                            "调试：worker 进入主循环前的等待(ms)，给 gdb attach 留窗口",
+                            NULL, &replay_debug_delay_ms,
+                            0, 0, 600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomBoolVariable("pg_partdist.replay_debug_trace",
+                             "调试：回放路径面包屑日志",
+                             NULL, &replay_debug_trace,
                              false,
                              PGC_SIGHUP, 0, NULL, NULL, NULL);
 }
@@ -488,12 +500,30 @@ ReplayWorkerMain(Datum arg)
      */
     InRecovery = true;
 
+    /*
+     * rmgr 私有恢复状态初始化（镜像 StartupXLOG）。btree/gin/gist 的 redo
+     * 入口第一件事就是 MemoryContextSwitchTo(opCtx)，而 opCtx 由各自的
+     * rm_startup 创建 —— 不调它，btree_redo 会把 CurrentMemoryContext 切成
+     * NULL，下一个 palloc 即段错误（实测：heap 记录正常、第一条 NEWROOT
+     * 必崩，kern.log ip 落在 palloc）。
+     */
+    RmgrStartup();
+
     work_cxt = AllocSetContextCreate(TopMemoryContext,
                                      "shard replay work",
                                      ALLOCSET_DEFAULT_SIZES);
 
     ereport(LOG, (errmsg("pg_partdist replay worker 启动 (pid %d)",
                          MyProcPid)));
+
+    if (replay_debug_delay_ms > 0)
+    {
+        ereport(LOG, (errmsg("pg_partdist replay worker 调试等待 %d ms",
+                             replay_debug_delay_ms)));
+        (void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         replay_debug_delay_ms, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+    }
 
     while (!ShutdownRequestPending)
     {
@@ -619,6 +649,7 @@ ReplayWorkerMain(Datum arg)
         ResetLatch(MyLatch);
     }
 
+    RmgrCleanup();
     proc_exit(0);
 }
 

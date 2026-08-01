@@ -151,6 +151,11 @@ extern int  replay_naptime_ms;
 extern int  replay_checkpoint_interval_ms;
 extern int  replay_checkpoint_records;
 extern bool replay_trust_local_segments;
+extern int  replay_debug_delay_ms;
+extern bool replay_debug_trace;
+
+#define REPLAY_TRACE(...) \
+    do { if (replay_debug_trace) elog(LOG, __VA_ARGS__); } while (0)
 
 /* bgworker 入口（PGDLLEXPORT：-fvisibility=hidden 下须显式导出，
  * 否则 postmaster 侧 load_external_function 找不到符号） */
