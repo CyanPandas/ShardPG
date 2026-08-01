@@ -6,7 +6,11 @@ OBJS = \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
 	src/wal/partwal_sync.o \
+	src/wal/shard_fileset.o \
 	src/worker/demux_worker.o \
+	src/replay/shard_replay.o \
+	src/replay/replay_checkpoint.o \
+	src/replay/replay_worker.o \
 	src/raft_boundary.o
 
 EXTENSION = pg_partdist

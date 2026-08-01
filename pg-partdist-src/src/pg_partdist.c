@@ -4,6 +4,9 @@
 #include "partition_wal.h"
 #include "partwal_sync.h"
 #include "demux_worker.h"
+#include "shard_replay.h"
+
+#include "storage/bufmgr.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -272,6 +275,17 @@ _PG_init(void)
      * PartWALFlush() drains the buffer to pg_parwal at XACT_EVENT_PRE_COMMIT.
      */
     wal_insert_hook = PartWALInsert;
+
+    /*
+     * 补丁 0002 豁免钩子：物理回放副本页面携带 leader 坐标 LSN，
+     * FlushBuffer 对命中副本文件集合的页跳过 XLogFlush（FRD §8.3）。
+     * 在每个进程（含 checkpointer/bgwriter）的 _PG_init 都会装上。
+     */
+    buffer_flush_lsn_exempt_hook = PartDistFlushExemptHook;
+
+    /* Replay GUCs + launcher（FRD §7：worker 池 + 排他认领） */
+    DefineReplayGUCs();
+    RegisterReplayLauncher();
 
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();

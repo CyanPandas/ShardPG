@@ -39,10 +39,12 @@
 #include "partition_wal_header.h"
 #include "partition_wal_writer.h"
 #include "demux_worker.h"
+#include "shard_fileset.h"
 
 #include "access/heapam_xlog.h"
 #include "access/rmgr.h"
 #include "access/xact.h"
+#include "catalog/storage_xlog.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
@@ -207,6 +209,22 @@ PartWALSyncRegister(Oid partition_id, RelFileNumber relfilenode)
     LWLockRelease(PartWALCtl->lock);
 }
 
+bool
+PartWALSyncIsRegistered(RelFileNumber relfilenode)
+{
+    bool found = false;
+
+    if (PartWALRelHash == NULL || PartWALCtl == NULL)
+        return false;
+    if (!RelFileNumberIsValid(relfilenode))
+        return false;
+
+    LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+    (void) hash_search(PartWALRelHash, &relfilenode, HASH_FIND, &found);
+    LWLockRelease(PartWALCtl->lock);
+    return found;
+}
+
 /* ================================================================== */
 /* PartWALInsert -- mirrors XLogInsert()                               */
 /*                                                                     */
@@ -225,10 +243,12 @@ PartWALInsert(XLogRecPtr end_lsn,
               uint32 record_len)
 {
     int              i;
-    PartWALRelEntry *entry;
-    bool             found;
+    PartWALRelEntry *entry = NULL;
+    bool             found = false;
     PartWALSlot     *slot;
     bool             wrote_slot = false;
+    RelFileNumber    match_rfn = InvalidRelFileNumber;
+    RelFileLocator   smgr_loc;
 
     if (PartWALCtl == NULL || PartWALRelHash == NULL)
         return;
@@ -238,19 +258,50 @@ PartWALInsert(XLogRecPtr end_lsn,
         (info & ~XLR_INFO_MASK) == XLOG_HEAP_CONFIRM)
         return;
 
+    /*
+     * 无块引用路径（FRD §5.2 特判）：RM_SMGR create/truncate 不注册任何
+     * buffer，locator 在 main data 里。补丁 0001-v2 让钩子对这类记录以
+     * nblocks == 0 触发；这里在加锁前先把 locator 解析出来。
+     */
+    if (nblocks == 0)
+    {
+        if (rmid != RM_SMGR_ID ||
+            !SmgrRecordGetLocator(record_data, record_len, info, &smgr_loc))
+            return;
+    }
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
-    for (i = 0; i < nblocks; i++)
+    if (nblocks == 0)
     {
-        if (blocks[i].forkno != MAIN_FORKNUM)
-            continue;
-
         entry = (PartWALRelEntry *)
-            hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
+            hash_search(PartWALRelHash, &smgr_loc.relNumber,
                         HASH_FIND, &found);
-        if (!found)
-            continue;
+        if (found)
+            match_rfn = smgr_loc.relNumber;
+    }
+    else
+    {
+        /*
+         * fileset 化捕获（FRD §5.2）：任一 block 的 relNumber 命中反向映射
+         * 即归入该 shard 的流。不再按 forkno 过滤 —— VM/FSM fork 与主关系
+         * 同 relNumber，天然命中。
+         */
+        for (i = 0; i < nblocks; i++)
+        {
+            entry = (PartWALRelEntry *)
+                hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
+                            HASH_FIND, &found);
+            if (found)
+            {
+                match_rfn = blocks[i].rlocator.relNumber;
+                break;
+            }
+        }
+    }
 
+    if (found)
+    {
         /*
          * Write to ring buffer.  If the target slot is still valid another
          * backend's unconsumed record would be lost -- this should not happen
@@ -264,8 +315,9 @@ PartWALInsert(XLogRecPtr end_lsn,
                             PartWALCtl->write_pos)));
 
         slot->partition_id = entry->partition_id;
-        slot->relfilenode  = blocks[i].rlocator.relNumber;
+        slot->relfilenode  = match_rfn;
         slot->orig_lsn     = end_lsn;
+        slot->start_lsn    = ProcLastRecPtr;    /* 本条记录的起始 LSN */
         slot->xid          = GetCurrentTransactionIdIfAny();
         slot->rmid         = rmid;
         slot->info         = info;
@@ -284,7 +336,6 @@ PartWALInsert(XLogRecPtr end_lsn,
          * for cross-page UPDATEs that carry the same relfilenode in multiple
          * block references. */
         wrote_slot = true;
-        break;
     }
 
     LWLockRelease(PartWALCtl->lock);
@@ -332,6 +383,147 @@ PartWALInsert(XLogRecPtr end_lsn,
 }
 
 /* ================================================================== */
+/* 原始 WAL 记录字节装配                                               */
+/* ================================================================== */
+
+static void PartWALOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
+                               TimeLineID *tli_p);
+static void PartWALCloseSegment(XLogReaderState *state);
+static int  PartWALReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr,
+                            int reqLen, XLogRecPtr targetRecPtr, char *readBuf);
+
+/*
+ * AssembleRawWALRecord — 从 pg_wal 段文件按 start_lsn 装配一条记录的
+ * **原始连续字节**（跨页时剥掉后续页的页头），并按 xl_crc 校验。
+ *
+ * 为什么不能用 reader->readRecordBuf：PG16 只有**跨页**记录才装配进
+ * readRecordBuf；单页记录的 record 指针直指页缓冲(readBuf)，此时
+ * readRecordBuf 里是陈旧字节。旧 demux 崩溃恢复路径正踩此坑 —— 单页
+ * 记录写进 parwal 的 payload 是垃圾，仅因下游只校验过头部而未暴露。
+ *
+ * 返回 palloc 的缓冲（调用方负责 pfree）；失败返回 NULL。
+ * 调用前提：该 LSN 区间已 XLogFlush 落盘。
+ */
+static char *
+AssembleRawWALRecord(XLogReaderState *state, XLogRecPtr start_lsn,
+                     uint32 total_len)
+{
+    char       *buf;
+    char        pagebuf[XLOG_BLCKSZ];
+    uint32      copied = 0;
+    XLogRecPtr  cur = start_lsn;
+    pg_crc32c   crc;
+    XLogRecord *rechdr;
+
+    if (total_len < SizeOfXLogRecord)
+        return NULL;
+
+    buf = palloc(total_len);
+
+    while (copied < total_len)
+    {
+        XLogRecPtr pagestart = cur - (cur % XLOG_BLCKSZ);
+        uint32     off_in_page;
+        uint32     hdrsz;
+        uint32     avail;
+        uint32     n;
+
+        if (PartWALReadPage(state, pagestart, XLOG_BLCKSZ, cur, pagebuf) < 0)
+        {
+            pfree(buf);
+            return NULL;
+        }
+
+        hdrsz       = XLogPageHeaderSize((XLogPageHeader) pagebuf);
+        off_in_page = (uint32) (cur % XLOG_BLCKSZ);
+        if (off_in_page < hdrsz)
+            off_in_page = hdrsz;    /* 续段从页头之后开始 */
+
+        avail = XLOG_BLCKSZ - off_in_page;
+        n     = Min(avail, total_len - copied);
+        memcpy(buf + copied, pagebuf + off_in_page, n);
+        copied += n;
+        cur = pagestart + XLOG_BLCKSZ;
+    }
+
+    /* CRC 校验（与 ValidXLogRecord 同算法），装配错误在此 fail-fast */
+    rechdr = (XLogRecord *) buf;
+    INIT_CRC32C(crc);
+    COMP_CRC32C(crc, buf + SizeOfXLogRecord, total_len - SizeOfXLogRecord);
+    COMP_CRC32C(crc, buf, offsetof(XLogRecord, xl_crc));
+    FIN_CRC32C(crc);
+
+    if (!EQ_CRC32C(crc, rechdr->xl_crc))
+    {
+        ereport(WARNING,
+                (errmsg("pg_partdist: 原始 WAL 记录装配 CRC 不符 @%X/%08X",
+                        LSN_FORMAT_ARGS(start_lsn))));
+        pfree(buf);
+        return NULL;
+    }
+
+    return buf;
+}
+
+/*
+ * ReadRawWALRecordAt — 定位 + 校验 + 装配 start_lsn 处的记录。
+ * group-commit 场景下为 peer backend 的槽位补齐字节（其 pending 内容
+ * 在 peer 的私有数组里，本 backend 拿不到）。
+ */
+static bool
+ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
+                   char **out_buf, uint32 *out_len, TransactionId *out_xid)
+{
+    static XLogReaderState *raw_reader = NULL;
+    XLogRecord *record;
+    char       *errormsg = NULL;
+    char       *buf;
+
+    if (raw_reader == NULL)
+    {
+        raw_reader = XLogReaderAllocate(wal_segment_size, NULL,
+                                        XL_ROUTINE(.page_read     = PartWALReadPage,
+                                                   .segment_open  = PartWALOpenSegment,
+                                                   .segment_close = PartWALCloseSegment),
+                                        NULL);
+        if (raw_reader == NULL)
+            return false;
+    }
+
+    XLogBeginRead(raw_reader, start_lsn);
+    record = XLogReadRecord(raw_reader, &errormsg);
+    if (record == NULL)
+    {
+        ereport(WARNING,
+                (errmsg("pg_partdist: 无法读取 peer WAL 记录 @%X/%08X: %s",
+                        LSN_FORMAT_ARGS(start_lsn),
+                        errormsg ? errormsg : "(no message)")));
+        return false;
+    }
+
+    if (expect_end_lsn != InvalidXLogRecPtr &&
+        raw_reader->EndRecPtr != expect_end_lsn)
+    {
+        ereport(WARNING,
+                (errmsg("pg_partdist: peer WAL 记录端点不符 @%X/%08X "
+                        "(读到 %X/%08X, 期望 %X/%08X)",
+                        LSN_FORMAT_ARGS(start_lsn),
+                        LSN_FORMAT_ARGS(raw_reader->EndRecPtr),
+                        LSN_FORMAT_ARGS(expect_end_lsn))));
+        return false;
+    }
+
+    buf = AssembleRawWALRecord(raw_reader, start_lsn, record->xl_tot_len);
+    if (buf == NULL)
+        return false;
+
+    *out_buf = buf;
+    *out_len = record->xl_tot_len;
+    *out_xid = XLogRecGetXid(raw_reader);
+    return true;
+}
+
+/* ================================================================== */
 /* PartWALFlush -- mirrors XLogFlush(lsn)                             */
 /*                                                                     */
 /* Drains all valid ring-buffer slots with orig_lsn <= upto_lsn to    */
@@ -375,6 +567,15 @@ PartWALFlush(XLogRecPtr upto_lsn)
         partwal_my_max_lsn = InvalidXLogRecPtr;
         return;
     }
+
+    /*
+     * 先把 pg_wal 刷到 upto_lsn：group-commit 场景下我们会消费 peer backend
+     * 的槽位，其记录字节不在本 backend 的 pending 数组里，只能按 start_lsn
+     * 从 pg_wal 回读 —— 回读的前提是字节已落盘。时序不变式不受影响：
+     * 这里刷的只是数据记录（[B] 是本事务提交记录的 XLogFlush，尚未发生），
+     * [A] parwal fsync 仍然先于 [B]。
+     */
+    XLogFlush(upto_lsn);
 
     PG_TRY();
     {
@@ -423,13 +624,16 @@ PartWALFlush(XLogRecPtr upto_lsn)
 
             /*
              * Look up the WAL record body captured by PartWALInsert().
-             * Only available for this backend's own slots; group-commit
-             * slots (backend_id != MyBackendId) are written with data_len=0.
+             * 本 backend 的槽位从 pending 数组取；peer backend 的槽位
+             * （group-commit）按 start_lsn 从 pg_wal 回读 —— 流必须
+             * 自包含（data_len > 0），data_len=0 的 DATA 记录会让
+             * 物理回放断链（FRD §5/§7）。
              */
             {
-                const char    *wal_data = NULL;
-                uint32         wal_len  = 0;
-                TransactionId  wal_xid  = slot->xid;
+                const char    *wal_data  = NULL;
+                uint32         wal_len   = 0;
+                TransactionId  wal_xid   = slot->xid;
+                char          *read_buf  = NULL;
 
                 if (slot->backend_id == MyBackendId)
                 {
@@ -446,9 +650,27 @@ PartWALFlush(XLogRecPtr upto_lsn)
                     }
                 }
 
+                if (wal_data == NULL &&
+                    slot->start_lsn != InvalidXLogRecPtr)
+                {
+                    uint32        rlen = 0;
+                    TransactionId rxid = InvalidTransactionId;
+
+                    if (ReadRawWALRecordAt(slot->start_lsn, slot->orig_lsn,
+                                           &read_buf, &rlen, &rxid))
+                    {
+                        wal_data = read_buf;
+                        wal_len  = rlen;
+                        wal_xid  = rxid;
+                    }
+                }
+
                 AppendPartWALRecord(writer, slot->orig_lsn,
                                     slot->rmid, slot->info,
                                     wal_data, wal_len, wal_xid);
+
+                if (read_buf != NULL)
+                    pfree(read_buf);
 
                 /* 只登记本 backend（= 本事务）写入的分区，供末尾的复制挂钩用 */
                 if (slot->backend_id == MyBackendId)
@@ -639,14 +861,56 @@ PartWALCloseSegment(XLogReaderState *state)
 /* WAL range scan (for crash recovery only)                            */
 /* ================================================================== */
 
+/*
+ * RecordTouchesPartition — 记录是否属于该分区的物理子流。
+ *
+ * 判据与运行时捕获(PartWALInsert)一致：任一 block 的 relNumber 经
+ * shmem 反向哈希命中该 partition_id（fileset 化，覆盖索引/TOAST/VM/FSM）；
+ * 无块引用的 RM_SMGR 记录按 main data 里的 locator 特判（FRD §5.2）。
+ */
 static bool
-RecordTouchesRelfilenode(XLogReaderState *reader, RelFileNumber target_rfn)
+RecordTouchesPartition(XLogReaderState *reader, Oid partition_id)
 {
     int blk;
     int max_blk;
 
     if (!XLogRecHasAnyBlockRefs(reader))
-        return false;
+    {
+        RelFileLocator loc;
+        xl_smgr_truncate trunc;
+        xl_smgr_create   create;
+        uint8   op;
+
+        if (XLogRecGetRmid(reader) != RM_SMGR_ID)
+            return false;
+
+        op = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+        if (op == XLOG_SMGR_TRUNCATE &&
+            XLogRecGetDataLen(reader) >= sizeof(trunc))
+        {
+            memcpy(&trunc, XLogRecGetData(reader), sizeof(trunc));
+            loc = trunc.rlocator;
+        }
+        else if (op == XLOG_SMGR_CREATE &&
+                 XLogRecGetDataLen(reader) >= sizeof(create))
+        {
+            memcpy(&create, XLogRecGetData(reader), sizeof(create));
+            loc = create.rlocator;
+        }
+        else
+            return false;
+
+        {
+            PartWALRelEntry *entry;
+            bool             found;
+
+            LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+            entry = (PartWALRelEntry *)
+                hash_search(PartWALRelHash, &loc.relNumber, HASH_FIND, &found);
+            LWLockRelease(PartWALCtl->lock);
+            return found && entry->partition_id == partition_id;
+        }
+    }
 
     max_blk = XLogRecMaxBlockId(reader);
 
@@ -659,7 +923,15 @@ RecordTouchesRelfilenode(XLogReaderState *reader, RelFileNumber target_rfn)
         if (XLogRecGetBlockTagExtended(reader, (uint8) blk, &rlocator, &fork,
                                         &blkno, NULL))
         {
-            if (rlocator.relNumber == target_rfn)
+            PartWALRelEntry *entry;
+            bool             found;
+
+            LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+            entry = (PartWALRelEntry *)
+                hash_search(PartWALRelHash, &rlocator.relNumber,
+                            HASH_FIND, &found);
+            LWLockRelease(PartWALCtl->lock);
+            if (found && entry->partition_id == partition_id)
                 return true;
         }
     }
@@ -747,10 +1019,7 @@ ScanWALRangeForPartition(PartitionWALWriter *writer,
         last_read      = reader->EndRecPtr;
         records_scanned++;
 
-        if (!XLogRecHasAnyBlockRefs(reader))
-            continue;
-
-        if (!RecordTouchesRelfilenode(reader, writer->relfilenode))
+        if (!RecordTouchesPartition(reader, writer->partition_id))
             continue;
 
         rmid = XLogRecGetRmid(reader);
@@ -760,20 +1029,40 @@ ScanWALRangeForPartition(PartitionWALWriter *writer,
             (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_HEAP_CONFIRM)
             continue;
 
-        /* Skip records already written (dedup guard) */
-        if (reader->ReadRecPtr <= writer->last_wal_lsn)
+        /*
+         * Skip records already written (dedup guard).
+         * orig_lsn 语义 = end LSN（FRD §4.2），比较也用 EndRecPtr。
+         */
+        if (reader->EndRecPtr <= writer->last_wal_lsn)
             continue;
 
         PG_TRY();
         {
-            AppendPartWALRecord(writer,
-                                reader->ReadRecPtr,
-                                rmid,
-                                XLogRecGetInfo(reader),
-                                reader->readRecordBuf,
-                                record->xl_tot_len,
-                                XLogRecGetXid(reader));
-            records_written++;
+            /*
+             * 原始字节必须重新装配：readRecordBuf 仅对跨页记录有效，
+             * 单页记录的原始字节在页缓冲里（见 AssembleRawWALRecord）。
+             */
+            char *raw = AssembleRawWALRecord(reader, reader->ReadRecPtr,
+                                             record->xl_tot_len);
+
+            if (raw != NULL)
+            {
+                AppendPartWALRecord(writer,
+                                    reader->EndRecPtr,   /* end LSN, §4.2 */
+                                    rmid,
+                                    XLogRecGetInfo(reader),
+                                    raw,
+                                    record->xl_tot_len,
+                                    XLogRecGetXid(reader));
+                pfree(raw);
+                records_written++;
+            }
+            else
+                ereport(WARNING,
+                        (errmsg("pg_partdist sync: 无法装配原始记录 "
+                                "for partition %u at LSN %X/%08X",
+                                writer->partition_id,
+                                LSN_FORMAT_ARGS(reader->ReadRecPtr))));
         }
         PG_CATCH();
         {

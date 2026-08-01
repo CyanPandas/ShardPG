@@ -32,8 +32,10 @@
 #include "partwal_sync.h"
 #include "metadata_cache.h"
 #include "demux_worker.h"
+#include "shard_fileset.h"
 
 #include "access/table.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
@@ -148,7 +150,45 @@ InitPartitionWALAndRegister(Oid partition_id)
 
     rfn = GetRelFileNumberSafe(partition_id);
     if (RelFileNumberIsValid(rfn))
+    {
         PartWALSyncRegister(partition_id, rfn);
+
+        /*
+         * fileset 化捕获（FRD §5）：主堆之外，索引 / TOAST 堆 / TOAST 索引
+         * 也必须进反向映射，否则这几类记录整类漏捕获。本函数被
+         * EnsurePartWALRegistered 按 DML 频度调用，catalog 遍历用
+         * backend 本地环形缓存去重；DDL 变更后由 register_shard_fileset()
+         * SQL 函数强制刷新（会绕过该缓存）。
+         */
+        if (IsTransactionState())
+        {
+#define FILESET_SEEN_MAX 16
+            static Oid seen[FILESET_SEEN_MAX] = {0};
+            static int seen_pos = 0;
+            int        s;
+            bool       done = false;
+
+            for (s = 0; s < FILESET_SEEN_MAX; s++)
+                if (seen[s] == partition_id)
+                {
+                    done = true;
+                    break;
+                }
+
+            if (!done)
+            {
+                ShardFileSet fs;
+
+                if (BuildShardFileSet(partition_id, &fs) > 0)
+                {
+                    RegisterShardFileSet(&fs);
+                    seen[seen_pos] = partition_id;
+                    seen_pos = (seen_pos + 1) % FILESET_SEEN_MAX;
+                }
+            }
+#undef FILESET_SEEN_MAX
+        }
+    }
 }
 
 char *

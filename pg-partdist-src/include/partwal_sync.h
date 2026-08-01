@@ -56,6 +56,11 @@ typedef struct PartWALSlot
     Oid             partition_id;
     RelFileNumber   relfilenode;
     XLogRecPtr      orig_lsn;       /* end_lsn from wal_insert_hook */
+    XLogRecPtr      start_lsn;      /* 记录起始 LSN(ProcLastRecPtr)。group-commit
+                                     * 场景下本 backend 消费 peer 槽位时，其字节
+                                     * 不在本 backend 的 pending 数组里，须按此
+                                     * 起点从 pg_wal 回读 —— 否则流里出现
+                                     * data_len=0 的 DATA 记录，物理回放断链 */
     TransactionId   xid;            /* originating transaction ID */
     uint8           rmid;
     uint8           info;
@@ -90,6 +95,9 @@ extern void  PartWALSyncShmemInit(void);
 /* ------------------------------------------------------------------ */
 
 extern void  PartWALSyncRegister(Oid partition_id, RelFileNumber relfilenode);
+
+/* 探测 relfilenode 是否已注册（backend 自动注册路径的低成本去重用） */
+extern bool  PartWALSyncIsRegistered(RelFileNumber relfilenode);
 
 /* ------------------------------------------------------------------ */
 /* Per-backend WAL content capture (for full-body pg_parwal records)   */

@@ -577,3 +577,76 @@ CREATE OR REPLACE FUNCTION follower_set_applied_part_lsn(
 
 COMMENT ON FUNCTION follower_set_applied_part_lsn(OID, BIGINT) IS
     '推进 follower_partition_map.applied_part_lsn（单调不回退）。数据面 Raft 组是该列的第一个真实写入方。';
+
+-- ==================================================================
+-- R1 惰性回放（follower 物理重放）边界函数（FRD §5/§7/§10）
+-- ==================================================================
+
+-- leader 侧：构建 + 注册 + 持久化 shard 的物理文件集合（主堆/索引/TOAST）。
+-- DDL 变更 fileset 后必须重新调用（FRD §12）。返回成员数。
+CREATE OR REPLACE FUNCTION register_shard_fileset(
+    p_shard REGCLASS
+) RETURNS INTEGER LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_register_shard_fileset';
+
+COMMENT ON FUNCTION register_shard_fileset(REGCLASS) IS
+    'Leader 侧：把 shard 的全部物理文件（主堆/索引/TOAST 堆及其索引）注册进捕获反向映射并持久化，索引与 TOAST 的 WAL 记录随主堆进入同一 parwal 流。';
+
+-- fileset 导出：follower 侧 replay_set_locmap 的输入。
+CREATE OR REPLACE FUNCTION shard_fileset(
+    p_shard REGCLASS,
+    OUT role INTEGER,
+    OUT ord INTEGER,
+    OUT spc OID,
+    OUT db OID,
+    OUT relnum OID
+) RETURNS SETOF record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_fileset';
+
+COMMENT ON FUNCTION shard_fileset(REGCLASS) IS
+    '导出 shard 的物理文件集合描述（role: 0=主堆 1=索引 2=TOAST堆 3=TOAST索引；ord=同 role 内定义序）。';
+
+-- follower 侧：按 (role, ord) 把 leader fileset 与本地 shell 表配对成 loc_map，
+-- 持久化到 pg_parwal/<oid>/locmap，并登记补丁 0002 的刷脏豁免。
+CREATE OR REPLACE FUNCTION replay_set_locmap(
+    p_local_shard REGCLASS,
+    p_roles INTEGER[],
+    p_ords INTEGER[],
+    p_spcs OID[],
+    p_dbs OID[],
+    p_relnums OID[]
+) RETURNS INTEGER LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_set_locmap';
+
+COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]) IS
+    'Follower 侧：建立 leader→本地 文件号映射（loc_map）。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。';
+
+-- 启停该 shard 的物理回放（启用标记持久化，节点重启后自动恢复）。
+CREATE OR REPLACE FUNCTION replay_enable(
+    p_local_shard REGCLASS
+) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_enable';
+
+CREATE OR REPLACE FUNCTION replay_disable(
+    p_local_shard REGCLASS
+) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_disable';
+
+COMMENT ON FUNCTION replay_enable(REGCLASS) IS
+    '启用该本地 shard 副本的物理回放（前提：已 replay_set_locmap）。';
+COMMENT ON FUNCTION replay_disable(REGCLASS) IS
+    '停用该本地 shard 副本的物理回放。';
+
+-- 回放状态观测。
+CREATE OR REPLACE FUNCTION replay_status(
+    OUT shard OID,
+    OUT enabled BOOLEAN,
+    OUT claimed_by INTEGER,
+    OUT applied BIGINT,
+    OUT durable BIGINT,
+    OUT max_orig PG_LSN
+) RETURNS SETOF record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_status';
+
+COMMENT ON FUNCTION replay_status() IS
+    '各回放槽位状态：applied=worker 内存游标，durable=apply_checkpoint 落盘游标，max_orig=已应用的最大 leader end LSN。';

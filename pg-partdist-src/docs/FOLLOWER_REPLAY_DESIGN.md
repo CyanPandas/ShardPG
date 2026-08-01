@@ -37,7 +37,7 @@
 | ② | **R4 硬阻断于 R3**:promoted shard 的元组 xmin 是旧 leader 的 xid,读它必须走 §9.4 规则 3(R3 实装);R3 又阻塞于本文档外的全局 MVCC 文档 ⇒ R4 验收的"继续读写"在 R3 前不可达 | §14.2 |
 | ③ | **per-shard 常驻 bgworker 撞 `max_worker_processes`**(默认 8,实测环境即 8),而每节点 shard 数为几十~上百 ⇒ 改为 worker 池 + 轮转认领;与 pg_raft 的 `RAFT_MAX_GROUPS=32` 同形状,应统一处置 | §7、§13.10 |
 | ④ | **`EB_SKIP_EXTENSION_LOCK` 写死在 `xlogutils.c:526`,不受 `InRecovery` 控制** ⇒ "单写者"不能只写在前置条件里,必须落成排他认领锁,否则并发扩展同一文件是静默堆损坏 | §13.10 |
-| ⑤ | **`decoded` 内含指向原始 `body` 的裸指针**(FPI 镜像/block data 非深拷贝) ⇒ `body` 须存活至 `rm_redo` 返回后,禁止复用缓冲区跨记录换手 | §7.4 |
+| ⑤ | ~~decoded 内含指向 body 的裸指针~~ **实现时复核推翻**:PG16.14 `DecodeXLogRecord` 深拷贝全部载荷进 decoded 尾部空间,`body` 在 decode 返回后即可复用。**真正的陷阱在读取侧**:`readRecordBuf` 仅对跨页记录持有原始字节,取"原始记录字节"必须自行装配(旧 demux 崩溃恢复路径曾因此写入垃圾 payload,已随 R1 修复) | §7.4 |
 | ⑥ | **升主推进 WAL 位点的运维面空白**:跳过的段号成为永久空洞,影响归档连续性、`max_wal_size` 账目、级联备库 ⇒ R4 立项前须出处置结论 | §11 |
 
 另核实两处对本设计有利、v3 未提及的事实:`CreateFakeRelcacheEntry` 在 16.14 已不再
@@ -459,14 +459,17 @@ ShardReplayDataRecord(ShardReplayCtx *ctx, PartWALRecord *h, char *body)
 }
 ```
 
-> **★ 实现陷阱:`decoded` 内含指向 `body` 的裸指针,不是深拷贝。**
-> `DecodeXLogRecord` 对 block data 与 FPI 镜像走的是
-> `blk->bkp_image = ptr;` / `blk->data = ptr;`——`ptr` 在**原始 record 字节**
-> (即本函数的 `body`)上滚动,只有少量定长字段被复制进 `decoded`。因此:
-> `body` 必须存活到 `rm_redo` **返回之后**,`pfree(decoded)` 不解除这个约束。
-> 最容易踩的写法是主循环"逐条读进同一个复用缓冲区"——下一条记录读入时会覆盖上一条
-> 的 FPI 镜像。落地要求:要么每条记录的 body 独立分配(记录级 memory context,
-> `rm_redo` 后整体 reset),要么复用缓冲区的换手点严格晚于 `rm_redo` 返回。
+> **★ 缓冲区生命周期(实现复核后修正)**:PG16.14 的 `DecodeXLogRecord` 是
+> **深拷贝**——FPI 镜像、block data、main data 全部 memcpy 进 `decoded` 尾部的
+> 连续空间(`xlogreader.c`:"Copy the data of each fragment to contiguous
+> space"),`decoded` 完全自包含。因此 `body` 缓冲在 decode 返回后即可复用,
+> 主循环用单个复用缓冲区逐条读取是安全的。
+>
+> 真正的陷阱在**取原始字节**的一侧(leader 捕获/回读路径):`XLogReadRecord`
+> 之后 `readRecordBuf` 仅对**跨页**记录持有装配好的原始字节;单页记录的
+> record 指针直指页读缓冲,`readRecordBuf` 里是陈旧内容。凡需要"原始连续
+> 记录字节"(写 parwal、group-commit peer 槽位回读)必须按页自行装配并以
+> `xl_crc` 校验(实现见 `partwal_sync.c` 的 `AssembleRawWALRecord`)。
 
 注:`xl_xid` 与头部 `gxid` 内嵌的 xid **不一定相同**——子事务的记录 `xl_xid` 是
 subxid,而头部 gxid 是顶层事务的。因此第 2 步以 `xl_xid` 为键、以

@@ -2,6 +2,7 @@
 #include "metadata_cache.h"
 #include "partition_wal.h"
 #include "demux_worker.h"
+#include "shard_replay.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -46,6 +47,9 @@ pg_partdist_shmem_request_hook(void)
 
     /* Demux worker shared state */
     RequestDemuxShmem();
+
+    /* Replay 认领槽位 + 副本豁免哈希（FRD §7/§13.10/补丁 0002） */
+    RequestReplayShmem();
 }
 
 void
@@ -105,6 +109,9 @@ pg_partdist_shmem_startup_hook(void)
 
     /* Initialise Demux worker shared state */
     DemuxShmemInit();
+
+    /* Initialise replay control (claim slots + flush-exempt data) */
+    ReplayShmemInit();
 }
 
 /* ---- SPI helpers ---- */

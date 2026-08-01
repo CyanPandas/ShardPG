@@ -38,6 +38,7 @@
 #include "partition_wal_header.h"
 #include "partition_wal_writer.h"
 #include "partwal_sync.h"
+#include "shard_fileset.h"
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -290,6 +291,12 @@ DemuxCrashRecovery(void)
     TimeLineID     tli = 1;
     XLogRecPtr     flush_lsn;
 
+    /*
+     * 先从持久化 fileset 文件重建 shmem 反向映射（索引/TOAST 成员），
+     * 随后的 WAL 扫描过滤(RecordTouchesPartition)与运行时捕获才同判据。
+     */
+    LoadAllShardFileSets();
+
     flush_lsn = GetFlushRecPtr(&tli);
     if (flush_lsn == InvalidXLogRecPtr)
         return;
@@ -326,6 +333,9 @@ DemuxCrashRecovery(void)
          * Register this partition in the shmem hash so the WAL insert hook
          * can identify future WAL records for it.  Done even if no recovery
          * scan is needed (partition is up to date).
+         *
+         * 注意主堆 rfn 之外的成员（索引/TOAST）由启动时的
+         * LoadAllShardFileSets() 从持久化 fileset 文件补齐注册。
          */
         PartWALSyncRegister(partition_id, chk.relfilenode);
 

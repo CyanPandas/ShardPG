@@ -1,0 +1,65 @@
+--- a/src/backend/storage/buffer/bufmgr.c	2026-07-31 10:59:41.879794939 +0000
++++ b/src/backend/storage/buffer/bufmgr.c	2026-07-31 11:01:08.299527109 +0000
+@@ -163,6 +163,15 @@
+ int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
+ int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+ 
++/*
++ * Extension-installable hook: exempt a relation's buffers from the
++ * XLogFlush(page LSN) call in FlushBuffer (see the comment there).
++ * Consulted by every process that flushes shared buffers (backends,
++ * checkpointer, bgwriter), so implementations must rely only on state
++ * reachable from any process (e.g. shared memory) and must be cheap.
++ */
++buffer_flush_lsn_exempt_hook_type buffer_flush_lsn_exempt_hook = NULL;
++
+ /* local state for LockBufferForCleanup */
+ static BufferDesc *PinCountWaitBuf = NULL;
+ 
+@@ -3476,9 +3485,25 @@
+ 	 * happen, attempting to flush WAL through that location would fail, with
+ 	 * disastrous system-wide consequences.  To make sure that can't happen,
+ 	 * skip the flush if the buffer isn't permanent.
++	 *
++	 * buffer_flush_lsn_exempt_hook: pages of physically-replayed replica
++	 * relations carry LSNs in the *origin* server's coordinate system; the
++	 * local pg_wal has no such location and never will.  The WAL-before-data
++	 * rule is nevertheless satisfied for them: the log protecting those pages
++	 * is the replicated partition WAL, which is durable *before* the page is
++	 * modified (apply happens only after the entry is committed).  An
++	 * extension that maintains such replicas installs the hook and returns
++	 * true for exactly those relations; everything else keeps the native
++	 * XLogFlush behaviour.
+ 	 */
+ 	if (buf_state & BM_PERMANENT)
+-		XLogFlush(recptr);
++	{
++		RelFileLocator rlocator = BufTagGetRelFileLocator(&buf->tag);
++
++		if (buffer_flush_lsn_exempt_hook == NULL ||
++			!buffer_flush_lsn_exempt_hook(&rlocator))
++			XLogFlush(recptr);
++	}
+ 
+ 	/*
+ 	 * Now it's safe to write buffer to disk. Note that no one else should
+--- a/src/include/storage/bufmgr.h	2026-07-31 11:01:12.175918793 +0000
++++ b/src/include/storage/bufmgr.h	2026-07-31 11:01:25.880303537 +0000
+@@ -61,6 +61,17 @@
+ } PrefetchBufferResult;
+ 
+ /*
++ * Extension-installable hook: return true to exempt the given relation's
++ * buffers from the XLogFlush(page LSN) call in FlushBuffer.  Intended for
++ * physically-replayed replica relations whose page LSNs live in the origin
++ * server's coordinate system (see FlushBuffer).  Runs in every process that
++ * flushes shared buffers; implementations must be cheap and rely only on
++ * shared state.
++ */
++typedef bool (*buffer_flush_lsn_exempt_hook_type) (const RelFileLocator *rlocator);
++extern PGDLLIMPORT buffer_flush_lsn_exempt_hook_type buffer_flush_lsn_exempt_hook;
++
++/*
+  * Flags influencing the behaviour of ExtendBufferedRel*
+  */
+ typedef enum ExtendBufferedFlags

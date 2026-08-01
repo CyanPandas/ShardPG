@@ -1,0 +1,64 @@
+--- a/src/backend/access/transam/xloginsert.c	2026-07-31 10:59:41.826789583 +0000
++++ b/src/backend/access/transam/xloginsert.c	2026-07-31 11:00:11.519789876 +0000
+@@ -495,11 +495,21 @@
+ 	 * wal_record_copy / wal_record_len: contiguous copy of the assembled WAL
+ 	 * record bytes built inside the insertion loop (where rdt is in scope)
+ 	 * and consumed by the hook invocation below.  NULL when no hook is set or
+-	 * no block refs were registered.
++	 * the record is not hook-relevant.
++	 *
++	 * v2: in addition to records carrying block references, RM_SMGR records
++	 * are hook-relevant even though they register no buffers (smgr create/
++	 * truncate put their RelFileLocator in main data only).  Physical replica
++	 * replay must capture them or replica files silently diverge on VACUUM
++	 * tail truncation, so the hook fires for them with nblocks == 0 and the
++	 * extension parses the locator out of the record copy.
+ 	 */
+ 	char   *wal_record_copy = NULL;
+ 	uint32  wal_record_len  = 0;
+ 
++#define WAL_INSERT_HOOK_RELEVANT(rmid) \
++	(max_registered_block_id > 0 || (rmid) == RM_SMGR_ID)
++
+ 	do
+ 	{
+ 		XLogRecPtr	RedoRecPtr;
+@@ -531,7 +541,7 @@
+ 		 * any previous copy and let the next iteration rebuild it.
+ 		 */
+ 		if (EndPos != InvalidXLogRecPtr &&
+-			wal_insert_hook != NULL && max_registered_block_id > 0)
++			wal_insert_hook != NULL && WAL_INSERT_HOOK_RELEVANT(rmid))
+ 		{
+ 			XLogRecord  *rechdr    = (XLogRecord *) hdr_scratch;
+ 			uint32       total_len = rechdr->xl_tot_len;
+@@ -563,7 +573,7 @@
+ 	 * loop succeeds but before XLogResetInsertion() clears registered_buffers,
+ 	 * so the hook can inspect the block references for the just-written record.
+ 	 */
+-	if (wal_insert_hook != NULL && max_registered_block_id > 0)
++	if (wal_insert_hook != NULL && WAL_INSERT_HOOK_RELEVANT(rmid))
+ 	{
+ 		WALInsertBlockRef	hook_blocks[64]; /* generous upper bound */
+ 		int					nblocks = 0;
+@@ -580,10 +590,18 @@
+ 				nblocks++;
+ 			}
+ 		}
+-		if (nblocks > 0)
+-			wal_insert_hook(EndPos, rmid, info, hook_blocks, nblocks,
++
++		/*
++		 * v2: fire with nblocks == 0 for blockless-but-relevant records
++		 * (RM_SMGR).  Block-carrying records still require at least one
++		 * in-use block ref, preserving v1 behaviour.
++		 */
++		if (nblocks > 0 || max_registered_block_id == 0)
++			wal_insert_hook(EndPos, rmid, info,
++							nblocks > 0 ? hook_blocks : NULL, nblocks,
+ 							wal_record_copy, wal_record_len);
+ 	}
++#undef WAL_INSERT_HOOK_RELEVANT
+ 
+ 	if (wal_record_copy != NULL)
+ 		pfree(wal_record_copy);
