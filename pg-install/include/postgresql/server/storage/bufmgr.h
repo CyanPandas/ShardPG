@@ -61,6 +61,17 @@ typedef struct PrefetchBufferResult
 } PrefetchBufferResult;
 
 /*
+ * Extension-installable hook: return true to exempt the given relation's
+ * buffers from the XLogFlush(page LSN) call in FlushBuffer.  Intended for
+ * physically-replayed replica relations whose page LSNs live in the origin
+ * server's coordinate system (see FlushBuffer).  Runs in every process that
+ * flushes shared buffers; implementations must be cheap and rely only on
+ * shared state.
+ */
+typedef bool (*buffer_flush_lsn_exempt_hook_type) (const RelFileLocator *rlocator);
+extern PGDLLIMPORT buffer_flush_lsn_exempt_hook_type buffer_flush_lsn_exempt_hook;
+
+/*
  * Flags influencing the behaviour of ExtendBufferedRel*
  */
 typedef enum ExtendBufferedFlags
