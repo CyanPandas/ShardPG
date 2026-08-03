@@ -118,6 +118,33 @@ CREATE OR REPLACE FUNCTION pg_raft_report_data_leader(
 ) RETURNS bigint LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader';
 
+-- ------------------------------------------------------------------
+-- DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）
+-- ------------------------------------------------------------------
+-- 决议记录写在**协调组**（写集内按 hash(dtxid) 选出的那个分区组）的日志里；
+-- **该记录在协调组达到多数派持久化即为全局提交点**，dtx_decide 只有在那之后
+-- 才返回成功。索引表 partdist.dtx_decision 由各成员的 apply 路径维护，
+-- 因此协调组切主后新 leader 立刻可答（协调权随 Raft 选举自动转移）。
+CREATE OR REPLACE FUNCTION dtx_decide(
+    p_coord_gsid bigint,
+    p_dtxid bigint,
+    p_verdict integer,
+    p_participants bigint[] DEFAULT NULL
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_decide';
+
+COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[]) IS
+    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
+
+CREATE OR REPLACE FUNCTION dtx_status(
+    p_coord_gsid bigint,
+    p_dtxid bigint
+) RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_status';
+
+COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
+    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';
+
 COMMENT ON FUNCTION pg_raft_report_data_leader(bigint, integer, bigint, integer[]) IS
     '数据组新任 leader 的登记入口（须在 group 0 leader 上执行）：过任期栅栏后把 '
     'OP_PARTITION_PRIMARY 提进 group 0，apply 时各节点更新 partition_map 并把真实 '

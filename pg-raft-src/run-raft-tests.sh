@@ -1272,6 +1272,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_20: DTX-2PC 决议层（决议在协调组达多数派即为全局提交点）
+# 用例本体在 test/raft_20_dtx_decision.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_20 DTX 决议层"
+
+start_all_nodes
+sleep 2
+RAFT_20_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_20_dtx_decision.sh" 2>&1) && RAFT_20_RC=0 || RAFT_20_RC=$?
+echo "$RAFT_20_OUT" | sed 's/^/    /'
+if [[ "$RAFT_20_RC" -eq 0 ]]; then
+  ok "raft_20_dtx_decision"
+else
+  bad "raft_20_dtx_decision($(echo "$RAFT_20_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

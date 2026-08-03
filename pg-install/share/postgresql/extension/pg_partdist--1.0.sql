@@ -594,6 +594,31 @@ CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
 COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGINT, INTEGER, BIGINT[]) IS
     '在本节点该分区的 parwal 流追加一条 DTX 记录并 fsync，返回分配到的 partition_lsn。participants 仅 DECISION(kind=2) 记录携带。';
 
+-- ------------------------------------------------------------------
+-- DTX-2PC 决议索引表（DTX_2PC_DESIGN.md §6.2）
+-- ------------------------------------------------------------------
+-- DECISION 记录本身是权威（它在协调组的 Raft 日志里，达多数派即为全局提交点），
+-- 但按 dtxid 顺序扫段文件太慢。协调组的 **apply 路径**在每个组成员上维护这张
+-- 索引表，因此切主后新 leader 手里天然就有全表 —— 这正是"协调权随 Raft 选举
+-- 自动转移"的落地形态。
+--
+-- 决议槽一次性：INSERT ... ON CONFLICT (dtxid) DO NOTHING。第一条进入协调组
+-- 日志的决议获胜，后到的同 dtxid 决议被忽略（推定中止与正常提交路径可能并发，
+-- 见 §2.2）。
+CREATE TABLE IF NOT EXISTS dtx_decision (
+    dtxid         BIGINT      PRIMARY KEY,
+    coord_gsid    BIGINT      NOT NULL,
+    verdict       SMALLINT    NOT NULL,   -- 1=COMMIT, 2=ABORT
+    commit_ts     BIGINT      NOT NULL DEFAULT 0,
+    participants  BIGINT[]    NOT NULL DEFAULT '{}',
+    decided_plsn  BIGINT      NOT NULL,   -- 该 DECISION 记录的 partition_lsn
+    acked         BIGINT[]    NOT NULL DEFAULT '{}',  -- 已回执的参与组（GC 用）
+    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE dtx_decision IS
+    'DTX-2PC 决议索引：由协调组的 apply 路径在每个成员上维护，供 dtx_status 快速应答。权威仍是协调组日志里的 DECISION 记录。';
+
 CREATE OR REPLACE FUNCTION partwal_read_dtx_record(
     p_partition_id OID,
     p_partition_lsn BIGINT,

@@ -485,3 +485,36 @@ make 会静默跳过重编，install 装的还是旧 .so —— A/B 对照实验
 - 验证：9 节点全量 **50/50 全绿**（raft_01–19）。新增
   `test/raft_19_dtx_record_format.sh`（A 全新库冒烟+签名 / B leader 侧格式与载荷
   往返 / C DATA 不被误判为 DTX / D **follower 侧 flags 保真**）。
+
+### DTX-2PC 第 4a 步：决议层本体（2026-08-03）
+
+- 修改文件（pg-partdist-src 侧）：`sql/pg_partdist--1.0.sql` 新增
+  `partdist.dtx_decision` 决议索引表（+ `pg-install` 已安装副本、
+  `setup-raft.sh` 的 `CREATE TABLE IF NOT EXISTS` 补建段）。
+- 决议逻辑本体在 pg_raft 侧（`src/raft_consensus.c`：`dtx_decide` /
+  `dtx_status` / `dtx_write_decision` / apply 路径的索引维护），
+  但**它写的是 pg_partdist 的表**，因此记在本台账：
+  改 `partdist.dtx_decision` 的 schema 必须同时看 pg_raft 的 apply 路径。
+- 语义要点（`DTX_2PC_DESIGN.md` §6）：
+  - **决议记录在协调组达多数派持久化 = 全局提交点**。`dtx_decide` 内部
+    `replicate_group_upto()` 返回才算数（follower 先 fsync 再 ack，
+    故"多数派提交"严格等价于"多数派已持久化"）。
+  - 决议**必须连同它之前的增量一起复制**，不能只 propose 自己那一条 ——
+    follower 的 `AppendPartWALRecordAt` 遇到 plsn 空洞会 ERROR、拿不到 ack。
+    为此把原 `pg_raft_partwal_replicate` 里的增量循环抽成
+    `replicate_group_upto()`，prepare 路径与决议路径共用。
+  - **索引表由每个组成员的 apply 路径各自维护**（`data_entry_apply` 里按
+    `flags & DTX` 且 `info == DECISION` 判定，用 `partwal_read_dtx_record`
+    从本节点刚落盘的字节解析）。这正是"协调权随 Raft 选举自动转移"的落地点：
+    协调组切主后新 leader 手里天然有全表，`dtx_status` 立刻可答。
+  - **推定中止**：`dtx_status` 查无决议时**先写一条 ABORT 决议并达多数派再答复**，
+    否则"问的时候没有、答完之后原提交路径又把 COMMIT 写进去"会让同一事务出现
+    两个矛盾结论。写完之后决议槽被占，后到的 COMMIT 被一次性检查挡下。
+- **本步未做的部分（4b）**：内核补丁 0004 的 master 挂点、关 Citus 2PC 恢复。
+  暂缓理由见 `DTX_2PC_DESIGN.md` §9.3 的落地评估（要重编整个 PG 并连
+  `pg-install` 一起提交，风险与代价都高，而决议正确性与挂点无关）。
+  **在自动接线落地之前，跨分区事务并不会真的走 2PC** —— 别把 4a 的绿灯
+  读成"2PC 已上线"。
+- 验证：9 节点全量 **51/51 全绿**（raft_01–20）。新增 `test/raft_20_dtx_decision.sh`
+  （A 非 leader 拒绝且不留痕 / B 决议在全部成员上均在 / C 决议槽一次性 /
+  D 推定中止 / E 协调组切主后仍可查）。

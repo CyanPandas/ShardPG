@@ -643,6 +643,21 @@ if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
 PREPARE，我们无从知道 prepared 是否成功。而调整加载顺序这条路是堵死的：
 Citus 强制要求自己排 `shared_preload_libraries` 第一位。
 
+> **★ 落地评估（2026-08-03，第 4 步实施时）：本项暂缓，决议层本体先行。**
+> 1. **它只是"把决议接进客户端提交路径"的接线，不是决议本身**。决议的正确性
+>    （多数派即提交点、槽一次性、推定中止、随选举转移）已由 `dtx_decide` /
+>    `dtx_status` 独立成立并经 raft_20 验收，与挂在哪无关。
+> 2. **代价高**：`postgres-src` 在 `pg_citus_raft` 工作区是空目录（PG 源在主仓库
+>    另一份 489M 的树里），要落补丁得重新 configure + 全量编译 PG，再把整个
+>    `pg-install/`（含 `postgres` 二进制）提交——按 `468a518` 的教训，pg-install
+>    必须与 `patches/` 同步提交，否则一键复现直接断。
+> 3. **风险**：当前 `pg-install` 是已知可用的构建，替换它一旦 configure 参数不一致
+>    就会毁掉整个环境的可复现性。
+>
+> 在它落地前，`dtx_decide` 由 master 侧**显式调用**（SQL 可调），属本项目一贯的
+> "机制先行"形态；自动接线随补丁 0004 一并做。**注意：在自动接线落地之前，
+> 跨分区事务并不会真的走 2PC**，不要把 4a 的绿灯读成"2PC 已上线"。
+
 **方案：内核补丁 0004**，在 `CommitTransaction()` 里、`CallXactCallbacks(XACT_EVENT_PRE_COMMIT)`
 **之后**、`RecordTransactionCommit()` **之前**加一个 hook：
 
@@ -740,7 +755,8 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 | 1 ✅ | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + 本组复制串行化 | **raft_17 三阶段**（判据演进见 §9.1 方框）：阶段一并发终态多数派、阶段二确定性让路（长事务 P 被让路后其记录仍须达多数派——未修复构建在此必败）、阶段三失多数派提交行数=0 |
 | 2 ✅ | **成员集显式化**（§9.2）：未知成员集 fail-stop + 从控制面 `partition_map` 自动导出 + 建组入口堵源头 | **raft_18 四条判据全过**：A 未知成员集建组被拒且不留残组；B 有登记时自动导出 `cluster_size=3`；C **quorum 按真实成员数**（3 全在可写 / 停 1 个 2/3 仍可写 / 停 2 个 1/3 必败）；D 非副本节点不被拖入。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t` 建出 `cluster_size=9` 的组 |
 | 3 ✅ | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | **raft_19 四段全过**：A 全新库 `CREATE EXTENSION` + 四个函数签名；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/info 载子类型、DECISION 载荷往返；C 对 DATA 调 `read_dtx` 返回 NULL；D **两个 follower 的 flags/info 序列与 leader 完全一致** |
-| 4 | **决议层**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护；**补丁 0004** + master 挂点；关 Citus 2PC 恢复 | **raft_18**：prepare 后 decide 前杀协调者 → 全体推定中止；decide 落盘后杀协调者 → 参与者经恢复得 COMMIT |
+| 4a ✅ | **决议层本体**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护 | **raft_20 五段全过**：A 非协调组 leader 调 decide 返回 NULL 且不留痕；B **COMMIT 决议返回后 DECISION 记录与索引在协调组全部成员上均在**（= 已在多数派持久化，全局提交点）；C 决议槽一次性；D 推定中止先写 ABORT 再答复、此后 COMMIT 无法翻盘；E **协调组切主后两笔决议仍可查**（协调权随 Raft 选举自动转移，无需状态搬迁） |
+| 4b ⏸ | **补丁 0004 + master 挂点 + 关 Citus 2PC 恢复** | **暂缓**，理由见 §9.3 的落地评估 |
 | 5 | **恢复守护 + 快路径 + 只读参与者剔除** | **raft_19**：协调组切主后决议仍可查、任期栅栏拦下旧 leader 的幽灵决议；单分区事务不产生 PREPARE/DECISION 记录 |
 | 6 | **升主 in-doubt 清理**（§9.6）+ 快路径分叉归队规则（§9.5） | 与惰性回放的 promotion 路径合流验收 |
 

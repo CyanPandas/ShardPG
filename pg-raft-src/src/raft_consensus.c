@@ -70,6 +70,7 @@
  * 若 partition_wal_header.h 改了 DATA 位的取值，这里必须同步。
  */
 #define PARTWAL_FLAG_DATA  1
+#define PARTWAL_FLAG_DTX   8
 #define RAFT_HARDSTATE_MAGIC   UINT32_C(0x52484654)
 /*
  * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
@@ -203,6 +204,7 @@ static bool raft_group_ensure(int64 group_id, const int *members, int n_members,
                               RaftGroupCtx *ctx);
 static bool group_membership_known(RaftGroupCtx *ctx);
 static bool group_resolve_membership(RaftGroupCtx *ctx);
+static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
@@ -219,6 +221,8 @@ static bool data_shipping_allowed = false;
 static bool raft_persist_spi_begin(bool *spi_owned);
 static void raft_persist_spi_end(bool spi_owned);
 static int64 entry_partition_lsn(const char *payload);
+static int entry_record_flags(const char *payload);
+static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
 
 /* ---- 共享内存 ---- */
@@ -557,6 +561,42 @@ static RaftLogEntry *log_slot(RaftGroupCtx *ctx, int64 index);
  */
 #define RAFT_OP_PARWAL "OP_PARWAL"
 
+/* 从描述符 JSON 里抠出一个整型字段（不引 jsonb，简单扫描即可） */
+static int
+entry_int_field(const char *payload, const char *key, int dflt)
+{
+    const char *p;
+    int         v = 0;
+
+    if (payload == NULL)
+        return dflt;
+    p = strstr(payload, key);
+    if (p == NULL)
+        return dflt;
+    p = strchr(p, ':');
+    if (p == NULL)
+        return dflt;
+    if (sscanf(p + 1, " %d", &v) != 1)
+        return dflt;
+    return v;
+}
+
+/*
+ * 描述符里的 flags / info。旧 leader 发来的条目可能没有 "flags"，
+ * 按 DATA 处理 —— 与 PartWALRecordIsData() 对 flags==0 的兼容判定一致。
+ */
+static int
+entry_record_flags(const char *payload)
+{
+    return entry_int_field(payload, "\"flags\"", PARTWAL_FLAG_DATA);
+}
+
+static int
+entry_record_info(const char *payload)
+{
+    return entry_int_field(payload, "\"info\"", 0);
+}
+
 /* 从描述符 JSON 里抠出 partition_lsn（不引 jsonb，简单扫描即可） */
 static int64
 entry_partition_lsn(const char *payload)
@@ -759,6 +799,40 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
                      (unsigned) local_oid, (long long) plsn);
     ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
     pfree(sql.data);
+
+    /*
+     * ★ DTX DECISION 记录：每个组成员在 apply 它时各自把决议登记进本地
+     * partdist.dtx_decision（DTX_2PC_DESIGN.md §6.2）。
+     *
+     * 这正是"协调权随 Raft 选举自动转移"的落地点：协调组切主后，新 leader
+     * 手里天然就有全表，dtx_status 立刻可答，不需要任何状态搬迁。
+     *
+     * 判据用 flags 的 DTX 位 + info==DTX_DECISION(2)，与写入侧一致；
+     * 载荷由 partwal_read_dtx_record 从**本节点刚落盘的字节**解析，
+     * 因此 follower 上的登记与 leader 逐字段相同。
+     * ON CONFLICT DO NOTHING —— 决议槽一次性，重复 apply 幂等。
+     */
+    if (ok && (entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
+        entry_record_info(e->payload) == 2)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_decision"
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                         "SELECT d.dtxid, d.coord_gsid, d.verdict, d.commit_ts, "
+                         "       coalesce(d.participants, '{}'::bigint[]), %lld "
+                         "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d "
+                         "WHERE d.dtxid IS NOT NULL "
+                         "ON CONFLICT (dtxid) DO NOTHING",
+                         (long long) plsn, (unsigned) local_oid,
+                         (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
+            elog(WARNING,
+                 "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
+                 (long long) ctx->group_id, (long long) plsn);
+        pfree(sql.data);
+    }
+
     raft_persist_spi_end(spi_owned);
     return ok;
 }
@@ -3445,6 +3519,68 @@ replicate_release(RaftGroupCtx *ctx)
 }
 
 /*
+ * 把本组的 parwal 增量复制到多数派，直到（含）cur_plsn。
+ *
+ * 调用方必须已持有本组的复制认领位（replicate_claim）。任何一条未达多数派
+ * 即 ERROR —— 对 prepare 路径是"事务中止"，对决议路径是"决议未成立"。
+ *
+ * 增量下界必须在**进入临界区之后**读取：等待认领位期间，并发 backend 很可能
+ * 已经把这一段复制完了，此时循环空转即返回。
+ *
+ * 为什么决议记录也必须走"整段增量"而不是只 propose 自己那一条：follower 的
+ * AppendPartWALRecordAt 遇到 plsn 空洞会 ERROR（不留洞是物理回放的前提），
+ * 单独 propose 决议那一条会因为前面缺记录而拿不到 ack。
+ */
+static void
+replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
+{
+    int64 last;
+    int64 plsn;
+
+    last = ctx->g->last_data_plsn;
+    if (last == 0)
+    {
+        int64 p;
+
+        /* 重启后运行期游标为 0：从环内最后一条 OP_PARWAL 回推 */
+        SpinLockAcquire(&ctx->log->mutex);
+        for (p = ctx->log->last_log_index; p > 0 &&
+             p > ctx->log->last_log_index - RAFT_LOG_CAPACITY; p--)
+        {
+            RaftLogEntry e;
+
+            if (log_get_entry_locked(ctx, p, &e) &&
+                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            {
+                last = entry_partition_lsn(e.payload);
+                break;
+            }
+        }
+        SpinLockRelease(&ctx->log->mutex);
+        if (last > 0)
+            ctx->g->last_data_plsn = last;
+    }
+
+    for (plsn = last + 1; plsn <= cur_plsn; plsn++)
+    {
+        /*
+         * group_propose 只在拿到多数派 ack 之后才返回 idx > 0，而 follower
+         * 是**先 fsync 再 ack** 的（运输层加固 §11.5.1 #1/#3）——所以
+         * "返回成功" 严格等价于 "该条目已在多数派持久化"。
+         * prepare 路径靠它得到 prepared 语义；决议路径靠它得到**提交点**。
+         */
+        int64 idx = data_propose_one(ctx, plsn);
+
+        if (idx <= 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派",
+                            partition_id, (long long) ctx->group_id,
+                            (long long) plsn)));
+    }
+}
+
+/*
  * prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
  *
  * 由 pg_partdist 的 PartWALFlush 在事务 PRE_COMMIT / PRE_PREPARE 时经
@@ -3470,8 +3606,6 @@ pg_raft_partwal_replicate(Oid partition_id)
     bool         isnull;
     int64        gid = 0;
     int64        cur = 0;
-    int64        last;
-    int64        plsn;
     int          state;
 
     if (!pg_raft_raft_enabled || RaftGroups == NULL)
@@ -3554,46 +3688,7 @@ pg_raft_partwal_replicate(Oid partition_id)
          * 增量下界必须在**进入临界区之后**重新读取：等待期间并发 backend
          * 很可能已经把这一段（含本事务的记录）复制完了，此时循环空转即返回。
          */
-        last = ctx.g->last_data_plsn;
-        if (last == 0)
-        {
-            int64 p;
-
-            /* 重启后运行期游标为 0：从环内最后一条 OP_PARWAL 回推 */
-            SpinLockAcquire(&ctx.log->mutex);
-            for (p = ctx.log->last_log_index; p > 0 &&
-                 p > ctx.log->last_log_index - RAFT_LOG_CAPACITY; p--)
-            {
-                RaftLogEntry e;
-
-                if (log_get_entry_locked(&ctx, p, &e) &&
-                    strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
-                {
-                    last = entry_partition_lsn(e.payload);
-                    break;
-                }
-            }
-            SpinLockRelease(&ctx.log->mutex);
-            if (last > 0)
-                ctx.g->last_data_plsn = last;
-        }
-
-        for (plsn = last + 1; plsn <= cur; plsn++)
-        {
-            /*
-             * group_propose 只在拿到多数派 ack 之后才返回 idx > 0，而 follower
-             * 是**先 fsync 再 ack** 的（运输层加固 §11.5.1 #1/#3）——所以
-             * "返回成功" 严格等价于 "该条目已在多数派持久化"，即用户方案
-             * 阶段 1 第 4 步的 prepared 语义。不需要再单独等 commit_index。
-             */
-            int64 idx = data_propose_one(&ctx, plsn);
-
-            if (idx <= 0)
-                ereport(ERROR,
-                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                         errmsg("pg_raft: 分区 %u(组 %lld) record %lld 复制未达多数派，prepare 失败，事务中止",
-                                partition_id, (long long) gid, (long long) plsn)));
-        }
+        replicate_group_upto(&ctx, cur, partition_id);
     }
     PG_FINALLY();
     {
@@ -3649,4 +3744,294 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_INT32(dropped);
+}
+
+/* ================================================================== */
+/* DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）                              */
+/* ================================================================== */
+
+/*
+ * dtx_write_decision — 在协调组写一条 DECISION 记录并复制到多数派。
+ *
+ * **这是全局提交点**：只有 replicate_group_upto 返回（= 该记录已在协调组的
+ * 多数派 fsync 落盘）之后，事务才算正式提交（用户方案阶段 2 第 4 步）。
+ * 任何一步失败都 ERROR —— 决议不成立，调用方不得向客户端返回成功。
+ *
+ * 调用方必须已确认本节点是协调组 leader，并已持有复制认领位。
+ * 返回该 DECISION 记录的 partition_lsn。
+ */
+static int64
+dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
+                   int32 verdict, uint64 commit_ts,
+                   const char *participants_sql)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int64 plsn = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR, (errmsg("pg_raft: dtx 决议需要 SPI")));
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT partdist.partwal_append_dtx_record("
+                     "%u::oid, 2, %lld::bigint, %lld::bigint, %llu::bigint, %d, %s)",
+                     (unsigned) local_oid, (long long) dtxid,
+                     (long long) ctx->group_id, (unsigned long long) commit_ts,
+                     verdict, participants_sql);
+    if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            plsn = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (plsn <= 0)
+        ereport(ERROR,
+                (errmsg("pg_raft: 组 %lld 写 DECISION 记录失败（dtxid=%lld）",
+                        (long long) ctx->group_id, (long long) dtxid)));
+
+    /* ★ 提交点：这一步返回即"决议已在协调组多数派持久化" */
+    replicate_group_upto(ctx, plsn, (Oid) local_oid);
+
+    /*
+     * 本地索引。其余成员由 data_entry_apply 在 apply 该条目时各自写入，
+     * 因此协调组切主后新 leader 手里天然有全表（§6.2）。
+     */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_decision"
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                         "VALUES (%lld, %lld, %d, %llu, %s, %lld) "
+                         "ON CONFLICT (dtxid) DO NOTHING",
+                         (long long) dtxid, (long long) ctx->group_id, verdict,
+                         (unsigned long long) commit_ts, participants_sql,
+                         (long long) plsn);
+        (void) SPI_execute(sql.data, false, 0);
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+    }
+    return plsn;
+}
+
+/* 查已有决议；返回 verdict，0 = 尚无决议 */
+static int32
+dtx_lookup_decision(int64 dtxid)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int32 verdict = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                     (long long) dtxid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            verdict = DatumGetInt16(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return verdict;
+}
+
+/*
+ * 协调组的公共前置：解析组、确认成员集已知、确认本节点是 leader。
+ * 不是 leader 返回 false（调用方应返回 NULL，由上层按 partition_map 重新寻址）。
+ */
+static bool
+dtx_coord_ctx(int64 coord_gsid, RaftGroupCtx *ctx, int64 *local_oid)
+{
+    int state;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return false;
+    parse_peers();
+    restore_groups_if_needed();
+
+    if (!raft_group_ctx(coord_gsid, ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 协调组 %lld 在本节点不存在",
+                        (long long) coord_gsid)));
+    if (!group_resolve_membership(ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 协调组 %lld 的成员集未知，无法做决议",
+                        (long long) coord_gsid)));
+
+    restore_hard_state_if_needed(ctx);
+    restore_persistent_log_if_needed(ctx);
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    state = ctx->cons->state;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (state != RAFT_LEADER)
+        return false;
+
+    *local_oid = group_local_partition(ctx);
+    if (*local_oid <= 0)
+        ereport(ERROR,
+                (errmsg("pg_raft: 协调组 %lld 在本节点没有对应分片",
+                        (long long) coord_gsid)));
+    return true;
+}
+
+/* 把 int8[] 渲染成可嵌进 SQL 的字面量；NULL/空 → '{}'::bigint[] */
+static char *
+dtx_participants_sql(ArrayType *arr)
+{
+    StringInfoData buf;
+    Datum *elems;
+    bool  *nulls;
+    int    n = 0;
+    int    i;
+    bool   first = true;
+
+    initStringInfo(&buf);
+    appendStringInfoString(&buf, "ARRAY[");
+    if (arr != NULL)
+    {
+        deconstruct_array(arr, INT8OID, 8, true, 'd', &elems, &nulls, &n);
+        for (i = 0; i < n; i++)
+        {
+            if (nulls[i])
+                continue;
+            if (!first)
+                appendStringInfoChar(&buf, ',');
+            appendStringInfo(&buf, "%lld", (long long) DatumGetInt64(elems[i]));
+            first = false;
+        }
+    }
+    appendStringInfoString(&buf, "]::bigint[]");
+    return buf.data;
+}
+
+/*
+ * partdist.dtx_decide(coord_gsid, dtxid, verdict, participants[]) → int
+ *
+ * 在协调组 leader 上执行。返回最终生效的 verdict（1=COMMIT 2=ABORT）；
+ * 本节点不是协调组 leader 时返回 NULL —— 调用方据此按 partition_map 重新寻址。
+ *
+ * **决议槽一次性**：若该 dtxid 已有决议（例如恢复守护抢先写了 ABORT），
+ * 直接返回已有的那个，不覆盖。这是推定中止与正常提交路径并发时的收敛点。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_decide);
+
+Datum
+pg_raft_dtx_decide(PG_FUNCTION_ARGS)
+{
+    int64        coord_gsid = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    int32        verdict = PG_GETARG_INT32(2);
+    ArrayType   *parts = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    RaftGroupCtx ctx;
+    int64        local_oid = 0;
+    int32        existing;
+    char        *parts_sql;
+    uint64       commit_ts;
+
+    if (verdict != 1 && verdict != 2)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_raft: verdict 必须是 1(COMMIT) 或 2(ABORT)")));
+
+    if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
+        PG_RETURN_NULL();
+
+    existing = dtx_lookup_decision(dtxid);
+    if (existing != 0)
+        PG_RETURN_INT32(existing);
+
+    /*
+     * TSO 未建：commit_ts 先用协调者本地时钟（§9.8）。决议的原子性来自 Raft
+     * 多数派，不依赖时间戳；全局快照一致性等 R3/TSO 立项时再收紧。
+     */
+    commit_ts = (verdict == 1) ? (uint64) GetCurrentTimestamp() : 0;
+    parts_sql = dtx_participants_sql(parts);
+
+    replicate_claim(&ctx);
+    PG_TRY();
+    {
+        /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
+        existing = dtx_lookup_decision(dtxid);
+        if (existing == 0)
+            (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
+                                      commit_ts, parts_sql);
+        else
+            verdict = existing;
+    }
+    PG_FINALLY();
+    {
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+
+    pfree(parts_sql);
+    PG_RETURN_INT32(verdict);
+}
+
+/*
+ * partdist.dtx_status(coord_gsid, dtxid) → int
+ *
+ * 参与者恢复时查询决议。**推定中止**（§2.2）：查无决议时**先写一条
+ * ABORT DECISION 并达多数派**，再返回 2。
+ *
+ * 这一步不能省 —— 否则"问的时候没有、答完之后原提交路径又把 COMMIT 写进去"
+ * 会让同一事务出现两个互相矛盾的结论。先写后答之后，决议槽已被 ABORT 占住，
+ * 后到的 COMMIT 会被 dtx_decide 的一次性检查挡下。
+ *
+ * 本节点不是协调组 leader 时返回 NULL。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_status);
+
+Datum
+pg_raft_dtx_status(PG_FUNCTION_ARGS)
+{
+    int64        coord_gsid = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    RaftGroupCtx ctx;
+    int64        local_oid = 0;
+    int32        existing;
+    char        *parts_sql;
+
+    if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
+        PG_RETURN_NULL();
+
+    existing = dtx_lookup_decision(dtxid);
+    if (existing != 0)
+        PG_RETURN_INT32(existing);
+
+    parts_sql = dtx_participants_sql(NULL);
+    replicate_claim(&ctx);
+    PG_TRY();
+    {
+        existing = dtx_lookup_decision(dtxid);
+        if (existing == 0)
+        {
+            (void) dtx_write_decision(&ctx, local_oid, dtxid, 2 /* ABORT */,
+                                      0, parts_sql);
+            existing = 2;
+        }
+    }
+    PG_FINALLY();
+    {
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+
+    pfree(parts_sql);
+    PG_RETURN_INT32(existing);
 }

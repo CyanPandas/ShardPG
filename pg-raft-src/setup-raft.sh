@@ -193,6 +193,17 @@ CREATE OR REPLACE FUNCTION partdist.partwal_read_dtx_record(
     OUT commit_ts BIGINT, OUT verdict INTEGER, OUT participants BIGINT[])
     RETURNS record LANGUAGE c STRICT STABLE
     AS 'pg_partdist', 'pg_partdist_partwal_read_dtx_record';
+-- DTX-2PC 决议索引表（已装 pg_partdist 不会重跑安装脚本，这里补建）
+CREATE TABLE IF NOT EXISTS partdist.dtx_decision (
+    dtxid         BIGINT      PRIMARY KEY,
+    coord_gsid    BIGINT      NOT NULL,
+    verdict       SMALLINT    NOT NULL,
+    commit_ts     BIGINT      NOT NULL DEFAULT 0,
+    participants  BIGINT[]    NOT NULL DEFAULT '{}',
+    decided_plsn  BIGINT      NOT NULL,
+    acked         BIGINT[]    NOT NULL DEFAULT '{}',
+    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE OR REPLACE FUNCTION partdist.partwal_truncate_to(
     p_partition_id OID, p_keep_upto_part_lsn BIGINT)
     RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
