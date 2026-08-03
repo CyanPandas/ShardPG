@@ -55,6 +55,11 @@ extern void DestroyPartitionWALWriter(PartitionWALWriter *writer);
  * AppendPartWALRecord — buffer one PartWALRecord (header + raw_data bytes)
  * for the given partition.  Flushes automatically on segment boundary or
  * when buffer is full.  Updates last_partition_lsn and last_wal_lsn.
+ *
+ * gxid  由**调用方**合成（MakeGlobalXid(PartDistLocalNodeId(), xid)）：
+ *       捕获点在 XLogInsert 内部，那里不能碰目录，节点号只能等到 flush 路径
+ *       上再解析。写入器只负责把它原样落进头部。
+ * flags PARTWAL_FLAG_* 记录类别；0 与 PARTWAL_FLAG_DATA 等价（DATA 是缺省类）。
  */
 extern void AppendPartWALRecord(PartitionWALWriter *writer,
                                 XLogRecPtr orig_lsn,
@@ -62,7 +67,8 @@ extern void AppendPartWALRecord(PartitionWALWriter *writer,
                                 uint8 info,
                                 const char *raw_data,
                                 uint32 data_len,
-                                TransactionId xid);
+                                GlobalTransactionId gxid,
+                                uint8 flags);
 
 /*
  * AppendPartWALRecordAt — 按指定 partition_lsn 落盘（数据面 Raft follower 用）。
@@ -76,7 +82,8 @@ extern bool AppendPartWALRecordAt(PartitionWALWriter *writer,
                                   uint8 info,
                                   const char *raw_data,
                                   uint32 data_len,
-                                  TransactionId xid);
+                                  GlobalTransactionId gxid,
+                                  uint8 flags);
 
 /*
  * TruncatePartWALTo — 丢弃 partition_lsn > keep_upto_plsn 的记录并回退

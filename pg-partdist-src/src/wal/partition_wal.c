@@ -290,50 +290,12 @@ IsCitusShardTable(Oid relid)
     return IsCitusShardName(relname);
 }
 
-static int32
-GetLocalCitusGroupId(void)
-{
-    static int32 cached_group_id = -2;
-    Oid          oid;
-    Relation     rel;
-    SysScanDesc  scan;
-    HeapTuple    tup;
-
-    if (cached_group_id != -2)
-        return cached_group_id;
-
-    oid = get_relname_relid("pg_dist_local_group", PG_CATALOG_NAMESPACE);
-    if (!OidIsValid(oid))
-    {
-        cached_group_id = -1;
-        return -1;
-    }
-
-    PG_TRY();
-    {
-        rel  = table_open(oid, AccessShareLock);
-        scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
-        tup  = systable_getnext(scan);
-        if (HeapTupleIsValid(tup))
-        {
-            bool  isnull;
-            Datum d = heap_getattr(tup, 1, RelationGetDescr(rel), &isnull);
-            cached_group_id = isnull ? -1 : DatumGetInt32(d);
-        }
-        else
-            cached_group_id = -1;
-        systable_endscan(scan);
-        table_close(rel, AccessShareLock);
-    }
-    PG_CATCH();
-    {
-        FlushErrorState();
-        cached_group_id = -1;
-    }
-    PG_END_TRY();
-
-    return cached_group_id;
-}
+/*
+ * 本节点的 Citus group id —— 实现搬到 src/wal/global_mvcc.c，因为 gxid 的
+ * 节点号也要它。留一层薄封装是为了不改本文件既有的调用点措辞；两处若各存
+ * 一份静态缓存，group id 的解析时机不同就可能一个拿到 -1、一个拿到真值。
+ */
+#define GetLocalCitusGroupId()  PartDistCitusGroupId()
 
 typedef struct DistTableEntry
 {
@@ -747,7 +709,8 @@ pg_partdist_write_partition_wal_record(PG_FUNCTION_ARGS)
                             (uint8)(flags & 0xFF),
                             0,
                             dummy_data, 0,
-                            InvalidTransactionId);
+                            InvalidGlobalXid,
+                            PARTWAL_FLAG_DATA);
         FlushPartitionWALWriter(writer, true);
         DestroyPartitionWALWriter(writer);
     }

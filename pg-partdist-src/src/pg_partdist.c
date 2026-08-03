@@ -5,6 +5,7 @@
 #include "partwal_sync.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
+#include "global_mvcc.h"
 
 #include "storage/bufmgr.h"
 
@@ -73,15 +74,30 @@ PartWALXactCallback(XactEvent event, void *arg)
     switch (event)
     {
         case XACT_EVENT_PRE_COMMIT:
+            /* 提交已成定局 → 连同 COMMIT 标记一起落盘 */
+            PartWALFlush(InvalidXLogRecPtr, true);
+            break;
+
         case XACT_EVENT_PRE_PREPARE:
-            PartWALFlush(InvalidXLogRecPtr);
+            /*
+             * 2PC：prepared 事务还可能 ROLLBACK PREPARED，此刻不能写
+             * COMMITTED 标记（详见 partwal_sync.h 中 write_marker 的说明）。
+             * 字节照常落盘并复制 —— 物理回放本就不是事务性的，可见性由标记决定。
+             */
+            PartWALFlush(InvalidXLogRecPtr, false);
             break;
 
         case XACT_EVENT_ABORT:
             PartWALAbort();
             break;
 
+        case XACT_EVENT_PREPARE:
+            PartWALEndTxn();
+            break;
+
         case XACT_EVENT_COMMIT:
+            /* 事务真正结束：清掉"已落盘 LSN + 涉及分区"这套本地记账 */
+            PartWALEndTxn();
             if (DemuxState == NULL)
                 break;
             flush_now = GetFlushRecPtr(&tli);
@@ -248,6 +264,9 @@ _PG_init(void)
         0,
         NULL, NULL, NULL
     );
+
+    /* GUC: gxid 的来源节点号（与上面的路由层 local_node_id 不是一回事） */
+    DefineGlobalMVCCGUCs();
 
     /* Chain shared-memory hooks */
     prev_shmem_request_hook = shmem_request_hook;

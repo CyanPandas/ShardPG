@@ -127,13 +127,17 @@ lead_plsn=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${leader_o
 check "leader 已产生 parwal 记录" "$([[ "$lead_plsn" -gt 100 ]] && echo ok)" "ok"
 
 wait_caught_up() {  # wait_caught_up <fport> <期望plsn> <超时s>
-  local fp=$1 target=$2 timeout=$3 t app=0
+  # 惰性语义（L1-a 起）：armed 不等于开始回放，必须由 replay_catchup 触发。
+  # R1 的验收对象是**物理回放的结果**（页面字节、SMGR 截断、崩溃后续放），
+  # 与触发方式无关，所以这里只把"被动轮询"换成"触发 + 校验"。
+  local fp=$1 target=$2 timeout=$3 app=0
   local foid; foid=$(PSQL $fp -Atc "SELECT partdist.local_partition_for_shard(${gid})")
-  for t in $(seq 1 "$timeout"); do
-    app=$(PSQL $fp -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}" 2>/dev/null || echo 0)
-    [[ -n "$app" && "$app" -ge "$target" ]] && { echo "$app"; return 0; }
-    sleep 1
-  done
+  app=$(PSQL $fp -Atc \
+        "SELECT partdist.replay_catchup(${foid}::regclass, ${target}, $((timeout * 1000)))" \
+        2>/dev/null || echo 0)
+  [[ -n "$app" && "$app" -ge "$target" ]] && { echo "$app"; return 0; }
+  # 触发失败时回读一次游标，便于失败信息里显示实际进度
+  app=$(PSQL $fp -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}" 2>/dev/null || echo 0)
   echo "$app"; return 1
 }
 
@@ -160,7 +164,11 @@ SQL
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "UPDATE r1_replay SET v = v||'-u2' WHERE id % 5 = 0;"
 
 PSQL $f1 -q -c "SELECT partdist.replay_enable('${shard_tbl}');" >/dev/null
-sleep 1
+# 惰性语义下 worker 只在 catchup 在途时才真正 apply —— 后台触发一次长追平，
+# 制造"正在追积压"的窗口，kill -9 才打得中一个 apply 中的 worker。
+( PSQL $f1 -Atc "SELECT partdist.replay_catchup('${shard_tbl}', NULL, 180000)" >/dev/null 2>&1 ) &
+catchup_bg=$!
+sleep 3
 
 # 精确找 f1 节点的 replay worker（bgworker 的 cwd = 其数据目录）
 fdir="worker$((f1 - 5432))"
@@ -171,6 +179,7 @@ wpid=$(docker exec -u postgres $CONTAINER bash -c "
 check "找到 f1 节点的 replay worker（积压追赶中）" "$([[ -n "$wpid" ]] && echo ok)" "ok"
 docker exec -u postgres $CONTAINER kill -9 "$wpid" 2>/dev/null
 echo "  已 kill -9 worker(pid=$wpid)，节点将整体重置"
+wait "$catchup_bg" 2>/dev/null || true   # 触发连接会随节点重置一起断开
 
 wait_node_up() {  # <port> <超时s>
   local p=$1 timeout=$2 t
@@ -240,10 +249,17 @@ diff_one_follower() {  # <fport> <fdata> <标签>
       local lsz fsz
       lsz=$(DEX stat -c %s "$lpath"); fsz=$(DEX stat -c %s "$fpath")
       check "${tag} ${key}${fork:-.main} 大小一致(${lsz})" "$fsz" "$lsz"
-      local same
-      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" 2>/dev/null)
+      local same errf
+      errf=$(mktemp)
+      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" 2>"$errf")
       check "${tag} ${key}${fork:-.main} 洞外逐字节一致" \
             "$same" "IDENTICAL_OUTSIDE_HOLE"
+      # 差在哪个字段比"差了几个字节"有用得多 —— 失败时把定性明细打出来
+      if [[ "$same" != "IDENTICAL_OUTSIDE_HOLE" ]]; then
+        echo "        ---- 差异定性（leader=${lpath##*/} follower=${fpath##*/}）----"
+        sed 's/^/        /' "$errf"
+      fi
+      rm -f "$errf"
     done
   done <<< "$lead_paths"
 }

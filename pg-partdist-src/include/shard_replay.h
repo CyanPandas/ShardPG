@@ -26,6 +26,7 @@
 #include "utils/timestamp.h"
 
 #include "shard_fileset.h"
+#include "shard_xidmap.h"
 
 /* ------------------------------------------------------------------ */
 /* loc_map                                                              */
@@ -49,9 +50,19 @@ typedef struct ReplayLocMapFile
 } ReplayLocMapFile;
 
 /* ------------------------------------------------------------------ */
-/* apply checkpoint（FRD §8.4；R1: nxidmap 恒 0）                      */
+/* apply checkpoint（FRD §8.4）                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 文件布局：ShardApplyCheckpoint 头 + nxidmap 个 XidMapEntry。
+ *
+ * CRC 覆盖「头（crc 字段置 0）+ 全部条目」—— 只校验头的话，快照被截断
+ * 或写坏时头依旧自洽，重启后 xid_map 静默残缺，可见性判定就此错位。
+ *
+ * 版本号仍是 3：nxidmap == 0 时新算法与旧的"只算头"逐字节等价，
+ * 所以 R1 时代写下的 checkpoint（nxidmap 恒 0）继续有效，
+ * 不会因为升级 R2 就把所有 follower 打回从头重放。
+ */
 #define APPLY_CHECKPOINT_MAGIC     UINT32_C(0x4143484B) /* "ACHK" */
 #define APPLY_CHECKPOINT_VERSION   3
 #define APPLY_CHECKPOINT_FILENAME  "apply_checkpoint"
@@ -63,15 +74,22 @@ typedef struct ShardApplyCheckpoint
     Oid             shard_oid;
     uint64          durable_part_lsn;   /* 此游标前的效果已全部持久化        */
     XLogRecPtr      max_orig_lsn;       /* 已应用的最大 leader end LSN(§11)  */
-    uint64          max_replayed_fxid;  /* R2 起使用；R1 恒 0                */
+    uint64          max_replayed_fxid;  /* 升主水位 W 的持久化来源（§7.5）   */
     uint64          resume_segno;       /* 恢复扫描起点提示（仅优化）        */
     uint64          resume_offset;
-    uint32          nxidmap;            /* R1 恒 0                           */
-    uint32          crc;                /* 头（crc 字段置 0 计算）的 CRC32C  */
+    uint32          nxidmap;            /* 随后的 xid_map 快照条目数         */
+    uint32          crc;                /* 头(crc=0) + 全部条目的 CRC32C     */
 } ShardApplyCheckpoint;
 
-extern bool ReadApplyCheckpoint(Oid shard_oid, ShardApplyCheckpoint *out);
-extern void WriteApplyCheckpoint(const ShardApplyCheckpoint *chk);
+/*
+ * entries：读时若非 NULL，成功后 *entries 指向 palloc 出来的 nxidmap 条
+ * 快照（nxidmap == 0 时为 NULL），由调用方 pfree；写时为待落盘的快照，
+ * chk->nxidmap == 0 时可传 NULL。
+ */
+extern bool ReadApplyCheckpoint(Oid shard_oid, ShardApplyCheckpoint *out,
+                                XidMapEntry **entries);
+extern void WriteApplyCheckpoint(const ShardApplyCheckpoint *chk,
+                                 const XidMapEntry *entries);
 
 /* ------------------------------------------------------------------ */
 /* 回放上下文（FRD §7.1，R1 子集）                                     */
@@ -85,6 +103,13 @@ typedef struct ShardReplayCtx
     RelFileLocator     local_locs[SHARD_FILESET_MAX_RELS];
     XLogReaderState   *reader;             /* 仅作 DecodeXLogRecord 容器，
                                             * 读回调全 NULL                   */
+    HTAB              *xid_map;            /* local_xid → gxid（§9.2）        */
+    FullTransactionId  max_replayed_fxid;  /* 已回放的最大 xid（64 位，升主
+                                            * 水位 W 的来源）。用 64 位是因为
+                                            * 32 位跨 epoch 回卷后 "xid <= W"
+                                            * 的比较会失效，而路由表里的
+                                            * watermark 本就是 FullTransactionId,
+                                            * 两处类型必须一致（§7.1 注）     */
     uint64             applied_part_lsn;   /* 已应用游标（内存值）            */
     uint64             durable_part_lsn;   /* 已持久化游标                    */
     XLogRecPtr         max_orig_lsn;       /* 已应用的最大 leader end LSN     */
@@ -111,6 +136,31 @@ typedef struct ShardReplayCtx
  * 返回追平后的 applied_part_lsn；失败 ereport(ERROR)。
  */
 extern uint64 ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms);
+
+/* ------------------------------------------------------------------ */
+/* 事务号水位（FRD §7.5）                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 把本地 nextXid 拉到严格大于 xid。
+ *
+ * 不能直接用核内的 AdvanceNextFullTransactionIdPastXid()：varsup.c 里那个
+ * 带 Assert(AmStartupProcess() || !IsUnderPostmaster) —— 它无锁读 nextXid，
+ * 只对 startup 进程安全。replay worker 是普通 bgworker，assert 构建下直接崩。
+ * 本变体逻辑相同，但读-改-写全程持 XidGenLock。
+ *
+ * 目的：本地后续分配的 xid 必须严格大于所有回放引入的 xid，否则升主后
+ * "xid <= W → 查 xid_map"的判定会把新事务误路由到旧 leader 的命名空间。
+ */
+extern void PartDistAdvanceNextXidPastXid(TransactionId xid);
+
+/* 逐条记录登记：更新 xid_map 并抬高 ctx->max_replayed_fxid */
+extern void ShardReplayNoteXid(ShardReplayCtx *ctx, GlobalTransactionId gxid);
+
+extern void ShardReplayInitXidMap(ShardReplayCtx *ctx);
+extern void ShardReplayRestoreXidMap(ShardReplayCtx *ctx,
+                                     const XidMapEntry *ents, uint32 nents);
+extern void ShardReplayAdvanceWatermark(ShardReplayCtx *ctx);
 
 typedef uint64 (*ShardReplayCatchUpFn) (Oid shard_oid, uint64 bound,
                                         int timeout_ms);

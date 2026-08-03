@@ -27,6 +27,7 @@
 #include "shard_fileset.h"
 #include "partition_wal.h"
 #include "partition_wal_writer.h"
+#include "enhanced_clog.h"
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"       /* wal_segment_size */
@@ -663,6 +664,24 @@ ReplayWorkerMain(Datum arg)
                 MemoryContext        old;
                 ShardReplayCtx      *ctx;
                 ShardApplyCheckpoint chk;
+                XidMapEntry         *xments = NULL;
+
+                /*
+                 * 槽位换了 shard：旧 ctx 的 xid_map 必须显式销毁。它建在
+                 * TopMemoryContext 上，条目上限 100 万 × 48B ≈ 48MB —— 换几次
+                 * shard 就把 worker 撑起来了（reader / ctx 本身也一并释放）。
+                 */
+                if (ctxs[i] != NULL)
+                {
+                    if (ctxs[i]->xid_map != NULL)
+                        hash_destroy(ctxs[i]->xid_map);
+                    if (ctxs[i]->reader != NULL)
+                        XLogReaderFree(ctxs[i]->reader);
+                    if (ctxs[i]->seg_fd >= 0)
+                        CloseTransientFile(ctxs[i]->seg_fd);
+                    pfree(ctxs[i]);
+                    ctxs[i] = NULL;
+                }
 
                 old = MemoryContextSwitchTo(TopMemoryContext);
                 ctx = palloc0(sizeof(ShardReplayCtx));
@@ -686,12 +705,27 @@ ReplayWorkerMain(Datum arg)
                     continue;
                 }
 
-                if (ReadApplyCheckpoint(ctx->shard_oid, &chk))
+                ShardReplayInitXidMap(ctx);
+
+                if (ReadApplyCheckpoint(ctx->shard_oid, &chk, &xments))
                 {
-                    ctx->durable_part_lsn = chk.durable_part_lsn;
-                    ctx->applied_part_lsn = chk.durable_part_lsn;
-                    ctx->max_orig_lsn     = chk.max_orig_lsn;
+                    ctx->durable_part_lsn  = chk.durable_part_lsn;
+                    ctx->applied_part_lsn  = chk.durable_part_lsn;
+                    ctx->max_orig_lsn      = chk.max_orig_lsn;
+                    ctx->max_replayed_fxid =
+                        FullTransactionIdFromU64(chk.max_replayed_fxid);
+
+                    ShardReplayRestoreXidMap(ctx, xments, chk.nxidmap);
+                    if (xments != NULL)
+                        pfree(xments);
                 }
+
+                /*
+                 * 启动即拉齐 nextXid（§7.2 第 2 步）：本地 nextXid 只在 PG 自身
+                 * checkpoint 时随 pg_control 持久化，崩溃后可能回退到回放水位
+                 * 之前 —— 那时本地新事务会分到已经被回放占用的 xid。
+                 */
+                ShardReplayAdvanceWatermark(ctx);
 
                 ctx->reader = XLogReaderAllocate(wal_segment_size, NULL,
                                                  XL_ROUTINE(), NULL);
@@ -802,6 +836,61 @@ PG_FUNCTION_INFO_V1(pg_partdist_replay_enable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_disable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_status);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_catchup);
+PG_FUNCTION_INFO_V1(pg_partdist_gclog_status);
+
+/*
+ * gclog_status(node_id int, local_xid bigint)
+ *   → (status text, start_ts bigint, commit_ts bigint)
+ *
+ * 增强型 CLOG 的核账入口。R3 的读路径会走 C 接口，这里只是把同一份账本
+ * 暴露给验收用例 —— 「follower 上这笔事务到底判成什么了」必须能直接问出来，
+ * 否则只能靠"多读出一行"这种间接现象反推。
+ *
+ * 从未写过的槽返回 running（稀疏文件空洞语义，= 未决 = 不可见）。
+ */
+Datum
+pg_partdist_gclog_status(PG_FUNCTION_ARGS)
+{
+    int32               node_id   = PG_GETARG_INT32(0);
+    int64               local_xid = PG_GETARG_INT64(1);
+    GlobalTransactionId gxid;
+    TxnStatus           status = TXN_RUNNING;
+    uint64              start_ts = 0, commit_ts = 0;
+    TupleDesc           tupdesc;
+    Datum               values[3];
+    bool                nulls[3] = {false, false, false};
+    const char         *name;
+
+    if (node_id < 0 || node_id > PG_UINT16_MAX)
+        ereport(ERROR,
+                (errmsg("pg_partdist: node_id %d 超出 gxid 的 16 位范围", node_id)));
+    if (local_xid < 0 || (uint64) local_xid >= (UINT64CONST(1) << GXID_XID_BITS))
+        ereport(ERROR,
+                (errmsg("pg_partdist: local_xid %lld 超出 gxid 的 48 位范围",
+                        (long long) local_xid)));
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("pg_partdist: gclog_status 返回类型不是复合类型")));
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    gxid = MakeGlobalXid((uint16) node_id, (TransactionId) local_xid);
+    (void) EnhancedClogReadStatus(gxid, &status, &start_ts, &commit_ts);
+
+    switch (status)
+    {
+        case TXN_RUNNING:   name = "running";   break;
+        case TXN_PREPARED:  name = "prepared";  break;
+        case TXN_COMMITTED: name = "committed"; break;
+        case TXN_ABORTED:   name = "aborted";   break;
+        default:            name = "unknown";   break;
+    }
+
+    values[0] = CStringGetTextDatum(name);
+    values[1] = Int64GetDatum((int64) start_ts);
+    values[2] = Int64GetDatum((int64) commit_ts);
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
 
 /*
  * register_shard_fileset(regclass) → int
@@ -1071,7 +1160,8 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
         values[4] = Int64GetDatum((int64) s->applied);
         values[5] = Int64GetDatum((int64) s->target_plsn);
 
-        if (ReadApplyCheckpoint(s->shard_oid, &chk))
+        /* 只读游标，不需要 xid_map 快照 —— 传 NULL 免掉一次 palloc/pfree */
+        if (ReadApplyCheckpoint(s->shard_oid, &chk, NULL))
         {
             values[6] = Int64GetDatum((int64) chk.durable_part_lsn);
             values[7] = LSNGetDatum(chk.max_orig_lsn);

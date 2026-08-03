@@ -383,7 +383,8 @@ static RaftLogEntry *log_slot(RaftGroupCtx *ctx, int64 index);
  * 数据组的 Raft entry 是一条**描述符**（小 JSON，塞得进 RAFT_PAYLOAD_MAX），
  * 真实 WAL 字节随同一次 AppendEntries 以 bytea 参数下发：
  *
- *   {"partition_lsn":N,"orig_lsn":"X/Y","rmid":R,"info":I,"xid":T,"nbytes":B}
+ *   {"partition_lsn":N,"orig_lsn":"X/Y","rmid":R,"info":I,
+ *    "flags":F,"gxid":G,"nbytes":B}
  *
  * 这样既复用了全部既有 Raft 机制（ring / prev_log 一致性检查 / 多数派提交 /
  * raft_log 持久化），又不必把任意长的字节流塞进 768 字节的 payload。
@@ -493,9 +494,10 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
     bool           ok = false;
     int64          local_oid;
     char           orig_lsn[64];
-    long long      xid = 0;
+    long long      gxid = 0;
     int            rmid = 0;
     int            info = 0;
+    int            flags = 0;
     const char    *p;
 
     local_oid = group_local_partition(ctx);
@@ -519,9 +521,20 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
     p = strstr(payload, "\"info\"");
     if (p != NULL && (p = strchr(p, ':')) != NULL)
         (void) sscanf(p + 1, " %d", &info);
-    p = strstr(payload, "\"xid\"");
+    p = strstr(payload, "\"flags\"");
     if (p != NULL && (p = strchr(p, ':')) != NULL)
-        (void) sscanf(p + 1, " %lld", &xid);
+        (void) sscanf(p + 1, " %d", &flags);
+
+    /*
+     * "gxid" 是 parwal-3.0 的字段名；仍在途的 2.0 描述符只有 "xid"，按老语义
+     * 当作节点号 0 的 gxid 收下 —— 值域上就是 gxid 的低位，无需换算。
+     * 注意不能反过来用 strstr("\"xid\"") 兜底匹配 "gxid"：子串会误命中。
+     */
+    p = strstr(payload, "\"gxid\"");
+    if (p == NULL)
+        p = strstr(payload, ",\"xid\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %lld", &gxid);
 
     if (!raft_persist_spi_begin(&spi_owned))
         return false;
@@ -535,12 +548,12 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
      */
     appendStringInfo(&sql,
                      "SELECT partdist.partwal_follower_append("
-                     "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %lld::bigint, "
+                     "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %d, %lld::bigint, "
                      "decode(%s, 'hex'))",
                      (unsigned) local_oid,
                      (long long) entry_partition_lsn(payload),
                      quote_literal_cstr(orig_lsn),
-                     rmid, info, xid,
+                     rmid, info, flags, gxid,
                      quote_literal_cstr(data_hex != NULL ? data_hex : ""));
     ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0);
     pfree(sql.data);
@@ -2944,7 +2957,8 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     char        *orig_lsn = NULL;
     int          rmid = 0;
     int          info = 0;
-    int64        xid = 0;
+    int          flags = 0;
+    int64        gxid = 0;
     int64        nbytes = 0;
     int64        local_oid;
     int64        idx;
@@ -2961,7 +2975,7 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "SELECT orig_lsn::text, rmid, info, xid, length(data) "
+                     "SELECT orig_lsn::text, rmid, info, gxid, length(data), flags "
                      "FROM partdist.partwal_read_record(%u::oid, %lld)",
                      (unsigned) local_oid, (long long) partition_lsn);
     if (SPI_execute(sql.data, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
@@ -2976,19 +2990,26 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
                                        SPI_tuptable->tupdesc, 2, &isnull));
     info = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
                                        SPI_tuptable->tupdesc, 3, &isnull));
-    xid = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-                                      SPI_tuptable->tupdesc, 4, &isnull));
+    gxid = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+                                       SPI_tuptable->tupdesc, 4, &isnull));
     nbytes = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
                                          SPI_tuptable->tupdesc, 5, &isnull));
+    flags = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                        SPI_tuptable->tupdesc, 6, &isnull));
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 
+    /*
+     * 描述符里带的是 **gxid**（含来源节点号）与记录类别 flags：follower 落盘时
+     * 必须原样写回头部。若只传 32 位本地 xid，同一节点上两个 leader 的副本在
+     * 事务层就会撞号（FRD §9.1）。
+     */
     initStringInfo(&payload);
     appendStringInfo(&payload,
                      "{\"partition_lsn\":%lld,\"orig_lsn\":\"%s\",\"rmid\":%d,"
-                     "\"info\":%d,\"xid\":%lld,\"nbytes\":%lld}",
-                     (long long) partition_lsn, orig_lsn, rmid, info,
-                     (long long) xid, (long long) nbytes);
+                     "\"info\":%d,\"flags\":%d,\"gxid\":%lld,\"nbytes\":%lld}",
+                     (long long) partition_lsn, orig_lsn, rmid, info, flags,
+                     (long long) gxid, (long long) nbytes);
 
     idx = group_propose(ctx, RAFT_OP_PARWAL, payload.data);
 

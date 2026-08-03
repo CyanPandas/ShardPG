@@ -28,11 +28,13 @@
 #include "partition_wal.h"
 #include "partition_wal_header.h"
 #include "partition_wal_writer.h"
+#include "enhanced_clog.h"
 
 #include "access/heapam_xlog.h"
 #include "access/nbtxlog.h"
 #include "access/rmgr.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"            /* XLOG_XACT_COMMIT / XLOG_XACT_OPMASK */
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecord.h"
@@ -349,6 +351,17 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                         (unsigned long long) hdr->partition_lsn,
                         hdr->data_len, record->xl_tot_len)));
 
+    /*
+     * 登记事务号（§7.5/§9.2）。放在 skip 判断**之前**：被跳过的记录不改页面，
+     * 但它的 xid 一样是 leader 已经分配掉的 —— 水位漏掉它，本地就可能重新
+     * 分配到同一个号，升主后 "xid <= W" 的判定随即错位。
+     *
+     * 只对 version >= 3 的流有意义：2.0 记录的 gxid 是补 0 节点号的兼容值，
+     * 登进 xid_map 会把"协调节点的事务"和"未知来源"混为一谈（§4.4）。
+     */
+    if (hdr->version >= PARTWAL_RECORD_VERSION_3)
+        ShardReplayNoteXid(ctx, PartWALRecordGxid(hdr));
+
     if (ShardReplaySkippable(record->xl_rmid, record->xl_info))
         return;
 
@@ -403,6 +416,268 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 
     ctx->reader->record = NULL;
     pfree(decoded);
+}
+
+/* ================================================================== */
+/* 事务号水位与 xid_map（FRD §7.5 / §9.2）                             */
+/* ================================================================== */
+
+/*
+ * PartDistAdvanceNextXidPastXid — 把本地 nextXid 拉到严格大于 xid。
+ *
+ * 逐行对照 varsup.c 的 AdvanceNextFullTransactionIdPastXid()，只有一处不同：
+ * 核内那个版本无锁读 nextXid（带 Assert(AmStartupProcess() || !IsUnderPostmaster)
+ * 声明这只对 startup 进程安全），replay worker 是普通 bgworker，assert 构建下
+ * 直接崩。这里读-改-写全程持 XidGenLock。
+ */
+void
+PartDistAdvanceNextXidPastXid(TransactionId xid)
+{
+    FullTransactionId newNextFullXid;
+    TransactionId     next_xid;
+    uint32            epoch;
+
+    if (!TransactionIdIsNormal(xid))
+        return;
+
+    LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+
+    next_xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
+    epoch    = EpochFromFullTransactionId(ShmemVariableCache->nextXid);
+
+    if (!TransactionIdFollowsOrEquals(xid, next_xid))
+    {
+        LWLockRelease(XidGenLock);
+        return;                 /* 本地已经走在前面 */
+    }
+
+    /*
+     * 目标是 xid + 1。32 位加一回绕时 epoch 进位 —— 与核内同款判据：
+     * 新值比旧的 next_xid 小就说明绕过去了。
+     */
+    TransactionIdAdvance(xid);
+    if (xid < next_xid)
+        epoch++;
+
+    newNextFullXid = FullTransactionIdFromEpochAndXid(epoch, xid);
+    if (FullTransactionIdFollows(newNextFullXid, ShmemVariableCache->nextXid))
+        ShmemVariableCache->nextXid = newNextFullXid;
+
+    LWLockRelease(XidGenLock);
+}
+
+/*
+ * ShardReplayInitXidMap — 建空的 xid_map，并把水位的 epoch 对齐到本地。
+ *
+ * epoch 必须取本地的：leader 的 epoch 不在段流里，而这个水位存在的意义
+ * 就是和本地 nextXid 比大小，两边口径必须一致。
+ */
+void
+ShardReplayInitXidMap(ShardReplayCtx *ctx)
+{
+    HASHCTL info;
+
+    memset(&info, 0, sizeof(info));
+    info.keysize   = sizeof(TransactionId);
+    info.entrysize = sizeof(XidMapEntry);
+    info.hcxt      = TopMemoryContext;
+
+    ctx->xid_map = hash_create("pg_partdist shard xid_map", 1024, &info,
+                               HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+    LWLockAcquire(XidGenLock, LW_SHARED);
+    ctx->max_replayed_fxid =
+        FullTransactionIdFromEpochAndXid(
+            EpochFromFullTransactionId(ShmemVariableCache->nextXid),
+            FirstNormalTransactionId);
+    LWLockRelease(XidGenLock);
+}
+
+/*
+ * ShardReplayRestoreXidMap — 用 checkpoint 快照重建 xid_map。
+ */
+void
+ShardReplayRestoreXidMap(ShardReplayCtx *ctx, const XidMapEntry *ents,
+                         uint32 nents)
+{
+    uint32 i;
+
+    if (ctx->xid_map == NULL || ents == NULL || nents == 0)
+        return;
+
+    for (i = 0; i < nents; i++)
+    {
+        XidMapEntry *e;
+        bool         found;
+
+        e = (XidMapEntry *) hash_search(ctx->xid_map, &ents[i].local_xid,
+                                        HASH_ENTER, &found);
+        e->reserved = 0;
+        e->gxid     = ents[i].gxid;
+    }
+
+    ereport(DEBUG1,
+            (errmsg("shard replay: shard %u 从 checkpoint 恢复 xid_map %u 条",
+                    ctx->shard_oid, nents)));
+}
+
+/*
+ * ShardReplayAdvanceWatermark — 把本地 nextXid 拉到回放水位之上。
+ */
+void
+ShardReplayAdvanceWatermark(ShardReplayCtx *ctx)
+{
+    TransactionId xid = XidFromFullTransactionId(ctx->max_replayed_fxid);
+
+    if (TransactionIdIsNormal(xid))
+        PartDistAdvanceNextXidPastXid(xid);
+}
+
+/*
+ * ShardReplayNoteXid — 登记一个回放引入的事务号。
+ *
+ * 两件事：
+ *   1. 写 xid_map（local_xid → gxid）。同一个 local_xid 在同一分区内只会
+ *      对应一个来源节点（那是 gxid 存在的理由），重复登记是幂等的。
+ *   2. 抬高 max_replayed_fxid。折算 64 位用**本地当前 epoch** —— leader 的
+ *      epoch 不在流里，而这个水位只用于和本地 nextXid 比较，本地口径即可。
+ */
+void
+ShardReplayNoteXid(ShardReplayCtx *ctx, GlobalTransactionId gxid)
+{
+    TransactionId     local_xid = (TransactionId) GxidLocalXid(gxid);
+    XidMapEntry      *ent;
+    bool              found;
+    FullTransactionId fxid;
+
+    if (!TransactionIdIsNormal(local_xid))
+        return;                 /* 无 xid 的记录（如 VACUUM 的部分 freeze）*/
+
+    if (ctx->xid_map != NULL)
+    {
+        if (hash_get_num_entries(ctx->xid_map) >= SHARD_XIDMAP_MAX_ENTRIES)
+            ereport(ERROR,
+                    (errmsg("shard replay: shard %u 的 xid_map 条目数达到上限 %d",
+                            ctx->shard_oid, SHARD_XIDMAP_MAX_ENTRIES),
+                     errdetail("条目要等对应 xid 全部冻结后才可回收（FRD §8.4）；"
+                               "在那套账目接上之前这里硬停，不静默丢条目 —— "
+                               "丢一条就是丢一份可见性信息。")));
+
+        ent = (XidMapEntry *) hash_search(ctx->xid_map, &local_xid,
+                                          HASH_ENTER, &found);
+        ent->reserved = 0;      /* 条目会原样落盘并计入 CRC，补齐位必须确定 */
+        ent->gxid     = gxid;
+    }
+
+    /*
+     * 按本地当前 epoch 折算成 64 位（§7.1 注：32 位跨 epoch 比较会失效）。
+     *
+     * 已知局限：若 leader 的 xid 在一次追平内跨过 32 位回绕，回绕之后的
+     * local_xid 折算出的 fxid 会小于当前水位，这里就不再抬高 —— 水位停在
+     * 回绕点。要正确处理得靠冻结账目给出"当前 epoch"的可信来源，那属于
+     * R2-e（§13.5）的范围；单次追平跨 40 亿个 xid 在本项目的规模下不会发生，
+     * 先按停在回绕点处理，而不是假装折算正确。
+     */
+    fxid = FullTransactionIdFromEpochAndXid(
+               EpochFromFullTransactionId(ctx->max_replayed_fxid), local_xid);
+    if (FullTransactionIdFollows(fxid, ctx->max_replayed_fxid))
+        ctx->max_replayed_fxid = fxid;
+}
+
+/* ================================================================== */
+/* MARKER 记录应用（FRD §7.6）                                         */
+/* ================================================================== */
+
+/*
+ * ApplyMarkerRecord — 事务标记登记。
+ *
+ * R2-b 阶段只做**校验与解析**：把载荷长度、类别、子事务清单核对清楚，并把
+ * 顶层与子事务的 gxid 解出来。真正的落账（增强型 CLOG / pg_gclog 写入、
+ * xid_map 登记、max_replayed_fxid 推进）分别在 R2-c / R2-d 接上 ——
+ * 那两处只需要在下面标注的位置各插一次调用，解析逻辑不再改动。
+ *
+ * 与 DATA 的关键区别：标记记录**不碰任何页面**，因此不参与页级幂等
+ * （BLK_DONE）那套机制。重复回放的幂等性由增强型 CLOG 的"写同一状态"
+ * 天然满足（R2-d）。
+ */
+static void
+ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
+{
+    TxnMarkerPayload    *m = (TxnMarkerPayload *) body;
+    GlobalTransactionId  gxid = PartWALRecordGxid(hdr);
+    TransactionId       *subxacts;
+    uint16               origin;
+    uint8                op;
+    uint32               i;
+
+    if (hdr->version < PARTWAL_RECORD_VERSION_3)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 记录出现在 "
+                        "version=%u 的流里（2.0 无事务层语义）",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->version)));
+
+    if (hdr->data_len < sizeof(TxnMarkerPayload) ||
+        hdr->data_len != (uint32) TxnMarkerPayloadSize(m->nsubxacts))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 载荷长度不符"
+                        "（data_len=%u，nsubxacts=%u 需要 %zu）",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len, m->nsubxacts,
+                        TxnMarkerPayloadSize(m->nsubxacts))));
+
+    origin   = GxidNodeId(gxid);
+    op       = hdr->info & XLOG_XACT_OPMASK;
+    subxacts = TxnMarkerSubxacts(m);
+
+    if (op != XLOG_XACT_COMMIT && op != XLOG_XACT_ABORT)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 的 info=0x%02X "
+                        "既不是 COMMIT 也不是 ABORT",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn, hdr->info)));
+
+    REPLAY_TRACE("TRACE marker: plsn=%llu %s node=%u xid=%llu nsub=%u "
+                 "start_ts=%llu commit_ts=%llu",
+                 (unsigned long long) hdr->partition_lsn,
+                 (op == XLOG_XACT_COMMIT) ? "COMMIT" : "ABORT",
+                 origin, (unsigned long long) GxidLocalXid(gxid),
+                 m->nsubxacts,
+                 (unsigned long long) m->start_ts,
+                 (unsigned long long) m->commit_ts);
+
+    /*
+     * 顶层与全部已提交子事务都要进 xid_map / 抬高水位：子事务写下的元组
+     * 带的是**子事务自己的** xid，升主后判定这些元组的可见性同样要能
+     * 由 local_xid 反查到 gxid。
+     */
+    ShardReplayNoteXid(ctx, gxid);
+    for (i = 0; i < m->nsubxacts; i++)
+        ShardReplayNoteXid(ctx, MakeGlobalXid(origin, subxacts[i]));
+
+    /*
+     * 落账到增强型 CLOG（§7.6）。
+     *
+     * COMMIT 要写**整棵提交树** —— 顶层 + 全部已提交子事务，等价于
+     * TransactionIdCommitTree 的全局版本。被 ROLLBACK TO 掉的子事务不在
+     * m->subxacts 里，于是它的 gxid 在 gclog 中始终是全零槽 = TXN_RUNNING
+     * = 未决 = 不可见：SAVEPOINT 回滚语义由"缺席"表达，不需要额外写 ABORTED。
+     *
+     * 只写不 fsync；落盘由 apply checkpoint 前的 EnhancedClogSync() 保证
+     * （§8.4 推进协议第 2 步）。重放同一条 MARKER 会算出同样的槽内容，
+     * 幂等，崩溃恢复正是靠这一点。
+     */
+    if (op == XLOG_XACT_COMMIT)
+    {
+        EnhancedClogWriteStatus(gxid, m->start_ts, m->commit_ts, TXN_COMMITTED);
+        for (i = 0; i < m->nsubxacts; i++)
+            EnhancedClogWriteStatus(MakeGlobalXid(origin, subxacts[i]),
+                                    m->start_ts, m->commit_ts, TXN_COMMITTED);
+    }
+    else
+        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_ABORTED);
 }
 
 /* ================================================================== */
@@ -536,6 +811,8 @@ void
 ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
 {
     ShardApplyCheckpoint chk;
+    XidMapEntry         *ents = NULL;
+    uint32               nents = 0;
     int                  i;
 
     if (ctx->applied_part_lsn == ctx->durable_part_lsn)
@@ -565,7 +842,49 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
                 smgrimmedsync(reln, fork);
     }
 
+    /*
+     * §8.4 推进协议第 2 步的后半：fsync 本批标记写进增强型 CLOG 的判决。
+     *
+     * 顺序不能反 —— checkpoint 文件一旦落盘就宣告"该游标之前的效果都已持久化"。
+     * 若判决还留在 page cache 里就先写了游标，崩溃后会重放不到那批 MARKER
+     * （游标已经跨过去了），于是页面上有元组、gclog 里没有判决：一笔永久未决的
+     * 事务，既不可见也不会被回收。
+     */
+    EnhancedClogSync();
+
     REPLAY_TRACE("TRACE ckpt: flush done, writing cursor");
+
+    /*
+     * 在写游标之前把本批回放引入的 xid 拉齐到本地 nextXid（§7.5）。
+     * 顺序不能反：checkpoint 一旦落盘就宣告"该游标之前的效果都已持久化"，
+     * 而 nextXid 落后于回放水位本身就是一种未完成的效果。
+     */
+    if (TransactionIdIsNormal(XidFromFullTransactionId(ctx->max_replayed_fxid)))
+        PartDistAdvanceNextXidPastXid(
+            XidFromFullTransactionId(ctx->max_replayed_fxid));
+
+    /* xid_map 快照：与头同在一个 tmp 文件里原子落盘（§8.4） */
+    nents = (ctx->xid_map != NULL)
+            ? (uint32) hash_get_num_entries(ctx->xid_map) : 0;
+    if (nents > 0)
+    {
+        HASH_SEQ_STATUS seq;
+        XidMapEntry    *e;
+        uint32          k = 0;
+
+        ents = (XidMapEntry *) palloc(nents * sizeof(XidMapEntry));
+        hash_seq_init(&seq, ctx->xid_map);
+        while ((e = (XidMapEntry *) hash_seq_search(&seq)) != NULL)
+        {
+            if (k >= nents)     /* 理论不可达：本函数期间没有并发写入 */
+            {
+                hash_seq_term(&seq);
+                break;
+            }
+            ents[k++] = *e;
+        }
+        nents = k;
+    }
 
     memset(&chk, 0, sizeof(chk));
     chk.magic            = APPLY_CHECKPOINT_MAGIC;
@@ -573,12 +892,20 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
     chk.shard_oid        = ctx->shard_oid;
     chk.durable_part_lsn = ctx->applied_part_lsn;
     chk.max_orig_lsn     = ctx->max_orig_lsn;
-    chk.max_replayed_fxid = 0;          /* R2 起使用 */
+    chk.max_replayed_fxid = U64FromFullTransactionId(ctx->max_replayed_fxid);
     chk.resume_segno     = ctx->seg_segno;
     chk.resume_offset    = (uint64) ctx->seg_off;
-    chk.nxidmap          = 0;
+    chk.nxidmap          = nents;
 
-    WriteApplyCheckpoint(&chk);
+    WriteApplyCheckpoint(&chk, ents);
+
+    if (ents != NULL)
+        pfree(ents);
+
+    REPLAY_TRACE("TRACE ckpt: shard %u 游标=%llu 水位fxid=%llu xid_map=%u 条",
+                 ctx->shard_oid,
+                 (unsigned long long) chk.durable_part_lsn,
+                 (unsigned long long) chk.max_replayed_fxid, nents);
 
     ctx->durable_part_lsn   = ctx->applied_part_lsn;
     ctx->records_since_ckpt = 0;
@@ -683,11 +1010,28 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
                                 (unsigned long long) expected,
                                 nb, ent->hdr.data_len)));
 
-            REPLAY_TRACE("TRACE apply: plsn=%llu rmid=%u info=0x%02X len=%u",
+            REPLAY_TRACE("TRACE apply: plsn=%llu rmid=%u info=0x%02X len=%u "
+                         "flags=0x%02X",
                          (unsigned long long) expected,
-                         ent->hdr.rmid, ent->hdr.info, ent->hdr.data_len);
+                         ent->hdr.rmid, ent->hdr.info, ent->hdr.data_len,
+                         ent->hdr.flags);
 
-            ApplyDataRecord(ctx, &ent->hdr, body);
+            /*
+             * 阶段三的三路派发（FRD §7.4/§7.6/§7.7）。判据是 flags 的类别位，
+             * 不是 rmid —— MARKER 的 rmid 也是 RM_XACT_ID，但载荷是
+             * TxnMarkerPayload 而不是 XLogRecord，走 redo 会当场解码失败。
+             * 2.0 段流的 flags 恒为 0，PartWALRecordIsData 把它们归入 DATA。
+             */
+            if (PartWALRecordIsMarker(&ent->hdr))
+                ApplyMarkerRecord(ctx, &ent->hdr, body);
+            else if (PartWALRecordIsCtrl(&ent->hdr))
+                ereport(ERROR,
+                        (errmsg("shard replay: shard %u @plsn %llu 收到 CTRL "
+                                "记录，但控制记录尚未实现（FRD §7.7/§12）",
+                                ctx->shard_oid,
+                                (unsigned long long) expected)));
+            else
+                ApplyDataRecord(ctx, &ent->hdr, body);
 
             REPLAY_TRACE("TRACE apply done: plsn=%llu",
                          (unsigned long long) expected);

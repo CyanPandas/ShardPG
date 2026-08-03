@@ -56,6 +56,7 @@
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"        /* GetCurrentTimestamp（TSO 就位前的时间源）*/
 
 /*
  * 切主重构·prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
@@ -69,8 +70,6 @@
  */
 typedef void (*PartWALReplicateHook) (Oid partition_id);
 static void **partwal_replicate_hook_rv = NULL;
-
-#define PARTWAL_FLUSH_TOUCHED_MAX 64
 
 /* ================================================================== */
 /* Shmem names / tranche                                               */
@@ -102,6 +101,13 @@ static HTAB    *PartWALRelHash = NULL;
  * Passed implicitly to PartWALFlush() when upto_lsn == InvalidXLogRecPtr.
  */
 static XLogRecPtr partwal_my_max_lsn = InvalidXLogRecPtr;
+
+/*
+ * 本事务已由 PartWALFlush 落盘的最大 LSN。partwal_my_max_lsn 在 flush 结束时
+ * 就被清掉（它表达的是"还有未落盘的插入"），但中止路径需要知道"字节其实已经
+ * 在盘上了"才能决定要不要补 ABORT 标记 —— 那个事实由这个变量保存到事务结束。
+ */
+static XLogRecPtr partwal_my_flushed_lsn = InvalidXLogRecPtr;
 
 /*
  * Per-backend WAL content capture array.
@@ -136,6 +142,47 @@ FreePartWALPendingContent(void)
     }
     partwal_pending_count = 0;
     /* Keep the array allocated; capacity is reused across transactions. */
+}
+
+/*
+ * 本事务（本 backend）碰过的分区集合 —— MARKER 与复制挂钩的唯一依据。
+ *
+ * 为什么不像原来那样从 PartWALCtl->slots 里推导：group commit 下 peer backend
+ * 可能已经把本事务的槽位消费掉了，此时本 backend 的 PartWALFlush 会在
+ * "flushed_upto >= upto_lsn" 处提前返回，一个槽位都遍历不到 —— 于是既不写
+ * 提交标记、也不触发复制，而字节其实已经落在段文件里了。改成 backend 本地
+ * 记账后，谁写的盘都不影响"本事务碰了哪些分区"这个事实。
+ *
+ * 数组按需翻倍，不设静默上限：漏掉一个分区就是漏掉一份提交标记，
+ * follower 侧该事务永远不可见。
+ */
+static Oid *partwal_my_touched  = NULL;
+static int  partwal_my_ntouched = 0;
+static int  partwal_my_touched_cap = 0;
+
+static void
+PartWALNoteTouched(Oid partition_id)
+{
+    int i;
+
+    for (i = 0; i < partwal_my_ntouched; i++)
+        if (partwal_my_touched[i] == partition_id)
+            return;
+
+    if (partwal_my_ntouched >= partwal_my_touched_cap)
+    {
+        int           new_cap = (partwal_my_touched_cap == 0)
+                                ? 8 : partwal_my_touched_cap * 2;
+        MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+        partwal_my_touched = (partwal_my_touched == NULL)
+            ? palloc(new_cap * sizeof(Oid))
+            : repalloc(partwal_my_touched, new_cap * sizeof(Oid));
+        MemoryContextSwitchTo(old);
+        partwal_my_touched_cap = new_cap;
+    }
+
+    partwal_my_touched[partwal_my_ntouched++] = partition_id;
 }
 
 /* ================================================================== */
@@ -248,6 +295,7 @@ PartWALInsert(XLogRecPtr end_lsn,
     PartWALSlot     *slot;
     bool             wrote_slot = false;
     RelFileNumber    match_rfn = InvalidRelFileNumber;
+    Oid              match_partition = InvalidOid;
     RelFileLocator   smgr_loc;
 
     if (PartWALCtl == NULL || PartWALRelHash == NULL)
@@ -314,7 +362,8 @@ PartWALInsert(XLogRecPtr end_lsn,
                             "overwriting unconsumed entry",
                             PartWALCtl->write_pos)));
 
-        slot->partition_id = entry->partition_id;
+        match_partition    = entry->partition_id;
+        slot->partition_id = match_partition;
         slot->relfilenode  = match_rfn;
         slot->orig_lsn     = end_lsn;
         slot->start_lsn    = ProcLastRecPtr;    /* 本条记录的起始 LSN */
@@ -339,6 +388,14 @@ PartWALInsert(XLogRecPtr end_lsn,
     }
 
     LWLockRelease(PartWALCtl->lock);
+
+    /*
+     * 登记"本事务碰过这个分区"。放在锁外：数组是 backend 本地的，
+     * 且 palloc 不能在 LWLock 下做 —— 所以 partition_id 在锁内先取到局部变量，
+     * 不能出锁后再解 entry（shmem 哈希项出锁即不保证有效）。
+     */
+    if (wrote_slot)
+        PartWALNoteTouched(match_partition);
 
     /*
      * Capture WAL record body outside the LWLock (palloc is not safe under
@@ -533,16 +590,108 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
 
 #define PARTWAL_WRITER_CACHE_MAX  32
 
+/*
+ * PartWALBuildTxnMarker — 组装本事务的 MARKER 载荷（FRD §4.3）。
+ *
+ * 返回 palloc 出来的缓冲区，*out_len 是 24 + 4*nsubxacts。
+ * 时间戳先用本地 TimestampTz（微秒，单调够用）；TSO 就位后只换取值来源，
+ * 字段宽度与磁盘格式都不动。
+ */
+static char *
+PartWALBuildTxnMarker(bool committed, uint32 *out_len)
+{
+    TransactionId  *children = NULL;
+    int             nchildren;
+    char           *buf;
+    TxnMarkerPayload *m;
+
+    /*
+     * 已提交子事务清单。中止的子事务**不在**这个列表里 —— 于是它们的 gxid
+     * 在增强型 CLOG 中没有 COMMITTED 记录，天然不可见，SAVEPOINT 回滚语义
+     * 由"缺席"表达，不需要额外的中止清单。
+     */
+    nchildren = committed ? xactGetCommittedChildren(&children) : 0;
+    if (nchildren < 0)
+        nchildren = 0;
+
+    *out_len = (uint32) TxnMarkerPayloadSize(nchildren);
+    buf = palloc0(*out_len);        /* palloc0：reserved 与尾部必须是确定字节 */
+
+    m = (TxnMarkerPayload *) buf;
+    m->start_ts  = (uint64) GetCurrentTransactionStartTimestamp();
+    m->commit_ts = committed ? (uint64) GetCurrentTimestamp() : UINT64CONST(0);
+    m->nsubxacts = (uint32) nchildren;
+    m->reserved  = 0;
+
+    if (nchildren > 0)
+        memcpy(TxnMarkerSubxacts(m), children,
+               (size_t) nchildren * sizeof(TransactionId));
+
+    return buf;
+}
+
+/*
+ * PartWALAppendTxnMarker — 给一个分区追加一条 MARKER 记录。
+ *
+ * 调用方必须持有 PartWALCtl->lock：partition_lsn 的分配是"读盘上的
+ * last_partition_lsn 再 +1"，并发写同一分区不加锁会分配出相同编号。
+ *
+ * orig_lsn 取本事务数据记录的最大 LSN（此刻提交记录还没写进 pg_wal，
+ * 拿不到真正的提交 LSN）：既保证 orig_lsn 在流内单调，也让标记与它所
+ * 标记的数据落在同一个段文件里（段号由 orig_lsn 换算）。
+ */
+static void
+PartWALAppendTxnMarker(PartitionWALWriter *writer, XLogRecPtr orig_lsn,
+                       TransactionId xid, bool committed,
+                       const char *payload, uint32 payload_len)
+{
+    AppendPartWALRecord(writer, orig_lsn,
+                        RM_XACT_ID,
+                        committed ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT,
+                        payload, payload_len,
+                        MakeGlobalXid(PartDistLocalNodeId(), xid),
+                        PARTWAL_FLAG_MARKER);
+}
+
+/*
+ * PartWALReplicateTouched — 对本事务碰过的每个分区调一次复制挂钩。
+ *
+ * 挂钩是区间式的（[last_data_plsn+1, get_partition_flush_lsn]），所以重复调用
+ * 只会把"这次新落盘的那些记录"送走，没有重放代价。
+ */
+static void
+PartWALReplicateTouched(void)
+{
+    PartWALReplicateHook fn;
+    int                  i;
+
+    if (partwal_my_ntouched <= 0)
+        return;
+
+    if (partwal_replicate_hook_rv == NULL)
+        partwal_replicate_hook_rv =
+            find_rendezvous_variable("partdist_partwal_replicate_hook");
+    fn = (PartWALReplicateHook) *partwal_replicate_hook_rv;
+    if (fn == NULL)
+        return;
+
+    for (i = 0; i < partwal_my_ntouched; i++)
+        fn(partwal_my_touched[i]);
+}
+
 void
-PartWALFlush(XLogRecPtr upto_lsn)
+PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
 {
     int                 i;
     Oid                 cache_partition[PARTWAL_WRITER_CACHE_MAX];
     PartitionWALWriter *cache_writer[PARTWAL_WRITER_CACHE_MAX];
     int                 ncached = 0;
     XLogRecPtr          last_lsn = InvalidXLogRecPtr;
-    Oid                 touched[PARTWAL_FLUSH_TOUCHED_MAX];
-    int                 n_touched = 0;
+    XLogRecPtr          marker_lsn;
+    TransactionId       my_xid;
+    char               *marker_payload = NULL;
+    uint32              marker_len = 0;
+    bool                drain_needed = true;
 
     /* Default: flush up to the per-backend tracked max LSN */
     if (upto_lsn == InvalidXLogRecPtr)
@@ -551,22 +700,39 @@ PartWALFlush(XLogRecPtr upto_lsn)
     if (upto_lsn == InvalidXLogRecPtr)
     {
         partwal_my_max_lsn = InvalidXLogRecPtr;
+        partwal_my_ntouched = 0;
         return;  /* no inserts from this backend */
     }
+
+    /*
+     * 标记记录的 orig_lsn 取本事务数据记录的最大 LSN —— 段号由 orig_lsn 换算，
+     * 这样标记与它所标记的数据落在同一个段文件里。（此刻提交记录还没写进
+     * pg_wal，拿不到真正的提交 LSN。）ntouched > 0 时 partwal_my_max_lsn 必然
+     * 有效；退一步用 upto_lsn 兜底，避免 Invalid 把标记甩到 1 号段去。
+     */
+    marker_lsn = (partwal_my_max_lsn != InvalidXLogRecPtr)
+                 ? partwal_my_max_lsn : upto_lsn;
+    my_xid     = GetCurrentTransactionIdIfAny();
+
+    /*
+     * 载荷在加锁前组装：xactGetCommittedChildren / GetCurrentTimestamp 都不
+     * 适合放在 LWLock 下，palloc 更不行。
+     */
+    if (write_marker && partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
+        marker_payload = PartWALBuildTxnMarker(true, &marker_len);
 
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
     /*
      * Group commit: another backend already wrote our records to pg_parwal.
      * Mirrors XLogFlush()'s "already flushed" early-return check.
+     *
+     * 注意这里**不能直接 return**：字节虽然是别人写的，本事务的提交标记
+     * 和复制触发仍然得由本 backend 负责（见 partwal_my_touched 的注释）。
      */
     if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
         PartWALCtl->flushed_upto >= upto_lsn)
-    {
-        LWLockRelease(PartWALCtl->lock);
-        partwal_my_max_lsn = InvalidXLogRecPtr;
-        return;
-    }
+        drain_needed = false;
 
     /*
      * 先把 pg_wal 刷到 upto_lsn：group-commit 场景下我们会消费 peer backend
@@ -575,11 +741,12 @@ PartWALFlush(XLogRecPtr upto_lsn)
      * 这里刷的只是数据记录（[B] 是本事务提交记录的 XLogFlush，尚未发生），
      * [A] parwal fsync 仍然先于 [B]。
      */
-    XLogFlush(upto_lsn);
+    if (drain_needed)
+        XLogFlush(upto_lsn);
 
     PG_TRY();
     {
-        for (i = 0; i < PARTWAL_BUFFER_SLOTS; i++)
+        for (i = 0; drain_needed && i < PARTWAL_BUFFER_SLOTS; i++)
         {
             PartWALSlot        *slot = &PartWALCtl->slots[i];
             PartitionWALWriter *writer = NULL;
@@ -665,24 +832,20 @@ PartWALFlush(XLogRecPtr upto_lsn)
                     }
                 }
 
+                /*
+                 * gxid 在这里合成，而不是在捕获点（PartWALInsert）。
+                 * 捕获点跑在 XLogInsert 内部，那里不允许碰目录，而节点号要
+                 * 扫 pg_dist_local_group —— 所以捕获侧只记 32 位本地 xid，
+                 * 到 flush 路径（已在事务上下文里）再补上高 16 位来源节点。
+                 */
                 AppendPartWALRecord(writer, slot->orig_lsn,
                                     slot->rmid, slot->info,
-                                    wal_data, wal_len, wal_xid);
+                                    wal_data, wal_len,
+                                    MakeGlobalXid(PartDistLocalNodeId(), wal_xid),
+                                    PARTWAL_FLAG_DATA);
 
                 if (read_buf != NULL)
                     pfree(read_buf);
-
-                /* 只登记本 backend（= 本事务）写入的分区，供末尾的复制挂钩用 */
-                if (slot->backend_id == MyBackendId)
-                {
-                    int t;
-
-                    for (t = 0; t < n_touched; t++)
-                        if (touched[t] == slot->partition_id)
-                            break;
-                    if (t == n_touched && n_touched < PARTWAL_FLUSH_TOUCHED_MAX)
-                        touched[n_touched++] = slot->partition_id;
-                }
             }
             last_lsn = slot->orig_lsn;
 
@@ -733,6 +896,16 @@ PartWALFlush(XLogRecPtr upto_lsn)
     }
 
     FreePartWALPendingContent();
+    /*
+     * 记下"本事务已经有字节落盘"，并保留 partwal_my_touched 到事务真正结束。
+     *
+     * 本函数返回后事务仍可能失败 —— 最常见的就是下面那个复制挂钩自己 ERROR
+     * （凑不齐多数派 / 本节点已不是该组 leader）。那时 DATA 记录已经在段文件
+     * 里了，PartWALAbort 必须还认得出"哪些分区要补 ABORT 标记"，所以这里不能
+     * 像以前那样把状态清干净。清理改由 PartWALEndTxn() 在 COMMIT/PREPARE 事件
+     * 里做（见 pg_partdist.c 的 PartWALXactCallback）。
+     */
+    partwal_my_flushed_lsn = upto_lsn;
     partwal_my_max_lsn = InvalidXLogRecPtr;
 
     /*
@@ -740,20 +913,71 @@ PartWALFlush(XLogRecPtr upto_lsn)
      * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
      * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
      */
-    if (n_touched > 0)
-    {
-        PartWALReplicateHook fn;
+    PartWALReplicateTouched();
 
-        if (partwal_replicate_hook_rv == NULL)
-            partwal_replicate_hook_rv =
-                find_rendezvous_variable("partdist_partwal_replicate_hook");
-        fn = (PartWALReplicateHook) *partwal_replicate_hook_rv;
-        if (fn != NULL)
+    /*
+     * COMMIT 标记**在 DATA 复制成功之后**才写，因此有一条强不变式：
+     *
+     *     段流里出现某个 gxid 的 COMMIT 标记 ⇒ 该事务的 DATA 记录已经
+     *     在多数派上持久化。
+     *
+     * 反过来如果先写标记再复制，上面那个挂钩一旦 ERROR（凑不齐多数派、
+     * 本节点已不是 leader），事务中止时就得再补一条 ABORT 标记 ——
+     * 同一个 gxid 先 COMMIT 后 ABORT，回放侧只要停在两者中间就会把一个
+     * 已回滚的事务判成可见。把顺序倒过来就没有这个中间态。
+     *
+     * 代价是标记要重开一次 writer 再 fsync 一次；相对每条记录一次带 fsync
+     * 的 Raft 往返，这点开销可以忽略。
+     */
+    if (marker_payload != NULL)
+    {
+        LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+        PG_TRY();
         {
-            for (i = 0; i < n_touched; i++)
-                fn(touched[i]);
+            int t;
+
+            for (t = 0; t < partwal_my_ntouched; t++)
+            {
+                PartitionWALWriter *w;
+
+                InitPartitionWALDirectory(partwal_my_touched[t]);
+                w = CreatePartitionWALWriter(partwal_my_touched[t],
+                                             InvalidRelFileNumber);
+                if (w == NULL)
+                    ereport(ERROR,
+                            (errmsg("pg_partdist: 无法为分区 %u 打开 writer "
+                                    "写提交标记", partwal_my_touched[t])));
+                PartWALAppendTxnMarker(w, marker_lsn, my_xid, true,
+                                       marker_payload, marker_len);
+                DestroyPartitionWALWriter(w);   /* flush + fsync */
+            }
         }
+        PG_CATCH();
+        {
+            LWLockRelease(PartWALCtl->lock);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        LWLockRelease(PartWALCtl->lock);
+
+        pfree(marker_payload);
+
+        /* 再跑一次挂钩，把刚落盘的标记送出去（区间式，只会多出这一条） */
+        PartWALReplicateTouched();
     }
+}
+
+/*
+ * PartWALEndTxn — 事务真正结束（COMMIT / PREPARE 事件）后清掉本事务的记账。
+ *
+ * 与 PartWALAbort 的分工：中止路径要先补 ABORT 标记再清，所以它自己清；
+ * 这里只负责成功路径。
+ */
+void
+PartWALEndTxn(void)
+{
+    partwal_my_flushed_lsn = InvalidXLogRecPtr;
+    partwal_my_ntouched    = 0;
 }
 
 /* ================================================================== */
@@ -763,18 +987,47 @@ PartWALFlush(XLogRecPtr upto_lsn)
 void
 PartWALAbort(void)
 {
-    int i;
+    int             i;
+    XLogRecPtr      my_max;
+    TransactionId   my_xid = GetCurrentTransactionIdIfAny();
+    char           *payload = NULL;
+    uint32          payload_len = 0;
+    bool            already_on_disk;
 
-    if (partwal_my_max_lsn == InvalidXLogRecPtr)
+    /*
+     * 两条来源：还没 flush 过（partwal_my_max_lsn）、或者已经 flush 完了但
+     * 事务在其之后才失败（partwal_my_flushed_lsn，典型是复制挂钩 ERROR）。
+     */
+    my_max = (partwal_my_max_lsn != InvalidXLogRecPtr)
+             ? partwal_my_max_lsn : partwal_my_flushed_lsn;
+
+    if (my_max == InvalidXLogRecPtr)
+    {
+        PartWALEndTxn();
         return;  /* no inserts from this backend */
+    }
 
     if (PartWALCtl == NULL)
     {
         partwal_my_max_lsn = InvalidXLogRecPtr;
+        PartWALEndTxn();
         return;
     }
 
+    /* 载荷在加锁前 palloc —— 与 PartWALFlush 同理 */
+    if (partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
+        payload = PartWALBuildTxnMarker(false, &payload_len);
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+
+    /*
+     * 本事务的字节是否已经落进段文件？两种情况会：
+     *   1) group commit —— peer backend 的 PartWALFlush 顺手写掉了我们的槽位；
+     *   2) 本事务已过 PRE_COMMIT（parwal 写完），之后才失败中止。
+     * 两种情况下丢弃槽位都为时已晚：follower 已经/即将拿到这些 DATA 记录。
+     */
+    already_on_disk = (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
+                       PartWALCtl->flushed_upto >= my_max);
 
     for (i = 0; i < PARTWAL_BUFFER_SLOTS; i++)
     {
@@ -783,9 +1036,57 @@ PartWALAbort(void)
             slot->valid = false;
     }
 
+    /*
+     * 补一条 ABORT 标记（commit_ts = 0）。没有它，follower 上这批 DATA 记录
+     * 的 gxid 在增强型 CLOG 里始终是"无状态"，和"尚未提交"分不开 ——
+     * 空间无法回收，可见性判断也没有终态。
+     *
+     * 整段包在 PG_TRY 里并降级为 WARNING：这里已经在事务中止路径上，
+     * 再抛 ERROR 会升级成 FATAL。写不下去时 follower 侧只是继续把这批 xid
+     * 当作未决（不可见，语义安全），下次该分区有写入时标记会被补上复制。
+     */
+    if (already_on_disk && payload != NULL)
+    {
+        PG_TRY();
+        {
+            int     t;
+
+            for (t = 0; t < partwal_my_ntouched; t++)
+            {
+                PartitionWALWriter *w;
+
+                InitPartitionWALDirectory(partwal_my_touched[t]);
+                w = CreatePartitionWALWriter(partwal_my_touched[t],
+                                             InvalidRelFileNumber);
+                if (w == NULL)
+                    continue;
+                PartWALAppendTxnMarker(w, my_max, my_xid, false,
+                                       payload, payload_len);
+                DestroyPartitionWALWriter(w);   /* flush + fsync */
+            }
+        }
+        PG_CATCH();
+        {
+            ErrorData *ed;
+
+            MemoryContextSwitchTo(TopMemoryContext);
+            ed = CopyErrorData();
+            FlushErrorState();
+            ereport(WARNING,
+                    (errmsg("pg_partdist: 中止标记落盘失败：%s", ed->message),
+                     errdetail("该事务的 xid 在 follower 侧将保持未决状态，"
+                               "直到同分区的下一次写入把标记带过去。")));
+            FreeErrorData(ed);
+        }
+        PG_END_TRY();
+    }
+
     LWLockRelease(PartWALCtl->lock);
+    if (payload != NULL)
+        pfree(payload);
     FreePartWALPendingContent();
     partwal_my_max_lsn = InvalidXLogRecPtr;
+    PartWALEndTxn();
 }
 
 /* ================================================================== */
@@ -1053,7 +1354,9 @@ ScanWALRangeForPartition(PartitionWALWriter *writer,
                                     XLogRecGetInfo(reader),
                                     raw,
                                     record->xl_tot_len,
-                                    XLogRecGetXid(reader));
+                                    MakeGlobalXid(PartDistLocalNodeId(),
+                                                  XLogRecGetXid(reader)),
+                                    PARTWAL_FLAG_DATA);
                 pfree(raw);
                 records_written++;
             }

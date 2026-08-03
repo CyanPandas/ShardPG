@@ -526,31 +526,43 @@ COMMENT ON FUNCTION partwal_notify_primary_switch(OID, INTEGER, INTEGER, PG_LSN)
 -- 注意：同一逻辑分片在各节点的本地 OID 不同，调用方必须先用 P0 的
 -- local_partition_for_shard(global_shard_id) 把组 id 解析成本节点 partition_id。
 
+-- parwal-3.0：OUT 列表里 xid 换成 gxid（64 位全局事务标识，FRD §9.1）并新增
+-- flags（记录类别 DATA/MARKER/CTRL）。改 OUT 参数不能靠 CREATE OR REPLACE ——
+-- 输出参数参与函数签名，必须先 DROP，否则升级时留下一个仍按 2.0 列布局解析
+-- 的旧入口，而它指向的却是新 .so 的符号。
+DROP FUNCTION IF EXISTS partwal_read_record(OID, BIGINT);
+
 CREATE OR REPLACE FUNCTION partwal_read_record(
     p_partition_id OID,
     p_partition_lsn BIGINT,
     OUT orig_lsn PG_LSN,
     OUT rmid INTEGER,
     OUT info INTEGER,
-    OUT xid BIGINT,
+    OUT flags INTEGER,
+    OUT gxid BIGINT,
     OUT data BYTEA
 ) RETURNS record LANGUAGE c STRICT STABLE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_read_record';
 
 COMMENT ON FUNCTION partwal_read_record(OID, BIGINT) IS
-    'Leader 侧：按 partition_lsn 从本节点 pg_parwal 读出一条完整 parwal 记录（头部字段 + 原始 WAL 字节）。';
+    'Leader 侧：按 partition_lsn 从本节点 pg_parwal 读出一条完整 parwal 记录（头部字段 + 原始 WAL 字节）。gxid 高 16 位为来源节点号；读到 2.0 老记录时归一为节点号 0。';
 
 -- p_partition_lsn 是 **leader 指定的**编号，follower 必须按它落盘而非本地自增：
 -- 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一 pg_parwal
 -- 目录树下既有本地 demux 写入也有复制流，用本地计数器会让两个编号空间永久错位。
 -- 重传时（该编号已落过盘）幂等 no-op；出现空洞则 ERROR，由 leader 回退补齐。
+-- 同样必须先 DROP 2.0 的 7 参签名：新增参数会形成**重载**而不是替换，7 参调用
+-- 仍会命中旧入口，但它的 C 实现已经按 8 个参数取值 —— 读到的第 8 个参数是越界。
+DROP FUNCTION IF EXISTS partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
+
 CREATE OR REPLACE FUNCTION partwal_follower_append(
     p_partition_id OID,
     p_partition_lsn BIGINT,
     p_orig_lsn PG_LSN,
     p_rmid INTEGER,
     p_info INTEGER,
-    p_xid BIGINT,
+    p_flags INTEGER,
+    p_gxid BIGINT,
     p_data BYTEA
 ) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append';
@@ -563,8 +575,8 @@ CREATE OR REPLACE FUNCTION partwal_truncate_to(
 ) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_truncate_to';
 
-COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA) IS
-    'Follower 侧平凡 apply：按 leader 指定的 partition_lsn 把 parwal 记录原样落盘并 fsync，返回该 partition_lsn。重传幂等，不做 redo。';
+COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, INTEGER, BIGINT, BYTEA) IS
+    'Follower 侧平凡 apply：按 leader 指定的 partition_lsn 把 parwal 记录原样落盘并 fsync，返回该 partition_lsn。重传幂等，不做 redo。gxid/flags 原样透传，不在此处重新合成 —— 记录的来源节点是 leader，不是本节点。';
 
 COMMENT ON FUNCTION partwal_truncate_to(OID, BIGINT) IS
     'Raft 日志截断时同步截断本节点 pg_parwal：丢弃 partition_lsn > p_keep_upto_part_lsn 的记录并重写 checkpoint。';
@@ -673,3 +685,69 @@ CREATE OR REPLACE FUNCTION replay_catchup(
 
 COMMENT ON FUNCTION replay_catchup(REGCLASS, BIGINT, INTEGER) IS
     '惰性回放触发入口：把该副本追平到 p_upto（NULL=本地全部字节；升主时传 Raft commit_index），同步等待完成，返回追平后的 applied_part_lsn。';
+
+-- ==================================================================
+-- 增强型 CLOG（pg_gclog）核账入口（R2-d）
+-- ==================================================================
+
+-- 回放引入的 xid 是**别的节点**分配的，本地原生 clog 对它们一无所知
+-- （nextXid 被推进但从未 ExtendCLOG）。判决落在 pg_gclog/<node_id>/ 里，
+-- 键是 gxid = (node_id << 48) | local_xid。
+--
+-- 从未写过的槽返回 running —— 稀疏文件空洞语义，等价"未决 = 不可见"，
+-- 是安全的默认值。
+CREATE OR REPLACE FUNCTION gclog_status(
+    p_node_id INTEGER,
+    p_local_xid BIGINT,
+    OUT status TEXT,
+    OUT start_ts BIGINT,
+    OUT commit_ts BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_gclog_status';
+
+COMMENT ON FUNCTION gclog_status(INTEGER, BIGINT) IS
+    '查增强型 CLOG 里某个全局事务的判决：status = running/prepared/committed/aborted，commit_ts 在 aborted 时为 0。running 也表示"从未记过账"。';
+
+-- ==================================================================
+-- 副本壳表的冻结账目暴露面（R2-e，FRD §13 约束 5）
+-- ==================================================================
+
+-- 副本壳表的 relfrozenxid **不由本地 vacuum 维护** —— 冻结是靠回放 leader 的
+-- freeze 记录实现的，元组物理上确实被冻了，但 pg_class.relfrozenxid 这个
+-- **目录字段**没人更新，于是它的 age() 会一直涨。
+--
+-- 光靠建表时的 autovacuum_enabled=off **挡不住**：内核 autovacuum.c 里写着
+--     if (!av_enabled && !force_vacuum)   /* But ignore if at risk */
+-- 一旦 relfrozenxid 落后超过 autovacuum_freeze_max_age，force_vacuum 为真，
+-- autovacuum_enabled=off 就被忽略，副本壳表会被强制 anti-wraparound vacuum
+-- 扫到 —— 而它的元组带的是**外来节点的 xid**，本地 clog 要么没有对应页
+-- （报 "could not access status of transaction"），要么给出张冠李戴的答案。
+--
+-- 同时这些表还会把库级 datfrozenxid 压住，阻塞 clog 截断。
+--
+-- 本函数只做**观测**：把每个副本壳表离强制阈值还有多远摆出来。
+-- 真正的处置（同步 leader 的 relfrozenxid，或显式推进本地值）需要 CTRL
+-- 记录通道（§12），属后续工作。
+CREATE OR REPLACE FUNCTION replay_freeze_status(
+    OUT shard REGCLASS,
+    OUT relfrozenxid_age BIGINT,
+    OUT force_threshold BIGINT,
+    OUT pct_to_force NUMERIC,
+    OUT autovacuum_off BOOLEAN
+) RETURNS SETOF record LANGUAGE sql STABLE AS $$
+    SELECT c.oid::regclass,
+           age(c.relfrozenxid)::bigint,
+           current_setting('autovacuum_freeze_max_age')::bigint,
+           round(100.0 * age(c.relfrozenxid)
+                 / current_setting('autovacuum_freeze_max_age')::numeric, 2),
+           -- 布尔 reloption 存的是 off/false/no/0 等多种写法，别只匹配一种
+           coalesce(array_to_string(c.reloptions, ',')
+                    ~* 'autovacuum_enabled=(off|false|no|0)(,|$)', false)
+    FROM pg_class c
+    WHERE c.relkind = 'r'
+      AND EXISTS (SELECT 1 FROM partdist.replay_status() s WHERE s.shard = c.oid)
+    ORDER BY age(c.relfrozenxid) DESC
+$$;
+
+COMMENT ON FUNCTION replay_freeze_status() IS
+    '副本壳表的冻结账目暴露面（FRD §13 约束 5）：pct_to_force 达到 100% 时内核会忽略 autovacuum_enabled=off 强制回卷 vacuum，而副本元组带的是外来 xid，本地无法解释。';

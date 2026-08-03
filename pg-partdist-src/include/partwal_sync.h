@@ -150,17 +150,35 @@ extern void  PartWALInsert(XLogRecPtr end_lsn,
  * files, fsyncs, then marks them consumed.  Pass InvalidXLogRecPtr to flush
  * up to the per-backend max LSN tracked by PartWALInsert().
  *
- * Group commit: if PartWALCtl->flushed_upto >= upto_lsn, returns with no I/O.
+ * Group commit: if PartWALCtl->flushed_upto >= upto_lsn, another backend
+ * already wrote our bytes — the drain is skipped, but the commit marker and
+ * the replication hook still run (they are per-transaction, not per-slot).
+ *
+ * write_marker: 是否给本事务追加 COMMIT 标记（PARTWAL_FLAG_MARKER）。
+ *   PRE_COMMIT  → true：此刻提交已成定局，标记即事务在 follower 上的可见性依据。
+ *   PRE_PREPARE → false：2PC 的 prepared 事务还可能被 ROLLBACK PREPARED，
+ *                 此时写 COMMITTED 会让最终回滚的数据在 follower 上变可见。
+ *                 不写标记的后果只是该事务在 follower 上保持"未决 = 不可见"，
+ *                 语义安全。补齐 PREPARE/COMMIT PREPARED 两段式标记是后续工作。
  *
  * Called at XACT_EVENT_PRE_COMMIT and XACT_EVENT_PRE_PREPARE.
  */
-extern void  PartWALFlush(XLogRecPtr upto_lsn);
+extern void  PartWALFlush(XLogRecPtr upto_lsn, bool write_marker);
 
 /*
- * PartWALAbort -- invalidate this backend's pending ring-buffer slots.
- * No disk I/O.  Called at XACT_EVENT_ABORT.
+ * PartWALAbort -- invalidate this backend's pending ring-buffer slots, and —
+ * 若本事务的字节已经落进段文件（group commit，或 PRE_COMMIT 之后才失败）——
+ * 补一条 ABORT 标记，好让 follower 侧这批 xid 有终态。
+ * Called at XACT_EVENT_ABORT.
  */
 extern void  PartWALAbort(void);
+
+/*
+ * PartWALEndTxn -- 清掉本事务的 backend 本地记账（已落盘 LSN + 涉及分区）。
+ * 成功路径专用，在 XACT_EVENT_COMMIT / XACT_EVENT_PREPARE 调用；
+ * 中止路径由 PartWALAbort 自己收尾（它要先补标记再清）。
+ */
+extern void  PartWALEndTxn(void);
 
 /* ------------------------------------------------------------------ */
 /* WAL range scan (used by DemuxCrashRecovery)                         */

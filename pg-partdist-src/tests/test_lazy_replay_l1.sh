@@ -12,6 +12,14 @@
 #   V3 增量：再写一批 → 仍然零回放 → 再触发 → 再一致
 #   V4 追平中途 kill -9 → 重新触发仍能从 durable 游标续上
 #   V5 未 armed 的 shard 拒绝触发
+#
+# 全程**不做 VACUUM (FREEZE)**（R2-f 起）：页面判据已对齐内核 heap_mask()，
+# 不再依赖"冻结把 t_infomask 洗成 canonical 状态"这根拐杖。所以本用例证明的是
+# **普通事务的物理回放**结果与 leader 一致。
+#
+# 本用例**不涉及可见性**：follower 上这些元组的 xmin 是 leader 的 xid，本地原生
+# clog 对它一无所知。判决记在 pg_gclog（R2-d，见 test_txn_layer_r2.sh 的核账），
+# 读路径查它是 R3 的事。R2 的验收标准是账本正确，不是可见（FRD §14.2 R2 行）。
 set -u
 
 CONTAINER="${CONTAINER:-pg-citus-replay-container}"
@@ -59,6 +67,11 @@ catchup_to_leader() {  # catchup_to_leader <fport> <标签>
     FAIL=$((FAIL+1)); echo ""; return 1
   fi
   app=$(PSQL $fp -Atc "SELECT partdist.replay_catchup('${shard_tbl}', ${lp}, 300000)" 2>&1)
+  # 触发失败时把 psql 的原话打出来 —— 只报"实际=''"没法定位是拒绝、超时还是崩溃
+  if [[ ! "$app" =~ ^[0-9]+$ ]]; then
+    echo "  [$tag] replay_catchup 未返回数字，原话：" >&2
+    sed 's/^/      /' <<< "$app" >&2
+  fi
   echo "$app|$lp"
 }
 
@@ -184,11 +197,28 @@ sleep 3
 check "★ 第二批写入后 applied 未动（仍是 ${before_app}）" \
       "$(PSQL $f1 -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}")" "$before_app"
 
+# 这里原本是一句 VACUUM (FREEZE)（R2-f 移除）。
+#
+# 它当初的作用是**页面比对的拐杖**：freeze 记录整体重写 t_infomask，把 leader
+# 扫描期顺手设上的提示位覆盖成 canonical 状态，两侧才对得上。判据改为对齐内核
+# heap_mask() 之后（提示位、t_cid、元组对齐填充等本来就在掩码里），这根拐杖不再
+# 需要 —— 换成一批**普通事务**，V3 的增量语义不变，而且顺带证明了页面判据在
+# 不冻结的情况下同样成立。
+#
+# 注意它**不能**证明"普通事务可见"：follower 上这些元组的 xmin 是 leader 的 xid，
+# 本地原生 clog 对它一无所知，判定要走 pg_gclog（R2-d 已记账）+ 读路径（R3 未实装）。
+# R2 的验收标准是**账本正确**，不是可见（FRD §14.2 R2 行）。
+assert_group_leader "普通事务批次前" && \
+PSQL $COORD -v ON_ERROR_STOP=1 -q \
+  -c "UPDATE l1_lazy SET v = v||'-u' WHERE id % 7 = 0;"
+# 保留一次**普通** VACUUM（不带 FREEZE）：它照样建/更新 VM fork 并产生
+# XLOG_HEAP2_VISIBLE 记录，VM 的比对覆盖不丢；而 vacuum_freeze_min_age 默认
+# 5000 万，本用例的元组全都够不着，所以一个都不会被冻结 —— 拐杖去掉了，覆盖还在。
 assert_group_leader "VACUUM 前" && \
 PSQL $pport -v ON_ERROR_STOP=1 -q \
   -c "SET citus.override_table_visibility=false;" \
-  -c "VACUUM (FREEZE) ${shard_tbl};"
-assert_group_leader "VACUUM 后"
+  -c "VACUUM ${shard_tbl};"
+assert_group_leader "普通事务批次后"
 
 r=$(catchup_to_leader $f1 "V3-f1"); app1=${r%%|*}; tgt=${r##*|}
 check "第二次触发追平到 ${tgt}" \

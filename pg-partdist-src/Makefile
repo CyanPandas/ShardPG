@@ -3,11 +3,13 @@ OBJS = \
 	src/pg_partdist.o \
 	src/metadata_cache.o \
 	src/router/write_router.o \
+	src/wal/global_mvcc.o \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
 	src/wal/partwal_sync.o \
 	src/wal/shard_fileset.o \
 	src/worker/demux_worker.o \
+	src/replay/enhanced_clog.o \
 	src/replay/shard_replay.o \
 	src/replay/replay_checkpoint.o \
 	src/replay/replay_worker.o \

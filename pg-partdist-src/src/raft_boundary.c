@@ -119,7 +119,8 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
  *       Leader 侧：按 partition_lsn 从本节点 pg_parwal/<partition_id>/ 读出
  *       一条完整记录（头部字段 + 原始 WAL 字节），交给 pg_raft 打包成 entry。
  *
- *   partwal_follower_append(partition_id, orig_lsn, rmid, info, xid, data)
+ *   partwal_follower_append(partition_id, partition_lsn, orig_lsn,
+ *                           rmid, info, flags, gxid, data)
  *       Follower 侧的"平凡 apply"：把收到的记录**原样落盘**到本节点自己的
  *       pg_parwal/<partition_id>/（本节点 local_oid 与 leader 不同，由调用方
  *       用 P0 的 local_partition_for_shard(global_shard_id) 解析），fsync 后
@@ -240,8 +241,8 @@ pg_partdist_partwal_read_record(PG_FUNCTION_ARGS)
 	PartWALRecord	rec;
 	char		   *data = NULL;
 	TupleDesc		tupdesc;
-	Datum			values[5];
-	bool			nulls[5];
+	Datum			values[6];
+	bool			nulls[6];
 	HeapTuple		tuple;
 	bytea		   *payload;
 
@@ -261,12 +262,20 @@ pg_partdist_partwal_read_record(PG_FUNCTION_ARGS)
 	if (rec.data_len > 0)
 		memcpy(VARDATA(payload), data, rec.data_len);
 
+	/*
+	 * gxid 走 int64 传输：节点号最多 16 位、本地 xid 48 位，合起来 64 位里
+	 * 最高位恒为 0，所以塞进有符号 bigint 不会变负数。
+	 *
+	 * 2.0 老段流由 PartWALRecordGxid() 归一成 node=0 的 gxid —— 直接整读
+	 * rec.gxid 会把 36..39 的结构体填充垃圾当成节点号。
+	 */
 	memset(nulls, 0, sizeof(nulls));
 	values[0] = LSNGetDatum(rec.orig_lsn);
 	values[1] = Int32GetDatum((int32) rec.rmid);
 	values[2] = Int32GetDatum((int32) rec.info);
-	values[3] = Int64GetDatum((int64) rec.xid);
-	values[4] = PointerGetDatum(payload);
+	values[3] = Int32GetDatum((int32) rec.flags);
+	values[4] = Int64GetDatum((int64) PartWALRecordGxid(&rec));
+	values[5] = PointerGetDatum(payload);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	if (data != NULL)
@@ -283,8 +292,9 @@ pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 	XLogRecPtr			orig_lsn = PG_GETARG_LSN(2);
 	int32				rmid = PG_GETARG_INT32(3);
 	int32				info = PG_GETARG_INT32(4);
-	int64				xid = PG_GETARG_INT64(5);
-	bytea			   *data = PG_GETARG_BYTEA_PP(6);
+	int32				flags = PG_GETARG_INT32(5);
+	int64				gxid = PG_GETARG_INT64(6);
+	bytea			   *data = PG_GETARG_BYTEA_PP(7);
 	PartitionWALWriter *writer;
 
 	/*
@@ -315,7 +325,8 @@ pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 								 (uint8) info,
 								 VARDATA_ANY(data),
 								 (uint32) VARSIZE_ANY_EXHDR(data),
-								 (TransactionId) xid);
+								 (GlobalTransactionId) gxid,
+								 (uint8) flags);
 
 	/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
 	FlushPartitionWALWriter(writer, true);

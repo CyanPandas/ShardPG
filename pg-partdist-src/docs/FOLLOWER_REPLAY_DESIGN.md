@@ -86,6 +86,8 @@ secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo �
 | ⑦ | **R1 验收判据"逐页 diff 一致"不可达**(实测修正):FPI 恢复会把页内空闲空洞清零,主库保留残字节,原生备库亦然 ⇒ 判据改为"两侧 pd_lower/pd_upper 相同且**洞外**逐字节一致"(实测洞外差异为 0) | §14.2 |
 | ⑧ | **worker 进程初始化三要素**(实测,缺一即段错误):`BackgroundWorkerInitializeConnection(NULL)` 走 BaseInit、`CreateAuxProcessResourceOwner()` 供 buffer pin 记账、`RmgrStartup()` 建各 rmgr 的 redo 内存上下文。v3 稿"纯 `BGWORKER_SHMEM_ACCESS`、无 DB 连接"不成立 | §7 |
 | ⑨ | **`pd_prune_xid` 也必须排除在一致性判据外**(L1 实测):`heap_xlog_prune()` 原文注释 "we don't worry about updating the page's prunability hints" —— **内核 redo 故意不复制该字段**,它只是"这页可能有东西可清理"的优化提示。实测 leader 侧 VACUUM 后归 0、follower 侧保留 prune 前旧值(6 字节,3 页各 2 字节),原生备库同样如此。判据 = 空洞与 pd_prune_xid 之外全等 | §14.2 |
+| ⑩ | **一致性判据改为对齐内核 `heap_mask()`**(R2 实测):逐次补例外的路子在 R2 又撞墙 —— 主堆稳定 4 字节差异,全部落在**元组间 MAXALIGN 对齐填充**里。改为照抄 `wal_consistency_checking` 给堆页用的那套掩码(`heap_mask()` + `bufmask.c`):空洞 / `pd_prune_xid` / `pd_flags` 三个提示位 / 未冻结元组的 `t_infomask & HEAP_XACT_MASK` / `t_cid` / 元组对齐填充。**但 `pd_lsn` 刻意不掩**(R1 的核心主张就是页 LSN 逐字节等于 leader 的 `orig_lsn`),并额外保留"leader 已冻结而 follower 未冻结 → 判为差异"(冻结记录是写 WAL 的,丢了是真缺陷) | §14.2 |
+| ⑪ | **`autovacuum_enabled=off` 挡不住防回卷**(R2-e 核实):`autovacuum.c:3196` 是 `if (!av_enabled && !force_vacuum)` —— `relfrozenxid` 落后超过 `autovacuum_freeze_max_age` 时 off 被忽略,副本壳表照样被强制 anti-wraparound vacuum 扫到,而它的元组带外来 xid,本地 clog 无法解释;同时压住库级 `datfrozenxid`、阻塞 clog 截断。§13 约束 4 拿 off 当保护是**不够的**,只是推迟。R2-e 先交付可观测(`replay_freeze_status()`),处置待 §12 CTRL 通道 | §13 |
 
 另核实两处对本设计有利、v3 未提及的事实:`CreateFakeRelcacheEntry` 在 16.14 已不再
 `Assert(InRecovery)`(§13.3);核内 `AdvanceNextFullTransactionIdPastXid` 写 `nextXid`
@@ -257,8 +259,9 @@ typedef struct TxnMarkerPayload
     uint64  commit_ts;    /* 提交时间戳,CommitTransaction() 时向 TSO 申请;
                              ABORT 标记中为 0                                      */
     uint32  nsubxacts;    /* 已提交子事务数;无 SAVEPOINT 时为 0                   */
+    uint32  reserved;     /* 显式补齐,恒为 0                                      */
     /* TransactionId subxacts[nsubxacts] 紧随其后(leader 侧本地 xid) */
-} TxnMarkerPayload;       /* data_len = 20 + 4 * nsubxacts */
+} TxnMarkerPayload;       /* sizeof = 24;data_len = 24 + 4 * nsubxacts */
 ```
 
 - `flags` 含 `PARTWAL_FLAG_MARKER`;`rmid = RM_XACT_ID`;
@@ -267,6 +270,31 @@ typedef struct TxnMarkerPayload
   `MakeGlobalXid(leader_node_id, subxid)` 合成(§7.6)。
 - 与 reply_v1 的 16 字节定长相比多出 `nsubxacts` 与子事务数组:这是为覆盖
   SAVEPOINT 语义的**有意格式增量**(§9.5),需回同步到评审文档。
+- `reserved` 是**显式**补齐字段,不是编译器填充。结构体整体直写磁盘,留一个
+  未初始化的 4 字节洞会让同一逻辑内容产生不同字节 —— parwal-2.0 的 `xid`
+  尾部填充就踩过这个坑(见 `PartWALRecordGxid` 的兼容读注释)。因此
+  `sizeof(TxnMarkerPayload)` 是 **24 而非 20**,`global_mvcc.c` 用
+  `StaticAssertDecl` 把 24 与 `nsubxacts` 的偏移 16 钉在编译期。
+
+**写入时机与顺序(实现约束,R2-b)**
+
+COMMIT 标记在**本事务 DATA 记录复制成功之后**才落盘,由此得到一条强不变式:
+
+> 段流里出现某个 gxid 的 COMMIT 标记 ⇒ 该事务的 DATA 记录已在多数派上持久化。
+
+顺序若反过来(先写标记再复制),复制挂钩一旦 ERROR(凑不齐多数派、本节点
+已不是该组 leader),事务中止时就要再补一条 ABORT 标记 —— 同一个 gxid 先
+COMMIT 后 ABORT,回放侧只要停在两者之间就会把一个已回滚的事务判成可见。
+
+- ABORT 标记(`commit_ts = 0`)在 `XACT_EVENT_ABORT` 补写,条件是本事务的字节
+  **已经落进段文件**:group commit 下被 peer backend 顺手写掉,或本事务过了
+  PRE_COMMIT 之后才失败。此时丢弃 ring buffer 槽位已无意义,follower 迟早
+  拿到这批 DATA 记录,必须给它们一个终态。abort 路径不调用复制挂钩(中止中
+  再 ERROR 会升级为 FATAL),标记由该分区下一次写入的区间式复制带走。
+- **2PC 尚未覆盖**:`XACT_EVENT_PRE_PREPARE` 不写 COMMIT 标记 —— prepared
+  事务还可能 `ROLLBACK PREPARED`,此刻写 COMMITTED 会让最终回滚的数据在
+  follower 上变可见。代价是 2PC 事务在 follower 上保持"未决 = 不可见",
+  语义安全。补齐 PREPARE / COMMIT PREPARED 两段式标记是后续工作。
 
 ### 4.4 兼容性
 
@@ -567,6 +595,17 @@ PartDistAdvanceNextXidPastXid(TransactionId xid)
 调用上述函数一次性拉齐 nextXid。worker 启动时以持久化的 `max_replayed_fxid`
 先行拉齐(§7.2 第 2 步)。
 
+**登记要在 skip 判断之前**(实现约束,R2-c):附录 A 白名单里那些记录不改页面,
+但它们的 xid 一样是 leader 已经分配掉的。水位漏掉它们,本地就可能重新分配到
+同一个号,升主后 "xid ≤ W → 查 xid_map" 的判定随即错位。
+
+**只对 `version >= 3` 的流登记**:2.0 记录的 gxid 是补 0 节点号的兼容值(§4.4),
+登进 xid_map 会把"协调节点(group id 恰好是 0)的事务"和"来源未知"混为一谈。
+
+**epoch 取本地口径**:leader 的 epoch 不在段流里,而这个水位存在的意义就是和
+本地 nextXid 比大小,两边口径必须一致。`ShardReplayInitXidMap` 在建表时持
+`XidGenLock` 读一次本地 epoch 作为起点。
+
 ### 7.6 阶段三 B:应用 MARKER 记录(增强型 CLOG)
 
 ```c
@@ -691,6 +730,19 @@ typedef struct ShardApplyCheckpoint
 } ShardApplyCheckpoint;
 ```
 
+**CRC 必须覆盖快照本体**(实现约束,R2-c):只校验头的话,快照被截断或写坏时
+头依旧自洽,重启后 xid_map 静默残缺——页面上有元组、却查不到这些 xid 属于谁,
+可见性判定就此错位,而且没有任何报错。
+
+版本号仍是 **3**:`nxidmap == 0` 时"头 + 空快照"的 CRC 与旧的"只算头"逐字节
+等价,因此 R1 时代写下的 checkpoint 继续通过校验——升级到 R2 不会把已有
+follower 打回从 plsn 1 重放(那恰好是最危险的路径,见 §8.5)。
+
+`XidMapEntry` 带一个显式的 `reserved` 补齐字段(`sizeof == 16`,`gxid` 在偏移 8,
+两条 `StaticAssertDecl` 钉死):条目原样落盘并计入 CRC,留未初始化的填充洞会让
+同一份逻辑内容每次写出不同字节,副本之间没法按字节比对 checkpoint——与
+`TxnMarkerPayload.reserved`(§4.3)同源的教训。
+
 **推进协议**(类比 checkpoint 的 REDO 点):
 
 1. apply 到 `partition_lsn = N`;
@@ -794,9 +846,51 @@ extern bool EnhancedClogReadStatus(GlobalTransactionId gxid,
 ```
 
 最小实现要求(满足回放模块即可):按 `GxidNodeId` 分目录
-`pg_gclog/<node_id>/`,段文件内按低位 xid 直接寻址 16 字节槽;写路径
+`pg_gclog/<node_id>/`,段文件内按低位 xid 直接寻址定长槽;写路径
 write + 延迟 fsync,fsync 时机由 §8.4 推进协议步骤 2 保证。SLRU 化、缓冲与 GC
 属全局 MVCC 文档范围。
+
+**槽长由 16 改为 24 字节(R2-d 实测修正)。** 上面的 `uint8 start_ts[6]` /
+`commit_ts[6]` 是 48 位时间戳,**放不下 TimestampTz** —— 它是"自 2000-01-01
+起的微秒数",`2^48 µs ≈ 8.9 年`,**2008 年就溢出了**;实测当前值
+`839,057,670,472,675`,是 `2^48 = 281,474,976,710,656` 的三倍。截断不报错,
+只会把提交顺序悄悄弄乱,而 §10 的可见性判据正是 `commit_ts ≤ 快照 start_ts`。
+落地布局:
+
+```c
+typedef struct EnhancedClogSlot
+{
+    uint64  start_ts;       /* 事务启动时间戳                   */
+    uint64  commit_ts;      /* 提交时间戳;ABORTED 时为 0        */
+    uint32  status;         /* TxnStatus                        */
+    uint32  reserved;       /* 显式补齐,恒为 0                  */
+} EnhancedClogSlot;         /* 24 字节 */
+```
+
+TSO 就位后只换取值来源,不动布局。`reserved` 与 `TxnMarkerPayload`/`XidMapEntry`
+同理:槽直写磁盘,不留未初始化的填充洞。
+
+**全零槽 = `TXN_RUNNING` = 未决 = 不可见。** 这正是稀疏文件空洞读出来的样子,
+也正是想要的默认值:没有判决的事务一律当作还没提交。段文件因此**必然稀疏**,
+只有真正回放过的 xid 才占实际块。
+
+**回滚的子事务不写 `ABORTED`,靠"缺席"表达**(与 §7.6 一致):被 `ROLLBACK TO`
+的子事务不在 MARKER 的提交清单里,于是它的槽从未被写过,读出来就是
+`TXN_RUNNING`。实测核账:顶层与已 RELEASE 的子事务全部 `committed`,
+被回滚的那个是 `running`。
+
+**不缓存 fd**(与内核 SLRU 同款做法,`slru.c` 的读写页都是开-读写-关)。
+`OpenTransientFile` 的 fd 登记在 resource owner 上、事务结束即被关闭,跨事务
+缓存它轻则报 "temporary files and directories not closed at end-of-transaction",
+重则 fd 已被复用、后续 pwrite 打到不相干的文件上。开销可忽略:MARKER 是
+"每事务每分区一条",而每条记录本就要走一次带 fsync 的 Raft 往返。
+
+**并发**:回放 worker 是每分区一个,而 gclog 是每来源节点一套 ⇒ 同一段文件会被
+多个 worker 同时写,`ShardReplayCtx` 那套"每分区独占、无需加锁"的前提在这里
+**不成立**。但实际不需要锁:段文件创建用 `O_CREAT`(不带 `O_EXCL`,并发创建都
+成功、同一个文件);槽内容幂等 —— 同一 gxid 被两个 worker 写,是因为该事务跨了
+两个分片,两条 MARKER 的载荷来自同一次提交,算出的 24 字节完全相同,任何交错
+都得到同样的结果。
 
 ### 9.4 ShardRouteEntry 可见性路由表(R3 实装,本期建结构)
 
@@ -954,9 +1048,36 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
    副本壳表 `autovacuum_enabled = off`(建表即设 + launcher 防御性校验),
    副本分区不服务任何本地读写(升主前)。
 5. **冻结与回卷账目**:副本表的 relfrozenxid 不由本地 vacuum 维护(freeze 由 leader
-   的 freeze 记录回放实现)。本地 `datfrozenxid` 计算须排除副本壳表,或经控制记录
+   的 freeze 记录回放实现 —— 元组物理上确实被冻了,只是 `pg_class.relfrozenxid`
+   这个**目录字段**没人更新)。本地 `datfrozenxid` 计算须排除副本壳表,或经控制记录
    同步 leader 的 relfrozenxid;同时 nextXid 被最活跃 leader 拉齐后,本地普通表的
    age() 相应增大,须确认 autovacuum 对本地表正常 freeze。R2 验收项。
+
+   > **⚠ 约束 4 的 `autovacuum_enabled = off` 挡不住这条(R2-e 核实)。**
+   > 内核 `autovacuum.c:3196` 原文:
+   > ```c
+   > /* User disabled it in pg_class.reloptions?  (But ignore if at risk) */
+   > if (!av_enabled && !force_vacuum)
+   > ```
+   > `force_vacuum` 的判据是 `relfrozenxid < nextXid - autovacuum_freeze_max_age`。
+   > 一旦越线,`autovacuum_enabled=off` **被忽略**,副本壳表照样会被强制
+   > anti-wraparound vacuum 扫到 —— 而它的元组带的是外来节点的 xid:本地 clog
+   > 要么没有对应页(§13 约束 4 说的 "could not access status of transaction"),
+   > 要么给出张冠李戴的答案。同时这些表还会把库级 `datfrozenxid` 压住、阻塞
+   > clog 截断。
+   >
+   > 所以"建表即设 autovacuum off"只是**推迟**问题,不是解决。真正的处置有两条路,
+   > 都需要 CTRL 记录通道(§12):
+   >   (a) leader 在 freeze 之后经 CTRL 记录同步自己的 relfrozenxid,follower 据此
+   >       更新壳表的目录字段 —— 语义最干净;
+   >   (b) 直接把壳表的 relfrozenxid 推到接近本地 nextXid。副本元组的 xid 本就是
+   >       外来的、本地机制"必须永不解释"(约束 4),本地口径的 relfrozenxid 对它
+   >       没有意义 —— 但这是一次**有语义后果的取舍**(升主后该字段仍然是错的),
+   >       须显式决策,不能顺手做掉。
+   >
+   > R2-e 交付的是**可观测**:`partdist.replay_freeze_status()` 把每个副本壳表
+   > 离强制阈值还有多远(`pct_to_force`)摆出来,验收用例断言 autovacuum 确实已关
+   > 并打印最坏值。处置本身留待 §12 CTRL 通道就位。
 6. **unlogged / 临时表**:不产生 WAL,天然不在流内;shard 表必须是 logged。
 7. **多索引 AM**:R1 只承诺 heap + btree(覆盖 TOAST);GIN 等按附录 A 矩阵逐个
    验证后放开。
@@ -992,6 +1113,8 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
 pg-partdist-src/
   include/
     partition_wal_header.h     [改] parwal-3.0:gxid 头、MARKER/CTRL flags、TxnMarkerPayload
+    partwal_sync.h             [改] PartWALFlush(upto, write_marker)、PartWALEndTxn;
+                                    ABORT 标记补写(§4.3 写入时机)
     shard_fileset.h            [新] ShardFileSet + 反向映射接口(§5)
     shard_replay.h             [新] ShardReplayCtx、LocMapEntry、回放入口、边界回调(§6/§7)
     shard_xidmap.h             [新] XidMapEntry、xid_map 接口(§9.2)
@@ -999,13 +1122,16 @@ pg-partdist-src/
     enhanced_clog.h            [新] TxnStatus、EnhancedClogRecord、读写接口(§9.3)
     global_mvcc.h              [新] GlobalTransactionId、MakeGlobalXid、预留读接口(§10)
   src/replay/
-    replay_worker.c            [新] launcher + per-shard bgworker、InRecovery、
-                                    PartDistAdvanceNextXidPastXid
-    shard_replay.c             [新] 五阶段主循环、DATA/MARKER/CTRL 三路派发、skip 白名单
-    xid_map.c                  [新] HTAB 实现 + 快照 dump/load(R3 迁 dshash)
-    replay_checkpoint.c        [新] apply_checkpoint 单文件原子读写(§8.4)
+    replay_worker.c            [新] launcher + per-shard bgworker、InRecovery
+    shard_replay.c             [新] 五阶段主循环、DATA/MARKER/CTRL 三路派发、skip 白名单;
+                                    PartDistAdvanceNextXidPastXid 与 xid_map 的
+                                    建表/恢复/登记(实现落在这里,不另开 xid_map.c ——
+                                    它们全都只被回放主循环调用,拆文件只增加往返)
+    replay_checkpoint.c        [新] apply_checkpoint 单文件原子读写(§8.4),
+                                    含 xid_map 快照与覆盖快照的 CRC
+    enhanced_clog.c            [新] pg_gclog 写路径 + 延迟 fsync;读接口供核账
+                                    (R3 读路径的入口)
     shard_route.c              [新] 共享内存路由表(注册/换表/promote;读侧 stub)
-    enhanced_clog.c            [新] 写路径最小实现;读路径 stub
   patches/
     0002-flushbuffer-lsn-exempt-hook.patch   [新] §8.3
     0003-advance-wal-insert.patch            [新] §11(R4)
@@ -1020,8 +1146,8 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 
 | 阶段 | 内容 | 验收 | 前置 |
 |------|------|------|------|
-| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader **空洞与 `pd_prune_xid` 之外逐字节一致(含 pd_lsn)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
-| R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13.5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致 | R1 |
+| R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader 在**内核 `heap_mask()` 掩码之外逐字节一致(且 `pd_lsn` 不掩,须相同)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
+| R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13 约束 5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致(**★★ 见下方「R2 验收 = 账本正确，不是可见」**) | R1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
 | R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
 
@@ -1043,10 +1169,73 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 > 它只是"这页可能有东西可清理"的优化提示,主备分歧无害。实测 leader 侧 VACUUM
 > 后归 0、follower 侧保留 prune 前的旧值(6 字节差异,3 页各 2 字节)。
 >
-> 修正后的判据(比对工具见 `tests/pagecmp.py`):两侧 `pd_lower`/`pd_upper` 必须
-> 相同(否则"洞"的位置不可比),且**空洞与 `pd_prune_xid` 之外的全部字节相同**。
-> 这两处按定义都不承载语义 —— 判据覆盖页头(含 `pd_lsn`)、全部行指针、全部元组
-> 数据、special 区,已是物理复制能达到的最强一致性。
+> **判据改为对齐内核自己的掩码规则**(R2 实测重订)。上面两处例外是逐次撞出来的,
+> 到 R2 又撞上第三处 —— 主堆稳定报 4 字节差异,查下来全部落在**元组之间的
+> MAXALIGN 对齐填充**里(实测:`lp[190]` 覆盖 `[4624,4677)`,`MAXALIGN(53)=56`,
+> 填充区 `[4677,4680)`,差异字节正是 4677)。元组按 8 字节对齐存放,而 `lp_len`
+> 是元组真实长度,中间那几个字节谁也不读、redo 也不写,主备残留内容不同是常态。
+>
+> 与其继续一处处补,不如直接采用**内核既有的权威答案**:PostgreSQL 的
+> `wal_consistency_checking` 就是用来验证"redo 出来的页与主库页是否一致"的,
+> 它对堆页调用 `heap_mask()`(`src/backend/access/heap/heapam.c`)配合
+> `bufmask.c` 的 `mask_page_lsn_and_checksum` / `mask_page_hint_bits` /
+> `mask_unused_space`,把主备之间本就不保证相同的字段统一涂掉再比。
+> `tests/pagecmp.py` 照抄这份掩码集合:
+>
+> | 内核掩掉的 | 原因 | 本项目 |
+> |---|---|---|
+> | `pd_lsn` / `pd_checksum` | 备库页 LSN 与主库无关 | **不掩**,见下 |
+> | `pd_prune_xid` | `heap_xlog_prune()` 原文"we don't worry about updating the page's prunability hints" | 掩 |
+> | `pd_flags` 的 `PD_HAS_FREE_LINES`/`PD_PAGE_FULL`/`PD_ALL_VISIBLE` | 三个都是提示位 | 按位掩,其余位严格比 |
+> | `[pd_lower, pd_upper)` 空洞 | FPI 恢复清零,主库留残字节 | 掩 |
+> | 未冻结元组的 `t_infomask & HEAP_XACT_MASK`(0xFFF0) | 可见性提示位由读取者写,不产生 WAL | 掩;掩码外的位单独比 |
+> | 已冻结元组的 `HEAP_XMAX_INVALID`/`HEAP_XMAX_COMMITTED` | 同上 | 掩 |
+> | `t_cid` | 回放时被置成 `FirstCommandId`(见 `heap_xlog_insert`) | 掩 |
+> | 每条行指针后的 `MAXALIGN(lp_len) - lp_len` 填充 | 无人读、redo 不写 | 掩 |
+>
+> **本项目刻意比内核更严的一条:`pd_lsn` 不掩。** R1 的核心主张就是 follower 用
+> leader 的 `orig_lsn` 盖页(§4.2/§8.2),页 LSN 必须逐字节相同 —— 这正是本设计
+> 区别于普通逻辑复制的地方,不能跟着内核一起放过。
+>
+> **另加一条内核不需要、本项目必要的检查**:leader 已冻结(`t_infomask & 0x0300
+> == 0x0300`)而 follower 未冻结 → 判为差异。冻结记录 `XLOG_HEAP2_FREEZE_PAGE`
+> 是**写 WAL** 的,丢了它是真缺陷,不能被"提示位豁免"一起放过。
+>
+> 修正后的判据:两侧 `pd_lower`/`pd_upper` 必须相同(否则"洞"的位置不可比),
+> 且**上表掩码之外的全部字节相同**。判据仍覆盖 `pd_lsn`、全部行指针、
+> 全部元组数据(含 xmin/xmax 本身、`t_infomask2`、`t_ctid`、`t_hoff`)与 special 区。
+> 掩码规则是**堆页专用**的(要走行指针与元组头布局);索引页需另配
+> `btree_mask` 等,现工具不适用。
+
+> **★★ R2 验收 = 账本正确，不是可见。** 这条要写死,免得反复误判进度。
+>
+> R2 交付后,follower 上**仍然读得出被回滚的行** —— 实测 leader 5 行、follower 6 行,
+> 多出来的正是被 `ROLLBACK TO SAVEPOINT` 掉的那个子事务写的。**这不是缺陷**:
+> 元组的 `xmin` 是 leader 的 32 位 xid,follower 拿它去查**自己的**原生 clog,
+> 查到的是它自己历史上那个碰巧同号的事务(实测 follower 本地 xid 计数器 59529,
+> 而元组 xmin 才 4002~4008)。同一个 32 位数字在两个节点上是两笔毫不相干的事务 ——
+> 这正是 gxid 存在的全部理由。
+>
+> R2 要证明的是**账记对了**,不是**有人查对了账**:
+>   - `pg_gclog` 里顶层与已 RELEASE 的子事务判为 `committed`,被 `ROLLBACK TO`
+>     的那个**没有记录**(空洞 = `TXN_RUNNING` = 未决 = 不可见 —— 回滚语义由
+>     "缺席"表达,不写 `ABORTED`);
+>   - kill -9 之后段流里每条 COMMIT 标记在 gclog 里仍是 `committed`(§8.4 推进协议)。
+>
+> 这两条 `tests/test_txn_layer_r2.sh` 都**直接查账**断言(`partdist.gclog_status()`),
+> 不靠"多读出几行"这类间接现象。
+>
+> 让 `SELECT` 去查 gclog 是 **R3** 的事(`HeapTupleSatisfiesGlobalMVCC` +
+> xid_map 迁 dshash 共享化)。R3 落地那天,上面那 6 行会变回 5 行 —— 那才是
+> 可见性的验收信号,不属于 R2。
+>
+> 相应地,`tests/test_lazy_replay_l1.sh` 里那句 `VACUUM (FREEZE)` 已在 R2-f 去掉,
+> 改为普通事务批次 + **普通** VACUUM:FREEZE 当初是**页面比对的拐杖**(freeze 记录
+> 整体重写 `t_infomask`,把 leader 扫描期设上的提示位洗成 canonical 状态),判据
+> 对齐 `heap_mask()` 之后不再需要。保留普通 VACUUM 是为了不丢 VM fork 的比对覆盖 ——
+> `vacuum_freeze_min_age` 默认 5000 万,用例里的元组一个都够不着,不会被冻结。
+> (`test_follower_replay_r1.sh` 仍保留 `VACUUM (FREEZE)`:它那条"壳表行数一致"
+> 的内容校验**确实**依赖冻结元组可读,那是 R1 阶段的既定边界,用例注释已写明。)
 
 > **★ R4 硬阻断于 R3,不是"先后"而是"依赖"。** 升主后该 shard 上的元组 xmin/xmax
 > 是**旧 leader 的本地 xid**,读它们必须走 §9.4 路由规则 3(`xid ≤ W` 查该分区
@@ -1068,10 +1257,10 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 
 | reply_v1 | 本文 | 差异说明 |
 |----------|------|----------|
-| 3.2 PartWALRecord / TxnMarkerPayload | §4 | marker 增加 nsubxacts + 子事务列表(§9.5,需回同步) |
+| 3.2 PartWALRecord / TxnMarkerPayload | §4 | **已回同步(R2-f)**:marker 增加 `nsubxacts` + 子事务列表;`TxnMarkerPayload` 为 **24 字节**(含显式 `reserved`),非 20 —— 原文的 20 与它自己 §7.6 的 `sizeof(TxnMarkerPayload)` 长度校验自相矛盾。`PartWALRecord` 保持 40 字节、`gxid` 在偏移 32,与 2.0 逐字节等长 |
 | 3.2 ShardFileSet / loc_map | §5 / §7.1 | 一致 |
 | 3.2 xid_map 作用域与持久化 | §9.2 / §8.4 | 快照并入 apply_checkpoint 单文件(原子性实现方式) |
-| 3.2 ShardRouteEntry / 增强型 CLOG / ShardReplayCtx / ShardApplyCheckpoint | §9.4 / §9.3 / §7.1 / §8.4 | `max_replayed_xid`(32 位)→ `max_replayed_fxid`(64 位)并持久化;checkpoint 增加 CRC 与恢复提示字段 |
+| 3.2 ShardRouteEntry / 增强型 CLOG / ShardReplayCtx / ShardApplyCheckpoint | §9.4 / §9.3 / §7.1 / §8.4 | `max_replayed_xid`(32 位)→ `max_replayed_fxid`(64 位)并持久化;checkpoint 增加 CRC 与恢复提示字段。**R2-d 回同步**:`EnhancedClogRecord` 槽长由 16 改 24 字节 —— 原文的 6 字节时间戳是 48 位,放不下 TimestampTz(2^48 µs ≈ 8.9 年,2008 年即溢出;实测当前值是 2^48 的三倍),截断会悄悄弄乱提交顺序,而 §10 的可见性判据正是 `commit_ts ≤ 快照 start_ts` |
 | 3.3 前置条件 + 五阶段 | §7 前置条件 + §7.2~§7.9 | 水位推进原语:`SetTransactionIdLimit()` → `PartDistAdvanceNextXidPastXid()`(前者仅设防回卷限,不推进 nextXid,评审文档待更正) |
 | 3.3 末尾路由规则 | §9.4 | 一致(三条规则原文保留) |
 | 3.4 回放示例 A~D | — | 示例不重复收录,以 §7 代码骨架为准 |

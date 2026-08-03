@@ -403,11 +403,12 @@ AppendPartWALRecord(PartitionWALWriter *writer,
                     uint8 info,
                     const char *raw_data,
                     uint32 data_len,
-                    TransactionId xid)
+                    GlobalTransactionId gxid,
+                    uint8 flags)
 {
     /* expected == 0：本地自增分配（leader / demux 侧的原有语义）。 */
     (void) AppendPartWALRecordAt(writer, 0, orig_lsn, rmid, info,
-                                 raw_data, data_len, xid);
+                                 raw_data, data_len, gxid, flags);
 }
 
 /*
@@ -431,7 +432,8 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
                       uint8 info,
                       const char *raw_data,
                       uint32 data_len,
-                      TransactionId xid)
+                      GlobalTransactionId gxid,
+                      uint8 flags)
 {
     XLogSegNo     new_segno;
     PartWALRecord rec;
@@ -493,10 +495,10 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
         writer->last_partition_lsn = assigned_plsn;
         rec.rmid          = rmid;
         rec.info          = info;
-        rec.version       = PARTWAL_RECORD_VERSION_2;
-        rec.flags         = 0;
+        rec.version       = PARTWAL_RECORD_VERSION_3;
+        rec.flags         = flags;
         rec.data_len      = data_len;
-        rec.xid           = xid;
+        rec.gxid          = gxid;
 
         ptr       = (char *) &rec;
         remaining = sizeof(PartWALRecord);
@@ -544,10 +546,10 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
     writer->last_partition_lsn = assigned_plsn;
     rec.rmid          = rmid;
     rec.info          = info;
-    rec.version       = PARTWAL_RECORD_VERSION_2;
-    rec.flags         = 0;
+    rec.version       = PARTWAL_RECORD_VERSION_3;
+    rec.flags         = flags;
     rec.data_len      = data_len;
-    rec.xid           = xid;
+    rec.gxid          = gxid;
 
     /* Copy header into buffer */
     memcpy(writer->buffer + writer->buf_used, &rec, sizeof(PartWALRecord));
