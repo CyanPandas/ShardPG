@@ -60,6 +60,11 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
   滑出环窗口时按"元数据持久、跳过安全"语义窗口内快进（§13.4）。
 - **事务 prepare 接线（§14）**：写入提交前自动逐条复制到分区组（[A] 后、[B] 前），
   多数派持久化才算 prepared，失多数派事务中止；顺带获得旧 primary 写栅栏。
+- **并发下的 prepare 多数派保证（2026-08-03，DTX-2PC 第 1 步）**：修掉 group commit
+  让路窗口——触达分区集合改为 `PartWALInsert` 时 per-backend 登记，`PartWALFlush`
+  的**提前返回路径也调复制挂钩**；本组的复制在 pg_raft 侧串行化（认领位 +
+  持有者消失时回收），消除并发 backend 抢同一段 plsn 的重复提案。
+  回归 `raft_17`，含修复前必失败的对照实验。
 - 回归基线：`pg-raft-src/run-raft-tests.sh` **32/32**（raft_01–16）；
   `pg-partdist-src/tests/test_shard_identity_p0.sh` **10/10**；
   全新库 `CREATE EXTENSION` 冒烟通过。
@@ -419,6 +424,32 @@ PartWAL 接入链路：
 | `raft_14_hash_shard_secondary_backup` | **真实哈希分片 (a) 形态**：多记录逐条 propose、follower 逐字节指纹一致、`partition_lsn` 1..N 连续无洞、一条 record 一次备份、不回放（壳表 0 行）、初次登记（primary/term/secondaries 不含 master）、路由层一致、master 无分片身份 | ✅ |
 | `raft_15_self_election_failover` | **切主全链路**：停主 → 组内自治选举 → 上报登记 → 每节点 `partition_map`+`pg_dist_placement` 落新主（任期递增、master 不入 secondaries）→ 旧主重启以 follower 归队、登记不回退 | ✅ |
 | `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
+| `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑）。阶段一：同 worker 两个数据组 + 8 会话并发单行 INSERT，断言**持有完整前缀的成员数 >= 多数派**（不是"全体 follower 追平"——Raft 只保证 quorum，且本项目无后台追平通道）。阶段二（核心判据）：停掉两个 follower 使该组失去多数派后并发写，断言**提交成功行数 == 0** | ⚠️ 被下述 segfault 阻断 |
+
+> **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
+> 下的实际目录探测协调节点目录名（raft4 是 `master`，pg_citus_raft 是
+> `coordinator`）与 worker 数，节点 id ↔ 端口按 `BASE_PORT + N - 1` 算术推导。
+> 因此同一套用例可在 4 节点（raft4）与 9 节点（pg_citus_raft）环境跑。
+> 可用 `CONTAINER` / `COORD_DIR` / `N_WORKERS` / `BASE_PORT` 覆盖。
+> quorum 编排本身与节点数无关（raft_05 停"除 leader 外全部节点"；数据组用例用
+> 显式 3 成员组），所以只需要改映射函数。
+
+> **🚨 头号阻断项：并发写入路径 segfault（2026-08-03 新发现）**
+> 6 个并发会话对同一个 Citus 分片连打单行 INSERT，该 worker 上的 backend
+> 必 SIGSEGV（实测 3/3）。**不需要任何 raft 组**，也**与让路窗口修复无关**
+> （修复前后都崩）。根因未定位，最大嫌疑是 `PartWALFlush` 里
+> "backend X 顺带落盘 backend Y 的槽位"这条 group-commit 分支
+> （`ReadRawWALRecordAt` → `AssembleRawWALRecord` → `PartWALReadPage`）——
+> 此前所有用例都是**串行**写入，这条分支从未真正执行过。
+> 详见 `DTX_2PC_DESIGN.md` §9.0（含最小复现与已确定的事实）。
+> **它优先于 2PC 的一切后续步骤**，因为它会污染所有并发验收：节点崩溃后
+> shmem 组表重置，之后的 INSERT 会因"查不到数据组"跳过复制挂钩而提交成功，
+> 症状与让路窗口一模一样。
+
+> **raft_15 在 9 节点环境下偶发失败（2026-08-03 实测）**：全量套件里出现过一次
+> "节点 5434 断言失败"，同一构建重跑即通过，判为 flake。怀疑是 group 0 的 apply
+> 在 9 个成员上的传播时序（harness 只等协调节点上出现登记就立刻断言各 follower）。
+> **不是 2PC 工作的回归。**
 
 仍缺的场景：
 

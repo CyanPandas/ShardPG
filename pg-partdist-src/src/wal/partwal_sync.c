@@ -70,7 +70,30 @@
 typedef void (*PartWALReplicateHook) (Oid partition_id);
 static void **partwal_replicate_hook_rv = NULL;
 
-#define PARTWAL_FLUSH_TOUCHED_MAX 64
+/*
+ * ★ 触达分区集合：per-backend，在 PartWALInsert 时登记（DTX_2PC_DESIGN.md §9.1）
+ *
+ * 此前这个集合是在 PartWALFlush 里从环形缓冲区反推的（只收
+ * slot->backend_id == MyBackendId 的槽位）。那个做法有一个正确性漏洞：
+ * group commit 下并发 backend 会顺带把本事务的记录写进段文件并把槽位置
+ * valid=false，于是
+ *   (a) 本 backend 走 flushed_upto >= upto_lsn 的提前返回分支，复制挂钩
+ *       根本不被调用；
+ *   (b) 即使不提前返回，槽位已被消费，反推也拿不到分区号。
+ * 结果是"本事务已 prepared 但字节从未达到多数派"。无 2PC 时它只表现为
+ * 复制延后（下一次写入补齐），有 2PC 时协调者会据此写 COMMIT 决议 —— 丢数据。
+ *
+ * 改为在插入侧登记后，集合与"本事务写过哪些分区"严格对应，与谁做的落盘无关。
+ * 数组按需增长（palloc 在 TopMemoryContext，与 partwal_pending 同生命周期），
+ * 由 PartWALFlush / PartWALAbort 负责清空。
+ */
+static Oid *partwal_touched       = NULL;
+static int  partwal_touched_count = 0;
+static int  partwal_touched_cap   = 0;
+
+static void PartWALNoteTouched(Oid partition_id);
+static void PartWALResetTouched(void);
+static void PartWALReplicateTouched(void);
 
 /* ================================================================== */
 /* Shmem names / tranche                                               */
@@ -136,6 +159,96 @@ FreePartWALPendingContent(void)
     }
     partwal_pending_count = 0;
     /* Keep the array allocated; capacity is reused across transactions. */
+}
+
+/* ------------------------------------------------------------------ */
+/* 触达分区集合(DTX_2PC_DESIGN.md §9.1)                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * PartWALNoteTouched — 登记"本事务写过分区 partition_id"。
+ *
+ * 必须在**释放 PartWALCtl->lock 之后**调用：这里会 palloc，而 palloc 在
+ * LWLock 下不安全（与本文件捕获 WAL 字节的做法同理）。
+ * 集合通常只有 1~2 个元素（一个事务很少跨很多分片），线性去重足够。
+ */
+static void
+PartWALNoteTouched(Oid partition_id)
+{
+    int i;
+
+    for (i = 0; i < partwal_touched_count; i++)
+        if (partwal_touched[i] == partition_id)
+            return;
+
+    if (partwal_touched_count >= partwal_touched_cap)
+    {
+        int           new_cap = (partwal_touched_cap == 0)
+                                ? 8 : partwal_touched_cap * 2;
+        MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+        partwal_touched = (partwal_touched == NULL)
+            ? palloc(new_cap * sizeof(Oid))
+            : repalloc(partwal_touched, new_cap * sizeof(Oid));
+        MemoryContextSwitchTo(old);
+        partwal_touched_cap = new_cap;
+    }
+
+    partwal_touched[partwal_touched_count++] = partition_id;
+}
+
+static void
+PartWALResetTouched(void)
+{
+    partwal_touched_count = 0;
+    /* 保留数组本身，容量跨事务复用 */
+}
+
+/*
+ * PartWALReplicateTouched — 对本事务触达的每个分区调用复制挂钩。
+ *
+ * 调用点必须满足：[A]（这些分区的 parwal 记录已落盘 fsync）已经完成，
+ * [B]（本事务提交/prepare 记录的 XLogFlush）尚未发生，且已释放
+ * PartWALCtl->lock（挂钩内部有网络往返，不能占着锁）。
+ *
+ * 挂钩 ERROR（写栅栏 / 凑不齐多数派）即事务中止 —— 这正是 prepare 语义。
+ * 集合在**进入循环前**清空：挂钩若 ERROR，事务转入 abort 路径，
+ * PartWALAbort 会再清一次，两处都不会把陈旧分区带进下一个事务。
+ */
+static void
+PartWALReplicateTouched(void)
+{
+    PartWALReplicateHook fn;
+    Oid                  local[8];
+    Oid                 *list = local;
+    int                  n = partwal_touched_count;
+    int                  i;
+
+    if (n == 0)
+        return;
+
+    if (partwal_replicate_hook_rv == NULL)
+        partwal_replicate_hook_rv =
+            find_rendezvous_variable("partdist_partwal_replicate_hook");
+    fn = (PartWALReplicateHook) *partwal_replicate_hook_rv;
+
+    if (fn == NULL)
+    {
+        PartWALResetTouched();
+        return;                 /* 未装载 pg_raft：零开销，行为同接线前 */
+    }
+
+    /* 先把集合复制出来再清空，避免挂钩内部（经 SPI）反向触发写入时读到脏状态 */
+    if (n > (int) lengthof(local))
+        list = palloc(n * sizeof(Oid));
+    memcpy(list, partwal_touched, n * sizeof(Oid));
+    PartWALResetTouched();
+
+    for (i = 0; i < n; i++)
+        fn(list[i]);
+
+    if (list != local)
+        pfree(list);
 }
 
 /* ================================================================== */
@@ -248,6 +361,7 @@ PartWALInsert(XLogRecPtr end_lsn,
     PartWALSlot     *slot;
     bool             wrote_slot = false;
     RelFileNumber    match_rfn = InvalidRelFileNumber;
+    Oid              matched_partition = InvalidOid;
     RelFileLocator   smgr_loc;
 
     if (PartWALCtl == NULL || PartWALRelHash == NULL)
@@ -316,6 +430,12 @@ PartWALInsert(XLogRecPtr end_lsn,
 
         slot->partition_id = entry->partition_id;
         slot->relfilenode  = match_rfn;
+
+        /*
+         * 记下分区号供出锁后登记触达集合 —— entry 指向共享哈希表，
+         * 释放锁之后不得再解引用。
+         */
+        matched_partition  = entry->partition_id;
         slot->orig_lsn     = end_lsn;
         slot->start_lsn    = ProcLastRecPtr;    /* 本条记录的起始 LSN */
         slot->xid          = GetCurrentTransactionIdIfAny();
@@ -339,6 +459,14 @@ PartWALInsert(XLogRecPtr end_lsn,
     }
 
     LWLockRelease(PartWALCtl->lock);
+
+    /*
+     * ★ 登记触达分区（DTX_2PC_DESIGN.md §9.1）。必须在这里而不是 flush 时
+     * 从环形缓冲区反推 —— group commit 下槽位可能被并发 backend 消费掉。
+     * 出锁后调用（内部 palloc）。
+     */
+    if (wrote_slot && OidIsValid(matched_partition))
+        PartWALNoteTouched(matched_partition);
 
     /*
      * Capture WAL record body outside the LWLock (palloc is not safe under
@@ -541,8 +669,6 @@ PartWALFlush(XLogRecPtr upto_lsn)
     PartitionWALWriter *cache_writer[PARTWAL_WRITER_CACHE_MAX];
     int                 ncached = 0;
     XLogRecPtr          last_lsn = InvalidXLogRecPtr;
-    Oid                 touched[PARTWAL_FLUSH_TOUCHED_MAX];
-    int                 n_touched = 0;
 
     /* Default: flush up to the per-backend tracked max LSN */
     if (upto_lsn == InvalidXLogRecPtr)
@@ -551,6 +677,7 @@ PartWALFlush(XLogRecPtr upto_lsn)
     if (upto_lsn == InvalidXLogRecPtr)
     {
         partwal_my_max_lsn = InvalidXLogRecPtr;
+        PartWALResetTouched();
         return;  /* no inserts from this backend */
     }
 
@@ -565,6 +692,20 @@ PartWALFlush(XLogRecPtr upto_lsn)
     {
         LWLockRelease(PartWALCtl->lock);
         partwal_my_max_lsn = InvalidXLogRecPtr;
+        FreePartWALPendingContent();
+
+        /*
+         * ★ 让路窗口修复（DTX_2PC_DESIGN.md §9.1）：本事务的记录已由并发
+         * backend 写进段文件并 fsync（flushed_upto 是在持锁状态下、writer
+         * 析构即 fsync 之后才推进的，所以这里的 >= 判定蕴含"已落盘"），
+         * [A] 对本事务同样成立 —— 因此**必须照常复制**，不能直接返回。
+         *
+         * 修复前这条路径静默跳过复制，事务照样 prepared 成功，字节却从未
+         * 达到多数派。挂钩内部按"当前 flush 点"取增量上界，而该上界必然
+         * >= 本事务记录的 partition_lsn（我们的记录已经在盘上了），所以
+         * 覆盖是安全的。
+         */
+        PartWALReplicateTouched();
         return;
     }
 
@@ -672,17 +813,12 @@ PartWALFlush(XLogRecPtr upto_lsn)
                 if (read_buf != NULL)
                     pfree(read_buf);
 
-                /* 只登记本 backend（= 本事务）写入的分区，供末尾的复制挂钩用 */
-                if (slot->backend_id == MyBackendId)
-                {
-                    int t;
-
-                    for (t = 0; t < n_touched; t++)
-                        if (touched[t] == slot->partition_id)
-                            break;
-                    if (t == n_touched && n_touched < PARTWAL_FLUSH_TOUCHED_MAX)
-                        touched[n_touched++] = slot->partition_id;
-                }
+                /*
+                 * 触达集合不再在这里从环形缓冲区反推 —— 见
+                 * PartWALNoteTouched()（PartWALInsert 时按 backend 登记）。
+                 * 反推的问题：group commit 下本事务的槽位可能已被并发
+                 * backend 消费，反推不到；而 peer 的槽位又不属于本事务。
+                 */
             }
             last_lsn = slot->orig_lsn;
 
@@ -740,20 +876,7 @@ PartWALFlush(XLogRecPtr upto_lsn)
      * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
      * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
      */
-    if (n_touched > 0)
-    {
-        PartWALReplicateHook fn;
-
-        if (partwal_replicate_hook_rv == NULL)
-            partwal_replicate_hook_rv =
-                find_rendezvous_variable("partdist_partwal_replicate_hook");
-        fn = (PartWALReplicateHook) *partwal_replicate_hook_rv;
-        if (fn != NULL)
-        {
-            for (i = 0; i < n_touched; i++)
-                fn(touched[i]);
-        }
-    }
+    PartWALReplicateTouched();
 }
 
 /* ================================================================== */
@@ -764,6 +887,8 @@ void
 PartWALAbort(void)
 {
     int i;
+
+    PartWALResetTouched();
 
     if (partwal_my_max_lsn == InvalidXLogRecPtr)
         return;  /* no inserts from this backend */

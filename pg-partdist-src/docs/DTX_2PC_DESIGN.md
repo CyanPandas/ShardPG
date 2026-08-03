@@ -444,7 +444,44 @@ Citus router 到单分片 ⇒ **快路径**（§3.4），一轮 quorum，不碰�
 
 ## 9. 隐患清单
 
-按严重度排序。#1 与 #2 是**开工前必须先修**的。
+按严重度排序。**#0 是新发现的头号阻断项**；#1 与 #2 是开工前必须先修的。
+
+### 9.0 【阻断】并发写入路径 segfault（2026-08-03 新发现，先于一切 2PC 工作）
+
+**最小复现**（`pg_citus_raft` 环境实测 3/3 崩溃，不需要任何 raft 组）：
+
+```
+建一张 Citus 哈希分布表（shard_count=16, rf=1）
+挑一个持有 >= 2 个分片的 worker，用 get_shard_id_for_distribution_column
+反查出精确落到其中一个分片的 480 个 id
+6 个并发会话，每个连打 80 条单行 INSERT（autocommit）
+⇒ 该 worker 上 backend 收到 SIGSEGV，postmaster 重置整个节点
+```
+
+日志形态：`server process (PID N) was terminated by signal 11: Segmentation fault`，
+`DETAIL: Failed process was running: INSERT INTO public.<table>_<shardid> ...`。
+
+**已经确定的事实**：
+
+1. **与 pg_raft 无关**——上面的复现完全不建数据组，照崩；
+2. **与本次让路窗口修复无关**——修复前、修复后两个构建都崩，频率相当；
+3. **只在并发下出现**。此前所有用例（raft_13/14/16、P0 回归）都是**串行**写入，
+   因此 `PartWALFlush` 里"backend X 顺带落盘 backend Y 的槽位"这条 group-commit
+   分支**从未被真正执行过**。它正是本缺陷的最大嫌疑区间：
+   `PartWALFlush` → `ReadRawWALRecordAt`（peer 槽位的字节不在本 backend 的
+   `partwal_pending` 里，只能按 `slot->start_lsn` 从 pg_wal 回读）
+   → `AssembleRawWALRecord` → `PartWALReadPage`。
+   注意 `PartWALReadPage` 的返回值只判了 `< 0`，**短读（count < XLOG_BLCKSZ）
+   被当成成功**，页缓冲尾部是未初始化的栈内存——这一条已可确认是缺陷（虽然它
+   本身应该表现为 CRC 不符而不是段错误）。
+4. 尚未拿到 backtrace：容器内 `kernel.core_pattern` 由宿主机 apport 接管且
+   `/proc/sys` 只读，容器里改不了；拿 core 需要改宿主机全局 sysctl（未擅自改）
+   或用 gdb follow-fork 跟一次。
+
+**对 2PC 的影响**：这条路径正是 prepare 依赖的路径，且**它会污染一切并发验收**
+——节点崩溃后 shmem 组表被重置，之后的 INSERT 因"查不到数据组"而跳过复制挂钩
+并提交成功，看起来和让路窗口的症状一模一样。本次定位就因此得出过一个错误的
+对照结论（见 §10 步 1 的说明）。**修它优先于 2PC 的任何后续步骤。**
 
 ### 9.1 【最高】group-commit 让路窗口：从性能弱化升级为正确性 bug
 
@@ -468,6 +505,18 @@ if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
 现状下这只是"复制延后到该分区下一次写入"（计划 §14.3 #1 记为性能弱化）。
 一旦引入 2PC，它变成：**PREPARE 返回成功、但这些字节从未达到多数派** ⇒
 协调者据此写 COMMIT 决议 ⇒ 参与组多数派上根本没有这个事务的数据。**这是丢数据。**
+
+> **★ 怎么测它（2026-08-03 实测教训）**：**看终态是测不出来的。** 漏掉的记录会在
+> 该分区下一次非提前返回的 flush 里被增量下界（`last_data_plsn` → 当前 flush 点）
+> 顺带补齐，所以 burst 结束后 leader 与 follower 几乎总是收敛的 —— 实测**修复前的
+> 构建照样能通过"follower 逐字节追平"这种判据**。让路窗口破坏的不是终态，而是
+> **时序保证**：事务在自己的记录达到多数派之前就向客户端返回了成功。
+>
+> 把它变成可观测布尔量的办法是**先让该组失去多数派，再并发写**：
+> 调用了挂钩的事务拿不到多数派会 ERROR（正确）；走提前返回、没调挂钩的事务
+> 根本不知道多数派已丢，**会提交成功**（违规）。判据 = "提交成功的行数 == 0"。
+> 这是 raft_16 第 2 步的并发版本，也正是 prepare 需要的性质。
+> raft_17 的阶段二即按此实现；但在 §9.0 的 segfault 修掉之前拿不到干净结论。
 
 **修法**（两处，缺一不可）：
 
@@ -601,7 +650,7 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 
 | 步 | 内容 | 验收 |
 |---|---|---|
-| 1 | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + prepare 语义改"等复制点" | **raft_17**：并发负载（多 backend 同分区）下，每个 INSERT 返回时其记录必已在多数派 fsync；对照实验证明修复前会漏 |
+| 1 ⚠️ | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + 本组复制串行化 | 代码已落地（2026-08-03），raft_01–16 无回退。**但验收未完成**：raft_17 的判据被 §9.0 的 segfault 污染，拿不到可信的对照实验 |
 | 2 | **成员集显式化**（§9.2）：过渡断言，空成员集组拒绝参与 2PC | 副本集为全体真子集的组，quorum 按真实成员数计算 |
 | 3 | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | 全新库 `CREATE EXTENSION` 冒烟；follower 侧 DTX 记录 flags 保真 |
 | 4 | **决议层**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护；**补丁 0004** + master 挂点；关 Citus 2PC 恢复 | **raft_18**：prepare 后 decide 前杀协调者 → 全体推定中止；decide 落盘后杀协调者 → 参与者经恢复得 COMMIT |

@@ -31,6 +31,7 @@
 #include "executor/spi.h"
 #include "storage/ipc.h"
 #include "storage/fd.h"
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
@@ -113,6 +114,8 @@ typedef struct RaftGroupState
     bool                hs_loaded;      /* HardState 是否已从文件恢复进 shmem */
     bool                report_pending; /* 数据组新任 leader 尚未向控制面登记（tick 里重试投递） */
     int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
+    bool                replicate_in_progress; /* 本组的 prepare 复制正在进行（串行化，见 replicate_claim） */
+    int                 replicate_pid;         /* 持有者 backend PID；持有者消失时由等待者回收 */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
     RaftConsensusShmem  cons;
@@ -242,6 +245,10 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.last_applied = 0;
     g->log.repl_inited = false;
     g->log.apply_in_progress = false;
+
+    g->last_data_plsn = 0;
+    g->replicate_in_progress = false;
+    g->replicate_pid = 0;
 }
 
 void
@@ -2968,6 +2975,11 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     {
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
+        elog(WARNING,
+             "pg_raft: 组 %lld 读不到本地 parwal 记录 plsn=%lld(local_oid=%lld)——"
+             "该 partition_lsn 在本节点不存在",
+             (long long) ctx->group_id, (long long) partition_lsn,
+             (long long) local_oid);
         return 0;
     }
     orig_lsn = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
@@ -2994,7 +3006,28 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
 
     pfree(payload.data);
 
-    if (idx > 0 && partition_lsn > ctx->g->last_data_plsn)
+    if (idx <= 0)
+    {
+        int state;
+        int64 last_idx, commit_idx, applied;
+
+        SpinLockAcquire(&ctx->cons->mutex);
+        state = ctx->cons->state;
+        SpinLockRelease(&ctx->cons->mutex);
+        SpinLockAcquire(&ctx->log->mutex);
+        last_idx = ctx->log->last_log_index;
+        commit_idx = ctx->log->commit_index;
+        applied = ctx->log->last_applied;
+        SpinLockRelease(&ctx->log->mutex);
+
+        elog(WARNING,
+             "pg_raft: 组 %lld propose plsn=%lld 失败(state=%d last_log_index=%lld "
+             "commit_index=%lld last_applied=%lld 环容量=%d 成员数=%d)",
+             (long long) ctx->group_id, (long long) partition_lsn, state,
+             (long long) last_idx, (long long) commit_idx, (long long) applied,
+             RAFT_LOG_CAPACITY, group_cluster_size(ctx));
+    }
+    else if (partition_lsn > ctx->g->last_data_plsn)
         ctx->g->last_data_plsn = partition_lsn;
     return idx;
 }
@@ -3028,6 +3061,98 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
         PG_RETURN_INT64(0);
 
     PG_RETURN_INT64(data_propose_one(&ctx, partition_lsn));
+}
+
+/*
+ * 本组 prepare 复制的串行化（DTX_2PC_DESIGN.md §9.1）。
+ *
+ * 为什么需要：让路窗口修复之后，并发 backend 不再各自提前返回，而是**都会**
+ * 对同一个分区调用复制挂钩。若不串行，两个 backend 会同时读到同一个
+ * last_data_plsn 并各自 propose 同一段 plsn —— 字节层面无害（follower 落盘幂等、
+ * apply 单调），但每条重复提案都白占一个 RAFT_LOG_CAPACITY(128) 的环槽位，
+ * 高并发下会把环烧满并触发背压。串行之后，后到者进入临界区时 last_data_plsn
+ * 已被推进，循环直接空转返回。
+ *
+ * 回收：正常路径由 PG_FINALLY 释放（覆盖 ERROR）；持有者 FATAL/被杀时其
+ * PGPROC 消失，等待者按 BackendPidGetProc() 回收（liveness 检查必须在**出
+ * 自旋锁之后**做 —— 它内部要拿 ProcArrayLock，自旋锁下不允许再取 LWLock）。
+ * 硬崩溃走 postmaster 全局重启，shmem 重建，无残留。
+ *
+ * 复用 RaftGroups->mutex：它原本只护注册表（in_use/group_id/members），
+ * 这里扩到"每组的复制认领位"。二者都是短临界区、无嵌套取锁，安全。
+ */
+#define RAFT_REPLICATE_CLAIM_TIMEOUT_MS  60000
+
+static void
+replicate_claim(RaftGroupCtx *ctx)
+{
+    long waited_us = 0;
+
+    for (;;)
+    {
+        bool got = false;
+        int  holder = 0;
+
+        SpinLockAcquire(&RaftGroups->mutex);
+        if (!ctx->g->replicate_in_progress)
+        {
+            ctx->g->replicate_in_progress = true;
+            ctx->g->replicate_pid = MyProcPid;
+            got = true;
+        }
+        else
+            holder = ctx->g->replicate_pid;
+        SpinLockRelease(&RaftGroups->mutex);
+
+        if (got)
+            return;
+
+        /* 持有者还活着吗？（出锁后做：BackendPidGetProc 会取 ProcArrayLock） */
+        if (holder != 0 && holder != MyProcPid &&
+            BackendPidGetProc(holder) == NULL)
+        {
+            SpinLockAcquire(&RaftGroups->mutex);
+            if (ctx->g->replicate_in_progress &&
+                ctx->g->replicate_pid == holder)
+            {
+                ctx->g->replicate_pid = MyProcPid;
+                got = true;
+            }
+            SpinLockRelease(&RaftGroups->mutex);
+
+            if (got)
+            {
+                elog(WARNING,
+                     "pg_raft: 组 %lld 的复制认领位由已消失的 backend %d 持有，已回收",
+                     (long long) ctx->group_id, holder);
+                return;
+            }
+        }
+
+        if (waited_us >= RAFT_REPLICATE_CLAIM_TIMEOUT_MS * 1000L)
+            ereport(ERROR,
+                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                     errmsg("pg_raft: 等待组 %lld 的复制认领位超过 %d ms，prepare 失败",
+                            (long long) ctx->group_id,
+                            RAFT_REPLICATE_CLAIM_TIMEOUT_MS),
+                     errdetail("持有者 backend %d 可能卡在对端 RPC 上。", holder)));
+
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(1000L);       /* 1ms */
+        waited_us += 1000L;
+    }
+}
+
+static void
+replicate_release(RaftGroupCtx *ctx)
+{
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (ctx->g->replicate_in_progress && ctx->g->replicate_pid == MyProcPid)
+    {
+        ctx->g->replicate_in_progress = false;
+        ctx->g->replicate_pid = 0;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
 }
 
 /*
@@ -3110,40 +3235,65 @@ pg_raft_partwal_replicate(Oid partition_id)
     if (cur <= 0)
         return;
 
-    /* 增量下界：优先用运行期游标；重启后从环内最后一条 OP_PARWAL 回推 */
-    last = ctx.g->last_data_plsn;
-    if (last == 0)
+    /*
+     * cur 是取自本地 parwal 的当前 flush 点，它必然 >= 本事务刚落盘的那些记录的
+     * partition_lsn —— group commit 让路时本事务的记录是被并发 backend 写下去的，
+     * 但"写下去"发生在 flushed_upto 推进之前，所以到这里 cur 已经覆盖它们。
+     * 因此"复制到 cur"是覆盖本事务的安全上界（DTX_2PC_DESIGN.md §9.1）。
+     */
+    replicate_claim(&ctx);
+    PG_TRY();
     {
-        int64 p;
-
-        SpinLockAcquire(&ctx.log->mutex);
-        for (p = ctx.log->last_log_index; p > 0 &&
-             p > ctx.log->last_log_index - RAFT_LOG_CAPACITY; p--)
+        /*
+         * 增量下界必须在**进入临界区之后**重新读取：等待期间并发 backend
+         * 很可能已经把这一段（含本事务的记录）复制完了，此时循环空转即返回。
+         */
+        last = ctx.g->last_data_plsn;
+        if (last == 0)
         {
-            RaftLogEntry e;
+            int64 p;
 
-            if (log_get_entry_locked(&ctx, p, &e) &&
-                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            /* 重启后运行期游标为 0：从环内最后一条 OP_PARWAL 回推 */
+            SpinLockAcquire(&ctx.log->mutex);
+            for (p = ctx.log->last_log_index; p > 0 &&
+                 p > ctx.log->last_log_index - RAFT_LOG_CAPACITY; p--)
             {
-                last = entry_partition_lsn(e.payload);
-                break;
+                RaftLogEntry e;
+
+                if (log_get_entry_locked(&ctx, p, &e) &&
+                    strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+                {
+                    last = entry_partition_lsn(e.payload);
+                    break;
+                }
             }
+            SpinLockRelease(&ctx.log->mutex);
+            if (last > 0)
+                ctx.g->last_data_plsn = last;
         }
-        SpinLockRelease(&ctx.log->mutex);
-        if (last > 0)
-            ctx.g->last_data_plsn = last;
-    }
 
-    for (plsn = last + 1; plsn <= cur; plsn++)
+        for (plsn = last + 1; plsn <= cur; plsn++)
+        {
+            /*
+             * group_propose 只在拿到多数派 ack 之后才返回 idx > 0，而 follower
+             * 是**先 fsync 再 ack** 的（运输层加固 §11.5.1 #1/#3）——所以
+             * "返回成功" 严格等价于 "该条目已在多数派持久化"，即用户方案
+             * 阶段 1 第 4 步的 prepared 语义。不需要再单独等 commit_index。
+             */
+            int64 idx = data_propose_one(&ctx, plsn);
+
+            if (idx <= 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                         errmsg("pg_raft: 分区 %u(组 %lld) record %lld 复制未达多数派，prepare 失败，事务中止",
+                                partition_id, (long long) gid, (long long) plsn)));
+        }
+    }
+    PG_FINALLY();
     {
-        int64 idx = data_propose_one(&ctx, plsn);
-
-        if (idx <= 0)
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("pg_raft: 分区 %u(组 %lld) record %lld 复制未达多数派，prepare 失败，事务中止",
-                            partition_id, (long long) gid, (long long) plsn)));
+        replicate_release(&ctx);
     }
+    PG_END_TRY();
 }
 
 /*

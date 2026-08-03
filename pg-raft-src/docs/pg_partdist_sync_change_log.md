@@ -283,3 +283,55 @@
   增量在该分区下一次写入时补齐（详见计划文档 §14.3）。
 - 验证：raft_16（自动复制/失多数派拒 prepare/恢复追平）+ raft_01–15 回归 +
   全新库 CREATE EXTENSION 冒烟。
+
+## 2026-08-03
+
+### 修复 group commit 让路窗口（DTX-2PC 第 1 步）
+
+- 修改时间：2026-08-03
+- 修改文件：`pg-partdist-src/src/wal/partwal_sync.c`
+- 依据：`pg-partdist-src/docs/DTX_2PC_DESIGN.md` §9.1
+- 背景：上一条（2026-07-24）末尾把"group commit 让路窗口"记为**边界**，
+  说"增量在该分区下一次写入时补齐"。**这个定性是错的，它是正确性缺陷。**
+  两条独立的成因：
+  1. 触达集合只统计 `slot->backend_id == MyBackendId` 的槽位 ⇒ backend X
+     顺带落盘 backend Y 的槽位时，**Y 的分区不在 X 的复制范围里**；
+  2. Y 随后看到 `flushed_upto` 已覆盖自己，走提前返回分支 ⇒ **复制挂钩
+     根本不被调用**。
+  合起来：Y 的记录落了盘、事务提交成功、却没有任何人把它复制出去。
+  无 2PC 时表现为复制延后；有 2PC 时协调者会据此写 COMMIT 决议 —— 丢数据。
+- 修改内容：
+  1. 触达集合改为 **per-backend 在 `PartWALInsert` 时登记**
+     （`PartWALNoteTouched`，出 `PartWALCtl->lock` 后调用，内部 palloc），
+     不再于 flush 时从环形缓冲区反推；数组按需增长，不再有 64 个/事务的上限；
+  2. `PartWALFlush` 的**提前返回路径也调用复制挂钩**
+     （`PartWALReplicateTouched`）。该路径上 `flushed_upto >= upto_lsn` 是在
+     持锁状态、writer 析构（含 fsync）之后才推进的，所以 [A] 对本事务同样成立，
+     复制是安全且必需的；
+  3. 顺带修掉提前返回路径不释放 `partwal_pending` 的问题（此前该路径下
+     捕获的 WAL 字节副本会一直挂到下一次 flush/abort，会话内累积）。
+- 对 Raft/failover/PartWAL 行为的影响：
+  - PartWAL 的落盘/fsync/编号语义**无任何变化**；
+  - 未装载 pg_raft 时行为完全一致（挂钩指针为空即返回）；
+  - 有数据组的分区：并发写入下"提交返回时多数派已持久化"从"最终一致"
+    收紧为**真正的 prepare 语义**；
+  - 提前返回路径新增一次 SPI（挂钩内部查 global_shard_id / flush lsn），
+    这是必需的开销。
+- 配套（pg_raft 侧，不属本台账但一并记）：`pg_raft_partwal_replicate()` 增加
+  本组复制的串行化认领位，避免并发 backend 抢同一段 `partition_lsn` 重复提案
+  烧掉 `RAFT_LOG_CAPACITY=128` 的环槽位；持有者 backend 消失时由等待者按
+  `BackendPidGetProc()` 回收。
+- 验证现状（**如实记录，验收未完成**）：raft_01–16 在修复版上无回退（46/1，
+  唯一的 raft_15 失败在同构建重跑即通过，判为 flake）。新增
+  `raft_17_concurrent_prepare_quorum`，但**尚未拿到可信的对照实验**：
+  1. 最初的判据（burst 后断言 follower 逐字节追平）**测不出这个缺陷** ——
+     漏掉的记录会被增量下界在下一次非提前返回的 flush 里补齐，终态几乎总是
+     收敛，实测**修复前的构建照样通过**。判据已改为"失多数派 + 并发写 ⇒
+     提交成功行数必须为 0"（见 `DTX_2PC_DESIGN.md` §9.1 的方框）。
+  2. 新判据的验证被一个**新发现的 segfault** 阻断：6 路并发单行 INSERT 打同一
+     Citus 分片必崩（3/3），**不需要 raft 组**、**修复前后都崩**。崩溃会重置
+     shmem 组表，之后的 INSERT 因"查不到数据组"跳过挂钩并提交成功 ——
+     与让路窗口的症状无法区分。详见 `DTX_2PC_DESIGN.md` §9.0。
+  结论：本次改动的**正确性由代码路径本身确定**（提前返回分支不调挂钩、
+  触达集合看不到被 peer 消费的槽位，两点在代码里都是无歧义的），
+  但**端到端验收要等 segfault 修掉之后补做**。

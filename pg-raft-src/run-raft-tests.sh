@@ -1,13 +1,52 @@
 #!/usr/bin/env bash
-# [宿主机] 四节点 pg_raft 控制面回归(master:5432 + worker1-3:5433-5435)
-# 适配 shardpg-3.0 的 raft4 环境;pg_partdist 数据面回归请用 pg-partdist-src/sim/。
+# [宿主机] pg_raft 控制面回归。
+#
+# 拓扑自适应(2026-08-03)：此前硬编码四节点(master:5432 + worker1-3:5433-5435)，
+# 只能在 shardpg-3.0 的 raft4 环境跑；现按容器里 pg-cluster-data/ 的实际目录
+# 探测协调节点目录名与 worker 数量，从而同时支持
+#   raft4      : master      + worker1-3  (5432-5435)
+#   pg_citus_raft: coordinator + worker1-8  (5432-5440)
+# 也可用环境变量强制：CONTAINER / COORD_DIR / N_WORKERS / BASE_PORT。
+# 节点 id ↔ 端口的约定不变：node N ↔ BASE_PORT + N - 1，node 1 = 协调节点。
+#
+# quorum 相关的编排本身与节点数无关（raft_05 停掉"除 leader 外全部节点"；
+# 数据组用例用显式 3 成员组），所以只需要把映射函数改成算术即可。
+#
+# pg_partdist 数据面回归请用 pg-partdist-src/sim/。
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-pg-partdist-raft4-container}"
 PSQL="docker exec -u postgres ${CONTAINER} /work/pg-install/bin/psql"
 PG_CTL="docker exec -u postgres ${CONTAINER} /work/pg-install/bin/pg_ctl"
 RAFT_TEST_DIR="/work/pg-raft-src/test/sql"
-NODE_PORTS=(5432 5433 5434 5435)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_PORT="${BASE_PORT:-5432}"
+
+# 协调节点的数据目录名：raft4 叫 master，pg_citus_raft 叫 coordinator
+if [[ -z "${COORD_DIR:-}" ]]; then
+  if docker exec "$CONTAINER" test -d /work/pg-cluster-data/master 2>/dev/null; then
+    COORD_DIR=master
+  else
+    COORD_DIR=coordinator
+  fi
+fi
+
+# worker 数量：数 pg-cluster-data 下的 worker 目录（排除同名 .log 文件）
+if [[ -z "${N_WORKERS:-}" ]]; then
+  N_WORKERS=$(docker exec "$CONTAINER" bash -lc \
+    "find /work/pg-cluster-data -maxdepth 1 -type d -name 'worker*' | wc -l" 2>/dev/null || echo 3)
+  N_WORKERS=${N_WORKERS//[^0-9]/}
+  [[ -n "$N_WORKERS" && "$N_WORKERS" -gt 0 ]] || N_WORKERS=3
+fi
+
+N_NODES=$((N_WORKERS + 1))
+NODE_PORTS=()
+for ((_i = 0; _i < N_NODES; _i++)); do
+  NODE_PORTS+=($((BASE_PORT + _i)))
+done
+
+echo "拓扑：容器=${CONTAINER} 协调节点目录=${COORD_DIR} 节点数=${N_NODES}(1c+${N_WORKERS}w) 端口=${NODE_PORTS[0]}-${NODE_PORTS[$((N_NODES - 1))]}"
+
 PASS=0
 FAIL=0
 
@@ -16,33 +55,21 @@ bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
 section() { echo ""; echo "========== $* =========="; }
 
 raft_port_for_node() {
-  case "$1" in
-    1) echo 5432 ;;
-    2) echo 5433 ;;
-    3) echo 5434 ;;
-    4) echo 5435 ;;
-    *) return 1 ;;
-  esac
+  local n=$1
+  (( n >= 1 && n <= N_NODES )) || return 1
+  echo $((BASE_PORT + n - 1))
 }
 
 raft_node_name_for_port() {
-  case "$1" in
-    5432) echo master ;;
-    5433) echo worker1 ;;
-    5434) echo worker2 ;;
-    5435) echo worker3 ;;
-    *) return 1 ;;
-  esac
+  local n=$(( $1 - BASE_PORT + 1 ))
+  (( n >= 1 && n <= N_NODES )) || return 1
+  if (( n == 1 )); then echo "$COORD_DIR"; else echo "worker$((n - 1))"; fi
 }
 
 raft_node_id_for_port() {
-  case "$1" in
-    5432) echo 1 ;;
-    5433) echo 2 ;;
-    5434) echo 3 ;;
-    5435) echo 4 ;;
-    *) return 1 ;;
-  esac
+  local n=$(( $1 - BASE_PORT + 1 ))
+  (( n >= 1 && n <= N_NODES )) || return 1
+  echo "$n"
 }
 
 node_start() {
@@ -1159,6 +1186,26 @@ else
   bad "raft_16_prepare_auto_replicate(${RAFT_16_WHY})"
 fi
 raft16_cleanup
+
+# ------------------------------------------------------------------
+# raft_17: 并发 prepare 的多数派保证(group commit 让路窗口)
+# 用例本体在 test/raft_17_concurrent_prepare_quorum.sh —— 它自带夹具与清理,
+# 也可独立跑(迭代时不必等整套跑完)。判据是"持有完整前缀的成员数 >= 多数派",
+# 不是"全体 follower 追平" —— Raft 只保证 quorum,且本项目尚无后台追平通道。
+# ------------------------------------------------------------------
+section "raft_17 并发 prepare 的多数派保证"
+
+start_all_nodes
+sleep 2
+RAFT_17_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_17_concurrent_prepare_quorum.sh" 2>&1) && RAFT_17_RC=0 || RAFT_17_RC=$?
+echo "$RAFT_17_OUT" | sed 's/^/    /'
+if [[ "$RAFT_17_RC" -eq 0 ]]; then
+  ok "raft_17_concurrent_prepare_quorum"
+else
+  bad "raft_17_concurrent_prepare_quorum($(echo "$RAFT_17_OUT" | tail -1))"
+fi
+
 
 # ------------------------------------------------------------------
 section "汇总"
