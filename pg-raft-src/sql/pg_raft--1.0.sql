@@ -142,6 +142,14 @@ CREATE OR REPLACE FUNCTION dtx_status(
 ) RETURNS integer LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_status';
 
+CREATE OR REPLACE FUNCTION dtx_recover_prepared(
+    p_timeout_ms integer DEFAULT 30000
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_recover_prepared';
+
+COMMENT ON FUNCTION dtx_recover_prepared(integer) IS
+    '参与者侧恢复守护：扫描本节点超时未闭合的 shardpg_dtx_* prepared 事务，向协调组问决议并 COMMIT/ROLLBACK PREPARED，同时补写 DTX_COMMIT/ABORT 标记。问不到决议时保持 prepared 不动（推定中止的权力只在协调组手里）。返回本轮处理数。';
+
 COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
     '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';
 

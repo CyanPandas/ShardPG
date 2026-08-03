@@ -518,3 +518,61 @@ make 会静默跳过重编，install 装的还是旧 .so —— A/B 对照实验
 - 验证：9 节点全量 **51/51 全绿**（raft_01–20）。新增 `test/raft_20_dtx_decision.sh`
   （A 非 leader 拒绝且不留痕 / B 决议在全部成员上均在 / C 决议槽一次性 /
   D 推定中止 / E 协调组切主后仍可查）。
+
+### DTX-2PC 第 5a 步：参与者侧恢复守护（2026-08-03）
+
+- 修改文件：**仅 pg-raft-src 侧**（`src/raft_consensus.c` 的
+  `dtx_recover_prepared` / `dtx_ask_coordinator` / `dtx_parse_gid`，
+  以及 `sql/pg_raft--1.0.sql` 的声明）。记在本台账是因为它
+  **读 `partdist.partition_map` 做协调组寻址、写 `partdist` 的 parwal 标记记录**。
+- 机制：扫描本节点超时未闭合的 `shardpg_dtx_*` prepared 事务 → 从 gid 解析
+  `(dtxid, coord_gsid)` → 按 `partition_map[coord_gsid].primary_node` 寻址协调组
+  现任 leader → `dtx_status` 问决议 → `COMMIT/ROLLBACK PREPARED` + 补
+  `DTX_COMMIT/ABORT` 标记。问不到决议时**保持 prepared 不动**——推定中止的
+  权力只在协调组手里（由它先写 ABORT 决议达多数派）。
+  寻址走 partition_map 是决议放数据组的直接收益：协调者宕机后自治选举+上报会
+  实时更新它，寻址自动指向新 leader。
+
+- **实施中踩的三个坑（都值得记）**：
+  1. **gid 匹配永远匹配不到**：写成
+     `LIKE 'shardpg_dtx=%%' ESCAPE '='`，本意是躲开 `appendStringInfo` 的
+     格式化，两层转义叠加后变成匹配**字面量** `shardpg_dtx%`，恢复守护静默空转。
+     改用 `strpos(gid, 'shardpg_dtx_') = 1`，彻底绕开转义。
+  2. **`COMMIT/ROLLBACK PREPARED` 不能经 SPI 执行**：它们不允许出现在事务块里，
+     而 SQL 函数体永远在调用方事务里。改为像 TopologyMonitor 的 self-probe 那样
+     经 libpq 连回本节点，让它作为**顶层语句**执行。
+  3. **prepared 事务的行锁把决议路径锁死（最严重，设计级）**：见下条。
+
+### 【重要】prepared 事务的行锁与 inline apply 的冲突
+
+- 症状：分片上存在 prepared 事务时，`dtx_decide` **永久阻塞**在
+  `Lock / transactionid`；`pg_locks` 显示它持着
+  `partdist.follower_partition_map` 的 `RowExclusiveLock`。
+- 根因：prepare 路径在**用户事务内**触发复制（`PartWALFlush` 挂钩），
+  而 `group_apply_pending()` 会 UPSERT `follower_partition_map` 的进度行；
+  事务随后进入 PREPARED 状态，**行锁一直被持有**。2PC 的基本形态恰恰是
+  "prepare 后保持 in-doubt、再做决议"，协调者的复制又触发 apply 去改同一行，
+  于是撞锁永久等待。**只要 2PC 成立就必然出现，不是夹具问题。**
+- 修复（**两次修错后才收敛**，两次都记下来）：
+  1. 第一版只挡 `group_propose` **尾部**的 `group_apply_pending()` —— 不够，
+     它开头还有一个（防重启后误判环满），同样在用户事务里；`dtx_decide` 依旧
+     阻塞，靠 `pg_locks` 看到它持着 `follower_partition_map` 的
+     `RowExclusiveLock` 才定位到。
+  2. 第二版改成"用户事务内整个跳过 apply"。**代价被严重低估**：写入负载下
+     每次 propose 都在用户事务里，`last_applied` 永不推进，环容量检查很快判满
+     拒收新条目 —— raft_17 实测 follower 卡死在 **127**
+     （`RAFT_LOG_CAPACITY=128`），是稳定复现的吞吐塌陷而非偶发。
+  3. 最终**收敛到只跳过 `data_entry_apply` 里对 `follower_partition_map` 的
+     进度 UPSERT**（唯一会与 prepared 事务撞锁的语句），游标照常推进、
+     DTX 决议索引照常维护。
+- 影响评估：本节点这张表的 `applied_part_lsn` 在纯 2PC 负载下会滞后；
+  **follower 侧不受影响**（它们的 apply 跑在 `pg_raft_append_entries` 这个顶层
+  SQL 调用里，不在任何 prepared 事务内）。该列服务于切主候选筛选，滞后只会让
+  本节点显得"没追平"，是**保守方向**。**`commit_index` 与多数派持久化不变，
+  提交点语义完全不变。**
+- 教训与并发三缺陷同源：**只有真把形态跑起来，设计上的隐含耦合才会暴露**。
+  这条在 raft_20（决议层单独验收、无 prepared 事务参与）时完全测不出来。
+
+- 验证：新增 `test/raft_21_dtx_recovery.sh`（A 有决议⇒提交+DTX_COMMIT 标记 /
+  B 无决议⇒推定中止+DTX_ABORT 标记且决议落库 / C 未超时不被触碰 /
+  D 协调组不可达⇒保持 prepared 不动）。

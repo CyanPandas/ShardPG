@@ -31,6 +31,7 @@
 #include "executor/spi.h"
 #include "storage/ipc.h"
 #include "storage/fd.h"
+#include "postmaster/postmaster.h"   /* PostPortNumber：dtx 恢复连回本节点 */
 #include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
@@ -71,6 +72,28 @@
  */
 #define PARTWAL_FLAG_DATA  1
 #define PARTWAL_FLAG_DTX   8
+
+/*
+ * ★ 用户事务内的复制路径不做 inline apply（2026-08-03 实测的 2PC 死锁）。
+ *
+ * 症状：分片上存在 prepared 事务时，`dtx_decide` **永久阻塞**在
+ * `Lock / transactionid`。
+ *
+ * 根因：prepare 路径在**用户事务内**触发复制（PartWALFlush 的挂钩），而
+ * group_propose 末尾的 group_apply_pending() 会 UPSERT
+ * `partdist.follower_partition_map` 的进度行；该事务随后进入 PREPARED 状态，
+ * **这把行锁就一直被持有**。而 2PC 恰恰要求事务在等决议期间保持 prepared——
+ * 协调者的 dtx_decide 自己复制时再触发 apply，就撞上那把锁，永久等待。
+ * 这不是夹具问题：只要"prepare 后保持 in-doubt、再做决议"这个 2PC 基本形态
+ * 成立，就必然撞上。
+ *
+ * 处置：用户事务内的复制路径（prepare 挂钩、dtx 决议）跳过 inline apply。
+ * 进度游标是**单调幂等**的，推迟到下一次 client backend 路径再推进无损；
+ * 代价只是 applied_part_lsn 比 commit_index 落后一小段，而它本就允许滞后
+ * （切主安全线比的是"谁追平了"）。commit_index 与多数派持久化不受影响——
+ * **提交点语义完全不变**。
+ */
+static bool in_txn_replication = false;
 #define RAFT_HARDSTATE_MAGIC   UINT32_C(0x52484654)
 /*
  * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
@@ -793,12 +816,35 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
     if (!raft_persist_spi_begin(&spi_owned))
         return false;           /* 拿不到 SPI（如 BGW），下轮再来 */
 
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
-                     (unsigned) local_oid, (long long) plsn);
-    ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
-    pfree(sql.data);
+    /*
+     * ★ 只有这条会与 prepared 事务撞锁，所以只跳过它（in_txn_replication）。
+     *
+     * 冲突链：prepare 路径在用户事务内触发复制 → apply → UPSERT
+     * `follower_partition_map` 的进度行 → 事务进入 PREPARED，**行锁一直被持有**
+     * → 协调者 dtx_decide 的复制再触发 apply 撞上同一行 → 永久阻塞。
+     *
+     * 初版是"用户事务内整个跳过 group_apply_pending"，太粗暴：写入负载下每次
+     * propose 都在用户事务里，`last_applied` 永不推进，环容量检查
+     * （last_log_index - last_applied）很快判满、拒收新条目 —— raft_17 实测
+     * follower 卡死在 127（RAFT_LOG_CAPACITY=128）。
+     *
+     * 现在只跳过这条 SQL，**游标照常推进、DTX 决议索引照常维护**，
+     * 环不会被撑满。代价：本节点这张表里的 applied_part_lsn 在纯 2PC 负载下
+     * 会滞后（follower 侧不受影响——它们的 apply 跑在 pg_raft_append_entries
+     * 这个顶层 SQL 调用里，不在任何 prepared 事务内）。该列服务于切主候选
+     * 筛选，滞后只会让本节点显得"没追平"，是保守方向，不会误判为已追平。
+     */
+    if (in_txn_replication)
+        ok = true;
+    else
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
+                         (unsigned) local_oid, (long long) plsn);
+        ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
+        pfree(sql.data);
+    }
 
     /*
      * ★ DTX DECISION 记录：每个组成员在 apply 它时各自把决议登记进本地
@@ -2560,6 +2606,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
      * 先把已提交的积压 apply 掉再 append：重启后恢复出的 last_applied 可能
      * 远低于环窗口，此时容量检查(last_log_index - last_applied)会误判环满、
      * 拒绝一切新提案；group_apply_pending 里的控制面快进会先把游标追平。
+     *
      */
     group_apply_pending(ctx);
 
@@ -3682,6 +3729,7 @@ pg_raft_partwal_replicate(Oid partition_id)
      * 因此"复制到 cur"是覆盖本事务的安全上界（DTX_2PC_DESIGN.md §9.1）。
      */
     replicate_claim(&ctx);
+    in_txn_replication = true;
     PG_TRY();
     {
         /*
@@ -3692,6 +3740,7 @@ pg_raft_partwal_replicate(Oid partition_id)
     }
     PG_FINALLY();
     {
+        in_txn_replication = false;
         replicate_release(&ctx);
     }
     PG_END_TRY();
@@ -3963,6 +4012,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     parts_sql = dtx_participants_sql(parts);
 
     replicate_claim(&ctx);
+    in_txn_replication = true;
     PG_TRY();
     {
         /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
@@ -3975,6 +4025,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     }
     PG_FINALLY();
     {
+        in_txn_replication = false;
         replicate_release(&ctx);
     }
     PG_END_TRY();
@@ -4016,6 +4067,7 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
 
     parts_sql = dtx_participants_sql(NULL);
     replicate_claim(&ctx);
+    in_txn_replication = true;
     PG_TRY();
     {
         existing = dtx_lookup_decision(dtxid);
@@ -4028,10 +4080,291 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
     }
     PG_FINALLY();
     {
+        in_txn_replication = false;
         replicate_release(&ctx);
     }
     PG_END_TRY();
 
     pfree(parts_sql);
     PG_RETURN_INT32(existing);
+}
+
+/* ================================================================== */
+/* DTX-2PC 恢复守护（参与者侧，DTX_2PC_DESIGN.md §7）                  */
+/* ================================================================== */
+
+/*
+ * gid 编码：shardpg_dtx_<dtxid>_<coord_gsid>（§5.4）
+ *
+ * 为什么把 dtx 信息编进 gid：参与者**崩溃重启后**唯一还在的线索就是
+ * pg_prepared_xacts —— 它是 PG 原生持久化的。任何放在本地表里的映射都可能
+ * 与 prepared 事务不同步，而 gid 与 prepared 事务同生共死。
+ */
+static bool
+dtx_parse_gid(const char *gid, int64 *dtxid, int64 *coord_gsid)
+{
+    long long d = 0, c = 0;
+
+    if (gid == NULL)
+        return false;
+    if (sscanf(gid, "shardpg_dtx_%lld_%lld", &d, &c) != 2)
+        return false;
+    if (d <= 0 || c <= 0)
+        return false;
+    *dtxid = (int64) d;
+    *coord_gsid = (int64) c;
+    return true;
+}
+
+/*
+ * 向协调组现任 leader 问决议。
+ *
+ * 寻址走 partdist.partition_map[coord_gsid].primary_node —— 切主重构（§13）
+ * 保证它随数据组自治选举实时更新，因此**协调者宕机后寻址自动指向新 leader**，
+ * 这正是决议放数据组、而不是放某个固定 worker 的收益。
+ *
+ * 返回 1=COMMIT / 2=ABORT / 0=问不到（对端不是 leader、连不上、元数据没追平），
+ * 0 时调用方保持 prepared 不动，下轮再问 —— 绝不擅自决定。
+ */
+static int
+dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
+{
+    StringInfoData sql;
+    bool      spi_owned;
+    bool      isnull;
+    int       coord_node = 0;
+    int       slot = -1;
+    int       i;
+    int       verdict = 0;
+    char      conninfo[256];
+    char      qry[192];
+    PGconn   *conn;
+    PGresult *res;
+
+    /* 1) 查协调组的现任 primary 节点 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node FROM partdist.partition_map "
+                     " WHERE partition_id = %llu::oid",
+                     (unsigned long long) coord_gsid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            coord_node = DatumGetInt32(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (coord_node <= 0)
+        return 0;               /* 元数据还没追平：下轮再问 */
+
+    /* 本节点就是协调者：直接本地调，省一次往返 */
+    if (coord_node == pg_raft_node_id)
+    {
+        if (!raft_persist_spi_begin(&spi_owned))
+            return 0;
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT partdist.dtx_status(%lld, %lld)",
+                         (long long) coord_gsid, (long long) dtxid);
+        if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                    SPI_tuptable->tupdesc, 1, &isnull);
+            if (!isnull)
+                verdict = DatumGetInt32(d);
+        }
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+        return verdict;
+    }
+
+    /* 2) 远端：走 libpq */
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == coord_node)
+        {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        return 0;
+
+    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                            conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return 0;               /* 协调者不可达：保持 prepared，下轮再问 */
+    }
+    snprintf(qry, sizeof(qry), "SELECT partdist.dtx_status(%lld, %lld)",
+             (long long) coord_gsid, (long long) dtxid);
+    res = PQexec(conn, qry);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        verdict = atoi(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    PQfinish(conn);
+    return verdict;
+}
+
+/*
+ * partdist.dtx_recover_prepared(timeout_ms) → int
+ *
+ * 参与者侧的恢复守护（§7）：扫描本节点上**超时未闭合**的 prepared 事务，
+ * 向协调组问决议并据此 COMMIT/ROLLBACK PREPARED，同时在该分区的 parwal 流里
+ * 补写 DTX_COMMIT / DTX_ABORT 标记。返回本轮处理掉的事务数。
+ *
+ * 超时只影响"多久开始问"，不影响正确性：与正常路径（master 驱动的阶段 3）
+ * 并发执行也安全——COMMIT PREPARED 对同一 gid 只会成功一次，标记记录按
+ * dtxid 幂等。设保守一点是为了别和正常路径抢答。
+ *
+ * 问不到决议（协调者不可达/正在选举/元数据没追平）时**保持 prepared 不动**，
+ * 绝不擅自决定——推定中止的权力只在协调组手里（由它先写 ABORT 决议达多数派）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_recover_prepared);
+
+Datum
+pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
+{
+    int32          timeout_ms = PG_ARGISNULL(0) ? 30000 : PG_GETARG_INT32(0);
+    StringInfoData sql;
+    bool           spi_owned;
+    int            handled = 0;
+    int            ntodo = 0;
+    int            i;
+    char         **gids = NULL;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT32(0);
+    parse_peers();
+
+    /* 1) 取出待处理的 gid 列表（先取完再逐个处理：处理会改 pg_prepared_xacts） */
+    if (!raft_persist_spi_begin(&spi_owned))
+        PG_RETURN_INT32(0);
+    initStringInfo(&sql);
+    /*
+     * 用 strpos 而不是 LIKE：gid 前缀里含 '_'（LIKE 的单字符通配符），
+     * 而 '%' 又要在 appendStringInfo 里转义，两层转义极易写错 ——
+     * 初版写成 LIKE 'shardpg_dtx=%%' ESCAPE '='，转义后是字面量 "shardpg_dtx%"，
+     * **永远匹配不到任何 gid**，恢复守护静默空转。
+     */
+    appendStringInfo(&sql,
+                     "SELECT gid FROM pg_prepared_xacts "
+                     " WHERE strpos(gid, 'shardpg_dtx_') = 1 "
+                     "   AND prepared < now() - interval '%d milliseconds' "
+                     " ORDER BY prepared LIMIT 64",
+                     timeout_ms);
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        ntodo = (int) SPI_processed;
+        gids = (char **) palloc(sizeof(char *) * ntodo);
+        for (i = 0; i < ntodo; i++)
+            gids[i] = SPI_getvalue(SPI_tuptable->vals[i],
+                                   SPI_tuptable->tupdesc, 1);
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    /* 2) 逐个问决议并闭合 */
+    for (i = 0; i < ntodo; i++)
+    {
+        int64 dtxid = 0;
+        int64 coord_gsid = 0;
+        int   verdict;
+        int64 local_oid = 0;
+
+        if (!dtx_parse_gid(gids[i], &dtxid, &coord_gsid))
+            continue;
+
+        verdict = dtx_ask_coordinator(coord_gsid, dtxid);
+        if (verdict != 1 && verdict != 2)
+            continue;           /* 问不到：保持 prepared，下轮再来 */
+
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+
+        /* 本分区的本地 OID（写标记记录用）；解析不到就只闭合事务 */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT partdist.local_partition_for_shard(%lld)",
+                         (long long) coord_gsid);
+        {
+            bool isnull;
+
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                        SPI_tuptable->tupdesc, 1, &isnull);
+                if (!isnull)
+                    local_oid = DatumGetInt64(d);
+            }
+        }
+        pfree(sql.data);
+
+        /*
+         * ★ COMMIT/ROLLBACK PREPARED **不能经 SPI 执行**：它们不允许出现在
+         * 事务块里，而 SQL 函数体永远在调用方的事务里 —— SPI 跑必然报
+         * "COMMIT PREPARED cannot run inside a transaction block"。
+         * 只能像 TopologyMonitor 的 self-probe 那样，经 libpq 连回本节点，
+         * 让它作为**顶层语句**执行。
+         *
+         * 先闭合事务、再补标记记录。顺序无关正确性（决议已在协调组持久化，
+         * 是终局的），但闭合优先能尽快释放 prepared 事务持有的锁。
+         */
+        {
+            char      selfconn[256];
+            char      cmd[256];
+            PGconn   *sc;
+            PGresult *sres;
+
+            pg_raft_format_conninfo("127.0.0.1", PostPortNumber,
+                                    selfconn, sizeof(selfconn));
+            sc = PQconnectdb(selfconn);
+            if (PQstatus(sc) != CONNECTION_OK)
+            {
+                elog(WARNING, "pg_raft: dtx 恢复：连回本节点失败: %s",
+                     PQerrorMessage(sc));
+                PQfinish(sc);
+                raft_persist_spi_end(spi_owned);
+                continue;
+            }
+            snprintf(cmd, sizeof(cmd), "%s PREPARED '%s'",
+                     (verdict == 1) ? "COMMIT" : "ROLLBACK", gids[i]);
+            sres = PQexec(sc, cmd);
+            if (PQresultStatus(sres) == PGRES_COMMAND_OK)
+                handled++;
+            else
+                elog(WARNING, "pg_raft: dtx 恢复：%s 失败: %s",
+                     cmd, PQerrorMessage(sc));
+            PQclear(sres);
+            PQfinish(sc);
+        }
+
+        if (local_oid > 0)
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.partwal_append_dtx_record("
+                             "%u::oid, %d, %lld::bigint, %lld::bigint)",
+                             (unsigned) local_oid,
+                             (verdict == 1) ? 3 : 4,   /* DTX_COMMIT / DTX_ABORT */
+                             (long long) dtxid, (long long) coord_gsid);
+            (void) SPI_execute(sql.data, false, 1);
+            pfree(sql.data);
+        }
+        raft_persist_spi_end(spi_owned);
+
+        elog(LOG, "pg_raft: dtx 恢复：gid=%s 决议=%s，已闭合",
+             gids[i], (verdict == 1) ? "COMMIT" : "ABORT");
+    }
+
+    PG_RETURN_INT32(handled);
 }

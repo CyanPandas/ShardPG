@@ -462,8 +462,50 @@ Citus router 到单分片 ⇒ **快路径**（§3.4），一轮 quorum，不碰�
 
 ## 9. 隐患清单
 
-按严重度排序。#0 / #1 / #2 是开工前必须先修的，**均已于 2026-08-03 修复并验收**；
-#3 起为尚未处理项。
+按严重度排序。#0 / #1 / #2 / #2.5 均已于 2026-08-03 修复并验收；#3 起为尚未处理项。
+
+### 9.2.5 【已修复】prepared 事务的行锁把决议路径锁死（2026-08-03，实施第 5 步时发现）
+
+**症状**：分片上存在 prepared 事务时，`dtx_decide` **永久阻塞**在
+`Lock / transactionid`（等那个 prepared 事务结束）。
+
+**根因**：prepare 路径在**用户事务内**触发复制（`PartWALFlush` 的挂钩），而
+`group_propose` 末尾的 inline `group_apply_pending()` 会 UPSERT
+`partdist.follower_partition_map` 的进度行。该事务随后进入 PREPARED 状态，
+**这把行锁就一直被持有**。
+
+而 2PC 的基本形态恰恰是"prepare 之后保持 in-doubt、再由协调者做决议"——
+协调者 `dtx_decide` 自己的复制又会触发 apply、去 UPSERT 同一行，于是撞上
+prepared 事务的行锁，永久等待。**这不是测试夹具的问题**：只要 2PC 成立，
+这条死锁就必然出现，它会阻断整个端到端流程。
+
+**修复（收敛到唯一真正冲突的那条语句）**：用户事务内的复制路径
+（prepare 挂钩、`dtx_decide`、`dtx_status`）跳过 `data_entry_apply` 里
+**对 `follower_partition_map` 的进度 UPSERT**（`in_txn_replication` 标志），
+其余照旧——**游标照常推进、DTX 决议索引照常维护**。
+
+> **★ 两次修错，都值得记下来：**
+> 1. 第一版只挡 `group_propose` **尾部**的 `group_apply_pending()`。不够 ——
+>    它**开头**还有一个（"先把积压 apply 掉再 append"，防重启后误判环满），
+>    同样跑在用户事务里。`dtx_decide` 依旧阻塞，靠 `pg_locks` 看到它正持着
+>    `partdist.follower_partition_map` 的 `RowExclusiveLock` 才定位到。
+> 2. 第二版改成"用户事务内整个跳过 apply"。**这个代价我严重低估了**：
+>    写入负载下每次 propose 都在用户事务里，`last_applied` 于是**永不推进**，
+>    环容量检查（`last_log_index - last_applied`）很快判满、拒收新条目 ——
+>    raft_17 实测 follower 卡死在 **127**（`RAFT_LOG_CAPACITY = 128`）。
+>    这不是"重启后偶发"，是稳定复现的吞吐塌陷。
+>
+> 最终收敛到只跳过那一条 UPSERT：它是**唯一**会与 prepared 事务撞锁的东西。
+
+代价：本节点这张表里的 `applied_part_lsn` 在纯 2PC 负载下会滞后。
+**follower 侧不受影响**——它们的 apply 跑在 `pg_raft_append_entries` 这个顶层
+SQL 调用里，不在任何 prepared 事务内。该列服务于切主候选筛选，滞后只会让本
+节点显得"没追平"，是**保守方向**，不会把没追平的误判成已追平。
+**`commit_index` 与多数派持久化不受影响——提交点语义完全不变。**
+
+> 教训与 §9.0 同源：**只有真的把形态跑起来，设计上的隐含耦合才会暴露**。
+> 这条在"决议层单独验收"（raft_20，没有 prepared 事务参与）时完全测不出来，
+> 必须等 raft_21 把 prepared 事务和决议放到一起才现形。
 
 ### 9.0 【已修复】并发写入路径的三个隐藏缺陷（2026-08-03 发现并全部修复）
 
@@ -757,7 +799,15 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 | 3 ✅ | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | **raft_19 四段全过**：A 全新库 `CREATE EXTENSION` + 四个函数签名；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/info 载子类型、DECISION 载荷往返；C 对 DATA 调 `read_dtx` 返回 NULL；D **两个 follower 的 flags/info 序列与 leader 完全一致** |
 | 4a ✅ | **决议层本体**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护 | **raft_20 五段全过**：A 非协调组 leader 调 decide 返回 NULL 且不留痕；B **COMMIT 决议返回后 DECISION 记录与索引在协调组全部成员上均在**（= 已在多数派持久化，全局提交点）；C 决议槽一次性；D 推定中止先写 ABORT 再答复、此后 COMMIT 无法翻盘；E **协调组切主后两笔决议仍可查**（协调权随 Raft 选举自动转移，无需状态搬迁） |
 | 4b ⏸ | **补丁 0004 + master 挂点 + 关 Citus 2PC 恢复** | **暂缓**，理由见 §9.3 的落地评估 |
-| 5 | **恢复守护 + 快路径 + 只读参与者剔除** | **raft_19**：协调组切主后决议仍可查、任期栅栏拦下旧 leader 的幽灵决议；单分区事务不产生 PREPARE/DECISION 记录 |
+| 5a ✅ | **恢复守护**（§7）：`partdist.dtx_recover_prepared(timeout_ms)` | **raft_21 四段**：A 有 COMMIT 决议 ⇒ 提交、数据可见、补 `DTX_COMMIT` 标记；B 从未决议 ⇒ 经 `dtx_status` 推定中止、回滚、补 `DTX_ABORT` 标记且**决议已落库**；C 未超时的不被触碰（不与正常路径抢答）；D **协调组不可达 ⇒ 保持 prepared 不动**，绝不擅自决定 |
+| 5b ⛔ | **快路径 + 只读参与者剔除** | **阻塞于 4b**，见下方说明 |
+
+> **★ 5b 为什么必须等 4b（2026-08-03 实施时的判断）**：这两项都是
+> **master 侧的驱动决策**——"参与组数 ≤ 1 就不走 2PC"（§3.4）与"命中 0 行的
+> 分片不进参与者清单"（§8.3），都发生在 master 决定要不要发起 2PC 的那一刻。
+> 而 master 侧的驱动逻辑本身尚不存在（4b 未落地），此时实现快路径等于实现一段
+> **没有调用者、也无法观测**的代码。worker 侧的检测机制（触达集合为空 ⇒ 只读）
+> 已在 §9.1 的修复里就位，等 4b 一落地即可直接用。
 | 6 | **升主 in-doubt 清理**（§9.6）+ 快路径分叉归队规则（§9.5） | 与惰性回放的 promotion 路径合流验收 |
 
 **不回退基线**：`run-raft-tests.sh` 现 32/32（raft_01–16）+ P0 10/10 + 全新库

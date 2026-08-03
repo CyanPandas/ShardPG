@@ -1289,6 +1289,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_21: DTX-2PC 参与者侧恢复守护（推定中止 + 按决议闭合）
+# 用例本体在 test/raft_21_dtx_recovery.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_21 DTX 恢复守护"
+
+start_all_nodes
+sleep 2
+RAFT_21_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_21_dtx_recovery.sh" 2>&1) && RAFT_21_RC=0 || RAFT_21_RC=$?
+echo "$RAFT_21_OUT" | sed 's/^/    /'
+if [[ "$RAFT_21_RC" -eq 0 ]]; then
+  ok "raft_21_dtx_recovery"
+else
+  bad "raft_21_dtx_recovery($(echo "$RAFT_21_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"
