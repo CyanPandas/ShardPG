@@ -60,6 +60,7 @@ extern void AppendPartWALRecord(PartitionWALWriter *writer,
                                 XLogRecPtr orig_lsn,
                                 uint8 rmid,
                                 uint8 info,
+                                uint8 flags,
                                 const char *raw_data,
                                 uint32 data_len,
                                 TransactionId xid);
@@ -68,12 +69,17 @@ extern void AppendPartWALRecord(PartitionWALWriter *writer,
  * AppendPartWALRecordAt — 按指定 partition_lsn 落盘（数据面 Raft follower 用）。
  * expected == 0 等价于 AppendPartWALRecord（本地自增）。
  * expected <= 本地已有 → 幂等 no-op 返回 false；出现空洞 → ERROR。
+ *
+ * flags：记录分类（PARTWAL_FLAG_*）。follower 复制路径必须把 leader 的 flags
+ * 原样透传 —— 丢了它，DTX/标记记录在副本上会退化成 DATA 记录，升主回放时
+ * 被当作 WAL 字节喂给 rm_redo（DTX_2PC_DESIGN.md §5.5）。
  */
 extern bool AppendPartWALRecordAt(PartitionWALWriter *writer,
                                   uint64 expected_partition_lsn,
                                   XLogRecPtr orig_lsn,
                                   uint8 rmid,
                                   uint8 info,
+                                  uint8 flags,
                                   const char *raw_data,
                                   uint32 data_len,
                                   TransactionId xid);

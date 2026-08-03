@@ -401,12 +401,13 @@ AppendPartWALRecord(PartitionWALWriter *writer,
                     XLogRecPtr orig_lsn,
                     uint8 rmid,
                     uint8 info,
+                    uint8 flags,
                     const char *raw_data,
                     uint32 data_len,
                     TransactionId xid)
 {
     /* expected == 0：本地自增分配（leader / demux 侧的原有语义）。 */
-    (void) AppendPartWALRecordAt(writer, 0, orig_lsn, rmid, info,
+    (void) AppendPartWALRecordAt(writer, 0, orig_lsn, rmid, info, flags,
                                  raw_data, data_len, xid);
 }
 
@@ -429,6 +430,7 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
                       XLogRecPtr orig_lsn,
                       uint8 rmid,
                       uint8 info,
+                      uint8 flags,
                       const char *raw_data,
                       uint32 data_len,
                       TransactionId xid)
@@ -494,7 +496,7 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
         rec.rmid          = rmid;
         rec.info          = info;
         rec.version       = PARTWAL_RECORD_VERSION_2;
-        rec.flags         = 0;
+        rec.flags         = flags;
         rec.data_len      = data_len;
         rec.xid           = xid;
 
@@ -545,7 +547,7 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
     rec.rmid          = rmid;
     rec.info          = info;
     rec.version       = PARTWAL_RECORD_VERSION_2;
-    rec.flags         = 0;
+    rec.flags         = flags;
     rec.data_len      = data_len;
     rec.xid           = xid;
 

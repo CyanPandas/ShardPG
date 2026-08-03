@@ -66,6 +66,29 @@ typedef struct PartWALRecord
 #define PARTWAL_RECORD_VERSION_2    UINT8_C(2)   /* current: version+flags+xid present */
 
 /* ------------------------------------------------------------------ */
+/* 记录分类：一律以 flags 判定，不以 data_len 判定                      */
+/*                                                                      */
+/* FRD §4.1 定的格式契约。此前 flags 恒为 0、分类靠"载荷是不是原始      */
+/* XLogRecord"隐式判断；DTX-2PC 引入非 WAL 载荷的记录后必须显式化。     */
+/*                                                                      */
+/* 兼容性：**flags == 0 视同 DATA**（存量段文件里的记录都是 0）。       */
+/* 新写入的数据记录会显式带上 PARTWAL_FLAG_DATA，判定请用               */
+/* PartWALRecordIsData() 而不是直接比较。                               */
+/* ------------------------------------------------------------------ */
+
+#define PARTWAL_FLAG_DATA        UINT8_C(0x01)   /* 载荷 = 原始 XLogRecord 字节 */
+#define PARTWAL_FLAG_MARKER      UINT8_C(0x02)   /* FRD 预留：单机事务标记(R2)  */
+#define PARTWAL_FLAG_CTRL        UINT8_C(0x04)   /* FRD 预留：控制记录(FRD §12) */
+#define PARTWAL_FLAG_DTX         UINT8_C(0x08)   /* 分布式事务记录(DTX-2PC §5)  */
+
+/* 非 DATA 的记录一律不得喂给 rm_redo —— 它们的载荷不是 XLogRecord */
+#define PARTWAL_FLAG_NON_DATA_MASK \
+    (PARTWAL_FLAG_MARKER | PARTWAL_FLAG_CTRL | PARTWAL_FLAG_DTX)
+
+#define PartWALRecordIsData(flags) \
+    (((flags) & PARTWAL_FLAG_NON_DATA_MASK) == 0)
+
+/* ------------------------------------------------------------------ */
 /* PartWALCheckpointFile — per-partition checkpoint                    */
 /* ------------------------------------------------------------------ */
 
@@ -95,8 +118,5 @@ typedef struct PartWALCheckpointFile
  * from pg_parwal files.  They access the header fields directly.
  * No separate "PartWALHeader" type is needed in 2.0.
  */
-
-/* Keep PARTWAL_FLAG_DATA so existing SQL function code compiles */
-#define PARTWAL_FLAG_DATA        UINT8_C(0x01)
 
 #endif /* PARTITION_WAL_HEADER_H */

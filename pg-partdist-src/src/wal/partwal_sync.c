@@ -833,6 +833,7 @@ PartWALFlush(XLogRecPtr upto_lsn)
 
                 AppendPartWALRecord(writer, slot->orig_lsn,
                                     slot->rmid, slot->info,
+                                    PARTWAL_FLAG_DATA,
                                     wal_data, wal_len, wal_xid);
 
                 if (read_buf != NULL)
@@ -1209,6 +1210,7 @@ ScanWALRangeForPartition(PartitionWALWriter *writer,
                                     reader->EndRecPtr,   /* end LSN, §4.2 */
                                     rmid,
                                     XLogRecGetInfo(reader),
+                                    PARTWAL_FLAG_DATA,
                                     raw,
                                     record->xl_tot_len,
                                     XLogRecGetXid(reader));

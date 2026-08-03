@@ -746,6 +746,7 @@ pg_partdist_write_partition_wal_record(PG_FUNCTION_ARGS)
         AppendPartWALRecord(writer, lsn,
                             (uint8)(flags & 0xFF),
                             0,
+                            PARTWAL_FLAG_DATA,
                             dummy_data, 0,
                             InvalidTransactionId);
         FlushPartitionWALWriter(writer, true);

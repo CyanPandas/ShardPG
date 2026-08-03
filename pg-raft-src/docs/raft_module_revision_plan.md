@@ -436,6 +436,7 @@ PartWAL 接入链路：
 | `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
 | `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑），三阶段：① 同 worker 两数据组 + 8 会话并发单行 INSERT，断言持有完整前缀的成员数 >= 多数派（不是"全体追平"——Raft 只保证 quorum，且尚无后台追平通道）；② **确定性让路**：长事务 P 写 B 组后 pg_sleep，并发短事务 Q 的 flush 顺带消费其槽位并推过 flushed_upto，P 提交必走提前返回分支——断言被让路的 P 的记录仍达多数派；③ 失多数派 + 并发写，断言提交成功行数 == 0（2PC prepare 性质回归）。两个 burst 阶段均先甄别节点崩溃再断言。**真对照实验**（同用例仅换 .so、nm 验证构建身份）：让路窗口未修的构建在阶段二确定性失败（P 提交成功而记录只在 leader：43 vs 41/41），修复版 43/43/43 | ✅ |
 | `raft_18_membership_explicit` | **成员集显式化与真实多数派（§11.5.2 #3）**，用例本体在 `test/raft_18_membership_explicit.sh`（可独立跑），四条确定性判据：A 成员集未知（NULL 且 partition_map 无登记）时**建组必须报错拒绝**且不留残组；B 有控制面登记时 NULL 建组**自动导出**成员集，`cluster_size=3` 而非 9；C **quorum 按真实成员数**——3 成员全在可写、停 1 个（2/3）仍可写、停 2 个（1/3）必败；D 非副本节点不被 hearsay 拖入该组。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t`，建出 `cluster_size=9` 的组、向全集群广播选举、真正的数据持有者反被挤成 follower。**注意 C 不断言"某个特定节点当选"**——Raft 不保证哪个成员赢，用例动态发现 leader 与待停 follower（初版硬断言 worker1 当选，实测 worker3 先超时先当选而误报） | ✅ |
+| `raft_19_dtx_record_format` | **DTX-2PC 记录格式与 flags 端到端保真（`DTX_2PC_DESIGN.md` §5）**，用例本体在 `test/raft_19_dtx_record_format.sh`（可独立跑），四段：A **全新库 `CREATE EXTENSION` 冒烟 + 四个函数签名**（这是唯一能抓到签名不一致的检查，本次实施踩到两次）；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/`info` 载子类型、DECISION 载荷（dtxid/coord/ts/verdict/participants[]）完整往返；C 对 DATA 记录调 `partwal_read_dtx_record` 返回 NULL（分类以 flags 判定）；D **follower 侧 flags/info 序列与 leader 完全一致** | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
 > 下的实际目录探测协调节点目录名（raft4 是 `master`，pg_citus_raft 是
@@ -464,7 +465,7 @@ PartWAL 接入链路：
 > 节点的 apply 滞后窗口显著变大。修法不放宽断言本体：raft_15 改为**按节点带
 > 20s 有界重试**地跑同一断言文件；raft_10 的决议等待窗口 4s → 30s，并且
 > harness 不再吞 SQL 错误输出（失败时保留尾行便于诊断）。
-> 修后 9 节点全量 **49/49 全绿**（raft_01–18，含 raft_17 三阶段与 raft_18 四判据）。
+> 修后 9 节点全量 **50/50 全绿**（raft_01–19，含 raft_17 三阶段、raft_18 四判据、raft_19 四段）。
 > raft_04（拓扑监控）在 §9.2 那一轮偶发失败过一次，同构建重跑即过，仍是既知的时序 flake。
 
 仍缺的场景：
@@ -474,7 +475,11 @@ PartWAL 接入链路：
 - ❌ **一个节点同时是 A 分区 leader、B 分区 follower 的混合角色场景**——数据组用例的组
   成员目前都是全体 worker，没有覆盖“副本集是全体节点真子集”的真实拓扑，
   而这正是 §11.5.2 #3 多数派算错的暴露条件。
-- ✅ ~~全新库 `CREATE EXTENSION` 冒烟~~ 已入常规验收流程（2026-07-24）。
+- ⚠️→✅ 全新库 `CREATE EXTENSION` 冒烟：2026-07-24 记为"已入常规验收流程"，
+  **但实际上 `run-raft-tests.sh` 里从来没有这一项**（2026-08-03 核实）。
+  它恰恰是唯一能抓到边界函数签名不一致的检查——本次改 `partwal_read_record`/
+  `partwal_follower_append` 签名时连踩两次静默失败，全靠它暴露。
+  现已真正固化为 **raft_19 的 A 段**。
 - ✅ ~~raft_13 夹具重做~~ 已由 raft_14 以真实"一主多从"分片放置补齐（2026-07-24）；
   raft_13 保留原 reference 夹具作运输层回归。
 
@@ -1007,6 +1012,17 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
    无 propose 流量时落后的 follower 不会自行收敛。
    接入的目标形态已定稿：§4 阶段 3 的 **prepare 四步设计**（2026-07-24）。
 6. **无 InstallSnapshot**，日志落后超 ring 容量时靠拒写背压，落后太多的副本无法追平。
+
+   > **运维告警（2026-08-03 实测踩到）**：这条缺口在**运维误操作**下会把控制面
+   > 打成半瘫。任何清空 `partdist.raft_log` 的动作（最容易中招的是
+   > `setup-raft.sh` 的 `cleanup_raft_loose_objects()`——它第一句就是
+   > `DROP EXTENSION pg_raft CASCADE`，会连带删表）都必须**全节点同时做并全部重启**，
+   > 否则已重启的节点回到 index=0、未重启的仍在几百，前者永远追不上。
+   > 症状：某个节点（本次是 coordinator）group0 恒为 0/0/0 而其余节点正常，
+   > 登记到不了 master、`pg_dist_placement` 不切、大批用例连锁失败。
+   > 控制面重置顺序：先 `ALTER SYSTEM SET pg_raft.raft_enabled=off` + reload
+   > （否则 TopologyMonitor 每秒把清掉的条目写回去），再清表，再停机删
+   > `pg_raft_hardstate*`，最后恢复 GUC 重启。
 7. `partwal_notify_primary_switch()` 仍是日志占位，切主后不做真实角色切换。
 8. **raft_13 夹具用的是 Citus reference 表**，而 reference 表在每个节点都是本地主写，与
    “secondary 不本地产出该分区 WAL”的前提相悖（§11.5.1 的假阳性教训）。数据组用例应改用

@@ -425,3 +425,63 @@ make 会静默跳过重编，install 装的还是旧 .so —— A/B 对照实验
   真对照（同用例仅换 .so，nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t`
   而非报错。**测试方法论**：C 用例最初硬断言"worker1 当选"，实测 worker3 先超时
   先当选而误报——Raft 不保证哪个成员赢，已改为动态发现 leader 与待停 follower。
+
+### DTX-2PC 第 3 步：记录格式与 flags 端到端保真（同日第四批）
+
+- 修改时间：2026-08-03
+- 修改文件（pg-partdist-src 侧）：
+  - `include/partition_wal_header.h` —— 显式化记录分类位：`PARTWAL_FLAG_DATA(0x01)`
+    / `MARKER(0x02)` / `CTRL(0x04)`（FRD 预留）/ **`DTX(0x08)`**，并加
+    `PartWALRecordIsData()`。**兼容性：flags==0 视同 DATA**（存量段文件都是 0），
+    新写入的数据记录显式带 DATA 位。
+  - `include/dtx_record.h`（新增）—— `DtxRecordKind` 与 `DtxRecordPayload`
+    （dtxid / coord_gsid / commit_ts / verdict / participants[]），
+    以及头字段取值约定：`rmid=RM_XACT_ID`（仅可读性）、`info=kind`（**不是**
+    XLog info）、**`orig_lsn` 恒为 0**（不是 WAL 记录，回放侧禁止拿它盖页 LSN）。
+  - `include/partition_wal_writer.h` + `src/wal/partition_wal_writer.c` ——
+    `AppendPartWALRecord{,At}` 增加 `flags` 参数（此前头部 flags 恒写 0）。
+  - `src/raft_boundary.c` —— `partwal_read_record` 增加 `OUT flags`；
+    `partwal_follower_append` 增加 `p_flags`；新增
+    `partwal_append_dtx_record` / `partwal_read_dtx_record`。
+  - `sql/pg_partdist--1.0.sql` + `pg-install/share/postgresql/extension/` 副本
+    + `pg-raft-src/setup-raft.sh` 的 ensure/cleanup 段（四处同步点全覆盖）。
+- 目的：DTX 记录与 DATA 记录共用同一个 `partition_lsn` 序号空间和同一条复制通道，
+  只靠头部 flags 区分。**复制通道丢了 flags，DTX/标记记录到 follower 就退化成
+  DATA 记录，升主回放时被当作原始 WAL 字节喂给 `rm_redo`** —— PANIC 或静默堆损坏。
+- 对 Raft/failover/PartWAL 行为的影响：
+  - PartWAL 的落盘/fsync/编号语义**无变化**；DATA 记录只是头部多了个 flags 位；
+  - pg_raft 侧：`data_propose_one` 的描述符 JSON 增加 `"flags"`，
+    `data_entry_store` 解析后透传给 `partwal_follower_append`。
+    pg_raft **有意不依赖** pg_partdist 头文件，所以它只镜像了一个
+    `PARTWAL_FLAG_DATA=1` 常量作"描述符缺 flags 时的兜底"，其余**不透明透传**。
+- **踩过的坑（都会静默失败，务必留意）**：
+  1. `CREATE OR REPLACE` **改不了返回类型**（`partwal_read_record` 加了 OUT 列），
+     必须先 DROP；
+  2. 这两个函数是 **pg_partdist 扩展成员**，直接 `DROP FUNCTION` 被
+     `cannot drop function ... because extension pg_partdist requires it` 拒绝，
+     必须先 `ALTER EXTENSION pg_partdist DROP FUNCTION ...` 解除归属；
+  3. 上述两个错误发生在 `setup-raft.sh` 的 `ON_ERROR_STOP=0` + 输出重定向段里，
+     **无声无息**——结果是既有库留下新旧两个 `partwal_follower_append` 重载、
+     `partwal_read_record` 根本没更新。cleanup 段已改写为 DO 块（先 ALTER
+     EXTENSION 再 DROP，真失败时 `RAISE WARNING`），顺带折叠了几条一直在静默
+     失败的历史 DROP 行；
+  4. `pg_partdist` 在 `shared_preload_libraries` 里，`make install` 后**必须重启
+     节点**，否则 `CREATE EXTENSION` 报 `could not find function ... in file`
+     （看着像符号没导出，其实是 postmaster 还映射着旧 `.so`）。
+  5. `cleanup_raft_loose_objects` 第一句是 `DROP EXTENSION pg_raft CASCADE`，
+     **连带删掉 `partdist.raft_log`**——单独调它而不跟着跑
+     `install_raft_sql_on_node` 会把控制面日志清空。后果比想象中重：
+     已重启的节点从空表恢复成 index=0，未重启的节点 shmem 环仍停在旧 index，
+     而项目**没有 InstallSnapshot**，落后超 `RAFT_LOG_CAPACITY=128` 的节点
+     **永远追不上** —— 本次表现为只有 coordinator 的 group0 是 0/0/0、其余
+     节点 888，登记到不了 master、`pg_dist_placement` 不切，
+     raft_06/09/10/14/15/18/19 集体失败（**与本步代码无关**，是环境损坏）。
+     要刷新边界函数请调 `install_raft_sql_on_node <port>`（内部先 cleanup 再重建）。
+     控制面重置的正确顺序见 raft 计划 §12.3.B.6 旁注与环境记忆；关键是
+     **先 `ALTER SYSTEM SET pg_raft.raft_enabled=off` 再清表**——直接 TRUNCATE
+     无效，TopologyMonitor 每秒就把新条目写回去了。
+- 附带：`setup-raft.sh` 也改为**拓扑自适应**（与 `run-raft-tests.sh` 同款探测），
+  不再写死四节点，`PEERS` 按实际节点数生成。
+- 验证：9 节点全量 **50/50 全绿**（raft_01–19）。新增
+  `test/raft_19_dtx_record_format.sh`（A 全新库冒烟+签名 / B leader 侧格式与载荷
+  往返 / C DATA 不被误判为 DTX / D **follower 侧 flags 保真**）。

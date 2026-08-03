@@ -526,6 +526,10 @@ COMMENT ON FUNCTION partwal_notify_primary_switch(OID, INTEGER, INTEGER, PG_LSN)
 -- 注意：同一逻辑分片在各节点的本地 OID 不同，调用方必须先用 P0 的
 -- local_partition_for_shard(global_shard_id) 把组 id 解析成本节点 partition_id。
 
+-- flags 是记录分类（PARTWAL_FLAG_*，1=DATA / 8=DTX），必须随记录一起返回并由
+-- follower 原样落盘：丢了它，DTX/标记记录到副本上会退化成 DATA 记录，
+-- 升主回放时被当作 WAL 字节喂给 rm_redo（DTX_2PC_DESIGN.md §5.5）。
+DROP FUNCTION IF EXISTS partwal_read_record(OID, BIGINT);
 CREATE OR REPLACE FUNCTION partwal_read_record(
     p_partition_id OID,
     p_partition_lsn BIGINT,
@@ -533,17 +537,19 @@ CREATE OR REPLACE FUNCTION partwal_read_record(
     OUT rmid INTEGER,
     OUT info INTEGER,
     OUT xid BIGINT,
+    OUT flags INTEGER,
     OUT data BYTEA
 ) RETURNS record LANGUAGE c STRICT STABLE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_read_record';
 
 COMMENT ON FUNCTION partwal_read_record(OID, BIGINT) IS
-    'Leader 侧：按 partition_lsn 从本节点 pg_parwal 读出一条完整 parwal 记录（头部字段 + 原始 WAL 字节）。';
+    'Leader 侧：按 partition_lsn 从本节点 pg_parwal 读出一条完整 parwal 记录（头部字段 + flags + 原始载荷）。';
 
 -- p_partition_lsn 是 **leader 指定的**编号，follower 必须按它落盘而非本地自增：
 -- 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一 pg_parwal
 -- 目录树下既有本地 demux 写入也有复制流，用本地计数器会让两个编号空间永久错位。
 -- 重传时（该编号已落过盘）幂等 no-op；出现空洞则 ERROR，由 leader 回退补齐。
+DROP FUNCTION IF EXISTS partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
 CREATE OR REPLACE FUNCTION partwal_follower_append(
     p_partition_id OID,
     p_partition_lsn BIGINT,
@@ -551,7 +557,8 @@ CREATE OR REPLACE FUNCTION partwal_follower_append(
     p_rmid INTEGER,
     p_info INTEGER,
     p_xid BIGINT,
-    p_data BYTEA
+    p_data BYTEA,
+    p_flags INTEGER
 ) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append';
 
@@ -563,8 +570,44 @@ CREATE OR REPLACE FUNCTION partwal_truncate_to(
 ) RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_truncate_to';
 
-COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA) IS
-    'Follower 侧平凡 apply：按 leader 指定的 partition_lsn 把 parwal 记录原样落盘并 fsync，返回该 partition_lsn。重传幂等，不做 redo。';
+COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA, INTEGER) IS
+    'Follower 侧平凡 apply：按 leader 指定的 partition_lsn 把 parwal 记录（含 flags）原样落盘并 fsync，返回该 partition_lsn。重传幂等，不做 redo。';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 记录（DTX_2PC_DESIGN.md §5）
+-- ------------------------------------------------------------------
+-- DTX 记录与 DATA 记录共用同一个 partition_lsn 序号空间和同一条复制通道，
+-- 靠头部 flags 里的 PARTWAL_FLAG_DTX(8) 区分；子类型放在 info 字段
+-- （1=PREPARE 2=DECISION 3=COMMIT 4=ABORT）。orig_lsn 恒为 0 —— 它不是 WAL
+-- 记录，回放侧按 flags 在分派处即被路由走，永不进 rm_redo。
+CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
+    p_partition_id OID,
+    p_kind INTEGER,
+    p_dtxid BIGINT,
+    p_coord_gsid BIGINT,
+    p_commit_ts BIGINT DEFAULT 0,
+    p_verdict INTEGER DEFAULT 0,
+    p_participants BIGINT[] DEFAULT NULL
+) RETURNS BIGINT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_append_dtx_record';
+
+COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGINT, INTEGER, BIGINT[]) IS
+    '在本节点该分区的 parwal 流追加一条 DTX 记录并 fsync，返回分配到的 partition_lsn。participants 仅 DECISION(kind=2) 记录携带。';
+
+CREATE OR REPLACE FUNCTION partwal_read_dtx_record(
+    p_partition_id OID,
+    p_partition_lsn BIGINT,
+    OUT kind INTEGER,
+    OUT dtxid BIGINT,
+    OUT coord_gsid BIGINT,
+    OUT commit_ts BIGINT,
+    OUT verdict INTEGER,
+    OUT participants BIGINT[]
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_read_dtx_record';
+
+COMMENT ON FUNCTION partwal_read_dtx_record(OID, BIGINT) IS
+    '解析该 partition_lsn 上的 DTX 记录；该位置不是 DTX 记录（flags 无 PARTWAL_FLAG_DTX）时返回 NULL。';
 
 COMMENT ON FUNCTION partwal_truncate_to(OID, BIGINT) IS
     'Raft 日志截断时同步截断本节点 pg_parwal：丢弃 partition_lsn > p_keep_upto_part_lsn 的记录并重写 checkpoint。';

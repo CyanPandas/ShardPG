@@ -57,6 +57,19 @@
 #define RAFT_LOG_CAPACITY  128
 #define RAFT_OP_LEN        32
 #define RAFT_PAYLOAD_MAX   768
+
+/*
+ * parwal 记录分类位的**镜像**（权威定义在
+ * pg-partdist-src/include/partition_wal_header.h 的 PARTWAL_FLAG_*）。
+ *
+ * pg_raft 有意不在编译期依赖 pg_partdist 的头文件（两个扩展只经 SQL 边界函数
+ * 和 rendezvous variable 交互），所以这里只镜像一个值：数据组复制时 flags 是
+ * **不透明透传**的——leader 从 partwal_read_record 读出多少就原样写回
+ * partwal_follower_append，pg_raft 不解释它。唯一需要的常量是"描述符里没有
+ * flags 时（旧 leader 发来的条目）按什么处理"，取 DATA(0x01)。
+ * 若 partition_wal_header.h 改了 DATA 位的取值，这里必须同步。
+ */
+#define PARTWAL_FLAG_DATA  1
 #define RAFT_HARDSTATE_MAGIC   UINT32_C(0x52484654)
 /*
  * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
@@ -649,6 +662,7 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
     long long      xid = 0;
     int            rmid = 0;
     int            info = 0;
+    int            rec_flags = PARTWAL_FLAG_DATA;
     const char    *p;
 
     local_oid = group_local_partition(ctx);
@@ -675,6 +689,15 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
     p = strstr(payload, "\"xid\"");
     if (p != NULL && (p = strchr(p, ':')) != NULL)
         (void) sscanf(p + 1, " %lld", &xid);
+    /*
+     * ★ flags 必须透传（DTX_2PC_DESIGN.md §5.5）：丢了它，DTX/标记记录在
+     * follower 上会退化成 DATA 记录，升主回放时被当作 WAL 字节喂给 rm_redo。
+     * 描述符里没有 flags 时（旧 leader 发来的条目）按 DATA 处理 —— 与
+     * PartWALRecordIsData() 对 flags==0 的兼容判定一致。
+     */
+    p = strstr(payload, "\"flags\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %d", &rec_flags);
 
     if (!raft_persist_spi_begin(&spi_owned))
         return false;
@@ -689,12 +712,13 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
     appendStringInfo(&sql,
                      "SELECT partdist.partwal_follower_append("
                      "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %lld::bigint, "
-                     "decode(%s, 'hex'))",
+                     "decode(%s, 'hex'), %d)",
                      (unsigned) local_oid,
                      (long long) entry_partition_lsn(payload),
                      quote_literal_cstr(orig_lsn),
                      rmid, info, xid,
-                     quote_literal_cstr(data_hex != NULL ? data_hex : ""));
+                     quote_literal_cstr(data_hex != NULL ? data_hex : ""),
+                     rec_flags);
     ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0);
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
@@ -3170,6 +3194,7 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     char         orig_lsn_buf[32];
     int          rmid = 0;
     int          info = 0;
+    int          rec_flags = PARTWAL_FLAG_DATA;
     int64        xid = 0;
     int64        nbytes = 0;
     int64        local_oid;
@@ -3187,7 +3212,7 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "SELECT orig_lsn::text, rmid, info, xid, length(data) "
+                     "SELECT orig_lsn::text, rmid, info, xid, length(data), flags "
                      "FROM partdist.partwal_read_record(%u::oid, %lld)",
                      (unsigned) local_oid, (long long) partition_lsn);
     if (SPI_execute(sql.data, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
@@ -3241,6 +3266,8 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
         xid = isnull ? 0 : DatumGetInt64(d);
         d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
         nbytes = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
+        rec_flags = isnull ? PARTWAL_FLAG_DATA : DatumGetInt32(d);
 
         if (null1)
         {
@@ -3260,9 +3287,9 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     initStringInfo(&payload);
     appendStringInfo(&payload,
                      "{\"partition_lsn\":%lld,\"orig_lsn\":\"%s\",\"rmid\":%d,"
-                     "\"info\":%d,\"xid\":%lld,\"nbytes\":%lld}",
+                     "\"info\":%d,\"xid\":%lld,\"nbytes\":%lld,\"flags\":%d}",
                      (long long) partition_lsn, orig_lsn, rmid, info,
-                     (long long) xid, (long long) nbytes);
+                     (long long) xid, (long long) nbytes, rec_flags);
 
     idx = group_propose(ctx, RAFT_OP_PARWAL, payload.data);
 

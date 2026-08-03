@@ -1255,6 +1255,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_19: DTX-2PC 记录格式与 flags 端到端保真（含全新库 CREATE EXTENSION 冒烟）
+# 用例本体在 test/raft_19_dtx_record_format.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_19 DTX 记录格式与 flags 保真"
+
+start_all_nodes
+sleep 2
+RAFT_19_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_19_dtx_record_format.sh" 2>&1) && RAFT_19_RC=0 || RAFT_19_RC=$?
+echo "$RAFT_19_OUT" | sed 's/^/    /'
+if [[ "$RAFT_19_RC" -eq 0 ]]; then
+  ok "raft_19_dtx_record_format"
+else
+  bad "raft_19_dtx_record_format($(echo "$RAFT_19_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

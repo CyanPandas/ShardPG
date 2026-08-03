@@ -310,6 +310,24 @@ Citus 自己的 gid 形如 `citus_<initiator>_<pid>_<txn>_<shardid>`；我们不
 5. **验收必须包含全新库 `CREATE EXTENSION` 冒烟**——已装扩展不会重跑安装脚本，
    这类不一致在常规回归里完全静默。
 
+> **★ 实施时踩到的两个坑（2026-08-03，都会静默失败）**：
+> 1. **`CREATE OR REPLACE` 改不了返回类型**。`partwal_read_record` 加了 OUT 列，
+>    直接 REPLACE 报 `cannot change return type of existing function`，必须先 DROP。
+> 2. **这两个函数是 pg_partdist 的扩展成员**，直接 `DROP FUNCTION` 会被
+>    `cannot drop function ... because extension pg_partdist requires it` 拒绝，
+>    必须先 `ALTER EXTENSION pg_partdist DROP FUNCTION ...` 解除归属再 DROP。
+>
+> 要命的是 `setup-raft.sh` 的 cleanup 段整体是 `ON_ERROR_STOP=0` 且输出重定向的
+> ——两个错误都**无声无息**，结果是既有库里留下新旧两个 `partwal_follower_append`
+> 重载、而 `partwal_read_record` 根本没更新。**唯一能发现它的就是全新库冒烟**
+> （已固化为 raft_19 A 段）。setup-raft.sh 的这段已改写为 DO 块：
+> 先 ALTER EXTENSION 解除归属、再 DROP，真失败时 `RAISE WARNING` 出声。
+> 顺带把几条一直在静默失败的历史 DROP 行（同样撞扩展成员）一并折叠进去。
+>
+> 另：`pg_partdist` 在 `shared_preload_libraries` 里，`make install` 之后**必须
+> 重启节点**新 `.so` 才生效——否则 `CREATE EXTENSION` 会报
+> `could not find function "..." in file`，看起来像符号没导出，其实是旧镜像。
+
 ---
 
 ## 6. 状态机与决议存储
@@ -721,7 +739,7 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 | 0 ✅ | **§9.0 三缺陷修复**（reader UAF / NULL 行解引用 / leader 截断丢数据 + truncate 加锁） | 无组并发 burst 修复前 3/3 崩、修复后 3/3 干净；raft_17 全程无崩溃；缺陷 3 由旧判据抓获（13/240 丢数据）后复测归零 |
 | 1 ✅ | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + 本组复制串行化 | **raft_17 三阶段**（判据演进见 §9.1 方框）：阶段一并发终态多数派、阶段二确定性让路（长事务 P 被让路后其记录仍须达多数派——未修复构建在此必败）、阶段三失多数派提交行数=0 |
 | 2 ✅ | **成员集显式化**（§9.2）：未知成员集 fail-stop + 从控制面 `partition_map` 自动导出 + 建组入口堵源头 | **raft_18 四条判据全过**：A 未知成员集建组被拒且不留残组；B 有登记时自动导出 `cluster_size=3`；C **quorum 按真实成员数**（3 全在可写 / 停 1 个 2/3 仍可写 / 停 2 个 1/3 必败）；D 非副本节点不被拖入。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t` 建出 `cluster_size=9` 的组 |
-| 3 | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | 全新库 `CREATE EXTENSION` 冒烟；follower 侧 DTX 记录 flags 保真 |
+| 3 ✅ | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | **raft_19 四段全过**：A 全新库 `CREATE EXTENSION` + 四个函数签名；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/info 载子类型、DECISION 载荷往返；C 对 DATA 调 `read_dtx` 返回 NULL；D **两个 follower 的 flags/info 序列与 leader 完全一致** |
 | 4 | **决议层**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护；**补丁 0004** + master 挂点；关 Citus 2PC 恢复 | **raft_18**：prepare 后 decide 前杀协调者 → 全体推定中止；decide 落盘后杀协调者 → 参与者经恢复得 COMMIT |
 | 5 | **恢复守护 + 快路径 + 只读参与者剔除** | **raft_19**：协调组切主后决议仍可查、任期栅栏拦下旧 leader 的幽灵决议；单分区事务不产生 PREPARE/DECISION 记录 |
 | 6 | **升主 in-doubt 清理**（§9.6）+ 快路径分叉归队规则（§9.5） | 与惰性回放的 promotion 路径合流验收 |
