@@ -2235,7 +2235,6 @@ static void
 discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
 {
     int   i;
-    int64 drop_plsn = -1;
 
     if (idx <= 0)
         return;
@@ -2243,13 +2242,6 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     SpinLockAcquire(&ctx->log->mutex);
     if (idx > ctx->log->commit_index && idx == ctx->log->last_log_index)
     {
-        RaftLogEntry *dropped = log_slot(ctx, idx);
-
-        /* 记下被丢弃条目的 partition_lsn，出锁后据此截断 parwal */
-        if (dropped->index == idx &&
-            strcmp(dropped->op_type, RAFT_OP_PARWAL) == 0)
-            drop_plsn = entry_partition_lsn(dropped->payload);
-
         log_truncate_after_locked(ctx, idx - 1);
         for (i = 0; i < RAFT_MAX_PEERS; i++)
         {
@@ -2261,9 +2253,31 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     }
     SpinLockRelease(&ctx->log->mutex);
 
-    /* 日志截断了，字节也必须跟着截断（SPI 不能在自旋锁内做） */
-    if (drop_plsn > 0)
-        data_group_truncate_parwal(ctx, drop_plsn - 1);
+    /*
+     * ★ leader 侧失败回滚**不再截断 parwal 字节**（2026-08-03 修，raft_17
+     * 阶段二实测抓获的丢数据）。
+     *
+     * 此前这里按被丢弃条目的 plsn 调 partwal_truncate_to(plsn-1)。问题：
+     * parwal 流里 plsn 之后可能已经躺着**并发事务**在 [A] 落盘的记录 ——
+     * 截断连它们一起删。受害 backend 的复制挂钩随后看到
+     * last_data_plsn >= flush_lsn（游标被回滚），循环空转、静默返回，
+     * 其事务**带着"已复制"的假象提交**，而它的数据既不在本地 parwal
+     * 也没到任何 follower（raft_17 阶段二实测：失多数派下 13/240 行
+     * 如此漏网提交）。
+     *
+     * 现在失败条目的字节留在盘上成为"孤儿"：last_data_plsn 未推进，
+     * 下一次复制（同一或另一 backend）会按同一 plsn 重新 propose 同一
+     * 字节 —— 恢复多数派后自然收敛；仍失多数派则照样失败、事务照样
+     * 中止。代价是 parwal 流里可能存有**已中止事务**的 DATA 记录
+     * （"中止事务不在 plsn 空间留渣"的说法作废）——这与 2PC 设计一致：
+     * DATA 记录本就可能属于中止的事务，可见性由标记/决议闭合
+     * （DTX_2PC_DESIGN.md §5、FRD §7.6），当前阶段 follower 只存字节
+     * 不回放，无正确性影响。
+     *
+     * follower 侧的 AppendEntries 冲突截断（handle_append_entries）
+     * **保留** —— 那才是必须的：换 leader 后同一 plsn 会承载不同记录，
+     * 幂等去重会错误保留旧字节。
+     */
 
     delete_log_entry_sql(ctx, idx);
     persist_hard_state_unlocked(ctx);
@@ -2949,6 +2963,7 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     bool         spi_owned;
     bool         isnull;
     char        *orig_lsn = NULL;
+    char         orig_lsn_buf[32];
     int          rmid = 0;
     int          info = 0;
     int64        xid = 0;
@@ -2982,16 +2997,59 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
              (long long) local_oid);
         return 0;
     }
-    orig_lsn = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
-                                                 SPI_tuptable->tupdesc, 1, &isnull));
-    rmid = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 2, &isnull));
-    info = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 3, &isnull));
-    xid = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-                                      SPI_tuptable->tupdesc, 4, &isnull));
-    nbytes = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                         SPI_tuptable->tupdesc, 5, &isnull));
+    /*
+     * ★ 逐列判 NULL（2026-08-03 修，gdb 实锤的 SIGSEGV）。
+     *
+     * partwal_read_record 查不到记录时 PG_RETURN_NULL() —— 在
+     * `SELECT ... FROM f(...)` 形态下这不是"零行"，而是**一行全 NULL**
+     * （SPI_processed == 1），上面的 SPI_processed == 0 挡不住它。
+     * 此前对第 1 列直接 TextDatumGetCString(0) → text_to_cstring(NULL)
+     * → pg_detoast_datum_packed 解引用空指针，si_addr=0x0。
+     *
+     * 何时会读到不存在的 plsn：历史上是 leader 失败回滚的
+     * partwal_truncate_to 把并发事务的字节一起截掉（该截断已随本次修复
+     * 移除，见 discard_uncommitted_entry）；今后仍可能出现的场景是
+     * 归队 follower 被 AppendEntries 冲突截断后本地游标短暂超前，以及
+     * 段文件损坏/被运维清理。无论成因，正确行为都是按"记录不存在"
+     * 返回 0 —— 调用方 ERROR、事务中止；绝不是崩掉整个节点。
+     */
+    {
+        Datum d;
+        bool  null1;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &null1);
+        if (!null1)
+        {
+            /*
+             * ★ 拷出 SPI 上下文（顺手修的同族隐患）：TextDatumGetCString 的
+             * 结果分配在 SPI proc context 里，raft_persist_spi_end（内部
+             * SPI_finish）会释放它 —— 旧代码在 end 之后仍拿它拼 payload，
+             * 是潜伏的 use-after-free，只是该内存至今未被覆写过。
+             */
+            strlcpy(orig_lsn_buf, TextDatumGetCString(d), sizeof(orig_lsn_buf));
+            orig_lsn = orig_lsn_buf;
+        }
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        rmid = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+        info = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
+        xid = isnull ? 0 : DatumGetInt64(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
+        nbytes = isnull ? 0 : DatumGetInt32(d);
+
+        if (null1)
+        {
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+            elog(WARNING,
+                 "pg_raft: 组 %lld 本地 parwal 无记录 plsn=%lld(local_oid=%lld，"
+                 "可能已被失多数派回滚截断)，按 propose 失败处理",
+                 (long long) ctx->group_id, (long long) partition_lsn,
+                 (long long) local_oid);
+            return 0;
+        }
+    }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 

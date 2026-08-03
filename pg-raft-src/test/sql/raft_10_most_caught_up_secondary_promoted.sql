@@ -72,7 +72,12 @@ DO $$
 DECLARE
   i integer;
 BEGIN
-  FOR i IN 1..20 LOOP
+  -- 等待窗口 30s（原 4s）：决议要经 group 0 propose → 多数派提交 → 本节点
+  -- apply 才可见。9 节点 group0（多数派 5/9、8 个对端的心跳/退避竞争 tick）
+  -- 下 4s 偶发不够，2026-08-03 在 pg_citus_raft 环境实测超时误报过一次。
+  -- 断言本体不变：窗口耗尽后 primary 仍是 77 会在下一段以
+  -- "expected most caught-up node ..." 失败。
+  FOR i IN 1..150 LOOP
     PERFORM partdist.pg_raft_apply_committed();
     IF EXISTS (
         SELECT 1 FROM partdist.partition_map

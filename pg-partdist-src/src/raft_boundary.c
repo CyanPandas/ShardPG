@@ -39,6 +39,7 @@
 
 #include "partition_wal.h"
 #include "partition_wal_writer.h"
+#include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 
 PG_FUNCTION_INFO_V1(pg_partdist_get_partition_flush_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_get_follower_applied_part_lsn);
@@ -332,10 +333,34 @@ pg_partdist_partwal_truncate_to(PG_FUNCTION_ARGS)
 {
 	Oid		partition_id = PG_GETARG_OID(0);
 	int64	keep_upto = PG_GETARG_INT64(1);
+	bool	ok;
 
-	PG_RETURN_BOOL(TruncatePartWALTo(partition_id,
-									 (RelFileNumber) partition_id,
-									 (uint64) keep_upto));
+	/*
+	 * ★ 与 PartWALFlush 的追加者互斥（2026-08-03 修）。
+	 *
+	 * 本函数由 group_propose 的失败路径调用（失多数派回滚该条字节），
+	 * 此前完全无锁：截断段文件、改写 checkpoint 时，并发 backend 正持
+	 * PartWALCtl->lock 往同一分区追加并写自己的 checkpoint —— 两边用同名
+	 * checkpoint.tmp / fileset.tmp，实测出现 rename ENOENT 告警，更坏的
+	 * 情形是截断点计算基于正在被追加的文件。调用点在复制挂钩里，彼时
+	 * PartWALFlush 已释放锁，这里再取不会自锁。
+	 */
+	if (PartWALCtl != NULL)
+		LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		ok = TruncatePartWALTo(partition_id,
+							   (RelFileNumber) partition_id,
+							   (uint64) keep_upto);
+	}
+	PG_FINALLY();
+	{
+		if (PartWALCtl != NULL)
+			LWLockRelease(PartWALCtl->lock);
+	}
+	PG_END_TRY();
+
+	PG_RETURN_BOOL(ok);
 }
 
 Datum

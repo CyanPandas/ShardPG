@@ -446,42 +446,50 @@ Citus router 到单分片 ⇒ **快路径**（§3.4），一轮 quorum，不碰�
 
 按严重度排序。**#0 是新发现的头号阻断项**；#1 与 #2 是开工前必须先修的。
 
-### 9.0 【阻断】并发写入路径 segfault（2026-08-03 新发现，先于一切 2PC 工作）
+### 9.0 【已修复】并发写入路径的三个隐藏缺陷（2026-08-03 发现并全部修复）
 
-**最小复现**（`pg_citus_raft` 环境实测 3/3 崩溃，不需要任何 raft 组）：
+首次用并发负载（6 会话单行 autocommit INSERT 打同一分片）压 prepare 路径时连环
+暴露。此前所有用例（raft_13/14/16、P0 回归）都是**串行**写入，三条路径全都从未
+被真正执行过。逐个记录（都有 gdb backtrace 或决定性复现支撑）：
 
-```
-建一张 Citus 哈希分布表（shard_count=16, rf=1）
-挑一个持有 >= 2 个分片的 worker，用 get_shard_id_for_distribution_column
-反查出精确落到其中一个分片的 480 个 id
-6 个并发会话，每个连打 80 条单行 INSERT（autocommit）
-⇒ 该 worker 上 backend 收到 SIGSEGV，postmaster 重置整个节点
-```
+**缺陷 1：`ReadRawWALRecordAt` 的 reader use-after-free（segfault 主犯）。**
+group-commit 场景下 backend X 替 peer 落盘时需按 `start_lsn` 从 pg_wal 回读字节，
+所用的 `static XLogReaderState *raw_reader` 是**懒分配**的——而首次调用发生在
+PRE_COMMIT 回调里，彼时 `CurrentMemoryContext` 是**事务级**上下文：static 指针
+跨事务存活，reader 结构与内部缓冲却随事务结束被释放。第二次进来就是 UAF，写穿
+的是下一个事务复用同一内存后的 palloc chunk。症状：`pfree called with invalid
+pointer 0x...`（每次同一地址——fork 出的 backend 分配序列相同）或直接 SIGSEGV。
+**修复**：整个分配 + `XLogReadRecord` 过程切到 `TopMemoryContext`（读取期间的
+懒分配——decode buffer、readRecordBuf 扩容——同样必须覆盖，只包 Allocate 不够）。
+最小复现（不需要任何 raft 组）修复前 3/3 崩、修复后 3/3 干净。
+顺带修掉 `PartWALReadPage` 把短读当成功、以及提前返回路径不释放
+`partwal_pending` 的两个次级问题。
 
-日志形态：`server process (PID N) was terminated by signal 11: Segmentation fault`，
-`DETAIL: Failed process was running: INSERT INTO public.<table>_<shardid> ...`。
+**缺陷 2：`data_propose_one` 对 NULL 行解引用（失多数派场景的 segfault）。**
+gdb backtrace：`pg_detoast_datum_packed ← text_to_cstring ← data_propose_one`，
+`si_addr=0x0`。`partwal_read_record` 查不到记录时 `PG_RETURN_NULL()`——在
+`SELECT ... FROM f(...)` 形态下这是**一行全 NULL**（`SPI_processed==1`），
+而调用方 5 个 `SPI_getbinval` 一个 `isnull` 都没检查。**修复**：逐列判 NULL，
+记录缺失按 propose 失败返回 0（事务中止，与失多数派语义一致）；顺带修掉
+`orig_lsn` 字符串在 `SPI_finish` 之后仍被使用的潜伏 UAF。
 
-**已经确定的事实**：
+**缺陷 3：leader 侧失败回滚截断并发事务的字节（丢数据，raft_17 阶段二抓获）。**
+propose 失败时 `discard_uncommitted_entry` 按被丢弃条目的 plsn 调
+`partwal_truncate_to(plsn-1)`——但 parwal 流里 plsn 之后可能已躺着**并发事务**
+在 [A] 落盘的记录，截断连它们一起删。受害 backend 的复制挂钩随后看到
+`last_data_plsn >= flush_lsn`，空转返回，其事务**带着"已复制"的假象提交**——
+数据既不在本地 parwal 也没到任何 follower（实测失多数派下 13/240 行如此漏网）。
+**修复**：leader 侧失败只回滚 Raft 日志条目（ring + SQL 行），**字节不截断**，
+失败条留作孤儿、下次复制按同一 plsn 重新 propose；follower 侧 AppendEntries
+冲突截断保留（换 leader 后同一 plsn 承载不同记录，那个截断才是必须的）。
+语义变更：**"中止事务不在 plsn 空间留渣"作废**——parwal 流里可以有中止事务的
+DATA 记录，可见性由标记/决议闭合（§5、FRD §7.6），与 2PC 的设计本就一致。
+另外 `partwal_truncate_to` 补上了与 `PartWALFlush` 追加者的
+`PartWALCtl->lock` 互斥（此前完全无锁，实测出现 checkpoint.tmp rename 竞争）。
 
-1. **与 pg_raft 无关**——上面的复现完全不建数据组，照崩；
-2. **与本次让路窗口修复无关**——修复前、修复后两个构建都崩，频率相当；
-3. **只在并发下出现**。此前所有用例（raft_13/14/16、P0 回归）都是**串行**写入，
-   因此 `PartWALFlush` 里"backend X 顺带落盘 backend Y 的槽位"这条 group-commit
-   分支**从未被真正执行过**。它正是本缺陷的最大嫌疑区间：
-   `PartWALFlush` → `ReadRawWALRecordAt`（peer 槽位的字节不在本 backend 的
-   `partwal_pending` 里，只能按 `slot->start_lsn` 从 pg_wal 回读）
-   → `AssembleRawWALRecord` → `PartWALReadPage`。
-   注意 `PartWALReadPage` 的返回值只判了 `< 0`，**短读（count < XLOG_BLCKSZ）
-   被当成成功**，页缓冲尾部是未初始化的栈内存——这一条已可确认是缺陷（虽然它
-   本身应该表现为 CRC 不符而不是段错误）。
-4. 尚未拿到 backtrace：容器内 `kernel.core_pattern` 由宿主机 apport 接管且
-   `/proc/sys` 只读，容器里改不了；拿 core 需要改宿主机全局 sysctl（未擅自改）
-   或用 gdb follow-fork 跟一次。
-
-**对 2PC 的影响**：这条路径正是 prepare 依赖的路径，且**它会污染一切并发验收**
-——节点崩溃后 shmem 组表被重置，之后的 INSERT 因"查不到数据组"而跳过复制挂钩
-并提交成功，看起来和让路窗口的症状一模一样。本次定位就因此得出过一个错误的
-对照结论（见 §10 步 1 的说明）。**修它优先于 2PC 的任何后续步骤。**
+**方法论教训**：崩溃会重置 shmem 组表，之后的 INSERT 因"查不到数据组"跳过
+复制挂钩并提交成功——症状与让路窗口一模一样。**任何并发验收都必须先甄别
+"burst 期间是否有节点崩溃"**（raft_17 两个阶段都做了这层甄别）。
 
 ### 9.1 【最高】group-commit 让路窗口：从性能弱化升级为正确性 bug
 
@@ -506,17 +514,26 @@ if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
 一旦引入 2PC，它变成：**PREPARE 返回成功、但这些字节从未达到多数派** ⇒
 协调者据此写 COMMIT 决议 ⇒ 参与组多数派上根本没有这个事务的数据。**这是丢数据。**
 
-> **★ 怎么测它（2026-08-03 实测教训）**：**看终态是测不出来的。** 漏掉的记录会在
-> 该分区下一次非提前返回的 flush 里被增量下界（`last_data_plsn` → 当前 flush 点）
-> 顺带补齐，所以 burst 结束后 leader 与 follower 几乎总是收敛的 —— 实测**修复前的
-> 构建照样能通过"follower 逐字节追平"这种判据**。让路窗口破坏的不是终态，而是
-> **时序保证**：事务在自己的记录达到多数派之前就向客户端返回了成功。
+> **★ 怎么测它（2026-08-03 实测定稿）**：**看终态测不出来**——漏掉的记录会在
+> 该分区下一次非提前返回的 flush 里被增量下界顺带补齐，burst 后 leader 与
+> follower 几乎总是收敛，实测未修复构建照样通过"follower 逐字节追平"判据
+> （raft_17 阶段一即如此，两个构建都 3/3）。概率性判据（并发碰撞、失多数派下
+> 并发写）灵敏度不可控，且本轮定位曾被"装错构建"污染出过错误结论
+> （docker cp 的 mtime 陷阱，见交接台账），一律不采信。
 >
-> 把它变成可观测布尔量的办法是**先让该组失去多数派，再并发写**：
-> 调用了挂钩的事务拿不到多数派会 ERROR（正确）；走提前返回、没调挂钩的事务
-> 根本不知道多数派已丢，**会提交成功**（违规）。判据 = "提交成功的行数 == 0"。
-> 这是 raft_16 第 2 步的并发版本，也正是 prepare 需要的性质。
-> raft_17 的阶段二即按此实现；但在 §9.0 的 segfault 修掉之前拿不到干净结论。
+> **有效判据是确定性构造一次让路**（raft_17 阶段二）：长事务 P 写 B 组后
+> `pg_sleep`；并发短事务 Q 写同 worker 的 A 组，其 flush 顺带消费 P 的槽位并把
+> `flushed_upto` 推过 P；P 提交时**必然**走提前返回分支。**真对照实验**
+> （同环境同用例，仅换 `.so` 且以 nm 符号验证过构建身份）：
+> 让路窗口未修 ⇒ 阶段二确定性失败——P 提交成功、其 2 条记录（heap+btree）
+> 只在 leader（`leader=43, follower=41,41`），挂钩未被调用、B 组零 propose、
+> 此后不写 B 无自愈；修复后 ⇒ 同一位置 `43/43✔/43✔`。全程多数派健康、秒级、
+> 无概率成分。"失多数派 + 并发写 ⇒ 提交成功行数 == 0"保留为 raft_17 阶段三
+> ——它是 2PC prepare 性质的回归（raft_16 第 2 步的并发版本），不是让路窗口的
+> 检测器。
+>
+> 归因更正：此前记录的"13/240 漏网"发生在让路窗口**已修复**的构建上，
+> 真凶是 §9.0 缺陷 3（失败者截断并发事务字节 → 受害者挂钩空转），不是本缺陷。
 
 **修法**（两处，缺一不可）：
 
@@ -650,7 +667,8 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 
 | 步 | 内容 | 验收 |
 |---|---|---|
-| 1 ⚠️ | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + 本组复制串行化 | 代码已落地（2026-08-03），raft_01–16 无回退。**但验收未完成**：raft_17 的判据被 §9.0 的 segfault 污染，拿不到可信的对照实验 |
+| 0 ✅ | **§9.0 三缺陷修复**（reader UAF / NULL 行解引用 / leader 截断丢数据 + truncate 加锁） | 无组并发 burst 修复前 3/3 崩、修复后 3/3 干净；raft_17 全程无崩溃；缺陷 3 由旧判据抓获（13/240 丢数据）后复测归零 |
+| 1 ✅ | **修让路窗口**（§9.1）：per-backend 触达集合 + 两条路径都触发挂钩 + 本组复制串行化 | **raft_17 三阶段**（判据演进见 §9.1 方框）：阶段一并发终态多数派、阶段二确定性让路（长事务 P 被让路后其记录仍须达多数派——未修复构建在此必败）、阶段三失多数派提交行数=0 |
 | 2 | **成员集显式化**（§9.2）：过渡断言，空成员集组拒绝参与 2PC | 副本集为全体真子集的组，quorum 按真实成员数计算 |
 | 3 | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | 全新库 `CREATE EXTENSION` 冒烟；follower 侧 DTX 记录 flags 保真 |
 | 4 | **决议层**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护；**补丁 0004** + master 挂点；关 Citus 2PC 恢复 | **raft_18**：prepare 后 decide 前杀协调者 → 全体推定中止；decide 落盘后杀协调者 → 参与者经恢复得 COMMIT |

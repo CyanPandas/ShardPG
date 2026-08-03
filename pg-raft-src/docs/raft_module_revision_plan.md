@@ -424,7 +424,7 @@ PartWAL 接入链路：
 | `raft_14_hash_shard_secondary_backup` | **真实哈希分片 (a) 形态**：多记录逐条 propose、follower 逐字节指纹一致、`partition_lsn` 1..N 连续无洞、一条 record 一次备份、不回放（壳表 0 行）、初次登记（primary/term/secondaries 不含 master）、路由层一致、master 无分片身份 | ✅ |
 | `raft_15_self_election_failover` | **切主全链路**：停主 → 组内自治选举 → 上报登记 → 每节点 `partition_map`+`pg_dist_placement` 落新主（任期递增、master 不入 secondaries）→ 旧主重启以 follower 归队、登记不回退 | ✅ |
 | `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
-| `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑）。阶段一：同 worker 两个数据组 + 8 会话并发单行 INSERT，断言**持有完整前缀的成员数 >= 多数派**（不是"全体 follower 追平"——Raft 只保证 quorum，且本项目无后台追平通道）。阶段二（核心判据）：停掉两个 follower 使该组失去多数派后并发写，断言**提交成功行数 == 0** | ⚠️ 被下述 segfault 阻断 |
+| `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑），三阶段：① 同 worker 两数据组 + 8 会话并发单行 INSERT，断言持有完整前缀的成员数 >= 多数派（不是"全体追平"——Raft 只保证 quorum，且尚无后台追平通道）；② **确定性让路**：长事务 P 写 B 组后 pg_sleep，并发短事务 Q 的 flush 顺带消费其槽位并推过 flushed_upto，P 提交必走提前返回分支——断言被让路的 P 的记录仍达多数派；③ 失多数派 + 并发写，断言提交成功行数 == 0（2PC prepare 性质回归）。两个 burst 阶段均先甄别节点崩溃再断言。**真对照实验**（同用例仅换 .so、nm 验证构建身份）：让路窗口未修的构建在阶段二确定性失败（P 提交成功而记录只在 leader：43 vs 41/41），修复版 43/43/43 | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
 > 下的实际目录探测协调节点目录名（raft4 是 `master`，pg_citus_raft 是
@@ -434,22 +434,26 @@ PartWAL 接入链路：
 > quorum 编排本身与节点数无关（raft_05 停"除 leader 外全部节点"；数据组用例用
 > 显式 3 成员组），所以只需要改映射函数。
 
-> **🚨 头号阻断项：并发写入路径 segfault（2026-08-03 新发现）**
-> 6 个并发会话对同一个 Citus 分片连打单行 INSERT，该 worker 上的 backend
-> 必 SIGSEGV（实测 3/3）。**不需要任何 raft 组**，也**与让路窗口修复无关**
-> （修复前后都崩）。根因未定位，最大嫌疑是 `PartWALFlush` 里
-> "backend X 顺带落盘 backend Y 的槽位"这条 group-commit 分支
-> （`ReadRawWALRecordAt` → `AssembleRawWALRecord` → `PartWALReadPage`）——
-> 此前所有用例都是**串行**写入，这条分支从未真正执行过。
-> 详见 `DTX_2PC_DESIGN.md` §9.0（含最小复现与已确定的事实）。
-> **它优先于 2PC 的一切后续步骤**，因为它会污染所有并发验收：节点崩溃后
-> shmem 组表重置，之后的 INSERT 会因"查不到数据组"跳过复制挂钩而提交成功，
-> 症状与让路窗口一模一样。
+> **✅ 并发写入路径三缺陷已定位并修复（2026-08-03，详见 `DTX_2PC_DESIGN.md` §9.0）**
+> 首次并发压 prepare 路径连环暴露、当日全部修复：
+> ① `ReadRawWALRecordAt` 的 static reader 在事务上下文里懒分配 → 跨事务 UAF
+> （gdb 前无 raft 组也 3/3 必崩的 segfault 主犯；修复=分配与整个读取过程切
+> TopMemoryContext）；② `data_propose_one` 对 `partwal_read_record` 的
+> 全 NULL 行不判 `isnull` 直接 `TextDatumGetCString` → 空指针解引用
+> （gdb backtrace 实锤，si_addr=0x0；失多数派回滚后读被截断的 plsn 触发）；
+> ③ **leader 侧失败回滚截断并发事务已落盘的字节** → 受害事务的挂钩空转、
+> 带着"已复制"假象提交（丢数据，raft_17 阶段二抓获 13/240）——修复=leader 失败
+> 只回滚 Raft 日志条目、字节留作孤儿重新 propose；follower 冲突截断保留。
+> 方法论教训已固化进 raft_17：**并发验收必须先甄别 burst 期间是否有节点崩溃**
+> ——崩溃重置 shmem 组表后 INSERT 会跳过挂钩提交成功，症状与让路窗口无法区分。
 
-> **raft_15 在 9 节点环境下偶发失败（2026-08-03 实测）**：全量套件里出现过一次
-> "节点 5434 断言失败"，同一构建重跑即通过，判为 flake。怀疑是 group 0 的 apply
-> 在 9 个成员上的传播时序（harness 只等协调节点上出现登记就立刻断言各 follower）。
-> **不是 2PC 工作的回归。**
+> **raft_15/raft_10 在 9 节点环境下的偶发失败已修（2026-08-03，harness 时序）**：
+> 根因都是断言窗口按 4 节点标定——控制面语义本就是"多数派提交 + 全员**最终**
+> apply"（§13.2），9 节点 group0（多数派 5/9、8 对端心跳/退避竞争 tick）下单个
+> 节点的 apply 滞后窗口显著变大。修法不放宽断言本体：raft_15 改为**按节点带
+> 20s 有界重试**地跑同一断言文件；raft_10 的决议等待窗口 4s → 30s，并且
+> harness 不再吞 SQL 错误输出（失败时保留尾行便于诊断）。
+> 修后 9 节点全量 **48/48 全绿**（raft_01–17，含 raft_17 三阶段）。
 
 仍缺的场景：
 
@@ -1173,8 +1177,15 @@ pg_wal 提交 fsync（[B]）。复制严格发生在 [A] 之后、[B] 之前 —
   OP_PARWAL 回推；配合 follower 落盘幂等，重复/回退都无害，且**组建立前的历史记录会在
   首次写入时自动补齐复制**。
 - **步骤 4 语义（quorum 即 prepared）**：任何一条记录未达多数派 → ERROR → 事务在
-  prepare 中止；`group_propose` 失败路径连带回滚 leader 侧该条目的 ring/SQL/parwal
-  字节（运输层加固 #5），中止事务不在 plsn 空间留渣。
+  prepare 中止。~~`group_propose` 失败路径连带回滚 leader 侧该条目的 ring/SQL/parwal
+  字节（运输层加固 #5），中止事务不在 plsn 空间留渣。~~
+  **→ 2026-08-03 语义修订**：leader 侧失败回滚只撤 Raft 日志条目（ring + SQL 行），
+  **parwal 字节不截断**——原来的截断会连带删掉并发事务已在 [A] 落盘的记录，
+  受害事务的挂钩因增量游标空转而带着"已复制"假象提交（丢数据，raft_17 阶段二
+  实锤 13/240）。失败条字节留作孤儿、下次复制按同一 plsn 重新 propose；
+  "中止事务不留渣"作废：parwal 流中允许存在中止事务的 DATA 记录，可见性由
+  标记/决议闭合（`DTX_2PC_DESIGN.md` §5、§9.0 缺陷 3）。follower 侧
+  AppendEntries 冲突截断（运输层加固 #5 的另一半）保留不变。
 - **写栅栏（顺带获得）**：分区有数据组而本节点不是该组 leader 时，本地写入在 prepare
   即被 ERROR 拒绝 —— 切主后旧 primary 上仍在途的事务无法提交，不产生分叉写入。
 

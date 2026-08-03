@@ -335,3 +335,43 @@
   结论：本次改动的**正确性由代码路径本身确定**（提前返回分支不调挂钩、
   触达集合看不到被 peer 消费的槽位，两点在代码里都是无歧义的），
   但**端到端验收要等 segfault 修掉之后补做**。
+
+### 并发写入路径三缺陷修复（同日，DTX_2PC_DESIGN.md §9.0）
+
+- 修改时间：2026-08-03（同日第二批）
+- 修改文件（pg-partdist-src 侧）：
+  1. `src/wal/partwal_sync.c` —— `ReadRawWALRecordAt` 的 static reader 及
+     `XLogReadRecord` 全程切 `TopMemoryContext`。旧代码在 PRE_COMMIT 回调里
+     懒分配（事务级 context），事务结束即释放而 static 指针仍在 —— 第二次
+     进入即 use-after-free，症状为 `pfree called with invalid pointer`
+     （每次同一地址）或 SIGSEGV 拖垮整节点；无 raft 组的 6 路并发单行 INSERT
+     即 3/3 复现，修复后 3/3 干净。顺带：`PartWALReadPage` 短读（count <
+     reqLen）改按失败返回（原当成功，页缓冲尾部是未初始化栈内存）；
+     group-commit 提前返回路径补 `FreePartWALPendingContent()`（原路径不释放，
+     捕获的 WAL 字节副本会挂到下一次 flush/abort）。
+  2. `src/raft_boundary.c` —— `partwal_truncate_to` 增加 `PartWALCtl->lock`
+     互斥。原来完全无锁，截断段文件/改写 checkpoint 与持锁的 PartWALFlush
+     追加者并发，实测出现 checkpoint.tmp/fileset.tmp rename ENOENT 竞争。
+- 配套（pg_raft 侧，一并记录）：`data_propose_one` 对 `partwal_read_record`
+  的结果逐列判 `isnull`（gdb backtrace 实锤的空指针解引用：函数查不到记录时
+  返回的是**一行全 NULL** 而非零行，`SPI_processed==0` 挡不住）；`orig_lsn`
+  字符串在 `SPI_finish` 前拷出（潜伏 UAF）；`discard_uncommitted_entry`
+  不再调用 `partwal_truncate_to`（leader 侧失败回滚只撤日志条目，字节留作
+  孤儿重新 propose —— 原截断会删掉并发事务已落盘的记录，致其静默漏复制提交，
+  raft_17 阶段二实测 13/240 行丢数据）。
+- 验证：无组并发 burst 修复前 3/3 崩、修复后 3/3 干净；raft_17 三阶段 PASS
+  （① 并发终态多数派 3/3；② 确定性让路——被让路的长事务记录仍达多数派；
+  ③ 失多数派提交行数=0），全程无崩溃。**真对照实验**（同用例仅换 .so，
+  构建身份经 nm 符号验证）：让路窗口未修的构建在阶段二确定性失败——
+  P 提交成功而其 2 条记录只在 leader（leader=43, follower=41,41），
+  修复版同位置 43/43/43。终态判据测不出该缺陷（阶段一两个构建都过，
+  被增量下界自愈掩盖），详见 DTX_2PC_DESIGN.md §9.1 方框。
+
+### ⚠️ 本轮定位踩的工作流坑（务必留意）
+
+**docker cp 保留宿主机源文件 mtime**：cp 进容器的 .c 若比容器里的 .o 旧，
+make 会静默跳过重编，install 装的还是旧 .so —— A/B 对照实验跑的根本不是
+你以为的构建。本轮曾因此把修复版当对照版跑了两轮、写下过错误结论后返工。
+规程：cp 后必须 touch 再 make；构建诊断过滤用 `grep -E ": (error|warning):"`
+（避免匹配 gcc 命令行里的 -Werror=vla）；换构建后必须用 nm 特征符号验证
+产物身份，不能只信脚本 echo。

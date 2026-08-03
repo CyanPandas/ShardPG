@@ -225,18 +225,72 @@ for gid in "$GID_A" "$GID_B"; do
 done
 
 # ══════════════════════════════════════════════════════════════════════
-# 阶段二（核心判据）：失多数派 + 并发写 ⇒ 一行都不许提交成功
+# 阶段二（让路窗口的**确定性**判据）：长事务被并发 flush 让路后，其记录必须
+# 仍被复制出去
 #
-# 为什么端状态检查抓不到让路窗口：漏掉的记录会在该分区**下一次非提前返回的
-# flush** 里被增量下界（last_data_plsn → 当前 flush 点）顺带补齐，所以 burst
-# 结束后的终态几乎总是收敛的。让路窗口破坏的不是终态，而是**时序保证**——
-# 事务在自己的记录达到多数派之前就向客户端返回了成功。
+# 为什么终态检查（阶段一）抓不到让路窗口：漏掉的记录会在该分区下一次非提前
+# 返回的 flush 里被增量下界补齐，终态几乎总是收敛。为什么"失多数派+并发"
+# （阶段三）也抓不稳：失多数派把每个挂钩都拖进数秒的 RPC 超时，并发节奏被
+# 拉开，让路窗口反而几乎不被踩中（对照实验实测 0/240 漏网——判据无效）。
 #
-# 把 follower 停掉就能把这个时序差异变成可观测的布尔量：
+# 所以这里**确定性地制造一次让路**，不靠概率：
+#   会话 P：BEGIN; INSERT 1 条到 B 组; pg_sleep(4); COMMIT;
+#     —— P 的记录在 t0 就进了环形缓冲区，但 P 的 PRE_COMMIT 在 t0+4s。
+#   会话 Q（t0+1s）：对 A 组打若干条 autocommit
+#     —— Q 的 PartWALFlush 的 upto 覆盖 P 的 LSN，顺带把 P 的槽位落盘，
+#        flushed_upto 推进超过 P。
+#   t0+4s，P 的 PRE_COMMIT：flushed_upto >= 自己的 upto ⇒ **必然走提前返回分支**。
+#     · 让路窗口未修：不调挂钩 ⇒ B 组零 propose ⇒ P 提交成功但其记录
+#       永远只在 leader 盘上（此后不再写 B，无自愈）⇒ follower 缺最后一条；
+#     · 修复后：提前返回路径也调挂钩 ⇒ B 组把 P 的记录 propose 到多数派。
+# 判据：B 组多数派成员持有含 P 记录的完整前缀。全程多数派健康，秒级完成。
+# ══════════════════════════════════════════════════════════════════════
+P_ID=${IDS_B[$((HALF_B))]}
+(
+  echo "BEGIN;"
+  echo "INSERT INTO ${TBL} VALUES (${P_ID}, 'letpass');"
+  echo "SELECT pg_sleep(4);"
+  echo "COMMIT;"
+) | docker exec -i -u postgres "$CONTAINER" \
+      /work/pg-install/bin/psql -p "$BASE_PORT" -U postgres -q >>"$BURST_ERR" 2>&1 &
+P_PID=$!
+sleep 1
+for i in 0 1 2 3 4; do
+  q "$BASE_PORT" "INSERT INTO ${TBL} VALUES (${IDS_A[$((HALF_A + i))]}, 'q');" >/dev/null
+done
+wait "$P_PID"
+sleep 2
+# ★ 此后不得再写 B 组
+if grep -qiE "server closed the connection unexpectedly|crash of another server process|terminating connection because of crash" "$BURST_ERR"; then
+  fail "阶段二期间有节点崩溃——对让路窗口无参考价值"
+fi
+P_COMMITTED=$(q "$LEADER_PORT" "SELECT count(*) FROM ${TBL}_${GID_B} WHERE id = ${P_ID};")
+[[ "$P_COMMITTED" == "1" ]] \
+  || fail "阶段二夹具未成立：长事务 P 未提交成功(committed=${P_COMMITTED:-?})，无从判定让路"
+nrec=$(q "$LEADER_PORT" "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${GID_B}));")
+lmd5=$(q "$LEADER_PORT" "SELECT md5(string_agg(sub.h, ',' ORDER BY sub.plsn)) FROM (
+         SELECT g AS plsn, md5(r.data) AS h FROM generate_series(1, ${nrec}) g,
+              LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${GID_B}), g) r) sub;")
+have=1; detail="leader(${LEADER_PORT})=${nrec}"
+for port in "${FOLLOWERS[@]}"; do
+  fcnt=$(q "$port" "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${GID_B}));")
+  fmd5=$(q "$port" "SELECT md5(string_agg(sub.h, ',' ORDER BY sub.plsn)) FROM (
+           SELECT g AS plsn, md5(r.data) AS h FROM generate_series(1, ${nrec}) g,
+                LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${GID_B}), g) r) sub;")
+  detail+=" f(${port})=${fcnt:-?}"
+  [[ -n "$fmd5" && "$fmd5" == "$lmd5" ]] && { have=$((have + 1)); detail+="✔"; }
+done
+(( have >= MAJORITY )) \
+  || fail "让路窗口：长事务 P 提交成功但其记录未达多数派(${have}/${NMEMBERS}：${detail})——P 的 PRE_COMMIT 走了提前返回分支且复制挂钩未被调用"
+echo "raft_17 阶段二: 被让路的长事务记录已达多数派 ${have}/${NMEMBERS} — ${detail}"
+
+# ══════════════════════════════════════════════════════════════════════
+# 阶段三（2PC 性质回归）：失多数派 + 并发写 ⇒ 一行都不许提交成功
+#
 #   · 调用了复制挂钩的事务 → 拿不到多数派 → ERROR → INSERT 失败（正确）
-#   · 走提前返回、没调挂钩的事务 → 根本不知道多数派已丢 → **INSERT 成功**（违规）
-# 因此判据是"提交成功的行数 == 0"。这是 raft_16 第 2 步（失多数派 INSERT 必败）
-# 的并发版本，也正是 2PC 的 prepare 需要的性质。
+#   · 若有事务绕过挂钩 → 不知道多数派已丢 → INSERT 成功（违规）
+# 这是 raft_16 第 2 步（失多数派 INSERT 必败）的并发版本，正是 2PC 的
+# prepare 需要的性质。只打 A 组。
 # ══════════════════════════════════════════════════════════════════════
 for port in "${FOLLOWERS[@]}"; do
   docker exec -u postgres "$CONTAINER" /work/pg-install/bin/pg_ctl \
@@ -245,14 +299,17 @@ for port in "${FOLLOWERS[@]}"; do
 done
 sleep 3
 
-PHASE2_MIN_A=${IDS_A[$HALF_A]}
+# 阶段二的 Q 用掉了 IDS_A[HALF_A .. HALF_A+4]（多数派健康期、合法提交），
+# 阶段三从 HALF_A+10 起取 id —— IDS_A 升序，保证阶段三的断言下界能把
+# Q 的行排除在外，否则那 5 行会被误计为"失多数派期间提交"。
+PHASE3_START=$(( HALF_A + 10 ))
+PHASE3_MIN_A=${IDS_A[$PHASE3_START]}
 : > "$BURST_ERR"
-run_burst "$HALF_A" "$HALF_A" "$HALF_B" "$HALF_B"
+run_burst "$PHASE3_START" $(( ${#IDS_A[@]} - PHASE3_START )) 0 0
 sleep 2
 
 COMMITTED=$(q "$LEADER_PORT" \
-  "SELECT count(*) FROM ${TBL}_${GID_A} WHERE id >= ${PHASE2_MIN_A};")
-COMMITTED_B=$(q "$LEADER_PORT" "SELECT count(*) FROM ${TBL}_${GID_B};")
+  "SELECT count(*) FROM ${TBL}_${GID_A} WHERE id >= ${PHASE3_MIN_A};")
 
 for port in "${FOLLOWERS[@]}"; do
   docker exec -u postgres "$CONTAINER" /work/pg-install/bin/pg_ctl \
@@ -261,21 +318,18 @@ for port in "${FOLLOWERS[@]}"; do
 done
 sleep 3
 
-B_BASE=$(( ${#IDS_B[@]} / 2 / 2 * 2 ))   # 阶段一写进 B 的条数（仅用于报文可读性）
-
-# 阶段二同样要先甄别崩溃：节点崩溃会重置 shmem 组表，之后的 INSERT 因为
-# "查不到数据组"而直接跳过复制挂钩并提交成功 —— 那是崩溃的次生现象，
-# 不是让路窗口，混为一谈会得到假阳性（本次定位就踩过这个坑）。
+# 甄别崩溃：节点崩溃会重置 shmem 组表，之后的 INSERT 因为"查不到数据组"
+# 而直接跳过复制挂钩并提交成功 —— 那是崩溃的次生现象，混为一谈会得到假阳性
+# （本次定位就踩过这个坑）。
 if grep -qiE "server closed the connection unexpectedly|crash of another server process|terminating connection because of crash" "$BURST_ERR"; then
-  fail "阶段二 burst 期间有节点崩溃(并发写入路径 segfault)——本轮对让路窗口无参考价值"
+  fail "阶段三 burst 期间有节点崩溃——本轮对失多数派判据无参考价值"
 fi
 
 if [[ "$COMMITTED" =~ ^[0-9]+$ ]] && (( COMMITTED > 0 )); then
-  fail "失多数派期间仍有 ${COMMITTED} 行提交成功（组 ${GID_A}，阶段二 id >= ${PHASE2_MIN_A}）——"\
-"这些事务走了 group commit 让路的提前返回分支，从未调用复制挂钩，"\
-"因此不知道多数派已丢就向客户端返回了成功。这正是 DTX_2PC_DESIGN.md §9.1 的缺陷"
+  fail "失多数派期间仍有 ${COMMITTED} 行提交成功（组 ${GID_A}，id >= ${PHASE3_MIN_A}）——"\
+"存在绕过复制挂钩的提交路径（DTX_2PC_DESIGN.md §9.1 的 prepare 性质被破坏）"
 fi
-echo "raft_17 阶段二: 失多数派期间提交成功行数 = ${COMMITTED}（组 ${GID_A}）/ B 组总行数 ${COMMITTED_B}（阶段一写入 ${B_BASE} 行）"
+echo "raft_17 阶段三: 失多数派期间提交成功行数 = ${COMMITTED}（组 ${GID_A}）"
 
 cleanup
 echo "raft_17 PASS"

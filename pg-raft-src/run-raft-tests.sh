@@ -436,13 +436,15 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   CAND_MID=$(raft_node_id_for_port "${CAND_PORTS[1]}")
   CAND_HI=$(raft_node_id_for_port "${CAND_PORTS[2]}")
 
+  # 失败时保留 SQL 错误尾行——此前 &>/dev/null 吞掉一切，偶发失败无从诊断
+  RAFT_10_OUT=""
   if [[ "$SEED_OK" == "1" ]] && \
-     $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+     RAFT_10_OUT=$($PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
        -v cand_lo="$CAND_LO" -v cand_mid="$CAND_MID" -v cand_hi="$CAND_HI" \
-       -f "${RAFT_TEST_DIR}/raft_10_most_caught_up_secondary_promoted.sql" &>/dev/null; then
+       -f "${RAFT_TEST_DIR}/raft_10_most_caught_up_secondary_promoted.sql" 2>&1); then
     ok "raft_10_most_caught_up_secondary_promoted.sql"
   else
-    bad "raft_10_most_caught_up_secondary_promoted.sql"
+    bad "raft_10_most_caught_up_secondary_promoted.sql($(echo "$RAFT_10_OUT" | grep -E "ERROR|EXCEPTION" | tail -1))"
   fi
 
   for port in "${CAND_PORTS[@]}"; do
@@ -952,14 +954,29 @@ if [[ "$RAFT_14_OK" == "1" ]]; then
 
   if [[ -n "$RAFT_15_NEWP" ]]; then
     RAFT_15_OK=1
-    # master + 两个存活 worker 各自断言(partition_map / pg_dist_placement 每节点一份)
+    # master + 两个存活 worker 各自断言(partition_map / pg_dist_placement 每节点一份)。
+    #
+    # 按节点带有界重试:控制面语义是"多数派提交 + 全员**最终** apply"(§13.2)——
+    # master 上出现登记只说明多数派已提交,单个 follower 的 apply 由它自己的
+    # tick 推进,可以滞后。9 节点 group0 多数派 5/9,某 follower 不在提交时的
+    # ack 集里时滞后窗口明显大于 4 节点(3/4),一次性断言在 9 节点环境高概率
+    # 误报(2026-08-03 实测两次"节点 5434 断言失败"皆因此)。断言内容不放宽,
+    # 只允许每个节点在超时窗口内追平;窗口耗尽仍不满足才是真失败。
     for port in 5432 "${RAFT_14_FOLLOWER_PORTS[@]}"; do
-      if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+      RAFT_15_NODE_OK=0
+      for attempt in $(seq 1 20); do
+        if $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
              -v gid="$RAFT_14_GID" -v old_primary_id="$RAFT_14_PRIMARY_ID" \
              -v old_term="$RAFT_14_TERM" \
              -f "${RAFT_TEST_DIR}/raft_15_self_election_failover.sql" &>/dev/null; then
+          RAFT_15_NODE_OK=1
+          break
+        fi
+        sleep 1
+      done
+      if [[ "$RAFT_15_NODE_OK" != "1" ]]; then
         RAFT_15_OK=0
-        RAFT_15_WHY="节点 ${port} 断言失败"
+        RAFT_15_WHY="节点 ${port} 断言失败(等待 20s 追平后仍不满足)"
         break
       fi
     done
@@ -1212,7 +1229,7 @@ section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"
 if [[ $FAIL -eq 0 ]]; then
-  echo ">>> Raft 四节点回归全部通过 <<<"
+  echo ">>> Raft 回归全部通过（拓扑 1c+${N_WORKERS}w）<<<"
   exit 0
 else
   echo ">>> 存在 ${FAIL} 项失败,请根据上方 [FAIL] 排查 <<<"

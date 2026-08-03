@@ -606,6 +606,27 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
     XLogRecord *record;
     char       *errormsg = NULL;
     char       *buf;
+    MemoryContext oldctx;
+
+    /*
+     * ★ reader 与其全部内部缓冲必须活在 TopMemoryContext（2026-08-03 修）。
+     *
+     * 本函数只在 PRE_COMMIT 的 PartWALFlush 里被调用（group-commit 场景为
+     * peer backend 的槽位回读字节），彼时 CurrentMemoryContext 是**事务级**
+     * 上下文。此前 XLogReaderAllocate 未切换 context：static 指针跨事务存活，
+     * 而 reader 结构与内部缓冲（readBuf/readRecordBuf/errormsg_buf）随事务
+     * 结束被释放 —— 第二次进来就是 use-after-free，写穿的是**下一个事务**
+     * 复用同一块内存后放进去的 palloc chunk。症状：并发写入下 backend 报
+     * `pfree called with invalid pointer 0x...`（每次同一地址：fork 出的
+     * backend 分配序列相同）或直接 SIGSEGV，节点整体进 crash recovery。
+     * 串行负载永远走不到这条回读路径，所以此前从未暴露。
+     *
+     * 同理，XLogReadRecord 期间的**懒分配**（decode_buffer 首次读取时创建、
+     * readRecordBuf 遇长记录扩容）也发生在"调用时"的 context 里，所以整个
+     * 读取过程都必须在 TopMemoryContext 下执行，不能只包 Allocate。
+     * ERROR 逃逸时 context 由事务中止路径统一恢复，无需 PG_TRY。
+     */
+    oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
     if (raw_reader == NULL)
     {
@@ -615,11 +636,15 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
                                                    .segment_close = PartWALCloseSegment),
                                         NULL);
         if (raw_reader == NULL)
+        {
+            MemoryContextSwitchTo(oldctx);
             return false;
+        }
     }
 
     XLogBeginRead(raw_reader, start_lsn);
     record = XLogReadRecord(raw_reader, &errormsg);
+    MemoryContextSwitchTo(oldctx);
     if (record == NULL)
     {
         ereport(WARNING,
@@ -946,7 +971,15 @@ PartWALReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr,
         return -1;
 
     count = read(state->seg.ws_file, readBuf, XLOG_BLCKSZ);
-    return (count < 0) ? -1 : (int) count;
+
+    /*
+     * 短读按失败处理（page_read 回调的契约是"至少 reqLen 字节"）。
+     * 此前 count < reqLen 也当成功返回，readBuf 尾部是未初始化内存 ——
+     * AssembleRawWALRecord 有 CRC 兜底，但 XLogReadRecord 路径会拿它当
+     * 页头解析。wal_init_zero=on 时段文件预分配为整段，正常读不满页的
+     * 只有文件被并发回收/截断的窗口，此时就该失败重来。
+     */
+    return (count < reqLen) ? -1 : (int) count;
 }
 
 static void
