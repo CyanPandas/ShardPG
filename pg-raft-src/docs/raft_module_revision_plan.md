@@ -80,7 +80,10 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
 - ~~`pg_raft_data_propose()` 未接入写入路径~~ **→ 2026-07-24 已接入事务 prepare 路径**
   （§14，PartWALFlush 挂钩自动逐条 propose）。仍缺**后台追平通道** —— 无写入流量时
   落后 follower 不自行收敛（下一次写入的挂钩会顺带补齐增量）。
-- 2PC 的 prepare / commit 决议尚未实现（用户明确暂缓）。
+- 2PC 的 commit 决议尚未实现。~~（用户明确暂缓）~~ **→ 2026-08-03 解除暂缓**：
+  设计已定稿于 `pg-partdist-src/docs/DTX_2PC_DESIGN.md`（DTX-2PC v1），
+  **决议改放数据组，不再走控制面**（理由见该文 §3.2）。prepare 阶段本身已由
+  §14 落地，但存在一个正确性阻断项（group-commit 让路窗口，见 §14.3 #1 的更新）。
 
 ## 3. 目标架构
 
@@ -279,11 +282,24 @@ PartWAL 接入链路：
    → 多数派语义已具备并验收：多数派提交 == 多数派已持久化（raft_13 反例：失多数派
    propose 必须失败）；"prepared 状态"作为事务状态机（2PC）本体暂缓。
 
-其余（2PC 决议，暂缓）：
+其余（2PC 决议）——**2026-08-03 定稿，下述控制面方案已作废**：
 
-- Commit WAL 和协调者最终决议必须在控制面 Raft 复制到多数派、数据面达到配置 quorum 后才能成功返回。
-- 控制面 Raft 新增 `OP_PREPARE_DECISION` 和 `OP_COMMIT_DECISION`。
-- 接口继续与 `GlobalXID`、TSO、增强 CLOG 保持对齐。
+> ~~Commit WAL 和协调者最终决议必须在**控制面** Raft 复制到多数派后才能成功返回；
+> 控制面 Raft 新增 `OP_PREPARE_DECISION` 和 `OP_COMMIT_DECISION`。~~
+>
+> **被 `pg-partdist-src/docs/DTX_2PC_DESIGN.md` 取代。** 决议不进控制面，而是写在
+> **本事务写集内按 `hash(dtxid)` 选出的那个分区组**的日志里，该记录达多数派即为
+> 全局提交点。三条理由（该文 §3.2）：(1) 控制面 leader 常态在 master，每个跨分区
+> 事务都压一次多数派写会让单点更单点；(2) group 0 成员是全部 9 节点、数据组成员是
+> 3 副本子集，两个多数派互不蕴含，恢复要做跨组交叉判定；(3) §13 的自治选举+上报
+> 已让"某组现任 leader 是谁"成为随时可查的元数据，放数据组不引入新的服务发现问题。
+> 形态与 Spanner（commit record 写 coordinator Paxos group）、TiKV（decision 写
+> primary region）一致。
+
+- 决议记录、PREPARE/COMMIT 标记的字节格式见该文 §5；协调组选取见 §4；
+  协调者宕机走 **presumed abort**（查无决议即中止）而非"新 leader 续跑"，见 §2.2。
+- 接口继续与 `GlobalXID`、TSO、增强 CLOG 保持对齐（TSO 未建时 `commit_ts` 先用
+  协调者本地时钟，决议原子性不依赖它，见该文 §9.8）。
 
 验收标准：
 
@@ -326,8 +342,10 @@ PartWAL 接入链路：
 - ✅ `OP_NODE_STATUS`
 - ✅ `OP_PARTITION_PRIMARY`（2026-07-24 起 payload 含 `primary_term`；apply 带任期栅栏，
   真实 Citus 分片同步更新本地 `pg_dist_placement`——单放置守卫 + 子事务隔离）
-- ❌ `OP_PREPARE_DECISION`（阶段 3，未实现）
-- ❌ `OP_COMMIT_DECISION`（阶段 3，未实现）
+- 🚫 ~~`OP_PREPARE_DECISION`~~ / ~~`OP_COMMIT_DECISION`~~ **已废弃，不会实现**：
+  2PC 决议改由数据组承载，控制面不参与（见 `DTX_2PC_DESIGN.md` §3.2）。
+  新增的是**数据组内**的记录类型（`PARTWAL_FLAG_DTX` + `DtxRecordPayload`，
+  该文 §5）与两个 SQL 入口 `partdist.dtx_decide` / `partdist.dtx_status`（§6.3）。
 - ❌ `OP_CONFIG_CHANGE`（成员集下发依赖它，见 §11.5.2 #3）
 - ✅ 数据组内部条目类型：`OP_PARWAL`（描述符 + 随行字节；数据字节的门控按 `op_type` 判定，
   **不能**按 `group_id > 0` 判定，否则数据组里的普通条目复制不出去）
@@ -424,8 +442,10 @@ PartWAL 接入链路：
   在此追加记录**，它是 raft 侧与 pg_partdist 侧之间的交接台账）
 - `pg-raft-src/docs/INTEGRATION-citus-shard-parwal.md`
 - `pg-raft-src/docs/interfaces/partwalmgr_raft.idl`
-- `pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md`（P3 的设计依据，**当前有两份分叉副本，
-  见 §11.5.2 #5**）
+- `pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md`（P3 的设计依据；~~两份分叉副本~~
+  **已于 shardpg-replay 合并为 v3.1 单一版本，`shardpg-4.0` 继承，§11.5.2 #5 关闭**）
+- `pg-partdist-src/docs/DTX_2PC_DESIGN.md`（**新增 2026-08-03**：跨分区事务 2PC 的
+  设计依据，取代本文 §4 阶段 3 的控制面决议方案）
 
 归档或删除候选：
 
@@ -448,14 +468,15 @@ PartWAL 接入链路：
 | 只改 `partition_map` 会提升陈旧副本 | 有数据组的分区：选举限制 + `primary_term` 任期栅栏（§13）；遗留分区：绑定 `switch_partition_lsn` 候选过滤 | ✅ 已落地 |
 | 切主结果不达路由层（双真相源） | `OP_PARTITION_PRIMARY` apply 在每节点同步本地 `pg_dist_placement`（单放置守卫+子事务隔离） | ✅ 已落地（P3 前为"机制先行"） |
 | PartWAL 复制链路未打通 | 由分区级 Raft 组承担运输，复用 `partwal_sync` 与 `applied_part_lsn` | ✅ 已落地 |
-| 2PC 决议丢失会导致部分提交 | 通过控制面 Raft 复制 prepare / commit 决议并等待 quorum | ❌ 未开始 |
+| 2PC 决议丢失会导致部分提交 | ~~通过控制面 Raft 复制~~ **改为写入协调组（写集内 `hash(dtxid)` 选出的分区组）的日志并等 quorum**；查无决议即推定中止（`DTX_2PC_DESIGN.md`） | ⚠️ 设计定稿 2026-08-03，实现中 |
+| **group-commit 让路窗口使 prepare 的多数派保证失效** | per-backend 触达集合 + 提前返回路径也触发复制挂钩；prepare 语义改为"等 `commit_index` 覆盖本事务记录"（`DTX_2PC_DESIGN.md` §9.1） | ❌ **2PC 的头号阻断项**，见 §14.3 #1 |
 | 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
 | **一节点托管多分区副本 ⇒ 不同 leader 的 xid 在本地 clog 相撞** | **必须先做集群级 xid 区间租约**；在此之前多分区共存于一节点的 redo 配置不可上线 | ❌ **最硬阻断项**，见 §11.5.2 #1 |
 | **分区数超过 `RAFT_MAX_GROUPS=32` / ring 撑爆 shmem** | 数据组日志外部化到 parwal 段文件，shmem 只留游标 | ❌ 未做 |
 | **成员集不随 RPC 传播 ⇒ 多数派按全体 peers 算错** | 成员集改由控制面 `OP_CONFIG_CHANGE` 下发 | ❌ 未做 |
 | 数据组数量挤占控制面心跳 | 连接复用 + 对端级退避（已做）；报文级心跳合并 + 最小堆调度（待做） | ⚠️ 部分缓解 |
 | 边界函数签名变更在回归中静默失效 | 改签名同步改 `COMMENT`/`setup-raft.sh`/已安装副本；补全新库 `CREATE EXTENSION` 冒烟 | ⚠️ 已踩过一次 |
-| 两份 `FOLLOWER_REPLAY_DESIGN.md` 分叉导致 P3 依据不一致 | P3 开工前先合并 | ❌ 待处理 |
+| 两份 `FOLLOWER_REPLAY_DESIGN.md` 分叉导致 P3 依据不一致 | P3 开工前先合并 | ✅ 已合并为 v3.1（shardpg-replay → 4.0 继承） |
 
 ## 9. 近期任务清单
 
@@ -816,8 +837,9 @@ leader 的字节追加到**另一个编号**上，再从那个编号读回来比
 2. **调度与选举风暴**:心跳按对端节点合并;election_deadline 用最小堆;评估领导权共置。
 3. **成员变更**:分区副本集变更走 joint consensus 或"控制面决议 + 数据组配置热更"的等价
    安全机制,避免脑裂。
-4. **跨分区 2PC**:一个事务跨多个分区组时,prepare/commit 的原子性需与阶段 3 的
-   `OP_PREPARE_DECISION/OP_COMMIT_DECISION` 对齐(独立组下更难,需协调者跨组屏障)。
+4. **跨分区 2PC** ✅ **2026-08-03 已由 `DTX_2PC_DESIGN.md` 回答**:不做"协调者跨组
+   屏障",而是把决议写进**写集内的某一个参与组**(`hash(dtxid)` 选取)——决议与该组
+   数据在同一条日志上定序,跨组问题塌缩为单组问题;协调权随该组 Raft 选举自动转移。
 5. **崩溃恢复**:每组 HardState 与 parwal checkpoint 的一致性;重启后各组独立恢复。
 
 ### 11.7 风险与对策
@@ -968,8 +990,13 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
    并补一条后台追平通道（需解决 BGW 无 SPI 的取字节问题）。
 6. **P3 物理回放本体**：把平凡 apply 换成 `DecodeXLogRecord → 改写 RelFileLocator → rm_redo`。
    验收：follower 堆表与 leader 收敛一致；切主后新 primary 拥有切换点前的全部已提交数据。
-7. 其余：InstallSnapshot、`partwal_notify_primary_switch` 真实化、2PC 决议
-   （`OP_PREPARE_DECISION` / `OP_COMMIT_DECISION`）。
+7. 其余：InstallSnapshot、`partwal_notify_primary_switch` 真实化。
+
+> **2026-08-03 顺序修正**：2PC 不再排在最后，也不依赖 P3 —— 见
+> `pg-partdist-src/docs/DTX_2PC_DESIGN.md` §10 的六步落地顺序。其中第 1 步
+> （修 group-commit 让路窗口）是**独立于 P3 的正确性修复**，应立即执行；
+> 第 2 步（成员集显式化）与本节 #4 是同一件事，2PC 与 P3 共用。
+> 反过来，2PC **不解除** R3/R4 的既有阻断（该文 §9.6）。
 
 > **交接提示**：对 `pg-partdist-src`（即 raft 之外）的每一次改动，都必须在
 > `pg-raft-src/docs/pg_partdist_sync_change_log.md` 追加记录，写明时间、文件、目的与对
@@ -1129,11 +1156,20 @@ pg_wal 提交 fsync（[B]）。复制严格发生在 [A] 之后、[B] 之前 —
 
 ### 14.3 边界（本次不解决）
 
-1. **group commit 让路窗口**：若本事务的记录被并发的其他 backend 顺带落盘
-   （`flushed_upto` 已覆盖时本 backend 提前返回），该事务不会触发复制挂钩，
-   记录延后到该分区下一次写入时才补齐复制（增量下界机制天然补漏）。并发高负载下
-   "提交返回时多数派已持久化"的保证因此弱化为"最终复制"——收紧需要把挂钩信息
-   记进共享 slot，留待与后台追平通道一并做。
+1. **group commit 让路窗口** —— ⚠️ **2026-08-03 重新定级：不是边界，是正确性阻断项。**
+   若本事务的记录被并发的其他 backend 顺带落盘（`flushed_upto` 已覆盖时本 backend
+   提前返回），该事务不会触发复制挂钩；且 `touched[]` 只登记
+   `slot->backend_id == MyBackendId` 的槽位，而槽位已被 peer 消费置 `valid=false`，
+   ⇒ **本 backend 事后也无从知道自己写过哪些分区**。
+   在当前（无 2PC）形态下这只是"复制延后到该分区下一次写入"；
+   **一旦 2PC 落地，它变成"PREPARE 返回成功但字节从未达多数派"⇒ 协调者据此写
+   COMMIT 决议 ⇒ 参与组多数派上根本没有该事务的数据 ⇒ 丢数据。**
+   修法（`DTX_2PC_DESIGN.md` §9.1，两处缺一不可）：(a) 触达集合改为在
+   `PartWALInsert` 时 per-backend 记录（给已有的 `partwal_pending[]` 加一个
+   `partition_id` 字段即可，零额外结构）；(b) **提前返回路径也要调复制挂钩**。
+   顺带把 prepare 语义从"逐条 propose 我的范围"收紧为"确保复制推进到 ≥ X 并等
+   `commit_index` 覆盖"——消除并发 backend 抢同一段 plsn 的重复 propose，
+   批量场景天然合批。
 2. **raft 日志 SQL 行与用户事务同命**：propose 在 PRE_COMMIT 内经 SPI 写
    `partdist.raft_log`，若事务在 propose 之后仍中止（后续回调 ERROR 等窄窗口），
    leader 的 SQL 日志行随之回滚而 shmem 环仍在 —— 与既有 propose-in-txn 路径同级的

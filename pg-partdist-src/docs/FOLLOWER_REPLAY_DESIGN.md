@@ -268,6 +268,19 @@ typedef struct TxnMarkerPayload
 - 与 reply_v1 的 16 字节定长相比多出 `nsubxacts` 与子事务数组:这是为覆盖
   SAVEPOINT 语义的**有意格式增量**(§9.5),需回同步到评审文档。
 
+> **★ 2026-08-03 补:与 DTX-2PC 的对齐要求。** 本节的标记记录只覆盖**单机事务**
+> (顶层 COMMIT/ABORT)。跨分区事务另有一套记录,定义在
+> `pg-partdist-src/docs/DTX_2PC_DESIGN.md` §5:`PARTWAL_FLAG_DTX = 0x08`
+> (与本文预留的 `MARKER = 0x02` / `CTRL = 0x04` 不冲突),载荷为 `DtxRecordPayload`
+> (`dtxid` / `coord_gsid` / `commit_ts` / `verdict` / `participants[]`),
+> 子类型 `DTX_PREPARE|DECISION|COMMIT|ABORT` 存在头部 `info` 字段里。
+> 两条格式契约:
+> 1. **DTX 记录的 `orig_lsn` 恒为 0** —— 它不是 WAL 记录,没有 leader 侧 end LSN;
+>    回放侧**禁止**拿它盖页 LSN(它本来就不进 `rm_redo`,按 flags 在分派处即被路由走)。
+> 2. **标记记录须能携带 `dtxid`** —— 升主后判定 in-doubt 事务归属哪个全局事务
+>    全靠它(DATA 记录里只有 `xid`)。parwal-3.0 定稿时应把 `TxnMarkerPayload` 与
+>    `DtxRecordPayload` 统一,而不是维持两套并行格式。
+
 ### 4.4 兼容性
 
 - 回放模块按 `version` 分派:`VERSION_2` 段流仅支持 R1 阶段的纯物理回放
@@ -599,6 +612,19 @@ ShardReplayMarkerRecord(ShardReplayCtx *ctx, PartWALRecord *h, TxnMarkerPayload 
   §13 约束 5(副本表屏蔽 autovacuum、不服务读)保证,升主后由路由表接管(§9.4)。
 - 中止的子事务不在 COMMIT 标记的列表中 → 其 gxid 在增强型 CLOG 中无 COMMITTED
   记录 → 天然不可见,SAVEPOINT 回滚语义正确。
+
+> **★ 2026-08-03 补:in-doubt 事务的处理(跨分区事务必需)。** 本节只覆盖
+> COMMIT/ABORT 两态,而跨分区事务的流里会出现**第三态**:回放遇到
+> `DTX_PREPARE` 标记、但直到追平上界都没等到对应的 `DTX_COMMIT`/`DTX_ABORT`。
+> 处理规则:
+> - 遇 `DTX_PREPARE`:以 `TXN_PREPARED`(§9.3 枚举里现成的状态)写增强型 CLOG,
+>   并把 `(dtxid, coord_gsid, local_xid)` 记入本槽位的 in-doubt 集合;
+> - 遇 `DTX_COMMIT`/`DTX_ABORT`(或协调组上的 `DTX_DECISION`):按 §7.6 正常闭合,
+>   并从 in-doubt 集合移除;
+> - **追平结束时 in-doubt 集合非空 ⇒ 由升主流程逐一求决议**,见 §11 第 4.5 步。
+>   回放模块自身不发起网络请求,只把集合交出去。
+> `TXN_PREPARED` 的元组在决议落定前**一律不可见**——这与推定中止是一致的
+> (决议查无即 ABORT)。
 - 元组可见的最终条件(读路径,本期不实现):状态 = COMMITTED **且**
   `commit_ts ≤ 快照 start_ts`(§10)。
 
@@ -892,6 +918,23 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
    内部即循环 §7 阶段二~四,直至 `applied_part_lsn` 达到 `commit_index`。
 3. **最终 apply checkpoint**:落盘游标、`max_orig_lsn`、`max_replayed_fxid`、
    xid_map 快照;`PartDistAdvanceNextXidPastXid(max_replayed_fxid)` 拉齐 nextXid。
+
+4.5. **★ 清 in-doubt(2026-08-03 补,跨分区事务必需)**:追平结束时若 §7.6 的
+   in-doubt 集合非空,对其中每个 `dtxid` 向 `coord_gsid` 的现任 leader
+   (查 `partdist.partition_map[coord_gsid].primary_node`,切主重构 §13 保证它实时)
+   调 `partdist.dtx_status(dtxid)`,按结果补写 `DTX_COMMIT`/`DTX_ABORT` 标记并
+   闭合增强型 CLOG;**有 DATA 但连 `DTX_PREPARE` 都没有的**(写到一半崩)直接补
+   ABORT 标记。查无决议时对端会**先写 ABORT DECISION 达多数派再答复**
+   (推定中止,`DTX_2PC_DESIGN.md` §2.2),因此答复是终局的,不会被后到的 COMMIT 翻转。
+
+   > 这一步**不依赖 R3**:它是按**事务粒度**求决议并写标记,不是元组粒度的可见性
+   > 判定。所以 2PC 不新增对 R3 的阻塞;同时也**不解除**下面那条 R4←R3 硬阻断
+   > ——promoted 副本可读仍然卡在 xid_map + 增强型 CLOG。
+
+   > **另一条归队规则(`DTX_2PC_DESIGN.md` §9.5)**:单分区事务的快路径沿用
+   > `[A] → quorum → [B]` 时序,存在"组内已提交、leader 本地 `[B]` 前崩溃"的窗口
+   > ⇒ 旧 leader 与自己的组分叉。**旧 leader 归队时对检测到状态分叉的分片必须强制
+   > 重做物理基线**(§8.5 的 fail-safe 路径),不能直接按游标追平。
 4. **推进本地 WAL 插入位点**越过 `max_orig_lsn`(内核补丁 0003,
    `pg_partdist_advance_wal_to(XLogRecPtr)`:语义类似 pg_resetwal 的 `-l` 但在线执行
    ——持有全部 WALInsertLock,把 insert 位置跳到目标 LSN 所在段起点并切段)。
