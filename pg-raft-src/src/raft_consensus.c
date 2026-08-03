@@ -188,6 +188,8 @@ static void parse_peers(void);
 static bool raft_group_ctx(int64 group_id, RaftGroupCtx *ctx);
 static bool raft_group_ensure(int64 group_id, const int *members, int n_members,
                               RaftGroupCtx *ctx);
+static bool group_membership_known(RaftGroupCtx *ctx);
+static bool group_resolve_membership(RaftGroupCtx *ctx);
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
@@ -350,33 +352,177 @@ raft_control_ctx(RaftGroupCtx *ctx)
     return raft_group_ctx(RAFT_CONTROL_GROUP, ctx);
 }
 
-/* 该节点是否为本组成员（members 为空表示全体节点） */
+/*
+ * 从控制面下发的 partition_map 导出某数据组的成员集（DTX_2PC_DESIGN.md §9.2）。
+ *
+ * partition_map 由 group 0 的 apply 在**每个节点**各写一份（计划文档 §13），
+ * 所以这是本地可读、无需新增 RPC 的权威来源 —— 正是"成员集必须来自控制面下发，
+ * 不能从收到的报文里推断"的落地形态。
+ *
+ * 成员集 = {primary_node} ∪ secondary_nodes，剔除协调节点（master 不作数据副本）。
+ * 返回成员数；0 表示导不出来（该分区尚未登记，例如全新组的首次选举之前——
+ * 那种情况必须由 pg_raft_group_create(gid, members) 显式给出）。
+ *
+ * 需要 SPI，只能在 SQL/客户端 backend 路径调用，**不能在 BGW tick 里调**。
+ */
+static int
+group_members_from_partition_map(int64 group_id, int *members)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int   n = 0;
+
+    if (group_id == RAFT_CONTROL_GROUP || group_id <= 0)
+        return 0;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node, "
+                     "       COALESCE(array_to_string(secondary_nodes, ','), '') "
+                     "  FROM partdist.partition_map WHERE partition_id = %llu::oid",
+                     (unsigned long long) group_id);
+
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d;
+        int   primary_node = 0;
+        char *sec = NULL;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+            primary_node = DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        if (!isnull)
+            sec = TextDatumGetCString(d);
+
+        if (primary_node > 0 && primary_node != pg_raft_coordinator_node_id)
+            members[n++] = primary_node;
+
+        if (sec != NULL && sec[0] != '\0')
+        {
+            char *tok, *saveptr = NULL;
+
+            for (tok = strtok_r(sec, ",", &saveptr);
+                 tok != NULL && n < RAFT_MAX_PEERS;
+                 tok = strtok_r(NULL, ",", &saveptr))
+            {
+                int id = atoi(tok);
+                int j;
+
+                if (id <= 0 || id == pg_raft_coordinator_node_id)
+                    continue;
+                for (j = 0; j < n; j++)
+                    if (members[j] == id)
+                        break;
+                if (j == n)
+                    members[n++] = id;
+            }
+        }
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return n;
+}
+
+/*
+ * 成员集未知时尝试从 partition_map 补齐。返回补齐后是否已知。
+ * 仅可在 SPI 可用的路径调用。
+ */
+static bool
+group_resolve_membership(RaftGroupCtx *ctx)
+{
+    int members[RAFT_MAX_PEERS];
+    int n;
+
+    if (group_membership_known(ctx))
+        return true;
+
+    n = group_members_from_partition_map(ctx->group_id, members);
+    if (n <= 0)
+        return false;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    ctx->g->n_members = 0;
+    while (ctx->g->n_members < n)
+    {
+        ctx->g->members[ctx->g->n_members] = members[ctx->g->n_members];
+        ctx->g->n_members++;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    elog(LOG, "pg_raft: 组 %lld 的成员集从 partition_map 导出，共 %d 个成员",
+         (long long) ctx->group_id, n);
+    return true;
+}
+
+/*
+ * ★ 成员集语义（2026-08-03 修，DTX_2PC_DESIGN.md §9.2）
+ *
+ * 旧语义把 `n_members == 0` 重载为"全体节点"。这对**控制面组**成立（组 0 的
+ * 成员本来就是全部节点），对**数据组永远不成立**——一个分片的副本集必然是全体
+ * 节点的真子集。实测后果（9 节点环境，以 SQL 默认的 NULL 成员集建组）：
+ *   · cluster_size 算成 9、多数派算成 5，而只有 3 个节点持有该分片的数据；
+ *   · 该组向**全集群**广播 RequestVote/AppendEntries，非副本节点收到后
+ *     照样 hearsay 自动建组（同样是空成员集）并参与投票；
+ *   · 实测真正持有数据的 worker 反而掉成 term=0 的 follower，分片彻底不可用，
+ *     且非副本节点可以赢得它根本没有数据的分片的领导权。
+ *   · 更本质的危险：同一个组在不同节点上有两套不相交的多数派定义
+ *     （3 副本算 2/3，hearsay 节点算 5/9），Leader Completeness 失去交集保证。
+ *
+ * 新语义：数据组的 `n_members == 0` 表示**成员集未知**，而不是"全体"。未知即
+ * **不参与**：不竞选、不发心跳、不投票、不提案——fail-stop 而不是 fail-open。
+ * 成员集的权威来源是控制面下发到每个节点的 `partdist.partition_map`
+ * （见计划文档 §13），由 group_members_from_partition_map() 在 SPI 可用的
+ * 路径上自动导出；导不出来时必须由运维显式 pg_raft_group_create(gid, members)。
+ */
+static bool
+group_membership_known(RaftGroupCtx *ctx)
+{
+    return ctx->group_id == RAFT_CONTROL_GROUP || ctx->g->n_members > 0;
+}
+
+/* 该节点是否为本组成员（控制面组的空成员集仍表示全体节点） */
 static bool
 group_has_member(RaftGroupCtx *ctx, int node_id)
 {
     int i;
 
     if (ctx->g->n_members <= 0)
-        return true;
+        return ctx->group_id == RAFT_CONTROL_GROUP;
     for (i = 0; i < ctx->g->n_members; i++)
         if (ctx->g->members[i] == node_id)
             return true;
     return false;
 }
 
-/* 本组的集群规模（用于多数派计算） */
+/* 本组的集群规模（用于多数派计算）；数据组成员集未知时返回 0 */
 static int
 group_cluster_size(RaftGroupCtx *ctx)
 {
     if (ctx->g->n_members > 0)
         return ctx->g->n_members;
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return 0;               /* 成员集未知：规模无从谈起 */
     return (n_peers > 0) ? n_peers : 1;
 }
 
 static int
 cluster_majority(RaftGroupCtx *ctx)
 {
-    return group_cluster_size(ctx) / 2 + 1;
+    int size = group_cluster_size(ctx);
+
+    /*
+     * 规模未知时返回一个**不可能达到**的票数（ack 数上限是 n_peers <=
+     * RAFT_MAX_PEERS）。调用方本应在更早的门禁处就已返回，这里是兜底：
+     * 万一有路径漏网，也必须 fail-closed（永远提交不了），
+     * 绝不能退化成 0/2+1 = 1 而"一票自行提交"。
+     */
+    if (size <= 0)
+        return RAFT_MAX_PEERS + 1;
+    return size / 2 + 1;
 }
 
 /* ---- 日志辅助 ---- */
@@ -1080,7 +1226,16 @@ restore_groups_if_needed(void)
              tok = strtok_r(NULL, ",", &saveptr))
             members[n_members++] = atoi(tok);
 
-        (void) raft_group_ensure(gid, members, n_members, &ctx);
+        if (raft_group_ensure(gid, members, n_members, &ctx))
+        {
+            /*
+             * 注册表里可能是空成员集（历史行数据，或建组时成员集由
+             * partition_map 导出而注册表只存了 '{}'）。重启后必须重新导出，
+             * 否则该组恢复成"成员集未知"而永久不参与选举（DTX_2PC_DESIGN.md §9.2）。
+             * 本函数本就在 SPI 可用的路径上，可以直接查 partition_map。
+             */
+            (void) group_resolve_membership(&ctx);
+        }
         pfree(mstr);
     }
 
@@ -2619,6 +2774,15 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
     }
 
+    /*
+     * 机会性补齐成员集（DTX_2PC_DESIGN.md §9.2）；补不上也照常收条目。
+     * 理由同 pg_raft_rpc：leader 只向自己成员集里的节点发 AppendEntries，
+     * 多数派算术是 leader 按它自己的成员集做的，本节点落盘+ack 不会让谁算错。
+     * 成员集未知只剥夺**主动**参与（竞选/当选/提案），不剥夺被动接收 ——
+     * 否则 hearsay 引导路径被砍，全新分片永远建不起来。
+     */
+    (void) group_resolve_membership(&ctx);
+
     if (PG_NARGS() > 10 && !PG_ARGISNULL(10))
     {
         bytea *raw = PG_GETARG_BYTEA_PP(10);
@@ -2698,6 +2862,25 @@ pg_raft_rpc(PG_FUNCTION_ARGS)
         pfree(msg);
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
     }
+
+    /*
+     * 机会性地从控制面 partition_map 补齐成员集（DTX_2PC_DESIGN.md §9.2）：
+     * 补上了本节点就能主动参与该组（竞选/心跳）；补不上也**照常应答**。
+     *
+     * 为什么这里不能拒绝应答：候选人只会向**它自己成员集里的节点**发
+     * RequestVote（peer_in_group 过滤），所以收到 RV 就意味着对方认为本节点
+     * 是成员；票数算术是候选人按它自己的（已知的）成员集做的，本节点投票
+     * 不会让任何人算错多数派。反过来，拒绝应答会砍掉一条**有意设计**的引导
+     * 路径：数据组按计划文档 §11.5.2 的约定"只在 placement 节点先建组，
+     * 其余成员靠 hearsay 自动建组后再补 create 固化成员集"，首次选举时
+     * partition_map 尚无登记（登记正是由当选 leader 上报产生的），
+     * 一律拒绝会让全新分片永远选不出 leader（实测 raft_14/15/16/17 全挂）。
+     *
+     * 真正的危险是**成员集未知的节点主动竞选/当选**（它会把多数派算成全体
+     * 节点并向全集群广播）——那条路由 group_tick 里的 group_has_member 门禁
+     * 挡住，见 group_membership_known() 的注释。
+     */
+    (void) group_resolve_membership(&ctx);
 
     restore_hard_state_if_needed(&ctx);
     SpinLockAcquire(&ctx.cons->mutex);
@@ -2794,6 +2977,27 @@ pg_raft_group_create(PG_FUNCTION_ARGS)
 
     parse_peers();
     n_members = extract_members(arr, members);
+
+    /*
+     * ★ 不接受"成员集未知"的数据组（DTX_2PC_DESIGN.md §9.2）。
+     * p_members 的 SQL 默认值是 NULL，此前会直接建出一个 n_members == 0 的组，
+     * 而旧语义把它当"全体节点"——该组于是向全集群广播选举、把多数派算成 5/9，
+     * 实测导致真正的数据持有者掉成 follower、分片不可用。
+     * 现在：先从控制面 partition_map 导出；导不出来就直接报错，不建这种组。
+     */
+    if (n_members == 0)
+        n_members = group_members_from_partition_map(group_id, members);
+
+    if (n_members == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_raft: 数据组 %lld 的成员集未知，拒绝建组",
+                        (long long) group_id),
+                 errdetail("数据组的多数派必须按真实副本集计算；分片副本集是全体节点的"
+                           "真子集，空成员集不能当作\"全体节点\"。"),
+                 errhint("显式给出成员集：partdist.pg_raft_group_create(%lld, ARRAY[...]::int[])；"
+                         "或先让控制面把该分区登记进 partdist.partition_map。",
+                         (long long) group_id)));
 
     /* master 只做协调与登记，不作任何分区的数据副本（主/从都不行） */
     if (pg_raft_coordinator_node_id > 0)
@@ -3276,6 +3480,23 @@ pg_raft_partwal_replicate(Oid partition_id)
         return;                 /* 非全局分片（无 shard_identity）：不纳管 */
     if (!raft_group_ctx(gid, &ctx))
         return;                 /* 无数据组：行为与接线前一致 */
+
+    /*
+     * ★ 成员集未知的数据组拒绝参与 prepare（DTX_2PC_DESIGN.md §9.2）。
+     * 先尝试从控制面 partition_map 导出；仍未知则 **ERROR 中止事务**，
+     * 而不是"跳过复制照常提交" —— 后者等于让写入在没有任何多数派保证的
+     * 情况下返回成功，正是本项目刚修掉的那类丢数据形态。
+     */
+    if (!group_resolve_membership(&ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld)的成员集未知，写入被拒",
+                        partition_id, (long long) gid),
+                 errdetail("数据组的多数派必须按真实副本集计算；partition_map 中没有该分区的登记，"
+                           "无法确定副本集。"),
+                 errhint("先让控制面登记该分区，或在各副本节点执行 "
+                         "partdist.pg_raft_group_create(%lld, ARRAY[...]::int[])。",
+                         (long long) gid)));
 
     restore_hard_state_if_needed(&ctx);
     restore_persistent_log_if_needed(&ctx);

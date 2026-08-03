@@ -375,3 +375,53 @@ make 会静默跳过重编，install 装的还是旧 .so —— A/B 对照实验
 规程：cp 后必须 touch 再 make；构建诊断过滤用 `grep -E ": (error|warning):"`
 （避免匹配 gcc 命令行里的 -Werror=vla）；换构建后必须用 nm 特征符号验证
 产物身份，不能只信脚本 echo。
+
+### DTX-2PC 第 2 步：成员集显式化（同日第三批）
+
+- 修改时间：2026-08-03
+- 修改文件：**仅 pg-raft-src 侧**（`src/raft_consensus.c`），pg-partdist-src 无改动。
+  本条记录在台账里是因为它改变了 `partdist.partition_map` 的**用途**：
+  该表从此不只是"切主登记结果"，还是**数据组成员集的权威来源**——
+  pg_raft 会在所有 SPI 可用的路径上读它来导出成员集。
+  改动 partition_map 的 schema / 语义时必须一并考虑 pg_raft 的这个依赖。
+- 依据：`pg-partdist-src/docs/DTX_2PC_DESIGN.md` §9.2
+- 缺陷：`n_members == 0` 被重载为"全体节点"。对控制面组（组 0）成立，对数据组
+  永远不成立（分片副本集必然是全体节点的真子集）。实测（9 节点，SQL 默认的
+  `p_members = NULL` 建组）：cluster_size 算成 9、多数派算成 5；该组向全集群广播
+  RequestVote，非副本节点 hearsay 建组并参与投票；真正持有数据的 worker 反被挤成
+  term=0 的 follower，分片彻底不可用；三个副本全在也写不进去。本质危险是同一组
+  在不同节点上有两套不相交的多数派定义（2/3 vs 5/9），Leader Completeness 失去
+  交集保证，非副本节点还能赢得它没有数据的分片的领导权。
+- 修复：① 数据组空成员集语义改为"**未知**"并 fail-stop，但**只剥夺主动参与**
+  （不竞选/不当选/不提案），被动应答（投票、落盘+ack）照旧；
+  `cluster_majority()` 在规模未知时返回不可能达到的票数作 fail-closed 兜底；② 成员集从 `partdist.partition_map` 本地导出
+  （`{primary_node} ∪ secondary_nodes` 剔除协调节点），控制面已把它复制到每个
+  节点，因此无需新增 RPC —— 这正是"成员集必须来自控制面下发、不能从报文里推断"；
+  ③ `pg_raft_group_create` 的 NULL 成员集不再静默建组，导不出来即报错并给 hint；
+  ④ prepare 路径成员集未知时 ERROR 中止事务，而不是跳过复制照常提交。
+- 对 Raft/failover/PartWAL 行为的影响：
+  - 控制面组（组 0）语义**逐字节不变**（空成员集仍表示全体节点）；
+  - 已显式建组的数据组行为不变（raft_13/14/15/16/17 全绿）；
+  - 新增的失败模式是 fail-stop 的：成员集导不出来时宁可该组不可用，
+    也不允许两套多数派定义共存。
+- 残留边界：全新分片的**首次**选举发生在 partition_map 有登记之前（登记由当选
+  leader 上报产生，鸡生蛋），首次建组仍须显式给成员集；成员**变更**（扩缩副本）
+  仍缺 joint consensus，正解仍是 `OP_CONFIG_CHANGE` + 配置作为日志条目复制。
+- **踩过的坑（务必留意）**：初版把 `pg_raft_rpc` / `pg_raft_append_entries` 也
+  一并拒绝，raft_14/15/16/17 **全挂**。原因是数据组的引导流程（计划 §11.5.2）
+  依赖 hearsay：只在 placement 节点先建组，其余成员靠收到 RV 自动建组并投票，
+  之后才补 create 固化——而首次选举时 partition_map 尚无登记（登记正是当选
+  leader 上报产生的）。正确边界是"主动 vs 被动"：候选人/leader 只向自己成员集
+  里的节点发报文，多数派算术是**对方**做的，被动应答不会让谁算错；危险的只有
+  成员集未知的节点**主动竞选**。所以只堵 `group_tick`，RPC 路径改为机会性补齐、
+  补不上照常应答。
+- **既有用例的连带调整**：raft_12 的夹具依赖的正是被修掉的不安全行为——
+  ① 以空成员集建组（现已报错拒绝）⇒ 改为显式 `ARRAY[2,3,4]`；
+  ② 在**控制面 leader（常态是 master）**上断言"两个数据组均可见"，而 master
+  永不作数据副本，旧写法能过只因空成员集会让组经 hearsay 撒到全集群
+  ⇒ 断言改到数据组成员节点上跑。顺带修掉"非 leader 提交被拒"挑到组外节点的
+  问题（组在那里根本不存在，propose 同样返回 0，属"对的结果、错的原因"）。
+- 验证：9 节点全量 **49/49 全绿**（raft_01–18）。新增 `test/raft_18_membership_explicit.sh`（四条确定性判据 A/B/C/D）。
+  真对照（同用例仅换 .so，nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t`
+  而非报错。**测试方法论**：C 用例最初硬断言"worker1 当选"，实测 worker3 先超时
+  先当选而误报——Raft 不保证哪个成员赢，已改为动态发现 leader 与待停 follower。

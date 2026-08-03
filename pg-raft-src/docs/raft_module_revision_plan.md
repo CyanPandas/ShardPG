@@ -78,7 +78,14 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
 - **xid/clog 跨 leader 冲突未解**（§11.5.2 #1，最硬的阻断项）。
 - `RAFT_MAX_GROUPS = 32`，与“每节点托管几十上百分区”冲突；日志仍在定长 ring
   （`RAFT_LOG_CAPACITY = 128`，落后超容量时靠拒写背压），未外部化到 parwal，无日志压缩。
-- **组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按全体 peers 算多数派；
+- ~~**组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按全体 peers 算多数派；~~
+  **→ 2026-08-03 已修**（`DTX_2PC_DESIGN.md` §9.2，回归 raft_18）：数据组的空成员集
+  语义由"全体节点"改为"**未知**"，未知的节点不竞选/不当选/不提案（**被动应答
+  仍照旧**——否则 §11.5.2 约定的 hearsay 引导路径会被砍掉，全新分片永远选不出
+  leader，初版一刀切时 raft_14/15/16/17 全挂）；权威成员集改为从控制面下发的
+  `partdist.partition_map` 本地导出。
+  残留：全新分片首次选举（登记尚不存在）仍须显式给成员集；成员**变更**仍缺
+  joint consensus。原文后半句仍成立：
   上报路径在成员集未知时退化为"全体 peers 去掉自己与协调节点"（§13.6 #2）。
 - `raft_snapshot` 仍只是控制面元数据快照表，**没有 Raft InstallSnapshot RPC**。
 - `partwal_notify_primary_switch()` 仍是日志占位，未做真实角色切换。
@@ -351,7 +358,9 @@ PartWAL 接入链路：
   2PC 决议改由数据组承载，控制面不参与（见 `DTX_2PC_DESIGN.md` §3.2）。
   新增的是**数据组内**的记录类型（`PARTWAL_FLAG_DTX` + `DtxRecordPayload`，
   该文 §5）与两个 SQL 入口 `partdist.dtx_decide` / `partdist.dtx_status`（§6.3）。
-- ❌ `OP_CONFIG_CHANGE`（成员集下发依赖它，见 §11.5.2 #3）
+- ⚠️ `OP_CONFIG_CHANGE`（成员**变更**仍依赖它）。**成员集下发已不依赖它**：
+  2026-08-03 起数据组成员集从控制面已下发的 `partdist.partition_map` 本地导出
+  （`DTX_2PC_DESIGN.md` §9.2），无需新增 RPC。
 - ✅ 数据组内部条目类型：`OP_PARWAL`（描述符 + 随行字节；数据字节的门控按 `op_type` 判定，
   **不能**按 `group_id > 0` 判定，否则数据组里的普通条目复制不出去）
 
@@ -420,11 +429,13 @@ PartWAL 接入链路：
 | `raft_10_most_caught_up_secondary_promoted` | 最追平副本被提升，切换点=真实 flush 进度 | ✅ |
 | `raft_11_old_leader_log_catchup` | 旧 leader 回归后追平已提交决议 | ✅ |
 | `raft_12_multi_group_isolation` | 多组独立选举、日志按组隔离 | ✅ |
+| ↳ raft_12 夹具于 2026-08-03 随 §9.2 调整 | 两处旧写法依赖的正是被修掉的不安全行为：① 以**空成员集**建组（现已报错拒绝）⇒ 改为显式 `ARRAY[2,3,4]`；② 在**控制面 leader（常态是 master）**上断言"两个数据组均可见"——master 永不作数据副本，旧写法能过只因空成员集会让组经 hearsay 撒到全集群 ⇒ 改到数据组成员节点上断言。顺带修掉"非 leader 提交被拒"挑到组外节点的问题（那里组根本不存在，propose 同样返回 0，是"对的结果、错的原因"） | — |
 | `raft_13_data_group_replication` | 数据组多数派提交、字节级一致、失多数派拒写（reference 夹具，保留作运输层回归） | ✅ |
 | `raft_14_hash_shard_secondary_backup` | **真实哈希分片 (a) 形态**：多记录逐条 propose、follower 逐字节指纹一致、`partition_lsn` 1..N 连续无洞、一条 record 一次备份、不回放（壳表 0 行）、初次登记（primary/term/secondaries 不含 master）、路由层一致、master 无分片身份 | ✅ |
 | `raft_15_self_election_failover` | **切主全链路**：停主 → 组内自治选举 → 上报登记 → 每节点 `partition_map`+`pg_dist_placement` 落新主（任期递增、master 不入 secondaries）→ 旧主重启以 follower 归队、登记不回退 | ✅ |
 | `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
 | `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑），三阶段：① 同 worker 两数据组 + 8 会话并发单行 INSERT，断言持有完整前缀的成员数 >= 多数派（不是"全体追平"——Raft 只保证 quorum，且尚无后台追平通道）；② **确定性让路**：长事务 P 写 B 组后 pg_sleep，并发短事务 Q 的 flush 顺带消费其槽位并推过 flushed_upto，P 提交必走提前返回分支——断言被让路的 P 的记录仍达多数派；③ 失多数派 + 并发写，断言提交成功行数 == 0（2PC prepare 性质回归）。两个 burst 阶段均先甄别节点崩溃再断言。**真对照实验**（同用例仅换 .so、nm 验证构建身份）：让路窗口未修的构建在阶段二确定性失败（P 提交成功而记录只在 leader：43 vs 41/41），修复版 43/43/43 | ✅ |
+| `raft_18_membership_explicit` | **成员集显式化与真实多数派（§11.5.2 #3）**，用例本体在 `test/raft_18_membership_explicit.sh`（可独立跑），四条确定性判据：A 成员集未知（NULL 且 partition_map 无登记）时**建组必须报错拒绝**且不留残组；B 有控制面登记时 NULL 建组**自动导出**成员集，`cluster_size=3` 而非 9；C **quorum 按真实成员数**——3 成员全在可写、停 1 个（2/3）仍可写、停 2 个（1/3）必败；D 非副本节点不被 hearsay 拖入该组。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t`，建出 `cluster_size=9` 的组、向全集群广播选举、真正的数据持有者反被挤成 follower。**注意 C 不断言"某个特定节点当选"**——Raft 不保证哪个成员赢，用例动态发现 leader 与待停 follower（初版硬断言 worker1 当选，实测 worker3 先超时先当选而误报） | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
 > 下的实际目录探测协调节点目录名（raft4 是 `master`，pg_citus_raft 是
@@ -453,7 +464,8 @@ PartWAL 接入链路：
 > 节点的 apply 滞后窗口显著变大。修法不放宽断言本体：raft_15 改为**按节点带
 > 20s 有界重试**地跑同一断言文件；raft_10 的决议等待窗口 4s → 30s，并且
 > harness 不再吞 SQL 错误输出（失败时保留尾行便于诊断）。
-> 修后 9 节点全量 **48/48 全绿**（raft_01–17，含 raft_17 三阶段）。
+> 修后 9 节点全量 **49/49 全绿**（raft_01–18，含 raft_17 三阶段与 raft_18 四判据）。
+> raft_04（拓扑监控）在 §9.2 那一轮偶发失败过一次，同构建重跑即过，仍是既知的时序 flake。
 
 仍缺的场景：
 
@@ -508,7 +520,7 @@ PartWAL 接入链路：
 | 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
 | **一节点托管多分区副本 ⇒ 不同 leader 的 xid 在本地 clog 相撞** | **必须先做集群级 xid 区间租约**；在此之前多分区共存于一节点的 redo 配置不可上线 | ❌ **最硬阻断项**，见 §11.5.2 #1 |
 | **分区数超过 `RAFT_MAX_GROUPS=32` / ring 撑爆 shmem** | 数据组日志外部化到 parwal 段文件，shmem 只留游标 | ❌ 未做 |
-| **成员集不随 RPC 传播 ⇒ 多数派按全体 peers 算错** | 成员集改由控制面 `OP_CONFIG_CHANGE` 下发 | ❌ 未做 |
+| **成员集不随 RPC 传播 ⇒ 多数派按全体 peers 算错** | 空成员集语义改为"未知"并 fail-stop；成员集从控制面已下发的 `partition_map` 本地导出（`DTX_2PC_DESIGN.md` §9.2） | ✅ 已修，回归 raft_18 |
 | 数据组数量挤占控制面心跳 | 连接复用 + 对端级退避（已做）；报文级心跳合并 + 最小堆调度（待做） | ⚠️ 部分缓解 |
 | 边界函数签名变更在回归中静默失效 | 改签名同步改 `COMMENT`/`setup-raft.sh`/已安装副本；补全新库 `CREATE EXTENSION` 冒烟 | ⚠️ 已踩过一次 |
 | 两份 `FOLLOWER_REPLAY_DESIGN.md` 分叉导致 P3 依据不一致 | P3 开工前先合并 | ✅ 已合并为 v3.1（shardpg-replay → 4.0 继承） |
@@ -1019,7 +1031,10 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
    保证任一节点上来自不同 leader 的 xid 不重叠。**这一项完成前，P3 做出来也不可上线。**
 3. **数据组日志外部化到 parwal + 解除 `RAFT_MAX_GROUPS` 限制**。顺带解决 ring 容量与
    日志压缩（阶段 1 遗留的两项 ❌ 也一并关闭）。
-4. **成员集经控制面下发**（`OP_CONFIG_CHANGE`），多数派按真实副本集计算。
+4. ~~**成员集经控制面下发**（`OP_CONFIG_CHANGE`），多数派按真实副本集计算。~~
+   **→ 2026-08-03 已完成**（走 `partition_map` 导出而非新增 RPC，见
+   `DTX_2PC_DESIGN.md` §9.2；回归 raft_18 覆盖"副本集是全体真子集"场景）。
+   仍缺：成员**变更**的 joint consensus、"同节点混合角色"回归。
    完成后补“副本集是全体节点真子集”和“同节点混合角色”的回归。
 5. **接入真实写入路径**：把 `pg_raft_data_propose()` 挂到 demux/写入路径上，
    并补一条后台追平通道（需解决 BGW 无 SPI 的取字节问题）。

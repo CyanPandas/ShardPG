@@ -554,10 +554,15 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   # 在两个不同的非控制面节点各建一个组,让它们各自成为该组的 leader
   RAFT_12_NODE_A=5433
   RAFT_12_NODE_B=5434
+  # 成员集必须**显式**给出（2026-08-03，DTX_2PC_DESIGN.md §9.2）：数据组的空
+  # 成员集不再表示"全体节点"而是"未知"，未知即不竞选，建组入口也会直接报错。
+  # 这两个组是**合成 group id**（9000000+），partition_map 里没有对应登记，
+  # 因此导不出成员集，只能显式指定。取三个 worker（协调节点不作数据副本）。
+  RAFT_12_MEMBERS="ARRAY[2,3,4]::int[]"
   $PSQL -p "$RAFT_12_NODE_A" -U postgres -c \
-    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_A});" &>/dev/null || true
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_A}, ${RAFT_12_MEMBERS});" &>/dev/null || true
   $PSQL -p "$RAFT_12_NODE_B" -U postgres -c \
-    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_B});" &>/dev/null || true
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_B}, ${RAFT_12_MEMBERS});" &>/dev/null || true
 
   # 等两组各自选出 leader(组信息经 RV/AE 自动传播到其余节点)
   RAFT_12_LEADER_A=""
@@ -579,9 +584,11 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
         RAFT_12_PROPOSE_OK=0
       fi
     done
-    # 非 leader 节点提交必须被拒(返回 0)
+    # 非 leader 节点提交必须被拒(返回 0)。
+    # 必须挑一个**本组成员**：挑到组外节点（例如协调节点）时该组在那里根本不存在，
+    # propose 同样返回 0，用例就变成"对的结果、错的原因"——测不到"非 leader 被拒"。
     RAFT_12_NONLEADER_PORT=""
-    for port in "${NODE_PORTS[@]}"; do
+    for port in 5433 5434 5435; do
       if [[ "$port" != "$RAFT_12_LEADER_A" ]]; then
         RAFT_12_NONLEADER_PORT="$port"
         break
@@ -592,13 +599,19 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
       2>/dev/null || echo -1)
     sleep 2
 
+    # 断言必须在**数据组成员**节点上跑，不能在控制面 leader 上跑：控制面 leader
+    # 常态是协调节点（master），而 master 永不作数据副本、也就永远看不到数据组
+    # ——旧写法能过是因为空成员集会让组经 hearsay 撒到全集群，那正是 §9.2 修掉的
+    # 不安全行为。node A 是 gid_a 的建组节点、也是 gid_b 的成员，两组都可见。
+    RAFT_12_OBSERVER="$RAFT_12_NODE_A"
+    RAFT_12_SQL_OUT=""
     if [[ "$RAFT_12_PROPOSE_OK" == "1" ]] && [[ "$RAFT_12_NONLEADER_RC" == "0" ]] && \
-       $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       RAFT_12_SQL_OUT=$($PSQL -p "$RAFT_12_OBSERVER" -U postgres -v ON_ERROR_STOP=1 \
          -v gid_a="$RAFT_12_GID_A" -v gid_b="$RAFT_12_GID_B" \
-         -f "${RAFT_TEST_DIR}/raft_12_multi_group_isolation.sql" &>/dev/null; then
+         -f "${RAFT_TEST_DIR}/raft_12_multi_group_isolation.sql" 2>&1); then
       ok "raft_12_multi_group_isolation.sql"
     else
-      bad "raft_12_multi_group_isolation.sql(propose_ok=${RAFT_12_PROPOSE_OK} nonleader_rc=${RAFT_12_NONLEADER_RC})"
+      bad "raft_12_multi_group_isolation.sql(propose_ok=${RAFT_12_PROPOSE_OK} nonleader_rc=${RAFT_12_NONLEADER_RC} $(echo "$RAFT_12_SQL_OUT" | grep -E "ERROR|EXCEPTION" | tail -1))"
     fi
   else
     bad "raft_12_multi_group_isolation.sql(数据组未能各自选出 leader)"
@@ -1223,6 +1236,23 @@ else
   bad "raft_17_concurrent_prepare_quorum($(echo "$RAFT_17_OUT" | tail -1))"
 fi
 
+
+# ------------------------------------------------------------------
+# raft_18: 数据组成员集必须显式/可导出，多数派按真实副本集计算
+# 用例本体在 test/raft_18_membership_explicit.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_18 成员集显式化与真实多数派"
+
+start_all_nodes
+sleep 2
+RAFT_18_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_18_membership_explicit.sh" 2>&1) && RAFT_18_RC=0 || RAFT_18_RC=$?
+echo "$RAFT_18_OUT" | sed 's/^/    /'
+if [[ "$RAFT_18_RC" -eq 0 ]]; then
+  ok "raft_18_membership_explicit"
+else
+  bad "raft_18_membership_explicit($(echo "$RAFT_18_OUT" | tail -1))"
+fi
 
 # ------------------------------------------------------------------
 section "汇总"
