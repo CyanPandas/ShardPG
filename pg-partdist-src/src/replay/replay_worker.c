@@ -32,6 +32,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"       /* wal_segment_size */
 #include "access/xlogutils.h"
+#include "postmaster/bgwriter.h"        /* RequestCheckpoint */
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -1110,6 +1111,36 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
 
     /* 持久化 locmap（tmp + fsync + rename），与 CTRL 换表共用同一实现 */
     ShardReplayWriteLocMap(&lm);
+
+    /*
+     * ★ 强制一次本地 checkpoint —— 这不是可选的稳妥措施，是**正确性必需**。
+     *
+     * 副本的 shard 文件会被两条互不知情的 redo 流写：本模块的 parwal 回放
+     * （盖 leader 坐标 LSN），以及节点自身的本地 pg_wal 崩溃恢复。而 FPI 的
+     * 应用是**无条件**的 —— xlogutils.c 的 XLogReadBufferForRedoExtended 在
+     * XLogRecBlockImageApply() 分支里直接 RBM_ZERO_AND_LOCK + RestoreBlockImage，
+     * 前面**没有任何页 LSN 比较**（LSN 判据只存在于非 FPI 分支）。
+     *
+     * 于是：建壳表（CREATE TABLE ... INCLUDING ALL，wal_level=replica 下
+     * wal_skip 不适用）把每个索引的元页以 FPI 写进了本地 WAL。只要之后节点
+     * 崩溃、且崩溃恢复的 redo 起点早于建表，那条 FPI 就会把回放出来的元页
+     * 无条件盖回 _bt_initmetapage 的初值（btm_root=0 ⇒ 升主后索引不可用）。
+     *
+     * 实测（2026-08-04 受控实验）：崩溃前盘面 pd_lsn=0/A74EFD0 btm_root=1，
+     * immediate 崩溃重启后 pd_lsn=0/81DF748 btm_root=0 —— 后者正落在建壳表的
+     * WAL 区间 [0/81AECC0, 0/81E0198] 内，是一个**本地** LSN。
+     *
+     * 所以不变式是：**副本文件在开始回放之前，写过它们的本地 WAL 必须已经被
+     * checkpoint 甩到 redo 点之后。** 本函数是建立/刷新映射的唯一入口
+     * （首次配对、以及 §12 结构栅栏之后的重新配对 —— 后者紧跟在运维于本地
+     * 壳表上做的 CREATE INDEX 之后，同样会留下本地 WAL），因此把 checkpoint
+     * 钉在这里。代价是一次强制 checkpoint，而本函数是稀有操作。
+     *
+     * 注意这**不能**根治：§13.5 已证 autovacuum_enabled=off 挡不住
+     * anti-wraparound vacuum，它一旦扫到副本壳表就又会写本地 WAL，把这个洞
+     * 重新打开。彻底的办法是让副本文件永不被本地 WAL 触碰（见 FRD §13 约束 12）。
+     */
+    RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
     /* 槽位登记（豁免钩子即刻生效；enabled 仍需 replay_enable） */
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);

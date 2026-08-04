@@ -1215,6 +1215,59 @@ worker 抱着旧表还是撞同一道栅栏。
     (follower 见到 CTRL 先挂起、等到该 gxid 的 COMMIT 标记才生效),
     代价是回放管线从"串行应用"变成"带未决队列",与 §7 的形态冲突。
     D1 显式选择记录而不是解决。
+12. **★★ 副本文件被两条互不知情的 redo 流写,而 FPI 的应用是无条件的**
+    (2026-08-04 受控实验证实,已修一半)。
+
+    副本的 shard 文件有两个写者:本模块的 parwal 回放(盖 **leader 坐标**的
+    `orig_lsn`),以及节点自身的**本地 pg_wal 崩溃恢复**。两者互不知情。
+
+    致命处在于内核对 FPI 的处理**不比页 LSN**。`xlogutils.c` 的
+    `XLogReadBufferForRedoExtended()`:
+
+    ```c
+    /* If it has a full-page image and it should be restored, do it. */
+    if (XLogRecBlockImageApply(record, block_id))
+    {
+        *buf = XLogReadBufferExtended(rlocator, forknum, blkno,
+                                      RBM_ZERO_AND_LOCK, prefetch_buffer);
+        if (!RestoreBlockImage(record, block_id, page)) ...
+    ```
+
+    整页清零后覆盖,**前面没有任何 `lsn <= PageGetLSN(page)` 判断**——那条判据
+    只存在于下面的非 FPI 分支。所以"我们盖上去的 leader LSN 比本地 LSN 大"
+    这件事**保护不了**任何东西。
+
+    触发路径:follower 的 shell 表是本地 `CREATE TABLE ... (LIKE ... INCLUDING ALL)`
+    建的,建索引时每个元页都以 FPI 写进了本地 WAL(`wal_level = replica` 下
+    wal_skip 优化不适用——它只在 `wal_level = minimal` 时生效)。此后节点一旦
+    崩溃,且崩溃恢复的 redo 起点早于建表,那条 FPI 就把回放出来的元页**无条件
+    盖回** `_bt_initmetapage` 的初值。
+
+    **受控实测**(控制变量 = 建壳表之前先 CHECKPOINT 把 redo 点钉住):
+
+    | | pd_lsn | btm_root |
+    |---|---|---|
+    | 崩溃前(回放写的) | `0/A74EFD0` | 1 |
+    | immediate 崩溃重启后 | `0/81DF748` | **0** |
+
+    建壳表的 WAL 区间是 `[0/81AECC0, 0/81E0198]`,崩溃后那一页的 LSN 正落在
+    区间内,是一个**本地** LSN。前两轮探针没能复现,只因 redo 点碰巧已越过建表
+    位置——这个坑的窗口是"建壳表到下一次本地 checkpoint",默认最长 5 分钟。
+
+    **已落地的修法**:`replay_set_locmap()` 末尾强制一次
+    `RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT)`,
+    把 redo 点推到建壳表之后。选这个入口是因为它是建立/刷新映射的唯一通道:
+    首次配对,以及 §12 结构栅栏之后的重新配对(后者紧跟运维在本地壳表上做的
+    `CREATE INDEX`,同样会留下本地 WAL)。同一个受控实验验证:修复后崩溃前后
+    元页逐字节一致。
+
+    **不变式**:*副本文件在开始回放之前,写过它们的本地 WAL 必须已被 checkpoint
+    甩到 redo 点之后;开始回放之后,不得再有任何本地 WAL 记录写它们。*
+
+    **仍未根治**(与约束 5 联动):`autovacuum_enabled = off` 挡不住
+    anti-wraparound vacuum,它一旦扫到副本壳表就会写本地 WAL,把这个洞重新打开。
+    彻底的办法只有让副本文件永不被本地 WAL 触碰,而那需要先解决约束 5 的
+    relfrozenxid 处置。**两条约束应当合并立项,不要各修各的。**
 
 ---
 
@@ -1257,7 +1310,12 @@ pg-partdist-src/
     test_lazy_replay_l1.sh     L1 惰性触发语义
     test_txn_layer_r2.sh       R2 事务层(gclog 直接查账)
     test_ddl_fileset_d1.sh     [新] D1 DDL/fileset 控制通道(§12)
+    test_local_wal_conflict.sh [新] 本地 WAL 崩溃恢复不得覆盖回放结果(§13 约束 12)
 ```
+
+> `test_local_wal_conflict.sh` 必须**独立**于 R1 的 kill -9 用例:修复生效后
+> redo 点永远落在建壳表之后,R1 再也走不到该场景,对这条修复没有回归能力。
+> 本用例反过来刻意把 redo 点钉在建壳表**之前**,让"修复是否还在"成为唯一变量。
 
 GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)、
 `replay_naptime_ms`、`replay_checkpoint_interval_ms`、
@@ -1348,8 +1406,9 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 > 与关系 OID 只在关系刚建好时碰巧相等,leader 一做 `VACUUM FULL`/`REINDEX`/
 > `TRUNCATE` 就分家(这正是 §12 的常规场景),要走 `pg_filenode_relation()`。
 
-> **★★ 未决缺陷:崩溃恢复后 btree 元页(metapage)陈旧**(2026-08-04,
+> **★★ 已定位并修复:崩溃恢复后 btree 元页(metapage)陈旧**(2026-08-04,
 > 修好上面那个守卫之后**第一次**比到索引文件就暴露出来;此前索引从未被比过)。
+> 根因与修法见 §13 约束 12,下面保留当时的现象记录。
 >
 > 实测(R1 用例,1 主 2 从,同一份 leader 文件):
 > - **f2**(全程无崩溃)6 个文件**全部**逐字节一致,含 PK 索引与 TOAST 索引。
@@ -1371,13 +1430,11 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 > 元页 `btm_root = 0` 意味着索引在升主后不可用(`_bt_getroot` 会认为树是空的)。
 > 这不是掩码问题,`btree_mask()` 不掩元页的这些字段。
 >
-> **可能的机制**(未证实,须实测):§8.4 的推进协议是"刷 shard 脏页 → fsync →
-> 才写游标"。若元页在崩溃前已 apply 进共享缓冲、游标已推进过它、而那一页没被
-> 刷出去,重启后从游标续放就永远补不回来。要么 `FlushRelationsAllBuffers`
-> 没覆盖到它,要么顺序在某处被破坏。
+> **根因不在 §8.4 的推进协议**(那是最初的猜测,受控实验推翻了它),
+> 而是"两条 redo 流互不知情" —— 见 §13 约束 12。
 >
 > **这正是 R1 的 kill -9 用例本该抓住的场景** —— 抓不住的唯一原因是当时的
-> 页面比对只比了主堆(见上一条 ★)。定位与修复未排期。
+> 页面比对只比了主堆(见上一条 ★)。
 
 > **★★ R2 验收 = 账本正确，不是可见。** 这条要写死,免得反复误判进度。
 >
