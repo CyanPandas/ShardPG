@@ -619,6 +619,133 @@ CREATE TABLE IF NOT EXISTS dtx_decision (
 COMMENT ON TABLE dtx_decision IS
     'DTX-2PC 决议索引：由协调组的 apply 路径在每个成员上维护，供 dtx_status 快速应答。权威仍是协调组日志里的 DECISION 记录。';
 
+-- ------------------------------------------------------------------
+-- dtx_participant：本节点在某笔分布式事务里的参与登记（§9.3 的落地形态）
+--
+-- 由 worker 自己在 PREPARE TRANSACTION 的接线里、经 libpq **独立事务**写入
+-- （写在本事务里就会随事务一起进 prepared，谁也看不见）。两个消费方：
+--
+--   1) master 侧驱动：收齐 PREPARE 应答后逐节点读 gsids 合并出写集，
+--      据此算协调组 coord_gsid、再回写下来；
+--   2) 参与者恢复守护：本节点崩溃重启后，pg_prepared_xacts 里的 gid 在这里
+--      查到 coord_gsid，才知道该向哪个组要决议。
+--
+-- ★ coord_gsid 为 NULL 的含义是**推定中止安全**的关键：master 严格先把
+--   coord_gsid 写到全部参与者、再调 dtx_decide。因此"本行 coord_gsid 仍为
+--   NULL" ⇒ 决议**必然还没做过** ⇒ 超时后回滚是安全的。顺序反过来就会出现
+--   "全局已 COMMIT、参与者却查不到协调组"的不可解状态。
+--
+-- 一笔分布式事务在同一节点上可能有多个 gid（Citus 对同一节点可能开多条
+-- 连接，gid 末段的 <conn> 不同），所以主键是 (dtxid, gid)。
+CREATE TABLE IF NOT EXISTS dtx_participant (
+    dtxid       BIGINT      NOT NULL,
+    gid         TEXT        NOT NULL,
+    gsids       BIGINT[]    NOT NULL,   -- 本节点在该事务里真正写过的分区组
+    coord_gsid  BIGINT,                 -- master 下发；NULL = 决议尚未可能发生
+    noted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_dtx_participant PRIMARY KEY (dtxid, gid)
+);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_dtxid ON dtx_participant(dtxid);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_noted ON dtx_participant(noted_at);
+
+COMMENT ON TABLE dtx_participant IS
+    'DTX-2PC 参与登记：本节点在某笔分布式事务里写过的分区组，以及 master 下发的协调组。'
+    'coord_gsid IS NULL 蕴含"决议尚未做过"（master 保证先下发再决议），推定中止据此成立。';
+
+-- worker 自治登记（由 prepare 接线经 libpq 独立事务调用）。
+CREATE OR REPLACE FUNCTION dtx_note_participant(
+    p_dtxid BIGINT,
+    p_gid TEXT,
+    p_gsids BIGINT[]
+) RETURNS BOOLEAN
+    LANGUAGE sql VOLATILE
+AS $$
+    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids)
+    VALUES (p_dtxid, p_gid, p_gsids)
+    ON CONFLICT (dtxid, gid) DO UPDATE
+       SET gsids = EXCLUDED.gsids, noted_at = now()
+    RETURNING true
+$$;
+
+COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[]) IS
+    '登记本节点在某笔分布式事务里写过的分区组。必须在独立事务里调用。';
+
+-- master 侧第一轮：本节点在该事务里写过的全部分区组（多个 gid 取并集）。
+CREATE OR REPLACE FUNCTION dtx_local_participant(p_dtxid BIGINT)
+    RETURNS BIGINT[]
+    LANGUAGE sql STABLE
+AS $$
+    SELECT COALESCE(
+        (SELECT array_agg(DISTINCT g ORDER BY g)
+           FROM partdist.dtx_participant p, unnest(p.gsids) AS g
+          WHERE p.dtxid = p_dtxid),
+        '{}'::bigint[])
+$$;
+
+COMMENT ON FUNCTION dtx_local_participant(BIGINT) IS
+    '本节点在该分布式事务里真正写过的分区组（global_shard_id 升序去重）。空数组 = 只读参与者。';
+
+-- master 侧第二轮：下发协调组。必须在 dtx_decide **之前**完成（见表注释）。
+CREATE OR REPLACE FUNCTION dtx_note_coord(p_dtxid BIGINT, p_coord_gsid BIGINT)
+    RETURNS INTEGER
+    LANGUAGE plpgsql VOLATILE
+AS $$
+DECLARE
+    n INTEGER;
+BEGIN
+    UPDATE partdist.dtx_participant
+       SET coord_gsid = p_coord_gsid
+     WHERE dtxid = p_dtxid
+       AND coord_gsid IS DISTINCT FROM p_coord_gsid;
+    GET DIAGNOSTICS n = ROW_COUNT;
+
+    -- 已经是同一个值时 ROW_COUNT=0，但登记确实在，也算成功
+    IF n = 0 AND EXISTS (SELECT 1 FROM partdist.dtx_participant WHERE dtxid = p_dtxid) THEN
+        n := 1;
+    END IF;
+    RETURN n;
+END;
+$$;
+
+COMMENT ON FUNCTION dtx_note_coord(BIGINT, BIGINT) IS
+    '把 master 算出的协调组下发到本节点的参与登记。返回受影响行数，0 = 本节点没有该事务的登记。';
+
+-- 参与者恢复守护用：某个 prepared 事务的 (dtxid, coord_gsid, 本节点写过的组)。
+CREATE OR REPLACE FUNCTION dtx_participant_of(
+    p_gid TEXT,
+    OUT dtxid BIGINT,
+    OUT coord_gsid BIGINT,
+    OUT gsids BIGINT[]
+) RETURNS record
+    LANGUAGE sql STABLE
+AS $$
+    SELECT dtxid, coord_gsid, gsids FROM partdist.dtx_participant WHERE gid = p_gid
+$$;
+
+COMMENT ON FUNCTION dtx_participant_of(TEXT) IS
+    '按 prepared 事务的 gid 取本节点的参与登记。coord_gsid 为 NULL 表示 master 未下发过协调组（⇒ 决议必然未做过）。';
+
+-- GC：登记行的生命周期比 prepared 事务长一点点（prepare 失败会留下孤儿行）。
+-- 只删"已无对应 prepared 事务且超过 age"的行；有 prepared 事务在就绝不删，
+-- 那正是恢复守护要用的线索。
+CREATE OR REPLACE FUNCTION dtx_gc_participant(p_age_seconds INTEGER DEFAULT 3600)
+    RETURNS INTEGER
+    LANGUAGE plpgsql VOLATILE
+AS $$
+DECLARE
+    n INTEGER;
+BEGIN
+    DELETE FROM partdist.dtx_participant p
+     WHERE p.noted_at < now() - make_interval(secs => p_age_seconds)
+       AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts x WHERE x.gid = p.gid);
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END;
+$$;
+
+COMMENT ON FUNCTION dtx_gc_participant(INTEGER) IS
+    '清理已无对应 prepared 事务的陈旧参与登记（prepare 失败会留下孤儿行）。有 prepared 事务在的行绝不删。';
+
 CREATE OR REPLACE FUNCTION partwal_read_dtx_record(
     p_partition_id OID,
     p_partition_lsn BIGINT,

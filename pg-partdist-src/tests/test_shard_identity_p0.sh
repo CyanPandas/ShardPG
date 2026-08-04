@@ -23,7 +23,7 @@
 
 set -uo pipefail
 
-CONTAINER="pg-partdist-raft4-container"
+CONTAINER="${CONTAINER:-pg-partdist-raft4-container}"
 PG_INSTALL="/work/pg-install"
 COORD=5432
 WORKERS=(5433 5434 5435)

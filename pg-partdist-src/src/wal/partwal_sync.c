@@ -205,6 +205,38 @@ PartWALResetTouched(void)
 }
 
 /*
+ * 对外的触达集合读写接口（DTX 接线用，声明见 partwal_sync.h）。
+ *
+ * PartWALCopyTouched 必须在 PartWALFlush() **之前**调用：flush 末尾的
+ * PartWALReplicateTouched() 会把集合清空。
+ */
+int
+PartWALTouchedCount(void)
+{
+    return partwal_touched_count;
+}
+
+int
+PartWALCopyTouched(Oid *out, int max)
+{
+    int n = partwal_touched_count;
+
+    if (out != NULL && max > 0)
+    {
+        int copy = (n < max) ? n : max;
+
+        memcpy(out, partwal_touched, copy * sizeof(Oid));
+    }
+    return n;
+}
+
+void
+PartWALNoteTouchedPartition(Oid partition_id)
+{
+    PartWALNoteTouched(partition_id);
+}
+
+/*
  * PartWALReplicateTouched — 对本事务触达的每个分区调用复制挂钩。
  *
  * 调用点必须满足：[A]（这些分区的 parwal 记录已落盘 fsync）已经完成，
@@ -702,8 +734,15 @@ PartWALFlush(XLogRecPtr upto_lsn)
     if (upto_lsn == InvalidXLogRecPtr)
     {
         partwal_my_max_lsn = InvalidXLogRecPtr;
-        PartWALResetTouched();
-        return;  /* no inserts from this backend */
+
+        /*
+         * 本 backend 没有经 WAL 插入挂钩产生过待落盘记录，但触达集合仍可能
+         * 非空 —— DTX 接线会在第一次 flush 之后**直接**往段文件追加
+         * DTX_PREPARE 标记并重新登记触达分区，正是靠这条路径把标记复制出去。
+         * 复制挂钩取的是"当前 flush 点"，直接追加的记录已经在盘上，覆盖成立。
+         */
+        PartWALReplicateTouched();
+        return;
     }
 
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);

@@ -11,6 +11,7 @@ OBJS = \
 	src/replay/shard_replay.o \
 	src/replay/replay_checkpoint.o \
 	src/replay/replay_worker.o \
+	src/dtx/dtx_participant.o \
 	src/raft_boundary.o
 
 EXTENSION = pg_partdist

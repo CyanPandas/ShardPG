@@ -905,13 +905,14 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
           if [[ -n "$RAFT_14_TERM" ]]; then
             RAFT_14_OK=1
             for port in "${RAFT_14_FOLLOWER_PORTS[@]}"; do
-              if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+              # 保留 psql 的错误正文：只报"断言失败"不可诊断（2026-08-04 教训）
+              if ! RAFT_14_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
                      -v gid="$RAFT_14_GID" -v nrec="$RAFT_14_NREC" \
                      -v leader_md5="$RAFT_14_MD5" -v primary_id="$RAFT_14_PRIMARY_ID" \
                      -v shard_table="${RAFT_14_TABLE}_${RAFT_14_GID}" \
-                     -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                     -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" 2>&1); then
                 RAFT_14_OK=0
-                RAFT_14_WHY="follower ${port} 断言失败"
+                RAFT_14_WHY="follower ${port} 断言失败: $(echo "$RAFT_14_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
                 break
               fi
             done
@@ -1060,6 +1061,27 @@ raft16_cleanup() {
     "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_16_TABLE};" &>/dev/null || true
 }
 
+# raft_16 的 follower 断言是**终态收敛**判据，必须给有界的等待窗口而不是
+# 一次性快照：Raft 只保证多数派，一笔事务现在要跑三轮复制（DATA / PREPARE 标记 /
+# COMMIT 标记），每轮各自凑多数派，完全可能有一个 follower 连续两轮都不在多数派里
+# 而短暂落后；leader 的下一次心跳会按 next_index 把它补齐。
+# 一次性断言在 2PC 接线后变得对时序敏感（2026-08-04 实测：终态三节点完全一致，
+# 只是到达得比 sleep 2 晚）。窗口内收敛即通过，超时才判失败并报最后一次的错。
+raft16_follower_converged() {   # $1=port $2=nrec $3=leader_md5
+  local port=$1 nrec=$2 md5=$3 i
+  for i in $(seq 1 30); do
+    if RAFT_16_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+           -v gid="$RAFT_16_GID" -v nrec="$nrec" \
+           -v leader_md5="$md5" -v primary_id="$RAFT_16_PRIMARY_ID" \
+           -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
+           -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" 2>&1); then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 start_all_nodes
 sleep 2
 
@@ -1127,13 +1149,9 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
         if [[ "$RAFT_16_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC" -gt 0 && -n "$RAFT_16_MD5" ]]; then
           RAFT_16_OK=1
           for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
-            if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
-                   -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC" \
-                   -v leader_md5="$RAFT_16_MD5" -v primary_id="$RAFT_16_PRIMARY_ID" \
-                   -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
-                   -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+            if ! raft16_follower_converged "$port" "$RAFT_16_NREC" "$RAFT_16_MD5"; then
               RAFT_16_OK=0
-              RAFT_16_WHY="自动复制后 follower ${port} 断言失败"
+              RAFT_16_WHY="自动复制后 follower ${port} 断言失败: $(echo "$RAFT_16_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
               break
             fi
           done
@@ -1180,13 +1198,9 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
                ) sub;" 2>/dev/null || echo "")
             if [[ "$RAFT_16_NREC2" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC2" -gt "$RAFT_16_NREC" && -n "$RAFT_16_MD52" ]]; then
               for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
-                if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
-                       -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC2" \
-                       -v leader_md5="$RAFT_16_MD52" -v primary_id="$RAFT_16_PRIMARY_ID" \
-                       -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
-                       -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                if ! raft16_follower_converged "$port" "$RAFT_16_NREC2" "$RAFT_16_MD52"; then
                   RAFT_16_OK=0
-                  RAFT_16_WHY="恢复后追平断言失败(follower ${port})"
+                  RAFT_16_WHY="恢复后追平断言失败(follower ${port}): $(echo "$RAFT_16_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
                   break
                 fi
               done
@@ -1303,6 +1317,23 @@ if [[ "$RAFT_21_RC" -eq 0 ]]; then
   ok "raft_21_dtx_recovery"
 else
   bad "raft_21_dtx_recovery($(echo "$RAFT_21_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_22: DTX-2PC 端到端（真实跨分区事务经内核补丁 0004 的挂点走完三阶段）
+# 用例本体在 test/raft_22_dtx_end_to_end.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_22 DTX 端到端"
+
+start_all_nodes
+sleep 2
+RAFT_22_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_22_dtx_end_to_end.sh" 2>&1) && RAFT_22_RC=0 || RAFT_22_RC=$?
+echo "$RAFT_22_OUT" | sed 's/^/    /'
+if [[ "$RAFT_22_RC" -eq 0 ]]; then
+  ok "raft_22_dtx_end_to_end"
+else
+  bad "raft_22_dtx_end_to_end($(echo "$RAFT_22_OUT" | tail -1))"
 fi
 
 # ------------------------------------------------------------------

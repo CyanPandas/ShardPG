@@ -5,6 +5,7 @@
 #include "partwal_sync.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
+#include "dtx_participant.h"
 
 #include "storage/bufmgr.h"
 
@@ -73,15 +74,33 @@ PartWALXactCallback(XactEvent event, void *arg)
     switch (event)
     {
         case XACT_EVENT_PRE_COMMIT:
-        case XACT_EVENT_PRE_PREPARE:
             PartWALFlush(InvalidXLogRecPtr);
+            break;
+
+        case XACT_EVENT_PRE_PREPARE:
+            /*
+             * DTX-2PC 参与者接线（DTX_2PC_DESIGN.md §3.3）：两个挂点必须
+             * 夹住 PartWALFlush() —— Capture 在 flush 之前取触达集合快照
+             * （flush 末尾的复制挂钩会清空它），Finish 在 flush 之后追加
+             * DTX_PREPARE 标记、再复制一轮、并把本节点的写集自治登记出去。
+             * 无 2PC 语境（gid 不认识 / 只读参与者）时两者都是空操作。
+             */
+            PartDistDtxPrePrepareCapture();
+            PartWALFlush(InvalidXLogRecPtr);
+            PartDistDtxPrePrepareFinish();
             break;
 
         case XACT_EVENT_ABORT:
             PartWALAbort();
+            PartDistDtxReset();
+            break;
+
+        case XACT_EVENT_PREPARE:
+            PartDistDtxReset();
             break;
 
         case XACT_EVENT_COMMIT:
+            PartDistDtxReset();
             if (DemuxState == NULL)
                 break;
             flush_now = GetFlushRecPtr(&tli);
@@ -218,6 +237,29 @@ partdist_process_utility(PlannedStmt *pstmt,
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
 
+    /*
+     * DTX-2PC：截下 PREPARE TRANSACTION '<gid>'。这是**唯一**能同时看到 gid
+     * 和本事务触达集合的位置 —— PRE_PREPARE 回调里拿不到 gid（prepareGID 是
+     * xact.c 的 static），而语句执行完事务就已经 prepared 了。
+     */
+    if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, TransactionStmt))
+    {
+        TransactionStmt *tstmt = (TransactionStmt *) pstmt->utilityStmt;
+
+        if (tstmt->kind == TRANS_STMT_PREPARE)
+            PartDistDtxNotePrepareGid(tstmt->gid);
+        /*
+         * 阶段 3（§3.3）：master 收到决议后本来就要对每个参与者发
+         * COMMIT/ROLLBACK PREPARED，在这条语句执行**前**顺带把
+         * DTX_COMMIT/DTX_ABORT 标记补进本节点各触达组的 parwal 流 ——
+         * 零额外往返，且此时事务上下文还在，SPI 可用。
+         */
+        else if (tstmt->kind == TRANS_STMT_COMMIT_PREPARED ||
+                 tstmt->kind == TRANS_STMT_ROLLBACK_PREPARED)
+            PartDistDtxOnFinishPrepared(tstmt->gid,
+                                        tstmt->kind == TRANS_STMT_COMMIT_PREPARED);
+    }
+
     /* Execute the statement via the existing chain */
     if (prev_ProcessUtility_hook)
         prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
@@ -282,6 +324,9 @@ _PG_init(void)
      * 在每个进程（含 checkpointer/bgwriter）的 _PG_init 都会装上。
      */
     buffer_flush_lsn_exempt_hook = PartDistFlushExemptHook;
+
+    /* DTX-2PC 接线总开关 */
+    PartDistDtxDefineGUCs();
 
     /* Replay GUCs + launcher（FRD §7：worker 池 + 排他认领） */
     DefineReplayGUCs();

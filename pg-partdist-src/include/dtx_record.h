@@ -62,4 +62,17 @@ DtxRecordKindIsValid(int kind)
     return kind >= DTX_PREPARE && kind <= DTX_ABORT;
 }
 
+/*
+ * 往某分区的 parwal 流里追加一条 DTX 记录并 fsync，返回分配到的
+ * partition_lsn。SQL 入口 partdist.partwal_append_dtx_record() 是它的薄包装。
+ *
+ * participants[] 只有 DECISION 记录会写进去（其余 kind 一律忽略，§5.2）；
+ * xid 只有事务内写的 PREPARE 标记会带（见 §5.1 的头字段约定）。
+ */
+extern uint64 AppendDtxRecord(Oid partition_id, int kind,
+                              int64 dtxid, int64 coord_gsid,
+                              int64 commit_ts, int32 verdict,
+                              const int64 *participants, int nparticipants,
+                              TransactionId xid);
+
 #endif /* DTX_RECORD_H */

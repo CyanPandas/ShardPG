@@ -1082,6 +1082,21 @@ _PG_init(void)
         *rv = (void *) pg_raft_partwal_replicate;
     }
 
+    DefineCustomBoolVariable("pg_raft.dtx_2pc_enabled",
+                             "启用跨分区事务的 DTX-2PC：master 侧决议驱动 + 参与者自治登记。",
+                             "关闭后跨分区事务退回 Citus 原生 2PC（提交点在 master 本地），"
+                             "跨分区原子性不再有多数派保证。",
+                             &pg_raft_dtx_2pc_enabled, true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    /*
+     * DTX-2PC 接线（DTX_2PC_DESIGN.md §9.3）：
+     *   pre_record_commit_hook   —— 内核补丁 0004 开的挂点，master 侧做决议；
+     *   partdist_dtx_note_participant_hook —— pg_partdist 在 prepare 时调，
+     *   经 libpq 独立事务把本节点写集登记出去（libpq 由 pg_raft 持有）。
+     */
+    pg_raft_dtx_install_hooks();
+
     register_topology_worker();
 }
 

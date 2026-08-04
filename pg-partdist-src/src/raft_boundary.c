@@ -429,6 +429,65 @@ pg_partdist_follower_set_applied_part_lsn(PG_FUNCTION_ARGS)
  * 复制出去 —— DTX 记录与 DATA 记录共用同一个 partition_lsn 序号空间和同一条
  * 复制通道，flags 保证它在 follower 侧不被误当作 WAL 字节。
  */
+uint64
+AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
+				int64 commit_ts, int32 verdict,
+				const int64 *partvals, int nparts,
+				TransactionId xid)
+{
+	PartitionWALWriter *writer;
+	DtxRecordPayload   *payload;
+	Size				paylen;
+	uint64				assigned;
+
+	/* 参与者清单只有 DECISION 记录携带（§5.2） */
+	if (kind != DTX_DECISION)
+		nparts = 0;
+
+	paylen = DtxPayloadSize(nparts);
+	payload = (DtxRecordPayload *) palloc0(paylen);
+	payload->dtxid = (uint64) dtxid;
+	payload->coord_gsid = coord_gsid;
+	payload->commit_ts = (uint64) commit_ts;
+	payload->verdict = (kind == DTX_DECISION) ? (uint32) verdict : 0;
+	payload->nparticipants = (uint32) nparts;
+	if (nparts > 0)
+		memcpy(DtxPayloadParticipants(payload), partvals,
+			   sizeof(int64) * nparts);
+
+	InitPartitionWALDirectory(partition_id);
+	writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
+	if (writer == NULL)
+		ereport(ERROR,
+				(errmsg("partwal_append_dtx_record: 无法为分区 %u 创建写入器",
+						partition_id)));
+
+	/*
+	 * orig_lsn 恒为 0：DTX 记录不是 WAL 记录，没有 leader 侧 end LSN。
+	 * 回放侧按 flags 在分派处就把它路由走，永不进 rm_redo，也永不用它盖页 LSN。
+	 * info 存 DtxRecordKind（不是 XLog info）；rmid 存 RM_XACT_ID 仅为可读性。
+	 *
+	 * xid：PREPARE 标记要带本分区上的本地 top-level xid —— 升主回放时，
+	 * "这笔 in-doubt 的本地事务属于哪个全局事务"就只剩这一条线索（DATA 记录
+	 * 里只有 xid，没有 dtx 信息）。恢复守护补写的 COMMIT/ABORT 标记不在原事务
+	 * 里，传 InvalidTransactionId。
+	 */
+	AppendPartWALRecord(writer,
+						InvalidXLogRecPtr,
+						(uint8) RM_XACT_ID,
+						(uint8) kind,
+						PARTWAL_FLAG_DTX,
+						(const char *) payload,
+						(uint32) paylen,
+						xid);
+	FlushPartitionWALWriter(writer, true);
+	assigned = writer->last_partition_lsn;
+	DestroyPartitionWALWriter(writer);
+	pfree(payload);
+
+	return assigned;
+}
+
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_append_dtx_record);
 
 Datum
@@ -441,9 +500,6 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 	int64				commit_ts = PG_GETARG_INT64(4);
 	int32				verdict = PG_GETARG_INT32(5);
 	ArrayType		   *parts = PG_ARGISNULL(6) ? NULL : PG_GETARG_ARRAYTYPE_P(6);
-	PartitionWALWriter *writer;
-	DtxRecordPayload   *payload;
-	Size				paylen;
 	int					nparts = 0;
 	int64			   *partvals = NULL;
 	uint64				assigned;
@@ -478,44 +534,9 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 				partvals[nparts++] = DatumGetInt64(elems[i]);
 	}
 
-	/* 参与者清单只有 DECISION 记录携带（§5.2） */
-	if (kind != DTX_DECISION)
-		nparts = 0;
-
-	paylen = DtxPayloadSize(nparts);
-	payload = (DtxRecordPayload *) palloc0(paylen);
-	payload->dtxid = (uint64) dtxid;
-	payload->coord_gsid = coord_gsid;
-	payload->commit_ts = (uint64) commit_ts;
-	payload->verdict = (kind == DTX_DECISION) ? (uint32) verdict : 0;
-	payload->nparticipants = (uint32) nparts;
-	if (nparts > 0)
-		memcpy(DtxPayloadParticipants(payload), partvals,
-			   sizeof(int64) * nparts);
-
-	InitPartitionWALDirectory(partition_id);
-	writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
-	if (writer == NULL)
-		ereport(ERROR,
-				(errmsg("partwal_append_dtx_record: 无法为分区 %u 创建写入器",
-						partition_id)));
-
-	/*
-	 * orig_lsn 恒为 0：DTX 记录不是 WAL 记录，没有 leader 侧 end LSN。
-	 * 回放侧按 flags 在分派处就把它路由走，永不进 rm_redo，也永不用它盖页 LSN。
-	 * info 存 DtxRecordKind（不是 XLog info）；rmid 存 RM_XACT_ID 仅为可读性。
-	 */
-	AppendPartWALRecord(writer,
-						InvalidXLogRecPtr,
-						(uint8) RM_XACT_ID,
-						(uint8) kind,
-						PARTWAL_FLAG_DTX,
-						(const char *) payload,
-						(uint32) paylen,
-						InvalidTransactionId);
-	FlushPartitionWALWriter(writer, true);
-	assigned = writer->last_partition_lsn;
-	DestroyPartitionWALWriter(writer);
+	assigned = AppendDtxRecord(partition_id, kind, dtxid, coord_gsid,
+							   commit_ts, verdict, partvals, nparts,
+							   InvalidTransactionId);
 
 	PG_RETURN_INT64((int64) assigned);
 }

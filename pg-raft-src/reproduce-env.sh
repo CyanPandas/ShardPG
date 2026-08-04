@@ -122,6 +122,12 @@ pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 1
 # 协调节点(coordinator)：group 0 leader 优先落于此，且不得作为数据组成员
 pg_raft.coordinator_node_id = 1
+# ★ DTX-2PC（DTX_2PC_DESIGN.md §9.4）：必须关掉 Citus 自带的 2PC 恢复。
+# 它把 pg_dist_transaction 当决议真相源，会把我们决议为 ABORT 的事务无条件
+# COMMIT PREPARED，造成部分参与者提交、部分回滚的**分叉提交**。
+# 关掉之后由 partdist.dtx_recover_prepared() 统一收尾：协调组有决议的按决议，
+# 没走 2PC 的（快路径）再退回 Citus 原生规则。
+citus.recover_2pc_interval = -1
 EOF
     DEX /work/pg-install/bin/pg_ctl start -D "/work/pg-cluster-data/$dir" \
         -l "/work/pg-cluster-data/$dir.log" -w -t 60 >/dev/null

@@ -11,6 +11,12 @@
 >
 > 代码基线：`shardpg-4.0` @ `468a518`（parwal-2.0 记录头、prepare 接线 §14 已落地、
 > P3 物理回放未开始、惰性回放形态已定稿）。凡本文引用的代码事实均在该提交上复核过。
+>
+> **实施进度（2026-08-04）**：§10 的第 0–5 步全部落地并验收（raft_17–22）。
+> 跨分区事务**已经真的走 2PC**：内核补丁 0004 开的 `pre_record_commit_hook` 把决议
+> 接进了客户端提交路径，决议在协调组达多数派持久化即为全局提交点。
+> 剩第 6 步（升主 in-doubt 清理 + 快路径分叉归队规则），与惰性回放的 promotion
+> 路径合流时再做。
 
 ---
 
@@ -36,7 +42,9 @@
 | 4) 达多数派后进入 prepared | ⚠️ 多数派语义有了，但**有一个正确性漏洞**（§9.1 让路窗口），且没有"prepared 状态"这个事务状态机本体 |
 
 所以本文真正要新建的是：**决议层（阶段 2）、标记层（阶段 3）、恢复层，以及把
-阶段 1 的漏洞补上**。运输层一行都不用重写。
+阶段 1 的漏洞补上**。运输层一行都不用重写——**实际实施下来确实如此**：
+`pg_raft_partwal_replicate` / `data_propose_one` / AppendEntries 这条链路
+在整个 2PC 落地过程中只改了"记录头要带 flags"（§5.5），语义一行没动。
 
 ---
 
@@ -462,7 +470,8 @@ Citus router 到单分片 ⇒ **快路径**（§3.4），一轮 quorum，不碰�
 
 ## 9. 隐患清单
 
-按严重度排序。#0 / #1 / #2 / #2.5 均已于 2026-08-03 修复并验收；#3 起为尚未处理项。
+按严重度排序。#0 / #1 / #2 / #2.5 于 2026-08-03 修复并验收；
+#2.6 / #3 / #4 于 2026-08-04 修复并验收；#5 起为尚未处理项。
 
 ### 9.2.5 【已修复】prepared 事务的行锁把决议路径锁死（2026-08-03，实施第 5 步时发现）
 
@@ -506,6 +515,42 @@ SQL 调用里，不在任何 prepared 事务内。该列服务于切主候选筛
 > 教训与 §9.0 同源：**只有真的把形态跑起来，设计上的隐含耦合才会暴露**。
 > 这条在"决议层单独验收"（raft_20，没有 prepared 事务参与）时完全测不出来，
 > 必须等 raft_21 把 prepared 事务和决议放到一起才现形。
+
+### 9.2.6 【已修复】DTX 记录被写进段号 1，排到了它所标记的数据前面（2026-08-04）
+
+**症状**：跨分区事务跑通之后，raft_14 / raft_16 的 follower 断言
+`partition_lsn 非严格单调或记录损坏（1..9 应连续无洞）`。**leader 上同样失败**，
+所以不是复制通道的问题。dump 记录头看到的顺序是 `7,8,1,2,3,4,5,6`，
+其中 7、8 的 `orig_lsn` 是 `0/0` —— 正是两条 DTX 记录（PREPARE + COMMIT）。
+
+**根因**：`AppendPartWALRecordAt()` 用 `orig_lsn` 映射段文件号，而
+`orig_lsn == InvalidXLogRecPtr` 被无条件映射到**段 1**：
+
+```c
+if (orig_lsn == InvalidXLogRecPtr)
+    new_segno = 1;                     /* ← DTX 记录恒落段 1 */
+else
+    XLByteToSeg(orig_lsn, new_segno, wal_segment_size);
+```
+
+DATA 记录按各自的 pg_wal LSN 落在段 7，DTX 记录落在段 1。段文件**按文件名排序
+即是回放顺序**（`verify_partition_wal` 与物理回放都这么读），于是标记物理上排在
+它所标记的数据之前。这不只是让校验函数报错——升主回放会先看到 COMMIT 标记、
+再看到 DATA，FRD §7.6 建立可见性的顺序整个反过来。
+
+**为什么现在才现形**：DTX 记录此前只在 raft_19/20/21 里出现，那些用例要么用
+专门的空分区，要么按 plsn 直接定位读取，从不做"按文件顺序扫一遍"的判定。
+**2PC 接线让 DTX 记录第一次和 DATA 落进同一条分区流**，潜伏缺陷才暴露。
+这与 §9.0 是同一条教训：**只有真的把形态跑起来，隐含耦合才会暴露**。
+
+**修复**（`partition_wal_writer.c`，两处，缺一不可）：
+
+1. `orig_lsn == 0` 时**跟随当前段**，三级依据：写入器正开着的段 →
+   checkpoint 里最后一条 DATA 的 `orig_lsn` 所在段 → 都没有才回落到 1。
+2. `last_wal_lsn` **不得被 `orig_lsn == 0` 覆盖**——它是"当前段号"的持久化依据，
+   被 0 覆盖后 checkpoint 也变 0，下一个写入器就找不回当前段了。
+
+修复后同一构造下 leader 与两个 follower 的记录序列均为 `1..8` 且 `verify=t`。
 
 ### 9.0 【已修复】并发写入路径的三个隐藏缺陷（2026-08-03 发现并全部修复）
 
@@ -675,7 +720,7 @@ if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
 成员**变更**（扩缩副本）也还没有 joint consensus，正解仍是控制面
 `OP_CONFIG_CHANGE` 下发 + 配置作为日志条目复制。
 
-### 9.3 【高】master 侧 decide 的挂点：需要内核补丁 0004
+### 9.3 【已落地】master 侧 decide 的挂点：内核补丁 0004（2026-08-04）
 
 `dtx_decide` 必须严格发生在"Citus 发完全部 `PREPARE TRANSACTION` 之后、
 向客户端返回之前"。
@@ -685,23 +730,9 @@ if (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
 PREPARE，我们无从知道 prepared 是否成功。而调整加载顺序这条路是堵死的：
 Citus 强制要求自己排 `shared_preload_libraries` 第一位。
 
-> **★ 落地评估（2026-08-03，第 4 步实施时）：本项暂缓，决议层本体先行。**
-> 1. **它只是"把决议接进客户端提交路径"的接线，不是决议本身**。决议的正确性
->    （多数派即提交点、槽一次性、推定中止、随选举转移）已由 `dtx_decide` /
->    `dtx_status` 独立成立并经 raft_20 验收，与挂在哪无关。
-> 2. **代价高**：`postgres-src` 在 `pg_citus_raft` 工作区是空目录（PG 源在主仓库
->    另一份 489M 的树里），要落补丁得重新 configure + 全量编译 PG，再把整个
->    `pg-install/`（含 `postgres` 二进制）提交——按 `468a518` 的教训，pg-install
->    必须与 `patches/` 同步提交，否则一键复现直接断。
-> 3. **风险**：当前 `pg-install` 是已知可用的构建，替换它一旦 configure 参数不一致
->    就会毁掉整个环境的可复现性。
->
-> 在它落地前，`dtx_decide` 由 master 侧**显式调用**（SQL 可调），属本项目一贯的
-> "机制先行"形态；自动接线随补丁 0004 一并做。**注意：在自动接线落地之前，
-> 跨分区事务并不会真的走 2PC**，不要把 4a 的绿灯读成"2PC 已上线"。
-
-**方案：内核补丁 0004**，在 `CommitTransaction()` 里、`CallXactCallbacks(XACT_EVENT_PRE_COMMIT)`
-**之后**、`RecordTransactionCommit()` **之前**加一个 hook：
+**方案：内核补丁 0004**（`patches/0004-pre-record-commit-hook.patch`），在
+`CommitTransaction()` 里、`CallXactCallbacks(XACT_EVENT_PRE_COMMIT)` **之后**、
+`RecordTransactionCommit()` **之前**加一个 hook：
 
 ```c
 /* xact.c */
@@ -712,11 +743,83 @@ extern PGDLLIMPORT pre_record_commit_hook_type pre_record_commit_hook;
 这个位置的关键性质：**此时本地 commit record 尚未写入，hook 里 ERROR 还能干净地
 中止整个事务**（参与者的 prepared 事务随后被推定中止）。若放在 post-commit
 （`XACT_EVENT_COMMIT`），本地已经提交，决议失败时无法回头——**绝对不能放那里**。
+并行 worker 不触发（它提交的不是自己的分布式事务）。
 
-补丁落地后**必须重编 PG 并把 `pg-install/` 一并提交**（`468a518` 的教训：
-仓库跟踪的预编译 pg-install 与 `patches/` 不同步会让一键复现直接断在编译）。
+#### 9.3.1 写集从哪来：参与者自治登记 `partdist.dtx_participant`
 
-### 9.4 【高】Citus 自带的 2PC 恢复会与我们打架
+补丁只解决"何时决议"，不解决"决议给谁"。master 必须知道**真实写集**
+（哪些分区组真的被写了）才能算协调组，而它自己不知道——是各 worker 知道。
+Citus 的连接对象在 pg_partdist 里够不着，所以走一张表：
+
+```
+worker 侧（PREPARE TRANSACTION 的接线，dtx_participant.c）
+  ProcessUtility 截下 PREPARE TRANSACTION '<gid>'   ← 唯一能同时看到 gid 和触达集合的位置
+  XACT_EVENT_PRE_PREPARE:
+     PartWALFlush()                                  ← [A] DATA 落盘 + 复制到多数派
+     每个触达分区追加 DTX_PREPARE 标记（带本地 top-level xid）
+     PartWALFlush()                                  ← 标记也推到多数派
+     经 libpq **独立事务**写 partdist.dtx_participant(dtxid, gid, gsids[])
+  → 之后 PG 才写 prepare 记录并 fsync（[B]），[A] < [B] 不变
+
+master 侧（pre_record_commit_hook，raft_consensus.c 的 dtx_master_pre_record_commit）
+  1) 从 pg_dist_transaction 里取**本事务刚插入的行**（xmin = 当前 xid）→ 参与节点清单
+  2) 逐节点 SELECT partdist.dtx_local_participant(dtxid) → 合并成写集
+  3) 写集 ≤ 1 组 ⇒ 快路径，直接返回（§3.4）
+  4) coord_gsid = participants_sorted[dtxid % n]，**先**下发到全部参与节点
+     （partdist.dtx_note_coord，同步提交）
+  5) 到协调组现任 leader 上 partdist.dtx_decide(...) —— 返回 COMMIT 才放行
+```
+
+**dtxid 从 Citus 的 gid 推导**，不新造分配器：gid 形如
+`citus_<group>_<pid>_<txnnum>_<conn>`，同一笔分布式事务发往不同 worker 的 gid
+只有末段 `<conn>` 不同，前三段完全一致 ⇒ 各节点独立解析即得同一个 dtxid，
+零协商。打包成 `group(8) | pid(22) | txnnum(33)`。**pid 那 22 位不能省**：
+Citus 只保证 txnnum "自本次重启以来"唯一，协调节点重启后会重号，
+光用 (group, txnnum) 会让重启前后的两笔事务在 `dtx_decision` 上撞主键。
+
+**第 4 步为什么必须严格早于第 5 步**：参与者崩溃重启后，只能靠
+`dtx_participant.coord_gsid` 找协调组。先决议后下发会造出"全局已 COMMIT、
+参与者却查不到协调组"的**不可解**状态；反过来则永远安全——
+`coord_gsid IS NULL` 蕴含**决议必然还没做过**，推定中止（回滚）就是正确答案。
+这是整个恢复路径的支点。
+
+**只读参与者也要登记**（gsids 为空数组）。它不进写集（§8.3 的剔除照常成立），
+但**必须**能拿到 coord_gsid：它可能改过非纳管的表（reference 表 / 普通表），
+崩溃后既查不到协调组又擅自回滚就是分叉。
+
+**阶段 3 的挂点**：master 拿到决议后本来就要对每个参与者发
+`COMMIT/ROLLBACK PREPARED`，worker 在 ProcessUtility 里截下这条语句、
+在执行**前**把 `DTX_COMMIT`/`DTX_ABORT` 标记补进各触达组的 parwal 流——
+零额外往返。协调组跳过 COMMIT 标记（§5.3 DECISION 兼任）。
+标记的复制是 best-effort（§3.3 原文就是"随下一次 flush 复制"），
+复制失败绝不能把 `COMMIT PREPARED` 带崩。
+
+> **★ 实施时踩到的坑（2026-08-04）**
+> 1. **`XACT_EVENT_PRE_PREPARE` 里不能直接 SPI**。它跑在 `PrepareTransaction()`
+>    的 `PreCommit_Portals(true)` **之后**，portal 已关、活动快照已弹空，
+>    直接 `SPI_execute` 报 `cannot execute SQL without an outer snapshot or portal`。
+>    必须自己 `PushActiveSnapshot(GetTransactionSnapshot())`（pg_raft 的
+>    `raft_persist_spi_begin()` 一直是这么做的）。**这是第一次真的跑通端到端
+>    2PC 时立刻撞上的**——机制单测（raft_19/20/21）全都从顶层 SQL 调用，
+>    压根走不到这条路径。
+> 2. **`cleanup_raft_loose_objects` 漏了 dtx 三函数**。`dtx_decide` /
+>    `dtx_status` / `dtx_recover_prepared` 是 pg_raft 扩展成员，一旦有过
+>    "扩展被 DROP、函数被单独 CREATE OR REPLACE 重建"的历史就变成游离对象，
+>    此后每次 `CREATE EXTENSION pg_raft` 都整体失败于
+>    `function ... is not a member of extension "pg_raft"` ——
+>    表现是 `raft_log` 与全部 `pg_raft_*` 函数一起消失。
+>    与 §5.5 记的是同一类坑：**扩展成员的签名迁移必须显式解除归属再重建**。
+> 3. **不能假设 Citus 的 placement 轮转顺序**。`citus.shard_count = 2` 时两个
+>    分片完全可能落在同一节点，跨节点事务根本构造不出来；raft_22 改为
+>    `shard_count = 8` 再用 `get_shard_id_for_distribution_column()` 反查出
+>    两个分属不同节点的分片。
+> 4. **两个数据组的成员集必须互不相交**。相交时可能选出同一个 leader，
+>    而 leader 上报会改写 `pg_dist_placement` 把两个分片挪到同一节点；
+>    更麻烦的是当选者手里只有一张 `CREATE TABLE LIKE` 出来的**空副本表**
+>    （惰性回放尚未实装），后续断言全乱。夹具照 raft_16 的手法
+>    "先只在 primary 上建组、等它当选、再补建到 follower"。
+
+### 9.4 【已落地】Citus 自带的 2PC 恢复会与我们打架（2026-08-04）
 
 Citus 把 `pg_dist_transaction` 当决议真相源：master 本地提交成功后，它的
 maintenance daemon 会对残留的 prepared 事务无条件 `COMMIT PREPARED`。若我们的
@@ -725,8 +828,25 @@ maintenance daemon 会对残留的 prepared 事务无条件 `COMMIT PREPARED`。
 
 **处置**：`citus.recover_2pc_interval = -1`（关闭 Citus 的 2PC 恢复），
 由 §7 的守护统一处置；`pg_dist_transaction` 降级为参与者提示，
-**权威真相源 = 协调组日志**。这条要写进环境搭建脚本（`reproduce-env.sh` 的
-postgresql.conf 段）与验收前置检查。
+**权威真相源 = 协调组日志**。已写进 `reproduce-env.sh` 与 `setup-raft.sh` 的
+postgresql.conf 段，并作为 raft_22 A 段的前置检查（逐节点断言为 -1）。
+
+**关掉之后谁来收尾**：`partdist.dtx_recover_prepared()` 按两条规则分流——
+
+| 本节点 `dtx_participant.coord_gsid` | 提交点 | 收尾依据 |
+|---|---|---|
+| 有值 | 协调组的 DECISION 记录达多数派 | `dtx_status(coord_gsid, dtxid)`；问不到就保持 prepared |
+| 为 NULL（快路径 / 无纳管分片 / master 在下发前就挂了） | master 的本地提交 | Citus 原生规则：协调节点的 `pg_dist_transaction` 里有没有该 gid 的**已提交**行 |
+
+第二条是 `dtx_ask_citus_coordinator()`，它把 Citus 恢复守护的判据搬了过来——
+关掉 Citus 的守护之后，这类事务原本就没人管了。推定中止的时间窗与 Citus 自己的
+恢复同源：master 还在跑这笔事务时行尚未提交，但那时 prepared 事务的年龄也还没到
+超时，超时设保守即可。
+
+**顺带修掉的一个真实缺陷**：恢复守护此前把补标记的目标写成
+`local_partition_for_shard(coord_gsid)` —— 参与者通常**并不承载协调组的分片**，
+于是标记根本写不出去（raft_21 恰好用"参与者即协调组"的夹具，测不出来）。
+现在改为写到 `dtx_participant.gsids` 里本节点自己触达过的每一个组。
 
 ### 9.5 【中】快路径的提交点定义需要拍板
 
@@ -744,6 +864,12 @@ leader 本地事务却中止**，leader 与自己的组分叉。
 
 **建议先 (b)，留 (a) 作升级路径。** 无论选哪个，规则都必须写进 FRD §11 的
 升主/归队序列，否则归队路径会静默带着分叉数据。
+
+> **落地现状（2026-08-04）**：快路径的**判定**已经在跑——master 侧驱动算完写集后
+> `nparts <= 1` 直接返回，不做决议、不写 DECISION（raft_22 D 段验收：单分区
+> UPDATE 前后决议数不变、parwal 里不出现任何 DTX 标记）。**提交点的定义仍按 (b)**，
+> 即沿用现时序、把代价留在故障路径；(a) 与归队规则仍未实装，见第 6 步。
+> 恢复侧对这类事务已有明确归属：`coord_gsid IS NULL` ⇒ 按 Citus 原生规则收尾（§9.4）。
 
 ### 9.6 【中】升主序列要加一步"清 in-doubt"
 
@@ -770,6 +896,27 @@ promoted 副本可读仍然卡在 xid_map + 增强型 CLOG（FRD §14.2 的 R4�
   不是丢性能。**
 - 这两条都指向计划 §12.4 #3"数据组日志外部化到 parwal"。2PC 会把它从容量问题
   加速变成正确性问题，应提前排期。
+
+### 9.7.1 【中】一笔事务现在跑三轮复制，落后 follower 的窗口变宽（2026-08-04 实测）
+
+接线后，一笔跨分区事务在每个参与组上要凑**三次**多数派：
+
+| 轮次 | 内容 | 触发点 |
+|---|---|---|
+| 1 | DATA 批 | `PartWALFlush()`（PRE_PREPARE） |
+| 2 | `DTX_PREPARE` 标记 | 追加标记后再 flush 一次（PRE_PREPARE） |
+| 3 | `DTX_COMMIT`/`DTX_ABORT` 标记 | `COMMIT/ROLLBACK PREPARED` 的 ProcessUtility 挂点，**best-effort** |
+
+三轮各自凑各自的多数派，**同一个 follower 完全可能连续两轮都不在多数派里**而短暂
+落后一两条；补齐靠 leader 下一次心跳按 `next_index` 推送。终态一致（实测三节点
+最终完全相同），但"写完立刻看"的一次性快照判据在接线后变得对时序敏感——
+`run-raft-tests.sh` 的 raft_16 终态判据因此改成**有界重试**（30s 窗口内收敛即通过）。
+
+这不是新缺陷，而是把既有的"**缺后台追平通道**"（计划 §12.4）暴露得更明显：
+无写入流量时落后 follower 不自行收敛，只能等下一次写入或心跳带。
+**阶段 3 的标记复制是 best-effort（§3.3 原文即"随下一次 flush 复制"），
+失败不会影响正确性**——全局结果在阶段 2 已持久化，标记只是让升主回放少问一次
+协调组。真要收紧，正解是补后台追平通道，而不是把阶段 3 拉进关键路径。
 
 ### 9.8 【中】锁滞留与 TSO 缺位
 
@@ -798,19 +945,20 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
 | 2 ✅ | **成员集显式化**（§9.2）：未知成员集 fail-stop + 从控制面 `partition_map` 自动导出 + 建组入口堵源头 | **raft_18 四条判据全过**：A 未知成员集建组被拒且不留残组；B 有登记时自动导出 `cluster_size=3`；C **quorum 按真实成员数**（3 全在可写 / 停 1 个 2/3 仍可写 / 停 2 个 1/3 必败）；D 非副本节点不被拖入。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t` 建出 `cluster_size=9` 的组 |
 | 3 ✅ | **记录格式**（§5）：`PARTWAL_FLAG_DTX` + `DtxRecordPayload` + `partwal_read_record`/`partwal_follower_append` 携带 flags | **raft_19 四段全过**：A 全新库 `CREATE EXTENSION` + 四个函数签名；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/info 载子类型、DECISION 载荷往返；C 对 DATA 调 `read_dtx` 返回 NULL；D **两个 follower 的 flags/info 序列与 leader 完全一致** |
 | 4a ✅ | **决议层本体**（§6）：`dtx_decision` 表 + `dtx_decide`/`dtx_status` + apply 索引维护 | **raft_20 五段全过**：A 非协调组 leader 调 decide 返回 NULL 且不留痕；B **COMMIT 决议返回后 DECISION 记录与索引在协调组全部成员上均在**（= 已在多数派持久化，全局提交点）；C 决议槽一次性；D 推定中止先写 ABORT 再答复、此后 COMMIT 无法翻盘；E **协调组切主后两笔决议仍可查**（协调权随 Raft 选举自动转移，无需状态搬迁） |
-| 4b ⏸ | **补丁 0004 + master 挂点 + 关 Citus 2PC 恢复** | **暂缓**，理由见 §9.3 的落地评估 |
+| 4b ✅ | **补丁 0004 + master 挂点 + 关 Citus 2PC 恢复**（§9.3 / §9.4）：`pre_record_commit_hook` + 参与者自治登记 `dtx_participant` + master 侧写集收集/协调组选取/决议 + 阶段 3 标记 + `citus.recover_2pc_interval=-1` | **raft_22 A/B/C/F**：A 二进制导出 `pre_record_commit_hook` 且逐节点 `recover_2pc_interval=-1`；B 跨分区事务提交后协调组有且仅有一条 COMMIT 决议、participants 恰为真实写集、协调组=`participants_sorted[dtxid % n]`、且**决议在协调组每个成员上都在**；C 三阶段在 parwal 流里逐条可见（参与组 `DATA…,PREPARE,COMMIT`／协调组 `DATA…,PREPARE,DECISION` 且**无**单独 COMMIT 标记），PREPARE 携带本地 top-level xid 且排在 DATA 之后；F **协调组失去多数派** ⇒ 事务**提交失败**且无行可见（不允许部分提交）——注意判据构造：只停协调组 leader 是不够的，组内还剩 2/3 会自治选出新 leader 并上报改写路由，决议照样做得出来、事务**应该**成功（这正是 §2.1 好处 2），必须停两个成员让 1/3 永远凑不齐多数派。**真对照**：`pg_raft.dtx_2pc_enabled=off` 重跑，B 段确定性失败（"找不到 DECISION 记录"）。**不回退基线在这一步抓到两个真缺陷**：raft_19 A 段（全新库冒烟）抓到 hook 在没装 Citus 的库里直接引用 `pg_dist_transaction`；raft_14/16 抓到 §9.2.6 的段号错位 |
 | 5a ✅ | **恢复守护**（§7）：`partdist.dtx_recover_prepared(timeout_ms)` | **raft_21 四段**：A 有 COMMIT 决议 ⇒ 提交、数据可见、补 `DTX_COMMIT` 标记；B 从未决议 ⇒ 经 `dtx_status` 推定中止、回滚、补 `DTX_ABORT` 标记且**决议已落库**；C 未超时的不被触碰（不与正常路径抢答）；D **协调组不可达 ⇒ 保持 prepared 不动**，绝不擅自决定 |
-| 5b ⛔ | **快路径 + 只读参与者剔除** | **阻塞于 4b**，见下方说明 |
+| 5b ✅ | **快路径 + 只读参与者剔除**（§3.4 / §8.3） | **raft_22 D/E**：D 单分区事务前后决议数不变、parwal 里不出现任何 DTX 标记（开销与接线前持平）；E 广播 UPDATE 打到全部 8 个分片、只有 1 个分片真改到行 ⇒ 写集只剩 1 组、**不产生决议**，同时只读参与者仍留下 `gsids='{}'` 的登记（7 条空写集 / 1 条真写集）——剔除的是"进不进写集"，不是"登不登记"，后者是它崩溃后自解的唯一线索 |
 
-> **★ 5b 为什么必须等 4b（2026-08-03 实施时的判断）**：这两项都是
-> **master 侧的驱动决策**——"参与组数 ≤ 1 就不走 2PC"（§3.4）与"命中 0 行的
-> 分片不进参与者清单"（§8.3），都发生在 master 决定要不要发起 2PC 的那一刻。
-> 而 master 侧的驱动逻辑本身尚不存在（4b 未落地），此时实现快路径等于实现一段
-> **没有调用者、也无法观测**的代码。worker 侧的检测机制（触达集合为空 ⇒ 只读）
-> 已在 §9.1 的修复里就位，等 4b 一落地即可直接用。
 | 6 | **升主 in-doubt 清理**（§9.6）+ 快路径分叉归队规则（§9.5） | 与惰性回放的 promotion 路径合流验收 |
 
-**不回退基线**：`run-raft-tests.sh` 现 32/32（raft_01–16）+ P0 10/10 + 全新库
+> **★ 5b 为什么等到 4b 之后才做（2026-08-03 的判断，2026-08-04 兑现）**：这两项都是
+> **master 侧的驱动决策**——"参与组数 ≤ 1 就不走 2PC"（§3.4）与"命中 0 行的
+> 分片不进参与者清单"（§8.3），都发生在 master 决定要不要发起 2PC 的那一刻。
+> 4b 未落地时实现它们等于实现一段**没有调用者、也无法观测**的代码。
+> worker 侧的检测机制（触达集合为空 ⇒ 只读）在 §9.1 的修复里就已就位，
+> 4b 一落地就直接用上了，两项各自只是驱动里的一个判断。
+
+**不回退基线**：`run-raft-tests.sh` 现 raft_01–22 + P0 10/10 + 全新库
 `CREATE EXTENSION` 冒烟，每步都必须保持全绿。
 
 ---

@@ -65,9 +65,15 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
   的**提前返回路径也调复制挂钩**；本组的复制在 pg_raft 侧串行化（认领位 +
   持有者消失时回收），消除并发 backend 抢同一段 plsn 的重复提案。
   回归 `raft_17`，含修复前必失败的对照实验。
-- 回归基线：`pg-raft-src/run-raft-tests.sh` **32/32**（raft_01–16）；
+- **跨分区事务 2PC（2026-08-04，DTX-2PC 第 2–5 步）**：记录格式（`PARTWAL_FLAG_DTX`）、
+  决议层（`dtx_decide`/`dtx_status`，决议在协调组达多数派即为全局提交点）、
+  **内核补丁 0004 的 `pre_record_commit_hook`**（把决议接进客户端提交路径）、
+  参与者自治登记与恢复守护、快路径与只读参与者剔除。回归 `raft_19`–`raft_22`，
+  含 `pg_raft.dtx_2pc_enabled=off` 的对照实验。
+- 回归基线：`pg-raft-src/run-raft-tests.sh` **raft_01–22 全绿**；
   `pg-partdist-src/tests/test_shard_identity_p0.sh` **10/10**；
-  全新库 `CREATE EXTENSION` 冒烟通过。
+  全新库 `CREATE EXTENSION` 冒烟通过（raft_19 A 段，2026-08-04 正是它抓到
+  master 侧 hook 在没装 Citus 的库里直接引用 `pg_dist_transaction` 的缺陷）。
 
 ### 2.3 当前缺口
 
@@ -92,10 +98,15 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
 - ~~`pg_raft_data_propose()` 未接入写入路径~~ **→ 2026-07-24 已接入事务 prepare 路径**
   （§14，PartWALFlush 挂钩自动逐条 propose）。仍缺**后台追平通道** —— 无写入流量时
   落后 follower 不自行收敛（下一次写入的挂钩会顺带补齐增量）。
-- 2PC 的 commit 决议尚未实现。~~（用户明确暂缓）~~ **→ 2026-08-03 解除暂缓**：
-  设计已定稿于 `pg-partdist-src/docs/DTX_2PC_DESIGN.md`（DTX-2PC v1），
-  **决议改放数据组，不再走控制面**（理由见该文 §3.2）。prepare 阶段本身已由
-  §14 落地，但存在一个正确性阻断项（group-commit 让路窗口，见 §14.3 #1 的更新）。
+- ~~2PC 的 commit 决议尚未实现。~~ **→ 2026-08-04 端到端落地**：
+  设计定稿于 `pg-partdist-src/docs/DTX_2PC_DESIGN.md`（DTX-2PC v1），
+  **决议放数据组，不走控制面**（理由见该文 §3.2）。该文 §10 的第 0–5 步全部完成、
+  回归 raft_17–22：让路窗口修复 → 成员集显式化 → 记录格式 → 决议层 →
+  **内核补丁 0004（`pre_record_commit_hook`）把决议接进客户端提交路径** →
+  参与者恢复守护 + 快路径 + 只读参与者剔除。
+  **跨分区事务现在真的走 2PC，提交点是决议记录在协调组达多数派持久化的那一刻。**
+  剩该文第 6 步（升主 in-doubt 清理、快路径分叉归队规则），需与惰性回放的
+  promotion 路径合流。
 
 ## 3. 目标架构
 
@@ -252,14 +263,18 @@ flowchart TB
 - 切主前后 `partition_lsn` 保持单调。
 - 旧 primary 恢复后只能以 secondary 身份回归。
 
-### 阶段 3：接入 shardpg-2.0 数据面同步与 2PC 决议 ⚠️ 运输部分完成
+### 阶段 3：接入 shardpg-2.0 数据面同步与 2PC 决议 ✅ 2026-08-04 完成（redo 回放另计）
 
 目标：基于 `shardpg-2.0` 已有 PartWAL 同步写入和 follower replay 设计，实现方案文档要求的真正多副本同步，而不是在 Raft 模块里重新设计一套数据面。
 
 > 落地情况：**跨节点日志传输已由分区级 Raft 组实现**（P2 + 运输层加固，§11.5/§11.5.1）——
 > 原计划设想的 WalSender/WalReceiver 流式通道**不再需要**，AppendEntries 本身就是那条通道，
-> 且天然带多数派语义。仍未完成的是 **redo 回放（P3）** 与 **2PC 决议（`OP_PREPARE_DECISION` /
-> `OP_COMMIT_DECISION` 尚未实现）**。
+> 且天然带多数派语义。
+> **2PC 决议已于 2026-08-04 端到端落地**（`DTX_2PC_DESIGN.md` §10 第 0–5 步，
+> 回归 raft_17–22）：决议不进控制面，写在写集内按 `hash(dtxid)` 选出的分区组日志里，
+> 该记录达多数派持久化即为全局提交点；内核补丁 0004 的 `pre_record_commit_hook`
+> 把它接进了客户端提交路径。仍未完成的是 **redo 回放（P3）**，以及升主时的
+> in-doubt 清理（该文 §9.6，与惰性回放的 promotion 路径合流时再做）。
 
 PartWAL 接入链路：
 
@@ -292,7 +307,10 @@ PartWAL 接入链路：
    leader 侧 PRE_COMMIT fsync。
 4. 该日志在 Si 达到 Raft 多数派持久化后，进入 prepared 状态。
    → 多数派语义已具备并验收：多数派提交 == 多数派已持久化（raft_13 反例：失多数派
-   propose 必须失败）；"prepared 状态"作为事务状态机（2PC）本体暂缓。
+   propose 必须失败）。**"prepared 状态"作为事务状态机本体已于 2026-08-04 落地**：
+   参与者侧就是 PG 原生的 prepared transaction，配一条 `DTX_PREPARE` 标记记录
+   （携带 dtxid ↔ 本地 top-level xid 的绑定）+ `partdist.dtx_participant` 登记，
+   状态机的推进由协调组的决议驱动（`DTX_2PC_DESIGN.md` §6.1，回归 raft_22 C）。
 
 其余（2PC 决议）——**2026-08-03 定稿，下述控制面方案已作废**：
 
@@ -359,9 +377,11 @@ PartWAL 接入链路：
   新增的是**数据组内**的记录类型（`PARTWAL_FLAG_DTX` + `DtxRecordPayload`，
   该文 §5）与两个 SQL 入口 `partdist.dtx_decide` / `partdist.dtx_status`（§6.3）。
   **→ 2026-08-03 已落地并经 raft_20 验收**（决议记录在协调组达多数派持久化即为
-  全局提交点）。仍缺的是**把决议接进客户端提交路径**（内核补丁 0004 的
-  master 挂点），暂缓，理由见 `DTX_2PC_DESIGN.md` §9.3 的落地评估——
-  **在它落地前跨分区事务不会真的走 2PC**。
+  全局提交点）。**→ 2026-08-04 接进客户端提交路径**：内核补丁 0004
+  （`pre_record_commit_hook`，在 `CommitTransaction()` 里、全部
+  `XACT_EVENT_PRE_COMMIT` 回调之后、`RecordTransactionCommit()` 之前）+
+  参与者自治登记 `partdist.dtx_participant` + master 侧写集收集/协调组选取/决议，
+  经 raft_22 端到端验收。**跨分区事务现在真的走 2PC。**
 - ⚠️ `OP_CONFIG_CHANGE`（成员**变更**仍依赖它）。**成员集下发已不依赖它**：
   2026-08-03 起数据组成员集从控制面已下发的 `partdist.partition_map` 本地导出
   （`DTX_2PC_DESIGN.md` §9.2），无需新增 RPC。
@@ -437,12 +457,13 @@ PartWAL 接入链路：
 | `raft_13_data_group_replication` | 数据组多数派提交、字节级一致、失多数派拒写（reference 夹具，保留作运输层回归） | ✅ |
 | `raft_14_hash_shard_secondary_backup` | **真实哈希分片 (a) 形态**：多记录逐条 propose、follower 逐字节指纹一致、`partition_lsn` 1..N 连续无洞、一条 record 一次备份、不回放（壳表 0 行）、初次登记（primary/term/secondaries 不含 master）、路由层一致、master 无分片身份 | ✅ |
 | `raft_15_self_election_failover` | **切主全链路**：停主 → 组内自治选举 → 上报登记 → 每节点 `partition_map`+`pg_dist_placement` 落新主（任期递增、master 不入 secondaries）→ 旧主重启以 follower 归队、登记不回退 | ✅ |
-| `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平 | ✅ |
+| `raft_16_prepare_auto_replicate` | **prepare 接线（§14，全程无手工 propose）**：仅 INSERT 即自动逐条复制、逐字节一致；失多数派 INSERT 必败（prepare 中止）行数不变；恢复后自动追平。**两处终态判据于 2026-08-04 改为有界重试（30s 窗口）**：2PC 接线后一笔事务要跑三轮复制（DATA／PREPARE 标记／COMMIT 标记），各自凑各自的多数派，同一个 follower 可能连续两轮都不在多数派里而短暂落后，靠 leader 下一次心跳补齐——终态一致但到达得比固定 `sleep 2` 晚。这是"缺后台追平通道"（§12.4）的既有边界被放大，不是新缺陷（`DTX_2PC_DESIGN.md` §9.7.1） | ✅ |
 | `raft_17_concurrent_prepare_quorum` | **并发 prepare 的多数派保证（§14.3 #1 的让路窗口）**，用例本体在 `test/raft_17_concurrent_prepare_quorum.sh`（可独立跑），三阶段：① 同 worker 两数据组 + 8 会话并发单行 INSERT，断言持有完整前缀的成员数 >= 多数派（不是"全体追平"——Raft 只保证 quorum，且尚无后台追平通道）；② **确定性让路**：长事务 P 写 B 组后 pg_sleep，并发短事务 Q 的 flush 顺带消费其槽位并推过 flushed_upto，P 提交必走提前返回分支——断言被让路的 P 的记录仍达多数派；③ 失多数派 + 并发写，断言提交成功行数 == 0（2PC prepare 性质回归）。两个 burst 阶段均先甄别节点崩溃再断言。**真对照实验**（同用例仅换 .so、nm 验证构建身份）：让路窗口未修的构建在阶段二确定性失败（P 提交成功而记录只在 leader：43 vs 41/41），修复版 43/43/43 | ✅ |
 | `raft_18_membership_explicit` | **成员集显式化与真实多数派（§11.5.2 #3）**，用例本体在 `test/raft_18_membership_explicit.sh`（可独立跑），四条确定性判据：A 成员集未知（NULL 且 partition_map 无登记）时**建组必须报错拒绝**且不留残组；B 有控制面登记时 NULL 建组**自动导出**成员集，`cluster_size=3` 而非 9；C **quorum 按真实成员数**——3 成员全在可写、停 1 个（2/3）仍可写、停 2 个（1/3）必败；D 非副本节点不被 hearsay 拖入该组。真对照（nm 验证构建身份）：修复前 A 处 `group_create` 返回 `t`，建出 `cluster_size=9` 的组、向全集群广播选举、真正的数据持有者反被挤成 follower。**注意 C 不断言"某个特定节点当选"**——Raft 不保证哪个成员赢，用例动态发现 leader 与待停 follower（初版硬断言 worker1 当选，实测 worker3 先超时先当选而误报） | ✅ |
 | `raft_19_dtx_record_format` | **DTX-2PC 记录格式与 flags 端到端保真（`DTX_2PC_DESIGN.md` §5）**，用例本体在 `test/raft_19_dtx_record_format.sh`（可独立跑），四段：A **全新库 `CREATE EXTENSION` 冒烟 + 四个函数签名**（这是唯一能抓到签名不一致的检查，本次实施踩到两次）；B leader 侧 DATA `flags=1`、DTX `flags=8`/`orig_lsn=0`/`info` 载子类型、DECISION 载荷（dtxid/coord/ts/verdict/participants[]）完整往返；C 对 DATA 记录调 `partwal_read_dtx_record` 返回 NULL（分类以 flags 判定）；D **follower 侧 flags/info 序列与 leader 完全一致** | ✅ |
 | `raft_20_dtx_decision` | **DTX-2PC 决议层（`DTX_2PC_DESIGN.md` §6）**，用例本体在 `test/raft_20_dtx_decision.sh`（可独立跑），五段：A 非协调组 leader 调 `dtx_decide` 返回 NULL 且不留痕；B **COMMIT 决议返回后 DECISION 记录与索引表在协调组全部成员上均在**——返回即"已在多数派持久化"，这就是全局提交点；C 决议槽一次性（对同一 dtxid 再决议 ABORT 仍返回 1）；D **推定中止**：查无决议时 `dtx_status` 先写 ABORT 达多数派再答 2，此后 COMMIT 无法翻盘；E **协调组切主后两笔决议仍可查**——索引表由各成员 apply 时各自维护，协调权随 Raft 选举自动转移，无需状态搬迁 | ✅ |
-| `raft_21_dtx_recovery` | **DTX-2PC 参与者侧恢复守护（`DTX_2PC_DESIGN.md` §7）**，用例本体在 `test/raft_21_dtx_recovery.sh`（可独立跑），四段：A 协调组已有 COMMIT 决议 ⇒ 恢复守护提交 prepared 事务、数据可见、补 `DTX_COMMIT` 标记；B 从未决议 ⇒ 经 `dtx_status` **推定中止**、回滚、补 `DTX_ABORT` 标记且**决议已落库**（推定中止是写下来的，不是隐含的）；C 未超时的 prepared 事务不被触碰（不与正常路径抢答）；D **协调组不可达 ⇒ 保持 prepared 不动**——绝不擅自决定。夹具用手工 `PREPARE TRANSACTION 'shardpg_dtx_<dtxid>_<coord_gsid>'` 造 in-doubt 事务（自动接线未落地，见 §9.3） | ✅ |
+| `raft_21_dtx_recovery` | **DTX-2PC 参与者侧恢复守护（`DTX_2PC_DESIGN.md` §7）**，用例本体在 `test/raft_21_dtx_recovery.sh`（可独立跑），四段：A 协调组已有 COMMIT 决议 ⇒ 恢复守护提交 prepared 事务、数据可见、补 `DTX_COMMIT` 标记；B 从未决议 ⇒ 经 `dtx_status` **推定中止**、回滚、补 `DTX_ABORT` 标记且**决议已落库**（推定中止是写下来的，不是隐含的）；C 未超时的 prepared 事务不被触碰（不与正常路径抢答）；D **协调组不可达 ⇒ 保持 prepared 不动**——绝不擅自决定。夹具用手工 `PREPARE TRANSACTION 'shardpg_dtx_<dtxid>_<coord_gsid>'` 造 in-doubt 事务，测的是守护本身，与谁产生 prepared 事务无关 | ✅ |
+| `raft_22_dtx_end_to_end` | **DTX-2PC 端到端（`DTX_2PC_DESIGN.md` §3.3/§3.4/§5.3/§8.3/§9.3）**，用例本体在 `test/raft_22_dtx_end_to_end.sh`（可独立跑），六段：A 前置——二进制导出 `pre_record_commit_hook` 且逐节点 `citus.recover_2pc_interval=-1`；B **真实跨分区事务**提交后协调组有且仅有一条 COMMIT 决议、participants 恰为真实写集、协调组 == `participants_sorted[dtxid % n]`、**且决议在协调组每个成员上都在**；C 三阶段在 parwal 流里逐条可见（参与组 `DATA…,PREPARE,COMMIT` ／协调组 `DATA…,PREPARE,DECISION` 且**无**单独 COMMIT 标记），PREPARE 携带本地 top-level xid 且排在 DATA 之后；D **快路径**：单分区事务不写决议也不写标记；E **只读参与者剔除**：广播 UPDATE 打到全部 8 个分片但只有 1 个真改到行 ⇒ 不产生决议，同时只读参与者仍留 `gsids='{}'` 的登记（它崩溃后自解的唯一线索）；F **协调组失去多数派** ⇒ 事务**提交失败**且无行可见（不允许部分提交）。**判据构造有坑**：只停协调组 leader 不行——组内还剩 2/3 会自治选出新 leader 并上报改写路由，决议照样做得出来、事务本就该成功（那正是"协调权随选举转移"在起作用），必须停两个成员。**真对照**：`pg_raft.dtx_2pc_enabled=off` 重跑，B 段确定性失败 | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
 > 下的实际目录探测协调节点目录名（raft4 是 `master`，pg_citus_raft 是
@@ -451,6 +472,19 @@ PartWAL 接入链路：
 > 可用 `CONTAINER` / `COORD_DIR` / `N_WORKERS` / `BASE_PORT` 覆盖。
 > quorum 编排本身与节点数无关（raft_05 停"除 leader 外全部节点"；数据组用例用
 > 显式 3 成员组），所以只需要改映射函数。
+
+> **⚠️ 套件不是幂等的，连跑多轮会积累状态（2026-08-04 实测）**：每轮都会新建
+> Citus 分片、建/弃数据组、并因 leader 上报改写 `pg_dist_placement`；被 DROP 的
+> 分片表留下的 `pg_parwal/<oid>/` 目录不会回收（实测单节点 170+ 个）。连跑到第
+> 六轮时出现一批**与本次改动无关**的失败：控制面上报链路超时、`pg_dist_placement`
+> 与数据组 leader 分叉导致"本节点不是该分区组的 leader"、raft_17 的长事务夹具
+> 建不起来。就地重建 `pg-cluster-data`（initdb + Citus 接线 + setup-raft）之后
+> 同一份代码全绿。
+>
+> **判据**：排查回归失败前先看它是不是只在"连跑很多轮之后"出现——是的话先重建
+> 环境再复现，否则很容易把环境噪声误读成代码缺陷（本轮差点误判两次）。
+> 重建脚本参照 `reproduce-env.sh` 的 `[4/6]`–`[6/6]` 三段；`reproduce-env.sh up`
+> 本身会**重新克隆并覆盖工作区**，有未提交改动时不能直接用。
 
 > **✅ 并发写入路径三缺陷已定位并修复（2026-08-03，详见 `DTX_2PC_DESIGN.md` §9.0）**
 > 首次并发压 prepare 路径连环暴露、当日全部修复：
@@ -526,8 +560,9 @@ PartWAL 接入链路：
 | 只改 `partition_map` 会提升陈旧副本 | 有数据组的分区：选举限制 + `primary_term` 任期栅栏（§13）；遗留分区：绑定 `switch_partition_lsn` 候选过滤 | ✅ 已落地 |
 | 切主结果不达路由层（双真相源） | `OP_PARTITION_PRIMARY` apply 在每节点同步本地 `pg_dist_placement`（单放置守卫+子事务隔离） | ✅ 已落地（P3 前为"机制先行"） |
 | PartWAL 复制链路未打通 | 由分区级 Raft 组承担运输，复用 `partwal_sync` 与 `applied_part_lsn` | ✅ 已落地 |
-| 2PC 决议丢失会导致部分提交 | ~~通过控制面 Raft 复制~~ **改为写入协调组（写集内 `hash(dtxid)` 选出的分区组）的日志并等 quorum**；查无决议即推定中止（`DTX_2PC_DESIGN.md`） | ⚠️ 设计定稿 2026-08-03，实现中 |
-| **group-commit 让路窗口使 prepare 的多数派保证失效** | per-backend 触达集合 + 提前返回路径也触发复制挂钩；prepare 语义改为"等 `commit_index` 覆盖本事务记录"（`DTX_2PC_DESIGN.md` §9.1） | ❌ **2PC 的头号阻断项**，见 §14.3 #1 |
+| 2PC 决议丢失会导致部分提交 | ~~通过控制面 Raft 复制~~ **改为写入协调组（写集内 `hash(dtxid)` 选出的分区组）的日志并等 quorum**；查无决议即推定中止（`DTX_2PC_DESIGN.md`） | ✅ 2026-08-04 端到端落地，回归 raft_20/21/22 |
+| Citus 自带 2PC 恢复与协调组决议打架 ⇒ 分叉提交 | `citus.recover_2pc_interval = -1`，改由 `partdist.dtx_recover_prepared()` 统一收尾：有协调组的按决议、快路径的退回 Citus 原生规则（`DTX_2PC_DESIGN.md` §9.4） | ✅ 已落地，raft_22 A 段前置断言 |
+| **group-commit 让路窗口使 prepare 的多数派保证失效** | per-backend 触达集合 + 提前返回路径也触发复制挂钩；prepare 语义改为"等 `commit_index` 覆盖本事务记录"（`DTX_2PC_DESIGN.md` §9.1） | ✅ 已修，回归 raft_17（确定性让路构造） |
 | 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
 | **一节点托管多分区副本 ⇒ 不同 leader 的 xid 在本地 clog 相撞** | **必须先做集群级 xid 区间租约**；在此之前多分区共存于一节点的 redo 配置不可上线 | ❌ **最硬阻断项**，见 §11.5.2 #1 |
 | **分区数超过 `RAFT_MAX_GROUPS=32` / ring 撑爆 shmem** | 数据组日志外部化到 parwal 段文件，shmem 只留游标 | ❌ 未做 |
@@ -576,8 +611,11 @@ PartWAL 接入链路：
    (`OP_CONFIG_CHANGE`，完成后补"副本集真子集"与"混合角色"回归) →
    propose 接入写入路径 + 后台追平通道 → P3 redo 本体。
    其中"propose 接入写入路径"的目标形态即 §4 阶段 3 的 **prepare 四步设计**
-   （步骤 1/3/4 机制已具备并经 raft_13/14 验收，缺的是步骤 2 的自动挂接）。
-2. **2PC 决议**（`OP_PREPARE_DECISION` / `OP_COMMIT_DECISION`，用户明确暂缓）。
+   （2026-08-03 起四步全部自动挂接，回归 raft_16/17）。
+2. ~~**2PC 决议**~~ **✅ 2026-08-04 端到端完成**（`DTX_2PC_DESIGN.md` §10 第 0–5 步，
+   回归 raft_17–22）。剩该文第 6 步：**升主 in-doubt 清理**（§9.6）与
+   **快路径分叉归队规则**（§9.5），两者都必须与惰性回放的 promotion 路径合流才谈得上验收，
+   因此并入上面第 1 条的 P3 序列。
 
 ⚠️ 历史教训存档：2026-07-18 曾写"至此物理回放前提具备"，2026-07-20 审查推翻——
 运输层前提具备，但 xid/clog、组容量、成员集等架构级前提未满足，P3 不能直接开工，

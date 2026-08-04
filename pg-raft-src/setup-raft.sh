@@ -45,6 +45,14 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT,
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
 DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
+-- DTX-2PC 的三个 pg_raft 函数。**必须列在这里**：它们是 pg_raft 扩展成员，
+-- 但只要有过一次"扩展被 DROP、函数被 CREATE OR REPLACE 单独重建"的历史，
+-- 就会变成游离对象，此后每次 CREATE EXTENSION pg_raft 都直接报
+-- "function ... is not a member of extension pg_raft" 而整体失败 ——
+-- 表现是 raft_log / pg_raft_get_cluster_status 全部消失（2026-08-04 实测）。
+DROP FUNCTION IF EXISTS partdist.dtx_decide(BIGINT, BIGINT, INTEGER, BIGINT[]);
+DROP FUNCTION IF EXISTS partdist.dtx_status(BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.dtx_recover_prepared(INTEGER);
 -- DTX-2PC 记录格式：follower_append 增加 p_flags、read_record 增加 OUT flags。
 --
 -- 两处坑（2026-08-03 实测，都会静默失败）：
@@ -146,6 +154,12 @@ pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 1
 # 协调节点(master)：group 0 leader 优先落于此，且不得作为数据组成员
 pg_raft.coordinator_node_id = 1
+# ★ DTX-2PC（DTX_2PC_DESIGN.md §9.4）：必须关掉 Citus 自带的 2PC 恢复。
+# 它把 pg_dist_transaction 当决议真相源，会把我们决议为 ABORT 的事务无条件
+# COMMIT PREPARED，造成部分参与者提交、部分回滚的**分叉提交**。
+# 关掉之后由 partdist.dtx_recover_prepared() 统一收尾：协调组有决议的按决议，
+# 没走 2PC 的（快路径）再退回 Citus 原生规则。
+citus.recover_2pc_interval = -1
 EOF
 }
 
@@ -204,6 +218,72 @@ CREATE TABLE IF NOT EXISTS partdist.dtx_decision (
     acked         BIGINT[]    NOT NULL DEFAULT '{}',
     decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- DTX-2PC 参与登记（§9.3 的 master 侧驱动依赖它算写集，恢复守护依赖它找协调组）
+CREATE TABLE IF NOT EXISTS partdist.dtx_participant (
+    dtxid       BIGINT      NOT NULL,
+    gid         TEXT        NOT NULL,
+    gsids       BIGINT[]    NOT NULL,
+    coord_gsid  BIGINT,
+    noted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_dtx_participant PRIMARY KEY (dtxid, gid)
+);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_dtxid ON partdist.dtx_participant(dtxid);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_noted ON partdist.dtx_participant(noted_at);
+CREATE OR REPLACE FUNCTION partdist.dtx_note_participant(
+    p_dtxid BIGINT, p_gid TEXT, p_gsids BIGINT[])
+    RETURNS BOOLEAN LANGUAGE sql VOLATILE
+AS $dtxnp$
+    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids)
+    VALUES (p_dtxid, p_gid, p_gsids)
+    ON CONFLICT (dtxid, gid) DO UPDATE
+       SET gsids = EXCLUDED.gsids, noted_at = now()
+    RETURNING true
+$dtxnp$;
+CREATE OR REPLACE FUNCTION partdist.dtx_local_participant(p_dtxid BIGINT)
+    RETURNS BIGINT[] LANGUAGE sql STABLE
+AS $dtxlp$
+    SELECT COALESCE(
+        (SELECT array_agg(DISTINCT g ORDER BY g)
+           FROM partdist.dtx_participant p, unnest(p.gsids) AS g
+          WHERE p.dtxid = p_dtxid),
+        '{}'::bigint[])
+$dtxlp$;
+CREATE OR REPLACE FUNCTION partdist.dtx_note_coord(p_dtxid BIGINT, p_coord_gsid BIGINT)
+    RETURNS INTEGER LANGUAGE plpgsql VOLATILE
+AS $dtxnc$
+DECLARE
+  n INTEGER;
+BEGIN
+  UPDATE partdist.dtx_participant
+     SET coord_gsid = p_coord_gsid
+   WHERE dtxid = p_dtxid
+     AND coord_gsid IS DISTINCT FROM p_coord_gsid;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 AND EXISTS (SELECT 1 FROM partdist.dtx_participant WHERE dtxid = p_dtxid) THEN
+    n := 1;
+  END IF;
+  RETURN n;
+END;
+$dtxnc$;
+CREATE OR REPLACE FUNCTION partdist.dtx_participant_of(
+    p_gid TEXT, OUT dtxid BIGINT, OUT coord_gsid BIGINT, OUT gsids BIGINT[])
+    RETURNS record LANGUAGE sql STABLE
+AS $dtxpo$
+    SELECT dtxid, coord_gsid, gsids FROM partdist.dtx_participant WHERE gid = p_gid
+$dtxpo$;
+CREATE OR REPLACE FUNCTION partdist.dtx_gc_participant(p_age_seconds INTEGER DEFAULT 3600)
+    RETURNS INTEGER LANGUAGE plpgsql VOLATILE
+AS $dtxgc$
+DECLARE
+  n INTEGER;
+BEGIN
+  DELETE FROM partdist.dtx_participant p
+   WHERE p.noted_at < now() - make_interval(secs => p_age_seconds)
+     AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts x WHERE x.gid = p.gid);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END;
+$dtxgc$;
 CREATE OR REPLACE FUNCTION partdist.partwal_truncate_to(
     p_partition_id OID, p_keep_upto_part_lsn BIGINT)
     RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE

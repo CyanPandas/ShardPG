@@ -24,6 +24,7 @@
  */
 #include "pg_raft.h"
 
+#include "access/xact.h"             /* 内核补丁 0004：pre_record_commit_hook */
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -193,6 +194,7 @@ typedef struct RaftHardStateFile
 } RaftHardStateFile;
 
 bool  pg_raft_raft_enabled = false;
+bool  pg_raft_dtx_2pc_enabled = true;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
@@ -4213,6 +4215,135 @@ dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
 }
 
 /*
+ * 未走本项目 2PC 的 prepared 事务（快路径 / 写集 ≤ 1 组 / 无纳管分片）按
+ * **Citus 原生规则**闭合：提交点是 master 的本地提交，凭据是
+ * pg_dist_transaction 里有没有该 gid 的**已提交**行。
+ *
+ * 为什么必须由我们来做：§9.4 关掉了 Citus 自己的 2PC 恢复（它会把我们决议为
+ * ABORT 的事务无条件 COMMIT，造成分叉），关掉之后这一类事务就没人收尾了。
+ * 两条规则各管各的：coord_gsid 有值 ⇒ 协调组权威；为空 ⇒ Citus 规则。
+ *
+ * 推定中止的时间窗与 Citus 自己的恢复同源：master 还在跑这笔事务时行尚未提交，
+ * 但那时 prepared 事务的年龄也还没到超时。超时设保守即可，不影响正确性边界。
+ *
+ * 返回 1=COMMIT / 2=ABORT / 0=问不到（master 不可达，保持 prepared）。
+ */
+static int
+dtx_ask_citus_coordinator(const char *gid)
+{
+    int       slot = -1;
+    int       i;
+    int       verdict = 0;
+    char      conninfo[256];
+    PGconn   *conn;
+    PGresult *res;
+    char     *quoted;
+    StringInfoData qry;
+
+    if (pg_raft_coordinator_node_id <= 0)
+        return 0;
+
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == pg_raft_coordinator_node_id)
+        {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        return 0;
+
+    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                            conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+
+    quoted = PQescapeLiteral(conn, gid, strlen(gid));
+    if (quoted == NULL)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+    initStringInfo(&qry);
+    appendStringInfo(&qry,
+                     "SELECT count(*) FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
+                     quoted);
+    PQfreemem(quoted);
+
+    res = PQexec(conn, qry.data);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        verdict = (atoi(PQgetvalue(res, 0, 0)) > 0) ? 1 : 2;
+    PQclear(res);
+    pfree(qry.data);
+    PQfinish(conn);
+    return verdict;
+}
+
+/*
+ * 按 gid 取本节点的参与登记：coord_gsid（0 = master 未下发过）与本节点在这笔
+ * 事务里写过的分区组。返回 false 表示查无此登记（legacy gid / 该表不存在）。
+ *
+ * ★ coord_gsid 为 NULL 的语义是推定中止的支点：master 严格"先下发协调组、
+ * 后做决议"，所以查到 NULL 就意味着**决议必然还没做过**。
+ */
+static bool
+dtx_lookup_participant(const char *gid, int64 *dtxid, int64 *coord_gsid,
+                       int64 *gsids, int max_gsids, int *ngsids)
+{
+    StringInfoData sql;
+    bool           found = false;
+    char          *quoted;
+
+    *dtxid = 0;
+    *coord_gsid = 0;
+    *ngsids = 0;
+
+    quoted = quote_literal_cstr(gid);
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT dtxid, coalesce(coord_gsid, 0), gsids "
+                     "  FROM partdist.dtx_participant WHERE gid = %s", quoted);
+    pfree(quoted);
+
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool   isnull;
+        Datum  d;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+        {
+            *dtxid = DatumGetInt64(d);
+            found = true;
+        }
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        if (!isnull)
+            *coord_gsid = DatumGetInt64(d);
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+        if (!isnull)
+        {
+            ArrayType *arr = DatumGetArrayTypeP(d);
+            Datum     *elems;
+            bool      *nulls;
+            int        n = 0;
+            int        i;
+
+            deconstruct_array(arr, INT8OID, 8, true, 'd', &elems, &nulls, &n);
+            for (i = 0; i < n && *ngsids < max_gsids; i++)
+                if (!nulls[i])
+                    gsids[(*ngsids)++] = DatumGetInt64(elems[i]);
+        }
+    }
+    pfree(sql.data);
+    return found;
+}
+
+/*
  * partdist.dtx_recover_prepared(timeout_ms) → int
  *
  * 参与者侧的恢复守护（§7）：扫描本节点上**超时未闭合**的 prepared 事务，
@@ -4255,7 +4386,7 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
      */
     appendStringInfo(&sql,
                      "SELECT gid FROM pg_prepared_xacts "
-                     " WHERE strpos(gid, 'shardpg_dtx_') = 1 "
+                     " WHERE (strpos(gid, 'shardpg_dtx_') = 1 OR strpos(gid, 'citus_') = 1) "
                      "   AND prepared < now() - interval '%d milliseconds' "
                      " ORDER BY prepared LIMIT 64",
                      timeout_ms);
@@ -4278,36 +4409,66 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
     {
         int64 dtxid = 0;
         int64 coord_gsid = 0;
+        int64 mygsids[64];
+        int   nmygsids = 0;
         int   verdict;
-        int64 local_oid = 0;
+        int   k;
 
-        if (!dtx_parse_gid(gids[i], &dtxid, &coord_gsid))
-            continue;
+        /*
+         * 决议的寻址依据，按优先级：
+         *   a) partdist.dtx_participant（正常路径，Citus gid 走这里）——
+         *      coord_gsid 有值 ⇒ 协调组权威；为 NULL ⇒ 决议必然未做过，
+         *      按 Citus 原生规则闭合（快路径 / 无纳管分片的事务）；
+         *   b) gid 自带的 shardpg_dtx_<dtxid>_<coord>（机制测试用的自造 gid）。
+         */
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+        (void) dtx_lookup_participant(gids[i], &dtxid, &coord_gsid,
+                                      mygsids, lengthof(mygsids), &nmygsids);
+        raft_persist_spi_end(spi_owned);
 
-        verdict = dtx_ask_coordinator(coord_gsid, dtxid);
+        /*
+         * ★ 协调组的来源有两个，**gid 里编的那个优先**（§5.4）：
+         * 登记行里 coord_gsid 为 NULL 只说明"master 没下发过"，
+         * 而 shardpg_dtx_<dtxid>_<coord> 这种 gid 本身就带着协调组。
+         * 初版写成"登记行查到了就不再看 gid"，于是自造 gid 的事务被当成
+         * 未走 2PC、按 Citus 规则去问 pg_dist_transaction（那里当然没有），
+         * 结果**该提交的事务被推定中止回滚**（raft_21 A 段抓到）。
+         * 真正的 Citus gid 解析不出协调组，coord_gsid 仍为 0，照旧走 Citus 规则。
+         */
+        if (coord_gsid <= 0)
+        {
+            int64 g_dtxid = 0;
+            int64 g_coord = 0;
+
+            if (dtx_parse_gid(gids[i], &g_dtxid, &g_coord))
+            {
+                if (dtxid == 0)
+                    dtxid = g_dtxid;
+                coord_gsid = g_coord;
+            }
+        }
+        if (dtxid == 0)
+            continue;           /* 不认识的 gid：完全不碰 */
+
+        if (coord_gsid > 0)
+            verdict = dtx_ask_coordinator(coord_gsid, dtxid);
+        else
+            verdict = dtx_ask_citus_coordinator(gids[i]);
+
         if (verdict != 1 && verdict != 2)
             continue;           /* 问不到：保持 prepared，下轮再来 */
 
         if (!raft_persist_spi_begin(&spi_owned))
             break;
 
-        /* 本分区的本地 OID（写标记记录用）；解析不到就只闭合事务 */
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "SELECT partdist.local_partition_for_shard(%lld)",
-                         (long long) coord_gsid);
-        {
-            bool isnull;
-
-            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-            {
-                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
-                                        SPI_tuptable->tupdesc, 1, &isnull);
-                if (!isnull)
-                    local_oid = DatumGetInt64(d);
-            }
-        }
-        pfree(sql.data);
+        /*
+         * 标记要补在**本节点自己写过的**分区组上，不是协调组上 ——
+         * 一个参与者通常并不承载协调组的分片。没有登记（legacy gid）时退回
+         * 协调组，保持旧行为。
+         */
+        if (nmygsids == 0 && coord_gsid > 0)
+            mygsids[nmygsids++] = coord_gsid;
 
         /*
          * ★ COMMIT/ROLLBACK PREPARED **不能经 SPI 执行**：它们不允许出现在
@@ -4348,8 +4509,28 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
             PQfinish(sc);
         }
 
-        if (local_oid > 0)
+        for (k = 0; k < nmygsids; k++)
         {
+            int64 local_oid = 0;
+            bool  isnull;
+
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.local_partition_for_shard(%lld)",
+                             (long long) mygsids[k]);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                        SPI_tuptable->tupdesc, 1, &isnull);
+
+                if (!isnull)
+                    local_oid = DatumGetInt64(d);
+            }
+            pfree(sql.data);
+
+            if (local_oid <= 0)
+                continue;       /* 本节点不承载这个分片：没有 parwal 流可补 */
+
             initStringInfo(&sql);
             appendStringInfo(&sql,
                              "SELECT partdist.partwal_append_dtx_record("
@@ -4367,4 +4548,534 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_INT32(handled);
+}
+
+/* ================================================================== */
+/* DTX-2PC master 侧驱动（DTX_2PC_DESIGN.md §3.3 / §9.3）              */
+/* ================================================================== */
+
+/*
+ * 挂在内核补丁 0004 的 pre_record_commit_hook 上：Citus 已把
+ * PREPARE TRANSACTION 发给全部参与者并收齐应答，本地 commit record 尚未写入。
+ * 这里 ereport(ERROR) 仍然能把整个事务干净地翻进 abort 路径。
+ *
+ * 三步（顺序是正确性的一部分，不能调换）：
+ *   1) 逐参与节点读 partdist.dtx_local_participant(dtxid) 合并出**真实写集**
+ *      —— 只读参与者返回空数组，天然被剔除（§8.3）；
+ *   2) 写集 ≤ 1 组 ⇒ 快路径，不做决议直接返回（§3.4）；否则算
+ *      coord_gsid = participants[dtxid % n]，并**先**把它下发到全部参与节点；
+ *   3) 到协调组现任 leader 上调 partdist.dtx_decide() —— 该决议记录在协调组
+ *      达多数派持久化即为**全局提交点**，返回 COMMIT 之后本函数才放行，
+ *      客户端随后收到的 COMMIT 成功因此是有多数派保证的。
+ *
+ * 为什么第 2 步的下发必须严格早于第 3 步：参与者崩溃重启后只能靠
+ * partdist.dtx_participant.coord_gsid 找协调组。若先决议后下发，就会出现
+ * "全局已 COMMIT、参与者却查不到协调组"的不可解状态；反过来则永远安全 ——
+ * coord_gsid 为 NULL 蕴含决议尚未做过，推定中止（回滚）是正确答案。
+ */
+
+/* Citus gid → dtxid。**镜像**实现，权威在 pg-partdist-src/src/dtx/dtx_participant.c
+ * 的 DtxidFromGid()：两个扩展之间无编译期依赖，改一处必须同步改另一处。 */
+static bool
+dtx_dtxid_from_gid(const char *gid, int64 *dtxid)
+{
+    long long group = 0, pid = 0, txn = 0, conn = 0;
+    long long d = 0, c = 0;
+
+    if (gid == NULL)
+        return false;
+
+    if (sscanf(gid, "citus_%lld_%lld_%lld_%lld", &group, &pid, &txn, &conn) == 4)
+    {
+        if (pid <= 0 || txn <= 0)
+            return false;
+        *dtxid = ((int64) (group & 0xFF) << 55) |
+                 ((int64) (pid & 0x3FFFFF) << 33) |
+                 ((int64) (txn & 0x1FFFFFFFFLL));
+        return (*dtxid > 0);
+    }
+    if (sscanf(gid, "shardpg_dtx_%lld_%lld", &d, &c) == 2 && d > 0)
+    {
+        *dtxid = (int64) d;
+        return true;
+    }
+    return false;
+}
+
+/* ---- 每 backend 的 libpq 连接缓存（每事务重连太贵） ---- */
+#define DTX_CONN_CACHE_MAX 16
+
+typedef struct DtxConnCacheEntry
+{
+    char    host[NAMEDATALEN];
+    int     port;
+    PGconn *conn;
+} DtxConnCacheEntry;
+
+static DtxConnCacheEntry dtx_conns[DTX_CONN_CACHE_MAX];
+static int               dtx_nconns = 0;
+
+static PGconn *
+dtx_get_conn(const char *host, int port)
+{
+    char conninfo[256];
+    int  i;
+    int  slot = -1;
+
+    for (i = 0; i < dtx_nconns; i++)
+        if (dtx_conns[i].port == port && strcmp(dtx_conns[i].host, host) == 0)
+        {
+            slot = i;
+            break;
+        }
+
+    if (slot >= 0)
+    {
+        if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
+            return dtx_conns[slot].conn;
+        PQreset(dtx_conns[slot].conn);
+        if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
+            return dtx_conns[slot].conn;
+        PQfinish(dtx_conns[slot].conn);
+        dtx_conns[slot].conn = NULL;
+    }
+
+    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+
+    if (slot < 0)
+    {
+        if (dtx_nconns >= DTX_CONN_CACHE_MAX)
+        {
+            /* 缓存满：牺牲第 0 槽（拓扑规模远小于 16，实际到不了这里） */
+            PQfinish(dtx_conns[0].conn);
+            slot = 0;
+        }
+        else
+            slot = dtx_nconns++;
+        strlcpy(dtx_conns[slot].host, host, NAMEDATALEN);
+        dtx_conns[slot].port = port;
+    }
+
+    dtx_conns[slot].conn = PQconnectdb(conninfo);
+    if (PQstatus(dtx_conns[slot].conn) != CONNECTION_OK)
+    {
+        char *msg = pstrdup(PQerrorMessage(dtx_conns[slot].conn));
+
+        PQfinish(dtx_conns[slot].conn);
+        dtx_conns[slot].conn = NULL;
+        if (slot == dtx_nconns - 1)
+            dtx_nconns--;
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_FAILURE),
+                 errmsg("pg_raft: DTX 驱动连不上参与节点 %s:%d", host, port),
+                 errdetail("%s", msg)));
+    }
+    return dtx_conns[slot].conn;
+}
+
+/* 把 int8[] 的文本形式 "{1,2,3}" / "{}" 解析进 out，返回元素个数 */
+static int
+dtx_parse_int8_array(const char *text, int64 *out, int max)
+{
+    const char *p = text;
+    int         n = 0;
+
+    if (p == NULL)
+        return 0;
+    while (*p != '\0' && *p != '{')
+        p++;
+    if (*p == '{')
+        p++;
+    while (*p != '\0' && *p != '}' && n < max)
+    {
+        char *end = NULL;
+        long long v;
+
+        while (*p == ',' || *p == ' ')
+            p++;
+        if (*p == '\0' || *p == '}')
+            break;
+        v = strtoll(p, &end, 10);
+        if (end == p)
+            break;
+        out[n++] = (int64) v;
+        p = end;
+    }
+    return n;
+}
+
+static int
+dtx_cmp_int64(const void *a, const void *b)
+{
+    int64 x = *(const int64 *) a;
+    int64 y = *(const int64 *) b;
+
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+/* 在远端节点上执行一条返回单值的 SQL；返回值需 pfree，NULL 表示 SQL NULL */
+static char *
+dtx_remote_scalar(const char *host, int port, const char *sql)
+{
+    PGconn   *conn = dtx_get_conn(host, port);
+    PGresult *res = PQexec(conn, sql);
+    char     *out = NULL;
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        char *msg = pstrdup(PQerrorMessage(conn));
+
+        PQclear(res);
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("pg_raft: DTX 驱动在 %s:%d 上执行失败", host, port),
+                 errdetail("%s", msg),
+                 errhint("SQL: %s", sql)));
+    }
+    if (PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
+        out = pstrdup(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    return out;
+}
+
+#define DTX_MAX_PARTICIPANT_NODES  RAFT_MAX_PEERS
+#define DTX_MAX_PARTICIPANT_GROUPS 512
+
+/*
+ * 本库是否装了 Citus 的两张目录表。必须在 SPI 已连接、快照已压好的状态下调用。
+ *
+ * 缓存策略：只缓存"有"。缓存"没有"会让同一 session 里后建的 citus 扩展
+ * 永远看不见；而"有"之后再消失只可能是 DROP EXTENSION citus，那种情况下
+ * 本节点也早就不是 Citus 协调者了。
+ */
+static bool dtx_citus_present = false;
+
+static bool
+dtx_citus_catalog_present(void)
+{
+    bool isnull;
+
+    if (dtx_citus_present)
+        return true;
+
+    if (SPI_execute("SELECT to_regclass('pg_catalog.pg_dist_transaction') IS NOT NULL "
+                    "   AND to_regclass('pg_catalog.pg_dist_node') IS NOT NULL",
+                    true, 1) != SPI_OK_SELECT || SPI_processed == 0)
+        return false;
+
+    dtx_citus_present = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                   SPI_tuptable->tupdesc, 1, &isnull))
+                        && !isnull;
+    return dtx_citus_present;
+}
+
+typedef struct DtxNodeAddr
+{
+    char host[NAMEDATALEN];
+    int  port;
+} DtxNodeAddr;
+
+static void
+dtx_master_pre_record_commit(void)
+{
+    StringInfoData  sql;
+    bool            spi_owned;
+    int64           dtxid = 0;
+    DtxNodeAddr     nodes[DTX_MAX_PARTICIPANT_NODES];
+    int             nnodes = 0;
+    int64           parts[DTX_MAX_PARTICIPANT_GROUPS];
+    int             nparts = 0;
+    int64           coord_gsid;
+    int             coord_node = 0;
+    int             i, j;
+    int             verdict = 0;
+
+    if (!pg_raft_raft_enabled || !pg_raft_dtx_2pc_enabled)
+        return;
+    /*
+     * 只有 Citus 协调节点会驱动 2PC。这条判据同时是本 hook 的**性能闸门**：
+     * worker 上的每一次本地提交都会进来，必须在做任何 SQL 之前退出。
+     */
+    if (pg_raft_coordinator_node_id <= 0 ||
+        pg_raft_node_id != pg_raft_coordinator_node_id)
+        return;
+    if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
+        return;
+
+    /* ---- 1) 本事务刚写进 pg_dist_transaction 的行 = 已 prepare 的参与节点 ---- */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+
+    /*
+     * ★ 本库不一定装了 Citus。pg_raft/pg_partdist 在
+     * shared_preload_libraries 里，因此**每个库**的每次提交都会进这个 hook ——
+     * 包括一个全新的、连 citus 扩展都还没建的库。直接引用
+     * pg_catalog.pg_dist_transaction 会在解析期就报 relation does not exist，
+     * 于是连 `CREATE EXTENSION pg_partdist` 本身都提交不了
+     * （2026-08-04：正是 raft_19 A 段的全新库冒烟抓到的 —— 常规回归全都跑在
+     * 已装 Citus 的库上，完全静默）。
+     */
+    if (!dtx_citus_catalog_present())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfoString(
+        &sql,
+        "SELECT t.gid, n.nodename, n.nodeport "
+        "  FROM pg_catalog.pg_dist_transaction t "
+        "  JOIN pg_catalog.pg_dist_node n "
+        "    ON n.groupid = t.groupid AND n.noderole = 'primary' "
+        " WHERE t.xmin = pg_catalog.pg_current_xact_id()::xid");
+
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        for (i = 0; i < (int) SPI_processed; i++)
+        {
+            char *gid = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            char *host = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            char *portstr = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+            int   port = (portstr != NULL) ? atoi(portstr) : 0;
+            bool  dup = false;
+
+            if (dtxid == 0 && !dtx_dtxid_from_gid(gid, &dtxid))
+                continue;           /* 不是我们认识的 gid 形态 */
+            if (host == NULL || port <= 0)
+                continue;
+
+            for (j = 0; j < nnodes; j++)
+                if (nodes[j].port == port && strcmp(nodes[j].host, host) == 0)
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup && nnodes < DTX_MAX_PARTICIPANT_NODES)
+            {
+                strlcpy(nodes[nnodes].host, host, NAMEDATALEN);
+                nodes[nnodes].port = port;
+                nnodes++;
+            }
+        }
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (dtxid == 0 || nnodes == 0)
+        return;                     /* 不是跨节点的 Citus 2PC 事务 */
+
+    /* ---- 2) 逐节点取真实写集（只读参与者返回空数组，自动剔除） ---- */
+    for (i = 0; i < nnodes; i++)
+    {
+        char   qry[128];
+        char  *arr;
+        int64  got[DTX_MAX_PARTICIPANT_GROUPS];
+        int    ngot;
+
+        snprintf(qry, sizeof(qry),
+                 "SELECT partdist.dtx_local_participant(%lld)", (long long) dtxid);
+        arr = dtx_remote_scalar(nodes[i].host, nodes[i].port, qry);
+        if (arr == NULL)
+            continue;
+        ngot = dtx_parse_int8_array(arr, got, DTX_MAX_PARTICIPANT_GROUPS);
+        pfree(arr);
+
+        for (j = 0; j < ngot && nparts < DTX_MAX_PARTICIPANT_GROUPS; j++)
+        {
+            int  k;
+            bool dup = false;
+
+            for (k = 0; k < nparts; k++)
+                if (parts[k] == got[j])
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup)
+                parts[nparts++] = got[j];
+        }
+    }
+
+    /*
+     * 快路径（§3.4）：写集 ≤ 1 个分区组时不做决议。
+     * 0 组 = 没写任何纳管分片（退化为接线前行为）；
+     * 1 组 = 该组自己的 quorum 已经覆盖本事务的全部数据，再走一轮决议没有
+     * 任何额外保证，只有额外延迟。
+     */
+    if (nparts <= 1)
+        return;
+
+    qsort(parts, nparts, sizeof(int64), dtx_cmp_int64);
+    coord_gsid = parts[(uint64) dtxid % (uint64) nparts];
+
+    /* ---- 3) 先下发协调组（必须严格早于决议，理由见函数头注释） ---- */
+    for (i = 0; i < nnodes; i++)
+    {
+        char  qry[160];
+        char *r;
+
+        snprintf(qry, sizeof(qry),
+                 "SELECT partdist.dtx_note_coord(%lld, %lld)",
+                 (long long) dtxid, (long long) coord_gsid);
+        r = dtx_remote_scalar(nodes[i].host, nodes[i].port, qry);
+        if (r != NULL)
+            pfree(r);
+    }
+
+    /* ---- 4) 到协调组现任 leader 上做决议 ---- */
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR,
+                (errmsg("pg_raft: DTX 决议无法建立 SPI 连接")));
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node FROM partdist.partition_map "
+                     " WHERE partition_id = %llu::oid",
+                     (unsigned long long) coord_gsid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        if (!isnull)
+            coord_node = DatumGetInt32(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (coord_node <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分布式事务 %lld 的协调组 %lld 查不到现任 leader",
+                        (long long) dtxid, (long long) coord_gsid),
+                 errdetail("partdist.partition_map 尚未追平该组的主节点登记。")));
+
+    parse_peers();
+    {
+        int   slot = -1;
+        char  qry[512];
+        char *r;
+        int   n;
+
+        for (i = 0; i < n_peers; i++)
+            if (peers[i].node_id == coord_node)
+            {
+                slot = i;
+                break;
+            }
+        if (slot < 0)
+            ereport(ERROR,
+                    (errmsg("pg_raft: 协调组 %lld 的 leader 节点 %d 不在 pg_raft.peers 里",
+                            (long long) coord_gsid, coord_node)));
+
+        n = snprintf(qry, sizeof(qry),
+                     "SELECT partdist.dtx_decide(%lld, %lld, 1, ARRAY[",
+                     (long long) coord_gsid, (long long) dtxid);
+        for (i = 0; i < nparts && n < (int) sizeof(qry) - 32; i++)
+            n += snprintf(qry + n, sizeof(qry) - n, "%s%lld",
+                          (i == 0) ? "" : ",", (long long) parts[i]);
+        snprintf(qry + n, sizeof(qry) - n, "]::bigint[])");
+
+        r = dtx_remote_scalar(peers[slot].host, peers[slot].port, qry);
+        if (r == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 节点 %d 不是协调组 %lld 的 leader，无法做决议",
+                            coord_node, (long long) coord_gsid),
+                     errhint("协调组正在选举或 partition_map 未追平；重试本事务即可。")));
+        verdict = atoi(r);
+        pfree(r);
+    }
+
+    if (verdict != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                 errmsg("pg_raft: 分布式事务 %lld 的全局决议是 ABORT", (long long) dtxid),
+                 errdetail("协调组 %lld 的日志里已有一条 ABORT 决议（多半是恢复守护"
+                           "在推定中止时抢先写入）。决议槽一次性，不可翻盘。",
+                           (long long) coord_gsid)));
+
+    elog(DEBUG1, "pg_raft: dtx %lld COMMIT（协调组 %lld，参与组 %d 个）",
+         (long long) dtxid, (long long) coord_gsid, nparts);
+}
+
+/*
+ * 参与者自治登记的落地实现（pg_partdist 经 rendezvous variable
+ * "partdist_dtx_note_participant_hook" 调用）。
+ *
+ * 必须写在**独立事务**里：调用点在 XACT_EVENT_PRE_PREPARE，本事务下一步就要
+ * 变成 prepared，写在里面就永远不会有别的会话看得见。独立事务在 PG 里只能靠
+ * libpq 自连接完成（与恢复守护跑 COMMIT PREPARED 同一手法）。
+ *
+ * synchronous_commit=off：这行丢了的后果是 master 侧把本节点算成只读参与者，
+ * 写集缺一块 —— 但那只可能发生在本节点**崩溃**之后，而崩溃会让本节点的
+ * prepared 事务连同它一起消失，master 的 PREPARE 也就失败了。不需要为它付
+ * 一次 fsync。coord_gsid 的回填（dtx_note_coord）才必须是同步提交的。
+ */
+bool
+pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
+                             const int64 *gsids, int ngsids)
+{
+    StringInfoData sql;
+    PGconn        *conn;
+    PGresult      *res;
+    bool           ok = false;
+    int            i;
+    char           selfconn[256];
+
+    if (gid == NULL)
+        return true;
+
+    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
+    conn = PQconnectdb(selfconn);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        elog(WARNING, "pg_raft: DTX 参与登记连回本节点失败: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfoString(&sql, "SET synchronous_commit=off; "
+                                 "SELECT partdist.dtx_note_participant(");
+    appendStringInfo(&sql, "%lld, ", (long long) dtxid);
+    {
+        char *q = PQescapeLiteral(conn, gid, strlen(gid));
+
+        if (q == NULL)
+        {
+            pfree(sql.data);
+            PQfinish(conn);
+            return false;
+        }
+        appendStringInfoString(&sql, q);
+        PQfreemem(q);
+    }
+    appendStringInfoString(&sql, ", ARRAY[");
+    for (i = 0; i < ngsids; i++)
+        appendStringInfo(&sql, "%s%lld", (i == 0) ? "" : ",", (long long) gsids[i]);
+    appendStringInfoString(&sql, "]::bigint[])");
+
+    res = PQexec(conn, sql.data);
+    ok = (PQresultStatus(res) == PGRES_TUPLES_OK ||
+          PQresultStatus(res) == PGRES_COMMAND_OK);
+    if (!ok)
+        elog(WARNING, "pg_raft: DTX 参与登记失败: %s", PQerrorMessage(conn));
+    PQclear(res);
+    pfree(sql.data);
+    PQfinish(conn);
+    return ok;
+}
+
+/* _PG_init 调用：装内核补丁 0004 的挂点 + 参与登记挂点 */
+void
+pg_raft_dtx_install_hooks(void)
+{
+    void **rv;
+
+    pre_record_commit_hook = dtx_master_pre_record_commit;
+
+    rv = find_rendezvous_variable("partdist_dtx_note_participant_hook");
+    *rv = (void *) pg_raft_dtx_note_participant;
 }

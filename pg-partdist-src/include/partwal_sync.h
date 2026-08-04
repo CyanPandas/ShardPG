@@ -163,6 +163,24 @@ extern void  PartWALFlush(XLogRecPtr upto_lsn);
 extern void  PartWALAbort(void);
 
 /* ------------------------------------------------------------------ */
+/* 触达分区集合（DTX_2PC_DESIGN.md §9.1）                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 本事务写过哪些分区。集合在 PartWALInsert() 时按 backend 登记，
+ * 在 PartWALFlush() 触发复制挂钩之后被清空 —— 因此 DTX 接线必须在
+ * 调 PartWALFlush() **之前**取快照（PartWALCopyTouched）。
+ *
+ * PartWALCopyTouched: 拷贝一份当前集合，返回元素个数；out 由调用方
+ *   palloc/pfree（传 NULL 只问个数）。
+ * PartWALNoteTouchedPartition: 手工登记一个分区，供"flush 之后又追加了
+ *   记录（如 DTX_PREPARE 标记）、需要再复制一轮"的路径使用。
+ */
+extern int   PartWALCopyTouched(Oid *out, int max);
+extern int   PartWALTouchedCount(void);
+extern void  PartWALNoteTouchedPartition(Oid partition_id);
+
+/* ------------------------------------------------------------------ */
 /* WAL range scan (used by DemuxCrashRecovery)                         */
 /* ------------------------------------------------------------------ */
 
