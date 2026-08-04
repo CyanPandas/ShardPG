@@ -53,6 +53,9 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.dtx_decide(BIGINT, BIGINT, INTEGER, BIGINT[]);
 DROP FUNCTION IF EXISTS partdist.dtx_status(BIGINT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.dtx_recover_prepared(INTEGER);
+DROP FUNCTION IF EXISTS partdist.dtx_ack(BIGINT, BIGINT, BIGINT[]);
+DROP FUNCTION IF EXISTS partdist.dtx_gc_dist_transaction();
+DROP FUNCTION IF EXISTS partdist.dtx_close_indoubt(OID);
 -- DTX-2PC 记录格式：follower_append 增加 p_flags、read_record 增加 OUT flags。
 --
 -- 两处坑（2026-08-03 实测，都会静默失败）：

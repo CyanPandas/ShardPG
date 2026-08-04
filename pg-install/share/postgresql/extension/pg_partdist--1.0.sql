@@ -578,7 +578,7 @@ COMMENT ON FUNCTION partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGE
 -- ------------------------------------------------------------------
 -- DTX 记录与 DATA 记录共用同一个 partition_lsn 序号空间和同一条复制通道，
 -- 靠头部 flags 里的 PARTWAL_FLAG_DTX(8) 区分；子类型放在 info 字段
--- （1=PREPARE 2=DECISION 3=COMMIT 4=ABORT）。orig_lsn 恒为 0 —— 它不是 WAL
+-- （1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET）。orig_lsn 恒为 0 —— 它不是 WAL
 -- 记录，回放侧按 flags 在分派处即被路由走，永不进 rm_redo。
 CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
     p_partition_id OID,

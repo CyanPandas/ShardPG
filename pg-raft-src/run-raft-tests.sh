@@ -1348,6 +1348,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_23: DTX-2PC 升主 in-doubt 闭合（§9.6 机制先行）+ 混合写集告警
+# 用例本体在 test/raft_23_dtx_close_indoubt.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_23 DTX in-doubt 闭合"
+
+start_all_nodes
+sleep 2
+RAFT_23_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_23_dtx_close_indoubt.sh" 2>&1) && RAFT_23_RC=0 || RAFT_23_RC=$?
+echo "$RAFT_23_OUT" | sed 's/^/    /'
+if [[ "$RAFT_23_RC" -eq 0 ]]; then
+  ok "raft_23_dtx_close_indoubt"
+else
+  bad "raft_23_dtx_close_indoubt($(echo "$RAFT_23_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

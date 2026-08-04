@@ -148,7 +148,38 @@ CREATE OR REPLACE FUNCTION dtx_recover_prepared(
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_recover_prepared';
 
 COMMENT ON FUNCTION dtx_recover_prepared(integer) IS
-    '参与者侧恢复守护：扫描本节点超时未闭合的 shardpg_dtx_* prepared 事务，向协调组问决议并 COMMIT/ROLLBACK PREPARED，同时补写 DTX_COMMIT/ABORT 标记。问不到决议时保持 prepared 不动（推定中止的权力只在协调组手里）。返回本轮处理数。';
+    '参与者侧恢复守护：扫描本节点超时未闭合的 shardpg_dtx_*/citus_* prepared 事务，向协调组（或按 Citus 规则向 master）问决议并 COMMIT/ROLLBACK PREPARED，同时补写 DTX_COMMIT/ABORT 标记。问不到决议时保持 prepared 不动。顺带做回执清扫、FORGET 重试与登记 GC。返回本轮处理数。';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 决议 GC：回执 + FORGET（DTX_2PC_DESIGN.md §9.7）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION dtx_ack(
+    p_coord_gsid bigint,
+    p_dtxid bigint,
+    p_gsids bigint[] DEFAULT NULL
+) RETURNS boolean LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_ack';
+
+COMMENT ON FUNCTION dtx_ack(bigint, bigint, bigint[]) IS
+    '参与者回执：在协调组 leader 上把 p_gsids 并进该决议的 acked。收齐（acked ⊇ participants）即追加 FORGET 记录复制到多数派，各成员 apply 时同步删除决议行。非 leader 返回 NULL；行已不存在（已 FORGET）返回 true。空数组调用 = 只做收齐检查与 FORGET 重试。';
+
+CREATE OR REPLACE FUNCTION dtx_gc_dist_transaction()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_gc_dist_transaction';
+
+COMMENT ON FUNCTION dtx_gc_dist_transaction() IS
+    'pg_dist_transaction 的 GC（Citus 2PC 恢复被关闭后由本项目接管）：仅删除"发起 backend 已死且所有节点均确认无该 gid 的 prepared 事务"的行；任一节点不可达返回 -1 且整轮不删。';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 升主 in-doubt 闭合（DTX_2PC_DESIGN.md §9.6，机制先行）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION dtx_close_indoubt(
+    p_partition_id oid
+) RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_close_indoubt';
+
+COMMENT ON FUNCTION dtx_close_indoubt(oid) IS
+    '对本节点该分区的 parwal 流做 in-doubt 闭合：找出有 DTX_PREPARE 而无闭合记录的 dtxid，按 登记协调组 → 本地决议索引 → 广播 peers → citus 前缀规则 的顺序全网求决议，找到即补写 DTX_COMMIT/ABORT 标记。找不到的保持 in-doubt（NOTICE 报数）。返回闭合数。升主序列在追平之后、对外服务之前调用。';
 
 COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
     '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';

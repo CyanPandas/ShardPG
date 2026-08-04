@@ -66,13 +66,22 @@ fail() { cleanup; echo "raft_18 FAIL: $1"; exit 1; }
 cleanup
 
 # ── 夹具：一张分布式表，取一个落在 worker1 上的分片 ──
-psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
-  "SET citus.enable_ddl_propagation=on;
-   SET citus.shard_count = $((N_WORKERS * 2));
-   SET citus.shard_replication_factor = 1;
-   CREATE TABLE ${TBL}(id int primary key, v text);
-   SELECT create_distributed_table('${TBL}', 'id');" >/dev/null 2>&1 \
-  || fail "建分布式表失败"
+# 有界重试：套件里紧挨着 raft_17（第三阶段停/启两个 worker），刚重启的节点
+# 可能还没就绪，建表打到它会失败——功能夹具且幂等，重试不弱化任何判据。
+FIX_OK=0
+for _ in 1 2 3; do
+  if psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "SET citus.enable_ddl_propagation=on;
+     SET citus.shard_count = $((N_WORKERS * 2));
+     SET citus.shard_replication_factor = 1;
+     DROP TABLE IF EXISTS ${TBL};
+     CREATE TABLE ${TBL}(id int primary key, v text);
+     SELECT create_distributed_table('${TBL}', 'id');" >/dev/null 2>&1; then
+    FIX_OK=1; break
+  fi
+  sleep 5
+done
+[[ "$FIX_OK" == "1" ]] || fail "建分布式表失败（重试 3 次）"
 
 GID=$(q "$BASE_PORT" \
   "SELECT p.shardid FROM pg_dist_placement p

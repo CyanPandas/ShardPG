@@ -215,6 +215,9 @@ PartDistDtxPrePrepareFinish(void)
      */
     gsids = (int64 *) palloc(sizeof(int64) * (ntouched > 0 ? ntouched : 1));
 
+    {
+    int n_unmanaged = 0;
+
     if (ntouched > 0)
     {
         if (SPI_connect() != SPI_OK_CONNECT)
@@ -238,10 +241,13 @@ PartDistDtxPrePrepareFinish(void)
             /*
              * 未登记进 shard_identity 的分区不是 Citus 分片（或身份表还没
              * 重建），它没有数据组、也就没有 Raft 日志可承载标记 —— 跳过，
-             * 行为退回接线前。
+             * 行为退回接线前，但要计数：混合写集有分叉窗口（§9.4 残留边界）。
              */
             if (gsid <= 0)
+            {
+                n_unmanaged++;
                 continue;
+            }
 
             (void) AppendDtxRecord(touched[i], DTX_PREPARE,
                                    dtx_pending_dtxid,
@@ -253,6 +259,22 @@ PartDistDtxPrePrepareFinish(void)
         }
         PopActiveSnapshot();
         SPI_finish();
+    }
+
+    /*
+     * 混合写集告警（DTX_2PC_DESIGN.md §9.4 残留边界）：本事务同时写了纳管
+     * 分片与非纳管的分片形名表。非纳管部分归 master 本地提交管辖、纳管部分
+     * 归协调组决议管辖 —— master 在决议 COMMIT 之后、本地 commit record
+     * 落盘之前崩溃时两套规则给出相反答案。检测有边界：只有触达集合里的
+     * 非纳管**分片形名**表可见；普通表的写入不进触达集合，测不到。
+     */
+    if (n_unmanaged > 0 && ngsids > 0)
+        ereport(WARNING,
+                (errmsg("pg_partdist: 分布式事务 %lld 混合了纳管与非纳管写入"
+                        "（%d 个非纳管分区）",
+                        (long long) dtx_pending_dtxid, n_unmanaged),
+                 errdetail("非纳管部分不受协调组决议保护；master 在决议后、"
+                           "本地提交前崩溃存在两套规则分叉的窗口。")));
     }
 
     /* 2) 再复制一轮，把 PREPARE 标记也推到多数派（失败即 ERROR，事务中止） */

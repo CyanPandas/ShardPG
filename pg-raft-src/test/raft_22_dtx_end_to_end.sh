@@ -290,15 +290,22 @@ done
 echo "raft_22 C2: 两组全部成员的 DATA/PREPARE/标记序列与 leader 一致（标记真的复制出去了）✓"
 
 # ── D. 快路径：单分区事务不产生决议 ────────────────────────────────
-NDEC_BEFORE=$(q "${PORTS[$COORD_IDX]}" "SELECT count(*) FROM partdist.dtx_decision;")
+# ★ 不能断言"决议总数不变"：B 段那笔决议会被自动回执→FORGET 回收（§9.7），
+# 总数随时间自己变。判据改为"没有出现引用这两个分片、且不是 B 段那笔的新决议"。
+new_decisions() {   # $1=port
+  q "$1" "SELECT count(*) FROM partdist.dtx_decision
+           WHERE dtxid <> ${DTXID}
+             AND (participants @> ARRAY[${GIDS[0]}]::bigint[]
+               OR participants @> ARRAY[${GIDS[1]}]::bigint[]);"
+}
 B0=$(plsn_of "${PORTS[0]}" "${GIDS[0]}"); B1=$(plsn_of "${PORTS[1]}" "${GIDS[1]}")
 psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
   "UPDATE ${TBL} SET v = 'solo' WHERE id = ${IDS[0]};" >/dev/null 2>&1 \
   || fail "D: 单分区 UPDATE 失败"
 sleep 2
-NDEC_AFTER=$(q "${PORTS[$COORD_IDX]}" "SELECT count(*) FROM partdist.dtx_decision;")
-[[ "$NDEC_BEFORE" == "$NDEC_AFTER" ]] \
-  || fail "D: 单分区事务不应产生决议（快路径），决议数 ${NDEC_BEFORE} → ${NDEC_AFTER}"
+D_NEW=$(new_decisions "${PORTS[$COORD_IDX]}")
+[[ "$D_NEW" == "0" ]] \
+  || fail "D: 单分区事务不应产生决议（快路径），出现 ${D_NEW} 条新决议"
 KD0=$(kinds_of "${PORTS[0]}" "${GIDS[0]}" "$B0"); KD1=$(kinds_of "${PORTS[1]}" "${GIDS[1]}" "$B1")
 [[ "$KD0" != *"1"* && "$KD1" != *"1"* ]] \
   || fail "D: 单分区事务不应写 DTX 标记，实际 '${KD0}' / '${KD1}'"
@@ -315,9 +322,9 @@ psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
   "UPDATE ${TBL} SET v = 'ro-elim' WHERE v = 'solo';" >/dev/null 2>&1 \
   || fail "E: 广播 UPDATE 执行失败"
 sleep 2
-E_ANY=$(q "${PORTS[$COORD_IDX]}" "SELECT count(*) FROM partdist.dtx_decision;")
-[[ "$E_ANY" == "$NDEC_AFTER" ]] \
-  || fail "E: 广播 UPDATE 实际只写了 1 个分片，只读参与者应被剔除、不产生决议，决议数 ${NDEC_AFTER} → ${E_ANY}"
+E_NEW=$(new_decisions "${PORTS[$COORD_IDX]}")
+[[ "$E_NEW" == "0" ]] \
+  || fail "E: 广播 UPDATE 实际只写了 1 个分片，只读参与者应被剔除、不产生决议，出现 ${E_NEW} 条新决议"
 RO=0; WR=0
 for p in $(seq "$BASE_PORT" $((BASE_PORT + 8))); do
   RO=$(( RO + $(q "$p" "SELECT count(*) FROM partdist.dtx_participant WHERE gsids = '{}'::bigint[];") ))

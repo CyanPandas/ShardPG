@@ -57,7 +57,7 @@ cleanup() {
   for port in "${MEMBER_PORTS[@]}"; do
     for g in $(q "$port" "SELECT gid FROM pg_prepared_xacts
                            WHERE strpos(gid,'shardpg_dtx_')=1
-                              OR gid ~ '^citus_0_[0-9]+_77700[0-9]_0\$';"); do
+                              OR gid ~ '^citus_0_[0-9]+_(77700|88800)[0-9]_0$';"); do
       q "$port" "ROLLBACK PREPARED '${g}';" >/dev/null
     done
     q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_C},${DTX_A},${DTX_F},${DTX_U},910005);" >/dev/null
@@ -69,7 +69,7 @@ cleanup() {
       q "$port" "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS ${TBL}_${GID};" >/dev/null
     fi
   done
-  q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid ~ '^citus_0_[0-9]+_77700[0-9]_0\$';" >/dev/null
+  q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid ~ '^citus_0_[0-9]+_(77700|88800)[0-9]_0$';" >/dev/null
   q "$BASE_PORT" "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${TBL};" >/dev/null
 }
 fail() { cleanup; echo "raft_21 FAIL: $1"; exit 1; }
@@ -275,6 +275,50 @@ q "$LEADER_PORT" "SELECT pg_reload_conf();" >/dev/null
   || fail "H: 45s 内 BGW 守护没有自动闭合（自动接线未生效 —— master 挂掉后 in-doubt 将永久滞留）"
 [[ "$(row_visible 1008)" == "1" ]] || fail "H: 自动闭合应按决议提交"
 echo "raft_21 H: 守护自动闭合，无需任何手工调用 ✓"
+
+# ── I. pg_dist_transaction 的 GC（§9.7）──
+# Citus 的恢复兼任这张表的 GC，被 §9.4 关掉后由本项目接管。删除条件缺一不可：
+# 发起 backend 已死 && 所有节点确认无该 gid 的 prepared 事务；任一节点不可达
+# ⇒ 整轮放弃。它是 citus 规则的真相源，删错一行 = 把等收尾的事务错判成 ABORT。
+GID_I1="citus_0_${DEAD_PID}_888001_0"    # 发起者已死、无 prepared ⇒ 应删
+GID_I2="citus_0_${LIVE_PID}_888002_0"    # 发起者活着 ⇒ 必须保留
+GID_I3="citus_0_${DEAD_PID}_888003_0"    # 有 prepared 在 ⇒ 必须保留
+q "$BASE_PORT" "INSERT INTO pg_dist_transaction (groupid, gid) VALUES
+                (0,'${GID_I1}'), (0,'${GID_I2}'), (0,'${GID_I3}');" >/dev/null
+psql_at "$LEADER_PORT" -q -c \
+  "BEGIN; INSERT INTO ${SHARD_TBL} VALUES (1009, 'i');
+   PREPARE TRANSACTION '${GID_I3}';" >/dev/null 2>&1 \
+  || fail "I: 造 prepared 事务失败"
+
+# GC 每轮最多处理 128 个候选（守护是分批周期制）；表里可能有历史积压，
+# 有界循环直到夹具行被处理到或无法推进。
+for _ in $(seq 1 6); do
+  N=$(q "$BASE_PORT" "SELECT partdist.dtx_gc_dist_transaction();")
+  [[ "$N" =~ ^[0-9]+$ ]] || fail "I: GC 返回 '${N}'（全节点在线时不应放弃）"
+  [[ "$(q "$BASE_PORT" "SELECT count(*) FROM pg_dist_transaction WHERE gid='${GID_I1}';")" == "0" ]] && break
+  [[ "$N" == "0" ]] && break
+done
+R1=$(q "$BASE_PORT" "SELECT count(*) FROM pg_dist_transaction WHERE gid='${GID_I1}';")
+R2=$(q "$BASE_PORT" "SELECT count(*) FROM pg_dist_transaction WHERE gid='${GID_I2}';")
+R3=$(q "$BASE_PORT" "SELECT count(*) FROM pg_dist_transaction WHERE gid='${GID_I3}';")
+[[ "$R1" == "0" ]] || fail "I: 发起者已死且全网无 prepared 的行应被删除"
+[[ "$R2" == "1" ]] || fail "I: 发起者还活着的行绝不能删（master 可能还没提交完）"
+[[ "$R3" == "1" ]] || fail "I: 仍有 prepared 事务的行绝不能删（那是它收尾的真相源）"
+
+# 节点不可达 ⇒ 整轮放弃（保守不删）
+GID_I4="citus_0_${DEAD_PID}_888004_0"
+q "$BASE_PORT" "INSERT INTO pg_dist_transaction (groupid, gid) VALUES (0,'${GID_I4}');" >/dev/null
+node_ctl worker8 stop -m fast
+sleep 1
+N2=$(q "$BASE_PORT" "SELECT partdist.dtx_gc_dist_transaction();")
+node_ctl worker8 -l "/work/pg-cluster-data/worker8.log" start -w -t 30
+[[ "$N2" == "-1" ]] \
+  || fail "I: 有节点不可达时 GC 必须整轮放弃（返回 -1），实际 '${N2}'"
+[[ "$(q "$BASE_PORT" "SELECT count(*) FROM pg_dist_transaction WHERE gid='${GID_I4}';")" == "1" ]] \
+  || fail "I: 节点不可达时不得删除任何行（无法确认 prepared 是否存在）"
+q "$LEADER_PORT" "ROLLBACK PREPARED '${GID_I3}';" >/dev/null
+q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid IN ('${GID_I2}','${GID_I3}','${GID_I4}');" >/dev/null
+echo "raft_21 I: dist_transaction GC——已死+全网无 prepared 才删；发起者活着/有 prepared/节点不可达都保守不删 ✓"
 
 cleanup
 echo "raft_21 PASS"

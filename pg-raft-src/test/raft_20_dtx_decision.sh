@@ -41,7 +41,7 @@ cleanup() {
     node_ctl "$d" -l "/work/pg-cluster-data/${d}.log" start -w -t 30
   done
   for port in "${MEMBER_PORTS[@]}" "$BASE_PORT"; do
-    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_OK}, ${DTX_PRESUMED});" >/dev/null
+    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_OK}, ${DTX_PRESUMED}, 900103);" >/dev/null
     if [[ -n "$GID" ]]; then
       q "$port" "SELECT partdist.pg_raft_group_drop(${GID});" >/dev/null
       q "$port" "DELETE FROM partdist.partition_map WHERE partition_id = ${GID}::oid;" >/dev/null
@@ -176,6 +176,48 @@ sleep 2
 [[ "$E2" == "2" ]] \
   || fail "E: 协调组切主后原 ABORT 决议应仍可查得 2，实际 '${E2}'"
 echo "raft_20 E: 协调组切主（${OLD_LEADER} → ${NEW_LEADER}）后两笔决议均可查，协调权随 Raft 选举自动转移 ✓"
+
+# ── F. 回执与 FORGET（§9.7 决议 GC）──
+# acked 收齐（⊇ participants）后 leader 写 FORGET 记录复制到多数派，
+# 每个成员 apply 它时**同步**删除本地决议行 —— 删除走与写入相同的复制路径。
+DTX_FGT=900103
+LEADER_PORT=""
+for _ in $(seq 1 30); do
+  LEADER_PORT=$(find_leader || true)
+  [[ -n "$LEADER_PORT" ]] && break
+  sleep 1
+done
+[[ -n "$LEADER_PORT" ]] || fail "F: 协调组没有 leader"
+FD=$(q "$LEADER_PORT" "SELECT partdist.dtx_decide(${GID}, ${DTX_FGT}, 1, ARRAY[${GID}, 777002]::bigint[]);")
+[[ "$FD" == "1" ]] || fail "F: 预置决议失败（'${FD}'）"
+
+# 部分回执：行还在，acked 记下已回执的组
+A1=$(q "$LEADER_PORT" "SELECT partdist.dtx_ack(${GID}, ${DTX_FGT}, ARRAY[${GID}]::bigint[]);")
+[[ "$A1" == "t" ]] || fail "F: 第一笔回执应被接受，实际 '${A1}'"
+ACKED=$(q "$LEADER_PORT" "SELECT acked::text FROM partdist.dtx_decision WHERE dtxid=${DTX_FGT};")
+[[ "$ACKED" == "{${GID}}" ]] \
+  || fail "F: 部分回执后 acked 应为 {${GID}}，实际 '${ACKED}'（行不应被删——777002 还没回执）"
+
+# 收齐：FORGET 复制出去，行在**全部成员**上消失
+A2=$(q "$LEADER_PORT" "SELECT partdist.dtx_ack(${GID}, ${DTX_FGT}, ARRAY[777002]::bigint[]);")
+[[ "$A2" == "t" ]] || fail "F: 第二笔回执应被接受，实际 '${A2}'"
+for port in "${MEMBER_PORTS[@]}"; do
+  ok=0
+  for _ in $(seq 1 20); do
+    [[ "$(q "$port" "SELECT count(*) FROM partdist.dtx_decision WHERE dtxid=${DTX_FGT};")" == "0" ]] \
+      && { ok=1; break; }
+    sleep 1
+  done
+  [[ $ok -eq 1 ]] \
+    || fail "F: 回执收齐后成员 ${port} 上的决议行应随 FORGET 的 apply 删除，20s 未删"
+done
+
+# 行已不存在时回执返回 true（幂等闭环），且不复活任何行
+A3=$(q "$LEADER_PORT" "SELECT partdist.dtx_ack(${GID}, ${DTX_FGT}, ARRAY[${GID}]::bigint[]);")
+[[ "$A3" == "t" ]] || fail "F: 已 FORGET 的决议再回执应返回 true，实际 '${A3}'"
+[[ "$(q "$LEADER_PORT" "SELECT count(*) FROM partdist.dtx_decision WHERE dtxid=${DTX_FGT};")" == "0" ]] \
+  || fail "F: 迟到回执不得复活决议行"
+echo "raft_20 F: 回执部分收齐不删、收齐即 FORGET、全体成员同步回收、迟到回执幂等 ✓"
 
 cleanup
 echo "raft_20 PASS"

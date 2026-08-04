@@ -10,6 +10,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "utils/guc.h"
 #include "utils/wait_event.h"
 
 /*
@@ -98,6 +99,14 @@ pg_raft_topology_monitor_main(Datum main_arg)
 
     (void) main_arg;
 
+    /*
+     * ★ SIGHUP 必须显式接（2026-08-04 审查修正）：BGWorker 默认不处理它，
+     * 没有这两行时所有 pg_raft.* 的 SIGHUP 级 GUC（raft_enabled、心跳/选举
+     * 超时、dtx 守护参数……）对本进程 `pg_reload_conf()` 都**静默无效**，
+     * 只有重启才生效——raft_21 H 在套件负载下超时才把这个缺口暴露出来
+     * （守护一直按旧的 dtx_recover_timeout_ms 算年龄）。
+     */
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 
@@ -117,6 +126,12 @@ pg_raft_topology_monitor_main(Datum main_arg)
         ResetLatch(MyLatch);
 
         CHECK_FOR_INTERRUPTS();
+
+        if (ConfigReloadPending)
+        {
+            ConfigReloadPending = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
 
         if (pg_raft_raft_enabled)
         {

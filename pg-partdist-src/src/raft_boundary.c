@@ -508,7 +508,7 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("partwal_append_dtx_record: 非法的记录子类型 %d", kind),
-				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT。")));
+				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET。")));
 
 	if (kind == DTX_DECISION &&
 		verdict != (int32) DTX_VERDICT_COMMIT && verdict != (int32) DTX_VERDICT_ABORT)

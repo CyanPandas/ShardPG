@@ -29,7 +29,16 @@ typedef enum DtxRecordKind
     DTX_PREPARE  = 1,   /* 参与组：本事务在本组已 prepared          */
     DTX_DECISION = 2,   /* 协调组：全局决议（verdict 见下）         */
     DTX_COMMIT   = 3,   /* 参与组：提交标记                         */
-    DTX_ABORT    = 4    /* 参与组：中止标记                         */
+    DTX_ABORT    = 4,   /* 参与组：中止标记                         */
+
+    /*
+     * 协调组：遗忘记录（presumed abort 的标准收尾，§9.7）。
+     * 全部参与组都已回执（acked ⊇ participants）后由协调组 leader 追加并
+     * 复制到多数派；每个成员 apply 它时把该 dtxid 的决议行从本地
+     * partdist.dtx_decision 删除。此后不会再有人来问这笔决议——每个写过的
+     * 参与者都已闭合并留下标记。载荷只有 dtxid/coord_gsid，participants 空。
+     */
+    DTX_FORGET   = 5
 } DtxRecordKind;
 
 #define DTX_VERDICT_COMMIT  UINT32_C(1)
@@ -59,7 +68,7 @@ typedef struct DtxRecordPayload
 static inline bool
 DtxRecordKindIsValid(int kind)
 {
-    return kind >= DTX_PREPARE && kind <= DTX_ABORT;
+    return kind >= DTX_PREPARE && kind <= DTX_FORGET;
 }
 
 /*
