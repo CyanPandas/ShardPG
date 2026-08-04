@@ -52,10 +52,49 @@ pg_raft_self_trigger_probe(void)
     PQfinish(conn);
 }
 
+/*
+ * DTX-2PC 参与者恢复守护的自动接线（DTX_2PC_DESIGN.md §7）。
+ *
+ * 与 self-probe 同一手法：BGW 内不做 SPI，经 libpq 连回本节点，让
+ * partdist.dtx_recover_prepared() 作为**顶层 SQL** 执行 —— 它内部还要再开
+ * libpq 自连接跑 COMMIT/ROLLBACK PREPARED（不允许出现在事务块里），
+ * 天然要求顶层语境。
+ *
+ * 每个节点都跑：恢复是参与者本地的事，与本节点是否 group0 leader 无关；
+ * 没有 prepared 事务时守护空转一条 SELECT，成本可忽略。
+ * 这是 §7 设计里"master 挂了之后由守护兜底"的兜底方——没有它，master 崩溃后
+ * 参与者的 in-doubt 事务（连同行锁）会一直挂到有人手工调 SQL 为止。
+ */
+static void
+pg_raft_self_trigger_dtx_recover(void)
+{
+    char      conninfo[256];
+    char      qry[96];
+    PGconn   *conn;
+    PGresult *res;
+
+    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        elog(DEBUG1, "pg_raft: dtx 恢复自触发连接失败: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return;
+    }
+    snprintf(qry, sizeof(qry), "SELECT partdist.dtx_recover_prepared(%d)",
+             pg_raft_dtx_recover_timeout_ms);
+    res = PQexec(conn, qry);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        elog(DEBUG1, "pg_raft: dtx 恢复自触发执行失败: %s", PQerrorMessage(conn));
+    PQclear(res);
+    PQfinish(conn);
+}
+
 void
 pg_raft_topology_monitor_main(Datum main_arg)
 {
     TimestampTz last_probe = 0;
+    TimestampTz last_dtx_recover = 0;
 
     (void) main_arg;
 
@@ -106,6 +145,20 @@ pg_raft_topology_monitor_main(Datum main_arg)
             {
                 pg_raft_self_trigger_probe();
                 last_probe = now;
+            }
+        }
+
+        /* DTX-2PC 恢复守护：按 dtx_recover_interval_ms 节流，每个节点都跑 */
+        if (pg_raft_raft_enabled && pg_raft_dtx_2pc_enabled &&
+            pg_raft_dtx_recover_interval_ms > 0)
+        {
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_dtx_recover == 0 ||
+                now - last_dtx_recover >= pg_raft_dtx_recover_interval_ms * 1000L)
+            {
+                pg_raft_self_trigger_dtx_recover();
+                last_dtx_recover = now;
             }
         }
     }

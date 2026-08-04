@@ -267,6 +267,28 @@ for i in 0 1; do
 done
 echo "raft_22 C: 三阶段记录序列 参与组='${K_PART}' 协调组='${K_COORD}'，PREPARE 携带本地 xid ✓"
 
+# C2. 标记必须真的复制出去：两组的**每个成员**最终与 leader 的 kind 序列一致。
+# 此前只查 leader 侧流——"PREPARE/COMMIT 标记是否真的到了 follower"在端到端
+# 层面没人验（raft_19 D 验的是手工 append 路径，不是 prepare 接线路径）。
+# 有界重试：标记走三轮复制各自凑多数派，个别 follower 短暂落后靠心跳补齐（§9.7.1）。
+for i in 0 1; do
+  IFS=',' read -r cm1 cm2 cm3 <<< "${MEMBERS[$i]}"
+  BASE_I=$([[ $i -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
+  K_LEADER=$(kinds_of "${PORTS[$i]}" "${GIDS[$i]}" "$BASE_I")
+  for n in $cm1 $cm2 $cm3; do
+    p=$(( BASE_PORT + n - 1 ))
+    [[ "$p" == "${PORTS[$i]}" ]] && continue
+    ok=0
+    for _ in $(seq 1 30); do
+      [[ "$(kinds_of "$p" "${GIDS[$i]}" "$BASE_I")" == "$K_LEADER" ]] && { ok=1; break; }
+      sleep 1
+    done
+    [[ $ok -eq 1 ]] \
+      || fail "C2: 组 ${GIDS[$i]} 成员 ${p} 的记录序列 30s 未追平 leader（'$(kinds_of "$p" "${GIDS[$i]}" "$BASE_I")' vs '${K_LEADER}'）"
+  done
+done
+echo "raft_22 C2: 两组全部成员的 DATA/PREPARE/标记序列与 leader 一致（标记真的复制出去了）✓"
+
 # ── D. 快路径：单分区事务不产生决议 ────────────────────────────────
 NDEC_BEFORE=$(q "${PORTS[$COORD_IDX]}" "SELECT count(*) FROM partdist.dtx_decision;")
 B0=$(plsn_of "${PORTS[0]}" "${GIDS[0]}"); B1=$(plsn_of "${PORTS[1]}" "${GIDS[1]}")
@@ -316,22 +338,32 @@ echo "raft_22 E: 只读参与者不进写集但仍被登记（${RO} 条空写集
 # 初版就是这么写的，于是这一段在"协调组来得及重选"时必然误报
 # （2026-08-04 全量回归里实测到一次）。
 #
-# 停两个成员后 1/3 永远凑不齐多数派：决议做不出来（无论卡在协调组自己的
-# prepare 还是卡在 dtx_decide），事务都必须中止，**绝不允许出现部分提交**。
+# ★ 第二个构造坑（2026-08-04 审查改正）：停哪两个成员同样有讲究。
+# member_ports 的头一个是协调组自己的 primary —— 它同时是数据分片的主节点，
+# 停它会让 INSERT 在**路由/连接**阶段就失败，测的是"主挂了写不进"这个与
+# 2PC 毫无关系的性质（接线前也这样）。必须停两个**非主**成员：两个数据主
+# 都活着、远程 INSERT 都成功，失败只可能发生在 2PC 路径上 —— 协调组自身
+# 分片的 prepare 复制凑不齐多数派（1/3），事务必须中止、不允许部分提交。
+# 下面还断言失败原因文本里有"多数派"，钉死失败点。
+#
+# （"prepare 全成、只饿死 decide"无法从外部确定性构造：prepare 与 decide
+# 用同一个 quorum，都在同一条 COMMIT 语句内完成。decide 自身的多数派语义
+# 由 raft_20 B 在机制层验收——decide 返回即记录已在协调组全部成员上。）
 COORD_MEMBERS=$(member_ports "${MEMBERS[$COORD_IDX]}")
+COORD_PRIMARY_PORT=${PORTS[$COORD_IDX]}
 STOPPED=()
 for p in $COORD_MEMBERS; do
-  [[ ${#STOPPED[@]} -ge 2 ]] && break
+  [[ "$p" == "$COORD_PRIMARY_PORT" ]] && continue   # 数据主必须活着，见上
   d="worker$(( p - BASE_PORT ))"
   DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/${d}" stop -m fast -w -t 30 >/dev/null 2>&1
   STOPPED+=("$d")
 done
-[[ ${#STOPPED[@]} -eq 2 ]] || fail "F: 没能停掉协调组的两个成员"
+[[ ${#STOPPED[@]} -eq 2 ]] || fail "F: 没能停掉协调组的两个非主成员"
 sleep 3
 
 F_COMMITTED=0
-psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
-  "INSERT INTO ${TBL} VALUES (${ALT[0]},'dtx-abort'),(${ALT[1]},'dtx-abort');" >/dev/null 2>&1 \
+F_ERR=$(psql_at "$BASE_PORT" -v ON_ERROR_STOP=1 -q -c \
+  "INSERT INTO ${TBL} VALUES (${ALT[0]},'dtx-abort'),(${ALT[1]},'dtx-abort');" 2>&1) \
   && F_COMMITTED=1
 
 for d in "${STOPPED[@]}"; do
@@ -342,6 +374,8 @@ sleep 3
 
 [[ "$F_COMMITTED" == "0" ]] \
   || fail "F: 协调组失多数派时跨分区事务竟然提交成功了（决议没被要求，等于没走 2PC）"
+echo "$F_ERR" | grep -q "多数派" \
+  || fail "F: 失败原因应是复制未达多数派（prepare 被拒），实际：$(echo "$F_ERR" | grep -m1 ERROR | head -c 200)"
 
 # 参与者上残留的 prepared 事务由恢复守护收尾，这里只断言"数据没变可见"
 ROWS_AFTER=$(q "$BASE_PORT" "SELECT count(*) FROM ${TBL} WHERE v = 'dtx-abort';")

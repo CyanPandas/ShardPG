@@ -1089,6 +1089,20 @@ _PG_init(void)
                              &pg_raft_dtx_2pc_enabled, true,
                              PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomIntVariable("pg_raft.dtx_recover_interval_ms",
+                            "DTX-2PC 参与者恢复守护的自动运行间隔（0=关闭自动运行）。",
+                            "每个节点的 TopologyMonitor 按该间隔经 libpq 自连接调"
+                            " partdist.dtx_recover_prepared()，收尾超时未闭合的 in-doubt 事务。",
+                            &pg_raft_dtx_recover_interval_ms, 10000, 0, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.dtx_recover_timeout_ms",
+                            "prepared 事务超过该年龄才会被恢复守护处理。",
+                            "只影响\"多久开始问\"，不影响正确性；设保守以免与正常路径的"
+                            "阶段 3 抢答（DTX_2PC_DESIGN.md §7）。",
+                            &pg_raft_dtx_recover_timeout_ms, 30000, 1000, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     /*
      * DTX-2PC 接线（DTX_2PC_DESIGN.md §9.3）：
      *   pre_record_commit_hook   —— 内核补丁 0004 开的挂点，master 侧做决议；

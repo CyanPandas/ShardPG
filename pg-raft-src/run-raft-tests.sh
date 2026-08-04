@@ -246,12 +246,23 @@ else
 fi
 
 # raft_04 需先停 worker2(node 3);4 节点停 1 个仍有多数派 3/4
+# 有界重试（同 raft_15 先例，2026-08-04）：这是功能接线测试且 SQL 幂等（开头
+# 重置 node_map/partition_map），propose 单发撞上 2 核 9 节点的负载抖动会
+# 偶发 "raft propose failed"（与 raft_09 早前一次同类的环境瞬态，非时序判据）。
 node_stop 5434
 sleep 2
-RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
-if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
-   $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
-     -f "${RAFT_TEST_DIR}/raft_04_topology_monitor.sql" &>/dev/null; then
+RAFT_04_OK=0
+for RAFT_04_TRY in 1 2 3; do
+  RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+  if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
+     $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -f "${RAFT_TEST_DIR}/raft_04_topology_monitor.sql" &>/dev/null; then
+    RAFT_04_OK=1
+    break
+  fi
+  sleep 5
+done
+if [[ "$RAFT_04_OK" == "1" ]]; then
   ok "raft_04_topology_monitor.sql"
 else
   bad "raft_04_topology_monitor.sql"

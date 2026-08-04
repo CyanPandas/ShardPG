@@ -195,6 +195,8 @@ typedef struct RaftHardStateFile
 
 bool  pg_raft_raft_enabled = false;
 bool  pg_raft_dtx_2pc_enabled = true;
+int   pg_raft_dtx_recover_interval_ms = 10000;
+int   pg_raft_dtx_recover_timeout_ms  = 30000;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
@@ -244,6 +246,7 @@ static int64 group_local_partition(RaftGroupCtx *ctx);
 static bool data_shipping_allowed = false;
 
 static bool raft_persist_spi_begin(bool *spi_owned);
+static bool dtx_dtxid_from_gid(const char *gid, int64 *dtxid);
 static void raft_persist_spi_end(bool spi_owned);
 static int64 entry_partition_lsn(const char *payload);
 static int entry_record_flags(const char *payload);
@@ -4261,6 +4264,50 @@ dtx_ask_citus_coordinator(const char *gid)
         return 0;
     }
 
+    /*
+     * ★ initiator 存活栅栏（2026-08-04 审查补上）。
+     *
+     * pg_dist_transaction 的行在 master **本地提交之前不可见**。若 master 只是
+     * 慢（发起 backend 还活着、尚未走到本地提交），凭"行不可见"就推定中止，
+     * 会把一笔 master 随后会成功提交的事务在参与者上回滚 —— 分叉提交。
+     * Citus 自己的恢复靠共享内存里的活跃分布式事务号拦这个窗口；我们按 §9.4
+     * 把它关掉了，就必须自己补等价物：gid 里恰好编着发起 backend 的 pid
+     * （citus_<group>_<pid>_<txn>_<conn>），它还在 master 的 pg_stat_activity
+     * 里就先不动，下轮再看。pid 复用只会造成多等一轮，是保守方向。
+     *
+     * ★ 顺序敏感：必须**先**查 pid、**后**查行。pid 已消失意味着
+     * "若它曾提交，提交必先于退出"，随后的行查询必然看得见该提交；
+     * 反过来先查行再查 pid，就存在"查行时未提交、查 pid 前刚提交并退出"
+     * 的窗口 —— 行不可见 + pid 不在 ⇒ 误判 ABORT，丢一笔已提交事务。
+     */
+    {
+        long long g_group = 0, g_pid = 0, g_txn = 0, g_conn = 0;
+
+        if (sscanf(gid, "citus_%lld_%lld_%lld_%lld",
+                   &g_group, &g_pid, &g_txn, &g_conn) == 4 && g_pid > 0)
+        {
+            char alive_qry[128];
+            bool alive = false;
+
+            snprintf(alive_qry, sizeof(alive_qry),
+                     "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld",
+                     g_pid);
+            res = PQexec(conn, alive_qry);
+            if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+                !PQgetisnull(res, 0, 0))
+                alive = (atoi(PQgetvalue(res, 0, 0)) > 0);
+            else
+                alive = true;   /* 查不动就当活着：保守方向，下轮再来 */
+            PQclear(res);
+
+            if (alive)
+            {
+                PQfinish(conn);
+                return 0;
+            }
+        }
+    }
+
     quoted = PQescapeLiteral(conn, gid, strlen(gid));
     if (quoted == NULL)
     {
@@ -4448,7 +4495,18 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
                 coord_gsid = g_coord;
             }
         }
-        if (dtxid == 0)
+        /*
+         * ★ 登记缺失的 citus gid 也必须能闭合（2026-08-04 审查补上）。
+         * 走到这里的 gid 只可能是 citus_% / shardpg_dtx_%（扫描已过滤）。
+         * citus gid 查无登记的来源：该 prepared 事务产生时接线是关的
+         * （dtx_2pc_enabled=off），或历史版本的异步登记随崩溃丢失。
+         * 原实现在这里直接 continue —— 这类事务从此**没有任何人**收尾
+         * （Citus 自己的恢复已被 §9.4 关掉），prepared 事务连同行锁永久滞留。
+         * 处置：从 citus gid 解析出 dtxid（只为日志可读；verdict 本身按 gid
+         * 查 pg_dist_transaction，不需要 dtxid），按 Citus 规则闭合；
+         * 无登记 ⇒ 无 gsids ⇒ 不补标记。
+         */
+        if (dtxid == 0 && !dtx_dtxid_from_gid(gids[i], &dtxid))
             continue;           /* 不认识的 gid：完全不碰 */
 
         if (coord_gsid > 0)
@@ -4545,6 +4603,19 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
 
         elog(LOG, "pg_raft: dtx 恢复：gid=%s 决议=%s，已闭合",
              gids[i], (verdict == 1) ? "COMMIT" : "ABORT");
+    }
+
+    /*
+     * 顺手做参与登记的 GC（§9.7）：dtx_gc_participant 此前没有任何自动调用方
+     * ——prepare 失败留下的孤儿行、已闭合事务的行会无限累积（2026-08-04 审查
+     * 发现，与"恢复守护无人调用"同一类缺口）。它只删"已无对应 prepared 事务
+     * 且超龄（默认 1h）"的行，有 prepared 在就绝不删（那是恢复寻址的唯一线索），
+     * 安全幂等；失败就等下轮。
+     */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        (void) SPI_execute("SELECT partdist.dtx_gc_participant()", false, 1);
+        raft_persist_spi_end(spi_owned);
     }
 
     PG_RETURN_INT32(handled);
@@ -5008,10 +5079,16 @@ dtx_master_pre_record_commit(void)
  * 变成 prepared，写在里面就永远不会有别的会话看得见。独立事务在 PG 里只能靠
  * libpq 自连接完成（与恢复守护跑 COMMIT PREPARED 同一手法）。
  *
- * synchronous_commit=off：这行丢了的后果是 master 侧把本节点算成只读参与者，
- * 写集缺一块 —— 但那只可能发生在本节点**崩溃**之后，而崩溃会让本节点的
- * prepared 事务连同它一起消失，master 的 PREPARE 也就失败了。不需要为它付
- * 一次 fsync。coord_gsid 的回填（dtx_note_coord）才必须是同步提交的。
+ * ★ 登记必须**同步提交**（2026-08-04 审查改正）。初版用了
+ * synchronous_commit=off，理由是"崩溃会让 prepared 事务连同登记一起消失"——
+ * 这个理由**不成立**：登记发生在 [B]（PREPARE TRANSACTION 的 WAL fsync）
+ * **之前**，节点在 [B] 之后崩溃时 prepared 事务是持久的，而异步提交的登记行
+ * 可能没落盘。后果有两层：a) master 收齐 ack 后来读写集，本节点答空 ⇒
+ * 写集缺一块，协调组选取与 participants[] 都按错的集合算；b) 本节点重启后
+ * 这笔 prepared 事务查无登记 ⇒ 拿不到 coord_gsid，只能退回 Citus 规则，
+ * 而它的数据其实归协调组决议管辖。同步提交的持久序恰好压住 [B]：
+ * 登记落盘 < [B] < ack ⇒ "prepared 存在 ⇒ 登记必在"。一次小事务的 fsync
+ * 换写集完整性，值得。
  */
 bool
 pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
@@ -5037,8 +5114,7 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
     }
 
     initStringInfo(&sql);
-    appendStringInfoString(&sql, "SET synchronous_commit=off; "
-                                 "SELECT partdist.dtx_note_participant(");
+    appendStringInfoString(&sql, "SELECT partdist.dtx_note_participant(");
     appendStringInfo(&sql, "%lld, ", (long long) dtxid);
     {
         char *q = PQescapeLiteral(conn, gid, strlen(gid));

@@ -22,6 +22,13 @@
 #   C. 超时未到的 prepared 事务**不被动**（守护只处理超时的，避免与正常路径抢答）。
 #   D. 协调组不可达时**保持 prepared 不动**——绝不擅自决定，
 #      推定中止的权力只在协调组手里。
+#   E. 登记缺失的 citus gid（接线关闭期产生等）⇒ 按 Citus 规则闭合，
+#      不允许永久滞留（Citus 自己的恢复已被 §9.4 关掉，没有别人收尾）。
+#   F. Citus 规则的提交侧：master 的 pg_dist_transaction 里有该 gid ⇒ 提交。
+#   G. initiator 存活栅栏：发起 backend 还活着 ⇒ 绝不推定中止
+#      （防"慢 master"被误回滚后 master 又本地提交 ⇒ 分叉）。
+#   H. 自动接线：TopologyMonitor 守护按 dtx_recover_interval_ms 自行闭合，
+#      无需任何手工 SQL —— master 崩溃后 in-doubt 的兜底方。
 set -uo pipefail
 
 CONTAINER="${CONTAINER:-pg-citus-raft-container}"
@@ -48,16 +55,21 @@ cleanup() {
   done
   sleep 1
   for port in "${MEMBER_PORTS[@]}"; do
-    for g in $(q "$port" "SELECT gid FROM pg_prepared_xacts WHERE strpos(gid,'shardpg_dtx_')=1;"); do
+    for g in $(q "$port" "SELECT gid FROM pg_prepared_xacts
+                           WHERE strpos(gid,'shardpg_dtx_')=1
+                              OR gid ~ '^citus_0_[0-9]+_77700[0-9]_0\$';"); do
       q "$port" "ROLLBACK PREPARED '${g}';" >/dev/null
     done
-    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_C},${DTX_A},${DTX_F},${DTX_U});" >/dev/null
+    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_C},${DTX_A},${DTX_F},${DTX_U},910005);" >/dev/null
+    q "$port" "ALTER SYSTEM RESET pg_raft.dtx_recover_timeout_ms;" >/dev/null
+    q "$port" "SELECT pg_reload_conf();" >/dev/null
     if [[ -n "$GID" ]]; then
       q "$port" "SELECT partdist.pg_raft_group_drop(${GID});" >/dev/null
       q "$port" "DELETE FROM partdist.partition_map WHERE partition_id = ${GID}::oid;" >/dev/null
       q "$port" "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS ${TBL}_${GID};" >/dev/null
     fi
   done
+  q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid ~ '^citus_0_[0-9]+_77700[0-9]_0\$';" >/dev/null
   q "$BASE_PORT" "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${TBL};" >/dev/null
 }
 fail() { cleanup; echo "raft_21 FAIL: $1"; exit 1; }
@@ -181,6 +193,88 @@ q "$LEADER_PORT" "SELECT partdist.dtx_recover_prepared(0);" >/dev/null
 [[ -z "$(q "$LEADER_PORT" "SELECT verdict FROM partdist.dtx_decision WHERE dtxid=${DTX_U};")" ]] \
   || fail "D: 协调组不可达时不该产生决议"
 echo "raft_21 D: 协调组不可达 ⇒ 保持 prepared 不动，推定中止的权力只在协调组手里 ✓"
+
+# ── E. 登记缺失的 citus gid：发起者已死、master 无提交记录 ⇒ 按 Citus 规则回滚 ──
+# 覆盖"prepared 事务产生时接线是关的（dtx_2pc_enabled=off）"等无登记形态。
+# 修复前这类 gid 在恢复循环里被 continue 跳过 —— Citus 自己的恢复已被 §9.4
+# 关掉，从此**没有任何人**收尾，prepared 事务连同行锁永久滞留。
+DEAD_PID=$(q "$BASE_PORT" "SELECT coalesce(max(pid),1)+100000 FROM pg_stat_activity;")
+GID_E="citus_0_${DEAD_PID}_777001_0"
+psql_at "$LEADER_PORT" -q -c \
+  "BEGIN; INSERT INTO ${SHARD_TBL} VALUES (1005, 'e');
+   PREPARE TRANSACTION '${GID_E}';" >/dev/null 2>&1 \
+  || fail "E: 造 citus-gid prepared 事务失败"
+# ★ 手工 PREPARE 也会被参与者接线自动登记（分片表触达非空）——夹具必须显式
+# 删掉登记行，"登记缺失"的前提才真的成立。没有这一步，本段在修复前的构建上
+# 也能通过（走的是"有登记、coord 为 NULL"的常规 Citus 规则路径），测不到
+# "无登记 ⇒ continue ⇒ 永久滞留"那个缺陷（2026-08-04 真对照实验抓出）。
+q "$LEADER_PORT" "DELETE FROM partdist.dtx_participant WHERE gid='${GID_E}';" >/dev/null
+q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid='${GID_E}';" >/dev/null
+q "$LEADER_PORT" "SELECT partdist.dtx_recover_prepared(0);" >/dev/null
+[[ "$(q "$LEADER_PORT" "SELECT count(*) FROM pg_prepared_xacts WHERE gid='${GID_E}';")" == "0" ]] \
+  || fail "E: 登记缺失的 citus prepared 事务未被闭合（修复前的永久滞留形态）"
+[[ "$(row_visible 1005)" == "0" ]] \
+  || fail "E: master 无提交记录，应按 Citus 规则回滚"
+echo "raft_21 E: 登记缺失的 citus gid ⇒ 按 Citus 规则推定中止，不再永久滞留 ✓"
+
+# ── F. Citus 规则的提交侧：master 的 pg_dist_transaction 里有该 gid ⇒ 提交 ──
+GID_F="citus_0_${DEAD_PID}_777002_0"
+psql_at "$LEADER_PORT" -q -c \
+  "BEGIN; INSERT INTO ${SHARD_TBL} VALUES (1006, 'f');
+   PREPARE TRANSACTION '${GID_F}';" >/dev/null 2>&1 \
+  || fail "F: 造 prepared 事务失败"
+q "$BASE_PORT" "INSERT INTO pg_dist_transaction (groupid, gid) VALUES (0, '${GID_F}');" >/dev/null
+q "$LEADER_PORT" "SELECT partdist.dtx_recover_prepared(0);" >/dev/null
+[[ "$(q "$LEADER_PORT" "SELECT count(*) FROM pg_prepared_xacts WHERE gid='${GID_F}';")" == "0" ]] \
+  || fail "F: 未闭合"
+[[ "$(row_visible 1006)" == "1" ]] \
+  || fail "F: master 已提交（pg_dist_transaction 有行），参与者应提交"
+q "$BASE_PORT" "DELETE FROM pg_dist_transaction WHERE gid='${GID_F}';" >/dev/null
+echo "raft_21 F: master 有提交记录 ⇒ 参与者提交、数据可见 ✓"
+
+# ── G. initiator 存活栅栏：发起 backend 还活着 ⇒ 绝不推定中止 ──
+# pg_dist_transaction 的行在 master 本地提交前不可见；master 只是**慢**时，
+# 凭"行不可见"回滚参与者 = 与 master 随后的本地提交分叉。Citus 自己的恢复靠
+# 共享内存里的活跃分布式事务号拦这个窗口；我们关了它就得自己拦（用 gid 里编的
+# 发起者 pid 查 master 的 pg_stat_activity）。用 master 的 checkpointer pid
+# 当"永远活着的发起者"——确定性、无竞态。
+LIVE_PID=$(q "$BASE_PORT" "SELECT pid FROM pg_stat_activity WHERE backend_type='checkpointer' LIMIT 1;")
+[[ -n "$LIVE_PID" ]] || fail "G: 取不到 master 的 checkpointer pid"
+GID_G="citus_0_${LIVE_PID}_777003_0"
+psql_at "$LEADER_PORT" -q -c \
+  "BEGIN; INSERT INTO ${SHARD_TBL} VALUES (1007, 'g');
+   PREPARE TRANSACTION '${GID_G}';" >/dev/null 2>&1 \
+  || fail "G: 造 prepared 事务失败"
+q "$LEADER_PORT" "SELECT partdist.dtx_recover_prepared(0);" >/dev/null
+[[ "$(q "$LEADER_PORT" "SELECT count(*) FROM pg_prepared_xacts WHERE gid='${GID_G}';")" == "1" ]] \
+  || fail "G: 发起 backend 还活着（pid=${LIVE_PID}），恢复守护不得动它 —— 慢 master 会被误推定中止"
+q "$LEADER_PORT" "ROLLBACK PREPARED '${GID_G}';" >/dev/null
+echo "raft_21 G: 发起者存活 ⇒ 保持 prepared 不动（防慢 master 分叉提交）✓"
+
+# ── H. 自动接线：不手工调用，TopologyMonitor 的守护自行闭合 ──
+# 恢复 partition_map（D 把它指向了不存在的节点 97）
+for port in "${MEMBER_PORTS[@]}"; do
+  q "$port" "UPDATE partdist.partition_map SET primary_node=${LEADER_NODE}
+              WHERE partition_id=${GID}::oid;" >/dev/null
+done
+DTX_H=910005
+q "$LEADER_PORT" "ALTER SYSTEM SET pg_raft.dtx_recover_timeout_ms = 1000;" >/dev/null
+q "$LEADER_PORT" "SELECT pg_reload_conf();" >/dev/null
+make_prepared "$DTX_H" 1008 || fail "H: 造 prepared 事务失败"
+DEC=$(q "$LEADER_PORT" "SELECT partdist.dtx_decide(${GID}, ${DTX_H}, 1, ARRAY[${GID}]::bigint[]);")
+[[ "$DEC" == "1" ]] || fail "H: 预置 COMMIT 决议失败（返回 '${DEC}'）"
+H_OK=0
+for _ in $(seq 1 45); do
+  [[ "$(q "$LEADER_PORT" "SELECT count(*) FROM pg_prepared_xacts WHERE gid='shardpg_dtx_${DTX_H}_${GID}';")" == "0" ]] \
+    && { H_OK=1; break; }
+  sleep 1
+done
+q "$LEADER_PORT" "ALTER SYSTEM RESET pg_raft.dtx_recover_timeout_ms;" >/dev/null
+q "$LEADER_PORT" "SELECT pg_reload_conf();" >/dev/null
+[[ "$H_OK" == "1" ]] \
+  || fail "H: 45s 内 BGW 守护没有自动闭合（自动接线未生效 —— master 挂掉后 in-doubt 将永久滞留）"
+[[ "$(row_visible 1008)" == "1" ]] || fail "H: 自动闭合应按决议提交"
+echo "raft_21 H: 守护自动闭合，无需任何手工调用 ✓"
 
 cleanup
 echo "raft_21 PASS"

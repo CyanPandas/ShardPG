@@ -73,6 +73,8 @@ extern void pg_raft_partwal_replicate(Oid partition_id);
 
 /* DTX-2PC（DTX_2PC_DESIGN.md §9.3）：master 侧驱动 + 参与者自治登记 */
 extern bool pg_raft_dtx_2pc_enabled;
+extern int  pg_raft_dtx_recover_interval_ms;
+extern int  pg_raft_dtx_recover_timeout_ms;
 extern void pg_raft_dtx_install_hooks(void);
 extern bool pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
                                          const int64 *gsids, int ngsids);
