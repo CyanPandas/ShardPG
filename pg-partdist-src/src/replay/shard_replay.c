@@ -53,30 +53,113 @@
 /* ================================================================== */
 
 bool
+ShardReplayReadLocMap(Oid shard_oid, ReplayLocMapFile *lm, const char **reason)
+{
+    char    path[MAXPGPATH];
+    int     fd;
+    ssize_t nb;
+
+    if (reason != NULL)
+        *reason = NULL;
+
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, shard_oid, REPLAY_LOCMAP_FILENAME);
+
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+    {
+        if (reason != NULL)
+            *reason = "locmap 文件不存在（未调用 replay_set_locmap）";
+        return false;
+    }
+
+    nb = read(fd, lm, sizeof(*lm));
+    CloseTransientFile(fd);
+
+    /*
+     * 长度先判：v1 的 locmap 是 780 字节、v2 是 912，短读本身就是版本判据。
+     * 长度对不上时连 magic 都不该信 —— 那几个字节可能落在 v1 的别的字段上。
+     */
+    if (nb != (ssize_t) sizeof(*lm))
+    {
+        if (reason != NULL)
+            *reason = "locmap 长度不符（v1 旧格式或文件损坏）——"
+                      "请重跑 replay_set_locmap() 重建";
+        return false;
+    }
+    if (lm->magic != REPLAY_LOCMAP_MAGIC)
+    {
+        if (reason != NULL)
+            *reason = "locmap magic 不符";
+        return false;
+    }
+    if (lm->version != REPLAY_LOCMAP_VERSION)
+    {
+        if (reason != NULL)
+            *reason = "locmap 版本不符（v1 无 role/ord，无法就地升级）——"
+                      "请重跑 replay_set_locmap() 重建";
+        return false;
+    }
+    if (lm->shard_oid != shard_oid ||
+        lm->npairs < 1 || lm->npairs > SHARD_FILESET_MAX_RELS)
+    {
+        if (reason != NULL)
+            *reason = "locmap 内容自相矛盾（shard_oid 或 npairs 越界）";
+        return false;
+    }
+
+    return true;
+}
+
+void
+ShardReplayWriteLocMap(const ReplayLocMapFile *lm)
+{
+    char    path[MAXPGPATH];
+    char    tmp[MAXPGPATH];
+    int     fd;
+    ssize_t nb;
+
+    InitPartitionWALDirectory(lm->shard_oid);
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, lm->shard_oid,
+             REPLAY_LOCMAP_FILENAME);
+    snprintf(tmp, MAXPGPATH, "%s.tmp", path);
+
+    fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 无法创建 locmap 临时文件 \"%s\": %m",
+                        tmp)));
+
+    do {
+        nb = write(fd, lm, sizeof(*lm));
+    } while (nb < 0 && errno == EINTR);
+
+    if (nb != (ssize_t) sizeof(*lm) || pg_fsync(fd) != 0)
+    {
+        CloseTransientFile(fd);
+        (void) unlink(tmp);
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: locmap 写入 \"%s\" 失败: %m", tmp)));
+    }
+    CloseTransientFile(fd);
+
+    if (rename(tmp, path) != 0)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 无法就位 locmap \"%s\": %m", path)));
+}
+
+bool
 ShardReplayLoadLocMap(ShardReplayCtx *ctx)
 {
-    char             path[MAXPGPATH];
-    int              fd;
-    ssize_t          nb;
     ReplayLocMapFile lm;
     HASHCTL          hctl;
     int              i;
 
-    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
-             DataDir, PARTITION_WAL_DIR, ctx->shard_oid,
-             REPLAY_LOCMAP_FILENAME);
-
-    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-    if (fd < 0)
-        return false;
-
-    nb = read(fd, &lm, sizeof(lm));
-    CloseTransientFile(fd);
-
-    if (nb != (ssize_t) sizeof(lm) ||
-        lm.magic != REPLAY_LOCMAP_MAGIC ||
-        lm.shard_oid != ctx->shard_oid ||
-        lm.npairs < 1 || lm.npairs > SHARD_FILESET_MAX_RELS)
+    if (!ShardReplayReadLocMap(ctx->shard_oid, &lm, NULL))
         return false;
 
     memset(&hctl, 0, sizeof(hctl));
@@ -100,6 +183,9 @@ ShardReplayLoadLocMap(ShardReplayCtx *ctx)
             hash_search(ctx->loc_map, &lm.pairs[i].leader_loc,
                         HASH_ENTER, &found);
         e->local_loc = lm.pairs[i].local_loc;
+        e->role      = lm.pairs[i].role;
+        e->ord       = lm.pairs[i].ord;
+        e->reserved  = 0;
 
         /* 收集去重后的本地文件号（checkpoint 刷脏用） */
         for (j = 0; j < ctx->nlocal; j++)
@@ -681,6 +767,278 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 }
 
 /* ================================================================== */
+/* CTRL 记录应用（FRD §7.7/§12）                                       */
+/* ================================================================== */
+
+/*
+ * 记下"停在结构栅栏上"。返回 false 让调用方跳出应用循环 **且不推进游标** ——
+ * 这是 NEEDS_STRUCT 与 FAILED 的实质区别：栅栏是可原地恢复的，
+ * 运维把本地结构补齐、重跑 replay_set_locmap() 之后，从同一个游标继续即可。
+ */
+static bool
+ReplayFenceStruct(ShardReplayCtx *ctx, const char *fmt,...)
+    pg_attribute_printf(2, 3);
+
+static bool
+ReplayFenceStruct(ShardReplayCtx *ctx, const char *fmt,...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(ctx->struct_errmsg, sizeof(ctx->struct_errmsg), fmt, ap);
+    va_end(ap);
+
+    ctx->needs_struct = true;
+
+    ereport(LOG,
+            (errmsg("shard replay: shard %u 停在结构栅栏 @plsn %llu: %s",
+                    ctx->shard_oid,
+                    (unsigned long long) ctx->applied_part_lsn + 1,
+                    ctx->struct_errmsg)));
+    return false;
+}
+
+/* 在当前 loc_map 里按 (role, ord) 找本地文件号 */
+static bool
+LocalLocForRoleOrd(ShardReplayCtx *ctx, uint8 role, uint8 ord,
+                   RelFileLocator *out)
+{
+    HASH_SEQ_STATUS seq;
+    LocMapEntry    *e;
+
+    hash_seq_init(&seq, ctx->loc_map);
+    while ((e = (LocMapEntry *) hash_seq_search(&seq)) != NULL)
+    {
+        if (e->role == role && e->ord == ord)
+        {
+            *out = e->local_loc;
+            hash_seq_term(&seq);
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * 把一个本地关系的全部 fork 截成 0 块。
+ *
+ * leader 侧换了文件号（VACUUM FULL / REINDEX / TRUNCATE）意味着那是一个
+ * **全新的空文件**，随后流里跟着的是它全部页面的 FPI。本地对应文件必须先
+ * 清空：否则旧文件比新文件长时，FPI 覆盖不到的尾部会留下上一代的残页，
+ * 而两侧文件长度不同这件事本身就会让页面比对直接判负。
+ *
+ * 幂等：崩溃后从游标重放会再截一次 0，再重放同一批 FPI，结果相同（§8.4）。
+ */
+static void
+ReplayTruncateLocalRel(const RelFileLocator *loc)
+{
+    SMgrRelation reln = smgropen(*loc, InvalidBackendId);
+    ForkNumber   forks[MAX_FORKNUM + 1];
+    BlockNumber  old_blocks[MAX_FORKNUM + 1];
+    BlockNumber  blocks[MAX_FORKNUM + 1];
+    int          nforks = 0;
+    ForkNumber   f;
+
+    smgrcreate(reln, MAIN_FORKNUM, true);
+
+    for (f = 0; f <= MAX_FORKNUM; f++)
+    {
+        BlockNumber n;
+
+        if (!smgrexists(reln, f))
+            continue;
+        n = smgrnblocks(reln, f);
+        if (n == 0)
+            continue;
+
+        forks[nforks]      = f;
+        old_blocks[nforks] = n;
+        blocks[nforks]     = 0;
+        nforks++;
+
+        /* invalid_page_tab 记的是本地文件号（同 ApplySmgrRecord） */
+        XLogTruncateRelation(*loc, f, 0);
+    }
+
+    if (nforks > 0)
+    {
+        START_CRIT_SECTION();
+        smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
+        END_CRIT_SECTION();
+    }
+}
+
+/*
+ * ApplyCtrlRecord — 应用一条控制记录。
+ *
+ * 返回 true = 已应用，调用方推进游标；false = 停在栅栏，游标原地不动。
+ *
+ * 目前只有 FILESET_UPDATE 一个 opcode。它的语义是"leader 的物理文件集合
+ * 换了，这是新的全量描述"。follower 的处置分两种，判据是**结构有没有变**：
+ *
+ *   (role, ord) 集合不变，只是文件号变了
+ *       → VACUUM FULL / REINDEX / TRUNCATE / 重写类 ALTER。本地关系一一对应
+ *         得上，原地换表 + 把对应本地文件截 0，后续 FPI 自然填满。全自动。
+ *
+ *   (role, ord) 集合变了（增或减）
+ *       → CREATE INDEX / DROP INDEX。停在栅栏。
+ *
+ * 为什么集合变了就不能自动配：ord 是**位置**（索引定义序），不是身份。
+ * leader 删掉 ord=0 那个索引之后，原来的 ord=1 会补位成 ord=0 —— 若照
+ * (role, ord) 硬配，follower 会把 leader 新的 0 号索引的内容灌进本地那个
+ * 本该被删掉的 0 号索引文件里，而 catalog 还宣称它是另一组列上的索引。
+ * 那是**静默损坏**，比停下来难查得多。
+ */
+static bool
+ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
+                const char *body)
+{
+    const PartWALCtrlFilesetUpdate *upd;
+    const ShardFileSetRel          *rels;
+    ReplayLocMapFile                lm;
+    HASHCTL                         hctl;
+    HTAB                           *new_map;
+    uint32                          i;
+
+    if (hdr->version < PARTWAL_RECORD_VERSION_3 ||
+        hdr->rmid != PARTWAL_CTRL_RMID)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu CTRL 记录头不合法"
+                        "（version=%u rmid=%u）", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->version, hdr->rmid)));
+
+    if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu 未知 CTRL opcode "
+                        "0x%02X —— 拒绝静默跳过控制记录",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn, hdr->info)));
+
+    if (hdr->data_len < sizeof(PartWALCtrlFilesetUpdate))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FILESET_UPDATE "
+                        "载荷过短 (%u)", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len)));
+
+    upd = (const PartWALCtrlFilesetUpdate *) body;
+
+    if (upd->nrels < 1 || upd->nrels > SHARD_FILESET_MAX_RELS ||
+        hdr->data_len != (uint32) PartWALCtrlFilesetUpdateSize(upd->nrels))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FILESET_UPDATE "
+                        "长度与 nrels 不符 (len=%u nrels=%u)",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len, upd->nrels)));
+
+    rels = PartWALCtrlFilesetRels(upd);
+
+    if ((upd->flags & PARTWAL_FSUPD_NEEDS_REBASELINE) != 0)
+        return ReplayFenceStruct(ctx,
+                                 "leader 的 fileset 变更超过 "
+                                 "fileset_inline_max_blocks，新文件内容未随流"
+                                 "携带 —— 本副本须重做物理基线拷贝");
+
+    /*
+     * 结构判据：新 fileset 的 (role, ord) 集合必须与当前 loc_map 完全相同。
+     * 个数相等 + 每个 leader 成员都能在本地找到同 (role, ord) 的对应，
+     * 因为两侧 (role, ord) 各自唯一，这两条合起来即集合相等。
+     */
+    if (upd->nrels != (uint32) hash_get_num_entries(ctx->loc_map))
+        return ReplayFenceStruct(ctx,
+                                 "leader fileset 成员数由 %ld 变为 %u"
+                                 "（索引增删）—— 请在本地 shell 表上做等价"
+                                 "结构变更后重跑 replay_set_locmap()",
+                                 hash_get_num_entries(ctx->loc_map),
+                                 upd->nrels);
+
+    memset(&lm, 0, sizeof(lm));
+    lm.magic     = REPLAY_LOCMAP_MAGIC;
+    lm.version   = REPLAY_LOCMAP_VERSION;
+    lm.shard_oid = ctx->shard_oid;
+    lm.npairs    = 0;
+
+    for (i = 0; i < upd->nrels; i++)
+    {
+        RelFileLocator local;
+
+        if (!LocalLocForRoleOrd(ctx, rels[i].role, rels[i].ord, &local))
+            return ReplayFenceStruct(ctx,
+                                     "leader 的 (role=%u, ord=%u) 在本地"
+                                     " shell 表上无对应关系 —— 请做等价结构"
+                                     "变更后重跑 replay_set_locmap()",
+                                     rels[i].role, rels[i].ord);
+
+        lm.pairs[lm.npairs].leader_loc = rels[i].loc;
+        lm.pairs[lm.npairs].local_loc  = local;
+        lm.pairs[lm.npairs].role       = rels[i].role;
+        lm.pairs[lm.npairs].ord        = rels[i].ord;
+        lm.pairs[lm.npairs].reserved   = 0;
+        lm.npairs++;
+    }
+
+    /*
+     * 过了上面全部校验才动手 —— 栅栏必须在**一个字节都没改**之前立起来，
+     * 否则"游标没推进"就不再等于"什么都没发生"。
+     *
+     * 先截断：leader 文件号变了的成员，本地文件清空等 FPI 重建。
+     * 文件号没变的（哈希里查得到）内容仍然有效，一个字节都不要动。
+     */
+    for (i = 0; i < upd->nrels; i++)
+    {
+        bool found;
+
+        (void) hash_search(ctx->loc_map, &rels[i].loc, HASH_FIND, &found);
+        if (!found)
+            ReplayTruncateLocalRel(&lm.pairs[i].local_loc);
+    }
+
+    /* 换表：整张 loc_map 重建（新旧文件号在同一临界区换完，§12） */
+    memset(&hctl, 0, sizeof(hctl));
+    hctl.keysize   = sizeof(RelFileLocator);
+    hctl.entrysize = sizeof(LocMapEntry);
+    hctl.hcxt      = TopMemoryContext;
+    new_map = hash_create("shard replay loc_map", SHARD_FILESET_MAX_RELS,
+                          &hctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+    ctx->nlocal = 0;
+    for (i = 0; i < (uint32) lm.npairs; i++)
+    {
+        LocMapEntry *e;
+        bool         found;
+        int          j;
+
+        e = (LocMapEntry *) hash_search(new_map, &lm.pairs[i].leader_loc,
+                                        HASH_ENTER, &found);
+        e->local_loc = lm.pairs[i].local_loc;
+        e->role      = lm.pairs[i].role;
+        e->ord       = lm.pairs[i].ord;
+        e->reserved  = 0;
+
+        for (j = 0; j < ctx->nlocal; j++)
+            if (RelFileLocatorEquals(ctx->local_locs[j], lm.pairs[i].local_loc))
+                break;
+        if (j == ctx->nlocal && ctx->nlocal < SHARD_FILESET_MAX_RELS)
+            ctx->local_locs[ctx->nlocal++] = lm.pairs[i].local_loc;
+    }
+
+    hash_destroy(ctx->loc_map);
+    ctx->loc_map = new_map;
+
+    /* 持久化 + 刷新槽位（豁免钩子的数据源）*/
+    ShardReplayWriteLocMap(&lm);
+    ReplaySlotRefreshLocs(ctx->shard_oid);
+
+    ereport(LOG,
+            (errmsg("shard replay: shard %u @plsn %llu 已应用 FILESET_UPDATE"
+                    "（%u 个成员）", ctx->shard_oid,
+                    (unsigned long long) hdr->partition_lsn, upd->nrels)));
+    return true;
+}
+
+/* ================================================================== */
 /* 段文件索引（每轮 catch-up 重建）                                    */
 /* ================================================================== */
 
@@ -930,6 +1288,13 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
     if (bound <= ctx->applied_part_lsn)
         return;
 
+    /*
+     * 每轮开工先清栅栏标记：这一轮可能正是运维补完结构后重新触发的，
+     * 不清的话即使 CTRL 应用成功，收尾仍会把槽位落回 NEEDS_STRUCT。
+     */
+    ctx->needs_struct     = false;
+    ctx->struct_errmsg[0] = '\0';
+
     REPLAY_TRACE("TRACE Run: shard %u applied=%llu bound=%llu",
                  ctx->shard_oid,
                  (unsigned long long) ctx->applied_part_lsn,
@@ -1025,11 +1390,14 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
             if (PartWALRecordIsMarker(&ent->hdr))
                 ApplyMarkerRecord(ctx, &ent->hdr, body);
             else if (PartWALRecordIsCtrl(&ent->hdr))
-                ereport(ERROR,
-                        (errmsg("shard replay: shard %u @plsn %llu 收到 CTRL "
-                                "记录，但控制记录尚未实现（FRD §7.7/§12）",
-                                ctx->shard_oid,
-                                (unsigned long long) expected)));
+            {
+                /*
+                 * 结构栅栏：游标停在这条 CTRL **之前**。不能推进 ——
+                 * 推进了就等于宣称这条控制记录已生效，而它其实没有。
+                 */
+                if (!ApplyCtrlRecord(ctx, &ent->hdr, body))
+                    break;
+            }
             else
                 ApplyDataRecord(ctx, &ent->hdr, body);
 

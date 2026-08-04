@@ -193,29 +193,29 @@ ReplaySlotFindLocked(Oid shard_oid, bool create)
     return &ReplayCtl->slots[free_idx];
 }
 
+static void ReplaySlotLoadLocsLocked(ReplayShardSlot *s);
+static ReplayShardSlot *ReplaySlotFindLocked(Oid shard_oid, bool create);
+
+void
+ReplaySlotRefreshLocs(Oid shard_oid)
+{
+    ReplayShardSlot *s;
+
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    s = ReplaySlotFindLocked(shard_oid, false);
+    if (s != NULL)
+        ReplaySlotLoadLocsLocked(s);
+    LWLockRelease(ReplayCtl->lock);
+}
+
 /* 从 locmap 文件把本地文件号灌进槽位（豁免钩子的数据源） */
 static void
 ReplaySlotLoadLocsLocked(ReplayShardSlot *s)
 {
-    char             path[MAXPGPATH];
-    int              fd;
-    ssize_t          nb;
     ReplayLocMapFile lm;
     int              i, j;
 
-    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
-             DataDir, PARTITION_WAL_DIR, s->shard_oid,
-             REPLAY_LOCMAP_FILENAME);
-
-    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-    if (fd < 0)
-        return;
-    nb = read(fd, &lm, sizeof(lm));
-    CloseTransientFile(fd);
-
-    if (nb != (ssize_t) sizeof(lm) || lm.magic != REPLAY_LOCMAP_MAGIC ||
-        lm.shard_oid != s->shard_oid ||
-        lm.npairs < 1 || lm.npairs > SHARD_FILESET_MAX_RELS)
+    if (!ShardReplayReadLocMap(s->shard_oid, &lm, NULL))
         return;
 
     s->nlocs = 0;
@@ -306,15 +306,17 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
     /* worker 以 replay_naptime_ms 轮询槽位，这里同步等它把 applied 抬上去 */
     for (;;)
     {
-        bool done = false, failed = false;
+        bool done = false, failed = false, fenced = false;
 
         CHECK_FOR_INTERRUPTS();
 
         LWLockAcquire(ReplayCtl->lock, LW_SHARED);
         applied = s->applied;
-        if (s->state == REPLAY_FAILED && s->generation >= gen)
+        if ((s->state == REPLAY_FAILED || s->state == REPLAY_NEEDS_STRUCT) &&
+            s->generation >= gen)
         {
-            failed = true;
+            failed = (s->state == REPLAY_FAILED);
+            fenced = (s->state == REPLAY_NEEDS_STRUCT);
             strlcpy(errbuf, s->errmsg, sizeof(errbuf));
         }
         else if (applied >= bound)
@@ -325,6 +327,17 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
             ereport(ERROR,
                     (errmsg("replay_catchup: shard %u 追平失败: %s",
                             shard_oid, errbuf)));
+        /*
+         * 栅栏也要立刻返回，不能干等到超时 —— 它要等的是人工动作，
+         * 而超时报出来的会是"追平超时"，把原因盖掉。
+         */
+        if (fenced)
+            ereport(ERROR,
+                    (errmsg("replay_catchup: shard %u 停在结构栅栏（已追至 "
+                            "%llu）: %s", shard_oid,
+                            (unsigned long long) applied, errbuf),
+                     errhint("本地 shell 表做等价结构变更后重跑 "
+                             "replay_set_locmap()，再重新触发 replay_catchup()。")));
         if (done)
             return applied;
 
@@ -658,8 +671,17 @@ ReplayWorkerMain(Datum arg)
             if (s->target_plsn <= s->applied && s->state != REPLAY_CATCHING_UP)
                 continue;
 
+            /*
+             * 停在结构栅栏上的 shard 同样不再干活：它缺的是人工结构变更，
+             * 每个 naptime 重试一次只会把同一条 LOG 刷满日志。重新触发
+             * replay_catchup() 会把状态改回 CATCHING_UP，自然解除。
+             */
+            if (s->state == REPLAY_NEEDS_STRUCT)
+                continue;
+
             /* 惰性建 ctx（阶段一：checkpoint + locmap） */
-            if (ctxs[i] == NULL || ctxs[i]->shard_oid != s->shard_oid)
+            if (ctxs[i] == NULL || ctxs[i]->shard_oid != s->shard_oid ||
+                ctxs[i]->locmap_gen != s->locmap_gen)
             {
                 MemoryContext        old;
                 ShardReplayCtx      *ctx;
@@ -685,8 +707,9 @@ ReplayWorkerMain(Datum arg)
 
                 old = MemoryContextSwitchTo(TopMemoryContext);
                 ctx = palloc0(sizeof(ShardReplayCtx));
-                ctx->shard_oid = s->shard_oid;
-                ctx->seg_fd    = -1;
+                ctx->shard_oid  = s->shard_oid;
+                ctx->seg_fd     = -1;
+                ctx->locmap_gen = s->locmap_gen;
 
                 if (!ShardReplayLoadLocMap(ctx))
                 {
@@ -796,7 +819,18 @@ ReplayWorkerMain(Datum arg)
                     ShardReplayDoCheckpoint(ctxs[i]);
                     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
                     s->applied = ctxs[i]->applied_part_lsn;
-                    if (s->applied >= s->target_plsn)
+                    if (ctxs[i]->needs_struct)
+                    {
+                        /*
+                         * 结构栅栏（§12）：游标停在那条 FILESET_UPDATE 之前，
+                         * 已应用的部分是完整的。落 NEEDS_STRUCT 而不是 FAILED，
+                         * 是为了让运维一眼看出"补个结构就能原地继续"。
+                         */
+                        s->state = REPLAY_NEEDS_STRUCT;
+                        strlcpy(s->errmsg, ctxs[i]->struct_errmsg,
+                                REPLAY_ERRMSG_LEN);
+                    }
+                    else if (s->applied >= s->target_plsn)
                         s->state = REPLAY_IDLE;     /* 回到休眠 */
                     LWLockRelease(ReplayCtl->lock);
 
@@ -832,6 +866,7 @@ ReplayWorkerMain(Datum arg)
 PG_FUNCTION_INFO_V1(pg_partdist_register_shard_fileset);
 PG_FUNCTION_INFO_V1(pg_partdist_shard_fileset);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_set_locmap);
+PG_FUNCTION_INFO_V1(pg_partdist_replay_locmap);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_enable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_disable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_status);
@@ -950,6 +985,52 @@ pg_partdist_shard_fileset(PG_FUNCTION_ARGS)
 }
 
 /*
+ * replay_locmap(local regclass)
+ *   → (role int, ord int, leader_spc oid, leader_db oid,
+ *      leader_relnum oid, local_relnum oid)
+ *
+ * 直接把 follower 当前的 leader→本地 文件号映射摆出来。
+ *
+ * 有了 §12 的 CTRL 换表之后，locmap 不再是"建一次就不变"的：leader 一次
+ * VACUUM FULL 就会让 leader_relnum 整体换掉。判断"控制记录到底应用了没有"
+ * 必须能直接查这张表 —— 否则只能靠页面比对通没通去反推，那是间接现象。
+ */
+Datum
+pg_partdist_replay_locmap(PG_FUNCTION_ARGS)
+{
+    Oid              relid  = PG_GETARG_OID(0);
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    ReplayLocMapFile lm;
+    const char      *reason = NULL;
+    int              i;
+
+    InitMaterializedSRF(fcinfo, 0);
+
+    if (!ShardReplayReadLocMap(relid, &lm, &reason))
+        ereport(ERROR,
+                (errmsg("replay_locmap: shard %u 的 locmap 不可用: %s",
+                        relid, reason ? reason : "未知原因")));
+
+    for (i = 0; i < lm.npairs; i++)
+    {
+        Datum values[6];
+        bool  nulls[6] = {false, false, false, false, false, false};
+
+        values[0] = Int32GetDatum((int32) lm.pairs[i].role);
+        values[1] = Int32GetDatum((int32) lm.pairs[i].ord);
+        values[2] = ObjectIdGetDatum(lm.pairs[i].leader_loc.spcOid);
+        values[3] = ObjectIdGetDatum(lm.pairs[i].leader_loc.dbOid);
+        values[4] = ObjectIdGetDatum(lm.pairs[i].leader_loc.relNumber);
+        values[5] = ObjectIdGetDatum(lm.pairs[i].local_loc.relNumber);
+
+        tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+                             values, nulls);
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
  * replay_set_locmap(local regclass, roles int[], ords int[],
  *                   spcs oid[], dbs oid[], relnums oid[]) → int
  *
@@ -971,10 +1052,6 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
     ShardFileSet     local_fs;
     ReplayLocMapFile lm;
     int              i, j;
-    char             path[MAXPGPATH];
-    char             tmp[MAXPGPATH];
-    int              fd;
-    ssize_t          nb;
 
     deconstruct_array_builtin(roles_a, INT4OID, &roles, NULL, &n1);
     deconstruct_array_builtin(ords_a,  INT4OID, &ords,  NULL, &n2);
@@ -994,6 +1071,7 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
     /* 按 (role, ord) 配对（FRD §7.1："关系角色 + 索引定义序"） */
     memset(&lm, 0, sizeof(lm));
     lm.magic     = REPLAY_LOCMAP_MAGIC;
+    lm.version   = REPLAY_LOCMAP_VERSION;
     lm.shard_oid = local_relid;
     lm.npairs    = 0;
 
@@ -1014,6 +1092,9 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
                 e->leader_loc.dbOid     = DatumGetObjectId(dbs[i]);
                 e->leader_loc.relNumber = DatumGetObjectId(rels[i]);
                 e->local_loc            = local_fs.rels[j].loc;
+                e->role                 = local_fs.rels[j].role;
+                e->ord                  = local_fs.rels[j].ord;
+                e->reserved             = 0;
                 lm.npairs++;
                 matched = true;
                 break;
@@ -1027,33 +1108,8 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
                             role, ord, local_relid)));
     }
 
-    /* 持久化 locmap（tmp + fsync + rename） */
-    InitPartitionWALDirectory(local_relid);
-    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
-             DataDir, PARTITION_WAL_DIR, local_relid, REPLAY_LOCMAP_FILENAME);
-    snprintf(tmp, MAXPGPATH, "%s.tmp", path);
-
-    fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
-    if (fd < 0)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("replay_set_locmap: 无法创建 \"%s\": %m", tmp)));
-    do {
-        nb = write(fd, &lm, sizeof(lm));
-    } while (nb < 0 && errno == EINTR);
-    if (nb != (ssize_t) sizeof(lm) || pg_fsync(fd) != 0)
-    {
-        CloseTransientFile(fd);
-        (void) unlink(tmp);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("replay_set_locmap: 写入 \"%s\" 失败: %m", tmp)));
-    }
-    CloseTransientFile(fd);
-    if (rename(tmp, path) != 0)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("replay_set_locmap: 无法就位 \"%s\": %m", path)));
+    /* 持久化 locmap（tmp + fsync + rename），与 CTRL 换表共用同一实现 */
+    ShardReplayWriteLocMap(&lm);
 
     /* 槽位登记（豁免钩子即刻生效；enabled 仍需 replay_enable） */
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
@@ -1062,6 +1118,18 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
 
         ReplaySlotLoadLocsLocked(s);
         ReplayRecountReplicasLocked();
+
+        /*
+         * 配对换过了 → 让 worker 丢掉内存里那张 loc_map 重建（§12 栅栏恢复）。
+         * 同时把 NEEDS_STRUCT 清掉：结构既已补齐，栅栏就不该继续拦着，
+         * 下一次 replay_catchup 应当直接开工。
+         */
+        s->locmap_gen++;
+        if (s->state == REPLAY_NEEDS_STRUCT)
+        {
+            s->state = REPLAY_IDLE;
+            s->errmsg[0] = '\0';
+        }
     }
     LWLockRelease(ReplayCtl->lock);
 
@@ -1136,7 +1204,8 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     int            i;
-    static const char *state_name[] = {"idle", "catching_up", "failed"};
+    static const char *state_name[] = {"idle", "catching_up", "failed",
+                                       "needs_struct"};
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -1155,7 +1224,8 @@ pg_partdist_replay_status(PG_FUNCTION_ARGS)
         values[0] = ObjectIdGetDatum(s->shard_oid);
         values[1] = BoolGetDatum(s->armed);
         values[2] = CStringGetTextDatum(
-            (s->state >= 0 && s->state <= 2) ? state_name[s->state] : "?");
+            (s->state >= 0 && s->state < (int) lengthof(state_name))
+                ? state_name[s->state] : "?");
         values[3] = Int32GetDatum(s->claimed_by);
         values[4] = Int64GetDatum((int64) s->applied);
         values[5] = Int64GetDatum((int64) s->target_plsn);

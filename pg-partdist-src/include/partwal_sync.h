@@ -99,6 +99,19 @@ extern void  PartWALSyncRegister(Oid partition_id, RelFileNumber relfilenode);
 /* 探测 relfilenode 是否已注册（backend 自动注册路径的低成本去重用） */
 extern bool  PartWALSyncIsRegistered(RelFileNumber relfilenode);
 
+/*
+ * 枚举本节点当前捕获的全部分区 OID（去重）。DDL 之后的 fileset diff 用；
+ * 返回写进 out 的个数。
+ */
+extern int   PartWALSyncListPartitions(Oid *out, int max);
+
+/*
+ * 给一个分区追加一条 CTRL 控制记录并就地复制（FRD §7.7/§12）。
+ * opcode 落在头部的 info 字段（PARTWAL_CTRL_*）。
+ */
+extern void  PartWALAppendCtrl(Oid partition_id, uint8 opcode,
+                               const char *payload, uint32 payload_len);
+
 /* ------------------------------------------------------------------ */
 /* Per-backend WAL content capture (for full-body pg_parwal records)   */
 /* ------------------------------------------------------------------ */

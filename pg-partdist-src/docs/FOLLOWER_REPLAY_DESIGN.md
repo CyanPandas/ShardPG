@@ -641,11 +641,18 @@ ShardReplayMarkerRecord(ShardReplayCtx *ctx, PartWALRecord *h, TxnMarkerPayload 
 - 元组可见的最终条件(读路径,本期不实现):状态 = COMMITTED **且**
   `commit_ts ≤ 快照 start_ts`(§10)。
 
-### 7.7 阶段三 C:应用 CTRL 记录
+### 7.7 阶段三 C:应用 CTRL 记录(D1 已实装)
 
-目前仅 `FILESET_UPDATE`(§12):按新 fileset 全量描述更新 loc_map 与
-(未来的)路由表条目,处理完毕才继续后续 DATA 记录——控制记录之后的 DATA 才会引用
-新 relfilenode,apply 串行 ⇒ 无竞态。
+头部约定:`flags` 含 `PARTWAL_FLAG_CTRL`;`rmid = PARTWAL_CTRL_RMID`(0xFF 哨兵值,
+**不是**真实 rmgr id——CTRL 压根不进 `rm_redo`,派发判据是 flags 的类别位;
+设成不可能被当 rmgr 用的值,是为了万一有人误按 rmid 分派时立刻炸掉,
+而不是安静地走进某个 rmgr 的 redo);`info = opcode`。
+
+目前仅 `FILESET_UPDATE`(§12):按新 fileset 全量描述重建 loc_map,处理完毕才继续
+后续 DATA 记录——控制记录之后的 DATA 才会引用新 relfilenode,apply 串行 ⇒ 无竞态。
+
+**未知 opcode 一律 ERROR**,与 §7.3 未知 rmid 同款 fail-fast:控制记录改变的是
+"后续记录怎么解释",静默跳过一条没读懂的控制记录,等于在错误的映射上继续 redo。
 
 ### 7.8 阶段四:游标推进与持久化
 
@@ -1014,20 +1021,111 @@ raft 模块修订计划 §13,不在本文范围。
 
 ---
 
-## 12. DDL 与文件集合维护
+## 12. DDL 与文件集合维护(D1 已实装)
 
 改变 relfilenode 集合的操作:`CREATE/DROP INDEX`、`REINDEX`、`VACUUM FULL`、
-`TRUNCATE`、`ALTER TABLE` 重写类。shard 上的 DDL 必须走集群协调通道,流程:
+`TRUNCATE`、`ALTER TABLE` 重写类。
 
-1. leader 执行 DDL → 刷新本地 fileset 与反向映射;
-2. 向该 shard 的 ParWAL 流追加 `FILESET_UPDATE` 控制记录(新 fileset 全量描述,
-   含各关系角色与索引定义序),随 Raft 复制;
-3. follower apply 到该记录:执行等价物理结构变更,更新 loc_map 与路由表条目
-   (`PartDistRouteUpdateFileset`,新旧文件号在同一临界区换表)。
-   顺序保证:控制记录之后的 DATA 才会引用新 relfilenode,apply 串行 ⇒ 无竞态。
+> **★ D1 之前的失效模式是「静默分歧」,不是报错。** 这条要写在最前面,因为它
+> 决定了本节的优先级。捕获判据是"记录的 blocks[] 命中反向哈希"
+> (`partwal_sync.c` 的 `if (found)`),**没命中就直接 return**。于是 leader 上
+> 一次 `CREATE INDEX` 换出的新 relfilenode 从未登记 ⇒ 该索引的 WAL 记录一条都
+> 不进流 ⇒ follower 的索引永远停在旧内容,而**两侧谁都不报错**。
+> (follower 侧那句 "未知 relfilelocator" PANIC 只在另一种情形下出现:有人手动
+> 调了 `register_shard_fileset()` 却没同步更新 follower 的 loc_map。)
 
-REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录形式进流,数据量大;
-早期阶段可将这类 DDL 降级为"触发该 shard 副本重新做物理基线拷贝",简单可靠。
+### 12.1 leader 侧:检测与发射
+
+检测挂在 `ProcessUtility_hook` 上,**不是事件触发器** —— `VACUUM FULL` 与
+`CLUSTER` 不触发 `ddl_command_end`,用事件触发器会漏掉它们。
+
+判据故意粗:只看语句类型(`UtilityMayChangeRelfilenode()` 的白名单),不从
+parse tree 精确解出受影响的关系。精确解要为每种语句写一套(`AlterTableStmt`
+还得逐个子命令看),漏一种就是静默分歧;而真正决定发不发记录的是 PRE_COMMIT
+那次 fileset diff,误报的代价只是多走一次 catalog 遍历。
+
+**发射点在 `XACT_EVENT_PRE_COMMIT`,不在 ProcessUtility 里。** DDL 一执行完就
+发的话,事务随后回滚,follower 已经按新结构换过表、把本地文件截过了 —— leader
+回到旧结构,副本停在新结构,且新结构的内容来自一次不存在的 DDL。放到 PRE_COMMIT,
+暴露窗口与既有 COMMIT 标记完全一致(见 §13 约束 11)。
+
+`ShardFilesetMaybeEmitUpdates()` 的六步,顺序全部是硬的:
+
+1. `PartWALFlush(Invalid, false)` —— 排空已缓冲的记录。它们引用**旧**文件号,
+   必须排在 CTRL 之前:排在后面的话 follower 已经换过表,旧文件号在 loc_map 里
+   查不到,当场报"未知 relfilelocator"。
+2. 重建 fileset 并与持久化版本 diff(按 `(role, ord)` 比对文件号);无变化收工。
+3. `RegisterShardFileSet()` —— 新文件号即刻进入捕获。**必须在第 5 步之前**,
+   否则那批 FPI 一条都进不了流(而且是静默丢弃,正是上面那个失效模式)。
+4. 追加 `CTRL:FILESET_UPDATE`,载荷是新 fileset 的**全量**描述。
+   全量而非增量,是因为 follower 侧的应用必须幂等(崩溃后从游标重放会再走一次),
+   全量描述天然幂等:应用几次结果都是"loc_map 等于这份描述"。
+5. 对**换了文件号的成员**调 `log_newpage_range(..., page_std = false)`,把新文件
+   内容以 FPI 形式送进流。`page_std = false`(整页搬,不掐 `[pd_lower, pd_upper)`
+   的洞)有两个理由:VM/FSM 这类非标准布局的 fork 掐洞判据本就不适用;主 fork
+   整页搬则让 follower 的新文件成为 leader 的逐字节副本,连洞内残字节都一致,
+   正好省掉一处判据例外(对比 §14.2 的 ★ 块)。
+6. `PartWALFlush(Invalid, true)` —— 排空 FPI 并写 COMMIT 标记。
+
+CTRL 记录的 `orig_lsn` 取**当前 WAL 插入位置**(`GetXLogInsertRecPtr()`),
+不是本事务数据记录的最大 LSN:紧跟其后的 FPI 的 `orig_lsn` 必然更大,这样
+"CTRL 在前、FPI 在后"在 `partition_lsn` 与 `orig_lsn` 两个维度上都成立,
+段号(由 orig_lsn 换算)也不会倒挂。
+
+`PartWALAppendCtrl()` 还顺手把该分区登进本事务的 touched 表并**就地复制一次**:
+纯结构变更事务(典型是 `DROP INDEX`)不产生任何 DATA 记录,`PartWALFlush` 会在
+"本 backend 无插入"分支直接返回,控制记录就只落本地、永远进不了 Raft。
+
+**超大关系的退路**:新文件总块数超过 GUC `pg_partdist.fileset_inline_max_blocks`
+(默认 131072 = 1 GB)时,CTRL 带 `NEEDS_REBASELINE` 标志且**不灌内容** ——
+与其让一次 `VACUUM FULL` 把几十 GB 塞进 Raft 日志,不如显式退回基线拷贝。
+follower 见到该位一律停在栅栏上。
+
+### 12.2 follower 侧:换表还是停下来
+
+判据是**结构有没有变**,即新 fileset 的 `(role, ord)` 集合是否与当前 loc_map
+相同(成员数相等 + 每个 leader 成员都能找到同 `(role, ord)` 的本地对应;
+两侧 `(role, ord)` 各自唯一 ⇒ 这两条合起来即集合相等)。
+
+| 情形 | DDL | 处置 |
+|---|---|---|
+| 集合不变,只换文件号 | `VACUUM FULL` / `REINDEX` / `TRUNCATE` / 重写类 `ALTER` | **全自动**:原地换 loc_map,把换了号的成员对应的本地文件**截成 0 块**,后续 FPI 填满 |
+| 集合变了(增或减) | `CREATE INDEX` / `DROP INDEX` | **停在结构栅栏** `REPLAY_NEEDS_STRUCT` |
+
+**为什么集合变了不能自动配:`ord` 是位置,不是身份。** leader 删掉 `ord=0` 的
+索引之后,原来的 `ord=1` 会补位成 `ord=0`。照 `(role, ord)` 硬配,follower 会把
+leader 新 0 号索引的内容灌进本地那个本该被删掉的 0 号索引文件里,而 catalog
+还宣称它是另一组列上的索引 —— **静默损坏**,比停下来难查得多。
+
+**为什么本地文件要先截 0**:leader 换号意味着那是一个全新的空文件,随后流里是它
+全部页面的 FPI。本地旧文件若比新文件长,FPI 覆盖不到的尾部会留下上一代的残页,
+而两侧文件长度不同这件事本身就会让页面比对直接判负。截断幂等:崩溃后从游标重放
+会再截一次 0、再放同一批 FPI,结果相同。
+
+**栅栏的语义是「游标一个字节都没推进」**:全部校验通过之前不动任何字节,
+`ApplyCtrlRecord()` 返回 false 后应用循环直接跳出,`applied_part_lsn` 停在该
+CTRL 记录**之前**。所以它与 `REPLAY_FAILED` 是两回事,值得单列一个状态:
+前者补齐本地结构 + 重跑 `replay_set_locmap()` 就能原地继续,后者通常意味着这个
+副本要重做。混成一个状态,运维分不清"补个索引就行"和"这副本废了"。
+
+栅栏的解除靠 `replay_set_locmap()`:它写完新 locmap 会把槽位的 `locmap_gen` 加一,
+worker 据此丢弃内存里那张旧 loc_map 重建 ctx —— 否则补完结构再触发一次,
+worker 抱着旧表还是撞同一道栅栏。
+
+`replay_catchup()` 遇到栅栏**立即报错返回**,不干等到超时:它要等的是人工动作,
+而超时报出来的会是"追平超时",把原因盖掉。
+
+### 12.3 已知边界(D1 未覆盖)
+
+- **`DROP TABLE`**:shard 整个没了。副本侧的处置(停流 / 删副本)需要另一个
+  opcode,D1 保持沉默而不是发一条半吊子的 `FILESET_UPDATE`。
+- **`ALTER TABLE ... SET TABLESPACE`** 改的是 `spcOid`,机制上与换 relfilenode
+  同路(diff 按整个 `RelFileLocator` 比),但 follower 侧本地表空间未必存在,
+  未验证。
+- follower 侧的结构补齐目前是**人工**的(或由上层协调通道驱动)。让 replay
+  worker 自己跑 SPI DDL 的路走不通:它得从本地堆读数据建索引,而回放元组在 R3
+  之前根本不可见,建出来是空的(虽然后续 FPI 会覆盖),且要把 DDL 与
+  `InRecovery = true` 混在一个进程里。
 
 ---
 
@@ -1102,6 +1200,21 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
     落地要求:worker 认领 shard 时取该 shard 的排他锁(shmem 槽位 CAS 或 advisory lock),
     释放在 worker 退出路径上;并在回放主循环入口断言"本进程持有该 shard 的认领权"。
     这条与 §7 的 worker 池形态是配套的,不可只做池不做锁。
+11. **★ `PRE_COMMIT` 之后失败的窗口,对 fileset 变更没有"缺席即回滚"这条退路**
+    (D1 记入)。DATA 与 COMMIT 标记都在 `XACT_EVENT_PRE_COMMIT` 落盘并复制,
+    此后事务仍有可能失败;对 DATA 而言这不成问题——**没有 COMMIT 标记的数据在
+    follower 上就是未决 = 不可见**(§4.3/§9.3),回滚语义由缺席表达。
+
+    `CTRL:FILESET_UPDATE` 没有这个性质:它不经事务判决,在流内是无条件生效的。
+    所以 PRE_COMMIT 之后 DDL 事务若失败,leader 回到旧结构、副本已换到新结构,
+    且新结构的内容来自一次并未发生的 DDL;leader 侧持久化的 fileset 文件也会
+    指向已不存在的 relfilenode(下一次 DDL 的 diff 会把它纠回来)。
+
+    窗口与既有 COMMIT 标记完全同宽——发射点刻意选在 `PartWALFlush(..., true)`
+    **之前**紧邻处,不新增暴露面。要真正消除它,得让 CTRL 也参与事务判决
+    (follower 见到 CTRL 先挂起、等到该 gxid 的 COMMIT 标记才生效),
+    代价是回放管线从"串行应用"变成"带未决队列",与 §7 的形态冲突。
+    D1 显式选择记录而不是解决。
 
 ---
 
@@ -1112,10 +1225,13 @@ REINDEX/VACUUM FULL 在 leader 侧产生的新文件内容本身以 FPI/记录�
 ```
 pg-partdist-src/
   include/
-    partition_wal_header.h     [改] parwal-3.0:gxid 头、MARKER/CTRL flags、TxnMarkerPayload
+    partition_wal_header.h     [改] parwal-3.0:gxid 头、MARKER/CTRL flags、TxnMarkerPayload;
+                                    D1:PARTWAL_CTRL_RMID/opcode、PartWALCtrlFilesetUpdate
     partwal_sync.h             [改] PartWALFlush(upto, write_marker)、PartWALEndTxn;
                                     ABORT 标记补写(§4.3 写入时机)
-    shard_fileset.h            [新] ShardFileSet + 反向映射接口(§5)
+    shard_fileset.h            [新] ShardFileSet + 反向映射接口(§5);
+                                    D1:BuildShardFileSetEx(带 relids)、
+                                    ShardFilesetNoteMaybeChanged/MaybeEmitUpdates(§12)
     shard_replay.h             [新] ShardReplayCtx、LocMapEntry、回放入口、边界回调(§6/§7)
     shard_xidmap.h             [新] XidMapEntry、xid_map 接口(§9.2)
     shard_route.h              [新] ShardRole、ShardRouteEntry、路由接口(§9.4)
@@ -1135,12 +1251,19 @@ pg-partdist-src/
   patches/
     0002-flushbuffer-lsn-exempt-hook.patch   [新] §8.3
     0003-advance-wal-insert.patch            [新] §11(R4)
+  tests/
+    pagecmp.py                 页面比对(内核 heap_mask() 掩码集合,**堆页专用**)
+    test_follower_replay_r1.sh R1 物理回放闭环
+    test_lazy_replay_l1.sh     L1 惰性触发语义
+    test_txn_layer_r2.sh       R2 事务层(gclog 直接查账)
+    test_ddl_fileset_d1.sh     [新] D1 DDL/fileset 控制通道(§12)
 ```
 
 GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)、
 `replay_naptime_ms`、`replay_checkpoint_interval_ms`、
 `replay_checkpoint_bytes`、`replay_trust_local_segments`(测试模式,§6)、
-`replay_dw_enabled`(sidecar,§8.5)。
+`fileset_inline_max_blocks`(D1,§12,默认 131072)、
+`replay_dw_enabled`(sidecar,§8.5,**未实现**)。
 
 ### 14.2 阶段计划
 
@@ -1148,6 +1271,7 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 |------|------|------|------|
 | R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader 在**内核 `heap_mask()` 掩码之外逐字节一致(且 `pd_lsn` 不掩,须相同)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
 | R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13 约束 5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致(**★★ 见下方「R2 验收 = 账本正确，不是可见」**) | R1 |
+| D1 DDL/fileset 控制通道 | CTRL 记录格式 + `PartWALAppendCtrl`;locmap v2(加 `role`/`ord`);leader 侧 `ProcessUtility_hook` 检测 → PRE_COMMIT 发射 `FILESET_UPDATE` + `log_newpage_range` 灌新文件;follower 侧换表/截断 与 `REPLAY_NEEDS_STRUCT` 结构栅栏(§12) | `VACUUM FULL`/`REINDEX`/`TRUNCATE` 全自动追平且页面比对仍一致;`CREATE INDEX` 停在栅栏(游标不推进、locmap 未换),补齐本地结构 + 重跑 `replay_set_locmap()` 后原地继续;未同步结构的另一 follower 必须仍停住 | R1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
 | R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
 
@@ -1205,7 +1329,55 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 > 且**上表掩码之外的全部字节相同**。判据仍覆盖 `pd_lsn`、全部行指针、
 > 全部元组数据(含 xmin/xmax 本身、`t_infomask2`、`t_ctid`、`t_hoff`)与 special 区。
 > 掩码规则是**堆页专用**的(要走行指针与元组头布局);索引页需另配
-> `btree_mask` 等,现工具不适用。
+> `btree_mask` 等,现工具不适用。**而用例目前把它也用在索引文件上** ——
+> 它会照 `HeapTupleHeaderData` 的布局去掩元组内偏移 20–22(`t_infomask`)与
+> 8–12(`t_cid`),那些位置在 `IndexTupleData` 里是**真正的键数据**。
+> 后果不是误报是**漏报**:每条索引元组白送 6 字节豁免。待办。
+
+> **★ 判据本身要有"确实跑过"的守卫(D1 实测教训)。** 逐成员比对的循环
+> 用 `while read ... <<< "$rows"` 驱动,而循环体里的 `docker exec -i`
+> **会把循环自己的标准输入一并吞掉** —— 第一行之后的 fileset 成员被静默跳过。
+> 表现是全 PASS,但实际只比了主堆,索引与 TOAST 一个字节都没验。
+>
+> 这类失败的共性是"零个检查会静默通过":路径解析失败、循环提前退出、
+> 关系名对不上,统统表现为少几条 PASS 而不是一条 FAIL。所以逐成员比对
+> **必须配一条计数守卫**(实际比对的文件数 >= fileset 成员数)。
+> 修法:成员清单先 `mapfile` 进数组再 for 循环,容器调用一律 `</dev/null`。
+>
+> 顺带一条:路径不能用 `relnum::regclass` 反查 —— `relnum` 是 **relfilenode**,
+> 与关系 OID 只在关系刚建好时碰巧相等,leader 一做 `VACUUM FULL`/`REINDEX`/
+> `TRUNCATE` 就分家(这正是 §12 的常规场景),要走 `pg_filenode_relation()`。
+
+> **★★ 未决缺陷:崩溃恢复后 btree 元页(metapage)陈旧**(2026-08-04,
+> 修好上面那个守卫之后**第一次**比到索引文件就暴露出来;此前索引从未被比过)。
+>
+> 实测(R1 用例,1 主 2 从,同一份 leader 文件):
+> - **f2**(全程无崩溃)6 个文件**全部**逐字节一致,含 PK 索引与 TOAST 索引。
+> - **f1**(走了 §14.2 R1 行的 kill -9 → 节点重置 → 从 durable 游标续放)
+>   两个索引的 **page 0 = 元页**不一致,堆/TOAST 堆/VM fork 全部一致:
+>
+>   | 偏移 | 字段(`BTMetaPageData`) | leader | f1 |
+>   |---|---|---|---|
+>   | 4–7 | `pd_lsn.xrecoff` | 非零 | 陈旧值 |
+>   | 32 | `btm_root` | 3 | **0** |
+>   | 36 | `btm_level` | 1 | **0** |
+>   | 40 | `btm_fastroot` | 3 | **0** |
+>   | 44 | `btm_fastlevel` | 1 | **0** |
+>
+>   全零正是 `_bt_initmetapage()` 写下的初值 ⇒ f1 的元页**停在建索引那一刻**,
+>   `XLOG_BTREE_NEWROOT`(或带元页更新的 split)的效果丢了。页 LSN 也陈旧,
+>   说明这一页在 f1 上**根本没被 redo 写过**。
+>
+> 元页 `btm_root = 0` 意味着索引在升主后不可用(`_bt_getroot` 会认为树是空的)。
+> 这不是掩码问题,`btree_mask()` 不掩元页的这些字段。
+>
+> **可能的机制**(未证实,须实测):§8.4 的推进协议是"刷 shard 脏页 → fsync →
+> 才写游标"。若元页在崩溃前已 apply 进共享缓冲、游标已推进过它、而那一页没被
+> 刷出去,重启后从游标续放就永远补不回来。要么 `FlushRelationsAllBuffers`
+> 没覆盖到它,要么顺序在某处被破坏。
+>
+> **这正是 R1 的 kill -9 用例本该抓住的场景** —— 抓不住的唯一原因是当时的
+> 页面比对只比了主堆(见上一条 ★)。定位与修复未排期。
 
 > **★★ R2 验收 = 账本正确，不是可见。** 这条要写死,免得反复误判进度。
 >

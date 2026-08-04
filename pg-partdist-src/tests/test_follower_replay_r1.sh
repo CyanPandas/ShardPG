@@ -227,31 +227,49 @@ pdata=$(PSQL $pport -Atc "SHOW data_directory")
 f1data=$(PSQL $f1 -Atc "SHOW data_directory")
 f2data=$(PSQL $f2 -Atc "SHOW data_directory")
 
-# 逐 fileset 成员 diff：用两侧 pg_relation_filepath 配对（role,ord 序一致）
-lead_paths=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT role||'.'||ord||','||pg_relation_filepath(relnum::regclass) FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord" | grep ',')
+# 逐 fileset 成员 diff：用两侧 pg_relation_filepath 配对（role,ord 序一致）。
+#
+# 路径必须经 pg_filenode_relation 反查：fileset 里的 relnum 是 **relfilenode**，
+# 与关系 OID 只在关系刚建好时碰巧相等，leader 一做 VACUUM FULL/REINDEX/TRUNCATE
+# 就分家，`relnum::regclass` 会取到别的关系或 NULL。
+FILESET_PATHS_SQL="SELECT role||'.'||ord||','||
+       pg_relation_filepath(pg_filenode_relation(
+           CASE WHEN spc = 1663 THEN 0 ELSE spc END, relnum))
+  FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord"
+
+lead_paths=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; ${FILESET_PATHS_SQL}" | grep ',')
 
 diff_one_follower() {  # <fport> <fdata> <标签>
   local fp=$1 fdata=$2 tag=$3
-  local frows
-  frows=$(PSQL $fp -Atc "SET citus.enable_ddl_propagation=off; SELECT role||'.'||ord||','||pg_relation_filepath(relnum::regclass) FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord" | grep ',')
-  while IFS= read -r lrow; do
+  local frows ncmp=0
+  frows=$(PSQL $fp -Atc "SET citus.enable_ddl_propagation=off; ${FILESET_PATHS_SQL}" | grep ',')
+
+  # 成员清单先读进数组：循环体里的 `docker exec -i` 会把 `while read` 的标准
+  # 输入一并吞掉，第一行之后的成员被静默跳过 —— 表现是"全 PASS 但只比了主堆"，
+  # 而 R1 的验收判据恰恰就是这份逐成员比对。
+  local -a rows; local lrow
+  mapfile -t rows <<< "$lead_paths"
+
+  for lrow in "${rows[@]}"; do
     local key lrel frel lpath fpath fork
+    [[ -n "$lrow" ]] || continue
     key=${lrow%%,*}; lrel=${lrow#*,}
     frel=$(echo "$frows" | grep "^${key}," | cut -d, -f2)
     for fork in "" "_vm"; do
       lpath="${pdata}/${lrel}${fork}"; fpath="${fdata}/${frel}${fork}"
       local lex fex
-      lex=$(DEX bash -c "test -f '$lpath' && echo y || echo n")
-      fex=$(DEX bash -c "test -f '$fpath' && echo y || echo n")
+      lex=$(DEX bash -c "test -f '$lpath' && echo y || echo n" </dev/null)
+      fex=$(DEX bash -c "test -f '$fpath' && echo y || echo n" </dev/null)
       if [[ "$lex" == "n" && "$fex" == "n" ]]; then continue; fi
       check "${tag} ${key}${fork:-.main} 两侧都存在" "$lex/$fex" "y/y"
       [[ "$lex" == "y" && "$fex" == "y" ]] || continue
       local lsz fsz
-      lsz=$(DEX stat -c %s "$lpath"); fsz=$(DEX stat -c %s "$fpath")
+      lsz=$(DEX stat -c %s "$lpath" </dev/null); fsz=$(DEX stat -c %s "$fpath" </dev/null)
       check "${tag} ${key}${fork:-.main} 大小一致(${lsz})" "$fsz" "$lsz"
       local same errf
       errf=$(mktemp)
-      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" 2>"$errf")
+      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" </dev/null 2>"$errf")
+      ncmp=$((ncmp + 1))
       check "${tag} ${key}${fork:-.main} 洞外逐字节一致" \
             "$same" "IDENTICAL_OUTSIDE_HOLE"
       # 差在哪个字段比"差了几个字节"有用得多 —— 失败时把定性明细打出来
@@ -261,7 +279,12 @@ diff_one_follower() {  # <fport> <fdata> <标签>
       fi
       rm -f "$errf"
     done
-  done <<< "$lead_paths"
+  done
+
+  # 守卫：比过的文件数必须覆盖全部 fileset 成员（主堆/PK/TOAST 堆/TOAST 索引
+  # 共 4 个，主堆另有 _vm）。零个检查是静默通过的，必须有一条挡住它。
+  check "${tag} 实际比对了 ${ncmp} 个文件（>= 4 个成员）" \
+        "$([[ "$ncmp" -ge 4 ]] && echo ok)" "ok"
 }
 
 diff_one_follower $f1 "$f1data" "f1"

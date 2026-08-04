@@ -633,6 +633,23 @@ CREATE OR REPLACE FUNCTION replay_set_locmap(
 COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]) IS
     'Follower 侧：建立 leader→本地 文件号映射（loc_map）。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。';
 
+-- follower 侧当前生效的 loc_map。leader 一次 VACUUM FULL/REINDEX/TRUNCATE
+-- 就会经 CTRL:FILESET_UPDATE 把 leader_relnum 整体换掉（FRD §12），
+-- 「控制记录应用了没有」要能直接查，而不是从页面比对通没通去反推。
+CREATE OR REPLACE FUNCTION replay_locmap(
+    p_local_shard REGCLASS,
+    OUT role INTEGER,
+    OUT ord INTEGER,
+    OUT leader_spc OID,
+    OUT leader_db OID,
+    OUT leader_relnum OID,
+    OUT local_relnum OID
+) RETURNS SETOF record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_locmap';
+
+COMMENT ON FUNCTION replay_locmap(REGCLASS) IS
+    'Follower 侧当前生效的 leader→本地 文件号映射（含 role/ord 配对键）。';
+
 -- 启停该 shard 的物理回放（启用标记持久化，节点重启后自动恢复）。
 CREATE OR REPLACE FUNCTION replay_enable(
     p_local_shard REGCLASS

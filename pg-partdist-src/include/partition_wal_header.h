@@ -15,6 +15,7 @@
 #include "access/xlogdefs.h"
 #include "common/relpath.h"
 #include "global_mvcc.h"
+#include "shard_fileset.h"
 
 /* ------------------------------------------------------------------ */
 /* Magic and constants                                                  */
@@ -196,5 +197,65 @@ typedef struct TxnMarkerPayload
 
 #define TxnMarkerSubxacts(m) \
     ((TransactionId *) ((char *) (m) + sizeof(TxnMarkerPayload)))
+
+/* ------------------------------------------------------------------ */
+/* CTRL 记录：控制通道（FRD §7.7/§12）                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * CTRL 记录的头部字段约定：
+ *   flags 含 PARTWAL_FLAG_CTRL；rmid = PARTWAL_CTRL_RMID；info = opcode。
+ *
+ * rmid 用 0xFF 这个**哨兵值**而不是某个真实 rmgr id：CTRL 记录压根不进
+ * rm_redo，派发判据是 flags 的类别位（见 PartWALRecordIsCtrl）。把它设成
+ * 一个不可能被当成 rmgr 用的值，是为了万一将来有人误按 rmid 分派时立刻炸掉，
+ * 而不是安静地走进某个 rmgr 的 redo。
+ *
+ * gxid 取发出该记录的事务的 gxid（DDL 事务），仅供排障对账；CTRL 的应用
+ * **不经过**事务判决 —— 它在流内是无条件生效的（见 §12 的已知窗口）。
+ */
+#define PARTWAL_CTRL_RMID            UINT8_C(0xFF)
+
+/* opcode（放在头部的 info 字段） */
+#define PARTWAL_CTRL_FILESET_UPDATE  UINT8_C(0x01)
+
+/*
+ * FILESET_UPDATE 载荷：leader 侧 fileset 变更后的**全量**新描述。
+ *
+ * 为什么是全量而不是增量：follower 侧的应用必须幂等（崩溃后从游标重放会
+ * 再次走到这条记录），全量描述天然幂等 —— 无论应用几次，结果都是"loc_map
+ * 等于这份描述"。增量描述要求恰好应用一次，与 §8.4 的重放语义冲突。
+ *
+ * flags 里 NEEDS_REBASELINE 的含义：leader 判断新文件太大、不适合把内容
+ * 以 FPI 形式灌进流（见 GUC pg_partdist.fileset_inline_max_blocks），
+ * 于是只发结构变更通知，内容要 follower 自己重做物理基线。follower 见到
+ * 该位一律停在栅栏上，不会把"结构换了但内容没跟上"的状态当成正常。
+ *
+ * reserved 是**显式**补齐位（同 TxnMarkerPayload 的理由：结构体直写磁盘，
+ * 未初始化的编译器填充会让同一逻辑内容产生不同字节）。
+ *
+ * data_len == sizeof(PartWALCtrlFilesetUpdate) + nrels * sizeof(ShardFileSetRel)
+ *          == 8 + 16 * nrels
+ */
+typedef struct PartWALCtrlFilesetUpdate
+{
+    uint32      nrels;          /* 新 fileset 的成员数                       */
+    uint16      flags;          /* PARTWAL_FSUPD_*                           */
+    uint16      reserved;       /* 显式补齐，恒为 0                          */
+    /* ShardFileSetRel rels[nrels] 紧随其后（leader 侧文件号 + role/ord） */
+} PartWALCtrlFilesetUpdate;
+
+#define PARTWAL_FSUPD_NEEDS_REBASELINE  UINT16_C(0x0001)
+
+#define PartWALCtrlFilesetUpdateSize(n) \
+    (sizeof(PartWALCtrlFilesetUpdate) + (size_t) (n) * sizeof(ShardFileSetRel))
+
+#define PartWALCtrlFilesetRels(u) \
+    ((ShardFileSetRel *) ((char *) (u) + sizeof(PartWALCtrlFilesetUpdate)))
+
+StaticAssertDecl(sizeof(PartWALCtrlFilesetUpdate) == 8,
+                 "PartWALCtrlFilesetUpdate 必须是 8 字节（CTRL 磁盘格式）");
+StaticAssertDecl(sizeof(ShardFileSetRel) == 16,
+                 "ShardFileSetRel 必须是 16 字节且无填充洞（随 CTRL 直写磁盘）");
 
 #endif /* PARTITION_WAL_HEADER_H */

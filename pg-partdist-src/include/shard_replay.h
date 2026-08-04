@@ -32,22 +32,58 @@
 /* loc_map                                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * role/ord 是**配对键**，不是冗余信息：leader 侧 DDL 换了文件号之后
+ * （VACUUM FULL / REINDEX / TRUNCATE），FILESET_UPDATE 控制记录带来的是
+ * 一份新的 leader 文件号清单，follower 必须据此重新配对 —— 而 replay worker
+ * 是无 catalog 访问的 bgworker，没法现场 BuildShardFileSet 去查"本地哪个
+ * 关系是第 2 个索引"。把 (role, ord) 一起持久化进 locmap，换表就成了纯粹的
+ * 文件内查表，不碰 catalog（D1-c）。
+ */
 typedef struct LocMapEntry
 {
     RelFileLocator  leader_loc;     /* hash key：record 里携带的就是它 */
     RelFileLocator  local_loc;
+    uint8           role;           /* ShardRelRole，与 local_loc 同侧    */
+    uint8           ord;            /* 同 role 内序号                     */
+    uint16          reserved;       /* 显式补齐，恒为 0                   */
 } LocMapEntry;
 
+StaticAssertDecl(sizeof(LocMapEntry) == 28,
+                 "LocMapEntry 必须是 28 字节且无填充洞（随 locmap 直写磁盘）");
+
 #define REPLAY_LOCMAP_MAGIC     UINT32_C(0x4C4D4150)    /* "LMAP" */
+#define REPLAY_LOCMAP_VERSION   UINT32_C(2)             /* v2：加 role/ord */
 #define REPLAY_LOCMAP_FILENAME  "locmap"
 
+/*
+ * v1（R1/L1/R2 时代）没有 version 字段、每对 24 字节，整文件 780 字节；
+ * v2 是 912 字节。两者长度不同，read() 的返回长度就是可靠的判别器 ——
+ * 装载失败时提示重跑 replay_set_locmap()，不做原地升级：v1 文件里没有
+ * role/ord，凭空补不出来（那正是 v2 存在的理由）。
+ */
 typedef struct ReplayLocMapFile
 {
     uint32          magic;
+    uint32          version;        /* REPLAY_LOCMAP_VERSION */
     Oid             shard_oid;      /* 本地 shard（分区）OID = 目录名 */
     int32           npairs;
     LocMapEntry     pairs[SHARD_FILESET_MAX_RELS];
 } ReplayLocMapFile;
+
+/*
+ * locmap 的原子持久化（tmp + fsync + rename）。replay_set_locmap（首次配对）
+ * 与 CTRL:FILESET_UPDATE 的应用（换表）共用，避免两处各写一遍写岔。
+ */
+extern void ShardReplayWriteLocMap(const ReplayLocMapFile *lm);
+
+/*
+ * 读 + 校验 locmap 文件。失败返回 false，*reason 指向说明原因的静态串
+ * （可传 NULL）。三个读点（回放主循环、槽位 locs 装载、CTRL 换表）共用，
+ * 免得 v1/v2 的判别条件在三处各写一遍、各漏一条。
+ */
+extern bool ShardReplayReadLocMap(Oid shard_oid, ReplayLocMapFile *lm,
+                                  const char **reason);
 
 /* ------------------------------------------------------------------ */
 /* apply checkpoint（FRD §8.4）                                        */
@@ -95,6 +131,9 @@ extern void WriteApplyCheckpoint(const ShardApplyCheckpoint *chk,
 /* 回放上下文（FRD §7.1，R1 子集）                                     */
 /* ------------------------------------------------------------------ */
 
+/* 槽位与回放上下文共用同一个错误串长度（前者原样拷后者） */
+#define REPLAY_ERRMSG_LEN 160
+
 typedef struct ShardReplayCtx
 {
     Oid                shard_oid;
@@ -115,6 +154,17 @@ typedef struct ShardReplayCtx
     XLogRecPtr         max_orig_lsn;       /* 已应用的最大 leader end LSN     */
     uint64             records_since_ckpt;
     TimestampTz        last_ckpt_time;
+
+    /*
+     * 结构栅栏（§12）：应用到一条 FILESET_UPDATE 却发现本地结构对不上时置位，
+     * 应用循环随即跳出且**不推进游标**。worker 据此把槽位置成
+     * REPLAY_NEEDS_STRUCT 并把原因摆到 errmsg 上。
+     */
+    bool               needs_struct;
+    char               struct_errmsg[REPLAY_ERRMSG_LEN];
+
+    /* 建 ctx 时槽位上的 locmap 代次；与槽位不符即须重建（见 ReplayShardSlot）*/
+    uint64             locmap_gen;
 
     /* 段文件流读取状态 */
     int                seg_fd;
@@ -174,20 +224,26 @@ typedef uint64 (*ShardReplayCatchUpFn) (Oid shard_oid, uint64 bound,
 /* replay_enable（= armed）的持久化标记文件（pg_parwal/<oid>/ 下） */
 #define REPLAY_ENABLED_FILENAME "replay_enabled"
 
-#define REPLAY_ERRMSG_LEN 160
-
 /*
  * 回放状态机（惰性形态）。
  *
  * 平时停在 IDLE —— **不做任何 redo**，副本只是 P2 平凡 apply 落下来的字节。
  * 触发（replay_catchup / 升主）把 target_plsn 抬到目标位置，worker 转入
  * CATCHING_UP 追平，完成后回到 IDLE。追平出错停在 FAILED 并留下 errmsg。
+ *
+ * NEEDS_STRUCT 与 FAILED 的区别是**可恢复性**，值得单列一个状态：
+ * 前者是"leader 的结构变了、本地 shell 表还没跟上"（CREATE/DROP INDEX），
+ * 游标**停在该 CTRL 记录之前**、一个字节都没多应用，人工把本地结构补齐并
+ * 重跑 replay_set_locmap() 之后原地就能继续；后者是回放本身出了错，
+ * 通常意味着这个副本要重做。混成一个状态，运维就分不清"补个索引就行"
+ * 和"这副本废了"。
  */
 typedef enum ReplayState
 {
     REPLAY_IDLE = 0,
     REPLAY_CATCHING_UP = 1,
-    REPLAY_FAILED = 2
+    REPLAY_FAILED = 2,
+    REPLAY_NEEDS_STRUCT = 3
 } ReplayState;
 
 typedef struct ReplayShardSlot
@@ -195,6 +251,15 @@ typedef struct ReplayShardSlot
     Oid     shard_oid;      /* InvalidOid = 空槽 */
     int     claimed_by;     /* 0 = 未认领；否则为持有 worker 的 PID（§13.10） */
     bool    armed;          /* 允许被触发；false = 连触发都不受理 */
+
+    /*
+     * locmap 代次：每次 replay_set_locmap() 重建配对就 +1。worker 拿它和
+     * ctx 里那份比对，不同就重建 ctx —— 否则运维在结构栅栏之后补完结构、
+     * 重跑了 replay_set_locmap()，worker 仍抱着内存里那张旧 loc_map，
+     * 再触发一次还是撞同一道栅栏。
+     * （CTRL 换表是 worker 自己写的 locmap，不动这个计数。）
+     */
+    uint64  locmap_gen;
 
     uint64  target_plsn;    /* 触发目标；<= applied 即无待办（惰性的核心） */
     uint64  applied;        /* worker 单写、其他进程只读 */
@@ -221,6 +286,13 @@ extern void ReplayShmemInit(void);
 
 /* 补丁 0002 的钩子实现：relNumber 命中副本豁免哈希 → 跳过 XLogFlush */
 extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
+
+/*
+ * 从 locmap 文件重新灌一遍槽位的本地文件号。CTRL:FILESET_UPDATE 换表之后
+ * 必须调用 —— 豁免钩子认的是槽位里那份 locs[]，不刷新的话新文件号的脏页
+ * 会走进 XLogFlush(leader LSN)，那个位置本地 pg_wal 根本没有。
+ */
+extern void ReplaySlotRefreshLocs(Oid shard_oid);
 
 /* launcher 注册 + GUC 定义（_PG_init 调用） */
 extern void RegisterReplayLauncher(void);

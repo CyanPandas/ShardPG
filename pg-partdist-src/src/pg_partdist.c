@@ -74,6 +74,14 @@ PartWALXactCallback(XactEvent event, void *arg)
     switch (event)
     {
         case XACT_EVENT_PRE_COMMIT:
+            /*
+             * 若本事务跑过会改 relfilenode 的 DDL，先把 fileset 变更发出去
+             * （§12）：它内部会先排空旧文件号的记录，再追加 CTRL、灌新文件
+             * 内容。放在下面这次 flush 之前，是为了让 COMMIT 标记仍然是本
+             * 事务在流里的最后一条。
+             */
+            ShardFilesetMaybeEmitUpdates();
+
             /* 提交已成定局 → 连同 COMMIT 标记一起落盘 */
             PartWALFlush(InvalidXLogRecPtr, true);
             break;
@@ -214,11 +222,48 @@ partdist_object_access(ObjectAccessType access,
 }
 
 /*
+ * UtilityMayChangeRelfilenode — 这条语句跑完之后，某个 shard 的 fileset
+ * 有没有可能变了（FRD §12）。
+ *
+ * 判据故意是**语句类型**而不是"哪张表"：从 parse tree 精确解出受影响的
+ * 关系要为每种语句写一套（AlterTableStmt 还得逐个子命令看），漏一种就是
+ * 静默分歧。而真正决定要不要发记录的是 PRE_COMMIT 里那次 fileset diff ——
+ * 这里只需要"可能变了"这个粗判，误报的代价不过是多走一次 catalog 遍历，
+ * 而 DDL 本来就稀少。
+ *
+ * 名单来源：所有会走 RelationSetNewRelfilenumber() 的路径（TRUNCATE、
+ * 重写类 ALTER TABLE、CLUSTER/VACUUM FULL、REINDEX）加上会新建/删除关系的
+ * （CREATE/DROP INDEX、DROP TABLE）。VACUUM FULL 与 CLUSTER 不触发
+ * ddl_command_end 事件触发器，这也是这里挂 ProcessUtility 而不是用事件
+ * 触发器的原因。
+ */
+static bool
+UtilityMayChangeRelfilenode(Node *parsetree)
+{
+    switch (nodeTag(parsetree))
+    {
+        case T_IndexStmt:           /* CREATE INDEX                       */
+        case T_ReindexStmt:         /* REINDEX                            */
+        case T_ClusterStmt:         /* CLUSTER                            */
+        case T_VacuumStmt:          /* VACUUM FULL（普通 VACUUM 会 diff 掉）*/
+        case T_TruncateStmt:        /* TRUNCATE                           */
+        case T_AlterTableStmt:      /* 重写类 ALTER / ADD CONSTRAINT      */
+        case T_DropStmt:            /* DROP INDEX / DROP TABLE            */
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
  * partdist_process_utility — ProcessUtility_hook wrapper.
  *
  * For COPY FROM statements, calls pg_partdist_process_utility BEFORE the
  * chain so that the target shard is registered in the relfilenode hash
  * before the COPY writes any WAL records.
+ *
+ * 语句执行**之后**再判 fileset 是否可能变化（§12）：此刻新 relfilenode
+ * 已经存在，PRE_COMMIT 的 diff 才算得出来。
  */
 static void
 partdist_process_utility(PlannedStmt *pstmt,
@@ -241,6 +286,11 @@ partdist_process_utility(PlannedStmt *pstmt,
     else
         standard_ProcessUtility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
+
+    /* §12：可能动了 relfilenode → 让 PRE_COMMIT 去 diff 一次 fileset */
+    if (pstmt->utilityStmt != NULL &&
+        UtilityMayChangeRelfilenode(pstmt->utilityStmt))
+        ShardFilesetNoteMaybeChanged();
 }
 
 /* ---- module load ---- */
@@ -267,6 +317,24 @@ _PG_init(void)
 
     /* GUC: gxid 的来源节点号（与上面的路由层 local_node_id 不是一回事） */
     DefineGlobalMVCCGUCs();
+
+    /*
+     * GUC: DDL 换了文件号之后，最多把多少个块以 FPI 形式灌进分区流（§12）。
+     * 超过则只发结构变更通知，副本需重做物理基线 —— 与其让一次 VACUUM FULL
+     * 把几十 GB 塞进 Raft 日志，不如显式退回基线拷贝。
+     */
+    DefineCustomIntVariable(
+        "pg_partdist.fileset_inline_max_blocks",
+        "DDL 变更 fileset 后，随控制记录灌入分区流的新文件块数上限。",
+        "超过此值只发结构变更通知（NEEDS_REBASELINE），副本须重做物理基线。",
+        &fileset_inline_max_blocks,
+        131072,             /* 1 GB */
+        0,
+        INT_MAX,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL
+    );
 
     /* Chain shared-memory hooks */
     prev_shmem_request_hook = shmem_request_hook;

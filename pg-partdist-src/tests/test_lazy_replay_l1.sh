@@ -233,25 +233,42 @@ docker cp "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" "$CONTAINER":/tmp/pagecmp.
 sleep 3
 
 pdata=$(PSQL $pport -Atc "SHOW data_directory")
-lead_paths=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT role||'.'||ord||','||pg_relation_filepath(relnum::regclass) FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord" | grep ',')
+# relnum 是 relfilenode 不是关系 OID：一旦 leader 做过 VACUUM FULL/REINDEX/
+# TRUNCATE 两者就不再相等，`relnum::regclass` 会取到别的关系或 NULL。
+# 本用例虽不做那些 DDL，仍统一走 pg_filenode_relation，免得将来加一条 DDL
+# 就让整片比对静默变成零个检查。
+FILESET_PATHS_SQL="SELECT role||'.'||ord||','||
+       pg_relation_filepath(pg_filenode_relation(
+           CASE WHEN spc = 1663 THEN 0 ELSE spc END, relnum))
+  FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord"
+
+lead_paths=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; ${FILESET_PATHS_SQL}" | grep ',')
 
 diff_follower() {  # <fport> <标签>
-  local fp=$1 tag=$2 fdata frows
+  local fp=$1 tag=$2 fdata frows ncmp=0
   fdata=$(PSQL $fp -Atc "SHOW data_directory")
-  frows=$(PSQL $fp -Atc "SELECT role||'.'||ord||','||pg_relation_filepath(relnum::regclass) FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord" | grep ',')
-  while IFS= read -r lrow; do
+  frows=$(PSQL $fp -Atc "${FILESET_PATHS_SQL}" | grep ',')
+
+  # 必须先读进数组：循环体里的 `docker exec -i` 会吞掉 `while read` 的标准输入，
+  # 第一行之后的 fileset 成员被静默跳过 —— 表现是"全 PASS 但只比了主堆"。
+  local -a rows; local lrow
+  mapfile -t rows <<< "$lead_paths"
+
+  for lrow in "${rows[@]}"; do
     local key lrel frel fork lpath fpath lex fex same
+    [[ -n "$lrow" ]] || continue
     key=${lrow%%,*}; lrel=${lrow#*,}
     frel=$(echo "$frows" | grep "^${key}," | cut -d, -f2)
     for fork in "" "_vm"; do
       lpath="${pdata}/${lrel}${fork}"; fpath="${fdata}/${frel}${fork}"
-      lex=$(DEX bash -c "test -f '$lpath' && echo y || echo n")
-      fex=$(DEX bash -c "test -f '$fpath' && echo y || echo n")
+      lex=$(DEX bash -c "test -f '$lpath' && echo y || echo n" </dev/null)
+      fex=$(DEX bash -c "test -f '$fpath' && echo y || echo n" </dev/null)
       [[ "$lex" == "n" && "$fex" == "n" ]] && continue
       check "${tag} ${key}${fork:-.main} 两侧都存在" "$lex/$fex" "y/y"
       [[ "$lex" == "y" && "$fex" == "y" ]] || continue
       local errf; errf=$(mktemp)
-      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" 2>"$errf")
+      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" </dev/null 2>"$errf")
+      ncmp=$((ncmp + 1))
       check "${tag} ${key}${fork:-.main} 洞外逐字节一致" "$same" "IDENTICAL_OUTSIDE_HOLE"
       if [[ "$same" != "IDENTICAL_OUTSIDE_HOLE" ]]; then
         echo "        ---- 差异定性（leader=${lpath##*/} follower=${fpath##*/}）----"
@@ -260,7 +277,12 @@ diff_follower() {  # <fport> <标签>
       fi
       rm -f "$errf"
     done
-  done <<< "$lead_paths"
+  done
+
+  # 守卫：真正比过的文件数必须覆盖全部 fileset 成员。没有这条，
+  # "循环提前退出"会表现为全 PASS —— 零个检查是静默通过的。
+  check "${tag} 实际比对了 ${ncmp} 个文件（>= 4 个成员）" \
+        "$([[ "$ncmp" -ge 4 ]] && echo ok)" "ok"
 }
 diff_follower $f1 "f1"
 diff_follower $f2 "f2"

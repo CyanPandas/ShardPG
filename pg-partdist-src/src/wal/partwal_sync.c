@@ -653,6 +653,110 @@ PartWALAppendTxnMarker(PartitionWALWriter *writer, XLogRecPtr orig_lsn,
                         PARTWAL_FLAG_MARKER);
 }
 
+static void PartWALReplicateTouched(void);
+
+/*
+ * PartWALSyncListPartitions — 收集本节点当前捕获的全部分区 OID（去重）。
+ *
+ * 反向哈希的键是 relfilenode、值是 partition_id，一个分区有多个成员
+ * （主堆/索引/TOAST），所以要去重。返回写进 out 的个数。
+ *
+ * 用途：DDL 之后需要"把本地每个 shard 的 fileset 重新算一遍再 diff"
+ * （shard_fileset.c 的 §12 发射路径）。不从 pg_parwal 目录枚举是因为
+ * 目录里也有本节点作为 follower 持有的副本流，那些 shard 的 fileset
+ * 不归本节点维护。
+ */
+int
+PartWALSyncListPartitions(Oid *out, int max)
+{
+    HASH_SEQ_STATUS  seq;
+    PartWALRelEntry *entry;
+    int              n = 0;
+
+    if (PartWALRelHash == NULL || PartWALCtl == NULL || max <= 0)
+        return 0;
+
+    LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+    hash_seq_init(&seq, PartWALRelHash);
+    while ((entry = (PartWALRelEntry *) hash_seq_search(&seq)) != NULL)
+    {
+        int i;
+
+        for (i = 0; i < n; i++)
+            if (out[i] == entry->partition_id)
+                break;
+        if (i < n)
+            continue;
+
+        if (n >= max)
+        {
+            hash_seq_term(&seq);
+            break;
+        }
+        out[n++] = entry->partition_id;
+    }
+    LWLockRelease(PartWALCtl->lock);
+
+    return n;
+}
+
+/*
+ * PartWALAppendCtrl — 给一个分区追加一条 CTRL 控制记录（FRD §7.7/§12）。
+ *
+ * 与 MARKER 的两点不同：
+ *   1. orig_lsn 取**当前 WAL 插入位置**，不是本事务数据记录的最大 LSN ——
+ *      控制记录之后紧跟着的是它自己触发的那批 FPI（新文件内容），那些记录的
+ *      orig_lsn 必然更大。取当前插入位置才能让"CTRL 在前、FPI 在后"这个
+ *      顺序同时体现在 partition_lsn 和 orig_lsn 两个维度上，段号也不会倒挂。
+ *   2. 顺手把该分区登进本事务的 touched 表 —— 纯 DDL 事务可能一条 DML 都没有，
+ *      不登记的话复制挂钩根本不会遍历到它，控制记录只落本地不进 Raft。
+ *
+ * 调用方必须**不持有** PartWALCtl->lock（本函数自己取）。
+ */
+void
+PartWALAppendCtrl(Oid partition_id, uint8 opcode,
+                  const char *payload, uint32 payload_len)
+{
+    XLogRecPtr    ctrl_lsn = GetXLogInsertRecPtr();
+    TransactionId my_xid   = GetCurrentTransactionIdIfAny();
+
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    PG_TRY();
+    {
+        PartitionWALWriter *w;
+
+        InitPartitionWALDirectory(partition_id);
+        w = CreatePartitionWALWriter(partition_id, InvalidRelFileNumber);
+        if (w == NULL)
+            ereport(ERROR,
+                    (errmsg("pg_partdist: 无法为分区 %u 打开 writer 写控制记录",
+                            partition_id)));
+
+        AppendPartWALRecord(w, ctrl_lsn,
+                            PARTWAL_CTRL_RMID, opcode,
+                            payload, payload_len,
+                            MakeGlobalXid(PartDistLocalNodeId(), my_xid),
+                            PARTWAL_FLAG_CTRL);
+        DestroyPartitionWALWriter(w);       /* flush + fsync */
+    }
+    PG_CATCH();
+    {
+        LWLockRelease(PartWALCtl->lock);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    LWLockRelease(PartWALCtl->lock);
+
+    PartWALNoteTouched(partition_id);
+
+    /*
+     * 就地复制一次，不等 PRE_COMMIT 的那次 flush —— 纯结构变更事务
+     * （典型是 DROP INDEX）不产生任何 DATA 记录，PartWALFlush 会在
+     * "本 backend 无插入"分支直接返回，控制记录就只落本地、永远进不了 Raft。
+     */
+    PartWALReplicateTouched();
+}
+
 /*
  * PartWALReplicateTouched — 对本事务碰过的每个分区调一次复制挂钩。
  *

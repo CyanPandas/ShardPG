@@ -59,6 +59,13 @@ typedef struct ShardFileSet
 extern int  BuildShardFileSet(Oid shard_oid, ShardFileSet *fs);
 
 /*
+ * BuildShardFileSetEx — 同上，另把各成员的**关系 OID** 按同序填进 relids
+ * （数组长度须 >= SHARD_FILESET_MAX_RELS，可传 NULL 表示不要）。
+ * fileset 本身只存 RelFileLocator，而 log_newpage_range() 要 Relation。
+ */
+extern int  BuildShardFileSetEx(Oid shard_oid, ShardFileSet *fs, Oid *relids);
+
+/*
  * RegisterShardFileSet — fileset 全体成员写入 shmem 反向哈希
  * (relNumber → shard_oid)，并原子落盘 pg_parwal/<oid>/fileset。
  */
@@ -80,5 +87,24 @@ extern void LoadAllShardFileSets(void);
  */
 extern bool SmgrRecordGetLocator(const char *record_data, uint32 record_len,
                                  uint8 info, RelFileLocator *out);
+
+/* ------------------------------------------------------------------ */
+/* §12：DDL 引起的 fileset 变更                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ShardFilesetNoteMaybeChanged — "刚跑完一条可能改 relfilenode 的语句"。
+ * ProcessUtility_hook 在语句执行完之后调用，只置一个 backend 本地标记。
+ *
+ * ShardFilesetMaybeEmitUpdates — 在 XACT_EVENT_PRE_COMMIT 调用：若标记为真，
+ * 重算本节点每个 shard 的 fileset 并与持久化版本 diff，有变化的走
+ * "排空 → 注册 → 追加 CTRL:FILESET_UPDATE → 灌新文件 FPI"。
+ * 标记为假时直接返回，普通 DML 路径零开销。
+ */
+extern void ShardFilesetNoteMaybeChanged(void);
+extern void ShardFilesetMaybeEmitUpdates(void);
+
+/* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流（超限只发通知） */
+extern int  fileset_inline_max_blocks;
 
 #endif /* SHARD_FILESET_H */
