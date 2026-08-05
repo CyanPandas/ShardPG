@@ -99,11 +99,14 @@ static bool in_txn_replication = false;
 /*
  * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
  * 避免升级时丢掉 current_term/voted_for 造成任期回退。
+ * v3 起再增加 base_index/base_term —— 日志压缩的基点（快照 last_included_*）。
+ * 低版本文件读上来时基点为 0，等价于"没压缩过"，语义与压缩前完全一致。
  */
-#define RAFT_HARDSTATE_VERSION 2
+#define RAFT_HARDSTATE_VERSION 3
 #define RAFT_HARDSTATE_VERSION_MIN 1
 /* v1 布局 = v2 去掉末尾的 last_applied，用 offsetof 取以免手算漏掉结构体填充 */
 #define RAFT_HARDSTATE_V1_SIZE  offsetof(RaftHardStateFile, last_applied)
+#define RAFT_HARDSTATE_V2_SIZE  offsetof(RaftHardStateFile, base_index)
 
 /* group 0 = 控制面；其余为数据面分区组 */
 #define RAFT_CONTROL_GROUP  INT64CONST(0)
@@ -133,6 +136,14 @@ typedef struct RaftLogShmem
     int64        last_log_index;
     int64        commit_index;
     int64        last_applied;
+    /*
+     * 日志压缩基点：index <= base_index 的条目已被快照取代并从
+     * partdist.raft_log 删除，环里也不再保证有。base_term 是 base_index
+     * 那一条的 term —— prev 一致性检查与选举的"日志新旧"比较在压缩点上
+     * 只能靠它（条目本身已经没有了）。0/0 表示从未压缩过。
+     */
+    int64        base_index;
+    int64        base_term;
     int64        peer_next_index[RAFT_MAX_PEERS];
     int64        peer_match_index[RAFT_MAX_PEERS];
     bool         repl_inited;
@@ -150,6 +161,7 @@ typedef struct RaftGroupState
     bool                in_use;
     int64               group_id;
     bool                hs_loaded;      /* HardState 是否已从文件恢复进 shmem */
+    bool                log_restored;   /* SQL 日志是否已灌回环（不能用 last_log_index>0 判） */
     bool                report_pending; /* 数据组新任 leader 尚未向控制面登记（tick 里重试投递） */
     int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
     bool                replicate_in_progress; /* 本组的 prepare 复制正在进行（串行化，见 replicate_claim） */
@@ -191,6 +203,8 @@ typedef struct RaftHardStateFile
     int32  voted_for;
     int64  commit_index;
     int64  last_applied;
+    int64  base_index;      /* v3：日志压缩基点 = 快照 last_included_index */
+    int64  base_term;       /* v3：该条目的 term = 快照 last_included_term */
 } RaftHardStateFile;
 
 bool  pg_raft_raft_enabled = false;
@@ -201,6 +215,7 @@ char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
 int   pg_raft_catchup_interval_ms = 5000;
+int   pg_raft_compact_threshold = 500;
 
 static RaftGroupTable *RaftGroups = NULL;
 
@@ -264,6 +279,8 @@ static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
 static bool replicate_try_claim(RaftGroupCtx *ctx);
 static void replicate_release(RaftGroupCtx *ctx);
+static void step_down_if_higher(RaftGroupCtx *ctx, int64 their_term);
+static void control_maybe_compact(RaftGroupCtx *ctx);
 
 /* ---- 共享内存 ---- */
 
@@ -1007,6 +1024,10 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     hs.voted_for = voted_for;
     hs.commit_index = commit_index;
     hs.last_applied = last_applied;
+    SpinLockAcquire(&ctx->log->mutex);
+    hs.base_index = ctx->log->base_index;
+    hs.base_term = ctx->log->base_term;
+    SpinLockRelease(&ctx->log->mutex);
 
     fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0)
@@ -1104,8 +1125,10 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         return;
     }
 
-    if (hs.version < RAFT_HARDSTATE_VERSION)
+    if (hs.version < 2)
         hs.last_applied = 0;    /* v1 没有该字段，退化为"从 0 起重放" */
+    if (hs.version < 3)
+        hs.base_index = hs.base_term = 0;   /* v1/v2：从未压缩过 */
 
     SpinLockAcquire(&ctx->cons->mutex);
     if (hs.current_term > ctx->cons->current_term)
@@ -1120,6 +1143,21 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         ctx->log->last_applied = hs.last_applied;
     if (ctx->log->last_applied > ctx->log->commit_index)
         ctx->log->last_applied = ctx->log->commit_index;
+    if (hs.base_index > ctx->log->base_index)
+    {
+        ctx->log->base_index = hs.base_index;
+        ctx->log->base_term = hs.base_term;
+    }
+    /*
+     * 压缩基点之前的条目已经不存在了，三个游标都不能落在基点之下 ——
+     * 否则 apply 会去取一条永远取不到的条目而永久卡住。
+     */
+    if (ctx->log->last_log_index < ctx->log->base_index)
+        ctx->log->last_log_index = ctx->log->base_index;
+    if (ctx->log->commit_index < ctx->log->base_index)
+        ctx->log->commit_index = ctx->log->base_index;
+    if (ctx->log->last_applied < ctx->log->base_index)
+        ctx->log->last_applied = ctx->log->base_index;
     SpinLockRelease(&ctx->log->mutex);
 }
 
@@ -1324,6 +1362,48 @@ current_last_log_info_locked(RaftGroupCtx *ctx, int64 *last_idx, int64 *last_ter
 
     if (log_get_entry_locked(ctx, *last_idx, &entry))
         *last_term = entry.term;
+    else if (*last_idx == ctx->log->base_index)
+        *last_term = ctx->log->base_term;   /* 末尾恰好就是压缩基点 */
+}
+
+/*
+ * 取 index 处的 term。压缩基点上的条目已被删除，只剩 base_term 可用 ——
+ * prev 一致性检查与选举的日志新旧比较都必须认它，否则一压缩就没人能通过
+ * 基点处的 prev 检查（也就没人能再当选或被复制）。
+ *
+ * 返回 false = 本节点无从判断（比基点还老，或是尚未持有的空洞）。
+ * 调用方**不得**持有 log->mutex：SQL 那一级要走 SPI。
+ */
+static bool
+log_term_at(RaftGroupCtx *ctx, int64 index, int64 *term)
+{
+    RaftLogEntry e;
+    int64        base_idx;
+    int64        base_term;
+
+    if (index <= 0)
+    {
+        *term = 0;
+        return true;
+    }
+
+    SpinLockAcquire(&ctx->log->mutex);
+    base_idx = ctx->log->base_index;
+    base_term = ctx->log->base_term;
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (index == base_idx)
+    {
+        *term = base_term;
+        return true;
+    }
+
+    if (log_get_entry_ext(ctx, index, &e))
+    {
+        *term = e.term;
+        return true;
+    }
+    return false;
 }
 
 static bool
@@ -1550,14 +1630,23 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
     bool           clamped_hardstate = false;
     StringInfoData sql;
 
-    SpinLockAcquire(&ctx->log->mutex);
-    if (ctx->log->last_log_index > 0)
-    {
-        SpinLockRelease(&ctx->log->mutex);
+    /*
+     * ★ 早退条件必须是"是否已经灌过"，**不能**是 last_log_index > 0（2026-08-05 修）。
+     * 有了日志压缩之后，重启时 restore_hard_state_if_needed 会先把 last_log_index
+     * 顶到压缩基点（基点之前的条目已被快照取代，三个游标都不能落在它之下），
+     * 于是这里会误判成"已经有日志了"而**整段跳过**：表里 base+1..N 的尾巴永远
+     * 灌不回环。对 follower 只是要 leader 重发一遍；对**重启后重新当选的 leader**
+     * 就是灾难 —— 它以为自己的日志止于基点，会拿新内容去覆盖 base+1.. 这些**已经
+     * 提交**的位置，直接破坏 Leader Completeness。
+     */
+    if (ctx->g->log_restored)
         return;
-    }
-    SpinLockRelease(&ctx->log->mutex);
 
+    /*
+     * 旗只在**真的灌完**之后才置（下面每条失败路径都原样返回、留待下次重试）。
+     * 提前置的话，一次拿不到 SPI 或建表还没跑完就把这一组永久标成"已恢复"，
+     * 尾巴就再也灌不回来了 —— 那正是本函数要防的事故。
+     */
     if (!raft_persist_spi_begin(&spi_owned))
         return;
 
@@ -1635,11 +1724,73 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
      */
     if (ctx->log->last_applied > ctx->log->commit_index)
         ctx->log->last_applied = ctx->log->commit_index;
+    /* 压缩基点之前的条目已不存在，游标不能落在它之下（否则 apply 取不到条目） */
+    if (ctx->log->last_log_index < ctx->log->base_index)
+        ctx->log->last_log_index = ctx->log->base_index;
+    if (ctx->log->commit_index < ctx->log->base_index)
+        ctx->log->commit_index = ctx->log->base_index;
+    if (ctx->log->last_applied < ctx->log->base_index)
+        ctx->log->last_applied = ctx->log->base_index;
     SpinLockRelease(&ctx->log->mutex);
 
+    ctx->g->log_restored = true;
     raft_persist_spi_end(spi_owned);
     if (clamped_hardstate)
         persist_hard_state_unlocked(ctx);
+}
+
+/*
+ * 把一条 apply 包进子事务里执行（2026-08-05 修）。
+ *
+ * 起因：apply 体里任何一条 SQL 抛错（实测是一条 payload 违反
+ * node_map_status_check 的"毒丸"条目）都会直接从 apply_one_entry 里
+ * ereport 出去，而 apply_in_progress 是在它**之前**置上、之后才清的 ——
+ * 于是这面旗永久留在 true，本节点此后每次 group_apply_pending 都在
+ * "另一个 backend 正在 apply" 这一分支立即返回：**apply 游标从此永久冻结、
+ * 无任何告警**。实测九个节点全部卡在同一个 index 上，而 commit_index 照常
+ * 前进；有了日志压缩之后更糟——压缩点也跟着不动，节点既追不上也压不了。
+ *
+ * 处置与 apply_one_entry 的既有语义对齐：控制面"元数据表持久、跳过安全"，
+ * 抛错按跳过处理（游标照常推进，只记 WARNING）；数据面漏一条 redo 就是分叉，
+ * 抛错按失败处理（游标不推进，下一轮重试），但**旗一定清掉**。
+ */
+static bool
+apply_one_entry_guarded(RaftGroupCtx *ctx, const RaftLogEntry *e)
+{
+    MemoryContext oldcxt = CurrentMemoryContext;
+    ResourceOwner oldowner = CurrentResourceOwner;
+    bool          ok;
+
+    BeginInternalSubTransaction(NULL);
+    PG_TRY();
+    {
+        ok = apply_one_entry(ctx, e);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+
+        MemoryContextSwitchTo(oldcxt);
+        edata = CopyErrorData();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+
+        ok = (ctx->group_id == RAFT_CONTROL_GROUP);
+        elog(WARNING,
+             "pg_raft: group %lld 的条目 %lld(%s) apply 抛错：%s —— %s",
+             (long long) ctx->group_id, (long long) e->index, e->op_type,
+             edata->message,
+             ok ? "控制面按既有语义跳过" : "数据面保留游标，下轮重试");
+        FreeErrorData(edata);
+    }
+    PG_END_TRY();
+
+    return ok;
 }
 
 static void
@@ -1723,7 +1874,7 @@ group_apply_pending(RaftGroupCtx *ctx)
          * apply 抛错或进程在两者之间死掉，这条就被永久标记为已应用却从未
          * 生效；物理回放下这等于静默丢一条 redo。
          */
-        applied_ok = apply_one_entry(ctx, &e);
+        applied_ok = apply_one_entry_guarded(ctx, &e);
 
         SpinLockAcquire(&ctx->log->mutex);
         ctx->log->apply_in_progress = false;
@@ -1736,6 +1887,111 @@ group_apply_pending(RaftGroupCtx *ctx)
 
         persist_hard_state_unlocked(ctx);
     }
+
+    control_maybe_compact(ctx);
+}
+
+/*
+ * 控制面日志压缩（计划文档 §4 阶段 1 的第二个 ❌）。
+ *
+ * partdist.raft_log 此前只增不删：一轮回归就 240+ 行，重启时
+ * restore_persistent_log_if_needed 还要全表读回。压缩把 last_applied 之前的
+ * 行删掉，并把基点 (base_index, base_term) 记进 hardstate —— 删掉的那一段之后
+ * 只能靠 InstallSnapshot 传输，这正是快照与压缩必须同期落地的原因。
+ *
+ * 只做控制面：它的状态机是 partdist 的两张元数据表，`partdist.raft_snapshot`
+ * 在每次 apply 时已经把整张表存下来了，压缩点上的状态天然可得。数据组的状态机
+ * 在 P3 之前就是 parwal 字节流本身，压缩它的正解是日志外部化（§11.5.2 #2），
+ * 不是在这里删行。
+ *
+ * 触发点选在 apply 之后：此时一定在 SPI 可用的语境里（控制面 apply 本身就要
+ * 写元数据表），且 last_applied 刚刚推进过。
+ */
+static void
+control_maybe_compact(RaftGroupCtx *ctx)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int64          applied;
+    int64          base_idx;
+    int64          keep_term = 0;
+
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return;
+    if (pg_raft_compact_threshold <= 0)
+        return;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    applied = ctx->log->last_applied;
+    base_idx = ctx->log->base_index;
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (applied - base_idx < pg_raft_compact_threshold)
+        return;
+
+    /*
+     * 基点那一条的 term 必须先拿到：压缩之后它就没了，而 prev 一致性检查与
+     * 选举的日志新旧比较都还要用它。取不到就**不压缩**（宁可日志长一点）。
+     */
+    if (!log_term_at(ctx, applied, &keep_term) || keep_term <= 0)
+        return;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    /*
+     * 快照必须**先于**删行落库：反过来一旦中间崩溃，日志没了、快照也没有，
+     * 落后成员就再也追不上了。raft_snapshot 是 upsert，重复执行无害。
+     */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "INSERT INTO partdist.raft_snapshot "
+                     "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
+                     "SELECT 1, %lld, %lld, "
+                     "COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                     "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                     "now() "
+                     "ON CONFLICT (singleton) DO UPDATE SET "
+                     "last_included_index = EXCLUDED.last_included_index, "
+                     "last_included_term = EXCLUDED.last_included_term, "
+                     "node_map = EXCLUDED.node_map, "
+                     "partition_map = EXCLUDED.partition_map, updated_at = now() "
+                     "WHERE partdist.raft_snapshot.last_included_index <= EXCLUDED.last_included_index",
+                     (long long) applied, (long long) keep_term);
+    if (SPI_execute(sql.data, false, 0) < 0)
+    {
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+    resetStringInfo(&sql);
+
+    appendStringInfo(&sql,
+                     "DELETE FROM partdist.raft_log "
+                     "WHERE group_id = 0 AND log_index <= %lld",
+                     (long long) applied);
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    SpinLockAcquire(&ctx->log->mutex);
+    if (applied > ctx->log->base_index)
+    {
+        ctx->log->base_index = applied;
+        ctx->log->base_term = keep_term;
+    }
+    SpinLockRelease(&ctx->log->mutex);
+
+    persist_hard_state_unlocked(ctx);
+
+    elog(LOG, "pg_raft: 组 0 日志已压缩到 index=%lld term=%lld（%lld 条已由快照取代）",
+         (long long) applied, (long long) keep_term,
+         (long long) (applied - base_idx));
 }
 
 void
@@ -2049,6 +2305,148 @@ peer_last_log_index(RaftGroupCtx *ctx, RaftPeer *p)
     return val;
 }
 
+/*
+ * InstallSnapshot 的发送侧（计划文档 §4 阶段 1 / §12.4 #7）。
+ *
+ * 只服务**控制面（组 0）**：它的状态机就是 partdist.node_map + partition_map，
+ * 有紧凑表示，日志压缩掉的那一段只能靠它传输。数据组的状态机在 P3（物理回放）
+ * 之前就是 parwal 字节流本身，"快照内容"与"日志内容"是同一份东西，装快照等于
+ * 重放日志 —— 那样的快照只会是个假机制，所以这里不做。
+ *
+ * 载荷从 partdist.raft_snapshot 读（apply 时一直在写），因此**必须有 SPI**；
+ * 调用方保证在 client backend 语境里（追平通道 / propose 路径）。
+ * 用 PQexecParams 传参而不是拼串：node_map/partition_map 是任意长 JSON。
+ */
+static bool
+send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx)
+{
+    StringInfoData sql;
+    PGconn        *conn;
+    PGresult      *res;
+    bool           spi_owned;
+    bool           isnull;
+    char          *snap_idx = NULL;
+    char          *snap_term = NULL;
+    char          *node_map = NULL;
+    char          *partition_map = NULL;
+    char           s_term[32];
+    char           s_leader[16];
+    const char    *params[6];
+    int64          rt = 0;
+    int            ok_flag = 0;
+    bool           sent = false;
+    MemoryContext  oldctx;
+
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return false;
+    if (peer_in_backoff(p))
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT last_included_index::text, last_included_term::text, "
+                     "       node_map::text, partition_map::text "
+                     "  FROM partdist.raft_snapshot WHERE singleton = 1 "
+                     "   AND last_included_index >= %lld",
+                     (long long) base_idx);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+
+        oldctx = MemoryContextSwitchTo(TopTransactionContext);
+        snap_idx = TextDatumGetCString(SPI_getbinval(tup, desc, 1, &isnull));
+        snap_term = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
+        node_map = TextDatumGetCString(SPI_getbinval(tup, desc, 3, &isnull));
+        partition_map = TextDatumGetCString(SPI_getbinval(tup, desc, 4, &isnull));
+        MemoryContextSwitchTo(oldctx);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (snap_idx == NULL || node_map == NULL || partition_map == NULL)
+    {
+        elog(WARNING,
+             "pg_raft: 组 0 已压缩到 %lld，但快照表里没有可用载荷，无法为落后成员装快照",
+             (long long) base_idx);
+        return false;
+    }
+
+    conn = peer_conn_get(p);
+    if (conn == NULL)
+    {
+        peer_mark_result(p, false);
+        return false;
+    }
+
+    snprintf(s_term, sizeof(s_term), "%lld", (long long) term);
+    snprintf(s_leader, sizeof(s_leader), "%d", pg_raft_node_id);
+    params[0] = s_term;
+    params[1] = s_leader;
+    params[2] = snap_idx;
+    params[3] = snap_term;
+    params[4] = node_map;
+    params[5] = partition_map;
+
+    res = PQexecParams(conn,
+                       "SELECT partdist.pg_raft_install_snapshot("
+                       "$1::bigint, $2::int, $3::bigint, $4::bigint, $5::text, $6::text)",
+                       6, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        sent = parse_resp2(PQgetvalue(res, 0, 0), &rt, &ok_flag);
+    else if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQclear(res);
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return false;
+    }
+    else
+        elog(WARNING, "pg_raft: InstallSnapshot 到 node %d 失败: %s",
+             p->node_id, PQerrorMessage(conn));
+    PQclear(res);
+    peer_mark_result(p, true);
+
+    if (!sent)
+        return false;
+
+    if (rt > term)
+    {
+        step_down_if_higher(ctx, rt);
+        return true;            /* 已降级，本轮到此为止 */
+    }
+
+    if (ok_flag)
+    {
+        int   slot = peer_slot_of(p);
+        int64 installed;
+
+        /*
+         * 游标要按**快照行里的 index** 记，不能按调用方传进来的 base_idx。
+         * 取载荷的 WHERE 是 `last_included_index >= base_idx`：两者之间又压缩了
+         * 一轮的话，对端装到的是更新的那个点。此时若按 base_idx 记 match/next，
+         * leader 下一轮会去补 base_idx+1 —— 那条在对端已随压缩删掉，prev 检查
+         * 取不到 term 只能拒绝，白白退一轮 nextIndex 才重新触发快照。
+         */
+        installed = strtoll(snap_idx, NULL, 10);
+        if (installed < base_idx)
+            installed = base_idx;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        if (ctx->log->peer_match_index[slot] < installed)
+            ctx->log->peer_match_index[slot] = installed;
+        if (ctx->log->peer_next_index[slot] < installed + 1)
+            ctx->log->peer_next_index[slot] = installed + 1;
+        SpinLockRelease(&ctx->log->mutex);
+        elog(LOG, "pg_raft: 已向 node %d 安装组 0 快照（last_included_index=%lld）",
+             p->node_id, (long long) installed);
+        return true;
+    }
+    return false;
+}
+
 static bool
 send_rpc_msg(RaftPeer *p, const char *msg, int64 *resp_term, int *resp_flag)
 {
@@ -2181,6 +2579,7 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     int64 prev_term = 0;
     int64 next_idx;
     int64 last_idx;
+    int64 base_idx;
     int64 leader_commit;
     RaftLogEntry entry;
     int64 rt;
@@ -2228,12 +2627,29 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
         prev_known = true;
     next_idx = ctx->log->peer_next_index[peer_slot];
     last_idx = ctx->log->last_log_index;
+    base_idx = ctx->log->base_index;
+    if (prev_idx > 0 && prev_idx == base_idx)
+    {
+        prev_term = ctx->log->base_term;    /* prev 恰好是压缩基点 */
+        prev_known = true;
+    }
     has_entry = (next_idx <= last_idx &&
                  log_get_entry_locked(ctx, next_idx, &entry));
     SpinLockRelease(&ctx->log->mutex);
 
     if (!repl_ready)
         return;
+
+    /*
+     * 对端需要的条目已被压缩掉（next_index 落在基点或更早）：日志里没有了，
+     * 只能装快照。需要 SPI 读快照载荷，因此只在 client backend 语境下做；
+     * BGW tick 里就先跳过，等追平通道那一轮。
+     */
+    if (base_idx > 0 && next_idx <= base_idx && raft_spi_ctx)
+    {
+        if (send_install_snapshot(ctx, &peers[peer_slot], term, base_idx))
+            return;
+    }
 
     /*
      * 环外回退：peer 落后超过环容量时，prev 与待发条目都已滑出环窗口。
@@ -2997,7 +3413,6 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                       const char *entry_data_hex,
                       int64 *out_term, int *success)
 {
-    RaftLogEntry prev;
     bool         has_entry = (entry_idx > 0 && entry_op != NULL && entry_payload != NULL);
     int64        commit_to_mark;
     int64        conflict_plsn = -1;
@@ -3035,10 +3450,12 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      */
     if (prev_idx > 0)
     {
-        bool prev_ok;
+        int64 my_prev_term;
+        bool  prev_ok;
 
         raft_spi_ctx = true;
-        prev_ok = (log_get_entry_ext(ctx, prev_idx, &prev) && prev.term == prev_term);
+        prev_ok = (log_term_at(ctx, prev_idx, &my_prev_term) &&
+                   my_prev_term == prev_term);
         raft_spi_ctx = false;
 
         if (!prev_ok)
@@ -3243,6 +3660,142 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
         pfree(entry_payload);
     if (entry_data_hex)
         pfree(entry_data_hex);
+
+    snprintf(out, sizeof(out), "%lld %d", (long long) out_term, success);
+    PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_install_snapshot);
+
+/*
+ * InstallSnapshot 的接收侧（控制面专用，见 send_install_snapshot 的注释）。
+ *
+ * 处理顺序按 Raft 论文 §7：
+ *   1. term 落后直接拒（只回自己的 term）；
+ *   2. 认 leader、重置选举计时器（快照传输期间不该被误判为失联）；
+ *   3. **若本地在 last_included_index 上恰好持有同 term 的条目**，保留其后的
+ *      日志尾巴（对端只是想让我跳过前面那段）；否则整段日志作废 —— 那意味着
+ *      我持有的是另一条历史；
+ *   4. 用快照内容整体替换状态机（node_map / partition_map），并把路由层
+ *      同步一遍；
+ *   5. 基点、三个游标、hardstate 落定。
+ *
+ * 这一整套跑在 RPC 的 client backend 里，SPI 天然可用。
+ */
+Datum
+pg_raft_install_snapshot(PG_FUNCTION_ARGS)
+{
+    int64        in_term = PG_GETARG_INT64(0);
+    int          leader_id = PG_GETARG_INT32(1);
+    int64        last_idx = PG_GETARG_INT64(2);
+    int64        last_term = PG_GETARG_INT64(3);
+    char        *node_map = text_to_cstring(PG_GETARG_TEXT_PP(4));
+    char        *partition_map = text_to_cstring(PG_GETARG_TEXT_PP(5));
+    RaftGroupCtx ctx;
+    int64        my_term_at_idx = 0;
+    bool         keep_tail;
+    int64        out_term = 0;
+    int          success = 0;
+    char         out[64];
+
+    if (RaftGroups == NULL || !pg_raft_raft_enabled)
+        PG_RETURN_TEXT_P(cstring_to_text("0 0"));
+
+    parse_peers();
+    if (!raft_control_ctx(&ctx))
+        PG_RETURN_TEXT_P(cstring_to_text("0 0"));
+
+    restore_hard_state_if_needed(&ctx);
+    restore_persistent_log_if_needed(&ctx);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    if (in_term > ctx.cons->current_term)
+    {
+        ctx.cons->current_term = in_term;
+        ctx.cons->voted_for = 0;
+    }
+    out_term = ctx.cons->current_term;
+    if (in_term < ctx.cons->current_term)
+    {
+        SpinLockRelease(&ctx.cons->mutex);
+        snprintf(out, sizeof(out), "%lld 0", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+    ctx.cons->state = RAFT_FOLLOWER;
+    ctx.cons->leader_id = leader_id;
+    reset_election_deadline_locked(&ctx);
+    SpinLockRelease(&ctx.cons->mutex);
+
+    /* 已经不比快照旧就什么都不用做（重发幂等） */
+    SpinLockAcquire(&ctx.log->mutex);
+    if (ctx.log->base_index >= last_idx)
+    {
+        SpinLockRelease(&ctx.log->mutex);
+        snprintf(out, sizeof(out), "%lld 1", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+    SpinLockRelease(&ctx.log->mutex);
+
+    raft_spi_ctx = true;
+    keep_tail = (log_term_at(&ctx, last_idx, &my_term_at_idx) &&
+                 my_term_at_idx == last_term);
+    raft_spi_ctx = false;
+
+    if (!pg_raft_apply_snapshot_state(node_map, partition_map))
+    {
+        snprintf(out, sizeof(out), "%lld 0", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+
+    /*
+     * 日志行：保留尾巴时只删基点及之前；整段作废时连尾巴一起删 ——
+     * 那段尾巴是另一条历史，留着会在 restore 时被灌回环。
+     */
+    if (!keep_tail)
+        delete_log_entries_after_sql(&ctx, last_idx);
+    {
+        StringInfoData sql;
+        bool           spi_owned;
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            if (raft_log_table_ready())
+            {
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "DELETE FROM partdist.raft_log "
+                                 "WHERE group_id = 0 AND log_index <= %lld",
+                                 (long long) last_idx);
+                (void) SPI_execute(sql.data, false, 0);
+                pfree(sql.data);
+            }
+            raft_persist_spi_end(spi_owned);
+        }
+    }
+
+    SpinLockAcquire(&ctx.log->mutex);
+    ctx.log->base_index = last_idx;
+    ctx.log->base_term = last_term;
+    if (!keep_tail || ctx.log->last_log_index < last_idx)
+        ctx.log->last_log_index = last_idx;
+    if (ctx.log->commit_index < last_idx)
+        ctx.log->commit_index = last_idx;
+    /*
+     * apply 游标**回拨**到 last_idx，不是只往上抬。状态机刚被整表替换成
+     * "截至 last_idx 的那一份"，保留下来的尾巴（last_idx+1..）必须在它上面
+     * 重放一遍才对得上；只抬不降的话，本地 last_applied 若已经越过 last_idx，
+     * 那段尾巴就永远不会再 apply —— 状态机反而**倒退**成快照那一刻的样子。
+     * 控制面的 apply 全是幂等 upsert（partition_map 还带任期栅栏），重放无害。
+     */
+    ctx.log->last_applied = last_idx;
+    SpinLockRelease(&ctx.log->mutex);
+
+    persist_hard_state_unlocked(&ctx);
+    success = 1;
+
+    elog(LOG, "pg_raft: 已安装组 0 快照 last_included=(%lld,%lld)，%s",
+         (long long) last_idx, (long long) last_term,
+         keep_tail ? "保留其后的日志尾巴" : "整段日志作废");
 
     snprintf(out, sizeof(out), "%lld %d", (long long) out_term, success);
     PG_RETURN_TEXT_P(cstring_to_text(out));
@@ -3546,14 +4099,16 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
     {
         RaftGroupState *g = &RaftGroups->groups[i];
         RaftGroupCtx    ctx;
-        Datum           values[8];
-        bool            nulls[8];
+        Datum           values[10];
+        bool            nulls[10];
         int             state;
         int64           term;
         int             leader_id;
         int64           last_idx;
         int64           commit_idx;
         int64           applied;
+        int64           base_idx;
+        int64           base_term;
 
         if (!g->in_use)
             continue;
@@ -3573,6 +4128,8 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         last_idx = ctx.log->last_log_index;
         commit_idx = ctx.log->commit_index;
         applied = ctx.log->last_applied;
+        base_idx = ctx.log->base_index;
+        base_term = ctx.log->base_term;
         SpinLockRelease(&ctx.log->mutex);
 
         memset(nulls, 0, sizeof(nulls));
@@ -3585,6 +4142,8 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         values[5] = Int64GetDatum(commit_idx);
         values[6] = Int64GetDatum(applied);
         values[7] = Int32GetDatum(group_cluster_size(&ctx));
+        values[8] = Int64GetDatum(base_idx);
+        values[9] = Int64GetDatum(base_term);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

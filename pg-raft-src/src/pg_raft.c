@@ -1098,6 +1098,16 @@ _PG_init(void)
                             &pg_raft_catchup_interval_ms, 5000, 0, 3600000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomIntVariable("pg_raft.compact_threshold",
+                            "控制面日志压缩阈值：已 apply 的条目超过该数量即压缩（0=关）。",
+                            "压缩会把 partdist.raft_log 里 last_applied 之前的行删掉，"
+                            "并把基点记进 hardstate；被删掉的那一段之后只能靠 "
+                            "partdist.pg_raft_install_snapshot() 传给落后成员。"
+                            "只作用于控制面（组 0）——数据组的状态机在物理回放之前就是 "
+                            "parwal 字节流本身，压缩它的正解是日志外部化。",
+                            &pg_raft_compact_threshold, 500, 0, 1000000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.dtx_recover_interval_ms",
                             "DTX-2PC 参与者恢复守护的自动运行间隔（0=关闭自动运行）。",
                             "每个节点的 TopologyMonitor 按该间隔经 libpq 自连接调"

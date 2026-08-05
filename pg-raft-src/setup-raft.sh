@@ -46,6 +46,7 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT,
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
 DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_catchup();
+DROP FUNCTION IF EXISTS partdist.pg_raft_install_snapshot(BIGINT, INTEGER, BIGINT, BIGINT, TEXT, TEXT);
 -- DTX-2PC 的三个 pg_raft 函数。**必须列在这里**：它们是 pg_raft 扩展成员，
 -- 但只要有过一次"扩展被 DROP、函数被 CREATE OR REPLACE 单独重建"的历史，
 -- 就会变成游离对象，此后每次 CREATE EXTENSION pg_raft 都直接报
@@ -317,6 +318,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_group_index
 -- 切主重构：数据组自治选举的主副本任期（任期栅栏）。pg_partdist 已安装时不会
 -- 重跑安装脚本，这里补列（与 pg_partdist--1.0.sql 中的定义保持一致）。
 ALTER TABLE partdist.partition_map ADD COLUMN IF NOT EXISTS primary_term BIGINT NOT NULL DEFAULT 0;
+-- 日志压缩：快照基点的 term（pg_raft--1.0.sql 中同名列，已装扩展在此补齐）
+ALTER TABLE partdist.raft_snapshot ADD COLUMN IF NOT EXISTS last_included_term BIGINT NOT NULL DEFAULT 0;
 SQL
   ensure_boundary_functions "$port"
 }

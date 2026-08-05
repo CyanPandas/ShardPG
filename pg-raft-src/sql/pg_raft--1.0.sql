@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS raft_snapshot (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 日志压缩：基点那一条的 term。压缩之后条目本身没了，而 prev 一致性检查与
+-- 选举的日志新旧比较还要用它，所以必须随快照一起持久化。
+ALTER TABLE raft_snapshot ADD COLUMN IF NOT EXISTS last_included_term BIGINT NOT NULL DEFAULT 0;
+
 COMMENT ON TABLE raft_state IS '控制面 Raft 持久化状态：leader 标识、term 与租约信息。';
 COMMENT ON TABLE raft_log IS '控制面已复制日志：元数据变更、failover 决议等。';
 COMMENT ON TABLE raft_snapshot IS '当前控制面元数据快照，用于恢复与后续快照安装。';
@@ -252,7 +256,9 @@ CREATE OR REPLACE FUNCTION pg_raft_group_status()
         last_log_index bigint,
         commit_index   bigint,
         last_applied   bigint,
-        cluster_size   integer
+        cluster_size   integer,
+        base_index     bigint,
+        base_term      bigint
     ) LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_status';
 
@@ -284,7 +290,9 @@ $fn$;
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
 COMMENT ON FUNCTION pg_raft_group_status() IS
-    '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。';
+    '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
+    'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'
+    'index <= base_index 的条目已被快照取代并从 raft_log 删除。';
 
 -- ---- P2：数据组以 parwal 记录为 Raft entry ----
 
@@ -296,6 +304,18 @@ CREATE OR REPLACE FUNCTION pg_raft_data_propose(
 COMMENT ON FUNCTION pg_raft_data_propose(bigint, bigint) IS
     '在数据组 leader 上把本节点 pg_parwal 的第 partition_lsn 条记录作为 Raft entry 提交；'
     '返回 Raft log index（0=失败）。提交成功即多数派已 fsync 落盘且 applied_part_lsn 已推进。';
+
+CREATE OR REPLACE FUNCTION pg_raft_install_snapshot(
+    p_term bigint, p_leader_id integer,
+    p_last_included_index bigint, p_last_included_term bigint,
+    p_node_map text, p_partition_map text
+) RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_install_snapshot';
+
+COMMENT ON FUNCTION pg_raft_install_snapshot(bigint, integer, bigint, bigint, text, text) IS
+    'InstallSnapshot RPC（仅控制面/组 0）：用快照整体替换 node_map/partition_map、同步路由层、'
+    '把日志压缩基点推进到 last_included_index。返回 "term flag"（flag=1 表示已安装）。'
+    '日志被压缩掉的那一段只能靠它传输——落后成员的 nextIndex 落到基点及更早时由 leader 自动调用。';
 
 CREATE OR REPLACE FUNCTION pg_raft_catchup()
     RETURNS bigint LANGUAGE c VOLATILE

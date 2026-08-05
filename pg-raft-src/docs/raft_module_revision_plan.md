@@ -77,6 +77,11 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
   **环外条目从 `partdist.raft_log` 回读**（leader 取条目 + follower 的 prev 检查
   与冲突判定），落后超过 `RAFT_LOG_CAPACITY=128` 的成员从此能追平。
   回归 `raft_24`，含两级对照（关通道必不收敛 / 只摘掉环外回读则 >128 段确定性失败）。
+- **控制面日志压缩 + InstallSnapshot（2026-08-05）**：`pg_raft.compact_threshold`
+  触发压缩（快照先落库、再删 `raft_log` 行、基点随 hardstate v3 持久化），
+  落后到压缩点之前的成员由 `partdist.pg_raft_install_snapshot()` 整体装载
+  （两张元数据表整表替换 + 路由层同步）。回归 `raft_25`，含真对照
+  （只摘掉发送侧则落后成员确定性冻结在原进度）。
 - 回归基线：`pg-raft-src/run-raft-tests.sh` **raft_01–22 全绿**；
   `pg-partdist-src/tests/test_shard_identity_p0.sh` **10/10**；
   全新库 `CREATE EXTENSION` 冒烟通过（raft_19 A 段，2026-08-04 正是它抓到
@@ -212,26 +217,29 @@ flowchart TB
 - ✅ 持久化 HardState：`current_term`、`voted_for`、`commit_index` 必须先落盘，再响应
   RequestVote 或 AppendEntries。（2026-07-20 升级为文件 v2，增加 `last_applied`，兼容读 v1。）
 - ✅ 完善 follower catch-up：落后 follower 恢复后通过 `nextIndex/matchIndex` 追赶。
-- ❌ **增加 snapshot install 设计**：`raft_snapshot` 至今仍只是控制面元数据快照表
-  （每次 apply 都在写 node_map/partition_map/last_included_index），**但没有任何
-  消费者**——没有 InstallSnapshot RPC，也没有按 `last_included_index` 删日志行。
+- ✅ **snapshot install（2026-08-05 落地，仅控制面）**：`partdist.pg_raft_install_snapshot()`
+  RPC + `send_install_snapshot()` 发送侧。此前 `raft_snapshot` 只是一张**没有消费者**
+  的表（每次 apply 都在写，却既没有 RPC 也没有按 `last_included_index` 删行），
   即"有快照内容、无快照机制"。
-  > **2026-08-05 修正边界**：落后超 ring 容量**不再是死局** —— 追平通道会从
-  > `partdist.raft_log` 回读环外条目把成员补齐（§12.4 #5，回归 raft_24）。
-  > 快照的真正必要性因此从"追平手段"变成"**压缩的前提**"：只要开始按
-  > `last_included_index` 删日志行，被删掉那一段就只能靠 InstallSnapshot 传输。
-  > 两者是一件事的两半，必须同期落地。
+  > 边界（2026-08-05 同日确认）：落后超 ring 容量**本身不再需要快照** —— 追平通道
+  > 会从 `partdist.raft_log` 回读环外条目（§12.4 #5，回归 raft_24）。快照的必要性
+  > 因此是"**压缩的前提**"：一旦按 `last_included_index` 删行，被删那段就只剩快照
+  > 一条路。两者是一件事的两半，同期落地，回归 raft_25。
+  > **数据组不做**：它的状态机在 P3 之前就是 parwal 字节流本身，"快照内容"与
+  > "日志内容"是同一份东西，装快照等于重放日志 —— 那只会是个假机制。
 - ✅ 完善 leader 宕机重选：新 leader 必须拥有所有已提交日志，旧 leader 恢复后必须降级为
   follower（raft_08 / raft_11）。
-- ❌ **替换固定 ring buffer 的长期假设，补上日志截断/压缩策略**：仍是
-  `RAFT_LOG_CAPACITY = 128` 定长 ring。多组之后这一项从“长期优化”变成阻断项，
-  正解见 §11.5.2 #2（数据组日志外部化到 parwal）。
-  > **2026-08-05 边界更新**：环不再是**追平**的上限（环外条目已能从
-  > `partdist.raft_log` 回读，§12.4 #5），但仍是 **shmem 占用**（每组
-  > 128×800B ≈ 100KB，`RAFT_MAX_GROUPS=32` 的由来）与**提交路径开销**
-  > （每条数据条目一次 `raft_log` INSERT + 一次 committed UPDATE）的上限。
-  > 压缩仍完全没做：`raft_log` 只增不删（一轮回归就 240+ 行，重启时
-  > `restore_persistent_log_if_needed` 全表读回）。
+- ⚠️ **替换固定 ring buffer 的长期假设，补上日志截断/压缩策略**：
+  **压缩已于 2026-08-05 落地（控制面）**：`pg_raft.compact_threshold`（缺省 500）
+  触发 `control_maybe_compact()`——先把快照连同 `(last_included_index,
+  last_included_term)` 写进 `partdist.raft_snapshot`，再删 `raft_log` 里
+  `<= last_applied` 的行，基点随 hardstate v3 持久化。回归 raft_25。
+  **定长 ring 本体仍在**（`RAFT_LOG_CAPACITY = 128`）：
+  > 环不再是**追平**的上限（环外条目已能从 `raft_log` 回读，§12.4 #5），
+  > 但仍是 **shmem 占用**（每组 128×800B ≈ 100KB，`RAFT_MAX_GROUPS=32` 的由来）
+  > 与**提交路径开销**（每条数据条目一次 `raft_log` INSERT + 一次 committed
+  > UPDATE）的上限。**数据组的压缩也仍然没有**——正解是日志外部化到 parwal
+  > （§11.5.2 #2），不是在数据组里删行。
 
 验收标准：
 
@@ -384,7 +392,21 @@ PartWAL 接入链路：
 - ✅ `RequestVote(group_id, term, candidate_id, last_log_index, last_log_term)`
 - ✅ `AppendEntries(group_id, term, leader_id, prev_log_index, prev_log_term, leader_commit, entries[])`
   —— 数据组条目额外随行一个 `bytea` 原始 WAL 字节参数。
-- ❌ `InstallSnapshot(...)` **未实现**。
+- ✅ `pg_raft_install_snapshot(term, leader_id, last_included_index, last_included_term,
+  node_map, partition_map)` —— **2026-08-05 落地，仅控制面（组 0）**。载荷是
+  `partdist.raft_snapshot` 里的两张元数据表；发送侧在 leader 发现某成员的
+  `nextIndex` 落到压缩基点及更早时自动调用（需要 SPI，所以挂在追平通道的
+  client backend 语境上）。数据组不做——理由见 §4 阶段 1。
+  > 两条**靠推理定下、未被用例直接覆盖**的不变式（都只在竞态下才现形，构造不出
+  > 确定性夹具，因此不写进判据、也不算已验证）：
+  > ① 发送侧记 `matchIndex/nextIndex` 用的是**快照行里的 `last_included_index`**，
+  >    不是调用时读到的 `base_index` —— 取载荷的条件是 `>= base_index`，两者之间
+  >    又压缩一轮的话对端装到的是更新的点，按旧点记游标会去补一条对端已删的条目，
+  >    白退一轮 nextIndex 才重新触发快照（能自愈，只是浪费一轮）。
+  > ② 接收侧装完把 `last_applied` **回拨**到 `last_included_index`（不是只往上抬）：
+  >    状态机刚被整表替换成"截至该点"的那一份，保留下来的尾巴必须重放才对得上；
+  >    只抬不降的话，本地游标若已越过该点，尾巴永不再 apply，状态机反而倒退。
+  >    控制面 apply 全是幂等 upsert，重放无害。
 - ⚠️ 报文里的 `group_id` 缺省 0（向后兼容），但**成员集不在报文里传播**，是当前缺口。
 
 ### 控制面日志操作
@@ -485,6 +507,7 @@ PartWAL 接入链路：
 | `raft_21_dtx_recovery` | **DTX-2PC 参与者侧恢复守护（`DTX_2PC_DESIGN.md` §7）**，用例本体在 `test/raft_21_dtx_recovery.sh`（可独立跑），八段：A 协调组已有 COMMIT 决议 ⇒ 恢复守护提交 prepared 事务、数据可见、补 `DTX_COMMIT` 标记；B 从未决议 ⇒ 经 `dtx_status` **推定中止**、回滚、补 `DTX_ABORT` 标记且**决议已落库**（推定中止是写下来的，不是隐含的）；C 未超时的 prepared 事务不被触碰（不与正常路径抢答）；D **协调组不可达 ⇒ 保持 prepared 不动**——绝不擅自决定；E **登记缺失的 citus gid 按 Citus 规则闭合、不许永久滞留**（Citus 自己的恢复已被关掉，没人兜底就是行锁永久滞留；夹具必须显式删登记行——手工 PREPARE 也会被参与者接线自动登记，不删的话测不到这条路径，2026-08-04 真对照抓出）；F Citus 规则提交侧（master 的 `pg_dist_transaction` 有该 gid ⇒ 参与者提交）；G **initiator 存活栅栏**（发起 backend 还活着 ⇒ 绝不推定中止——`pg_dist_transaction` 的行在 master 本地提交前不可见，"慢 master"会被误回滚成分叉；用 master 的 checkpointer pid 当永活发起者，确定性无竞态）；H **守护自动闭合**（TopologyMonitor 周期自触发，无任何手工 SQL）。**E/G 均有真对照**：修复前构建 E 处 prepared 永久滞留、G 处活发起者的事务被误回滚；I **`pg_dist_transaction` 的 GC**（§9.7，2026-08-04）：只删"发起者已死 + 全网确认无 prepared"的行，发起者活着/仍有 prepared/任一节点不可达都保守不删（不可达返回 -1 整轮放弃） | ✅ |
 | `raft_23_dtx_close_indoubt` | **升主 in-doubt 闭合机制（`DTX_2PC_DESIGN.md` §9.6，机制先行）+ 混合写集告警（§9.4）**，用例本体在 `test/raft_23_dtx_close_indoubt.sh`（可独立跑），五段：A 有登记 ⇒ `dtx_status` 权威通道，推定中止先落库，流为 `1,2,4`（协调组即自身时 ABORT 决议兼任闭合）；B 无登记、决议在**成员不相交的另一个组** ⇒ 广播 peers 的决议索引命中，闭合 COMMIT；C citus 形态 dtxid ⇒ 前缀查 `pg_dist_transaction`（带发起者存活栅栏，只认 COMMIT）；D **四级阶梯全落空 ⇒ 保持 in-doubt 不动、重复调用幂等**——不知道协调组是谁就无法把推定中止写下来，绝不无凭据闭合；E 纳管+非纳管混合写集在 PREPARE 时收到 WARNING。剩给第 6 步的只是把函数插进升主序列与合流验收 | ✅ |
 | `raft_24_background_catchup` | **后台追平通道（§12.4 #5）**，用例本体在 `test/raft_24_background_catchup.sh`（可独立跑），四段：A **关掉通道（`catchup_interval_ms=0`）+ 无任何写入 ⇒ 必须不收敛**——这一半就是对照，没有它，B 段的收敛无法归因；B 打开通道（reload 生效，顺带走一遍 SIGHUP 通路）后仍不写入任何数据，落后成员在窗口内条数+逐字节指纹追平；C **落后 >128 条（超环容量）也能追平**，走的是环外条目从 `partdist.raft_log` 回读；D 追平**不产生新条目**（`last_log_index` 前后不变）且收敛后再调返回 0。**夹具两个硬约束**：① 段文件基线必须 `partwal_truncate_to(oid,0)` 清零——OID 复用会让新壳表继承上一轮的记录（raft_13 老教训，本次实测踩到）；② **不能假定领导权落在 placement 节点、更不能假定它不变**——起步时三成员日志都空谁先超时谁当选，且本实现无 PreVote，成员重启会带更高 term 竞选把在任 leader 打成 follower 一轮，所以每次写入前都重新发现 leader 并等路由层跟上。**真对照**（同用例仅换 .so）：只把 `log_get_entry_sql` 摘掉重编，A/B 照过、C 确定性失败（follower 卡在 41、leader 401） | ✅ |
+| `raft_25_snapshot_compaction` | **控制面日志压缩 + InstallSnapshot（§4 阶段 1 / §12.4 #7）**，用例本体在 `test/raft_25_snapshot_compaction.sh`（可独立跑），五段：A 压缩真的发生（基点推进、`raft_log` 里 `<= 基点` 的行为 0、快照行的 `(index, term)` 与基点**成对**一致——配错对会让接收方的 prev 检查永久错位）且压缩后新提案照常提交；B **落后到压缩点之前的成员靠快照追平**；C 装完快照状态机一致（只比**由日志决定**的列：`last_heartbeat`/`updated_at` 是各节点本地 `now()`，比它们是在测设计从未承诺的东西）；D 基点跨重启不丢（hardstate v3）；E **压缩之后重启不丢日志尾巴**（全节点重启后新条目不得落在已存在的 index 上——按压缩前的恢复写法会直接覆盖已提交条目，是 in-build 对照）。**B 的构造有个坑（首版实测踩到）**：压缩只删 SQL 行，shmem 环里最近 128 条还在，leader 照样逐条补得上——只推进 30 条时，把 `send_install_snapshot()` 摘掉的对照构建**也照样通过**（假测试）。必须推进 **>128 条**让环绕过去，那些条目才真的不复存在。**E 的构造也有个坑**：造尾巴之前必须先把 `compact_threshold` 顶高冻住基点，否则那几条 apply 完立刻又触发一次压缩、基点直接追到日志末端，尾巴长度为 0 —— 集群安静时必然如此，只有恰好有后台探测补上新条目才侥幸成立（首次跑套件正是这样蒙混过去的，独立重跑才暴露；用例里留了"尾巴为空即判构造无效"的自检）。**真对照**（同用例仅换 .so）：摘掉发送侧后 B 段确定性失败（落后成员冻结在 539，leader 已到 756） | ✅ |
 | `raft_22_dtx_end_to_end` | **DTX-2PC 端到端（`DTX_2PC_DESIGN.md` §3.3/§3.4/§5.3/§8.3/§9.3）**，用例本体在 `test/raft_22_dtx_end_to_end.sh`（可独立跑），六段：A 前置——二进制导出 `pre_record_commit_hook` 且逐节点 `citus.recover_2pc_interval=-1`；B **真实跨分区事务**提交后协调组有且仅有一条 COMMIT 决议、participants 恰为真实写集、协调组 == `participants_sorted[dtxid % n]`、**且决议在协调组每个成员上都在**；C 三阶段在 parwal 流里逐条可见（参与组 `DATA…,PREPARE,COMMIT` ／协调组 `DATA…,PREPARE,DECISION` 且**无**单独 COMMIT 标记），PREPARE 携带本地 top-level xid 且排在 DATA 之后；D **快路径**：单分区事务不写决议也不写标记；E **只读参与者剔除**：广播 UPDATE 打到全部 8 个分片但只有 1 个真改到行 ⇒ 不产生决议，同时只读参与者仍留 `gsids='{}'` 的登记（它崩溃后自解的唯一线索）；F **协调组失去多数派** ⇒ 事务**提交失败**且无行可见（不允许部分提交），并断言失败原因含"多数派"。**判据构造有两个坑**：① 只停协调组 leader 不行——组内还剩 2/3 会自治选出新 leader 并上报改写路由，决议照样做得出来、事务本就该成功（那正是"协调权随选举转移"在起作用）；② 也不能把协调组的 primary 算进被停的两个里——它同时是数据分片的主节点，停它测的是"主挂了写不进"这个与 2PC 无关的性质。必须停两个**非主**成员：数据主全活着，失败只可能落在 prepare 复制凑不齐多数派。**真对照**：`pg_raft.dtx_2pc_enabled=off` 重跑，B 段确定性失败 | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
@@ -595,6 +618,8 @@ PartWAL 接入链路：
 | 2PC 决议丢失会导致部分提交 | ~~通过控制面 Raft 复制~~ **改为写入协调组（写集内 `hash(dtxid)` 选出的分区组）的日志并等 quorum**；查无决议即推定中止（`DTX_2PC_DESIGN.md`） | ✅ 2026-08-04 端到端落地，回归 raft_20/21/22 |
 | Citus 自带 2PC 恢复与协调组决议打架 ⇒ 分叉提交 | `citus.recover_2pc_interval = -1`，改由 `partdist.dtx_recover_prepared()` 统一收尾：有协调组的按决议、快路径的退回 Citus 原生规则（`DTX_2PC_DESIGN.md` §9.4） | ✅ 已落地，raft_22 A 段前置断言 |
 | **TopologyMonitor 不处理 SIGHUP ⇒ 全部 pg_raft.\* GUC 对 reload 静默无效** | BGWorker 默认不接 SIGHUP；补 `pqsignal(SIGHUP, SignalHandlerForConfigReload)` + 循环里 `ProcessConfigFile`。此前 `raft_enabled`/心跳/选举超时改完 reload 只对新 backend 生效、守护进程要重启才认 —— 直到 raft_21 H（依赖 reload 降 dtx 守护超时）在负载下超时才暴露 | ✅ 2026-08-04 修复 |
+| **压缩之后重启会丢日志尾巴 ⇒ 覆盖已提交条目（2026-08-05 落地压缩时发现并修掉）** | 日志恢复原先按"`last_log_index > 0` 就说明已经有日志了"早退。有了压缩之后，重启时 hardstate 会先把 `last_log_index` 顶到基点（基点之前的条目已被快照取代，游标不能落在它之下），于是恢复被**整段跳过**，表里 `base+1..N` 的尾巴永远灌不回环。对 follower 只是要 leader 重发；对**重启后重新当选的 leader** 就是灾难——它以为日志止于基点，会拿新内容覆盖已提交的 `base+1..`，直接破坏 Leader Completeness。修复=改用每组一个 `log_restored` 标志判"是否已灌过"，并在灌完后把三个游标夹到基点之上。回归 raft_25 E 段（**in-build 对照**：按旧写法重启后新条目会落在已存在的 index 上） | ✅ 已修 |
+| **apply 抛错 ⇒ `apply_in_progress` 永久为真 ⇒ 该节点 apply 游标静默冻结** | 旗在 `apply_one_entry` **之前**置上、之后才清，中间任何 ereport 都会让它永远留在 true，此后每次 `group_apply_pending` 都在"另一个 backend 正在 apply"分支立即返回。实测：一条 payload 违反 `node_map_status_check` 的条目让**九个节点全部**卡在同一 index（`commit_index` 照常前进，无任何告警）；有了压缩之后更糟——基点也跟着不动，既追不上也压不了。修复=把 apply 包进子事务（`apply_one_entry_guarded`），控制面按既有"跳过安全"语义跳过、数据面保留游标下轮重试，**旗一定清掉** | ✅ 2026-08-05 修复 |
 | **按 payload 文本判日志冲突 ⇒ 误截断（2026-08-05 自造并当场修掉）** | `raft_log.payload` 是 **jsonb**，读回来的文本被规范化过（键序、冒号后空格），与 leader 线上发来的原始 JSON 逐字节不等。环外回读一落地，"同 index 但文本不同即冲突"的写法就把**每一条**环外条目判成冲突并截断——实测把控制面日志从 347 条削到 35 条。改回 Raft 原始规则：**冲突只看 term**（同 index 同 term 必出自同一 leader）。同理，重启后 restore 灌回环里的也是规范化文本，环内比文本一样不可靠 | ✅ 已修 |
 | **group-commit 让路窗口使 prepare 的多数派保证失效** | per-backend 触达集合 + 提前返回路径也触发复制挂钩；prepare 语义改为"等 `commit_index` 覆盖本事务记录"（`DTX_2PC_DESIGN.md` §9.1） | ✅ 已修，回归 raft_17（确定性让路构造） |
 | 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
@@ -1153,7 +1178,10 @@ follower 必须按 **leader 指定的** `partition_lsn` 落盘，而不是本地
    - 回归 raft_24（两级对照：关通道必不收敛 / 只摘掉环外回读则 >128 段确定性失败）。
 6. **P3 物理回放本体**：把平凡 apply 换成 `DecodeXLogRecord → 改写 RelFileLocator → rm_redo`。
    验收：follower 堆表与 leader 收敛一致；切主后新 primary 拥有切换点前的全部已提交数据。
-7. 其余：InstallSnapshot、`partwal_notify_primary_switch` 真实化。
+7. ~~其余：InstallSnapshot~~ **✅ 2026-08-05 完成（控制面）**：压缩 + InstallSnapshot
+   同期落地，回归 raft_25。剩 `partwal_notify_primary_switch` 真实化，以及
+   **数据组**的压缩/快照——前者的正解是日志外部化（#3），后者要等 P3
+   （在此之前数据组的"快照内容"与"日志内容"是同一份东西）。
 
 > **2026-08-03 顺序修正**：2PC 不再排在最后，也不依赖 P3 —— 见
 > `pg-partdist-src/docs/DTX_2PC_DESIGN.md` §10 的六步落地顺序。其中第 1 步

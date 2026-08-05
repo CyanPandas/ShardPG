@@ -1383,6 +1383,24 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_25: 控制面日志压缩 + InstallSnapshot（计划文档 §4 阶段 1 / §12.4 #7）
+# 用例本体在 test/raft_25_snapshot_compaction.sh（自带夹具与清理，可独立跑）。
+# 用时较长：B 段要把日志推过环容量（128 条）才谈得上"只能靠快照"。
+# ------------------------------------------------------------------
+section "raft_25 控制面压缩与快照"
+
+start_all_nodes
+sleep 2
+RAFT_25_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_25_snapshot_compaction.sh" 2>&1) && RAFT_25_RC=0 || RAFT_25_RC=$?
+echo "$RAFT_25_OUT" | sed 's/^/    /'
+if [[ "$RAFT_25_RC" -eq 0 ]]; then
+  ok "raft_25_snapshot_compaction"
+else
+  bad "raft_25_snapshot_compaction($(echo "$RAFT_25_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"
