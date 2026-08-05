@@ -1439,8 +1439,84 @@ log_get_entry_sql(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
 }
 
 /*
- * 两级取条目：先查环（无锁开销最小），环外再落到 SQL 日志。
- * **不得**在持有 log->mutex 时调用（SQL 那一级要走 SPI）。
+ * 数据组的环外取条目：从 parwal 按 run 重建（计划文档 §11.10 E2）。
+ *
+ * 数据组条目的内容本来就在段文件里，raft_log 里那份是冗余的镜像。E2 起
+ * 数据组的读路径**只认段文件**（E3 会把那份镜像的写入一并撤掉）——
+ * 重建不出来就当作"本节点没有这一条"，让 leader 继续回退，绝不去 raft_log
+ * 里捞一份可能与段文件不一致的影子。
+ */
+static bool
+log_get_entry_parwal(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    bool           found = false;
+
+    if (ctx->group_id == RAFT_CONTROL_GROUP || index <= 0)
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+    if (!raft_runs_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return false;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT term, payload FROM partdist.pg_raft_entry_from_parwal(%lld, %lld)",
+                     (long long) ctx->group_id, (long long) index);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+        bool      tnull;
+        bool      pnull;
+        Datum     dterm;
+        Datum     dpayload;
+
+        dterm = SPI_getbinval(tup, desc, 1, &tnull);
+        dpayload = SPI_getbinval(tup, desc, 2, &pnull);
+        /*
+         * 查不到 run、或该 plsn 在本节点段文件里不存在时，SQL 函数返回的是
+         * 一行全 NULL（不是零行）—— 与 partwal_read_record 同样的形态，
+         * 必须逐列判 NULL，否则 TextDatumGetCString(0) 直接段错误
+         * （2026-08-03 在 data_propose_one 上用 gdb 实锤过同一个坑）。
+         */
+        if (!tnull && !pnull)
+        {
+            char *payload = TextDatumGetCString(dpayload);
+
+            out->index = index;
+            out->term = DatumGetInt64(dterm);
+            strlcpy(out->op_type, RAFT_OP_PARWAL, RAFT_OP_LEN);
+            strlcpy(out->payload, payload, RAFT_PAYLOAD_MAX);
+            pfree(payload);
+            found = true;
+        }
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return found;
+}
+
+/*
+ * 环外那一级取条目：控制面从 partdist.raft_log 回读，数据组从 parwal 按 run
+ * 重建（§11.10 E2）。两条路径的返回语义相同 —— true 表示"本节点确实持有
+ * index 这一条，内容在 *out 里"。
+ */
+static bool
+log_get_entry_durable(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return log_get_entry_parwal(ctx, index, out);
+    return log_get_entry_sql(ctx, index, out);
+}
+
+/*
+ * 两级取条目：先查环（无锁开销最小），环外再落到持久层。
+ * **不得**在持有 log->mutex 时调用（第二级要走 SPI）。
  * 非 SPI 语境（BGW tick）退化为只查环，行为与加这条回读之前完全一致。
  */
 static bool
@@ -1455,7 +1531,7 @@ log_get_entry_ext(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
     if (got || !raft_spi_ctx)
         return got;
 
-    return log_get_entry_sql(ctx, index, out);
+    return log_get_entry_durable(ctx, index, out);
 }
 
 static void
@@ -2772,7 +2848,8 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
 
     /*
      * 环外回退：peer 落后超过环容量时，prev 与待发条目都已滑出环窗口。
-     * SPI 语境（propose / pg_raft_catchup）下从 SQL 日志读回来，这样落后
+     * SPI 语境（propose / pg_raft_catchup）下从持久层读回来（控制面查
+     * partdist.raft_log，数据组按 run 从 parwal 重建，§11.10 E2），这样落后
      * 任意远的 follower 都能被逐条追平；BGW tick 无 SPI，维持原行为
      * （prev_term=0 → 对端拒 → next_index 递减 → 仅心跳），不改变时序语义。
      */
@@ -2780,13 +2857,13 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     {
         RaftLogEntry old;
 
-        if (!prev_known && log_get_entry_sql(ctx, prev_idx, &old))
+        if (!prev_known && log_get_entry_durable(ctx, prev_idx, &old))
         {
             prev_term = old.term;
             prev_known = true;
         }
         if (!has_entry && next_idx <= last_idx &&
-            log_get_entry_sql(ctx, next_idx, &entry))
+            log_get_entry_durable(ctx, next_idx, &entry))
             has_entry = true;
     }
 
@@ -3608,7 +3685,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                  */
                 SpinLockRelease(&ctx->log->mutex);
                 raft_spi_ctx = true;
-                have_old = log_get_entry_sql(ctx, entry_idx, &old);
+                have_old = log_get_entry_durable(ctx, entry_idx, &old);
                 raft_spi_ctx = false;
                 SpinLockAcquire(&ctx->log->mutex);
 
