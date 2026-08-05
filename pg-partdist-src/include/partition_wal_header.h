@@ -218,6 +218,7 @@ typedef struct TxnMarkerPayload
 
 /* opcode（放在头部的 info 字段） */
 #define PARTWAL_CTRL_FILESET_UPDATE  UINT8_C(0x01)
+#define PARTWAL_CTRL_FREEZE_UPDATE   UINT8_C(0x02)
 
 /*
  * FILESET_UPDATE 载荷：leader 侧 fileset 变更后的**全量**新描述。
@@ -257,5 +258,62 @@ StaticAssertDecl(sizeof(PartWALCtrlFilesetUpdate) == 8,
                  "PartWALCtrlFilesetUpdate 必须是 8 字节（CTRL 磁盘格式）");
 StaticAssertDecl(sizeof(ShardFileSetRel) == 16,
                  "ShardFileSetRel 必须是 16 字节且无填充洞（随 CTRL 直写磁盘）");
+
+/* ------------------------------------------------------------------ */
+/* FREEZE_UPDATE 载荷：leader 的冻结账目（FRD §13 约束 5，D2）          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么要同步这两个**目录字段**：
+ *
+ * 副本壳表的元组物理上确实被冻结了（leader 的 freeze 记录随流回放，元组字节
+ * 两侧一致），但 `pg_class.relfrozenxid` 这个目录字段在 follower 上没人维护 ——
+ * 它停在建壳表那一刻的值。而 follower 的 nextXid 会被回放水位不断拉高
+ * （§7.5），于是 age(relfrozenxid) 无界增长，迟早越过
+ * autovacuum_freeze_max_age。
+ *
+ * 越过之后 **autovacuum_enabled = off 会被忽略**（autovacuum.c:3196
+ * `if (!av_enabled && !force_vacuum)`，§13 约束 5 已实测），副本壳表照样被
+ * 强制 anti-wraparound vacuum 扫到 —— 而它的元组带的是**外来节点**的 xid，
+ * 本地 clog 对它们一无所知。更糟的是那次 vacuum 会写本地 WAL 碰副本文件，
+ * 把 §13 约束 12 那个洞重新打开。
+ *
+ * 为什么直接搬 leader 的原值是**真话**（这正是本方案优于"直接推本地值"之处）：
+ * relfrozenxid = X 的语义是"本关系内不存在比 X 更老的未冻结 xid"。副本的堆页
+ * 与 leader 逐字节一致 ⇒ 同一句话在 follower 上同样成立。搬过来不是编造，
+ * 而是把一个本来就为真、只是没人写下来的事实补上。
+ *
+ * 只对**堆**有意义：索引的 pg_class.relfrozenxid 恒为 0。所以载荷里只会出现
+ * SHARD_REL_MAIN 与 SHARD_REL_TOAST 两种 role。
+ *
+ * data_len == sizeof(PartWALCtrlFreezeUpdate) + nrels * sizeof(PartWALFreezeEntry)
+ *          == 8 + 12 * nrels
+ */
+typedef struct PartWALFreezeEntry
+{
+    uint8       role;           /* ShardRelRole：只可能是 MAIN 或 TOAST */
+    uint8       ord;
+    uint16      reserved;       /* 显式补齐，恒为 0 */
+    uint32      relfrozenxid;   /* leader 的 pg_class.relfrozenxid */
+    uint32      relminmxid;     /* leader 的 pg_class.relminmxid   */
+} PartWALFreezeEntry;
+
+typedef struct PartWALCtrlFreezeUpdate
+{
+    uint32      nrels;
+    uint32      reserved;       /* 显式补齐，恒为 0 */
+    /* PartWALFreezeEntry rels[nrels] 紧随其后 */
+} PartWALCtrlFreezeUpdate;
+
+#define PartWALCtrlFreezeUpdateSize(n) \
+    (sizeof(PartWALCtrlFreezeUpdate) + (size_t) (n) * sizeof(PartWALFreezeEntry))
+
+#define PartWALCtrlFreezeRels(u) \
+    ((PartWALFreezeEntry *) ((char *) (u) + sizeof(PartWALCtrlFreezeUpdate)))
+
+StaticAssertDecl(sizeof(PartWALCtrlFreezeUpdate) == 8,
+                 "PartWALCtrlFreezeUpdate 必须是 8 字节（CTRL 磁盘格式）");
+StaticAssertDecl(sizeof(PartWALFreezeEntry) == 12,
+                 "PartWALFreezeEntry 必须是 12 字节且无填充洞");
 
 #endif /* PARTITION_WAL_HEADER_H */

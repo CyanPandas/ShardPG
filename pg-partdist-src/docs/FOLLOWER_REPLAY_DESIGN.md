@@ -1115,7 +1115,22 @@ worker 抱着旧表还是撞同一道栅栏。
 `replay_catchup()` 遇到栅栏**立即报错返回**,不干等到超时:它要等的是人工动作,
 而超时报出来的会是"追平超时",把原因盖掉。
 
-### 12.3 已知边界(D1 未覆盖)
+### 12.3 opcode 清单
+
+| opcode | 载荷 | 用途 |
+|---|---|---|
+| `FILESET_UPDATE` (0x01) | `PartWALCtrlFilesetUpdate` + `ShardFileSetRel[]` | 物理文件集合变更(§12.1/§12.2) |
+| `FREEZE_UPDATE` (0x02) | `PartWALCtrlFreezeUpdate` + `PartWALFreezeEntry[]` | 冻结账目同步(§13 约束 5,D2) |
+
+两者的**失败语义刻意不同**,别照抄:
+
+- `FILESET_UPDATE` 发射失败 ⇒ **让调用方的事务中止**。结构变了却没通知副本,
+  DDL 就不该提交,否则副本静默分歧。
+- `FREEZE_UPDATE` 发射失败 ⇒ **只告警,不更新基线,下次重发**。它只是账目字段,
+  为它中止用户的一次 VACUUM 是本末倒置 —— 而实测正会发生:VACUUM 刷出的 FPI
+  洪水把 Raft 心跳饿死、领导权移走,紧接着的 `PartWALAppendCtrl` 即报错。
+
+### 12.4 已知边界(D1 未覆盖)
 
 - **`DROP TABLE`**:shard 整个没了。副本侧的处置(停流 / 删副本)需要另一个
   opcode,D1 保持沉默而不是发一条半吊子的 `FILESET_UPDATE`。
@@ -1175,7 +1190,103 @@ worker 抱着旧表还是撞同一道栅栏。
    >
    > R2-e 交付的是**可观测**:`partdist.replay_freeze_status()` 把每个副本壳表
    > 离强制阈值还有多远(`pct_to_force`)摆出来,验收用例断言 autovacuum 确实已关
-   > 并打印最坏值。处置本身留待 §12 CTRL 通道就位。
+   > 并打印最坏值。
+   >
+   > **★ 处置已定:走方案 (a),经 CTRL 同步(D2 已实装,2026-08-04 用户决策)。**
+   >
+   > 为什么 (a) 是**真话**而 (b) 是编造:`relfrozenxid = X` 的语义是"本关系内
+   > 不存在比 X 更老的未冻结 xid"。副本堆页与 leader **逐字节一致** ⇒ 同一句话
+   > 在 follower 上同样成立。搬过来不是伪造,而是把一个本来就为真、只是没人
+   > 写下来的事实补上。(b) 则是明知副本元组带外来 xid 还把本地值往前推。
+   >
+   > 落地形态(§12.4):
+   > - 新 opcode `CTRL:FREEZE_UPDATE`,载荷只含堆关系(索引的 `relfrozenxid` 恒为 0)。
+   > - leader 侧检测是**时间驱动**而非 DDL 驱动:`autovacuum` 推进 relfrozenxid
+   >   **不走 ProcessUtility**(它在 autovacuum worker 里直接调 `vacuum_rel`),
+   >   D1 那套"DDL 后置脏标记"对它完全无效。GUC
+   >   `pg_partdist.freeze_sync_interval_ms`(默认 60s;relfrozenxid 是以千万 xid
+   >   为尺度变化的慢变量,分钟级滞后无影响)。去重靠与持久化基线
+   >   `pg_parwal/<oid>/freeze` 的 diff,不靠间隔本身。
+   >
+   >   **★ 间隔水位必须在共享内存里**(`PartWALCtlData.freeze_last_check`,
+   >   经 `PartWALFreezeCheckDue()` 在锁下 compare-and-set),不能是 backend
+   >   本地 static —— 本地 static 的初值 0 = "从没查过",于是**每条新连接的
+   >   第一次提交都会无视间隔立刻发射**。R1 开几十条短命 psql 连接,实测就把
+   >   "每分钟一次"变成了"每连接一次",几十条 CTRL propose 压在 VACUUM 灌
+   >   Raft 日志环的窗口上,把 128 槽的环顶爆 → 见约束 13(永久分叉)。
+   >   改成节点级水位后,同一轮 R1 的发射次数从几十降到 2,环顶爆 0 次。
+   > - **发射是尽力而为,失败绝不拖垮调用方的事务。** 与 FILESET_UPDATE 的区别
+   >   是本质的:结构变了却没通知副本,DDL 就不该提交;而 relfrozenxid 只是账目,
+   >   为它中止一次 VACUUM 是本末倒置 —— 实测正会如此:VACUUM 刷出的 FPI 洪水
+   >   把 Raft 心跳饿死、领导权移走,紧接着的 `PartWALAppendCtrl` 即以"本节点
+   >   不是该分区组的 leader"报错。失败时**不更新基线**,下次检查自然重发。
+   > - **follower 侧的写入不在 replay worker 里做。** worker 的连接是
+   >   `BackgroundWorkerInitializeConnection(NULL, NULL, 0)` —— **故意不选数据库**
+   >   (那么写是为了走完 `BaseInit`,不是为了读目录)。在它里面碰 `pg_class` 会
+   >   当场 `cannot read pg_class without having selected a database` FATAL,
+   >   而 worker 一 FATAL 就重启、从游标重放、再撞同一条记录 —— **无限崩溃循环**
+   >   (实测撞到,`applied` 永远停在 0)。所以 worker 只把值搬进共享内存槽位,
+   >   真正写 `pg_class`(`heap_inplace_update`,同内核 `vac_update_relstats`)
+   >   由 `replay_catchup()` 的**调用方**完成 —— 惰性形态下回放只可能由它触发,
+   >   一定有这么一个有数据库、有事务的普通 backend 在。
+   > - **★★★ leader 侧的发射用白名单门禁:本 backend 必须已经执行过至少一条
+   >   用户语句**(`ShardFreezeNoteUserActivity()`,由 `ExecutorStart` /
+   >   `ProcessUtility` 两个钩子置位),外加第二道 `MyBackendType == B_BACKEND`
+   >   且 `application_name` 不以 `citus_` 开头。这不是防御性编程,是**必需条件**。
+   >
+   >   理由:本检查挂在**每一个**事务的 `PRE_COMMIT` 上,而发射一次 = 一次
+   >   **同步 Raft 复制**,要阻塞等对端多数派 ack。于是任何"本身就在管理到
+   >   对端连接"、或者根本还没初始化完的进程,一旦被挂上这个钩子就会出事。
+   >   实测四例,**前三例都是先补黑名单、下一轮换个进程接着崩**:
+   >
+   >   | 进程 | 后果 |
+   >   |---|---|
+   >   | ① autovacuum launcher(不绑数据库) | 读 `pg_class` 当场 FATAL → 节点重置 |
+   >   | ② Citus 维护守护进程(`B_BG_WORKER`,跑 2PC 恢复 + 分布式死锁检测) | 同节点 backend `signal 11` → 节点重置 → 该组失多数派 → follower 追不平 |
+   >   | ③ Citus 内部 backend(`citus_internal gpid=` 等) | 本节点在给别的节点干活,在它的提交点反向同步等对端,同类重入 |
+   >   | ④ **任何新连接的 `InitPostgres` 引导事务** | `B_BACKEND` + 有数据库 + `application_name` 未设 ⇒ 前三条黑名单全放行,而 backend 尚未初始化完 → **SIGSEGV** |
+   >
+   >   ④ 的栈回溯(用 `pg_partdist.debug_segv_backtrace` 拿到):
+   >   ```
+   >   InitPostgres → CommitTransactionCommand → PartWALXactCallback
+   >     → ShardFreezeMaybeEmitUpdates → ShardFreezeEmitOne
+   >     → PartWALAppendCtrl → PartWALReplicateTouched
+   >     → pg_raft_partwal_replicate → data_propose_one
+   >     → text_to_cstring → pg_detoast_datum_packed        ← SIGSEGV
+   >   ```
+   >   即**每建一条连接就赌一次**。节点被打死后该分区组失去多数派,follower
+   >   收不到后半截记录,最终表现成"回放出的文件 diff 不一致"——而且每轮崩在
+   >   哪一步是随机的,于是**每轮失败的项都不一样**,极像回放逻辑的偶发缺陷。
+   >   R1 因此连续四轮被误判(29~47/55 之间乱跳),直到把栈打出来才定位。
+   >
+   >   **黑名单永远补不完,所以改成白名单。** 发射器本就是时间驱动的慢账目
+   >   同步,"等这个 backend 先跑条正经语句"没有任何代价。
+   >
+   >   排除 autovacuum worker 看似矛盾(推进 `relfrozenxid` 的正是它),其实不然:
+   >   发射器是**时间驱动 + 与持久化基线 diff**,不关心"谁改的",晚一点由任意
+   >   普通 backend 的提交点捎带即可。
+   >
+   >   对比 §12 的 fileset 发射器:它由 `ProcessUtility` 置的脏标记护着,只在真正
+   >   跑了 DDL 的事务里发射(Citus 传播 DDL 用的正是内部 backend,所以那条**不能**
+   >   按 `citus_` 排除)。**时间驱动的没有这层保护,必须自己判。**
+   >
+   >   配套修掉的 pg_raft 缺陷:`data_propose_one()` 读记录头时没判 `isnull`,
+   >   而 `partwal_read_record` 读不出记录时返回的是**一行全 NULL**而不是零行,
+   >   于是 `TextDatumGetCString(0)` 直接解引用空指针。一个本该是事务级 ERROR
+   >   的情况被放大成节点级崩溃 —— 上面那个 SIGSEGV 的最后一跳就是它。
+   > - **写入不间断的分片上,账目可能长期同步不了**(已知代价,非缺陷):本事务
+   >   只要还有未落盘的分区记录就整轮跳过(`PartWALHasPendingRecords()`),不与
+   >   正在写分片流的事务交织。fileset 变更不能这么做(结构变更必须与那次 DDL
+   >   同事务发出去),冻结账目可以 —— 两者的可延迟性本就不同。
+   >
+   > **仍未根治(D2 的边界,须显式记住)**:follower 的 `nextXid` 是被节点上
+   > **最活跃的那个 leader** 拉上去的(`PartDistAdvanceNextXidPastXid` 推的是
+   > 节点全局值)。同时托管来自 leader X(很忙)与 leader Y(很闲)的副本时,
+   > Y 的 `relfrozenxid` 在本节点的 xid 空间里看起来依然很老,`age()` 照样会爆。
+   > (a) 根治的是**单 leader 场景**——也就是现在必然出问题的那个;跨 leader 的
+   > xid 偏斜要把副本壳表从 `datfrozenxid` 计算与 autovacuum 强制路径里摘出去,
+   > 那需要内核补丁。与约束 12 是同一件事的两面:副本文件被本地 WAL 触碰的
+   > 唯一剩余入口就是这条 anti-wraparound vacuum。
 6. **unlogged / 临时表**:不产生 WAL,天然不在流内;shard 表必须是 logged。
 7. **多索引 AM**:R1 只承诺 heap + btree(覆盖 TOAST);GIN 等按附录 A 矩阵逐个
    验证后放开。
@@ -1269,6 +1380,41 @@ worker 抱着旧表还是撞同一道栅栏。
     彻底的办法只有让副本文件永不被本地 WAL 触碰,而那需要先解决约束 5 的
     relfrozenxid 处置。**两条约束应当合并立项,不要各修各的。**
 
+13. **★★ Raft 日志环顶爆 ⇒ leader 的物理截断在 follower 上永久缺失**
+    (2026-08-05 实测,未修,记为 pg_raft 侧待办)。
+
+    `RAFT_LOG_CAPACITY = 128`,`log_append_locked()` 的门是
+    `last_log_index - last_applied >= 127`。VACUUM 的 FPI 洪水灌记录的速度
+    远高于同步 apply 速率(实测 ~3–10 条/秒),环一满就
+    ```
+    WARNING: pg_raft: group 102042 log ring full, cannot append
+    ERROR:   pg_raft: 分区 188522(组 102042) record 2607 复制未达多数派,prepare 失败,事务中止
+    ```
+    问题在于:**`lazy_truncate_heap()` 的物理截断在 leader 上已经做掉,而它
+    不随事务回滚**(内核在 `AccessExclusiveLock` 下截空页,认定安全)。于是
+    leader 短了、follower 没短,那条 `XLOG_SMGR_TRUNCATE` 再也不会重发 ——
+    **永久分叉,既无检测也无修复路径**。R1 的实测表现:TOAST 主堆
+    leader `155648` / follower `614400`,而索引、TOAST 索引、主堆都对得上,
+    极像"某个特定关系的回放漏了"。
+
+    相关但不同的一个坑:中止的那个事务在分区流里留下了读不出来的空洞
+    (`partwal_read_record 返回空行`),复制挂钩是区间式的
+    (`[last_data_plsn+1, flush_lsn]`),踩到洞就整段失败。pg_raft 的
+    `data_propose_one()` 原本在这里**没判 `isnull`** —— 而
+    `partwal_read_record` 读不出记录时返回的是**一行全 NULL 而非零行**,
+    上游 `SPI_processed == 0` 那道门拦不住,于是 `TextDatumGetCString(0)`
+    直接 SIGSEGV 打死整个节点。已修成事务级 ERROR。
+
+    **D2 与这条的关系**:冻结账目发射器会往同一个环里插 CTRL propose。
+    发射水位原本是 backend 本地 static(初值 0 = 从没查过),导致**每条新连接
+    的第一次提交都无视间隔立刻发射**;R1 开几十条短命 psql 连接,恰好压在
+    VACUUM 灌环的窗口上,把环顶爆。已改为节点级共享水位
+    (`PartWALFreezeCheckDue`,`PartWALCtlData.freeze_last_check`)。
+    **但那只是让 D2 不再去顶这个环,环本身的流控缺失没有解决。**
+
+    真正的修法在 pg_raft:propose 侧在环接近满时**阻塞等 apply**而不是报错,
+    或把环溢出到磁盘。
+
 ---
 
 ## 14. 代码落点与分阶段计划
@@ -1311,6 +1457,7 @@ pg-partdist-src/
     test_txn_layer_r2.sh       R2 事务层(gclog 直接查账)
     test_ddl_fileset_d1.sh     [新] D1 DDL/fileset 控制通道(§12)
     test_local_wal_conflict.sh [新] 本地 WAL 崩溃恢复不得覆盖回放结果(§13 约束 12)
+    test_freeze_sync_d2.sh     [新] 冻结账目经 CTRL 同步(§13 约束 5)
 ```
 
 > `test_local_wal_conflict.sh` 必须**独立**于 R1 的 kill -9 用例:修复生效后
@@ -1321,7 +1468,21 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 `replay_naptime_ms`、`replay_checkpoint_interval_ms`、
 `replay_checkpoint_bytes`、`replay_trust_local_segments`(测试模式,§6)、
 `fileset_inline_max_blocks`(D1,§12,默认 131072)、
-`replay_dw_enabled`(sidecar,§8.5,**未实现**)。
+`freeze_sync_interval_ms`(D2,§13 约束 5,默认 60000;0 = 每事务查,测试用)、
+`replay_dw_enabled`(sidecar,§8.5,**未实现**)、
+`debug_segv_backtrace`(诊断,`PGC_POSTMASTER`,默认 off)。
+
+> **★ `debug_segv_backtrace` 为什么必须有。** PostgreSQL 不装 SIGSEGV 处理器,
+> 崩溃进程在日志里只留一行 `server process (PID nnn) was terminated by signal 11`
+> ——没有栈、没有语句;而本环境 `core_pattern` 是管道到 apport,容器里拿不到 core。
+> 结果是"看得见崩、看不见在哪崩"。开启后处理器把栈打进服务器日志再交还默认处置
+> (崩溃语义不变),配合
+> `addr2line -f -C -e /work/pg-install/lib/postgresql/pg_partdist.so <偏移>`
+> 就能还原调用链。约束 5 的第 ④ 例正是这么定位的 —— 在此之前连续四轮误判。
+>
+> 验收脚本侧的配套:`tests/lib_node_health.sh` 的 `health_check_no_crash`,
+> 在每个套件收尾断言"本轮时间窗内无 signal 11/6 或 PANIC"。**在此之前验收
+> 脚本对"节点崩了"完全是瞎的**,把节点级崩溃导致的文件不一致报成回放缺陷。
 
 ### 14.2 阶段计划
 
@@ -1330,6 +1491,7 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 | R1 物理回放闭环 | fileset 化捕获(含索引/TOAST,**含 §5.2 的 RM_SMGR main-data 特判**);补丁 0002;replay worker(**worker 池 + §13.10 排他认领**):decode→remap→盖 orig_lsn→rm_redo(兼容 v2 段流,XACT 原始记录跳过);apply checkpoint(无 xid_map);skip 白名单;`XLogHaveInvalidPages` 审计 | 带索引 + TOAST 的表,leader 写入后 follower 文件与 leader 在**内核 `heap_mask()` 掩码之外逐字节一致(且 `pd_lsn` 不掩,须相同)**(见下方 ★);kill -9 worker 后重启追平且仍一致;**用例须显式制造一次 VACUUM 尾部截断**(否则 §5.2 的 SMGR 洞测不出来) | — |
 | R2 事务层 | parwal-3.0(gxid 头 + TSO 标记 + 子事务列表);xid_map + 快照;`max_replayed_fxid` + nextXid 拉齐;增强型 CLOG 写路径;冻结账目核查(§13 约束 5) | 提交事务 COMMITTED、中止/子事务回滚 ABORTED/缺失;崩溃后 xid_map 与 CLOG 幂等重建;`pg_gclog` 内容与 leader 事务历史一致(**★★ 见下方「R2 验收 = 账本正确，不是可见」**) | R1 |
 | D1 DDL/fileset 控制通道 | CTRL 记录格式 + `PartWALAppendCtrl`;locmap v2(加 `role`/`ord`);leader 侧 `ProcessUtility_hook` 检测 → PRE_COMMIT 发射 `FILESET_UPDATE` + `log_newpage_range` 灌新文件;follower 侧换表/截断 与 `REPLAY_NEEDS_STRUCT` 结构栅栏(§12) | `VACUUM FULL`/`REINDEX`/`TRUNCATE` 全自动追平且页面比对仍一致;`CREATE INDEX` 停在栅栏(游标不推进、locmap 未换),补齐本地结构 + 重跑 `replay_set_locmap()` 后原地继续;未同步结构的另一 follower 必须仍停住 | R1 |
+| D2 冻结账目同步 | `CTRL:FREEZE_UPDATE`;leader 侧时间驱动检测(autovacuum 不走 ProcessUtility)+ 持久化基线 diff + **尽力而为**发射;follower 侧 worker 发布到槽位、`replay_catchup` 调用方写 `pg_class`(§13 约束 5) | follower 壳表的 `relfrozenxid` 由建表初值变为 leader 的值、`age()` 有界;leader 再次 VACUUM 后能重新同步;账目未变时不重复发射 | D1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
 | R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
 

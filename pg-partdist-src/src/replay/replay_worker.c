@@ -29,10 +29,15 @@
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
 
+#include "access/heapam.h"              /* heap_inplace_update */
+#include "access/relation.h"
+#include "access/table.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"       /* wal_segment_size */
 #include "access/xlogutils.h"
+#include "catalog/pg_class.h"
 #include "postmaster/bgwriter.h"        /* RequestCheckpoint */
+#include "utils/syscache.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -197,6 +202,90 @@ ReplaySlotFindLocked(Oid shard_oid, bool create)
 static void ReplaySlotLoadLocsLocked(ReplayShardSlot *s);
 static ReplayShardSlot *ReplaySlotFindLocked(Oid shard_oid, bool create);
 
+/*
+ * 把 worker 发布在槽位里的冻结账目写进本地 pg_class（§13 约束 5，D2）。
+ *
+ * **必须在普通 backend 里调用**：replay worker 的连接没有选数据库，
+ * 碰 pg_class 会 FATAL 并把它拖进崩溃重启循环。所以落点选在
+ * replay_catchup() 的调用方 —— 惰性形态下回放只可能由它触发，一定有这么
+ * 一个有数据库、有事务的调用方在。
+ *
+ * 为什么搬 leader 的原值是**真话**而不是编造：relfrozenxid = X 的语义是
+ * "本关系内不存在比 X 更老的未冻结 xid"。副本堆页与 leader 逐字节一致，
+ * 同一句话在本节点同样成立 —— 这正是本方案区别于"直接把本地值往前推"
+ * （写一个明知为假的目录字段）的地方。
+ *
+ * 用 heap_inplace_update 而非普通 UPDATE，与内核 vac_update_relstats 同款：
+ * pg_class 的这几个字段是非事务性的账目字段。
+ */
+static void
+ReplayDrainAndApplyFreeze(Oid shard_oid)
+{
+    PartWALFreezeEntry ents[SHARD_FILESET_MAX_RELS];
+    int                n = 0;
+    int                i;
+    Relation           classRel;
+    Oid                toastoid = InvalidOid;
+    Relation           shell;
+
+    /* 取走并清空，避免下一次 catchup 重复写 */
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+        if (s->shard_oid != shard_oid || s->freeze_n == 0)
+            continue;
+        n = s->freeze_n;
+        memcpy(ents, s->freeze, (size_t) n * sizeof(PartWALFreezeEntry));
+        s->freeze_n = 0;
+        break;
+    }
+    LWLockRelease(ReplayCtl->lock);
+
+    if (n == 0)
+        return;
+
+    shell = try_relation_open(shard_oid, AccessShareLock);
+    if (shell == NULL)
+        return;
+    toastoid = shell->rd_rel->reltoastrelid;
+    relation_close(shell, AccessShareLock);
+
+    classRel = table_open(RelationRelationId, RowExclusiveLock);
+
+    for (i = 0; i < n; i++)
+    {
+        Oid           relid;
+        HeapTuple     ctup;
+        Form_pg_class pgcform;
+
+        relid = (ents[i].role == SHARD_REL_MAIN) ? shard_oid : toastoid;
+        if (!OidIsValid(relid))
+            continue;
+
+        ctup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+        if (!HeapTupleIsValid(ctup))
+            continue;           /* 关系没了；leader 下次变化时会重发 */
+
+        pgcform = (Form_pg_class) GETSTRUCT(ctup);
+        if (pgcform->relfrozenxid != (TransactionId) ents[i].relfrozenxid ||
+            pgcform->relminmxid != (MultiXactId) ents[i].relminmxid)
+        {
+            pgcform->relfrozenxid = (TransactionId) ents[i].relfrozenxid;
+            pgcform->relminmxid   = (MultiXactId) ents[i].relminmxid;
+            heap_inplace_update(classRel, ctup);
+        }
+        heap_freetuple(ctup);
+    }
+
+    table_close(classRel, RowExclusiveLock);
+
+    ereport(DEBUG1,
+            (errmsg("pg_partdist replay: shard %u 冻结账目已写入 pg_class"
+                    "（%d 条）", shard_oid, n)));
+}
+
 void
 ReplaySlotRefreshLocs(Oid shard_oid)
 {
@@ -340,7 +429,10 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
                      errhint("本地 shell 表做等价结构变更后重跑 "
                              "replay_set_locmap()，再重新触发 replay_catchup()。")));
         if (done)
+        {
+            ReplayDrainAndApplyFreeze(shard_oid);
             return applied;
+        }
 
         if (timeout_ms > 0 && waited >= timeout_ms)
             ereport(ERROR,

@@ -107,4 +107,31 @@ extern void ShardFilesetMaybeEmitUpdates(void);
 /* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流（超限只发通知） */
 extern int  fileset_inline_max_blocks;
 
+/* ------------------------------------------------------------------ */
+/* §13 约束 5：冻结账目同步（D2）                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ShardFreezeMaybeEmitUpdates — 在 XACT_EVENT_PRE_COMMIT 调用：按时间间隔
+ * 把本节点每个 shard 的 pg_class.relfrozenxid / relminmxid 与持久化基线 diff，
+ * 有变化就发一条 CTRL:FREEZE_UPDATE。
+ *
+ * 用时间驱动而不是 D1 那套"DDL 后置脏标记"，是因为 **autovacuum 推进
+ * relfrozenxid 不走 ProcessUtility**，脏标记对它完全无效。
+ */
+extern void ShardFreezeMaybeEmitUpdates(void);
+
+/*
+ * ShardFreezeNoteUserActivity — "本 backend 执行了一条用户语句"。
+ *
+ * 由 ExecutorStart / ProcessUtility 两个钩子调用，是冻结发射器的**白名单**开关。
+ * 没有它，发射器会跑进新连接的 InitPostgres 引导事务里 —— 那时 backend 还没
+ * 初始化完，一路走到 pg_raft 的 SPI 读取会 SIGSEGV 打死整个节点。
+ * 详见 shard_fileset.c 里 ShardFreezeMaybeEmitUpdates 的守卫注释。
+ */
+extern void ShardFreezeNoteUserActivity(void);
+
+/* GUC：两次冻结账目检查的最小间隔（毫秒）；0 = 每个事务都查（测试用） */
+extern int  freeze_sync_interval_ms;
+
 #endif /* SHARD_FILESET_H */

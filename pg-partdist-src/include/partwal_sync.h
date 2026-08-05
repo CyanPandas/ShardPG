@@ -77,6 +77,9 @@ typedef struct PartWALCtlData
     LWLock        *lock;            /* protects all fields below */
     int            write_pos;       /* next slot to write (wraps at PARTWAL_BUFFER_SLOTS) */
     XLogRecPtr     flushed_upto;    /* highest orig_lsn written to pg_parwal */
+    TimestampTz    freeze_last_check;  /* §13 约束 5：上次冻结账目检查的时刻。
+                                         * **必须是节点级共享的**，不能是 backend
+                                         * 本地 static —— 见 PartWALFreezeCheckDue */
     PartWALSlot    slots[PARTWAL_BUFFER_SLOTS];
 } PartWALCtlData;
 
@@ -104,6 +107,25 @@ extern bool  PartWALSyncIsRegistered(RelFileNumber relfilenode);
  * 返回写进 out 的个数。
  */
 extern int   PartWALSyncListPartitions(Oid *out, int max);
+
+/* 本 backend 当前事务是否还有未落盘的分区记录（冻结账目发射用它回避交织） */
+extern bool  PartWALHasPendingRecords(void);
+
+/*
+ * PartWALFreezeCheckDue — 冻结账目检查的**节点级**限流（§13 约束 5）。
+ *
+ * 距上次检查已超过 interval_ms 则返回 true 并就地把水位推到现在（compare-and-set
+ * 在 PartWALCtl->lock 下完成，所以并发的多个 backend 里只有一个能过）。
+ *
+ * ★ 为什么这个状态必须在共享内存里、不能是 backend 本地 static：
+ * 本地 static 的初值是 0 = "从没查过"，于是**每个新连接的第一次提交都会无视
+ * 间隔立刻发射**。R1 用例开几十条短命 psql 连接，实测就变成几十次发射，而且
+ * 恰好和 VACUUM 灌 Raft 日志环的窗口重叠 —— 128 槽的环被顶爆
+ * （"log ring full, cannot append"），VACUUM 事务中止，而它的物理截断在
+ * leader 上已经做掉了，follower 却永远收不到那条 SMGR 截断记录：**永久分叉**。
+ * 表现是 R1 的 TOAST 文件大小两侧对不上。
+ */
+extern bool  PartWALFreezeCheckDue(int interval_ms);
 
 /*
  * 给一个分区追加一条 CTRL 控制记录并就地复制（FRD §7.7/§12）。

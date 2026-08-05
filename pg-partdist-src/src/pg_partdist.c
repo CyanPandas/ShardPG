@@ -1,5 +1,10 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
+#ifdef HAVE_EXECINFO_H
+#include <execinfo.h>
+#endif
+#include <signal.h>
+#include <unistd.h>
 #include "write_router.h"
 #include "partition_wal.h"
 #include "partwal_sync.h"
@@ -82,6 +87,13 @@ PartWALXactCallback(XactEvent event, void *arg)
              */
             ShardFilesetMaybeEmitUpdates();
 
+            /*
+             * 冻结账目同步（§13 约束 5）。放在 fileset 之后：结构变更可能
+             * 换出新的 TOAST 堆，先让 fileset 定下来再取它的 relfrozenxid。
+             * 本函数自带时间间隔守卫，普通事务只多一次时间戳比较。
+             */
+            ShardFreezeMaybeEmitUpdates();
+
             /* 提交已成定局 → 连同 COMMIT 标记一起落盘 */
             PartWALFlush(InvalidXLogRecPtr, true);
             break;
@@ -151,6 +163,8 @@ partdist_shmem_startup(void)
 static void
 partdist_executor_start(QueryDesc *queryDesc, int eflags)
 {
+    ShardFreezeNoteUserActivity();
+
     if (queryDesc->operation == CMD_INSERT ||
         queryDesc->operation == CMD_UPDATE ||
         queryDesc->operation == CMD_DELETE)
@@ -275,6 +289,8 @@ partdist_process_utility(PlannedStmt *pstmt,
                           DestReceiver *dest,
                           QueryCompletion *qc)
 {
+    ShardFreezeNoteUserActivity();
+
     /* Register COPY FROM target BEFORE the chain writes WAL */
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
@@ -293,6 +309,50 @@ partdist_process_utility(PlannedStmt *pstmt,
         ShardFilesetNoteMaybeChanged();
 }
 
+/* ---- SIGSEGV 诊断 ---- */
+
+/*
+ * PostgreSQL 不装 SIGSEGV 处理器，崩溃进程只在 postmaster 日志里留一行
+ *     server process (PID nnn) was terminated by signal 11
+ * ——没有栈、没有语句、没有任何指向。而本环境的 core_pattern 是管道到 apport，
+ * 容器里拿不到 core。结果就是"看得见崩、看不见在哪崩"，只能靠猜；这套模块
+ * 排查 D2 时因此连续四轮误判。
+ *
+ * 这个处理器把栈打进 stderr（即服务器日志），然后交还默认处置让 postmaster
+ * 照常看到真正的 signal 11 —— 崩溃语义一点不变，只是多留一份现场。
+ * backtrace_symbols_fd 是 async-signal-safe 的那个变体（不 malloc）。
+ * 后端二进制以 --export-dynamic 链接，所以能出函数名。
+ */
+static bool debug_segv_backtrace = false;
+
+#ifdef HAVE_EXECINFO_H
+static void
+partdist_segv_handler(int signum)
+{
+    void *frames[64];
+    int   n;
+    char  hdr[128];
+    int   len;
+
+    len = snprintf(hdr, sizeof(hdr),
+                   "pg_partdist: 收到信号 %d，pid %d 栈回溯：\n",
+                   signum, (int) getpid());
+    if (len > 0)
+    {
+        ssize_t rc = write(STDERR_FILENO, hdr, (size_t) len);
+
+        (void) rc;      /* 信号处理器里写不出去也没别的办法 */
+    }
+
+    n = backtrace(frames, (int) lengthof(frames));
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+
+    /* 交还默认处置：postmaster 仍看到真正的 signal，崩溃语义不变 */
+    signal(signum, SIG_DFL);
+    raise(signum);
+}
+#endif
+
 /* ---- module load ---- */
 
 void
@@ -300,6 +360,27 @@ _PG_init(void)
 {
     if (!process_shared_preload_libraries_in_progress)
         return;
+
+    DefineCustomBoolVariable(
+        "pg_partdist.debug_segv_backtrace",
+        "崩溃（SIGSEGV/SIGBUS/SIGILL）时把栈回溯打进服务器日志。",
+        "core_pattern 被 apport 接管、容器内拿不到 core 时的替代手段。",
+        &debug_segv_backtrace,
+        false,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL
+    );
+
+#ifdef HAVE_EXECINFO_H
+    if (debug_segv_backtrace)
+    {
+        /* 处理器随 fork 继承，因此在 postmaster 装一次即覆盖全部后端 */
+        signal(SIGSEGV, partdist_segv_handler);
+        signal(SIGBUS,  partdist_segv_handler);
+        signal(SIGILL,  partdist_segv_handler);
+    }
+#endif
 
     /* GUC: local node ID */
     DefineCustomIntVariable(
@@ -329,6 +410,25 @@ _PG_init(void)
         "超过此值只发结构变更通知（NEEDS_REBASELINE），副本须重做物理基线。",
         &fileset_inline_max_blocks,
         131072,             /* 1 GB */
+        0,
+        INT_MAX,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL
+    );
+
+    /*
+     * GUC: 两次冻结账目检查的最小间隔（§13 约束 5）。relfrozenxid 是以千万
+     * xid 为尺度变化的慢变量，分钟级滞后毫无影响；设 0 表示每个事务都查，
+     * 仅供验收用例使用。
+     */
+    DefineCustomIntVariable(
+        "pg_partdist.freeze_sync_interval_ms",
+        "两次把 leader 的 relfrozenxid 同步给副本的检查之间的最小间隔。",
+        "0 = 每个事务都检查（测试用）。autovacuum 推进 relfrozenxid 不走 "
+        "ProcessUtility，所以这条同步是时间驱动而非 DDL 驱动。",
+        &freeze_sync_interval_ms,
+        60000,
         0,
         INT_MAX,
         PGC_SUSET,

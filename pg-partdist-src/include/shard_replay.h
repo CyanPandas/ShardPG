@@ -27,6 +27,7 @@
 
 #include "shard_fileset.h"
 #include "shard_xidmap.h"
+#include "partition_wal_header.h"   /* PartWALFreezeEntry */
 
 /* ------------------------------------------------------------------ */
 /* loc_map                                                              */
@@ -163,6 +164,24 @@ typedef struct ShardReplayCtx
     bool               needs_struct;
     char               struct_errmsg[REPLAY_ERRMSG_LEN];
 
+    /*
+     * 待发布的冻结账目（§13 约束 5，D2）。
+     *
+     * ★ replay worker **访问不了 catalog**：它的连接是
+     * BackgroundWorkerInitializeConnection(NULL, NULL, 0) —— 故意不选数据库
+     * （那么写是为了走完 BaseInit，不是为了读目录）。在这里碰 pg_class 会
+     * 当场 "cannot read pg_class without having selected a database" FATAL，
+     * 而 worker 一 FATAL 就重启、从游标重放、再撞同一条记录 —— 无限崩溃循环。
+     * （这个坑是实测撞出来的，别再把目录写回搬进 worker。）
+     *
+     * 所以 worker 只负责把值搬到共享内存槽位（ReplayShardSlot.freeze），
+     * 真正写 pg_class 由 replay_catchup() 的**调用方**完成 —— 那是一个正常
+     * backend，有数据库、有事务。惰性形态下回放只可能由 replay_catchup
+     * 触发，所以一定有这么一个调用方在。
+     */
+    int                pending_freeze_n;
+    PartWALFreezeEntry pending_freeze[SHARD_FILESET_MAX_RELS];
+
     /* 建 ctx 时槽位上的 locmap 代次；与槽位不符即须重建（见 ReplayShardSlot）*/
     uint64             locmap_gen;
 
@@ -270,6 +289,14 @@ typedef struct ReplayShardSlot
     /* 本地副本文件号 —— 补丁 0002 豁免哈希的数据源 */
     int           nlocs;
     RelFileNumber locs[SHARD_FILESET_MAX_RELS];
+
+    /*
+     * worker 发布、replay_catchup 的调用方消费的冻结账目（§13 约束 5）。
+     * worker 碰不了 catalog（见 ShardReplayCtx.pending_freeze 的说明），
+     * 只能经这里把值交给一个有数据库的普通 backend 去写 pg_class。
+     */
+    int                freeze_n;
+    PartWALFreezeEntry freeze[SHARD_FILESET_MAX_RELS];
 } ReplayShardSlot;
 
 typedef struct ReplayCtlData

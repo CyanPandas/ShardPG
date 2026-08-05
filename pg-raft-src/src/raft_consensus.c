@@ -2984,8 +2984,38 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
         raft_persist_spi_end(spi_owned);
         return 0;
     }
-    orig_lsn = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0],
-                                                 SPI_tuptable->tupdesc, 1, &isnull));
+    /*
+     * ★ isnull 必须先判再转。partwal_read_record 是 OUT 参数形式的函数：
+     * 记录读不出来时它返回**一行全 NULL**，而不是零行 —— 上面
+     * `SPI_processed == 0` 那道门根本拦不住。此时
+     *     TextDatumGetCString(SPI_getbinval(...))  →  pg_detoast_datum_packed(NULL)
+     * 当场 SIGSEGV，**打死整个节点**（postmaster 随即
+     * "terminating any other active server processes; reinitializing"），
+     * 而调用方本来只该收到一个事务级 ERROR。
+     *
+     * 实测栈（pg_partdist 的 SIGSEGV 回溯）：
+     *   InitPostgres → CommitTransactionCommand → PartWALXactCallback
+     *   → ... → pg_raft_partwal_replicate → data_propose_one
+     *   → text_to_cstring → pg_detoast_datum_packed
+     *
+     * 一个节点级崩溃能把该分区组打到失去多数派，进而让 follower 追不平、
+     * 文件 diff 大面积不一致 —— 排查时极易被误判成回放逻辑的偶发缺陷。
+     */
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                SPI_tuptable->tupdesc, 1, &isnull);
+
+        if (isnull)
+        {
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+            ereport(ERROR,
+                    (errmsg("pg_raft: 分区 %lld 的记录 plsn=%lld 读不出头部"
+                            "（partwal_read_record 返回空行）",
+                            (long long) local_oid, (long long) partition_lsn)));
+        }
+        orig_lsn = TextDatumGetCString(d);
+    }
     rmid = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
                                        SPI_tuptable->tupdesc, 2, &isnull));
     info = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],

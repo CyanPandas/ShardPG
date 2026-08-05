@@ -217,9 +217,10 @@ PartWALSyncShmemInit(void)
                         &found);
     if (!found)
     {
-        PartWALCtl->lock         = &GetNamedLWLockTranche(PARTWAL_SYNC_LOCK_TRANCHE)[0].lock;
-        PartWALCtl->write_pos    = 0;
-        PartWALCtl->flushed_upto = InvalidXLogRecPtr;
+        PartWALCtl->lock              = &GetNamedLWLockTranche(PARTWAL_SYNC_LOCK_TRANCHE)[0].lock;
+        PartWALCtl->write_pos         = 0;
+        PartWALCtl->flushed_upto      = InvalidXLogRecPtr;
+        PartWALCtl->freeze_last_check = 0;
         memset(PartWALCtl->slots, 0, sizeof(PartWALCtl->slots));
     }
 
@@ -654,6 +655,43 @@ PartWALAppendTxnMarker(PartitionWALWriter *writer, XLogRecPtr orig_lsn,
 }
 
 static void PartWALReplicateTouched(void);
+
+/*
+ * PartWALHasPendingRecords — 本 backend 当前事务是否还有未落盘的分区记录。
+ *
+ * 冻结账目发射（§13 约束 5）用它来**回避**：正在写分片流的事务里插一条 CTRL，
+ * 会让 CTRL 的 partition_lsn 排到那些逻辑上更早的 DATA 前面，流序错乱。
+ */
+bool
+PartWALHasPendingRecords(void)
+{
+    return partwal_my_max_lsn != InvalidXLogRecPtr;
+}
+
+/*
+ * PartWALFreezeCheckDue — 冻结账目检查的节点级限流（§13 约束 5）。
+ * 语义与实现动机见 partwal_sync.h 的声明处注释。
+ */
+bool
+PartWALFreezeCheckDue(int interval_ms)
+{
+    TimestampTz now = GetCurrentTimestamp();
+    bool        due;
+
+    if (PartWALCtl == NULL)
+        return false;
+
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    due = (PartWALCtl->freeze_last_check == 0) ||
+          (interval_ms <= 0) ||
+          TimestampDifferenceExceeds(PartWALCtl->freeze_last_check, now,
+                                     interval_ms);
+    if (due)
+        PartWALCtl->freeze_last_check = now;
+    LWLockRelease(PartWALCtl->lock);
+
+    return due;
+}
 
 /*
  * PartWALSyncListPartitions — 收集本节点当前捕获的全部分区 OID（去重）。

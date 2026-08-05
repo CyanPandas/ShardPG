@@ -34,6 +34,10 @@ check() {
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
 
+# 节点崩溃检查（见 lib_node_health.sh 头部：验收脚本原本对"节点崩了"是瞎的）
+source "$(dirname "$0")/lib_node_health.sh"
+health_mark_start
+
 # 数据组领导权守卫：一旦 placement 节点丢主，leader 的写入会被 pg_raft 拒绝，
 # 后续记录不再复制 —— follower 的"落后"就不是回放缺陷了。必须把这种情况
 # 单独报出来，否则会被误判成页面比对失败（实测踩过：hardstate tmp 竞态导致
@@ -317,6 +321,8 @@ check "重新触发后追平到 ${tgt}" \
       "$([[ "$app1" =~ ^[0-9]+$ && -n "$tgt" && "$app1" -ge "$tgt" ]] && echo ok)" "ok"
 
 echo
+health_check_no_crash
+
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 [[ "$FAIL" -eq 0 ]] && echo "L1 惰性回放验收：全部通过" || echo "L1 惰性回放验收：存在 FAIL"
 

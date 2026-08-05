@@ -35,6 +35,10 @@ check() {  # check <名字> <实际> <期望>
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
 
+# 节点崩溃检查（见 lib_node_health.sh 头部：验收脚本原本对"节点崩了"是瞎的）
+source "$(dirname "$0")/lib_node_health.sh"
+health_mark_start
+
 echo "========== [0] 前置：group0 收敛 + 测试模式 GUC =========="
 leader=$(PSQL $COORD -Atc "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()")
 check "group0 有 leader" "$([[ -n "$leader" && "$leader" != "0" ]] && echo ok)" "ok"
@@ -332,5 +336,7 @@ for fp in $f1 $f2; do
 done
 
 echo
+health_check_no_crash
+
 echo "==================== 结果：PASS=${PASS} FAIL=${FAIL} ===================="
 [[ "$FAIL" -eq 0 ]] || exit 1

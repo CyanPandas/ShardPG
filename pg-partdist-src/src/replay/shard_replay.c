@@ -869,6 +869,57 @@ ReplayTruncateLocalRel(const RelFileLocator *loc)
 }
 
 /*
+ * ApplyFreezeRecord — 收下 leader 的冻结账目，搁进 ctx 待写。
+ *
+ * **这里不碰 catalog**：写 pg_class 要开事务，而 CommitTransactionCommand
+ * 会把 CurrentResourceOwner 置空，回放循环后续的 buffer pin 记账随即踩空。
+ * 真正的写入在 ShardReplayDoCheckpoint 里做（写游标之前）。
+ */
+static bool
+ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
+                  const char *body)
+{
+    const PartWALCtrlFreezeUpdate *upd;
+    const PartWALFreezeEntry      *ents;
+    uint32                         i;
+
+    if (hdr->data_len < sizeof(PartWALCtrlFreezeUpdate))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FREEZE_UPDATE 载荷"
+                        "过短 (%u)", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len)));
+
+    upd = (const PartWALCtrlFreezeUpdate *) body;
+
+    if (upd->nrels < 1 || upd->nrels > SHARD_FILESET_MAX_RELS ||
+        hdr->data_len != (uint32) PartWALCtrlFreezeUpdateSize(upd->nrels))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FREEZE_UPDATE 长度"
+                        "与 nrels 不符 (len=%u nrels=%u)", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len, upd->nrels)));
+
+    ents = PartWALCtrlFreezeRels(upd);
+
+    for (i = 0; i < upd->nrels; i++)
+        if (ents[i].role != SHARD_REL_MAIN && ents[i].role != SHARD_REL_TOAST)
+            ereport(ERROR,
+                    (errmsg("shard replay: shard %u @plsn %llu FREEZE_UPDATE "
+                            "出现非堆 role=%u —— 索引的 relfrozenxid 恒为 0，"
+                            "不该出现在这里", ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            ents[i].role)));
+
+    /* 全量覆盖：同一分区的后一条 FREEZE_UPDATE 天然作废前一条 */
+    memcpy(ctx->pending_freeze, ents,
+           (size_t) upd->nrels * sizeof(PartWALFreezeEntry));
+    ctx->pending_freeze_n = (int) upd->nrels;
+
+    return true;
+}
+
+/*
  * ApplyCtrlRecord — 应用一条控制记录。
  *
  * 返回 true = 已应用，调用方推进游标；false = 停在栅栏，游标原地不动。
@@ -907,6 +958,9 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                         "（version=%u rmid=%u）", ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn,
                         hdr->version, hdr->rmid)));
+
+    if (hdr->info == PARTWAL_CTRL_FREEZE_UPDATE)
+        return ApplyFreezeRecord(ctx, hdr, body);
 
     if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
         ereport(ERROR,
@@ -1165,6 +1219,42 @@ BuildParwalIndex(ShardReplayCtx *ctx, uint64 from_plsn, ParwalIndex *idx)
 /* apply checkpoint（FRD §8.4 推进协议）                               */
 /* ================================================================== */
 
+/*
+ * 把待发布的冻结账目搬进共享内存槽位（§13 约束 5，D2）。
+ *
+ * 这里**只做内存搬运，绝不碰 catalog** —— replay worker 没有选数据库，
+ * 读 pg_class 会当场 FATAL 并把 worker 拖进崩溃重启循环（见
+ * ShardReplayCtx.pending_freeze 的说明）。真正的写入由 replay_catchup()
+ * 的调用方在普通 backend 里完成。
+ */
+static void
+ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
+{
+    int i;
+
+    if (ctx->pending_freeze_n == 0)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+        if (s->shard_oid != ctx->shard_oid)
+            continue;
+
+        memcpy(s->freeze, ctx->pending_freeze,
+               (size_t) ctx->pending_freeze_n * sizeof(PartWALFreezeEntry));
+        s->freeze_n = ctx->pending_freeze_n;
+        break;
+    }
+    LWLockRelease(ReplayCtl->lock);
+
+    REPLAY_TRACE("TRACE freeze: shard %u 发布 %d 条冻结账目待写入",
+                 ctx->shard_oid, ctx->pending_freeze_n);
+    ctx->pending_freeze_n = 0;
+}
+
 void
 ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
 {
@@ -1220,6 +1310,19 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
     if (TransactionIdIsNormal(XidFromFullTransactionId(ctx->max_replayed_fxid)))
         PartDistAdvanceNextXidPastXid(
             XidFromFullTransactionId(ctx->max_replayed_fxid));
+
+    /*
+     * 冻结账目发布到槽位（§13 约束 5）。放在写游标之前，是为了让"游标之前
+     * 的效果都已就绪"这句话对它也成立 —— 尽管真正落 pg_class 的是
+     * replay_catchup 的调用方。
+     *
+     * 已知的**尽力而为**边界：槽位在共享内存里，节点崩溃即丢，而 leader 侧
+     * 的基线已记为"已发"、不会重发。后果只是这一轮账目滞后 —— leader 下次
+     * vacuum 推进 relfrozenxid 时会再发一条补上。对一个以千万 xid 为尺度
+     * 变化的账目字段，这个语义够用；要精确一次得把它也放进 apply_checkpoint
+     * 快照并动 checkpoint 格式版本，不值当。
+     */
+    ShardReplayPublishPendingFreeze(ctx);
 
     /* xid_map 快照：与头同在一个 tmp 文件里原子落盘（§8.4） */
     nents = (ctx->xid_map != NULL)

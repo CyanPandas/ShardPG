@@ -35,6 +35,10 @@ check() {  # check <名字> <实际> <期望>
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
 
+# 节点崩溃检查（见 lib_node_health.sh 头部：验收脚本原本对"节点崩了"是瞎的）
+source "$(dirname "$0")/lib_node_health.sh"
+health_mark_start
+
 # 小端 bytea → 整数：直接展开成内联表达式，不建辅助函数 ——
 # 这些查询跑在 worker 上，Citus 会拦掉 worker 上的 CREATE FUNCTION
 # （"operation is not allowed on this node"）。
@@ -378,6 +382,8 @@ for fp in $f1 $f2; do
 done
 
 echo ""
+health_check_no_crash
+
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "R2 事务层验收：全部通过"; else echo "R2 事务层验收：存在 FAIL"; fi
 
