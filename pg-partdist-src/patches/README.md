@@ -31,26 +31,46 @@ block 引用列表和完整记录字节传给已安装的扩展。这是 pg_part
 > **★★ 三个补丁全是 `pg_partdist` 的编译期硬依赖，缺任何一个都编不过。**
 > 实测缺 0002 时的报错：
 > `src/pg_partdist.c: error: 'buffer_flush_lsn_exempt_hook' undeclared`。
->
-> **`pg-raft-src/reproduce-env.sh` 不打这些补丁、也不重编 PostgreSQL** ——
-> 它假设镜像里的 `/work/pg-install` 已经是打过补丁的构建。镜像
-> `pg-partdist-raft4-env` 里那份**是干净的官方 16.14**，而旧环境里那份带补丁的
-> 是当初手工构建的、只存在于容器可写层。
->
-> 后果：**`reproduce-env.sh destroy` 之后 `up` 建不出可用环境**（2026-08-04 实测，
-> 销毁后才发现）。重建流程必须补上这一步：
->
-> ```bash
-> # 容器起来之后、编 pg_partdist 之前
-> docker cp <打过补丁的 postgres 源码树> <容器>:/work/postgres-src
-> docker exec -u postgres <容器> bash -lc '
->   cd /work/postgres-src &&
->   ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline &&
->   make -j2 && make install'
-> ```
->
-> 源码基线 = `postgres-src` submodule 的 `.gitlink` commit + 上述三个补丁。
-> **待办**：把这一步并进 `reproduce-env.sh`，否则"一键复现"名不副实。
+
+## 补丁与仓库里 `pg-install/` 的关系（复现路径的关键）
+
+`pg-raft-src/reproduce-env.sh` **不打补丁、也不重编 PostgreSQL**：它把仓库里
+**已经打过补丁并编译好**的 `pg-install/` 整棵树 `docker cp` 进容器，然后只编
+`pg_partdist` / `pg_raft` 两个扩展。也就是说——
+
+> **能不能从零 clone 复原，完全取决于仓库里这份 `pg-install/` 是不是打过补丁的构建。**
+
+2026-08-04 踩过一次：仓库里那份是 8/1 的构建，**只含 0001，缺 0001v2 和 0002**，
+于是 `reproduce-env.sh destroy` 之后 `up` 出来的环境编不过 pg_partdist
+（销毁旧容器之后才发现，只能在容器里手工重编 PostgreSQL 抢救）。
+2026-08-05 已把容器里那份带全部三个补丁的构建同步回仓库。
+
+**改动内核补丁之后必须做的事**（否则复现路径又会退化）：
+
+```bash
+# 1. 在容器里重编 PostgreSQL（源码 = postgres-src 基线 + 三个补丁）
+docker exec -u postgres <容器> bash -lc '
+  cd /work/postgres-src &&
+  ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline &&
+  make -j2 && make install'
+
+# 2. ★ 把结果同步回仓库并提交，否则仓库里还是旧构建
+docker cp <容器>:/work/pg-install /tmp/pg-install-new
+cp /tmp/pg-install-new/bin/postgres                                   pg-install/bin/
+cp /tmp/pg-install-new/include/postgresql/server/storage/bufmgr.h     pg-install/include/postgresql/server/storage/
+# （新增/改动的头文件按补丁涉及范围补齐）
+```
+
+**自检**（`reproduce-env.sh up` 之前值得先跑一遍，比编译失败早得多）：
+
+```bash
+grep -c wal_insert_hook               pg-install/include/postgresql/server/access/xloginsert.h  # 0001  应 >0
+nm -D pg-install/bin/postgres | grep -c wal_insert_hook                                          # 0001v2 应 =1
+grep -c buffer_flush_lsn_exempt_hook  pg-install/include/postgresql/server/storage/bufmgr.h      # 0002  应 >0
+nm -D pg-install/bin/postgres | grep -c buffer_flush_lsn_exempt                                  # 0002  应 =1
+```
+
+源码基线 = `postgres-src` submodule 的 `.gitlink` commit + 上述三个补丁。
 
 ## 应用方式
 

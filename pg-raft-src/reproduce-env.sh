@@ -78,6 +78,15 @@ do_up() {
   max_peers=$(grep -oP '#define RAFT_MAX_PEERS\s+\K[0-9]+' "$CLONE_DIR/pg-raft-src/src/raft_consensus.c")
   [[ "$N_NODES" -le "$max_peers" ]] || die "节点数 ${N_NODES} 超过 RAFT_MAX_PEERS=${max_peers}"
 
+  # ★ 本脚本**不打内核补丁、也不重编 PostgreSQL**：下面直接把克隆里的
+  # pg-install/ 整棵树拷进容器。所以"能不能复原"完全取决于仓库里那份构建是不是
+  # 打过补丁的。2026-08-04 实测：仓库里那份只含 0001，缺 0001v2/0002，
+  # destroy 之后 up 出来的环境编不过 pg_partdist —— 而那时旧容器已经删了。
+  # 在这里先验，让它**在建容器之前**就失败，别等到编译报符号未定义。
+  bash "$CLONE_DIR/pg-partdist-src/scripts/check_pg_install_patched.sh" \
+       "$CLONE_DIR/pg-install" \
+    || die "克隆里的 pg-install 不是打过补丁的构建，见 pg-partdist-src/patches/README.md"
+
   echo "========== [2/6] 起容器（镜像 ${IMAGE}）=========="
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "镜像不存在，从克隆构建..."
