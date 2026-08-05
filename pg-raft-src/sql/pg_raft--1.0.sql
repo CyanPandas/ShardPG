@@ -43,6 +43,28 @@ CREATE TABLE IF NOT EXISTS raft_group (
 COMMENT ON TABLE raft_group IS
     '数据面 Raft 组注册表：group_id 取 partdist.shard_identity.global_shard_id（Citus shardid），members 为该分片副本所在节点。';
 
+-- 数据组日志外部化（计划文档 §11.10 E1）：段式边界表。
+--
+-- 数据组的每条 Raft 条目都恰好对应一条 parwal 记录，条目载荷那串描述符与
+-- PartWALRecord 头部字段逐个对应 —— 也就是说日志内容**已经在段文件里**。
+-- 缺的只有 term 与 index↔plsn 的对应关系，这张表补的正是这两样。
+--
+-- 一行 = 一个 run："从 start_index 起连续若干条，plsn 自 start_plsn 起同步 +1，
+-- term 恒为 term"，延伸到下一个 run 的 start_index 为止。于是
+--   条目 i 的 term = 满足 start_index <= i 的最大那行的 term
+--   条目 i 的 plsn = start_plsn + (i - start_index)
+-- 只在 term 变了（换届）或 plsn 跳号（失败路径）时才追加一行，稳态下一届一行。
+CREATE TABLE IF NOT EXISTS raft_log_runs (
+    group_id    BIGINT NOT NULL,
+    start_index BIGINT NOT NULL,
+    start_plsn  BIGINT NOT NULL,
+    term        BIGINT NOT NULL,
+    PRIMARY KEY (group_id, start_index)
+);
+
+COMMENT ON TABLE raft_log_runs IS
+    '数据组日志的段式边界表（§11.10）：把 (index → plsn, term) 压成按任期/连续性分段的 run，条目载荷从 pg_parwal 记录头部重建。';
+
 CREATE TABLE IF NOT EXISTS raft_snapshot (
     singleton           INT PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
     last_included_index BIGINT NOT NULL DEFAULT 0,
@@ -281,8 +303,9 @@ CREATE OR REPLACE FUNCTION pg_raft_group_drop(p_group_id bigint)
     SET search_path = partdist, pg_catalog
 AS $fn$
 BEGIN
-    DELETE FROM partdist.raft_group WHERE group_id = p_group_id;
-    DELETE FROM partdist.raft_log   WHERE group_id = p_group_id;
+    DELETE FROM partdist.raft_group     WHERE group_id = p_group_id;
+    DELETE FROM partdist.raft_log       WHERE group_id = p_group_id;
+    DELETE FROM partdist.raft_log_runs  WHERE group_id = p_group_id;
     RETURN partdist.pg_raft_group_drop_internal(p_group_id);
 END;
 $fn$;
@@ -304,6 +327,44 @@ CREATE OR REPLACE FUNCTION pg_raft_data_propose(
 COMMENT ON FUNCTION pg_raft_data_propose(bigint, bigint) IS
     '在数据组 leader 上把本节点 pg_parwal 的第 partition_lsn 条记录作为 Raft entry 提交；'
     '返回 Raft log index（0=失败）。提交成功即多数派已 fsync 落盘且 applied_part_lsn 已推进。';
+
+-- 数据组日志外部化（§11.10 E1）：按段式边界表把第 p_index 条条目**重建**出来。
+--
+-- term 取自覆盖该 index 的 run；plsn = start_plsn + (index - start_index)；
+-- 载荷从 pg_parwal 记录头部拼回来 —— 字段与格式必须与 data_propose_one()
+-- 写进 raft_log.payload 的那串**完全一致**，E1 的用例逐条比对二者。
+--
+-- 查不到 run、或该 plsn 在本节点段文件里不存在时返回 0 行（partwal_read_record
+-- 读不到记录时返回的是一行全 NULL，不是零行，所以要显式过滤 orig_lsn IS NULL）。
+CREATE OR REPLACE FUNCTION pg_raft_entry_from_parwal(
+    p_group_id  bigint,
+    p_index     bigint,
+    OUT term    bigint,
+    OUT payload text
+) RETURNS record LANGUAGE sql STABLE AS $$
+    WITH run AS (
+        SELECT r.start_index, r.start_plsn, r.term
+          FROM partdist.raft_log_runs r
+         WHERE r.group_id = p_group_id
+           AND r.start_index <= p_index
+         ORDER BY r.start_index DESC
+         LIMIT 1
+    )
+    SELECT run.term,
+           format('{"partition_lsn":%s,"orig_lsn":"%s","rmid":%s,"info":%s,'
+                  '"xid":%s,"nbytes":%s,"flags":%s}',
+                  run.start_plsn + (p_index - run.start_index),
+                  w.orig_lsn::text, w.rmid, w.info, w.xid,
+                  length(w.data), w.flags)
+      FROM run,
+           LATERAL partdist.partwal_read_record(
+                       partdist.local_partition_for_shard(p_group_id),
+                       run.start_plsn + (p_index - run.start_index)) w
+     WHERE w.orig_lsn IS NOT NULL;
+$$;
+
+COMMENT ON FUNCTION pg_raft_entry_from_parwal(bigint, bigint) IS
+    '数据组日志外部化（§11.10）：按 raft_log_runs 反查 (term, plsn) 并从 pg_parwal 记录头部重建该条目的载荷。';
 
 CREATE OR REPLACE FUNCTION pg_raft_install_snapshot(
     p_term bigint, p_leader_id integer,
@@ -340,6 +401,7 @@ DECLARE
 BEGIN
     DELETE FROM partdist.raft_group;
     DELETE FROM partdist.raft_log WHERE group_id <> 0;
+    DELETE FROM partdist.raft_log_runs;
     n := partdist.pg_raft_group_reset_internal();
     RETURN n;
 END;

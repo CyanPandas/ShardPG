@@ -1401,6 +1401,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_26: 数据组日志外部化 E1（计划文档 §11.10）
+# 用例本体在 test/raft_26_log_runs_externalize.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_26 数据组日志外部化 E1"
+
+start_all_nodes
+sleep 2
+RAFT_26_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" \
+                bash "${SCRIPT_DIR}/test/raft_26_log_runs_externalize.sh" 2>&1) && RAFT_26_RC=0 || RAFT_26_RC=$?
+echo "$RAFT_26_OUT" | sed 's/^/    /'
+if [[ "$RAFT_26_RC" -eq 0 ]]; then
+  ok "raft_26_log_runs_externalize"
+else
+  bad "raft_26_log_runs_externalize($(echo "$RAFT_26_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

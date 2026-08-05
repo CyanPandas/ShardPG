@@ -1192,6 +1192,84 @@ raft_log_table_ready(void)
                         true, 1) == SPI_OK_SELECT && SPI_processed > 0);
 }
 
+/*
+ * 数据组日志外部化 E1（计划文档 §11.10）：段式边界表是否已就绪。
+ * 与 raft_log_table_ready 同样是"装了扩展但还没跑 setup"时的兜底。
+ */
+static bool
+raft_runs_table_ready(void)
+{
+    return (SPI_execute("SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = 'partdist' "
+                        "AND table_name = 'raft_log_runs'",
+                        true, 1) == SPI_OK_SELECT && SPI_processed > 0);
+}
+
+/*
+ * 维护数据组的段式边界表（§11.10 E1）。**调用方必须已在 SPI 语境里**。
+ *
+ * 一个 run 是"从 start_index 起连续若干条，plsn 自 start_plsn 起同步 +1，
+ * term 恒定"。只有两种情况需要新开一行：换届（term 变了），或 plsn 跳号
+ * （失败路径没把编号用掉）。稳态下一届只有一行 —— 这正是它能替代逐条
+ * 存映射的原因。
+ *
+ * 插入点选在 index 上会**自动截短**上一个 run（run 只延伸到下一行的
+ * start_index 为止），所以冲突改写不需要额外的修补动作。
+ */
+static void
+data_run_record_spi(RaftGroupCtx *ctx, int64 index, int64 term, int64 plsn)
+{
+    StringInfoData sql;
+    bool           isnull;
+    int64          r_start_index = 0;
+    int64          r_start_plsn = 0;
+    int64          r_term = 0;
+    bool           have_run = false;
+
+    if (ctx->group_id == RAFT_CONTROL_GROUP || index <= 0 || plsn <= 0)
+        return;
+    if (!raft_runs_table_ready())
+        return;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT start_index, start_plsn, term "
+                     "FROM partdist.raft_log_runs "
+                     "WHERE group_id = %lld AND start_index <= %lld "
+                     "ORDER BY start_index DESC LIMIT 1",
+                     (long long) ctx->group_id, (long long) index);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+
+        r_start_index = DatumGetInt64(SPI_getbinval(tup, desc, 1, &isnull));
+        r_start_plsn = DatumGetInt64(SPI_getbinval(tup, desc, 2, &isnull));
+        r_term = DatumGetInt64(SPI_getbinval(tup, desc, 3, &isnull));
+        have_run = true;
+    }
+
+    /* 现有 run 已经覆盖到这一条且对得上：无事可做（重传走的就是这条路） */
+    if (have_run && r_term == term &&
+        r_start_plsn + (index - r_start_index) == plsn)
+    {
+        pfree(sql.data);
+        return;
+    }
+
+    resetStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "INSERT INTO partdist.raft_log_runs "
+                     "(group_id, start_index, start_plsn, term) "
+                     "VALUES (%lld, %lld, %lld, %lld) "
+                     "ON CONFLICT (group_id, start_index) DO UPDATE SET "
+                     "start_plsn = EXCLUDED.start_plsn, term = EXCLUDED.term",
+                     (long long) ctx->group_id, (long long) index,
+                     (long long) plsn, (long long) term);
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+}
+
 static void
 delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
 {
@@ -1213,6 +1291,22 @@ delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
                      "WHERE group_id = %lld AND log_index = %lld",
                      (long long) ctx->group_id, (long long) index);
     (void) SPI_execute(sql.data, false, 0);
+
+    /*
+     * 段式边界表也要跟着回滚（§11.10 E1）。这个函数只被
+     * discard_uncommitted_entry 用（失多数派丢弃末尾那一条），而 run 是在
+     * persist_log_entry_sql 里、**先于**复制就写下去的 —— 不删的话会留下一个
+     * 指向不存在条目的段起点，此后所有 >= 它的 index 都会被按错误的 plsn 重建。
+     */
+    if (ctx->group_id != RAFT_CONTROL_GROUP && raft_runs_table_ready())
+    {
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.raft_log_runs "
+                         "WHERE group_id = %lld AND start_index >= %lld",
+                         (long long) ctx->group_id, (long long) index);
+        (void) SPI_execute(sql.data, false, 0);
+    }
     pfree(sql.data);
 
     raft_persist_spi_end(spi_owned);
@@ -1246,6 +1340,21 @@ delete_log_entries_after_sql(RaftGroupCtx *ctx, int64 index)
                      "WHERE group_id = %lld AND log_index > %lld",
                      (long long) ctx->group_id, (long long) index);
     (void) SPI_execute(sql.data, false, 0);
+
+    /*
+     * 段式边界表同样要截（§11.10 E1）。跨过截断点的那个 run **保留** ——
+     * 它对 <= index 的条目仍然成立，run 只延伸到下一行为止，后面被删掉的
+     * 那几行本来就是它的终点。
+     */
+    if (ctx->group_id != RAFT_CONTROL_GROUP && raft_runs_table_ready())
+    {
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.raft_log_runs "
+                         "WHERE group_id = %lld AND start_index > %lld",
+                         (long long) ctx->group_id, (long long) index);
+        (void) SPI_execute(sql.data, false, 0);
+    }
     pfree(sql.data);
 
     raft_persist_spi_end(spi_owned);
@@ -1513,6 +1622,16 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
                      committed ? "true" : "false");
     (void) SPI_execute(sql.data, false, 0);
     pfree(sql.data);
+
+    /*
+     * 数据组顺手维护段式边界表（§11.10 E1）。挂在这里是因为**所有**落库路径
+     * 都经过它：leader 的 group_propose、follower 的首次 append、以及重传。
+     * E1 阶段两份并存（表里的行 + run 重建出来的），用例逐条比对；E3 会把
+     * 上面那条 INSERT 从数据组路径上撤掉，只留 run。
+     */
+    if (ctx->group_id != RAFT_CONTROL_GROUP &&
+        op_type != NULL && strcmp(op_type, RAFT_OP_PARWAL) == 0)
+        data_run_record_spi(ctx, index, term, entry_partition_lsn(payload));
 
     raft_persist_spi_end(spi_owned);
 }
