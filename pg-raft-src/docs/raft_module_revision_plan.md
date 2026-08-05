@@ -1109,9 +1109,26 @@ term 恒为 `term`"，一直延伸到下一个 run 的 `start_index`。于是：
   对照：把 `log_get_entry_parwal()` 摘掉重编 ⇒ victim 确定性冻结在 0，leader 已到 140。
   > 遗留：E2 之后，**E1 之前就存在的数据组条目**（那时还没有 run 行）重建不出来。
   > 全新集群无此问题；存量集群升级需要一次性回填 run（尚未做，E3 一并处理）。
-- **E3 写路径瘦身**：数据组提交路径去掉 `raft_log` 的 INSERT/UPDATE；冲突截断改为
-  "删 run 尾巴 + `partwal_truncate_to`"。用例：冲突截断后段文件与 run 表同时收敛，
-  对照是只删 run 不截段文件则字节残留。
+- **E3 写路径瘦身**（未开工，设计已按下面这条实测结论修正）：数据组提交路径去掉
+  `raft_log` 的 INSERT/UPDATE；冲突截断改为"删 run 尾巴 + `partwal_truncate_to`"。
+  用例：冲突截断后段文件与 run 表同时收敛，对照是只删 run 不截段文件则字节残留。
+
+  > ⚠️ **日志末端不能从段文件推出来**（2026-08-05 做完 E2 后核对发现，早先"shmem
+  > 只留游标"的说法在这一点上是错的）。直觉做法是"`last_log_index` = 末个 run 的
+  > `start_index + (max_plsn - start_plsn)`"，但 **leader 的段文件里躺着大量还没被
+  > 提案的记录** —— demux 按本地提交不停地写，提案是另一条路径按需追上去的。
+  > raft_27 的夹具就是现成的证据：段文件里 seed 了 160 条，只提案了 140 条。
+  > 拿 `max(partition_lsn)` 当日志末端会**凭空多出 20 条**，重启后这个 leader 会
+  > 以为自己持有从未复制过的条目，直接破坏 Leader Completeness。
+  >
+  > 正解：`last_log_index` 随 **hardstate v4** 持久化。它本来就在每条 append 之后
+  > 被 `persist_hard_state_unlocked()` 写一次，加一个字段是零额外开销 —— 而
+  > `raft_log` 那份逐条 INSERT 正是要被它替换掉的东西。重启恢复因此变成：
+  > 末端取自 hardstate，(term, plsn) 映射取自 run，环里最近 ≤128 条按需重建。
+  >
+  > 顺带解决 E2 遗留的存量回填：数据组不再读 `raft_log`，老行留着不碍事；真正
+  > 需要的是"没有 run 行的老条目"在重启后重建不出来 —— E3 落地时按 hardstate 的
+  > `last_log_index` 与段文件实际内容对账，对不上就拒绝启动该组而不是静默降级。
 - **E4 去环 + 抬上限**：数据组不再分配 ring（shmem 只留游标），`RAFT_MAX_GROUPS`
   随之抬高。用例：建 N（远大于 32）个数据组仍能选举与复制。
 
