@@ -71,6 +71,10 @@ extern void pg_raft_consensus_apply_pending(void);
 /* prepare 接线：PartWALFlush 经 rendezvous "partdist_partwal_replicate_hook" 调用 */
 extern void pg_raft_partwal_replicate(Oid partition_id);
 
+/* 后台追平通道（计划文档 §12.4 #5）：TopologyMonitor 经 libpq 自连触发 */
+extern int  pg_raft_catchup_interval_ms;
+extern bool pg_raft_any_group_leader_local(void);
+
 /* DTX-2PC（DTX_2PC_DESIGN.md §9.3）：master 侧驱动 + 参与者自治登记 */
 extern bool pg_raft_dtx_2pc_enabled;
 extern int  pg_raft_dtx_recover_interval_ms;

@@ -45,6 +45,7 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT,
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
 DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_catchup();
 -- DTX-2PC 的三个 pg_raft 函数。**必须列在这里**：它们是 pg_raft 扩展成员，
 -- 但只要有过一次"扩展被 DROP、函数被 CREATE OR REPLACE 单独重建"的历史，
 -- 就会变成游离对象，此后每次 CREATE EXTENSION pg_raft 都直接报

@@ -1365,6 +1365,24 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_24: 后台追平通道（计划文档 §12.4 #5）
+# 用例本体在 test/raft_24_background_catchup.sh（自带夹具与清理，可独立跑）。
+# 用时较长（含一段刻意等待"关掉通道时不收敛"的对照窗口 + 200 笔写入）。
+# ------------------------------------------------------------------
+section "raft_24 后台追平通道"
+
+start_all_nodes
+sleep 2
+RAFT_24_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_24_background_catchup.sh" 2>&1) && RAFT_24_RC=0 || RAFT_24_RC=$?
+echo "$RAFT_24_OUT" | sed 's/^/    /'
+if [[ "$RAFT_24_RC" -eq 0 ]]; then
+  ok "raft_24_background_catchup"
+else
+  bad "raft_24_background_catchup($(echo "$RAFT_24_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

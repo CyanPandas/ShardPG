@@ -200,6 +200,7 @@ int   pg_raft_dtx_recover_timeout_ms  = 30000;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
+int   pg_raft_catchup_interval_ms = 5000;
 
 static RaftGroupTable *RaftGroups = NULL;
 
@@ -239,11 +240,17 @@ static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
 static int64 group_local_partition(RaftGroupCtx *ctx);
 
 /*
- * 数据组的 entry 携带真实 parwal 字节，取字节要走 SPI，因此只有 client backend
- * 路径（propose / flush_replication）能发数据条目；BGW tick 无 SPI，对数据组只
- * 发心跳，落后的 follower 在下一次 propose 时由 flush_replication 追平。
+ * 「当前是否处于 SPI 可用的语境」。两处依赖它：
+ *
+ *  1. 数据组的 entry 携带真实 parwal 字节，取字节要走 SPI（partwal_read_record）；
+ *  2. 环外条目回读 —— 环只有 RAFT_LOG_CAPACITY 条，更老的条目只能从
+ *     partdist.raft_log 读回来（log_get_entry_ext）。
+ *
+ * BGW tick 里没有 SPI，两件都做不了：对数据组只发心跳，对落后超过环容量的
+ * follower 只能空转。追平由 client backend 语境驱动 —— propose 路径，或
+ * 后台追平通道 pg_raft_catchup()（TopologyMonitor 经 libpq 自连触发）。
  */
-static bool data_shipping_allowed = false;
+static bool raft_spi_ctx = false;
 
 static bool raft_persist_spi_begin(bool *spi_owned);
 static bool dtx_dtxid_from_gid(const char *gid, int64 *dtxid);
@@ -255,6 +262,8 @@ static int64 entry_partition_lsn(const char *payload);
 static int entry_record_flags(const char *payload);
 static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
+static bool replicate_try_claim(RaftGroupCtx *ctx);
+static void replicate_release(RaftGroupCtx *ctx);
 
 /* ---- 共享内存 ---- */
 
@@ -1171,6 +1180,39 @@ delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
     raft_persist_spi_end(spi_owned);
 }
 
+/*
+ * 冲突截断时把 SQL 日志里 index 之后的行一并删掉。
+ *
+ * 环内截断只改 last_log_index，SQL 行照旧留着 —— 在有了 log_get_entry_sql
+ * 回读之后，这些被截断的行会被重新读出来当成"本节点持有的条目"，重启的
+ * restore 也会把它们灌回环。必须与环的截断同时发生。
+ */
+static void
+delete_log_entries_after_sql(RaftGroupCtx *ctx, int64 index)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+
+    if (index < 0 || !raft_persist_spi_begin(&spi_owned))
+        return;
+
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "DELETE FROM partdist.raft_log "
+                     "WHERE group_id = %lld AND log_index > %lld",
+                     (long long) ctx->group_id, (long long) index);
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+
+    raft_persist_spi_end(spi_owned);
+}
+
 static RaftLogEntry *
 log_slot(RaftGroupCtx *ctx, int64 index)
 {
@@ -1191,6 +1233,82 @@ log_get_entry_locked(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
         return false;
     *out = *e;
     return true;
+}
+
+/*
+ * 从 partdist.raft_log 读回一条**已滑出环窗口**的条目。
+ *
+ * 环只有 RAFT_LOG_CAPACITY(128) 条，而 SQL 日志是全量持久的。此前没有这条
+ * 回读路径，于是落后超过环容量的 follower **永远追不上**：leader 侧
+ * log_get_entry_locked 在槽位被覆盖时失败 → prev_term 取到 0 → follower 拒绝
+ * → next_index 一路退到 1 → 此后只发心跳、match 恒 0，静默卡死（§12.3.B.6
+ * 记录的"某节点 group0 恒 0/0/0"就是这个形态）。字节其实一直都在盘上。
+ *
+ * 调用方必须处于 SPI 可用语境（raft_spi_ctx），且不得持有 log->mutex。
+ */
+static bool
+log_get_entry_sql(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    bool           found = false;
+
+    if (index <= 0)
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return false;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT term, op_type, payload::text "
+                     "FROM partdist.raft_log WHERE group_id = %lld AND log_index = %lld",
+                     (long long) ctx->group_id, (long long) index);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+        bool      isnull;
+        char     *op;
+        char     *payload;
+
+        out->index = index;
+        out->term = DatumGetInt64(SPI_getbinval(tup, desc, 1, &isnull));
+        op = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
+        payload = TextDatumGetCString(SPI_getbinval(tup, desc, 3, &isnull));
+        strlcpy(out->op_type, op, RAFT_OP_LEN);
+        strlcpy(out->payload, payload, RAFT_PAYLOAD_MAX);
+        pfree(op);
+        pfree(payload);
+        found = true;
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return found;
+}
+
+/*
+ * 两级取条目：先查环（无锁开销最小），环外再落到 SQL 日志。
+ * **不得**在持有 log->mutex 时调用（SQL 那一级要走 SPI）。
+ * 非 SPI 语境（BGW tick）退化为只查环，行为与加这条回读之前完全一致。
+ */
+static bool
+log_get_entry_ext(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    bool got;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    got = log_get_entry_locked(ctx, index, out);
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (got || !raft_spi_ctx)
+        return got;
+
+    return log_get_entry_sql(ctx, index, out);
 }
 
 static void
@@ -1880,6 +1998,57 @@ send_sql_rpc(RaftPeer *p, const char *sql, bool honor_backoff,
     return ok;
 }
 
+/*
+ * 追平提示：直接问对端「你这一组的 last_log_index 是多少」。
+ *
+ * 为什么需要：本实现的 AppendEntries 响应里没有 conflict hint，`next_index` 只能
+ * 一次退一格。而新当选的 leader 会把所有 peer 的 next_index 初始化成 last+1，
+ * 于是一个落后 N 条的成员要先花 N 个 RPC 才探回到它真正持有的位置 —— 落后几百条
+ * 时，一次追平还没探完就可能被下一次选举打断，重来一遍，看起来像永远追不上。
+ *
+ * 只用于后台追平通道，且**只作起点提示**：AE 的 prev 一致性检查照旧，对端若在
+ * 该位置上持有不同的条目仍会拒绝，leader 继续按老办法逐格回退。因此这里读到
+ * 陈旧或错误的值都不影响正确性，只影响快慢。
+ */
+static int64
+peer_last_log_index(RaftGroupCtx *ctx, RaftPeer *p)
+{
+    PGconn   *conn;
+    PGresult *res;
+    char      sql[192];
+    int64     val = -1;
+
+    if (peer_in_backoff(p))
+        return -1;
+
+    conn = peer_conn_get(p);
+    if (conn == NULL)
+    {
+        peer_mark_result(p, false);
+        return -1;
+    }
+
+    snprintf(sql, sizeof(sql),
+             "SELECT last_log_index FROM partdist.pg_raft_group_status() "
+             "WHERE group_id = %lld",
+             (long long) ctx->group_id);
+
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        val = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+    else if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQclear(res);
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return -1;
+    }
+    PQclear(res);
+    peer_mark_result(p, true);
+    return val;
+}
+
 static bool
 send_rpc_msg(RaftPeer *p, const char *msg, int64 *resp_term, int *resp_flag)
 {
@@ -2010,11 +2179,14 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     int   leader_id = pg_raft_node_id;
     int64 prev_idx;
     int64 prev_term = 0;
+    int64 next_idx;
+    int64 last_idx;
     int64 leader_commit;
     RaftLogEntry entry;
     int64 rt;
     int   ok_flag;
     bool  has_entry;
+    bool  prev_known = false;
     bool  repl_ready;
     char *data_hex = NULL;
 
@@ -2047,14 +2219,48 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     {
         RaftLogEntry *pe = log_slot(ctx, prev_idx);
         if (pe->index == prev_idx)
+        {
             prev_term = pe->term;
+            prev_known = true;
+        }
     }
-    has_entry = (ctx->log->peer_next_index[peer_slot] <= ctx->log->last_log_index &&
-                 log_get_entry_locked(ctx, ctx->log->peer_next_index[peer_slot], &entry));
+    else
+        prev_known = true;
+    next_idx = ctx->log->peer_next_index[peer_slot];
+    last_idx = ctx->log->last_log_index;
+    has_entry = (next_idx <= last_idx &&
+                 log_get_entry_locked(ctx, next_idx, &entry));
     SpinLockRelease(&ctx->log->mutex);
 
     if (!repl_ready)
         return;
+
+    /*
+     * 环外回退：peer 落后超过环容量时，prev 与待发条目都已滑出环窗口。
+     * SPI 语境（propose / pg_raft_catchup）下从 SQL 日志读回来，这样落后
+     * 任意远的 follower 都能被逐条追平；BGW tick 无 SPI，维持原行为
+     * （prev_term=0 → 对端拒 → next_index 递减 → 仅心跳），不改变时序语义。
+     */
+    if (raft_spi_ctx)
+    {
+        RaftLogEntry old;
+
+        if (!prev_known && log_get_entry_sql(ctx, prev_idx, &old))
+        {
+            prev_term = old.term;
+            prev_known = true;
+        }
+        if (!has_entry && next_idx <= last_idx &&
+            log_get_entry_sql(ctx, next_idx, &entry))
+            has_entry = true;
+    }
+
+    /*
+     * prev 无从取证时不能硬发：prev_term 会当成 0 送出去，对端必拒，
+     * 白白把 next_index 往下推。不发条目、只发心跳（保持对端选举计时器）。
+     */
+    if (!prev_known)
+        has_entry = false;
 
     /*
      * 数据组的条目必须带上真实 parwal 字节；取字节要 SPI，BGW tick 里拿不到，
@@ -2062,7 +2268,7 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
      */
     if (has_entry && strcmp(entry.op_type, RAFT_OP_PARWAL) == 0)
     {
-        if (!data_shipping_allowed)
+        if (!raft_spi_ctx)
             has_entry = false;
         else
         {
@@ -2653,7 +2859,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
         return 0;
 
     persist_log_entry_sql(ctx, idx, term, op_type, payload, false);
-    data_shipping_allowed = true;
+    raft_spi_ctx = true;
     acks = sync_replicate_index(ctx, idx, term);
 
     SpinLockAcquire(&ctx->log->mutex);
@@ -2678,7 +2884,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
              (long long) term,
              acks,
              majority);
-        data_shipping_allowed = false;
+        raft_spi_ctx = false;
         discard_uncommitted_entry(ctx, idx);
         return 0;
     }
@@ -2686,7 +2892,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     /* 多数派提交后，继续推送到所有 Follower 再 apply（控制面需全节点一致） */
     mark_log_committed_sql(ctx, committed_upto);
     flush_replication(ctx, idx, term);
-    data_shipping_allowed = false;
+    raft_spi_ctx = false;
     group_apply_pending(ctx);
     return idx;
 }
@@ -2821,32 +3027,90 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     reset_election_deadline_locked(ctx);
     SpinLockRelease(&ctx->cons->mutex);
 
-    SpinLockAcquire(&ctx->log->mutex);
-
+    /*
+     * prev 一致性检查也要能看到环外条目（对端正在追平我这个落后很远的节点时，
+     * prev 必然已滑出我的环窗口）。log_get_entry_ext 内部自己取/放锁，
+     * 因此必须在进入下面的临界区之前做完。RPC 处理跑在真正的 client backend
+     * 里，SPI 天然可用 —— 这一侧不受 BGW 无 SPI 的限制。
+     */
     if (prev_idx > 0)
     {
-        if (!log_get_entry_locked(ctx, prev_idx, &prev) || prev.term != prev_term)
-        {
-            SpinLockRelease(&ctx->log->mutex);
+        bool prev_ok;
+
+        raft_spi_ctx = true;
+        prev_ok = (log_get_entry_ext(ctx, prev_idx, &prev) && prev.term == prev_term);
+        raft_spi_ctx = false;
+
+        if (!prev_ok)
             return true;
-        }
     }
+
+    SpinLockAcquire(&ctx->log->mutex);
 
     if (has_entry)
     {
+        bool already_present = false;
+
         if (entry_idx <= ctx->log->last_log_index)
         {
             RaftLogEntry *exist = log_slot(ctx, entry_idx);
-            if (exist->index == entry_idx &&
-                (exist->term != entry_term ||
-                 strcmp(exist->op_type, entry_op) != 0 ||
-                 strcmp(exist->payload, entry_payload) != 0))
+            RaftLogEntry  old;
+            bool          have_old = false;
+
+            if (exist->index == entry_idx)
             {
-                if (strcmp(exist->op_type, RAFT_OP_PARWAL) == 0)
-                    conflict_plsn = entry_partition_lsn(exist->payload);
-                log_truncate_after_locked(ctx, entry_idx - 1);
+                old = *exist;
+                have_old = true;
             }
+            else
+            {
+                /*
+                 * 环外的老条目：leader 正在补发我早就持有的一段。此时不能按
+                 * "槽位对不上"直接拒 —— 那正是落后超过环容量的节点永远追不上
+                 * 的第二道闸（第一道在 leader 侧的 log_get_entry_sql 回读）。
+                 * 也不能盲信：与 SQL 日志里的那一行逐字段比对再判定。
+                 */
+                SpinLockRelease(&ctx->log->mutex);
+                raft_spi_ctx = true;
+                have_old = log_get_entry_sql(ctx, entry_idx, &old);
+                raft_spi_ctx = false;
+                SpinLockAcquire(&ctx->log->mutex);
+
+                if (!have_old)
+                {
+                    /* 环外且日志里也没有 = 空洞，拒绝，让 leader 继续回退 */
+                    SpinLockRelease(&ctx->log->mutex);
+                    return true;
+                }
+            }
+
+            /*
+             * 冲突判据只看 term —— 这既是 Raft 的原始规则（同 index 同 term 的
+             * 条目必然出自同一个 leader、内容相同），也是这里**必须**这么写的
+             * 现实原因：`partdist.raft_log.payload` 是 jsonb，读回来的文本被
+             * 规范化过（键序、冒号后的空格），与 leader 线上发来的原始 JSON
+             * 文本逐字节不等。按文本比就会把每一条环外条目都判成冲突并截断，
+             * 实测把控制面日志从 347 条削到 35 条（2026-08-05 实测踩到）。
+             * 同理，重启后 restore 灌回环里的也是规范化文本，环内比文本一样不可靠。
+             */
+            if (old.term != entry_term)
+            {
+                if (strcmp(old.op_type, RAFT_OP_PARWAL) == 0)
+                    conflict_plsn = entry_partition_lsn(old.payload);
+                log_truncate_after_locked(ctx, entry_idx - 1);
+                /*
+                 * SQL 行必须与环同时截断：有了环外回读之后，留在表里的旧行
+                 * 会被重新读出来当作"本节点持有的条目"，重启 restore 也会把
+                 * 它们灌回环。删除必须发生在下面的 append 之前。
+                 */
+                SpinLockRelease(&ctx->log->mutex);
+                delete_log_entries_after_sql(ctx, entry_idx - 1);
+                SpinLockAcquire(&ctx->log->mutex);
+            }
+            else
+                already_present = true;
         }
+
         if (entry_idx == ctx->log->last_log_index + 1)
         {
             /*
@@ -2864,14 +3128,13 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
         }
-        else if (entry_idx <= ctx->log->last_log_index)
+        else if (already_present)
         {
-            RaftLogEntry *e = log_slot(ctx, entry_idx);
-            if (e->index != entry_idx)
-            {
-                SpinLockRelease(&ctx->log->mutex);
-                return true;
-            }
+            /*
+             * 已持有完全相同的这一条（环内或环外）——重传。不重复 append，
+             * 但**继续往下走**：数据组还要确认字节确实在盘上（SQL 行先于
+             * 字节写，崩溃可能只留下行），data_entry_store 幂等，落成功才 ack。
+             */
             SpinLockRelease(&ctx->log->mutex);
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
@@ -3505,6 +3768,210 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
 }
 
 /*
+ * 后台追平通道（计划文档 §12.4 #5 的后半段）。
+ *
+ * 缺口：数据条目只在 client backend 的 propose 路径下发，环外条目也只有 SPI
+ * 语境才读得回来。于是**没有写入流量时，落后的 follower 不会自行收敛** ——
+ * 掉线重启的副本要等下一笔业务写入才被顺带补齐；一直没有写入就一直不补。
+ * 落后超过环容量（128）时更糟：连下一笔写入也补不动，静默永久卡死。
+ *
+ * 本函数就是那条通道：由 TopologyMonitor 经 libpq 自连周期触发（与
+ * force_probe / dtx_recover_prepared 同一手法），因而跑在**真正的 client
+ * backend** 里 —— SPI 可用，既能读 parwal 字节，也能回读环外条目。
+ *
+ * 语义边界（务必保持）：
+ *   - 只补发**已存在**的条目，不产生新提案，不改变"多数派才提交"的语义；
+ *     commit_index 仍由 compute_new_commit_index 按多数派 match 推进。
+ *   - 只在本节点是该组 leader 时做事；非 leader 组直接跳过。
+ *   - 与 prepare 路径共用复制认领位，但**取不到就跳过**（非阻塞）：追平是
+ *     尽力而为的后台工作，绝不能去和事务提交路径抢锁、更不能让它等待。
+ *   - 每组每轮的补发条数有上限，避免一次调用把 tick 拖得过久。
+ */
+#define RAFT_CATCHUP_MAX_ROUNDS  256
+
+PG_FUNCTION_INFO_V1(pg_raft_catchup);
+
+Datum
+pg_raft_catchup(PG_FUNCTION_ARGS)
+{
+    int   i;
+    int64 shipped = 0;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT64(0);
+
+    parse_peers();
+    if (n_peers == 0)
+        PG_RETURN_INT64(0);
+
+    restore_groups_if_needed();
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        RaftGroupCtx    ctx;
+        int             state;
+        int             round;
+
+        if (!g->in_use)
+            continue;
+
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+
+        SpinLockAcquire(&ctx.cons->mutex);
+        state = ctx.cons->state;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (state != RAFT_LEADER)
+            continue;
+
+        if (!group_membership_known(&ctx))
+            continue;
+
+        if (!replicate_try_claim(&ctx))
+            continue;
+
+        raft_spi_ctx = true;
+        PG_TRY();
+        {
+            int p0;
+
+            restore_persistent_log_if_needed(&ctx);
+
+            /* 先按对端自报的 last_log_index 给 next_index 一个起点（只降不升） */
+            for (p0 = 0; p0 < n_peers; p0++)
+            {
+                int64 hint;
+                int64 cur_next;
+
+                if (!peer_in_group(&ctx, p0))
+                    continue;
+
+                SpinLockAcquire(&ctx.log->mutex);
+                cur_next = ctx.log->peer_next_index[p0];
+                SpinLockRelease(&ctx.log->mutex);
+
+                if (cur_next <= 1)
+                    continue;
+
+                hint = peer_last_log_index(&ctx, &peers[p0]);
+                if (hint < 0)
+                    continue;
+
+                SpinLockAcquire(&ctx.log->mutex);
+                if (ctx.log->peer_next_index[p0] > hint + 1)
+                    ctx.log->peer_next_index[p0] = hint + 1;
+                SpinLockRelease(&ctx.log->mutex);
+            }
+
+            for (round = 0; round < RAFT_CATCHUP_MAX_ROUNDS; round++)
+            {
+                int64 last_idx;
+                bool  any_behind = false;
+                bool  any_change = false;
+                int   p;
+
+                CHECK_FOR_INTERRUPTS();
+
+                SpinLockAcquire(&ctx.log->mutex);
+                last_idx = ctx.log->last_log_index;
+                SpinLockRelease(&ctx.log->mutex);
+
+                for (p = 0; p < n_peers; p++)
+                {
+                    int64 before;
+                    int64 after;
+                    int64 next_before;
+                    int64 next_after;
+
+                    if (!peer_in_group(&ctx, p))
+                        continue;
+
+                    SpinLockAcquire(&ctx.log->mutex);
+                    before = ctx.log->peer_match_index[p];
+                    next_before = ctx.log->peer_next_index[p];
+                    SpinLockRelease(&ctx.log->mutex);
+
+                    if (before >= last_idx)
+                        continue;
+
+                    any_behind = true;
+
+                    /* 不可达对端在退避窗口里，send_sql_rpc 自己会跳过 */
+                    replicate_to_peer(&ctx, p);
+
+                    SpinLockAcquire(&ctx.log->mutex);
+                    after = ctx.log->peer_match_index[p];
+                    next_after = ctx.log->peer_next_index[p];
+                    SpinLockRelease(&ctx.log->mutex);
+
+                    if (after > before)
+                        shipped += after - before;
+                    /*
+                     * next_index **下探**同样算进展：新当选的 leader 会把所有
+                     * peer 的 next_index 初始化成 last+1，落后很远的成员要先被
+                     * 一步步探回到它真正持有的位置（本实现的 AppendEntries 响应
+                     * 不带 conflict hint），这一段一条都发不出去。若把"没发出
+                     * 条目"当成没进展而收手，一次调用只能下探一格，追平会慢到
+                     * 看起来像没生效 —— 首版实测就是这样卡在 0。
+                     */
+                    if (after != before || next_after != next_before)
+                        any_change = true;
+                }
+
+                /* 全都追平了，或者这一轮什么都没动（对端不可达）：收手 */
+                if (!any_behind || !any_change)
+                    break;
+            }
+
+            /* 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派 */
+            leader_replicate_and_commit(&ctx);
+            group_apply_pending(&ctx);
+        }
+        PG_FINALLY();
+        {
+            raft_spi_ctx = false;
+            replicate_release(&ctx);
+        }
+        PG_END_TRY();
+    }
+
+    PG_RETURN_INT64(shipped);
+}
+
+/*
+ * 本节点是否是**任何一个**组的 leader（纯 shmem 读，BGW 可调）。
+ * TopologyMonitor 用它决定要不要为追平通道开一条自连接。
+ */
+bool
+pg_raft_any_group_leader_local(void)
+{
+    int i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return false;
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        int             state;
+
+        if (!g->in_use)
+            continue;
+
+        SpinLockAcquire(&g->cons.mutex);
+        state = g->cons.state;
+        SpinLockRelease(&g->cons.mutex);
+
+        if (state == RAFT_LEADER)
+            return true;
+    }
+    return false;
+}
+
+/*
  * 本组 prepare 复制的串行化（DTX_2PC_DESIGN.md §9.1）。
  *
  * 为什么需要：让路窗口修复之后，并发 backend 不再各自提前返回，而是**都会**
@@ -3582,6 +4049,27 @@ replicate_claim(RaftGroupCtx *ctx)
         pg_usleep(1000L);       /* 1ms */
         waited_us += 1000L;
     }
+}
+
+/*
+ * 非阻塞版认领：取不到就返回 false。后台追平通道用它 —— 追平是尽力而为的
+ * 后台工作，绝不能排队等在事务提交路径（prepare 复制）后面。
+ */
+static bool
+replicate_try_claim(RaftGroupCtx *ctx)
+{
+    bool got = false;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (!ctx->g->replicate_in_progress)
+    {
+        ctx->g->replicate_in_progress = true;
+        ctx->g->replicate_pid = MyProcPid;
+        got = true;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    return got;
 }
 
 static void

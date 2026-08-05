@@ -1089,6 +1089,15 @@ _PG_init(void)
                              &pg_raft_dtx_2pc_enabled, true,
                              PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomIntVariable("pg_raft.catchup_interval_ms",
+                            "后台追平通道的运行间隔（0=关闭）。",
+                            "本节点为 leader 的每个组，把落后成员按 nextIndex 逐条补齐。"
+                            "TopologyMonitor 经 libpq 自连接调 partdist.pg_raft_catchup()，"
+                            "因而跑在 client backend 里（BGW 无 SPI，取不到 parwal 字节，"
+                            "也回读不了环外条目）。关闭后落后副本只能等下一次业务写入顺带补齐。",
+                            &pg_raft_catchup_interval_ms, 5000, 0, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.dtx_recover_interval_ms",
                             "DTX-2PC 参与者恢复守护的自动运行间隔（0=关闭自动运行）。",
                             "每个节点的 TopologyMonitor 按该间隔经 libpq 自连接调"

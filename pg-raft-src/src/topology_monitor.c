@@ -91,11 +91,48 @@ pg_raft_self_trigger_dtx_recover(void)
     PQfinish(conn);
 }
 
+/*
+ * 后台追平通道的自触发（计划文档 §12.4 #5）。
+ *
+ * 与 self-probe / dtx 恢复同一手法，理由却更硬：追平**必须**在 client backend
+ * 里跑。BGW tick 没有 SPI，既读不到数据组条目的 parwal 字节，也回读不了已滑出
+ * 环窗口的老条目 —— 这正是"无写入流量时落后 follower 不自行收敛"的成因，
+ * 落后超过环容量（128）时更是永久卡死。
+ *
+ * 每个节点都跑，但只对**本节点是 leader 的组**做事；一个 leader 组都没有时
+ * 连接都不开（pg_raft_any_group_leader_local 是纯 shmem 读）。
+ */
+static void
+pg_raft_self_trigger_catchup(void)
+{
+    char      conninfo[256];
+    PGconn   *conn;
+    PGresult *res;
+
+    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        elog(DEBUG1, "pg_raft: 追平通道自连接失败: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return;
+    }
+
+    res = PQexec(conn, "SELECT partdist.pg_raft_catchup()");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        elog(DEBUG1, "pg_raft: 追平通道执行失败: %s", PQerrorMessage(conn));
+    else if (PQntuples(res) > 0 && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+        elog(LOG, "pg_raft: 后台追平通道补发 %s 条", PQgetvalue(res, 0, 0));
+    PQclear(res);
+    PQfinish(conn);
+}
+
 void
 pg_raft_topology_monitor_main(Datum main_arg)
 {
     TimestampTz last_probe = 0;
     TimestampTz last_dtx_recover = 0;
+    TimestampTz last_catchup = 0;
 
     (void) main_arg;
 
@@ -160,6 +197,23 @@ pg_raft_topology_monitor_main(Datum main_arg)
             {
                 pg_raft_self_trigger_probe();
                 last_probe = now;
+            }
+        }
+
+        /*
+         * 后台追平通道：按 catchup_interval_ms 节流。只有本节点确实是某个组的
+         * leader 时才开连接 —— 否则每个节点每 5 秒空转一次自连接。
+         */
+        if (pg_raft_raft_enabled && pg_raft_catchup_interval_ms > 0 &&
+            pg_raft_any_group_leader_local())
+        {
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_catchup == 0 ||
+                now - last_catchup >= pg_raft_catchup_interval_ms * 1000L)
+            {
+                pg_raft_self_trigger_catchup();
+                last_catchup = now;
             }
         }
 

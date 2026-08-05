@@ -297,6 +297,15 @@ COMMENT ON FUNCTION pg_raft_data_propose(bigint, bigint) IS
     '在数据组 leader 上把本节点 pg_parwal 的第 partition_lsn 条记录作为 Raft entry 提交；'
     '返回 Raft log index（0=失败）。提交成功即多数派已 fsync 落盘且 applied_part_lsn 已推进。';
 
+CREATE OR REPLACE FUNCTION pg_raft_catchup()
+    RETURNS bigint LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_catchup';
+
+COMMENT ON FUNCTION pg_raft_catchup() IS
+    '后台追平通道：对本节点为 leader 的每个组，把落后成员按 nextIndex 逐条补齐，返回补发条数。'
+    '只补发已存在的条目，不产生新提案，提交点仍按多数派推进。必须在 client backend 里跑'
+    '（要 SPI 读 parwal 字节与环外条目），由 TopologyMonitor 按 pg_raft.catchup_interval_ms 自连触发。';
+
 CREATE OR REPLACE FUNCTION pg_raft_group_reset_internal()
     RETURNS integer LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_reset';
