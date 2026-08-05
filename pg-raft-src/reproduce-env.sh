@@ -231,29 +231,44 @@ do_verify() {
     "INSERT INTO reply_v5 SELECT g, 'v'||g FROM generate_series(1,160) g;" >/dev/null
   check "插入 160 行回读" "$(PSQL "$COORD_PORT" -Atc 'SELECT count(*) FROM reply_v5')" "160"
 
-  echo "========== V6 数据面复制冒烟（单分片组：leader→2 followers 备份逐字节一致）=========="
+  echo "========== V6 数据面复制冒烟（单分片组：leader→全部 follower 备份逐字节一致）=========="
   PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
     "DROP TABLE IF EXISTS reply_v6; SET citus.shard_count=1; SET citus.shard_replication_factor=1;
      CREATE TABLE reply_v6(id int primary key, v text); SELECT create_distributed_table('reply_v6','id');" >/dev/null
-  local gid pport pid f1 f2
+  local gid pport pid f1
   gid=$(PSQL "$COORD_PORT" -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='reply_v6'::regclass")
   pport=$(PSQL "$COORD_PORT" -Atc \
     "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=${gid}")
   pid=$((pport - 5431))
-  f1=""; f2=""
+  # ★ follower 数量按拓扑取，**不能写死两个**。N_WORKERS=2 时除 leader 外只有
+  # 一个 follower，旧写法让 f2 为空，于是 `$((f2 - 5431))` 算出 -5431，
+  # **建组时塞进一个不存在的成员**——组照样建起来、leader 照样选出来，只在
+  # 最后一条指纹断言上报一个端口为空的 FAIL（`follower2(:)`），看上去像复现失败。
+  # 改成收集实际存在的 follower（最多 2 个），断言只对它们做。
+  local -a fols=()
   for i in $(seq 2 "$N_NODES"); do
     port=$(node_port "$i")
     [[ "$port" == "$pport" ]] && continue
-    if [[ -z "$f1" ]]; then f1=$port; elif [[ -z "$f2" ]]; then f2=$port; else break; fi
+    fols+=("$port")
+    [[ "${#fols[@]}" -ge 2 ]] && break
   done
-  for port in "$f1" "$f2"; do
+  check "V6 至少有 1 个 follower（当前拓扑 N_NODES=${N_NODES}）" \
+    "$([[ "${#fols[@]}" -ge 1 ]] && echo ok || echo none)" "ok"
+  if [[ "${#fols[@]}" -lt 1 ]]; then
+    echo "        N_WORKERS=${N_WORKERS} 太小，数据面复制无从验起；至少要 2。"
+    return
+  fi
+  f1="${fols[0]}"
+  for port in "${fols[@]}"; do
     PSQL "$port" -v ON_ERROR_STOP=1 -q -c \
       "SET citus.enable_ddl_propagation=off; CREATE TABLE IF NOT EXISTS reply_v6_${gid} (LIKE reply_v6 INCLUDING ALL);" >/dev/null
   done
-  for port in "$pport" "$f1" "$f2"; do
+  for port in "$pport" "${fols[@]}"; do
     PSQL "$port" -q -c "SELECT partdist.rebuild_shard_identity();" >/dev/null
   done
-  local members="ARRAY[${pid}, $((f1 - 5431)), $((f2 - 5431))]"
+  local members="ARRAY[${pid}"
+  for port in "${fols[@]}"; do members+=", $((port - 5431))"; done
+  members+="]"
   PSQL "$pport" -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null
   local t st=""
   for t in $(seq 1 20); do
@@ -261,31 +276,32 @@ do_verify() {
     [[ "$st" == "leader" ]] && break; sleep 1
   done
   check "分区组 ${gid} leader 落在 placement 节点(:${pport})" "$st" "leader"
-  for port in "$f1" "$f2"; do
+  for port in "${fols[@]}"; do
     PSQL "$port" -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null
   done
   PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
     "INSERT INTO reply_v6 SELECT g, 'r'||g FROM generate_series(1,3) g;" >/dev/null
   sleep 2
   local fp_sql="SELECT partdist.get_partition_flush_lsn(oidv) || ':' || COALESCE(md5(string_agg(sub.h, ',' ORDER BY sub.plsn)),'') FROM (SELECT partdist.local_partition_for_shard(${gid}) AS oidv) o, LATERAL (SELECT g AS plsn, md5(r.data) AS h FROM generate_series(1, partdist.get_partition_flush_lsn(o.oidv)) g, LATERAL partdist.partwal_read_record(o.oidv, g) r) sub GROUP BY oidv"
-  local lead_fp f1_fp f2_fp
+  local lead_fp fp k=0
   lead_fp=$(PSQL "$pport" -Atc "$fp_sql")
-  f1_fp=$(PSQL "$f1" -Atc "$fp_sql")
-  f2_fp=$(PSQL "$f2" -Atc "$fp_sql")
   check "leader 侧有 parwal 记录(防两侧皆空的假阳性)" \
     "$([[ -n "$lead_fp" && "$lead_fp" != 0:* ]] && echo ok || echo empty)" "ok"
-  check "follower1(:${f1}) parwal 指纹 == leader" "$f1_fp" "$lead_fp"
-  check "follower2(:${f2}) parwal 指纹 == leader" "$f2_fp" "$lead_fp"
+  for port in "${fols[@]}"; do
+    k=$((k + 1))
+    fp=$(PSQL "$port" -Atc "$fp_sql")
+    check "follower${k}(:${port}) parwal 指纹 == leader" "$fp" "$lead_fp"
+  done
   check "follower 壳表 0 行(只备份不回放)" \
     "$(PSQL "$f1" -Atc "SELECT count(*) FROM reply_v6_${gid}")" "0"
   check "coordinator 收到自治登记(primary=${pid}, term>=1)" \
     "$(PSQL "$COORD_PORT" -Atc "SELECT count(*) FROM partdist.partition_map WHERE partition_id=${gid} AND primary_node=${pid} AND primary_term>=1")" "1"
 
   # 冒烟夹具清理
-  for port in "$pport" "$f1" "$f2"; do
+  for port in "$pport" "${fols[@]}"; do
     PSQL "$port" -q -c "SELECT partdist.pg_raft_group_reset();" >/dev/null 2>&1 || true
   done
-  for port in "$f1" "$f2"; do
+  for port in "${fols[@]}"; do
     PSQL "$port" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS reply_v6_${gid};" >/dev/null 2>&1 || true
   done
   PSQL "$COORD_PORT" -q -c "DROP TABLE IF EXISTS reply_v6; DROP TABLE IF EXISTS reply_v5;" >/dev/null 2>&1 || true
