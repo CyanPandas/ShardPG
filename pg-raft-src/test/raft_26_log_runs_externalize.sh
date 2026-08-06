@@ -14,22 +14,27 @@
 #
 # E1 补上的就是这两样：partdist.raft_log_runs 用"段"记 (start_index, start_plsn,
 # term)，partdist.pg_raft_entry_from_parwal() 按段反查并从记录头部重建载荷。
-# 本期**不删**任何既有写入，用重建结果与 raft_log 里存的那份逐条对照。
+#
+# 本用例随 E3 改过一次判据：E1/E2 期间数据组的 raft_log 行还在，判据是"重建结果
+# vs 存档行"；E3 把那份存档撤掉之后该基准不复存在，改判**覆盖完整 + 跨节点一致**
+# （见下面 A/D）。后者本来就更强 —— 存档行与重建结果出自同一条写路径，拿它当基准
+# 等于自己证明自己。
 #
 # ── 判据 ─────────────────────────────────────────────────────────────
-#   A. **重建等价**：leader 上该组的每一条 raft_log，pg_raft_entry_from_parwal()
-#      重回来的 term 相等、payload 语义相等（比 jsonb 不比文本：raft_log.payload
-#      是 jsonb，读回来的文本被规范化过，逐字节比会假失败 —— 这一条是 2026-08-05
-#      在冲突判定上踩过的同一个坑）。
+#   A. **重建覆盖完整**：1..last_log_index 每个 index 都能重建出非空 (term,
+#      payload)，且该组在 partdist.raft_log 里是 0 行（E3 起写路径已撤）。
+#      注：E1/E2 期间这一段比的是"重建结果 vs raft_log 存档行"，E3 把存档撤掉
+#      之后那个基准不复存在，改判覆盖完整 + D 段的跨节点一致。
 #   B. **run 真的是"段"**：连续同任期的 N 条条目只占 1 行。这一条是整个设计的
 #      立足点 —— 若退化成逐条一行，那只是把 raft_log 换了张表，什么都没省。
 #   C. **跳号提案失败且不留痕**：段文件不允许空洞（AppendPartWALRecordAt 对
 #      `expected > last + 1` 直接 ERROR），所以跳号提案必然凑不齐多数派而被丢弃。
 #      判据是它**什么都不留下** —— run 写在复制之前，回滚不清它就会留下一个指向
 #      不存在条目的段起点，之后所有 >= 它的 index 都按错的 plsn 重建。
-#   D. **follower 侧同样成立**：run 由 persist_log_entry_sql 统一维护，leader 的
-#      propose 与 follower 的 append 都经过它。
-#      顺带确认：follower 的 plsn 天然连续，它的 run 行数与 leader 一致。
+#   D. **follower 侧同样成立 + 跨节点一致**：run 由 persist_log_entry_sql 统一
+#      维护，leader 的 propose 与 follower 的 append 都经过它；两边对同一段 index
+#      重建出来的 (term, payload) 指纹必须逐字节相同 —— 这才是"复制过去的内容与
+#      段文件里的字节是同一份"的真判据。
 #   E. **换届另起一段**：停掉 leader，剩下两个成员（3 成员的多数派=2）选出新
 #      leader，在新任期里再提案一条 —— run 增加一行，且新旧两段的重建都等价。
 #      这一条是 run 存在的首要理由（term 只能按段记，不可能从 parwal 头部读出来）。
@@ -78,18 +83,30 @@ fail() { cleanup; echo "raft_26 FAIL: $1"; exit 1; }
 
 g() { q "$1" "SELECT $2 FROM partdist.pg_raft_group_status() WHERE group_id = ${GID};"; }
 n_runs() { q "$1" "SELECT count(*) FROM partdist.raft_log_runs WHERE group_id = ${GID};"; }
-n_entries() { q "$1" "SELECT count(*) FROM partdist.raft_log WHERE group_id = ${GID};"; }
+n_entries() { g "$1" last_log_index; }
 
-# 重建与存档不一致的条目数（0 = 全部等价）。这里比的是 jsonb，不是文本 ——
-# raft_log.payload 是 jsonb，取出来的文本已被规范化（键序、冒号后空格），
-# 与 format() 拼出来的原始 JSON 逐字节不等；比文本会假失败。
-mismatches() {
-  q "$1" "SELECT count(*) FROM partdist.raft_log l
-            LEFT JOIN LATERAL partdist.pg_raft_entry_from_parwal(${GID}, l.log_index) e ON true
-           WHERE l.group_id = ${GID}
-             AND (e.term IS DISTINCT FROM l.term
-                  OR e.payload IS NULL
-                  OR e.payload::jsonb IS DISTINCT FROM l.payload);"
+# **E3 之后判据换了基准**：数据组的 partdist.raft_log 里已经没有行了（写路径
+# 被撤掉），原先"重建结果 vs 存档行"的自比无从谈起。改用两条更强的基准：
+#   ① 覆盖完整 —— 1..last_log_index 每个 index 都要重建得出非空 (term, payload)；
+#   ② 跨节点一致 —— 见 fp()。
+# 返回重建不出来的条目数（0 = 全覆盖）。
+missing() {
+  local lli; lli=$(n_entries "$1")
+  [[ "$lli" =~ ^[0-9]+$ && "$lli" -gt 0 ]] || { echo "-1"; return; }
+  q "$1" "SELECT count(*) FROM generate_series(1, ${lli}) i
+            LEFT JOIN LATERAL partdist.pg_raft_entry_from_parwal(${GID}, i) e ON true
+           WHERE e.term IS NULL OR e.payload IS NULL;"
+}
+
+# 整条日志的重建指纹。两个成员对同一段 index 重建出来的必须逐字节相同 ——
+# 这才是"复制过去的内容与段文件里的字节是同一份"的真判据（比自比 raft_log 强：
+# 那份存档本来就是同一条写路径产出的，比它等于自己证明自己）。
+fp() {
+  local lli; lli=$(n_entries "$1")
+  [[ "$lli" =~ ^[0-9]+$ && "$lli" -gt 0 ]] || { echo "EMPTY"; return; }
+  q "$1" "SELECT md5(string_agg(e.term || '|' || e.payload, ',' ORDER BY i))
+            FROM generate_series(1, ${lli}) i,
+                 LATERAL partdist.pg_raft_entry_from_parwal(${GID}, i) e;"
 }
 
 find_leader() {   # $1=最长等待秒数（缺省 30）
@@ -170,11 +187,15 @@ for k in $(seq 0 $(( N - 1 ))); do
 done
 
 ENT=$(n_entries "$LEADER")
-[[ "$ENT" == "$N" ]] || fail "A：leader 上该组条目数 ${ENT} != ${N}"
+[[ "$ENT" == "$N" ]] || fail "A：leader 上该组日志末端 ${ENT} != ${N}"
 [[ "$N" -ge 3 ]] || fail "夹具：连续段只有 ${N} 条，太短，判不出【段】与【逐条】的区别"
 
-BAD=$(mismatches "$LEADER")
-[[ "$BAD" == "0" ]] || fail "A：leader 上有 ${BAD} 条重建结果与 raft_log 不一致"
+ROWS=$(q "$LEADER" "SELECT count(*) FROM partdist.raft_log WHERE group_id = ${GID};")
+[[ "$ROWS" == "0" ]] \
+  || fail "A：E3 之后数据组不该再往 partdist.raft_log 写行，却有 ${ROWS} 行"
+
+BAD=$(missing "$LEADER")
+[[ "$BAD" == "0" ]] || fail "A：leader 上有 ${BAD} 条 index 重建不出来（末端 ${ENT}）"
 
 RUNS=$(n_runs "$LEADER")
 [[ "$RUNS" == "1" ]] \
@@ -204,8 +225,8 @@ IDX=$(propose "$LEADER" "$GAP_PLSN")
 [[ "$(n_runs "$LEADER")" == "$RUNS_BEFORE_GAP" ]] \
   || fail "C：跳号提案失败后 run 行数从 ${RUNS_BEFORE_GAP} 变成 $(n_runs "$LEADER")——留下了指向不存在条目的段起点"
 
-BAD=$(mismatches "$LEADER")
-[[ "$BAD" == "0" ]] || fail "C：跳号提案失败后 leader 上有 ${BAD} 条重建结果与 raft_log 不一致"
+BAD=$(missing "$LEADER")
+[[ "$BAD" == "0" ]] || fail "C：跳号提案失败后 leader 上有 ${BAD} 条 index 重建不出来"
 
 # ── D：follower 侧同样成立 ───────────────────────────────────────────
 FOLLOWER=""
@@ -221,8 +242,12 @@ done
 [[ "$(n_entries "$FOLLOWER")" == "$(n_entries "$LEADER")" ]] \
   || fail "D：follower ${FOLLOWER} 20s 内没跟上（$(n_entries "$FOLLOWER") / $(n_entries "$LEADER")）"
 
-BAD=$(mismatches "$FOLLOWER")
-[[ "$BAD" == "0" ]] || fail "D：follower 上有 ${BAD} 条重建结果与 raft_log 不一致"
+BAD=$(missing "$FOLLOWER")
+[[ "$BAD" == "0" ]] || fail "D：follower 上有 ${BAD} 条 index 重建不出来"
+
+LFP=$(fp "$LEADER"); FFP=$(fp "$FOLLOWER")
+[[ -n "$LFP" && "$LFP" != "EMPTY" && "$LFP" == "$FFP" ]] \
+  || fail "D：leader 与 follower 的重建指纹不同（${LFP} / ${FFP}）—— 复制过去的内容与段文件里的字节不是同一份"
 
 FRUNS=$(n_runs "$FOLLOWER")
 LRUNS=$(n_runs "$LEADER")
@@ -261,8 +286,8 @@ RUNS_AFTER=$(n_runs "$NEW_LEADER")
 [[ "$RUNS_AFTER" -gt "$RUNS_BEFORE" ]] \
   || fail "E：换届后提案没有新开一段（run 行数 ${RUNS_BEFORE} → ${RUNS_AFTER}）—— term 只能按段记，不断段就等于把新任期的条目按旧 term 重建"
 
-BAD=$(mismatches "$NEW_LEADER")
-[[ "$BAD" == "0" ]] || fail "E：换届后新 leader 上有 ${BAD} 条重建结果与 raft_log 不一致"
+BAD=$(missing "$NEW_LEADER")
+[[ "$BAD" == "0" ]] || fail "E：换届后新 leader 上有 ${BAD} 条 index 重建不出来"
 
 cleanup
 echo "raft_26 PASS: 数据组日志外部化 E1（A 重建等价 / B run 是段不是逐条 / C 跳号提案失败且不留痕 / D follower 侧成立 / E 换届另起一段）"

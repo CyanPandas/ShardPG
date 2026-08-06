@@ -19,9 +19,10 @@
 #      （段文件记录数与 leader 一致，不只是 raft_log 行数对上）。
 #   B. **确实走了环外那条路**：断言缺口 > 环容量，否则本用例退化成"环内追平"，
 #      把重建摘掉也照样通过（raft_25 B 段就是这么假过一次，见 §6 表）。
-#   C. **重建出来的条目与 leader 逐条一致**：追平后 victim 上每条 raft_log 的
-#      (term, payload) 与它自己按 run 重建的结果相同 —— 复制过去的内容与段文件
-#      里的字节是同一份，不是两套。
+#   C. **victim 与 leader 的整条日志重建指纹相同**：追平过来的内容与 leader 段
+#      文件里的字节必须是同一份，不是两套。（E3 之后数据组的 raft_log 是 0 行，
+#      顺带断言这一点；E1/E2 期间这一段比的是"重建 vs 存档行"，那份存档与重建
+#      出自同一条写路径，等于自己证明自己，跨节点比更强。）
 #
 # 真对照（离线执行，不在套件里）：log_get_entry_parwal() 直接 return false
 # 重编 .so ⇒ A 段确定性失败（victim 卡在 0，leader 已到 140）。
@@ -29,6 +30,8 @@ set -uo pipefail
 
 CONTAINER="${CONTAINER:-pg-citus-raft-container}"
 BASE_PORT="${BASE_PORT:-5432}"
+N_WORKERS="${N_WORKERS:-8}"
+LAST_PORT=$(( BASE_PORT + N_WORKERS ))
 TABLE=raft27_demo
 MEMBER_PORTS=(5433 5434 5435)
 MEMBER_IDS="ARRAY[2,3,4]"
@@ -52,6 +55,11 @@ cleanup() {
   local port
   for port in "${MEMBER_PORTS[@]}"; do node_start "$port"; done
   node_start "$BASE_PORT"
+  for port in $(seq "$BASE_PORT" "$LAST_PORT"); do
+    alive "$port" || continue
+    psql_at "$port" -q -c "ALTER SYSTEM RESET pg_raft.catchup_interval_ms" >/dev/null 2>&1 || true
+    q "$port" "SELECT pg_reload_conf();" >/dev/null
+  done
   for port in "$BASE_PORT" "${MEMBER_PORTS[@]}"; do
     q "$port" "SELECT partdist.pg_raft_group_reset();" >/dev/null
     [[ -n "$GID" ]] && q "$port" "DELETE FROM partdist.partition_map WHERE partition_id = ${GID}::oid;" >/dev/null
@@ -62,6 +70,36 @@ fail() { cleanup; echo "raft_27 FAIL: $1"; exit 1; }
 
 g() { q "$1" "SELECT $2 FROM partdist.pg_raft_group_status() WHERE group_id = ${GID};"; }
 nrec() { q "$1" "SELECT partdist.count_parwal_records(partdist.local_partition_for_shard(${GID}));"; }
+
+# ALTER SYSTEM + pg_reload_conf() **必须分开两次 -c**：写在同一次调用里会被包进
+# 一个事务块，ALTER SYSTEM 直接报错（raft_24 里踩过，错误还被 q 吞掉了）。
+set_guc() {   # $1=GUC 名 $2=值
+  local port
+  for port in $(seq "$BASE_PORT" "$LAST_PORT"); do
+    alive "$port" || continue
+    psql_at "$port" -v ON_ERROR_STOP=1 -q -c "ALTER SYSTEM SET $1 = $2" >/dev/null 2>&1 \
+      || fail "set_guc：节点 ${port} 设置 $1 失败"
+    q "$port" "SELECT pg_reload_conf();" >/dev/null
+  done
+}
+
+# 清零段文件并**确认稳定**。
+#
+# demux 是异步的：INSERT 提交之后它可能还没把记录写进段文件，此刻清零，随后
+# 那条才落盘 —— 段文件凭空多出一条（2026-08-05 实测，raft_28 A 段报"21 条，
+# 应为 20"）。所以清零后要复查，连续两次读到 0 才算干净。
+truncate_stable() {   # $1=端口
+  local i n prev=-1
+  for i in $(seq 1 10); do
+    q "$1" "SELECT partdist.partwal_truncate_to(
+              partdist.local_partition_for_shard(${GID}), 0);" >/dev/null
+    sleep 1
+    n=$(nrec "$1")
+    [[ "$n" == "0" && "$prev" == "0" ]] && return 0
+    prev="$n"
+  done
+  return 1
+}
 
 find_leader() {
   local port i secs=${1:-30}
@@ -113,9 +151,7 @@ LREC=$(nrec "$LEADER")
 # 节点都是本地主写，本地编号会和 leader 下发的编号相撞）。
 for p in "${MEMBER_PORTS[@]}"; do
   [[ "$p" == "$LEADER" ]] && continue
-  q "$p" "SELECT partdist.partwal_truncate_to(partdist.local_partition_for_shard(${GID}), 0);" >/dev/null
-  LEFT=$(nrec "$p")
-  [[ "$LEFT" == "0" ]] || fail "夹具：${p} 段文件清零后仍有 ${LEFT} 条记录"
+  truncate_stable "$p" || fail "夹具：${p} 段文件清零后 10 轮内没有稳定在 0（demux 仍在写？）"
 done
 
 VICTIM=""
@@ -128,6 +164,13 @@ done
 
 # ── 制造缺口：victim 停机期间提案 NENTRIES 条 ────────────────────────
 # 3 成员的多数派 = 2，leader + keeper 仍能提交。
+#
+# **先关掉后台追平通道**（2026-08-05 实测踩到）：TopologyMonitor 每
+# catchup_interval_ms 就自触发一轮，victim 一起来就被它悄悄补上几十条，
+# 等测到"缺口"时已经只剩 99 条 —— B 段的构造被后台活动破坏，用例变成假的。
+# 关掉之后，追平只能由 A 段显式调用 pg_raft_catchup() 完成，归因才干净。
+set_guc pg_raft.catchup_interval_ms 0
+
 node_stop "$VICTIM"
 
 # 分批用 plpgsql 循环提案：plsn 必须**严格升序**（段文件不允许空洞），而把
@@ -179,16 +222,22 @@ VREC=$(nrec "$VICTIM")
 [[ "$VREC" == "$LLI" ]] \
   || fail "A：victim 段文件里只有 ${VREC} 条记录，leader 日志已到 ${LLI} —— 行对上了但字节没落盘"
 
-# ── C：victim 上重建结果与自己收到的条目逐条一致 ─────────────────────
-BAD=$(q "$VICTIM" \
-  "SELECT count(*) FROM partdist.raft_log l
-     LEFT JOIN LATERAL partdist.pg_raft_entry_from_parwal(${GID}, l.log_index) e ON true
-    WHERE l.group_id = ${GID}
-      AND (e.term IS DISTINCT FROM l.term
-           OR e.payload IS NULL
-           OR e.payload::jsonb IS DISTINCT FROM l.payload);")
-[[ "$BAD" == "0" ]] \
-  || fail "C：victim 上有 ${BAD} 条重建结果与收到的条目不一致"
+# ── C：victim 与 leader 的重建结果逐条一致 ───────────────────────────
+# **E3 之后换了基准**：数据组的 raft_log 里已经没有行了，原先"重建 vs 存档行"
+# 的自比无从谈起（而且那本来就是自己证明自己 —— 存档与重建出自同一条写路径）。
+# 改比两个成员的整条日志指纹：追平过来的内容与 leader 段文件里的字节必须是同一份。
+fp() {
+  q "$1" "SELECT md5(string_agg(e.term || '|' || e.payload, ',' ORDER BY i))
+            FROM generate_series(1, ${LLI}) i,
+                 LATERAL partdist.pg_raft_entry_from_parwal(${GID}, i) e;"
+}
+LFP=$(fp "$LEADER"); VFP=$(fp "$VICTIM")
+[[ -n "$LFP" && "$LFP" == "$VFP" ]] \
+  || fail "C：victim 与 leader 的重建指纹不同（${VFP} / ${LFP}）—— 追平过来的内容与段文件里的字节不是同一份"
+
+ROWS=$(q "$VICTIM" "SELECT count(*) FROM partdist.raft_log WHERE group_id = ${GID};")
+[[ "$ROWS" == "0" ]] \
+  || fail "C：E3 之后数据组不该再往 partdist.raft_log 写行，victim 上却有 ${ROWS} 行"
 
 cleanup
 echo "raft_27 PASS: 数据组环外条目从 parwal 重建（A 超环容量追平且字节落盘 / B 缺口 ${GAP} > 环容量 ${RING_CAPACITY} / C 重建与条目逐条一致）"

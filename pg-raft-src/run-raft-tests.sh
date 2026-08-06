@@ -1436,6 +1436,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# raft_28: 数据组日志外部化 E3（计划文档 §11.10）
+# 用例本体在 test/raft_28_data_log_no_sql_rows.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_28 数据组写路径去 raft_log"
+
+start_all_nodes
+sleep 2
+RAFT_28_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_28_data_log_no_sql_rows.sh" 2>&1) && RAFT_28_RC=0 || RAFT_28_RC=$?
+echo "$RAFT_28_OUT" | sed 's/^/    /'
+if [[ "$RAFT_28_RC" -eq 0 ]]; then
+  ok "raft_28_data_log_no_sql_rows"
+else
+  bad "raft_28_data_log_no_sql_rows($(echo "$RAFT_28_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"
