@@ -1156,10 +1156,28 @@ worker 抱着旧表还是撞同一道栅栏。
    追平/升主前调用 `XLogHaveInvalidPages()` 断言为空),列入 R1 验收项。
    **已核实的反例**:`CreateFakeRelcacheEntry`(`heap_xlog_visible` 会用)在 16.14
    **已不再** `Assert(InRecovery)`,该路径不构成障碍。
-4. **原生 clog 空洞**:nextXid 被推进但回放 xid 区间从未 `ExtendCLOG`,原生
-   `TransactionIdDidCommit` 触碰这些 xid 会因 clog 文件缺失报错。必须保证:
-   副本壳表 `autovacuum_enabled = off`(建表即设 + launcher 防御性校验),
-   副本分区不服务任何本地读写(升主前)。
+4. **原生 clog 空洞(★ 已修,2026-08-06,红绿闭环)**:nextXid 被推进但回放
+   xid 区间从未 `ExtendCLOG`。**这条约束的原文低估了危害** —— 原文写"触碰
+   这些 xid 会报错",实测是**节点级灾难**且确定性复现(`test_clog_hole_c4.sh`
+   红灯):leader 烧 4 万 xid → follower 追平时 nextXid 跳过 clog 页边界
+   (每 32768 个 xid 一页)→ 页从未被 `ZEROPAGE`,回放路径当场
+   `PANIC: could not access status of transaction 41377`,节点崩;崩溃恢复
+   redo 到提交记录时同款 FATAL,**节点起不来**,只能按报错 xid 手工给
+   pg_xact 补零页。次生形态:可见性自相矛盾时 `lazy_scan_prune` 的无中断
+   重试循环攥着 buffer 锁自旋(实测 54 分钟,pg_cancel 无效)。
+
+   **修法**(`PartDistAdvanceNextXidPastXid`,shard_replay.c):推进前在
+   XidGenLock 内对被跳过的每个 xid 依次补 `ExtendCLOG/ExtendCommitTs/
+   ExtendSUBTRANS` —— 语义等价于"这些 xid 都像被本地分配过一样",三个
+   Extend* 只在页首 xid 上真正建页写 ZEROPAGE WAL,其余是取模空转。
+   **必须在锁内**:锁外的并发本地分配可能已在同一页提交,重复清零会抹掉
+   已提交状态。内核的 `AdvanceNextFullTransactionIdPastXid` 不补是因为它
+   只跑在 startup 进程里、standby 的 ZEROPAGE 随主库 WAL 流而来 ——
+   我们的回放没有这条流,必须自己补。
+
+   仍需保持:副本壳表 `autovacuum_enabled = off`(建表即设),副本分区不
+   服务本地读写(升主前)。修复后验收:同一场景 nextXid 跳 40k,本地事务
+   提交、immediate-stop 崩溃恢复、VACUUM 均正常(14/14)。
 5. **冻结与回卷账目**:副本表的 relfrozenxid 不由本地 vacuum 维护(freeze 由 leader
    的 freeze 记录回放实现 —— 元组物理上确实被冻了,只是 `pg_class.relfrozenxid`
    这个**目录字段**没人更新)。本地 `datfrozenxid` 计算须排除副本壳表,或经控制记录
@@ -1410,10 +1428,103 @@ worker 抱着旧表还是撞同一道栅栏。
     的第一次提交都无视间隔立刻发射**;R1 开几十条短命 psql 连接,恰好压在
     VACUUM 灌环的窗口上,把环顶爆。已改为节点级共享水位
     (`PartWALFreezeCheckDue`,`PartWALCtlData.freeze_last_check`)。
-    **但那只是让 D2 不再去顶这个环,环本身的流控缺失没有解决。**
 
-    真正的修法在 pg_raft:propose 侧在环接近满时**阻塞等 apply**而不是报错,
-    或把环溢出到磁盘。
+    > **★★ 状态(2026-08-05 终):下述 pg_raft 侧修法曾全部实装并逐项验证,
+    > 后按用户决定(Raft/2PC 模块冻结,回退到稳定版本)整体回退。**
+    > 当前代码 = 稳定版 + `data_propose_one` 的 isnull 修复(已提交)。
+    > 完整补丁存档:`pg_raft_flowcontrol_39.patch`(工作区外备份
+    > `/home/zhanhao/pg_raft_flowcontrol_39.patch.bak`,661 行,含背压、
+    > #39 认领归还、批量游标推进、`flow_stats` 观测、2PC 门禁半成品)。
+    > 下文保留为**已验证的设计记录**,供将来重新立项时直接取用;文中
+    > "已落地/已修"均指回退前的验证状态,不指当前代码。
+    > 测试侧的 `health_check_no_drops` 保留:`flow_stats` 不存在时显式打
+    > "跳过",流控将来落地即自动生效。
+
+    **已落地的修法(2026-08-05,pg_raft 侧,已回退——见上)**:
+
+    - **背压取代拒绝**(`wait_for_log_room`)。环满时不再直接丢提案,而是循环
+      `group_apply_pending` + 睡 1ms,直到有空位或超过
+      `pg_raft.propose_wait_ms`(默认 10s,`PGC_SIGHUP`;0 = 保留旧行为供诊断)。
+      等待是可打断的(`CHECK_FOR_INTERRUPTS`)。
+    - **`apply_in_progress` 的抛错泄漏**(独立缺陷,会造成永久卡死)。原先
+      `apply_in_progress = true` 之后直接调 `apply_one_entry`,而它会走 SPI ——
+      任何一次 ERROR 都是 longjmp,清标志那句根本不执行,标志永久停在 true。
+      此后本组 `group_apply_pending` 每次都从"另一个 backend 正在 apply"分支
+      返回,`last_applied` 再也不动,容量检查恒满,该组**从此拒收一切新条目**。
+      已用 `PG_TRY/PG_CATCH` 归还。
+    - **`data_entry_apply` 的失败原因**记进 `last_apply_fail`,超时 WARNING 里
+      直接给出人话。它的三条 `return false` 分支(没有本地分片 / 拿不到 SPI /
+      `follower_set_applied_part_lsn` 执行失败)在日志上原本完全看不出区别,
+      而处置完全不同。
+    - **丢弃留痕**(`partdist.pg_raft_group_flow_stats()`):每组
+      `ring_depth / ring_capacity / ring_full_waits / ring_full_drops /
+      quorum_drops / last_drop_plsn`。**这几个数字是"副本是否还可信"的唯一
+      线索** —— 后两者非零即意味着该分区可能已永久分叉,需重做物理基线。
+
+    实测(1 分片 3 副本,4 个并发写入器 + 同时 VACUUM FREEZE):
+    修复前 `log ring full` 3 次;修复后 **0 次,且背压一次都没触发**。
+    五套件全量回归 R1 56/0、L1 48/0、R2 48/0、D1 81/0、D2 15/0,零崩溃。
+
+    **#39(已修):apply 认领在 FATAL 上不归还。** 曾在一轮回归里造成 9 次背压
+    超时丢弃,新加的诊断给出的现场是:
+
+    ```
+    last_log=2767 commit=2767 applied=2640     ← 差恰好 = RAFT_LOG_CAPACITY-1
+    apply 最近一次失败原因：无
+    ```
+
+    `commit == last_log` 说明条目**全都提交了**,`data_entry_apply` 也从没报过
+    失败 —— 纯粹是没人拿得到 apply 认领。丢中什么全凭运气:一轮丢中的全是
+    可重试的冻结 CTRL(五套件照样全 PASS),另一轮丢中 VACUUM 截断的 DATA,
+    follower 流里留下缺口,后续记录期望的页状态对不上 ——
+    `PANIC: failed to add new item` 回放崩溃循环,节点反复重置,整轮回归卡死。
+    **约束 13 的"静默分叉"实际不静默,它以最恶性的方式发声。**
+
+    修法建立在"三条死亡路径各有各的归还机制"上:
+
+    | 死法 | 归还机制 |
+    |---|---|
+    | ERROR | `PG_CATCH`(longjmp 可接) |
+    | **FATAL** | **常驻 `before_shmem_exit` 回调**(`proc_exit` 会跑它,而 postmaster 对 FATAL 退出不重置 shmem —— bool 版泄漏的正是这条) |
+    | kill -9 | postmaster 整体重置节点、重建 shmem,天然清零 |
+
+    落地:认领从 bool 改为 `apply_owner_pid`,每 backend 首次进
+    `group_apply_pending` 时注册一次 `raft_apply_claim_release_on_exit`,
+    回调只清 `owner == MyProcPid` 的组。**没有探活、没有抢占** —— 抢占一个
+    还活着(只是慢)的持有者会让两个进程并发 redo 同一分区,破坏单写者不变式
+    (§13 约束 10)。此前一版 `kill(pid,0)` 探活 + 可重入例外因此回退:容器
+    PID 1 不回收僵尸,僵尸上 `kill(pid,0)` 照样返回 0,探活失真。
+
+    验收判据同步加固:`tests/lib_node_health.sh` 新增 `health_check_no_drops`,
+    每个套件收尾断言本轮 `ring_full_drops + quorum_drops` 增量为 0 ——
+    **全 PASS + 有丢弃 = 运气,不是通过。**
+
+    **#39 修复后的下一层(同日,干净环境实测):apply 逐条 SPI 追不上 FPI 洪水。**
+    认领泄漏修掉后,重建环境上仍有 6 次背压超时丢弃,诊断显示持有者**全部
+    活着且各不相同**、apply 也从未报失败 —— 不是泄漏,是吞吐:
+
+    ```
+    13:07:26  applied=561
+    13:08:25  applied=1310      ← 59 秒 749 条 ≈ 12.7 条/秒
+    ```
+
+    每条数据条目的 apply = 一次 SPI(`follower_set_applied_part_lsn` 的
+    UPDATE + WAL)。VACUUM 的 FPI 洪水提案速率远超它,128 槽的环持续饱和,
+    总有提案等满 `propose_wait_ms` 被丢。
+
+    **修法:批量游标推进。** 数据条目的 apply 是单调游标,逐条推与只推到
+    批尾**语义等价**(中间值没有读者)。`group_apply_pending` 在认领后把
+    `[idx, commit_index]` 的连续段合并,取批内最大 plsn 做**一次** SPI,
+    成功后 `last_applied` 直接跳到批尾 —— apply 成本除以批长(最多 127)。
+    控制面**不合并**:它的 apply 写的是各不相同的元数据表,逐条语义必须保留。
+
+    **仍未解决:多数派不足导致的丢弃是另一条通向同一后果的路。** 同一次并发
+    压测里 `quorum_drops = 12`。`discard_uncommitted_entry()` 会连带调
+    `data_group_truncate_parwal()` 把 **leader 自己段里那条也截掉**,于是
+    leader 的 `flush_lsn` 退回、follower 显示"已追平",而那条记录代表的物理
+    变更(VACUUM 的尾部截断、页面冻结)在 leader 上早已 durable 且不随事务
+    回滚。这条路现在**可见了但没修**;修法方向是让数据组的 propose 在多数派
+    不足时重试而不是丢弃,或把"已 durable 但未复制"的记录钉住不许截断。
 
 ---
 
@@ -1458,6 +1569,9 @@ pg-partdist-src/
     test_ddl_fileset_d1.sh     [新] D1 DDL/fileset 控制通道(§12)
     test_local_wal_conflict.sh [新] 本地 WAL 崩溃恢复不得覆盖回放结果(§13 约束 12)
     test_freeze_sync_d2.sh     [新] 冻结账目经 CTRL 同步(§13 约束 5)
+    test_clog_hole_c4.sh       [新] clog 空洞(§13 约束 4):烧 4 万 xid 跨页边界,
+                                    追平后本地事务/崩溃恢复/VACUUM 全存活;
+                                    红灯自救(按报错 xid 补 pg_xact 零页)
 ```
 
 > `test_local_wal_conflict.sh` 必须**独立**于 R1 的 kill -9 用例:修复生效后
@@ -1471,6 +1585,10 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 `freeze_sync_interval_ms`(D2,§13 约束 5,默认 60000;0 = 每事务查,测试用)、
 `replay_dw_enabled`(sidecar,§8.5,**未实现**)、
 `debug_segv_backtrace`(诊断,`PGC_POSTMASTER`,默认 off)。
+
+pg_raft 侧新增:`pg_raft.propose_wait_ms`(§13 约束 13,默认 10000,`PGC_SIGHUP`;
+日志环满时等待 apply 追上的上限,0 = 不等直接丢提案 —— **数据组上丢提案等于
+副本可能永久分叉,生产不应设 0**)。
 
 > **★ `debug_segv_backtrace` 为什么必须有。** PostgreSQL 不装 SIGSEGV 处理器,
 > 崩溃进程在日志里只留一行 `server process (PID nnn) was terminated by signal 11`

@@ -270,6 +270,7 @@ done
 
 echo
 health_check_no_crash
+health_check_no_drops
 
 echo "==================== 结果：PASS=${PASS} FAIL=${FAIL} ===================="
 [[ "$FAIL" -eq 0 ]] || exit 1

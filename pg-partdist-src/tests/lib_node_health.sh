@@ -17,9 +17,24 @@
 # health_check_no_crash 调用 check()，所以必须在定义了 check() 之后 source/调用。
 
 _HEALTH_START_TS=""
+_HEALTH_DROPS_BASE=""
+
+# 全部 9 个节点的端口（与 /work/pg-cluster-data 的节点布局一样是环境常量）
+_HEALTH_PORTS="5432 5433 5434 5435 5436 5437 5438 5439 5440"
+
+# 每端口一行："<port> <ring_full_drops+quorum_drops 总和>"；函数不存在的端口输出 "<port> MISSING"
+_health_drops_snapshot() {
+  local p v
+  for p in $_HEALTH_PORTS; do
+    v=$(docker exec -u postgres "$CONTAINER" /work/pg-install/bin/psql -p "$p"           -U postgres -d postgres -Atc           "SELECT COALESCE(sum(ring_full_drops+quorum_drops),0) FROM partdist.pg_raft_group_flow_stats()"           2>/dev/null </dev/null)
+    [[ "$v" =~ ^[0-9]+$ ]] || v=MISSING
+    echo "$p $v"
+  done
+}
 
 health_mark_start() {
   _HEALTH_START_TS=$(docker exec -u postgres "$CONTAINER" date -u "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+  _HEALTH_DROPS_BASE=$(_health_drops_snapshot)
 }
 
 # 输出本轮时间窗内的崩溃行，无则输出空。
@@ -54,5 +69,41 @@ health_check_no_crash() {
     echo "        ↑ 上面这些崩溃会让节点整体重置、分区组失去多数派，"
     echo "          由此产生的 diff 不一致**不是回放缺陷**，先修崩溃。"
     echo "        取栈回溯：ALTER SYSTEM SET pg_partdist.debug_segv_backtrace=on; 后重启节点。"
+  fi
+}
+
+# 断言：本轮时间窗内没有任何 Raft 提案被丢弃（§13 约束 13 / #39 的验收判据）。
+#
+# ★ 为什么必须有这条：只查崩溃的 health_check_no_crash 抓不住"静默丢弃"。
+# 实测两轮对照 —— 同一个缺陷（apply 认领在 FATAL 上泄漏），一轮丢中的全是
+# 可重试的冻结 CTRL（五套件全 PASS），另一轮丢中 VACUUM 截断的 DATA（follower
+# 永久分叉 + 回放 PANIC 循环）。**全 PASS + 有丢弃 = 运气，不是通过。**
+#
+# 节点重启会把 shmem 计数清零，所以差值只认"涨"（负数按 0 计）——重启丢掉的
+# 计数由 health_check_no_crash 那侧兜住（重启本身就是崩溃）。
+health_check_no_drops() {
+  local total=0 missing=0 detail="" p base cur delta
+  local cur_snap
+  cur_snap=$(_health_drops_snapshot)
+  for p in $_HEALTH_PORTS; do
+    base=$(printf '%s\n' "$_HEALTH_DROPS_BASE" | awk -v p="$p" '$1==p{print $2}')
+    cur=$(printf '%s\n' "$cur_snap" | awk -v p="$p" '$1==p{print $2}')
+    if [[ "$cur" == "MISSING" || "$base" == "MISSING" || -z "$cur" || -z "$base" ]]; then
+      missing=$((missing+1)); continue
+    fi
+    delta=$((cur - base)); [[ "$delta" -lt 0 ]] && delta=0
+    total=$((total+delta))
+    [[ "$delta" -gt 0 ]] && detail+=" :$p+$delta"
+  done
+  if [[ "$missing" -eq 9 ]]; then
+    # 静默通过是最糟的失败模式：函数整个不存在时要喊出来，不能装作 0
+    echo "  跳过  丢弃检查（partdist.pg_raft_group_flow_stats 不存在，flow-stats 版本之前的环境）"
+    return
+  fi
+  check "本轮无 Raft 提案被丢弃（ring_full_drops + quorum_drops）" "$total" "0"
+  if [[ "$total" != "0" ]]; then
+    echo "        增量按节点：${detail}"
+    echo "        ↑ 数据组丢提案 = leader 已 durable 的物理变更没送到 follower，"
+    echo "          即使本轮文件 diff 全过也可能只是丢中了可重试的 CTRL —— 视为不通过。"
   fi
 }

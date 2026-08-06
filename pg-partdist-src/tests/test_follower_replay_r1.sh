@@ -309,6 +309,7 @@ check "follower 壳表行数 == leader(${lead_cnt})（冻结元组可读，验�
 
 echo
 health_check_no_crash
+health_check_no_drops
 
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then

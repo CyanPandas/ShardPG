@@ -383,6 +383,7 @@ done
 
 echo ""
 health_check_no_crash
+health_check_no_drops
 
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "R2 事务层验收：全部通过"; else echo "R2 事务层验收：存在 FAIL"; fi

@@ -322,6 +322,7 @@ check "重新触发后追平到 ${tgt}" \
 
 echo
 health_check_no_crash
+health_check_no_drops
 
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 [[ "$FAIL" -eq 0 ]] && echo "L1 惰性回放验收：全部通过" || echo "L1 惰性回放验收：存在 FAIL"

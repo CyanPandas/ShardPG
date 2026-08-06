@@ -30,8 +30,12 @@
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
 
+#include "access/clog.h"            /* ExtendCLOG（§13 约束 4） */
+#include "access/commit_ts.h"       /* ExtendCommitTs */
 #include "access/heapam_xlog.h"
 #include "access/nbtxlog.h"
+#include "access/subtrans.h"        /* ExtendSUBTRANS */
+#include "access/transam.h"
 #include "access/rmgr.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"            /* XLOG_XACT_COMMIT / XLOG_XACT_OPMASK */
@@ -511,17 +515,43 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 /*
  * PartDistAdvanceNextXidPastXid — 把本地 nextXid 拉到严格大于 xid。
  *
- * 逐行对照 varsup.c 的 AdvanceNextFullTransactionIdPastXid()，只有一处不同：
- * 核内那个版本无锁读 nextXid（带 Assert(AmStartupProcess() || !IsUnderPostmaster)
- * 声明这只对 startup 进程安全），replay worker 是普通 bgworker，assert 构建下
- * 直接崩。这里读-改-写全程持 XidGenLock。
+ * 逐行对照 varsup.c 的 AdvanceNextFullTransactionIdPastXid()，两处不同：
+ *
+ * 1. 核内那个版本无锁读 nextXid（带 Assert(AmStartupProcess() || !IsUnderPostmaster)
+ *    声明这只对 startup 进程安全），replay worker 是普通 bgworker，assert 构建下
+ *    直接崩。这里读-改-写全程持 XidGenLock。
+ *
+ * 2. ★★★ 被跳过的 xid 区间必须补 ExtendCLOG/ExtendCommitTs/ExtendSUBTRANS
+ *    （§13 约束 4）。核内版本不补是有前提的：它只在 startup 进程里跑，standby
+ *    的 clog ZEROPAGE 记录会随主库 WAL 流一起回放过来。我们的回放**没有**这条
+ *    流 —— nextXid 一旦跳过 clog 页边界（32768 个 xid 一页），那一页的 ZEROPAGE
+ *    既没人写、WAL 里也没有，页只以内存 SLRU 的形式碰巧存在。实测两个症状
+ *    （2026-08-05，同一天两种死法）：
+ *
+ *      a) kill -9 后节点起不来：崩溃恢复 redo 到本地事务的 COMMIT 记录，
+ *             FATAL: could not access status of transaction 57338
+ *             Could not read from file "pg_xact/0000" at offset 8192
+ *         pg_xact 文件只有 1 页而本地 xid 已用到 57k。只能手工 dd 补零页救。
+ *
+ *      b) autovacuum 无限自旋拖死整节点：xid 落在不可靠 clog 覆盖区，
+ *         可见性判定自相矛盾，lazy_scan_prune 的重试循环无中断检查地
+ *         攥着 buffer 锁转 54 分钟，pg_cancel 无效，唯一解法 kill -9 ——
+ *         随即触发 (a)。
+ *
+ *    补法与 GetNewTransactionId 完全同构：对区间内每个 xid 依次调三个
+ *    Extend*（它们各自只在"该 xid 是所在页第一个"时真正清零建页并写
+ *    ZEROPAGE WAL，其余情况是一次取模判断的空转）。必须在 XidGenLock 内做：
+ *    锁外的并发本地分配可能已在同一页上提交，Extend* 的重新清零会抹掉
+ *    已提交状态。锁内则区间 (旧 nextXid, 新 nextXid) 保证无人用过，清零幂等。
  */
 void
 PartDistAdvanceNextXidPastXid(TransactionId xid)
 {
     FullTransactionId newNextFullXid;
     TransactionId     next_xid;
+    TransactionId     cur;
     uint32            epoch;
+    uint32            gap;
 
     if (!TransactionIdIsNormal(xid))
         return;
@@ -535,6 +565,29 @@ PartDistAdvanceNextXidPastXid(TransactionId xid)
     {
         LWLockRelease(XidGenLock);
         return;                 /* 本地已经走在前面 */
+    }
+
+    /*
+     * 给 [旧 nextXid, xid] 里的每个 xid 补齐三件套 —— 语义上等价于
+     * "这些 xid 都像被本地 GetNewTransactionId 分配过一样"。
+     * gap 按 32 位回绕差计算，只用于日志。
+     */
+    gap = (uint32) (xid - next_xid) + 1;
+    if (gap > 1000000)
+        ereport(WARNING,
+                (errmsg("pg_partdist replay: nextXid 一次性跳进 %u 个 xid"
+                        "（%u -> %u），clog/subtrans 逐页补齐会持锁较久",
+                        gap, next_xid, xid)));
+
+    cur = next_xid;
+    for (;;)
+    {
+        ExtendCLOG(cur);
+        ExtendCommitTs(cur);
+        ExtendSUBTRANS(cur);
+        if (TransactionIdEquals(cur, xid))
+            break;
+        TransactionIdAdvance(cur);
     }
 
     /*
