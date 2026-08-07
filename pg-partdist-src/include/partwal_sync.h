@@ -221,8 +221,9 @@ extern void  PartWALEndTxn(void);
 
 /*
  * 本事务写过哪些分区。集合在 PartWALInsert() 时按 backend 登记，
- * 在 PartWALFlush() 触发复制挂钩之后被清空 —— 因此 DTX 接线必须在
- * 调 PartWALFlush() **之前**取快照（PartWALCopyTouched）。
+ * 由 PartWALEndTxn()（COMMIT/PREPARE 事件）与 PartWALAbort() 清空 ——
+ * 复制挂钩是幂等区间式的，PartWALFlush() 触发复制**不清**集合，
+ * 因此同一事务内 flush 之后 PartWALCopyTouched 仍取得到快照。
  *
  * PartWALCopyTouched: 拷贝一份当前集合，返回元素个数；out 由调用方
  *   palloc/pfree（传 NULL 只问个数）。

@@ -61,7 +61,7 @@ for p in "${WORKERS[@]}"; do
 done
 
 # ---- C+D. 跨节点 + 剪枝(用 reference table:同一 shardid 复制到所有 worker)----
-echo "[C] cross-node: reference-table shardid identical across workers, local OIDs differ"
+echo "[C] cross-node: reference-table shardid identical across workers, local OID == pg_class truth"
 P "$COORD" -c "SET citus.enable_ddl_propagation=on;
   DROP TABLE IF EXISTS partdist_p0_refdemo;
   CREATE TABLE partdist_p0_refdemo(id int primary key);
@@ -72,16 +72,22 @@ if [ -z "$REF" ]; then
   bad "could not create reference table for cross-node check"
 else
   for p in "${WORKERS[@]}"; do P "$p" -c "SELECT partdist.rebuild_shard_identity();" >/dev/null; done
-  oids=""; distinct_ok=1; present_ok=1
+  # 注意不能断言"各节点 OID 互异"：刚重建的对称集群里 9 个节点 OID 计数器
+  # 几乎同步，同一 reference 分片在各节点常常分到相同 OID —— 互异只是
+  # 有机分化后的偶然现象。要验的是"本地 OID 指向的确实是本节点那张分片表"。
+  oids=""; truth_ok=1; present_ok=1
   for p in "${WORKERS[@]}"; do
     o=$(P "$p" -c "SELECT partdist.local_partition_for_shard($REF);")
     [ -z "$o" ] && present_ok=0
-    case " $oids " in *" $o "*) distinct_ok=0;; esac
+    # psql -Atc 会把 SET 的命令标签一并打出，只取末行的 oid
+    truth=$(P "$p" -c "SET citus.override_table_visibility TO off;
+        SELECT oid FROM pg_class WHERE relname='partdist_p0_refdemo_$REF';" | tail -n1)
+    [ -n "$o" ] && [ "$o" = "$truth" ] || truth_ok=0
     oids="$oids $o"
   done
   coord_null=$(P "$COORD" -c "SELECT coalesce(partdist.local_partition_for_shard($REF)::text,'NULL');")
   [ "$present_ok" = "1" ] && ok "shardid $REF present on all workers (local OIDs:$oids)" || bad "shardid $REF missing on some worker (oids:$oids)"
-  [ "$distinct_ok" = "1" ] && ok "per-node local OIDs are distinct (node-specific identity)" || bad "local OIDs not distinct:$oids"
+  [ "$truth_ok" = "1" ] && ok "per-node local OID matches pg_class shard relation" || bad "local OID mismatch vs pg_class:$oids"
   [ "$coord_null" = "NULL" ] && ok "coordinator does not host the shard (NULL)" || bad "coordinator unexpectedly returned $coord_null"
 
   echo "[D] prune: after dropping the table + rebuild, its rows vanish"

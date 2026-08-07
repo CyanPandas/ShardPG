@@ -259,8 +259,9 @@ for i in 0 1; do
               partdist.local_partition_for_shard(${GIDS[$i]}), g) d
       WHERE d.kind = 1 AND d.dtxid = ${DTXID};")
   [[ -n "$PLSN" && "$PLSN" != "0" ]] || fail "C: 组 ${GIDS[$i]} 上找不到本事务的 PREPARE 标记"
+  # parwal-3.0 起头部是 64 位 gxid（node_id<<48 | 本地 xid），取低 48 位
   PXID=$(q "${PORTS[$i]}" \
-    "SELECT xid FROM partdist.partwal_read_record(
+    "SELECT gxid & ((1::bigint<<48)-1) FROM partdist.partwal_read_record(
               partdist.local_partition_for_shard(${GIDS[$i]}), ${PLSN});")
   [[ -n "$PXID" && "$PXID" != "0" ]] \
     || fail "C: 组 ${GIDS[$i]} 的 PREPARE 标记没有携带本地 top-level xid（实际 '${PXID}'）"

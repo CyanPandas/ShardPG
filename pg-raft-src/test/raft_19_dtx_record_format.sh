@@ -162,11 +162,18 @@ PL_PREP=$(q "$LEADER_PORT" "SELECT partdist.partwal_append_dtx_record(${LOID}::o
 PL_DEC=$(q "$LEADER_PORT" "SELECT partdist.partwal_append_dtx_record(${LOID}::oid, 2, 777001, ${GID}, 1691000000, 1, ARRAY[${GID}, 999888]::bigint[]);")
 [[ "$PL_PREP" =~ ^[0-9]+$ && "$PL_DEC" =~ ^[0-9]+$ ]] || fail "B: 写 DTX 记录失败"
 
-# DATA 记录 flags 必须是 1（0x01），且 orig_lsn 非零
+# 分类契约：DTX 追加之前的段流里只允许 DATA(1)/MARKER(2)/CTRL(4) ——
+# R2 之后每笔事务尾部都有一条 COMMIT MARKER（flags=2），"全部 flags=1"
+# 的旧断言已不成立；但 flags=0（未分类）与 flags=8（DTX 混进数据段）
+# 仍然是必须抓的错。另单独确认 DATA 记录确实存在且带显式 flags=1。
 bad=$(q "$LEADER_PORT" "SELECT count(*) FROM generate_series(1, ${DATA_MAX}) g,
         LATERAL partdist.partwal_read_record(${LOID}::oid, g) r
-        WHERE r.flags <> 1;")
-[[ "$bad" == "0" ]] || fail "B: leader 侧有 ${bad} 条 DATA 记录的 flags 不是 1"
+        WHERE r.flags NOT IN (1, 2, 4);")
+[[ "$bad" == "0" ]] || fail "B: leader 侧有 ${bad} 条记录 flags 不在 {1,2,4}（未分类或 DTX 混入）"
+ndata=$(q "$LEADER_PORT" "SELECT count(*) FROM generate_series(1, ${DATA_MAX}) g,
+        LATERAL partdist.partwal_read_record(${LOID}::oid, g) r
+        WHERE r.flags = 1;")
+[[ "$ndata" =~ ^[0-9]+$ ]] && (( ndata > 0 )) || fail "B: leader 侧没有 flags=1 的 DATA 记录"
 
 # DTX 记录：flags=8、orig_lsn=0/0、info=子类型
 for pair in "${PL_PREP}:1" "${PL_DEC}:2"; do

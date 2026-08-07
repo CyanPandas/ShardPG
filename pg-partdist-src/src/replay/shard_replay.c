@@ -1554,6 +1554,18 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
                 if (!ApplyCtrlRecord(ctx, &ent->hdr, body))
                     break;
             }
+            else if (PartWALRecordIsDtx(&ent->hdr))
+            {
+                /*
+                 * DTX 记录（DTX_2PC_DESIGN.md §5.5）：载荷是 DtxRecord，不是
+                 * XLogRecord，绝不能进 rm_redo。它服务于升主时的 in-doubt
+                 * 闭合（恢复守护按需回读段文件），对物理回放只推进游标。
+                 * 事务号水位无需在此登记：同一事务的 DATA 记录带着相同
+                 * gxid，已在数据路径登记过。
+                 */
+                REPLAY_TRACE("TRACE dtx skip: plsn=%llu kind=%u",
+                             (unsigned long long) expected, ent->hdr.info);
+            }
             else
                 ApplyDataRecord(ctx, &ent->hdr, body);
 
