@@ -1,0 +1,84 @@
+DTX-2PC 内核补丁 0004：pre_record_commit_hook
+
+依据 pg-partdist-src/docs/DTX_2PC_DESIGN.md §9.3。
+
+分布式事务的决议（dtx_decide）必须严格发生在"Citus 已把 PREPARE TRANSACTION
+发给全部参与者之后、本地 commit record 落盘之前"这个窗口里。
+
+XactCallback 走不通：回调是 LIFO 顺序，pg_partdist 在 Citus 之后加载，它注册的
+XACT_EVENT_PRE_COMMIT 回调必然跑在 **Citus 的回调之前** —— 那时 Citus 还没发
+PREPARE，无从判断参与者是否都已 prepared。而调换加载顺序这条路是堵死的：
+Citus 强制要求自己排 shared_preload_libraries 第一位。
+
+因此在 CommitTransaction() 里、CallXactCallbacks(XACT_EVENT_PRE_COMMIT) **之后**、
+RecordTransactionCommit() **之前**开一个 hook。
+
+这个位置的关键性质：
+  1. 全部 XactCallback（含 Citus 的远程 PREPARE）都已执行完毕；
+  2. 本地 commit record 尚未写入，hook 里 ereport(ERROR) 还能干净地把整个事务
+     翻进 abort 路径 —— 参与者的 prepared 事务随后被推定中止；
+  3. 事务状态仍是 TRANS_INPROGRESS，SPI / libpq 都能正常使用。
+放在 XACT_EVENT_COMMIT（post-commit）则本地已经提交，决议失败时无法回头，
+**绝对不能放那里**。
+
+并行 worker 不触发（is_parallel_worker）：它提交的不是自己的分布式事务。
+
+--- a/src/include/access/xact.h
++++ b/src/include/access/xact.h
+@@ -137,6 +137,24 @@
+ 
+ typedef void (*XactCallback) (XactEvent event, void *arg);
+ 
++/*
++ * pre_record_commit_hook -- fired inside CommitTransaction(), after every
++ * XACT_EVENT_PRE_COMMIT callback has run and before RecordTransactionCommit().
++ *
++ * Why this cannot be an XactCallback: callbacks run in LIFO order, so a module
++ * loaded later runs *earlier*, and no callback can express "after every other
++ * module's PRE_COMMIT work is done".  Distributed-transaction commit decisions
++ * need exactly that position (see pg_partdist's DTX-2PC design).
++ *
++ * Contract:
++ *   - the local commit record has not been written yet, so ereport(ERROR) from
++ *     the hook still takes the normal abort path -- this is relied upon;
++ *   - transaction state is still TRANS_INPROGRESS, so SPI is usable;
++ *   - not called for parallel workers.
++ */
++typedef void (*pre_record_commit_hook_type) (void);
++extern PGDLLIMPORT pre_record_commit_hook_type pre_record_commit_hook;
++
+ typedef enum
+ {
+ 	SUBXACT_EVENT_START_SUB,
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -262,6 +262,13 @@
+ static bool currentCommandIdUsed;
+ 
+ /*
++ * Extension-installable hook fired inside CommitTransaction(), after every
++ * XACT_EVENT_PRE_COMMIT callback has run and before RecordTransactionCommit().
++ * See the contract in xact.h.
++ */
++pre_record_commit_hook_type pre_record_commit_hook = NULL;
++
++/*
+  * xactStartTimestamp is the value of transaction_timestamp().
+  * stmtStartTimestamp is the value of statement_timestamp().
+  * xactStopTimestamp is the time at which we log a commit / abort WAL record,
+@@ -2214,6 +2221,15 @@
+ 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_COMMIT
+ 					  : XACT_EVENT_PRE_COMMIT);
+ 
++	/*
++	 * Last chance to abort: every PRE_COMMIT callback has run (so any
++	 * extension-managed remote transactions are already prepared), and our own
++	 * commit record has not been written yet.  An ERROR raised from here still
++	 * takes the normal abort path.
++	 */
++	if (!is_parallel_worker && pre_record_commit_hook != NULL)
++		(*pre_record_commit_hook) ();
++
+ 	/* If we might have parallel workers, clean them up now. */
+ 	if (IsInParallelMode())
+ 		AtEOXact_Parallel(true);

@@ -37,8 +37,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "access/rmgr.h"
+#include "catalog/pg_type.h"
+#include "utils/array.h"
+
 #include "partition_wal.h"
+#include "partition_wal_header.h"
 #include "partition_wal_writer.h"
+#include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
+#include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
+#include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
 
 PG_FUNCTION_INFO_V1(pg_partdist_get_partition_flush_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_get_follower_applied_part_lsn);
@@ -343,10 +351,34 @@ pg_partdist_partwal_truncate_to(PG_FUNCTION_ARGS)
 {
 	Oid		partition_id = PG_GETARG_OID(0);
 	int64	keep_upto = PG_GETARG_INT64(1);
+	bool	ok;
 
-	PG_RETURN_BOOL(TruncatePartWALTo(partition_id,
-									 (RelFileNumber) partition_id,
-									 (uint64) keep_upto));
+	/*
+	 * ★ 与 PartWALFlush 的追加者互斥（2026-08-03 修）。
+	 *
+	 * 本函数由 group_propose 的失败路径调用（失多数派回滚该条字节），
+	 * 此前完全无锁：截断段文件、改写 checkpoint 时，并发 backend 正持
+	 * PartWALCtl->lock 往同一分区追加并写自己的 checkpoint —— 两边用同名
+	 * checkpoint.tmp / fileset.tmp，实测出现 rename ENOENT 告警，更坏的
+	 * 情形是截断点计算基于正在被追加的文件。调用点在复制挂钩里，彼时
+	 * PartWALFlush 已释放锁，这里再取不会自锁。
+	 */
+	if (PartWALCtl != NULL)
+		LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		ok = TruncatePartWALTo(partition_id,
+							   (RelFileNumber) partition_id,
+							   (uint64) keep_upto);
+	}
+	PG_FINALLY();
+	{
+		if (PartWALCtl != NULL)
+			LWLockRelease(PartWALCtl->lock);
+	}
+	PG_END_TRY();
+
+	PG_RETURN_BOOL(ok);
 }
 
 Datum
@@ -384,4 +416,209 @@ pg_partdist_follower_set_applied_part_lsn(PG_FUNCTION_ARGS)
 
 	SPI_finish();
 	PG_RETURN_BOOL(ret == SPI_OK_INSERT);
+}
+
+/* ------------------------------------------------------------------ */
+/* DTX-2PC — 分布式事务记录的写入与解析                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * partwal_append_dtx_record(partition_id, kind, dtxid, coord_gsid,
+ *                           commit_ts, verdict, participants[])
+ *
+ * 在本节点该分区的 parwal 流里追加一条 DTX 记录并 fsync，返回分配到的
+ * partition_lsn。设计依据 DTX_2PC_DESIGN.md §5。
+ *
+ * 记录随后由 prepare 接线的复制挂钩（pg_raft_partwal_replicate）按普通增量
+ * 复制出去 —— DTX 记录与 DATA 记录共用同一个 partition_lsn 序号空间和同一条
+ * 复制通道，flags 保证它在 follower 侧不被误当作 WAL 字节。
+ */
+uint64
+AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
+				int64 commit_ts, int32 verdict,
+				const int64 *partvals, int nparts,
+				TransactionId xid)
+{
+	PartitionWALWriter *writer;
+	DtxRecordPayload   *payload;
+	Size				paylen;
+	uint64				assigned;
+
+	/* 参与者清单只有 DECISION 记录携带（§5.2） */
+	if (kind != DTX_DECISION)
+		nparts = 0;
+
+	paylen = DtxPayloadSize(nparts);
+	payload = (DtxRecordPayload *) palloc0(paylen);
+	payload->dtxid = (uint64) dtxid;
+	payload->coord_gsid = coord_gsid;
+	payload->commit_ts = (uint64) commit_ts;
+	payload->verdict = (kind == DTX_DECISION) ? (uint32) verdict : 0;
+	payload->nparticipants = (uint32) nparts;
+	if (nparts > 0)
+		memcpy(DtxPayloadParticipants(payload), partvals,
+			   sizeof(int64) * nparts);
+
+	InitPartitionWALDirectory(partition_id);
+	writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
+	if (writer == NULL)
+		ereport(ERROR,
+				(errmsg("partwal_append_dtx_record: 无法为分区 %u 创建写入器",
+						partition_id)));
+
+	/*
+	 * orig_lsn 恒为 0：DTX 记录不是 WAL 记录，没有 leader 侧 end LSN。
+	 * 回放侧按 flags 在分派处就把它路由走，永不进 rm_redo，也永不用它盖页 LSN。
+	 * info 存 DtxRecordKind（不是 XLog info）；rmid 存 RM_XACT_ID 仅为可读性。
+	 *
+	 * xid：PREPARE 标记要带本分区上的本地 top-level xid —— 升主回放时，
+	 * "这笔 in-doubt 的本地事务属于哪个全局事务"就只剩这一条线索（DATA 记录
+	 * 里只有 xid，没有 dtx 信息）。恢复守护补写的 COMMIT/ABORT 标记不在原事务
+	 * 里，传 InvalidTransactionId。
+	 */
+	AppendPartWALRecord(writer,
+						InvalidXLogRecPtr,
+						(uint8) RM_XACT_ID,
+						(uint8) kind,
+						(const char *) payload,
+						(uint32) paylen,
+						TransactionIdIsValid(xid)
+							? MakeGlobalXid(PartDistLocalNodeId(), xid)
+							: InvalidGlobalXid,
+						PARTWAL_FLAG_DTX);
+	FlushPartitionWALWriter(writer, true);
+	assigned = writer->last_partition_lsn;
+	DestroyPartitionWALWriter(writer);
+	pfree(payload);
+
+	return assigned;
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_append_dtx_record);
+
+Datum
+pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
+{
+	Oid					partition_id = PG_GETARG_OID(0);
+	int32				kind = PG_GETARG_INT32(1);
+	int64				dtxid = PG_GETARG_INT64(2);
+	int64				coord_gsid = PG_GETARG_INT64(3);
+	int64				commit_ts = PG_GETARG_INT64(4);
+	int32				verdict = PG_GETARG_INT32(5);
+	ArrayType		   *parts = PG_ARGISNULL(6) ? NULL : PG_GETARG_ARRAYTYPE_P(6);
+	int					nparts = 0;
+	int64			   *partvals = NULL;
+	uint64				assigned;
+
+	if (!DtxRecordKindIsValid(kind))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("partwal_append_dtx_record: 非法的记录子类型 %d", kind),
+				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET。")));
+
+	if (kind == DTX_DECISION &&
+		verdict != (int32) DTX_VERDICT_COMMIT && verdict != (int32) DTX_VERDICT_ABORT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("partwal_append_dtx_record: DECISION 记录的 verdict 必须是 1(COMMIT) 或 2(ABORT)，实际 %d",
+						verdict)));
+
+	if (parts != NULL)
+	{
+		Datum  *elems;
+		bool   *nulls;
+		int		n;
+		int		i;
+
+		if (ARR_NDIM(parts) > 1)
+			ereport(ERROR,
+					(errmsg("partwal_append_dtx_record: participants 必须是一维数组")));
+		deconstruct_array(parts, INT8OID, 8, true, 'd', &elems, &nulls, &n);
+		partvals = (int64 *) palloc(sizeof(int64) * (n > 0 ? n : 1));
+		for (i = 0; i < n; i++)
+			if (!nulls[i])
+				partvals[nparts++] = DatumGetInt64(elems[i]);
+	}
+
+	assigned = AppendDtxRecord(partition_id, kind, dtxid, coord_gsid,
+							   commit_ts, verdict, partvals, nparts,
+							   InvalidTransactionId);
+
+	PG_RETURN_INT64((int64) assigned);
+}
+
+/*
+ * partwal_read_dtx_record(partition_id, partition_lsn)
+ *
+ * 把一条 DTX 记录解析成可读字段，供运维与回归断言用。
+ * 该 partition_lsn 上不是 DTX 记录时返回 NULL（调用方据此判别记录类型）。
+ */
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_read_dtx_record);
+
+Datum
+pg_partdist_partwal_read_dtx_record(PG_FUNCTION_ARGS)
+{
+	Oid					partition_id = PG_GETARG_OID(0);
+	int64				partition_lsn = PG_GETARG_INT64(1);
+	PartWALRecord		rec;
+	char			   *data = NULL;
+	DtxRecordPayload   *payload;
+	TupleDesc			tupdesc;
+	Datum				values[6];
+	bool				nulls[6];
+	HeapTuple			tuple;
+	ArrayType		   *parts_arr;
+	Datum			   *part_datums;
+	uint32				i;
+
+	if (partition_lsn <= 0)
+		PG_RETURN_NULL();
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errmsg("partwal_read_dtx_record: 返回类型必须是 record")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	if (!partwal_find_record(partition_id, (uint64) partition_lsn, &rec, &data))
+		PG_RETURN_NULL();
+
+	/* 分类一律以 flags 判定，不以 data_len 判定（FRD §4.1 契约） */
+	if ((rec.flags & PARTWAL_FLAG_DTX) == 0)
+	{
+		if (data != NULL)
+			pfree(data);
+		PG_RETURN_NULL();
+	}
+
+	if (data == NULL || rec.data_len < sizeof(DtxRecordPayload))
+		ereport(ERROR,
+				(errmsg("partwal_read_dtx_record: 分区 %u plsn %lld 的 DTX 载荷过短(%u 字节)",
+						partition_id, (long long) partition_lsn, rec.data_len)));
+
+	payload = (DtxRecordPayload *) data;
+	if (rec.data_len != DtxPayloadSize(payload->nparticipants))
+		ereport(ERROR,
+				(errmsg("partwal_read_dtx_record: 分区 %u plsn %lld 的 DTX 载荷长度不符"
+						"（头部 %u，按 nparticipants=%u 应为 %zu）",
+						partition_id, (long long) partition_lsn, rec.data_len,
+						payload->nparticipants,
+						DtxPayloadSize(payload->nparticipants))));
+
+	part_datums = (Datum *) palloc(sizeof(Datum) *
+								   (payload->nparticipants > 0 ? payload->nparticipants : 1));
+	for (i = 0; i < payload->nparticipants; i++)
+		part_datums[i] = Int64GetDatum(DtxPayloadParticipants(payload)[i]);
+	parts_arr = construct_array(part_datums, (int) payload->nparticipants,
+								INT8OID, 8, true, 'd');
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = Int32GetDatum((int32) rec.info);           /* kind        */
+	values[1] = Int64GetDatum((int64) payload->dtxid);
+	values[2] = Int64GetDatum(payload->coord_gsid);
+	values[3] = Int64GetDatum((int64) payload->commit_ts);
+	values[4] = Int32GetDatum((int32) payload->verdict);
+	values[5] = PointerGetDatum(parts_arr);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(data);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }

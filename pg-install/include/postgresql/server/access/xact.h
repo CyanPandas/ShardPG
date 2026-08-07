@@ -137,6 +137,24 @@ typedef enum
 
 typedef void (*XactCallback) (XactEvent event, void *arg);
 
+/*
+ * pre_record_commit_hook -- fired inside CommitTransaction(), after every
+ * XACT_EVENT_PRE_COMMIT callback has run and before RecordTransactionCommit().
+ *
+ * Why this cannot be an XactCallback: callbacks run in LIFO order, so a module
+ * loaded later runs *earlier*, and no callback can express "after every other
+ * module's PRE_COMMIT work is done".  Distributed-transaction commit decisions
+ * need exactly that position (see pg_partdist's DTX-2PC design).
+ *
+ * Contract:
+ *   - the local commit record has not been written yet, so ereport(ERROR) from
+ *     the hook still takes the normal abort path -- this is relied upon;
+ *   - transaction state is still TRANS_INPROGRESS, so SPI is usable;
+ *   - not called for parallel workers.
+ */
+typedef void (*pre_record_commit_hook_type) (void);
+extern PGDLLIMPORT pre_record_commit_hook_type pre_record_commit_hook;
+
 typedef enum
 {
 	SUBXACT_EVENT_START_SUB,

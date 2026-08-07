@@ -77,6 +77,45 @@ typedef struct PartWALRecord
 #define PARTWAL_RECORD_VERSION_3    UINT8_C(3)   /* parwal-3.0: 64-bit gxid + flags   */
 
 /* ------------------------------------------------------------------ */
+/* Record class flags —— 记录分类一律以 flags 判定，不以 data_len 判定  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 记录分四类，互斥地占 flags 的低 4 位：
+ *
+ *   DATA   —— 载荷是 leader 原样的 XLogRecord 字节，回放侧交给 rmgr redo。
+ *   MARKER —— 载荷是 TxnMarkerPayload（R2-b）：事务的开始/提交/回滚及子事务
+ *             清单。事务层靠它把物理记录归拢成一个全局事务，而不是从
+ *             RM_XACT 的原始字节里反解 —— leader 的 commit 记录带着 leader
+ *             本地的 xid/子事务/时间戳，直接 redo 会污染本节点的 CLOG。
+ *   CTRL   —— 控制记录（切主栅栏、段边界、fileset/freeze 同步等），
+ *             不参与 redo，只推进游标。
+ *   DTX    —— 分布式事务记录（DTX-2PC §5）：载荷是 DtxRecord，子类型放在
+ *             头部 info 字段。
+ *
+ * 未置任何类别位的记录按 DATA 处理 —— 2.0 段流全部落在这一档（其 flags 恒为 0）。
+ *
+ * 非 DATA 的记录一律不得喂给 rm_redo —— 它们的载荷不是 XLogRecord。
+ * IsData 的判定式必须同时排除 MARKER/CTRL/DTX 三个位：漏掉任何一个，该类
+ * 记录就会被当作原始 XLogRecord 送进 GetRmgr(rmid).rm_redo。
+ */
+#define PARTWAL_FLAG_DATA        UINT8_C(0x01)
+#define PARTWAL_FLAG_MARKER      UINT8_C(0x02)
+#define PARTWAL_FLAG_CTRL        UINT8_C(0x04)
+#define PARTWAL_FLAG_DTX         UINT8_C(0x08)
+
+#define PARTWAL_FLAG_CLASS_MASK  UINT8_C(0x0F)
+
+#define PARTWAL_FLAG_NON_DATA_MASK \
+    (PARTWAL_FLAG_MARKER | PARTWAL_FLAG_CTRL | PARTWAL_FLAG_DTX)
+
+#define PartWALRecordIsMarker(rec)  (((rec)->flags & PARTWAL_FLAG_MARKER) != 0)
+#define PartWALRecordIsCtrl(rec)    (((rec)->flags & PARTWAL_FLAG_CTRL) != 0)
+#define PartWALRecordIsDtx(rec)     (((rec)->flags & PARTWAL_FLAG_DTX) != 0)
+#define PartWALRecordIsData(rec)    \
+    (((rec)->flags & PARTWAL_FLAG_NON_DATA_MASK) == 0)
+
+/* ------------------------------------------------------------------ */
 /* PartWALCheckpointFile — per-partition checkpoint                    */
 /* ------------------------------------------------------------------ */
 
@@ -106,33 +145,6 @@ typedef struct PartWALCheckpointFile
  * from pg_parwal files.  They access the header fields directly.
  * No separate "PartWALHeader" type is needed in 2.0.
  */
-
-/* ------------------------------------------------------------------ */
-/* Record class flags                                                   */
-/* ------------------------------------------------------------------ */
-
-/*
- * 记录分三类，互斥地占 flags 的低 3 位：
- *
- *   DATA   —— 载荷是 leader 原样的 XLogRecord 字节，回放侧交给 rmgr redo。
- *   MARKER —— 载荷是 TxnMarkerPayload（R2-b）：事务的开始/提交/回滚及子事务
- *             清单。事务层靠它把物理记录归拢成一个全局事务，而不是从
- *             RM_XACT 的原始字节里反解 —— leader 的 commit 记录带着 leader
- *             本地的 xid/子事务/时间戳，直接 redo 会污染本节点的 CLOG。
- *   CTRL   —— 控制记录（切主栅栏、段边界等），不参与 redo，只推进游标。
- *
- * 未置任何类别位的记录按 DATA 处理 —— 2.0 段流全部落在这一档（其 flags 恒为 0）。
- */
-#define PARTWAL_FLAG_DATA        UINT8_C(0x01)
-#define PARTWAL_FLAG_MARKER      UINT8_C(0x02)
-#define PARTWAL_FLAG_CTRL        UINT8_C(0x04)
-
-#define PARTWAL_FLAG_CLASS_MASK  UINT8_C(0x07)
-
-#define PartWALRecordIsMarker(rec)  (((rec)->flags & PARTWAL_FLAG_MARKER) != 0)
-#define PartWALRecordIsCtrl(rec)    (((rec)->flags & PARTWAL_FLAG_CTRL) != 0)
-#define PartWALRecordIsData(rec)    \
-    (((rec)->flags & (PARTWAL_FLAG_MARKER | PARTWAL_FLAG_CTRL)) == 0)
 
 /*
  * PartWALRecordGxid — 统一取事务号，屏蔽 2.0/3.0 的差异。

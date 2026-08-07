@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS raft_snapshot (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 日志压缩：基点那一条的 term。压缩之后条目本身没了，而 prev 一致性检查与
+-- 选举的日志新旧比较还要用它，所以必须随快照一起持久化。
+ALTER TABLE raft_snapshot ADD COLUMN IF NOT EXISTS last_included_term BIGINT NOT NULL DEFAULT 0;
+
 COMMENT ON TABLE raft_state IS '控制面 Raft 持久化状态：leader 标识、term 与租约信息。';
 COMMENT ON TABLE raft_log IS '控制面已复制日志：元数据变更、failover 决议等。';
 COMMENT ON TABLE raft_snapshot IS '当前控制面元数据快照，用于恢复与后续快照安装。';
@@ -117,6 +121,72 @@ CREATE OR REPLACE FUNCTION pg_raft_report_data_leader(
     p_secondary_nodes integer[]
 ) RETURNS bigint LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）
+-- ------------------------------------------------------------------
+-- 决议记录写在**协调组**（写集内按 hash(dtxid) 选出的那个分区组）的日志里；
+-- **该记录在协调组达到多数派持久化即为全局提交点**，dtx_decide 只有在那之后
+-- 才返回成功。索引表 partdist.dtx_decision 由各成员的 apply 路径维护，
+-- 因此协调组切主后新 leader 立刻可答（协调权随 Raft 选举自动转移）。
+CREATE OR REPLACE FUNCTION dtx_decide(
+    p_coord_gsid bigint,
+    p_dtxid bigint,
+    p_verdict integer,
+    p_participants bigint[] DEFAULT NULL
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_decide';
+
+COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[]) IS
+    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
+
+CREATE OR REPLACE FUNCTION dtx_status(
+    p_coord_gsid bigint,
+    p_dtxid bigint
+) RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_status';
+
+CREATE OR REPLACE FUNCTION dtx_recover_prepared(
+    p_timeout_ms integer DEFAULT 30000
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_recover_prepared';
+
+COMMENT ON FUNCTION dtx_recover_prepared(integer) IS
+    '参与者侧恢复守护：扫描本节点超时未闭合的 shardpg_dtx_*/citus_* prepared 事务，向协调组（或按 Citus 规则向 master）问决议并 COMMIT/ROLLBACK PREPARED，同时补写 DTX_COMMIT/ABORT 标记。问不到决议时保持 prepared 不动。顺带做回执清扫、FORGET 重试与登记 GC。返回本轮处理数。';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 决议 GC：回执 + FORGET（DTX_2PC_DESIGN.md §9.7）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION dtx_ack(
+    p_coord_gsid bigint,
+    p_dtxid bigint,
+    p_gsids bigint[] DEFAULT NULL
+) RETURNS boolean LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_ack';
+
+COMMENT ON FUNCTION dtx_ack(bigint, bigint, bigint[]) IS
+    '参与者回执：在协调组 leader 上把 p_gsids 并进该决议的 acked。收齐（acked ⊇ participants）即追加 FORGET 记录复制到多数派，各成员 apply 时同步删除决议行。非 leader 返回 NULL；行已不存在（已 FORGET）返回 true。空数组调用 = 只做收齐检查与 FORGET 重试。';
+
+CREATE OR REPLACE FUNCTION dtx_gc_dist_transaction()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_gc_dist_transaction';
+
+COMMENT ON FUNCTION dtx_gc_dist_transaction() IS
+    'pg_dist_transaction 的 GC（Citus 2PC 恢复被关闭后由本项目接管）：仅删除"发起 backend 已死且所有节点均确认无该 gid 的 prepared 事务"的行；任一节点不可达返回 -1 且整轮不删。';
+
+-- ------------------------------------------------------------------
+-- DTX-2PC 升主 in-doubt 闭合（DTX_2PC_DESIGN.md §9.6，机制先行）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION dtx_close_indoubt(
+    p_partition_id oid
+) RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_dtx_close_indoubt';
+
+COMMENT ON FUNCTION dtx_close_indoubt(oid) IS
+    '对本节点该分区的 parwal 流做 in-doubt 闭合：找出有 DTX_PREPARE 而无闭合记录的 dtxid，按 登记协调组 → 本地决议索引 → 广播 peers → citus 前缀规则 的顺序全网求决议，找到即补写 DTX_COMMIT/ABORT 标记。找不到的保持 in-doubt（NOTICE 报数）。返回闭合数。升主序列在追平之后、对外服务之前调用。';
+
+COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
+    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';
 
 COMMENT ON FUNCTION pg_raft_report_data_leader(bigint, integer, bigint, integer[]) IS
     '数据组新任 leader 的登记入口（须在 group 0 leader 上执行）：过任期栅栏后把 '
@@ -186,7 +256,9 @@ CREATE OR REPLACE FUNCTION pg_raft_group_status()
         last_log_index bigint,
         commit_index   bigint,
         last_applied   bigint,
-        cluster_size   integer
+        cluster_size   integer,
+        base_index     bigint,
+        base_term      bigint
     ) LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_status';
 
@@ -218,7 +290,9 @@ $fn$;
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
 COMMENT ON FUNCTION pg_raft_group_status() IS
-    '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。';
+    '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
+    'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'
+    'index <= base_index 的条目已被快照取代并从 raft_log 删除。';
 
 -- ---- P2：数据组以 parwal 记录为 Raft entry ----
 
@@ -230,6 +304,27 @@ CREATE OR REPLACE FUNCTION pg_raft_data_propose(
 COMMENT ON FUNCTION pg_raft_data_propose(bigint, bigint) IS
     '在数据组 leader 上把本节点 pg_parwal 的第 partition_lsn 条记录作为 Raft entry 提交；'
     '返回 Raft log index（0=失败）。提交成功即多数派已 fsync 落盘且 applied_part_lsn 已推进。';
+
+CREATE OR REPLACE FUNCTION pg_raft_install_snapshot(
+    p_term bigint, p_leader_id integer,
+    p_last_included_index bigint, p_last_included_term bigint,
+    p_node_map text, p_partition_map text
+) RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_install_snapshot';
+
+COMMENT ON FUNCTION pg_raft_install_snapshot(bigint, integer, bigint, bigint, text, text) IS
+    'InstallSnapshot RPC（仅控制面/组 0）：用快照整体替换 node_map/partition_map、同步路由层、'
+    '把日志压缩基点推进到 last_included_index。返回 "term flag"（flag=1 表示已安装）。'
+    '日志被压缩掉的那一段只能靠它传输——落后成员的 nextIndex 落到基点及更早时由 leader 自动调用。';
+
+CREATE OR REPLACE FUNCTION pg_raft_catchup()
+    RETURNS bigint LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_catchup';
+
+COMMENT ON FUNCTION pg_raft_catchup() IS
+    '后台追平通道：对本节点为 leader 的每个组，把落后成员按 nextIndex 逐条补齐，返回补发条数。'
+    '只补发已存在的条目，不产生新提案，提交点仍按多数派推进。必须在 client backend 里跑'
+    '（要 SPI 读 parwal 字节与环外条目），由 TopologyMonitor 按 pg_raft.catchup_interval_ms 自连触发。';
 
 CREATE OR REPLACE FUNCTION pg_raft_group_reset_internal()
     RETURNS integer LANGUAGE c VOLATILE

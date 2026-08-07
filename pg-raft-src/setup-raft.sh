@@ -7,10 +7,33 @@ set -euo pipefail
 PG_PARTDIST_SRC="${PG_PARTDIST_SRC:-/work/pg-partdist-src}"
 PG_RAFT_SRC="${PG_RAFT_SRC:-/work/pg-raft-src}"
 PG_CONFIG="${PG_CONFIG:-/work/pg-install/bin/pg_config}"
-PEERS="1@127.0.0.1:5432,2@127.0.0.1:5433,3@127.0.0.1:5434,4@127.0.0.1:5435"
 PSQL="/work/pg-install/bin/psql"
-NODE_DIRS=(master worker1 worker2 worker3)
-NODE_PORTS=(5432 5433 5434 5435)
+# 拓扑自适应（2026-08-03，与 run-raft-tests.sh 同款）：按 pg-cluster-data 下的
+# 实际目录探测协调节点目录名与 worker 数，从而同时支持
+#   raft4        : master      + worker1-3 (5432-5435)
+#   pg_citus_raft: coordinator + worker1-8 (5432-5440)
+# 可用 COORD_DIR / N_WORKERS / BASE_PORT 强制。
+PG_DATA_ROOT="${PG_DATA_ROOT:-/work/pg-cluster-data}"
+BASE_PORT="${BASE_PORT:-5432}"
+if [[ -z "${COORD_DIR:-}" ]]; then
+  if [[ -d "${PG_DATA_ROOT}/master" ]]; then COORD_DIR=master; else COORD_DIR=coordinator; fi
+fi
+if [[ -z "${N_WORKERS:-}" ]]; then
+  N_WORKERS=$(find "$PG_DATA_ROOT" -maxdepth 1 -type d -name 'worker*' 2>/dev/null | wc -l)
+  N_WORKERS=${N_WORKERS//[^0-9]/}
+  [[ -n "$N_WORKERS" && "$N_WORKERS" -gt 0 ]] || N_WORKERS=3
+fi
+NODE_DIRS=("$COORD_DIR")
+NODE_PORTS=("$BASE_PORT")
+for ((_i = 1; _i <= N_WORKERS; _i++)); do
+  NODE_DIRS+=("worker${_i}")
+  NODE_PORTS+=($((BASE_PORT + _i)))
+done
+PEERS=""
+for ((_i = 0; _i < ${#NODE_PORTS[@]}; _i++)); do
+  [[ -n "$PEERS" ]] && PEERS+=","
+  PEERS+="$((_i + 1))@127.0.0.1:${NODE_PORTS[$_i]}"
+done
 
 cleanup_raft_loose_objects() {
   local port=$1
@@ -22,9 +45,52 @@ DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT,
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT);
 DROP FUNCTION IF EXISTS partdist.pg_raft_append_entries(BIGINT, INTEGER, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, TEXT, TEXT, BIGINT, BYTEA);
 DROP FUNCTION IF EXISTS partdist.pg_raft_data_propose(BIGINT, BIGINT);
-DROP FUNCTION IF EXISTS partdist.partwal_follower_append(OID, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
-DROP FUNCTION IF EXISTS partdist.partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA);
-DROP FUNCTION IF EXISTS partdist.partwal_truncate_to(OID, BIGINT);
+DROP FUNCTION IF EXISTS partdist.pg_raft_catchup();
+DROP FUNCTION IF EXISTS partdist.pg_raft_install_snapshot(BIGINT, INTEGER, BIGINT, BIGINT, TEXT, TEXT);
+-- DTX-2PC 的三个 pg_raft 函数。**必须列在这里**：它们是 pg_raft 扩展成员，
+-- 但只要有过一次"扩展被 DROP、函数被 CREATE OR REPLACE 单独重建"的历史，
+-- 就会变成游离对象，此后每次 CREATE EXTENSION pg_raft 都直接报
+-- "function ... is not a member of extension pg_raft" 而整体失败 ——
+-- 表现是 raft_log / pg_raft_get_cluster_status 全部消失（2026-08-04 实测）。
+DROP FUNCTION IF EXISTS partdist.dtx_decide(BIGINT, BIGINT, INTEGER, BIGINT[]);
+DROP FUNCTION IF EXISTS partdist.dtx_status(BIGINT, BIGINT);
+DROP FUNCTION IF EXISTS partdist.dtx_recover_prepared(INTEGER);
+DROP FUNCTION IF EXISTS partdist.dtx_ack(BIGINT, BIGINT, BIGINT[]);
+DROP FUNCTION IF EXISTS partdist.dtx_gc_dist_transaction();
+DROP FUNCTION IF EXISTS partdist.dtx_close_indoubt(OID);
+-- DTX-2PC 记录格式：follower_append 增加 p_flags、read_record 增加 OUT flags。
+--
+-- 两处坑（2026-08-03 实测，都会静默失败）：
+--   ① OUT 参数变了就必须先 DROP —— CREATE OR REPLACE 改不了返回类型
+--      （"cannot change return type of existing function"）；
+--   ② 这两个函数是 **pg_partdist 扩展成员**，直接 DROP 会被
+--      "cannot drop function ... because extension pg_partdist requires it" 拒绝，
+--      必须先 ALTER EXTENSION ... DROP FUNCTION 解除归属。
+--      本段整体是 ON_ERROR_STOP=0 且输出重定向的，失败**无声无息**，
+--      只有全新库 CREATE EXTENSION 或函数签名比对才看得出来。
+DO $mig$
+DECLARE
+  sig TEXT;
+BEGIN
+  FOREACH sig IN ARRAY ARRAY[
+    'partdist.partwal_read_record(OID, BIGINT)',
+    'partdist.partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA)',
+    'partdist.partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA, INTEGER)',
+    'partdist.partwal_follower_append(OID, PG_LSN, INTEGER, INTEGER, BIGINT, BYTEA)',
+    'partdist.partwal_truncate_to(OID, BIGINT)'
+  ] LOOP
+    BEGIN
+      EXECUTE format('ALTER EXTENSION pg_partdist DROP FUNCTION %s', sig);
+    EXCEPTION WHEN OTHERS THEN NULL;   -- 不是扩展成员/函数不存在：忽略
+    END;
+    BEGIN
+      EXECUTE format('DROP FUNCTION IF EXISTS %s', sig);
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'setup-raft: 无法 DROP %：%', sig, SQLERRM;
+    END;
+  END LOOP;
+END
+$mig$;
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset();
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_reset_internal();
 DROP FUNCTION IF EXISTS partdist.pg_raft_group_status();
@@ -93,6 +159,12 @@ pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 1
 # 协调节点(master)：group 0 leader 优先落于此，且不得作为数据组成员
 pg_raft.coordinator_node_id = 1
+# ★ DTX-2PC（DTX_2PC_DESIGN.md §9.4）：必须关掉 Citus 自带的 2PC 恢复。
+# 它把 pg_dist_transaction 当决议真相源，会把我们决议为 ABORT 的事务无条件
+# COMMIT PREPARED，造成部分参与者提交、部分回滚的**分叉提交**。
+# 关掉之后由 partdist.dtx_recover_prepared() 统一收尾：协调组有决议的按决议，
+# 没走 2PC 的（快路径）再退回 Citus 原生规则。
+citus.recover_2pc_interval = -1
 EOF
 }
 
@@ -113,18 +185,110 @@ CREATE OR REPLACE FUNCTION partdist.partwal_notify_primary_switch(
     RETURNS void LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_notify_primary_switch';
 -- P2 数据面 Raft 组的 parwal 边界函数(已安装的 pg_partdist 扩展不会重跑安装脚本)
+-- DTX-2PC：read_record 增加 OUT flags，follower_append 增加 p_flags —— 复制通道
+-- 丢了 flags，DTX/标记记录在副本上会退化成 DATA 记录（DTX_2PC_DESIGN.md §5.5）。
 CREATE OR REPLACE FUNCTION partdist.partwal_read_record(
     p_partition_id OID, p_partition_lsn BIGINT,
     OUT orig_lsn PG_LSN, OUT rmid INTEGER, OUT info INTEGER,
-    OUT xid BIGINT, OUT data BYTEA)
+    OUT xid BIGINT, OUT flags INTEGER, OUT data BYTEA)
     RETURNS record LANGUAGE c STRICT STABLE
     AS 'pg_partdist', 'pg_partdist_partwal_read_record';
 -- 运输层加固：follower 按 leader 指定的 partition_lsn 落盘（多了一个参数）
 CREATE OR REPLACE FUNCTION partdist.partwal_follower_append(
     p_partition_id OID, p_partition_lsn BIGINT, p_orig_lsn PG_LSN,
-    p_rmid INTEGER, p_info INTEGER, p_xid BIGINT, p_data BYTEA)
+    p_rmid INTEGER, p_info INTEGER, p_xid BIGINT, p_data BYTEA,
+    p_flags INTEGER)
     RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_follower_append';
+CREATE OR REPLACE FUNCTION partdist.partwal_append_dtx_record(
+    p_partition_id OID, p_kind INTEGER, p_dtxid BIGINT, p_coord_gsid BIGINT,
+    p_commit_ts BIGINT DEFAULT 0, p_verdict INTEGER DEFAULT 0,
+    p_participants BIGINT[] DEFAULT NULL)
+    RETURNS BIGINT LANGUAGE c VOLATILE
+    AS 'pg_partdist', 'pg_partdist_partwal_append_dtx_record';
+CREATE OR REPLACE FUNCTION partdist.partwal_read_dtx_record(
+    p_partition_id OID, p_partition_lsn BIGINT,
+    OUT kind INTEGER, OUT dtxid BIGINT, OUT coord_gsid BIGINT,
+    OUT commit_ts BIGINT, OUT verdict INTEGER, OUT participants BIGINT[])
+    RETURNS record LANGUAGE c STRICT STABLE
+    AS 'pg_partdist', 'pg_partdist_partwal_read_dtx_record';
+-- DTX-2PC 决议索引表（已装 pg_partdist 不会重跑安装脚本，这里补建）
+CREATE TABLE IF NOT EXISTS partdist.dtx_decision (
+    dtxid         BIGINT      PRIMARY KEY,
+    coord_gsid    BIGINT      NOT NULL,
+    verdict       SMALLINT    NOT NULL,
+    commit_ts     BIGINT      NOT NULL DEFAULT 0,
+    participants  BIGINT[]    NOT NULL DEFAULT '{}',
+    decided_plsn  BIGINT      NOT NULL,
+    acked         BIGINT[]    NOT NULL DEFAULT '{}',
+    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- DTX-2PC 参与登记（§9.3 的 master 侧驱动依赖它算写集，恢复守护依赖它找协调组）
+CREATE TABLE IF NOT EXISTS partdist.dtx_participant (
+    dtxid       BIGINT      NOT NULL,
+    gid         TEXT        NOT NULL,
+    gsids       BIGINT[]    NOT NULL,
+    coord_gsid  BIGINT,
+    noted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_dtx_participant PRIMARY KEY (dtxid, gid)
+);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_dtxid ON partdist.dtx_participant(dtxid);
+CREATE INDEX IF NOT EXISTS idx_dtx_participant_noted ON partdist.dtx_participant(noted_at);
+CREATE OR REPLACE FUNCTION partdist.dtx_note_participant(
+    p_dtxid BIGINT, p_gid TEXT, p_gsids BIGINT[])
+    RETURNS BOOLEAN LANGUAGE sql VOLATILE
+AS $dtxnp$
+    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids)
+    VALUES (p_dtxid, p_gid, p_gsids)
+    ON CONFLICT (dtxid, gid) DO UPDATE
+       SET gsids = EXCLUDED.gsids, noted_at = now()
+    RETURNING true
+$dtxnp$;
+CREATE OR REPLACE FUNCTION partdist.dtx_local_participant(p_dtxid BIGINT)
+    RETURNS BIGINT[] LANGUAGE sql STABLE
+AS $dtxlp$
+    SELECT COALESCE(
+        (SELECT array_agg(DISTINCT g ORDER BY g)
+           FROM partdist.dtx_participant p, unnest(p.gsids) AS g
+          WHERE p.dtxid = p_dtxid),
+        '{}'::bigint[])
+$dtxlp$;
+CREATE OR REPLACE FUNCTION partdist.dtx_note_coord(p_dtxid BIGINT, p_coord_gsid BIGINT)
+    RETURNS INTEGER LANGUAGE plpgsql VOLATILE
+AS $dtxnc$
+DECLARE
+  n INTEGER;
+BEGIN
+  UPDATE partdist.dtx_participant
+     SET coord_gsid = p_coord_gsid
+   WHERE dtxid = p_dtxid
+     AND coord_gsid IS DISTINCT FROM p_coord_gsid;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 AND EXISTS (SELECT 1 FROM partdist.dtx_participant WHERE dtxid = p_dtxid) THEN
+    n := 1;
+  END IF;
+  RETURN n;
+END;
+$dtxnc$;
+CREATE OR REPLACE FUNCTION partdist.dtx_participant_of(
+    p_gid TEXT, OUT dtxid BIGINT, OUT coord_gsid BIGINT, OUT gsids BIGINT[])
+    RETURNS record LANGUAGE sql STABLE
+AS $dtxpo$
+    SELECT dtxid, coord_gsid, gsids FROM partdist.dtx_participant WHERE gid = p_gid
+$dtxpo$;
+CREATE OR REPLACE FUNCTION partdist.dtx_gc_participant(p_age_seconds INTEGER DEFAULT 3600)
+    RETURNS INTEGER LANGUAGE plpgsql VOLATILE
+AS $dtxgc$
+DECLARE
+  n INTEGER;
+BEGIN
+  DELETE FROM partdist.dtx_participant p
+   WHERE p.noted_at < now() - make_interval(secs => p_age_seconds)
+     AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts x WHERE x.gid = p.gid);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END;
+$dtxgc$;
 CREATE OR REPLACE FUNCTION partdist.partwal_truncate_to(
     p_partition_id OID, p_keep_upto_part_lsn BIGINT)
     RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
@@ -154,6 +318,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_group_index
 -- 切主重构：数据组自治选举的主副本任期（任期栅栏）。pg_partdist 已安装时不会
 -- 重跑安装脚本，这里补列（与 pg_partdist--1.0.sql 中的定义保持一致）。
 ALTER TABLE partdist.partition_map ADD COLUMN IF NOT EXISTS primary_term BIGINT NOT NULL DEFAULT 0;
+-- 日志压缩：快照基点的 term（pg_raft--1.0.sql 中同名列，已装扩展在此补齐）
+ALTER TABLE partdist.raft_snapshot ADD COLUMN IF NOT EXISTS last_included_term BIGINT NOT NULL DEFAULT 0;
 SQL
   ensure_boundary_functions "$port"
 }

@@ -1,13 +1,52 @@
 #!/usr/bin/env bash
-# [宿主机] 四节点 pg_raft 控制面回归(master:5432 + worker1-3:5433-5435)
-# 适配 shardpg-3.0 的 raft4 环境;pg_partdist 数据面回归请用 pg-partdist-src/sim/。
+# [宿主机] pg_raft 控制面回归。
+#
+# 拓扑自适应(2026-08-03)：此前硬编码四节点(master:5432 + worker1-3:5433-5435)，
+# 只能在 shardpg-3.0 的 raft4 环境跑；现按容器里 pg-cluster-data/ 的实际目录
+# 探测协调节点目录名与 worker 数量，从而同时支持
+#   raft4      : master      + worker1-3  (5432-5435)
+#   pg_citus_raft: coordinator + worker1-8  (5432-5440)
+# 也可用环境变量强制：CONTAINER / COORD_DIR / N_WORKERS / BASE_PORT。
+# 节点 id ↔ 端口的约定不变：node N ↔ BASE_PORT + N - 1，node 1 = 协调节点。
+#
+# quorum 相关的编排本身与节点数无关（raft_05 停掉"除 leader 外全部节点"；
+# 数据组用例用显式 3 成员组），所以只需要把映射函数改成算术即可。
+#
+# pg_partdist 数据面回归请用 pg-partdist-src/sim/。
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-pg-partdist-raft4-container}"
 PSQL="docker exec -u postgres ${CONTAINER} /work/pg-install/bin/psql"
 PG_CTL="docker exec -u postgres ${CONTAINER} /work/pg-install/bin/pg_ctl"
 RAFT_TEST_DIR="/work/pg-raft-src/test/sql"
-NODE_PORTS=(5432 5433 5434 5435)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_PORT="${BASE_PORT:-5432}"
+
+# 协调节点的数据目录名：raft4 叫 master，pg_citus_raft 叫 coordinator
+if [[ -z "${COORD_DIR:-}" ]]; then
+  if docker exec "$CONTAINER" test -d /work/pg-cluster-data/master 2>/dev/null; then
+    COORD_DIR=master
+  else
+    COORD_DIR=coordinator
+  fi
+fi
+
+# worker 数量：数 pg-cluster-data 下的 worker 目录（排除同名 .log 文件）
+if [[ -z "${N_WORKERS:-}" ]]; then
+  N_WORKERS=$(docker exec "$CONTAINER" bash -lc \
+    "find /work/pg-cluster-data -maxdepth 1 -type d -name 'worker*' | wc -l" 2>/dev/null || echo 3)
+  N_WORKERS=${N_WORKERS//[^0-9]/}
+  [[ -n "$N_WORKERS" && "$N_WORKERS" -gt 0 ]] || N_WORKERS=3
+fi
+
+N_NODES=$((N_WORKERS + 1))
+NODE_PORTS=()
+for ((_i = 0; _i < N_NODES; _i++)); do
+  NODE_PORTS+=($((BASE_PORT + _i)))
+done
+
+echo "拓扑：容器=${CONTAINER} 协调节点目录=${COORD_DIR} 节点数=${N_NODES}(1c+${N_WORKERS}w) 端口=${NODE_PORTS[0]}-${NODE_PORTS[$((N_NODES - 1))]}"
+
 PASS=0
 FAIL=0
 
@@ -16,33 +55,21 @@ bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
 section() { echo ""; echo "========== $* =========="; }
 
 raft_port_for_node() {
-  case "$1" in
-    1) echo 5432 ;;
-    2) echo 5433 ;;
-    3) echo 5434 ;;
-    4) echo 5435 ;;
-    *) return 1 ;;
-  esac
+  local n=$1
+  (( n >= 1 && n <= N_NODES )) || return 1
+  echo $((BASE_PORT + n - 1))
 }
 
 raft_node_name_for_port() {
-  case "$1" in
-    5432) echo master ;;
-    5433) echo worker1 ;;
-    5434) echo worker2 ;;
-    5435) echo worker3 ;;
-    *) return 1 ;;
-  esac
+  local n=$(( $1 - BASE_PORT + 1 ))
+  (( n >= 1 && n <= N_NODES )) || return 1
+  if (( n == 1 )); then echo "$COORD_DIR"; else echo "worker$((n - 1))"; fi
 }
 
 raft_node_id_for_port() {
-  case "$1" in
-    5432) echo 1 ;;
-    5433) echo 2 ;;
-    5434) echo 3 ;;
-    5435) echo 4 ;;
-    *) return 1 ;;
-  esac
+  local n=$(( $1 - BASE_PORT + 1 ))
+  (( n >= 1 && n <= N_NODES )) || return 1
+  echo "$n"
 }
 
 node_start() {
@@ -219,12 +246,23 @@ else
 fi
 
 # raft_04 需先停 worker2(node 3);4 节点停 1 个仍有多数派 3/4
+# 有界重试（同 raft_15 先例，2026-08-04）：这是功能接线测试且 SQL 幂等（开头
+# 重置 node_map/partition_map），propose 单发撞上 2 核 9 节点的负载抖动会
+# 偶发 "raft propose failed"（与 raft_09 早前一次同类的环境瞬态，非时序判据）。
 node_stop 5434
 sleep 2
-RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
-if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
-   $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
-     -f "${RAFT_TEST_DIR}/raft_04_topology_monitor.sql" &>/dev/null; then
+RAFT_04_OK=0
+for RAFT_04_TRY in 1 2 3; do
+  RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+  if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
+     $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -f "${RAFT_TEST_DIR}/raft_04_topology_monitor.sql" &>/dev/null; then
+    RAFT_04_OK=1
+    break
+  fi
+  sleep 5
+done
+if [[ "$RAFT_04_OK" == "1" ]]; then
   ok "raft_04_topology_monitor.sql"
 else
   bad "raft_04_topology_monitor.sql"
@@ -409,13 +447,15 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   CAND_MID=$(raft_node_id_for_port "${CAND_PORTS[1]}")
   CAND_HI=$(raft_node_id_for_port "${CAND_PORTS[2]}")
 
+  # 失败时保留 SQL 错误尾行——此前 &>/dev/null 吞掉一切，偶发失败无从诊断
+  RAFT_10_OUT=""
   if [[ "$SEED_OK" == "1" ]] && \
-     $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+     RAFT_10_OUT=$($PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
        -v cand_lo="$CAND_LO" -v cand_mid="$CAND_MID" -v cand_hi="$CAND_HI" \
-       -f "${RAFT_TEST_DIR}/raft_10_most_caught_up_secondary_promoted.sql" &>/dev/null; then
+       -f "${RAFT_TEST_DIR}/raft_10_most_caught_up_secondary_promoted.sql" 2>&1); then
     ok "raft_10_most_caught_up_secondary_promoted.sql"
   else
-    bad "raft_10_most_caught_up_secondary_promoted.sql"
+    bad "raft_10_most_caught_up_secondary_promoted.sql($(echo "$RAFT_10_OUT" | grep -E "ERROR|EXCEPTION" | tail -1))"
   fi
 
   for port in "${CAND_PORTS[@]}"; do
@@ -525,10 +565,15 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
   # 在两个不同的非控制面节点各建一个组,让它们各自成为该组的 leader
   RAFT_12_NODE_A=5433
   RAFT_12_NODE_B=5434
+  # 成员集必须**显式**给出（2026-08-03，DTX_2PC_DESIGN.md §9.2）：数据组的空
+  # 成员集不再表示"全体节点"而是"未知"，未知即不竞选，建组入口也会直接报错。
+  # 这两个组是**合成 group id**（9000000+），partition_map 里没有对应登记，
+  # 因此导不出成员集，只能显式指定。取三个 worker（协调节点不作数据副本）。
+  RAFT_12_MEMBERS="ARRAY[2,3,4]::int[]"
   $PSQL -p "$RAFT_12_NODE_A" -U postgres -c \
-    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_A});" &>/dev/null || true
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_A}, ${RAFT_12_MEMBERS});" &>/dev/null || true
   $PSQL -p "$RAFT_12_NODE_B" -U postgres -c \
-    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_B});" &>/dev/null || true
+    "SELECT partdist.pg_raft_group_create(${RAFT_12_GID_B}, ${RAFT_12_MEMBERS});" &>/dev/null || true
 
   # 等两组各自选出 leader(组信息经 RV/AE 自动传播到其余节点)
   RAFT_12_LEADER_A=""
@@ -550,9 +595,11 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
         RAFT_12_PROPOSE_OK=0
       fi
     done
-    # 非 leader 节点提交必须被拒(返回 0)
+    # 非 leader 节点提交必须被拒(返回 0)。
+    # 必须挑一个**本组成员**：挑到组外节点（例如协调节点）时该组在那里根本不存在，
+    # propose 同样返回 0，用例就变成"对的结果、错的原因"——测不到"非 leader 被拒"。
     RAFT_12_NONLEADER_PORT=""
-    for port in "${NODE_PORTS[@]}"; do
+    for port in 5433 5434 5435; do
       if [[ "$port" != "$RAFT_12_LEADER_A" ]]; then
         RAFT_12_NONLEADER_PORT="$port"
         break
@@ -563,13 +610,19 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
       2>/dev/null || echo -1)
     sleep 2
 
+    # 断言必须在**数据组成员**节点上跑，不能在控制面 leader 上跑：控制面 leader
+    # 常态是协调节点（master），而 master 永不作数据副本、也就永远看不到数据组
+    # ——旧写法能过是因为空成员集会让组经 hearsay 撒到全集群，那正是 §9.2 修掉的
+    # 不安全行为。node A 是 gid_a 的建组节点、也是 gid_b 的成员，两组都可见。
+    RAFT_12_OBSERVER="$RAFT_12_NODE_A"
+    RAFT_12_SQL_OUT=""
     if [[ "$RAFT_12_PROPOSE_OK" == "1" ]] && [[ "$RAFT_12_NONLEADER_RC" == "0" ]] && \
-       $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       RAFT_12_SQL_OUT=$($PSQL -p "$RAFT_12_OBSERVER" -U postgres -v ON_ERROR_STOP=1 \
          -v gid_a="$RAFT_12_GID_A" -v gid_b="$RAFT_12_GID_B" \
-         -f "${RAFT_TEST_DIR}/raft_12_multi_group_isolation.sql" &>/dev/null; then
+         -f "${RAFT_TEST_DIR}/raft_12_multi_group_isolation.sql" 2>&1); then
       ok "raft_12_multi_group_isolation.sql"
     else
-      bad "raft_12_multi_group_isolation.sql(propose_ok=${RAFT_12_PROPOSE_OK} nonleader_rc=${RAFT_12_NONLEADER_RC})"
+      bad "raft_12_multi_group_isolation.sql(propose_ok=${RAFT_12_PROPOSE_OK} nonleader_rc=${RAFT_12_NONLEADER_RC} $(echo "$RAFT_12_SQL_OUT" | grep -E "ERROR|EXCEPTION" | tail -1))"
     fi
   else
     bad "raft_12_multi_group_isolation.sql(数据组未能各自选出 leader)"
@@ -863,13 +916,14 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
           if [[ -n "$RAFT_14_TERM" ]]; then
             RAFT_14_OK=1
             for port in "${RAFT_14_FOLLOWER_PORTS[@]}"; do
-              if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+              # 保留 psql 的错误正文：只报"断言失败"不可诊断（2026-08-04 教训）
+              if ! RAFT_14_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
                      -v gid="$RAFT_14_GID" -v nrec="$RAFT_14_NREC" \
                      -v leader_md5="$RAFT_14_MD5" -v primary_id="$RAFT_14_PRIMARY_ID" \
                      -v shard_table="${RAFT_14_TABLE}_${RAFT_14_GID}" \
-                     -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                     -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" 2>&1); then
                 RAFT_14_OK=0
-                RAFT_14_WHY="follower ${port} 断言失败"
+                RAFT_14_WHY="follower ${port} 断言失败: $(echo "$RAFT_14_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
                 break
               fi
             done
@@ -925,14 +979,29 @@ if [[ "$RAFT_14_OK" == "1" ]]; then
 
   if [[ -n "$RAFT_15_NEWP" ]]; then
     RAFT_15_OK=1
-    # master + 两个存活 worker 各自断言(partition_map / pg_dist_placement 每节点一份)
+    # master + 两个存活 worker 各自断言(partition_map / pg_dist_placement 每节点一份)。
+    #
+    # 按节点带有界重试:控制面语义是"多数派提交 + 全员**最终** apply"(§13.2)——
+    # master 上出现登记只说明多数派已提交,单个 follower 的 apply 由它自己的
+    # tick 推进,可以滞后。9 节点 group0 多数派 5/9,某 follower 不在提交时的
+    # ack 集里时滞后窗口明显大于 4 节点(3/4),一次性断言在 9 节点环境高概率
+    # 误报(2026-08-03 实测两次"节点 5434 断言失败"皆因此)。断言内容不放宽,
+    # 只允许每个节点在超时窗口内追平;窗口耗尽仍不满足才是真失败。
     for port in 5432 "${RAFT_14_FOLLOWER_PORTS[@]}"; do
-      if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+      RAFT_15_NODE_OK=0
+      for attempt in $(seq 1 20); do
+        if $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
              -v gid="$RAFT_14_GID" -v old_primary_id="$RAFT_14_PRIMARY_ID" \
              -v old_term="$RAFT_14_TERM" \
              -f "${RAFT_TEST_DIR}/raft_15_self_election_failover.sql" &>/dev/null; then
+          RAFT_15_NODE_OK=1
+          break
+        fi
+        sleep 1
+      done
+      if [[ "$RAFT_15_NODE_OK" != "1" ]]; then
         RAFT_15_OK=0
-        RAFT_15_WHY="节点 ${port} 断言失败"
+        RAFT_15_WHY="节点 ${port} 断言失败(等待 20s 追平后仍不满足)"
         break
       fi
     done
@@ -1003,6 +1072,27 @@ raft16_cleanup() {
     "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS ${RAFT_16_TABLE};" &>/dev/null || true
 }
 
+# raft_16 的 follower 断言是**终态收敛**判据，必须给有界的等待窗口而不是
+# 一次性快照：Raft 只保证多数派，一笔事务现在要跑三轮复制（DATA / PREPARE 标记 /
+# COMMIT 标记），每轮各自凑多数派，完全可能有一个 follower 连续两轮都不在多数派里
+# 而短暂落后；leader 的下一次心跳会按 next_index 把它补齐。
+# 一次性断言在 2PC 接线后变得对时序敏感（2026-08-04 实测：终态三节点完全一致，
+# 只是到达得比 sleep 2 晚）。窗口内收敛即通过，超时才判失败并报最后一次的错。
+raft16_follower_converged() {   # $1=port $2=nrec $3=leader_md5
+  local port=$1 nrec=$2 md5=$3 i
+  for i in $(seq 1 30); do
+    if RAFT_16_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+           -v gid="$RAFT_16_GID" -v nrec="$nrec" \
+           -v leader_md5="$md5" -v primary_id="$RAFT_16_PRIMARY_ID" \
+           -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
+           -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" 2>&1); then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 start_all_nodes
 sleep 2
 
@@ -1070,13 +1160,9 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
         if [[ "$RAFT_16_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC" -gt 0 && -n "$RAFT_16_MD5" ]]; then
           RAFT_16_OK=1
           for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
-            if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
-                   -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC" \
-                   -v leader_md5="$RAFT_16_MD5" -v primary_id="$RAFT_16_PRIMARY_ID" \
-                   -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
-                   -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+            if ! raft16_follower_converged "$port" "$RAFT_16_NREC" "$RAFT_16_MD5"; then
               RAFT_16_OK=0
-              RAFT_16_WHY="自动复制后 follower ${port} 断言失败"
+              RAFT_16_WHY="自动复制后 follower ${port} 断言失败: $(echo "$RAFT_16_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
               break
             fi
           done
@@ -1123,13 +1209,9 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
                ) sub;" 2>/dev/null || echo "")
             if [[ "$RAFT_16_NREC2" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC2" -gt "$RAFT_16_NREC" && -n "$RAFT_16_MD52" ]]; then
               for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
-                if ! $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
-                       -v gid="$RAFT_16_GID" -v nrec="$RAFT_16_NREC2" \
-                       -v leader_md5="$RAFT_16_MD52" -v primary_id="$RAFT_16_PRIMARY_ID" \
-                       -v shard_table="${RAFT_16_TABLE}_${RAFT_16_GID}" \
-                       -f "${RAFT_TEST_DIR}/raft_14_hash_shard_secondary_backup.sql" &>/dev/null; then
+                if ! raft16_follower_converged "$port" "$RAFT_16_NREC2" "$RAFT_16_MD52"; then
                   RAFT_16_OK=0
-                  RAFT_16_WHY="恢复后追平断言失败(follower ${port})"
+                  RAFT_16_WHY="恢复后追平断言失败(follower ${port}): $(echo "$RAFT_16_ERR" | grep -m1 -i 'ERROR\|raft_14:' | head -c 300)"
                   break
                 fi
               done
@@ -1161,11 +1243,169 @@ fi
 raft16_cleanup
 
 # ------------------------------------------------------------------
+# raft_17: 并发 prepare 的多数派保证(group commit 让路窗口)
+# 用例本体在 test/raft_17_concurrent_prepare_quorum.sh —— 它自带夹具与清理,
+# 也可独立跑(迭代时不必等整套跑完)。判据是"持有完整前缀的成员数 >= 多数派",
+# 不是"全体 follower 追平" —— Raft 只保证 quorum,且本项目尚无后台追平通道。
+# ------------------------------------------------------------------
+section "raft_17 并发 prepare 的多数派保证"
+
+start_all_nodes
+sleep 2
+RAFT_17_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_17_concurrent_prepare_quorum.sh" 2>&1) && RAFT_17_RC=0 || RAFT_17_RC=$?
+echo "$RAFT_17_OUT" | sed 's/^/    /'
+if [[ "$RAFT_17_RC" -eq 0 ]]; then
+  ok "raft_17_concurrent_prepare_quorum"
+else
+  bad "raft_17_concurrent_prepare_quorum($(echo "$RAFT_17_OUT" | tail -1))"
+fi
+
+
+# ------------------------------------------------------------------
+# raft_18: 数据组成员集必须显式/可导出，多数派按真实副本集计算
+# 用例本体在 test/raft_18_membership_explicit.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_18 成员集显式化与真实多数派"
+
+start_all_nodes
+sleep 2
+RAFT_18_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_18_membership_explicit.sh" 2>&1) && RAFT_18_RC=0 || RAFT_18_RC=$?
+echo "$RAFT_18_OUT" | sed 's/^/    /'
+if [[ "$RAFT_18_RC" -eq 0 ]]; then
+  ok "raft_18_membership_explicit"
+else
+  bad "raft_18_membership_explicit($(echo "$RAFT_18_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_19: DTX-2PC 记录格式与 flags 端到端保真（含全新库 CREATE EXTENSION 冒烟）
+# 用例本体在 test/raft_19_dtx_record_format.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_19 DTX 记录格式与 flags 保真"
+
+start_all_nodes
+sleep 2
+RAFT_19_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_19_dtx_record_format.sh" 2>&1) && RAFT_19_RC=0 || RAFT_19_RC=$?
+echo "$RAFT_19_OUT" | sed 's/^/    /'
+if [[ "$RAFT_19_RC" -eq 0 ]]; then
+  ok "raft_19_dtx_record_format"
+else
+  bad "raft_19_dtx_record_format($(echo "$RAFT_19_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_20: DTX-2PC 决议层（决议在协调组达多数派即为全局提交点）
+# 用例本体在 test/raft_20_dtx_decision.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_20 DTX 决议层"
+
+start_all_nodes
+sleep 2
+RAFT_20_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_20_dtx_decision.sh" 2>&1) && RAFT_20_RC=0 || RAFT_20_RC=$?
+echo "$RAFT_20_OUT" | sed 's/^/    /'
+if [[ "$RAFT_20_RC" -eq 0 ]]; then
+  ok "raft_20_dtx_decision"
+else
+  bad "raft_20_dtx_decision($(echo "$RAFT_20_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_21: DTX-2PC 参与者侧恢复守护（推定中止 + 按决议闭合）
+# 用例本体在 test/raft_21_dtx_recovery.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_21 DTX 恢复守护"
+
+start_all_nodes
+sleep 2
+RAFT_21_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_21_dtx_recovery.sh" 2>&1) && RAFT_21_RC=0 || RAFT_21_RC=$?
+echo "$RAFT_21_OUT" | sed 's/^/    /'
+if [[ "$RAFT_21_RC" -eq 0 ]]; then
+  ok "raft_21_dtx_recovery"
+else
+  bad "raft_21_dtx_recovery($(echo "$RAFT_21_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_22: DTX-2PC 端到端（真实跨分区事务经内核补丁 0004 的挂点走完三阶段）
+# 用例本体在 test/raft_22_dtx_end_to_end.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_22 DTX 端到端"
+
+start_all_nodes
+sleep 2
+RAFT_22_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_22_dtx_end_to_end.sh" 2>&1) && RAFT_22_RC=0 || RAFT_22_RC=$?
+echo "$RAFT_22_OUT" | sed 's/^/    /'
+if [[ "$RAFT_22_RC" -eq 0 ]]; then
+  ok "raft_22_dtx_end_to_end"
+else
+  bad "raft_22_dtx_end_to_end($(echo "$RAFT_22_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_23: DTX-2PC 升主 in-doubt 闭合（§9.6 机制先行）+ 混合写集告警
+# 用例本体在 test/raft_23_dtx_close_indoubt.sh（自带夹具与清理，可独立跑）。
+# ------------------------------------------------------------------
+section "raft_23 DTX in-doubt 闭合"
+
+start_all_nodes
+sleep 2
+RAFT_23_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_23_dtx_close_indoubt.sh" 2>&1) && RAFT_23_RC=0 || RAFT_23_RC=$?
+echo "$RAFT_23_OUT" | sed 's/^/    /'
+if [[ "$RAFT_23_RC" -eq 0 ]]; then
+  ok "raft_23_dtx_close_indoubt"
+else
+  bad "raft_23_dtx_close_indoubt($(echo "$RAFT_23_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_24: 后台追平通道（计划文档 §12.4 #5）
+# 用例本体在 test/raft_24_background_catchup.sh（自带夹具与清理，可独立跑）。
+# 用时较长（含一段刻意等待"关掉通道时不收敛"的对照窗口 + 200 笔写入）。
+# ------------------------------------------------------------------
+section "raft_24 后台追平通道"
+
+start_all_nodes
+sleep 2
+RAFT_24_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_24_background_catchup.sh" 2>&1) && RAFT_24_RC=0 || RAFT_24_RC=$?
+echo "$RAFT_24_OUT" | sed 's/^/    /'
+if [[ "$RAFT_24_RC" -eq 0 ]]; then
+  ok "raft_24_background_catchup"
+else
+  bad "raft_24_background_catchup($(echo "$RAFT_24_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
+# raft_25: 控制面日志压缩 + InstallSnapshot（计划文档 §4 阶段 1 / §12.4 #7）
+# 用例本体在 test/raft_25_snapshot_compaction.sh（自带夹具与清理，可独立跑）。
+# 用时较长：B 段要把日志推过环容量（128 条）才谈得上"只能靠快照"。
+# ------------------------------------------------------------------
+section "raft_25 控制面压缩与快照"
+
+start_all_nodes
+sleep 2
+RAFT_25_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
+                bash "${SCRIPT_DIR}/test/raft_25_snapshot_compaction.sh" 2>&1) && RAFT_25_RC=0 || RAFT_25_RC=$?
+echo "$RAFT_25_OUT" | sed 's/^/    /'
+if [[ "$RAFT_25_RC" -eq 0 ]]; then
+  ok "raft_25_snapshot_compaction"
+else
+  bad "raft_25_snapshot_compaction($(echo "$RAFT_25_OUT" | tail -1))"
+fi
+
+# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"
 if [[ $FAIL -eq 0 ]]; then
-  echo ">>> Raft 四节点回归全部通过 <<<"
+  echo ">>> Raft 回归全部通过（拓扑 1c+${N_WORKERS}w）<<<"
   exit 0
 else
   echo ">>> 存在 ${FAIL} 项失败,请根据上方 [FAIL] 排查 <<<"

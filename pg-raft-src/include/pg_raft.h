@@ -71,6 +71,20 @@ extern void pg_raft_consensus_apply_pending(void);
 /* prepare 接线：PartWALFlush 经 rendezvous "partdist_partwal_replicate_hook" 调用 */
 extern void pg_raft_partwal_replicate(Oid partition_id);
 
+/* 后台追平通道（计划文档 §12.4 #5）：TopologyMonitor 经 libpq 自连触发 */
+extern int  pg_raft_catchup_interval_ms;
+/* 控制面日志压缩阈值（条），0=关；压缩点之前只能靠 InstallSnapshot 追平 */
+extern int  pg_raft_compact_threshold;
+extern bool pg_raft_any_group_leader_local(void);
+
+/* DTX-2PC（DTX_2PC_DESIGN.md §9.3）：master 侧驱动 + 参与者自治登记 */
+extern bool pg_raft_dtx_2pc_enabled;
+extern int  pg_raft_dtx_recover_interval_ms;
+extern int  pg_raft_dtx_recover_timeout_ms;
+extern void pg_raft_dtx_install_hooks(void);
+extern bool pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
+                                         const int64 *gsids, int ngsids);
+
 extern RaftLeaderShmem *RaftLeaderShmemData;
 extern LWLock *RaftLeaderLock;
 
@@ -94,6 +108,9 @@ extern void pg_raft_try_acquire_leader(void);
 extern void pg_raft_topology_monitor_main(Datum main_arg);
 
 extern bool pg_raft_apply_node_status(int node_id, const char *status);
+/* InstallSnapshot 的 apply 侧：用快照整体替换控制面状态机并同步路由层 */
+extern bool pg_raft_apply_snapshot_state(const char *node_map_json,
+                                         const char *partition_map_json);
 extern bool pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
                                             const char *secondaries_array_literal,
                                             int old_primary_node,

@@ -454,9 +454,31 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
                         (unsigned long long) expected_partition_lsn,
                         (unsigned long long) writer->last_partition_lsn)));
 
-    /* Map orig_lsn to a segment number */
+    /*
+     * 段文件号：DATA 记录按 orig_lsn 映射；**非 WAL 记录（DTX / 标记，
+     * orig_lsn 恒为 0）必须跟随当前段**，绝不能另开一个段号。
+     *
+     * 为什么：段文件按文件名排序即是回放顺序（verify_partition_wal 与物理回放
+     * 都这么读），而 partition_lsn 的连续性是逐段累加判定的。原先无条件把
+     * orig_lsn==0 映射到段 1，于是一条 plsn=7 的 DTX_PREPARE 会被写进
+     * 000000010000000000000001，而它所标记的 plsn=1..6 的 DATA 在
+     * 000000010000000000000007 —— 按文件名读出来就是 7,8,1,2,3,4,5,6，
+     * "标记排在它标记的数据前面"，verify 直接判损坏。
+     * （2026-08-04：2PC 接线让 DTX 记录第一次和 DATA 落进同一个分区流，
+     * 这条潜伏缺陷才现形；raft_14/16 的 follower 断言抓到。）
+     *
+     * 取当前段的三级依据：写入器正开着的段 → checkpoint 里最后一条 DATA 的
+     * orig_lsn 所在段 → 都没有（该分区只写过 DTX 记录）才回落到 1。
+     */
     if (orig_lsn == InvalidXLogRecPtr)
-        new_segno = 1;
+    {
+        if (writer->current_segno != 0)
+            new_segno = writer->current_segno;
+        else if (writer->last_wal_lsn != InvalidXLogRecPtr)
+            XLByteToSeg(writer->last_wal_lsn, new_segno, wal_segment_size);
+        else
+            new_segno = 1;
+    }
     else
         XLByteToSeg(orig_lsn, new_segno, wal_segment_size);
 
@@ -534,7 +556,13 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
             }
         }
 
-        writer->last_wal_lsn = orig_lsn;
+        /*
+         * 非 WAL 记录（orig_lsn==0）**不得**清掉 last_wal_lsn ——
+         * 它是"当前段号"的持久化依据（见上面的段选择注释），被 0 覆盖后
+         * checkpoint 也跟着变 0，下一个写入器就找不回当前段了。
+         */
+        if (orig_lsn != InvalidXLogRecPtr)
+            writer->last_wal_lsn = orig_lsn;
         return true;
     }
 
@@ -562,7 +590,8 @@ AppendPartWALRecordAt(PartitionWALWriter *writer,
         writer->buf_used += (int) data_len;
     }
 
-    writer->last_wal_lsn = orig_lsn;
+    if (orig_lsn != InvalidXLogRecPtr)
+        writer->last_wal_lsn = orig_lsn;
     return true;
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 检查一棵 pg-install 树是不是打过 pg_partdist 所需的三个内核补丁。
+# 检查一棵 pg-install 树是不是打过 pg_partdist/pg_raft 所需的四个内核补丁。
 #
 # ★ 为什么需要它：`reproduce-env.sh` **不打补丁、也不重编 PostgreSQL**，它直接
 # 把仓库里的 `pg-install/` 整棵树拷进容器。所以"从零 clone 能不能复原"完全取决于
@@ -47,17 +47,21 @@ need_grep "0002   buffer_flush_lsn_exempt_hook 声明（bufmgr.h）" \
           "$ROOT/include/postgresql/server/storage/bufmgr.h" "buffer_flush_lsn_exempt_hook"
 need_nm   "0002   buffer_flush_lsn_exempt 符号（bin/postgres）" \
           "buffer_flush_lsn_exempt"
+need_grep "0004   pre_record_commit_hook 声明（xact.h）" \
+          "$ROOT/include/postgresql/server/access/xact.h" "pre_record_commit_hook"
+need_nm   "0004   pre_record_commit_hook 符号（bin/postgres，DTX-2PC 决议挂点）" \
+          "pre_record_commit_hook"
 
 if [[ "$fail" -ne 0 ]]; then
   cat <<'EOF'
 
 ！这份 pg-install 不是打过补丁的构建，pg_partdist 编不过。
   修法见 pg-partdist-src/patches/README.md 的「补丁与仓库里 pg-install/ 的关系」：
-  在容器里用 postgres-src 基线 + 三个补丁重编，再把 bin/postgres 与受影响的
+  在容器里用 postgres-src 基线 + 四个补丁重编，再把 bin/postgres 与受影响的
   头文件同步回仓库并提交。
 EOF
   exit 1
 fi
 
-echo "  → 三个补丁齐全"
+echo "  → 四个补丁齐全"
 exit 0

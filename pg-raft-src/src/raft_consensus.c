@@ -24,6 +24,7 @@
  */
 #include "pg_raft.h"
 
+#include "access/xact.h"             /* 内核补丁 0004：pre_record_commit_hook */
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -31,6 +32,8 @@
 #include "executor/spi.h"
 #include "storage/ipc.h"
 #include "storage/fd.h"
+#include "postmaster/postmaster.h"   /* PostPortNumber：dtx 恢复连回本节点 */
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
@@ -56,15 +59,54 @@
 #define RAFT_LOG_CAPACITY  128
 #define RAFT_OP_LEN        32
 #define RAFT_PAYLOAD_MAX   768
+
+/*
+ * parwal 记录分类位的**镜像**（权威定义在
+ * pg-partdist-src/include/partition_wal_header.h 的 PARTWAL_FLAG_*）。
+ *
+ * pg_raft 有意不在编译期依赖 pg_partdist 的头文件（两个扩展只经 SQL 边界函数
+ * 和 rendezvous variable 交互），所以这里只镜像一个值：数据组复制时 flags 是
+ * **不透明透传**的——leader 从 partwal_read_record 读出多少就原样写回
+ * partwal_follower_append，pg_raft 不解释它。唯一需要的常量是"描述符里没有
+ * flags 时（旧 leader 发来的条目）按什么处理"，取 DATA(0x01)。
+ * 若 partition_wal_header.h 改了 DATA 位的取值，这里必须同步。
+ */
+#define PARTWAL_FLAG_DATA  1
+#define PARTWAL_FLAG_DTX   8
+
+/*
+ * ★ 用户事务内的复制路径不做 inline apply（2026-08-03 实测的 2PC 死锁）。
+ *
+ * 症状：分片上存在 prepared 事务时，`dtx_decide` **永久阻塞**在
+ * `Lock / transactionid`。
+ *
+ * 根因：prepare 路径在**用户事务内**触发复制（PartWALFlush 的挂钩），而
+ * group_propose 末尾的 group_apply_pending() 会 UPSERT
+ * `partdist.follower_partition_map` 的进度行；该事务随后进入 PREPARED 状态，
+ * **这把行锁就一直被持有**。而 2PC 恰恰要求事务在等决议期间保持 prepared——
+ * 协调者的 dtx_decide 自己复制时再触发 apply，就撞上那把锁，永久等待。
+ * 这不是夹具问题：只要"prepare 后保持 in-doubt、再做决议"这个 2PC 基本形态
+ * 成立，就必然撞上。
+ *
+ * 处置：用户事务内的复制路径（prepare 挂钩、dtx 决议）跳过 inline apply。
+ * 进度游标是**单调幂等**的，推迟到下一次 client backend 路径再推进无损；
+ * 代价只是 applied_part_lsn 比 commit_index 落后一小段，而它本就允许滞后
+ * （切主安全线比的是"谁追平了"）。commit_index 与多数派持久化不受影响——
+ * **提交点语义完全不变**。
+ */
+static bool in_txn_replication = false;
 #define RAFT_HARDSTATE_MAGIC   UINT32_C(0x52484654)
 /*
  * v2 起 hardstate 增加 last_applied。v1 文件仍可读（last_applied 视为 0），
  * 避免升级时丢掉 current_term/voted_for 造成任期回退。
+ * v3 起再增加 base_index/base_term —— 日志压缩的基点（快照 last_included_*）。
+ * 低版本文件读上来时基点为 0，等价于"没压缩过"，语义与压缩前完全一致。
  */
-#define RAFT_HARDSTATE_VERSION 2
+#define RAFT_HARDSTATE_VERSION 3
 #define RAFT_HARDSTATE_VERSION_MIN 1
 /* v1 布局 = v2 去掉末尾的 last_applied，用 offsetof 取以免手算漏掉结构体填充 */
 #define RAFT_HARDSTATE_V1_SIZE  offsetof(RaftHardStateFile, last_applied)
+#define RAFT_HARDSTATE_V2_SIZE  offsetof(RaftHardStateFile, base_index)
 
 /* group 0 = 控制面；其余为数据面分区组 */
 #define RAFT_CONTROL_GROUP  INT64CONST(0)
@@ -94,6 +136,14 @@ typedef struct RaftLogShmem
     int64        last_log_index;
     int64        commit_index;
     int64        last_applied;
+    /*
+     * 日志压缩基点：index <= base_index 的条目已被快照取代并从
+     * partdist.raft_log 删除，环里也不再保证有。base_term 是 base_index
+     * 那一条的 term —— prev 一致性检查与选举的"日志新旧"比较在压缩点上
+     * 只能靠它（条目本身已经没有了）。0/0 表示从未压缩过。
+     */
+    int64        base_index;
+    int64        base_term;
     int64        peer_next_index[RAFT_MAX_PEERS];
     int64        peer_match_index[RAFT_MAX_PEERS];
     bool         repl_inited;
@@ -111,8 +161,11 @@ typedef struct RaftGroupState
     bool                in_use;
     int64               group_id;
     bool                hs_loaded;      /* HardState 是否已从文件恢复进 shmem */
+    bool                log_restored;   /* SQL 日志是否已灌回环（不能用 last_log_index>0 判） */
     bool                report_pending; /* 数据组新任 leader 尚未向控制面登记（tick 里重试投递） */
     int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
+    bool                replicate_in_progress; /* 本组的 prepare 复制正在进行（串行化，见 replicate_claim） */
+    int                 replicate_pid;         /* 持有者 backend PID；持有者消失时由等待者回收 */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
     RaftConsensusShmem  cons;
@@ -150,12 +203,19 @@ typedef struct RaftHardStateFile
     int32  voted_for;
     int64  commit_index;
     int64  last_applied;
+    int64  base_index;      /* v3：日志压缩基点 = 快照 last_included_index */
+    int64  base_term;       /* v3：该条目的 term = 快照 last_included_term */
 } RaftHardStateFile;
 
 bool  pg_raft_raft_enabled = false;
+bool  pg_raft_dtx_2pc_enabled = true;
+int   pg_raft_dtx_recover_interval_ms = 10000;
+int   pg_raft_dtx_recover_timeout_ms  = 30000;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
+int   pg_raft_catchup_interval_ms = 5000;
+int   pg_raft_compact_threshold = 500;
 
 static RaftGroupTable *RaftGroups = NULL;
 
@@ -185,6 +245,9 @@ static void parse_peers(void);
 static bool raft_group_ctx(int64 group_id, RaftGroupCtx *ctx);
 static bool raft_group_ensure(int64 group_id, const int *members, int n_members,
                               RaftGroupCtx *ctx);
+static bool group_membership_known(RaftGroupCtx *ctx);
+static bool group_resolve_membership(RaftGroupCtx *ctx);
+static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
@@ -192,16 +255,32 @@ static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
 static int64 group_local_partition(RaftGroupCtx *ctx);
 
 /*
- * 数据组的 entry 携带真实 parwal 字节，取字节要走 SPI，因此只有 client backend
- * 路径（propose / flush_replication）能发数据条目；BGW tick 无 SPI，对数据组只
- * 发心跳，落后的 follower 在下一次 propose 时由 flush_replication 追平。
+ * 「当前是否处于 SPI 可用的语境」。两处依赖它：
+ *
+ *  1. 数据组的 entry 携带真实 parwal 字节，取字节要走 SPI（partwal_read_record）；
+ *  2. 环外条目回读 —— 环只有 RAFT_LOG_CAPACITY 条，更老的条目只能从
+ *     partdist.raft_log 读回来（log_get_entry_ext）。
+ *
+ * BGW tick 里没有 SPI，两件都做不了：对数据组只发心跳，对落后超过环容量的
+ * follower 只能空转。追平由 client backend 语境驱动 —— propose 路径，或
+ * 后台追平通道 pg_raft_catchup()（TopologyMonitor 经 libpq 自连触发）。
  */
-static bool data_shipping_allowed = false;
+static bool raft_spi_ctx = false;
 
 static bool raft_persist_spi_begin(bool *spi_owned);
+static bool dtx_dtxid_from_gid(const char *gid, int64 *dtxid);
+static void dtx_ack_sweep(void);
+static void dtx_forget_sweep(void);
+static int  dtx_gc_dist_transaction(void);
 static void raft_persist_spi_end(bool spi_owned);
 static int64 entry_partition_lsn(const char *payload);
+static int entry_record_flags(const char *payload);
+static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
+static bool replicate_try_claim(RaftGroupCtx *ctx);
+static void replicate_release(RaftGroupCtx *ctx);
+static void step_down_if_higher(RaftGroupCtx *ctx, int64 their_term);
+static void control_maybe_compact(RaftGroupCtx *ctx);
 
 /* ---- 共享内存 ---- */
 
@@ -242,6 +321,10 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.last_applied = 0;
     g->log.repl_inited = false;
     g->log.apply_in_progress = false;
+
+    g->last_data_plsn = 0;
+    g->replicate_in_progress = false;
+    g->replicate_pid = 0;
 }
 
 void
@@ -343,33 +426,177 @@ raft_control_ctx(RaftGroupCtx *ctx)
     return raft_group_ctx(RAFT_CONTROL_GROUP, ctx);
 }
 
-/* 该节点是否为本组成员（members 为空表示全体节点） */
+/*
+ * 从控制面下发的 partition_map 导出某数据组的成员集（DTX_2PC_DESIGN.md §9.2）。
+ *
+ * partition_map 由 group 0 的 apply 在**每个节点**各写一份（计划文档 §13），
+ * 所以这是本地可读、无需新增 RPC 的权威来源 —— 正是"成员集必须来自控制面下发，
+ * 不能从收到的报文里推断"的落地形态。
+ *
+ * 成员集 = {primary_node} ∪ secondary_nodes，剔除协调节点（master 不作数据副本）。
+ * 返回成员数；0 表示导不出来（该分区尚未登记，例如全新组的首次选举之前——
+ * 那种情况必须由 pg_raft_group_create(gid, members) 显式给出）。
+ *
+ * 需要 SPI，只能在 SQL/客户端 backend 路径调用，**不能在 BGW tick 里调**。
+ */
+static int
+group_members_from_partition_map(int64 group_id, int *members)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int   n = 0;
+
+    if (group_id == RAFT_CONTROL_GROUP || group_id <= 0)
+        return 0;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node, "
+                     "       COALESCE(array_to_string(secondary_nodes, ','), '') "
+                     "  FROM partdist.partition_map WHERE partition_id = %llu::oid",
+                     (unsigned long long) group_id);
+
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d;
+        int   primary_node = 0;
+        char *sec = NULL;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+            primary_node = DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        if (!isnull)
+            sec = TextDatumGetCString(d);
+
+        if (primary_node > 0 && primary_node != pg_raft_coordinator_node_id)
+            members[n++] = primary_node;
+
+        if (sec != NULL && sec[0] != '\0')
+        {
+            char *tok, *saveptr = NULL;
+
+            for (tok = strtok_r(sec, ",", &saveptr);
+                 tok != NULL && n < RAFT_MAX_PEERS;
+                 tok = strtok_r(NULL, ",", &saveptr))
+            {
+                int id = atoi(tok);
+                int j;
+
+                if (id <= 0 || id == pg_raft_coordinator_node_id)
+                    continue;
+                for (j = 0; j < n; j++)
+                    if (members[j] == id)
+                        break;
+                if (j == n)
+                    members[n++] = id;
+            }
+        }
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return n;
+}
+
+/*
+ * 成员集未知时尝试从 partition_map 补齐。返回补齐后是否已知。
+ * 仅可在 SPI 可用的路径调用。
+ */
+static bool
+group_resolve_membership(RaftGroupCtx *ctx)
+{
+    int members[RAFT_MAX_PEERS];
+    int n;
+
+    if (group_membership_known(ctx))
+        return true;
+
+    n = group_members_from_partition_map(ctx->group_id, members);
+    if (n <= 0)
+        return false;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    ctx->g->n_members = 0;
+    while (ctx->g->n_members < n)
+    {
+        ctx->g->members[ctx->g->n_members] = members[ctx->g->n_members];
+        ctx->g->n_members++;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    elog(LOG, "pg_raft: 组 %lld 的成员集从 partition_map 导出，共 %d 个成员",
+         (long long) ctx->group_id, n);
+    return true;
+}
+
+/*
+ * ★ 成员集语义（2026-08-03 修，DTX_2PC_DESIGN.md §9.2）
+ *
+ * 旧语义把 `n_members == 0` 重载为"全体节点"。这对**控制面组**成立（组 0 的
+ * 成员本来就是全部节点），对**数据组永远不成立**——一个分片的副本集必然是全体
+ * 节点的真子集。实测后果（9 节点环境，以 SQL 默认的 NULL 成员集建组）：
+ *   · cluster_size 算成 9、多数派算成 5，而只有 3 个节点持有该分片的数据；
+ *   · 该组向**全集群**广播 RequestVote/AppendEntries，非副本节点收到后
+ *     照样 hearsay 自动建组（同样是空成员集）并参与投票；
+ *   · 实测真正持有数据的 worker 反而掉成 term=0 的 follower，分片彻底不可用，
+ *     且非副本节点可以赢得它根本没有数据的分片的领导权。
+ *   · 更本质的危险：同一个组在不同节点上有两套不相交的多数派定义
+ *     （3 副本算 2/3，hearsay 节点算 5/9），Leader Completeness 失去交集保证。
+ *
+ * 新语义：数据组的 `n_members == 0` 表示**成员集未知**，而不是"全体"。未知即
+ * **不参与**：不竞选、不发心跳、不投票、不提案——fail-stop 而不是 fail-open。
+ * 成员集的权威来源是控制面下发到每个节点的 `partdist.partition_map`
+ * （见计划文档 §13），由 group_members_from_partition_map() 在 SPI 可用的
+ * 路径上自动导出；导不出来时必须由运维显式 pg_raft_group_create(gid, members)。
+ */
+static bool
+group_membership_known(RaftGroupCtx *ctx)
+{
+    return ctx->group_id == RAFT_CONTROL_GROUP || ctx->g->n_members > 0;
+}
+
+/* 该节点是否为本组成员（控制面组的空成员集仍表示全体节点） */
 static bool
 group_has_member(RaftGroupCtx *ctx, int node_id)
 {
     int i;
 
     if (ctx->g->n_members <= 0)
-        return true;
+        return ctx->group_id == RAFT_CONTROL_GROUP;
     for (i = 0; i < ctx->g->n_members; i++)
         if (ctx->g->members[i] == node_id)
             return true;
     return false;
 }
 
-/* 本组的集群规模（用于多数派计算） */
+/* 本组的集群规模（用于多数派计算）；数据组成员集未知时返回 0 */
 static int
 group_cluster_size(RaftGroupCtx *ctx)
 {
     if (ctx->g->n_members > 0)
         return ctx->g->n_members;
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return 0;               /* 成员集未知：规模无从谈起 */
     return (n_peers > 0) ? n_peers : 1;
 }
 
 static int
 cluster_majority(RaftGroupCtx *ctx)
 {
-    return group_cluster_size(ctx) / 2 + 1;
+    int size = group_cluster_size(ctx);
+
+    /*
+     * 规模未知时返回一个**不可能达到**的票数（ack 数上限是 n_peers <=
+     * RAFT_MAX_PEERS）。调用方本应在更早的门禁处就已返回，这里是兜底：
+     * 万一有路径漏网，也必须 fail-closed（永远提交不了），
+     * 绝不能退化成 0/2+1 = 1 而"一票自行提交"。
+     */
+    if (size <= 0)
+        return RAFT_MAX_PEERS + 1;
+    return size / 2 + 1;
 }
 
 /* ---- 日志辅助 ---- */
@@ -391,6 +618,42 @@ static RaftLogEntry *log_slot(RaftGroupCtx *ctx, int64 index);
  * follower 必须**先把字节落盘 fsync 再 ack**，故"多数派提交"即"多数派已持久化"。
  */
 #define RAFT_OP_PARWAL "OP_PARWAL"
+
+/* 从描述符 JSON 里抠出一个整型字段（不引 jsonb，简单扫描即可） */
+static int
+entry_int_field(const char *payload, const char *key, int dflt)
+{
+    const char *p;
+    int         v = 0;
+
+    if (payload == NULL)
+        return dflt;
+    p = strstr(payload, key);
+    if (p == NULL)
+        return dflt;
+    p = strchr(p, ':');
+    if (p == NULL)
+        return dflt;
+    if (sscanf(p + 1, " %d", &v) != 1)
+        return dflt;
+    return v;
+}
+
+/*
+ * 描述符里的 flags / info。旧 leader 发来的条目可能没有 "flags"，
+ * 按 DATA 处理 —— 与 PartWALRecordIsData() 对 flags==0 的兼容判定一致。
+ */
+static int
+entry_record_flags(const char *payload)
+{
+    return entry_int_field(payload, "\"flags\"", PARTWAL_FLAG_DATA);
+}
+
+static int
+entry_record_info(const char *payload)
+{
+    return entry_int_field(payload, "\"info\"", 0);
+}
 
 /* 从描述符 JSON 里抠出 partition_lsn（不引 jsonb，简单扫描即可） */
 static int64
@@ -589,12 +852,92 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
     if (!raft_persist_spi_begin(&spi_owned))
         return false;           /* 拿不到 SPI（如 BGW），下轮再来 */
 
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
-                     (unsigned) local_oid, (long long) plsn);
-    ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
-    pfree(sql.data);
+    /*
+     * ★ 只有这条会与 prepared 事务撞锁，所以只跳过它（in_txn_replication）。
+     *
+     * 冲突链：prepare 路径在用户事务内触发复制 → apply → UPSERT
+     * `follower_partition_map` 的进度行 → 事务进入 PREPARED，**行锁一直被持有**
+     * → 协调者 dtx_decide 的复制再触发 apply 撞上同一行 → 永久阻塞。
+     *
+     * 初版是"用户事务内整个跳过 group_apply_pending"，太粗暴：写入负载下每次
+     * propose 都在用户事务里，`last_applied` 永不推进，环容量检查
+     * （last_log_index - last_applied）很快判满、拒收新条目 —— raft_17 实测
+     * follower 卡死在 127（RAFT_LOG_CAPACITY=128）。
+     *
+     * 现在只跳过这条 SQL，**游标照常推进、DTX 决议索引照常维护**，
+     * 环不会被撑满。代价：本节点这张表里的 applied_part_lsn 在纯 2PC 负载下
+     * 会滞后（follower 侧不受影响——它们的 apply 跑在 pg_raft_append_entries
+     * 这个顶层 SQL 调用里，不在任何 prepared 事务内）。该列服务于切主候选
+     * 筛选，滞后只会让本节点显得"没追平"，是保守方向，不会误判为已追平。
+     */
+    if (in_txn_replication)
+        ok = true;
+    else
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT partdist.follower_set_applied_part_lsn(%u::oid, %lld)",
+                         (unsigned) local_oid, (long long) plsn);
+        ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT);
+        pfree(sql.data);
+    }
+
+    /*
+     * ★ DTX DECISION 记录：每个组成员在 apply 它时各自把决议登记进本地
+     * partdist.dtx_decision（DTX_2PC_DESIGN.md §6.2）。
+     *
+     * 这正是"协调权随 Raft 选举自动转移"的落地点：协调组切主后，新 leader
+     * 手里天然就有全表，dtx_status 立刻可答，不需要任何状态搬迁。
+     *
+     * 判据用 flags 的 DTX 位 + info==DTX_DECISION(2)，与写入侧一致；
+     * 载荷由 partwal_read_dtx_record 从**本节点刚落盘的字节**解析，
+     * 因此 follower 上的登记与 leader 逐字段相同。
+     * ON CONFLICT DO NOTHING —— 决议槽一次性，重复 apply 幂等。
+     */
+    /*
+     * ★ DTX FORGET 记录（info==5，§9.7）：presumed abort 的标准收尾。
+     * 协调组 leader 在 acked ⊇ participants 后追加它并复制到多数派；
+     * 每个成员 apply 它时把该 dtxid 的决议行从本地索引删除 —— 删除经由
+     * 组日志复制，所以 **全体成员同步回收**，选举转移后也不留分叉的表。
+     * 此后按协议不会再有人来问这笔决议（全部写过的参与者都已闭合并留标记）。
+     */
+    if (ok && (entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
+        entry_record_info(e->payload) == 5)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.dtx_decision dd "
+                         "USING partdist.partwal_read_dtx_record(%u::oid, %lld) d "
+                         "WHERE dd.dtxid = d.dtxid",
+                         (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_DELETE)
+            elog(WARNING,
+                 "pg_raft: 组 %lld apply FORGET 记录（plsn=%lld）删除决议行失败",
+                 (long long) ctx->group_id, (long long) plsn);
+        pfree(sql.data);
+    }
+
+    if (ok && (entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
+        entry_record_info(e->payload) == 2)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_decision"
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                         "SELECT d.dtxid, d.coord_gsid, d.verdict, d.commit_ts, "
+                         "       coalesce(d.participants, '{}'::bigint[]), %lld "
+                         "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d "
+                         "WHERE d.dtxid IS NOT NULL "
+                         "ON CONFLICT (dtxid) DO NOTHING",
+                         (long long) plsn, (unsigned) local_oid,
+                         (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
+            elog(WARNING,
+                 "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
+                 (long long) ctx->group_id, (long long) plsn);
+        pfree(sql.data);
+    }
+
     raft_persist_spi_end(spi_owned);
     return ok;
 }
@@ -683,6 +1026,10 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     hs.voted_for = voted_for;
     hs.commit_index = commit_index;
     hs.last_applied = last_applied;
+    SpinLockAcquire(&ctx->log->mutex);
+    hs.base_index = ctx->log->base_index;
+    hs.base_term = ctx->log->base_term;
+    SpinLockRelease(&ctx->log->mutex);
 
     fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0)
@@ -780,8 +1127,10 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         return;
     }
 
-    if (hs.version < RAFT_HARDSTATE_VERSION)
+    if (hs.version < 2)
         hs.last_applied = 0;    /* v1 没有该字段，退化为"从 0 起重放" */
+    if (hs.version < 3)
+        hs.base_index = hs.base_term = 0;   /* v1/v2：从未压缩过 */
 
     SpinLockAcquire(&ctx->cons->mutex);
     if (hs.current_term > ctx->cons->current_term)
@@ -796,6 +1145,21 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         ctx->log->last_applied = hs.last_applied;
     if (ctx->log->last_applied > ctx->log->commit_index)
         ctx->log->last_applied = ctx->log->commit_index;
+    if (hs.base_index > ctx->log->base_index)
+    {
+        ctx->log->base_index = hs.base_index;
+        ctx->log->base_term = hs.base_term;
+    }
+    /*
+     * 压缩基点之前的条目已经不存在了，三个游标都不能落在基点之下 ——
+     * 否则 apply 会去取一条永远取不到的条目而永久卡住。
+     */
+    if (ctx->log->last_log_index < ctx->log->base_index)
+        ctx->log->last_log_index = ctx->log->base_index;
+    if (ctx->log->commit_index < ctx->log->base_index)
+        ctx->log->commit_index = ctx->log->base_index;
+    if (ctx->log->last_applied < ctx->log->base_index)
+        ctx->log->last_applied = ctx->log->base_index;
     SpinLockRelease(&ctx->log->mutex);
 }
 
@@ -856,6 +1220,39 @@ delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
     raft_persist_spi_end(spi_owned);
 }
 
+/*
+ * 冲突截断时把 SQL 日志里 index 之后的行一并删掉。
+ *
+ * 环内截断只改 last_log_index，SQL 行照旧留着 —— 在有了 log_get_entry_sql
+ * 回读之后，这些被截断的行会被重新读出来当成"本节点持有的条目"，重启的
+ * restore 也会把它们灌回环。必须与环的截断同时发生。
+ */
+static void
+delete_log_entries_after_sql(RaftGroupCtx *ctx, int64 index)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+
+    if (index < 0 || !raft_persist_spi_begin(&spi_owned))
+        return;
+
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "DELETE FROM partdist.raft_log "
+                     "WHERE group_id = %lld AND log_index > %lld",
+                     (long long) ctx->group_id, (long long) index);
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+
+    raft_persist_spi_end(spi_owned);
+}
+
 static RaftLogEntry *
 log_slot(RaftGroupCtx *ctx, int64 index)
 {
@@ -878,6 +1275,82 @@ log_get_entry_locked(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
     return true;
 }
 
+/*
+ * 从 partdist.raft_log 读回一条**已滑出环窗口**的条目。
+ *
+ * 环只有 RAFT_LOG_CAPACITY(128) 条，而 SQL 日志是全量持久的。此前没有这条
+ * 回读路径，于是落后超过环容量的 follower **永远追不上**：leader 侧
+ * log_get_entry_locked 在槽位被覆盖时失败 → prev_term 取到 0 → follower 拒绝
+ * → next_index 一路退到 1 → 此后只发心跳、match 恒 0，静默卡死（§12.3.B.6
+ * 记录的"某节点 group0 恒 0/0/0"就是这个形态）。字节其实一直都在盘上。
+ *
+ * 调用方必须处于 SPI 可用语境（raft_spi_ctx），且不得持有 log->mutex。
+ */
+static bool
+log_get_entry_sql(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    bool           found = false;
+
+    if (index <= 0)
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return false;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT term, op_type, payload::text "
+                     "FROM partdist.raft_log WHERE group_id = %lld AND log_index = %lld",
+                     (long long) ctx->group_id, (long long) index);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+        bool      isnull;
+        char     *op;
+        char     *payload;
+
+        out->index = index;
+        out->term = DatumGetInt64(SPI_getbinval(tup, desc, 1, &isnull));
+        op = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
+        payload = TextDatumGetCString(SPI_getbinval(tup, desc, 3, &isnull));
+        strlcpy(out->op_type, op, RAFT_OP_LEN);
+        strlcpy(out->payload, payload, RAFT_PAYLOAD_MAX);
+        pfree(op);
+        pfree(payload);
+        found = true;
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return found;
+}
+
+/*
+ * 两级取条目：先查环（无锁开销最小），环外再落到 SQL 日志。
+ * **不得**在持有 log->mutex 时调用（SQL 那一级要走 SPI）。
+ * 非 SPI 语境（BGW tick）退化为只查环，行为与加这条回读之前完全一致。
+ */
+static bool
+log_get_entry_ext(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
+{
+    bool got;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    got = log_get_entry_locked(ctx, index, out);
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (got || !raft_spi_ctx)
+        return got;
+
+    return log_get_entry_sql(ctx, index, out);
+}
+
 static void
 current_last_log_info_locked(RaftGroupCtx *ctx, int64 *last_idx, int64 *last_term)
 {
@@ -891,6 +1364,48 @@ current_last_log_info_locked(RaftGroupCtx *ctx, int64 *last_idx, int64 *last_ter
 
     if (log_get_entry_locked(ctx, *last_idx, &entry))
         *last_term = entry.term;
+    else if (*last_idx == ctx->log->base_index)
+        *last_term = ctx->log->base_term;   /* 末尾恰好就是压缩基点 */
+}
+
+/*
+ * 取 index 处的 term。压缩基点上的条目已被删除，只剩 base_term 可用 ——
+ * prev 一致性检查与选举的日志新旧比较都必须认它，否则一压缩就没人能通过
+ * 基点处的 prev 检查（也就没人能再当选或被复制）。
+ *
+ * 返回 false = 本节点无从判断（比基点还老，或是尚未持有的空洞）。
+ * 调用方**不得**持有 log->mutex：SQL 那一级要走 SPI。
+ */
+static bool
+log_term_at(RaftGroupCtx *ctx, int64 index, int64 *term)
+{
+    RaftLogEntry e;
+    int64        base_idx;
+    int64        base_term;
+
+    if (index <= 0)
+    {
+        *term = 0;
+        return true;
+    }
+
+    SpinLockAcquire(&ctx->log->mutex);
+    base_idx = ctx->log->base_index;
+    base_term = ctx->log->base_term;
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (index == base_idx)
+    {
+        *term = base_term;
+        return true;
+    }
+
+    if (log_get_entry_ext(ctx, index, &e))
+    {
+        *term = e.term;
+        return true;
+    }
+    return false;
 }
 
 static bool
@@ -1086,7 +1601,16 @@ restore_groups_if_needed(void)
              tok = strtok_r(NULL, ",", &saveptr))
             members[n_members++] = atoi(tok);
 
-        (void) raft_group_ensure(gid, members, n_members, &ctx);
+        if (raft_group_ensure(gid, members, n_members, &ctx))
+        {
+            /*
+             * 注册表里可能是空成员集（历史行数据，或建组时成员集由
+             * partition_map 导出而注册表只存了 '{}'）。重启后必须重新导出，
+             * 否则该组恢复成"成员集未知"而永久不参与选举（DTX_2PC_DESIGN.md §9.2）。
+             * 本函数本就在 SPI 可用的路径上，可以直接查 partition_map。
+             */
+            (void) group_resolve_membership(&ctx);
+        }
         pfree(mstr);
     }
 
@@ -1108,14 +1632,23 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
     bool           clamped_hardstate = false;
     StringInfoData sql;
 
-    SpinLockAcquire(&ctx->log->mutex);
-    if (ctx->log->last_log_index > 0)
-    {
-        SpinLockRelease(&ctx->log->mutex);
+    /*
+     * ★ 早退条件必须是"是否已经灌过"，**不能**是 last_log_index > 0（2026-08-05 修）。
+     * 有了日志压缩之后，重启时 restore_hard_state_if_needed 会先把 last_log_index
+     * 顶到压缩基点（基点之前的条目已被快照取代，三个游标都不能落在它之下），
+     * 于是这里会误判成"已经有日志了"而**整段跳过**：表里 base+1..N 的尾巴永远
+     * 灌不回环。对 follower 只是要 leader 重发一遍；对**重启后重新当选的 leader**
+     * 就是灾难 —— 它以为自己的日志止于基点，会拿新内容去覆盖 base+1.. 这些**已经
+     * 提交**的位置，直接破坏 Leader Completeness。
+     */
+    if (ctx->g->log_restored)
         return;
-    }
-    SpinLockRelease(&ctx->log->mutex);
 
+    /*
+     * 旗只在**真的灌完**之后才置（下面每条失败路径都原样返回、留待下次重试）。
+     * 提前置的话，一次拿不到 SPI 或建表还没跑完就把这一组永久标成"已恢复"，
+     * 尾巴就再也灌不回来了 —— 那正是本函数要防的事故。
+     */
     if (!raft_persist_spi_begin(&spi_owned))
         return;
 
@@ -1193,11 +1726,73 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
      */
     if (ctx->log->last_applied > ctx->log->commit_index)
         ctx->log->last_applied = ctx->log->commit_index;
+    /* 压缩基点之前的条目已不存在，游标不能落在它之下（否则 apply 取不到条目） */
+    if (ctx->log->last_log_index < ctx->log->base_index)
+        ctx->log->last_log_index = ctx->log->base_index;
+    if (ctx->log->commit_index < ctx->log->base_index)
+        ctx->log->commit_index = ctx->log->base_index;
+    if (ctx->log->last_applied < ctx->log->base_index)
+        ctx->log->last_applied = ctx->log->base_index;
     SpinLockRelease(&ctx->log->mutex);
 
+    ctx->g->log_restored = true;
     raft_persist_spi_end(spi_owned);
     if (clamped_hardstate)
         persist_hard_state_unlocked(ctx);
+}
+
+/*
+ * 把一条 apply 包进子事务里执行（2026-08-05 修）。
+ *
+ * 起因：apply 体里任何一条 SQL 抛错（实测是一条 payload 违反
+ * node_map_status_check 的"毒丸"条目）都会直接从 apply_one_entry 里
+ * ereport 出去，而 apply_in_progress 是在它**之前**置上、之后才清的 ——
+ * 于是这面旗永久留在 true，本节点此后每次 group_apply_pending 都在
+ * "另一个 backend 正在 apply" 这一分支立即返回：**apply 游标从此永久冻结、
+ * 无任何告警**。实测九个节点全部卡在同一个 index 上，而 commit_index 照常
+ * 前进；有了日志压缩之后更糟——压缩点也跟着不动，节点既追不上也压不了。
+ *
+ * 处置与 apply_one_entry 的既有语义对齐：控制面"元数据表持久、跳过安全"，
+ * 抛错按跳过处理（游标照常推进，只记 WARNING）；数据面漏一条 redo 就是分叉，
+ * 抛错按失败处理（游标不推进，下一轮重试），但**旗一定清掉**。
+ */
+static bool
+apply_one_entry_guarded(RaftGroupCtx *ctx, const RaftLogEntry *e)
+{
+    MemoryContext oldcxt = CurrentMemoryContext;
+    ResourceOwner oldowner = CurrentResourceOwner;
+    bool          ok;
+
+    BeginInternalSubTransaction(NULL);
+    PG_TRY();
+    {
+        ok = apply_one_entry(ctx, e);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+
+        MemoryContextSwitchTo(oldcxt);
+        edata = CopyErrorData();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+
+        ok = (ctx->group_id == RAFT_CONTROL_GROUP);
+        elog(WARNING,
+             "pg_raft: group %lld 的条目 %lld(%s) apply 抛错：%s —— %s",
+             (long long) ctx->group_id, (long long) e->index, e->op_type,
+             edata->message,
+             ok ? "控制面按既有语义跳过" : "数据面保留游标，下轮重试");
+        FreeErrorData(edata);
+    }
+    PG_END_TRY();
+
+    return ok;
 }
 
 static void
@@ -1281,7 +1876,7 @@ group_apply_pending(RaftGroupCtx *ctx)
          * apply 抛错或进程在两者之间死掉，这条就被永久标记为已应用却从未
          * 生效；物理回放下这等于静默丢一条 redo。
          */
-        applied_ok = apply_one_entry(ctx, &e);
+        applied_ok = apply_one_entry_guarded(ctx, &e);
 
         SpinLockAcquire(&ctx->log->mutex);
         ctx->log->apply_in_progress = false;
@@ -1294,6 +1889,111 @@ group_apply_pending(RaftGroupCtx *ctx)
 
         persist_hard_state_unlocked(ctx);
     }
+
+    control_maybe_compact(ctx);
+}
+
+/*
+ * 控制面日志压缩（计划文档 §4 阶段 1 的第二个 ❌）。
+ *
+ * partdist.raft_log 此前只增不删：一轮回归就 240+ 行，重启时
+ * restore_persistent_log_if_needed 还要全表读回。压缩把 last_applied 之前的
+ * 行删掉，并把基点 (base_index, base_term) 记进 hardstate —— 删掉的那一段之后
+ * 只能靠 InstallSnapshot 传输，这正是快照与压缩必须同期落地的原因。
+ *
+ * 只做控制面：它的状态机是 partdist 的两张元数据表，`partdist.raft_snapshot`
+ * 在每次 apply 时已经把整张表存下来了，压缩点上的状态天然可得。数据组的状态机
+ * 在 P3 之前就是 parwal 字节流本身，压缩它的正解是日志外部化（§11.5.2 #2），
+ * 不是在这里删行。
+ *
+ * 触发点选在 apply 之后：此时一定在 SPI 可用的语境里（控制面 apply 本身就要
+ * 写元数据表），且 last_applied 刚刚推进过。
+ */
+static void
+control_maybe_compact(RaftGroupCtx *ctx)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int64          applied;
+    int64          base_idx;
+    int64          keep_term = 0;
+
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return;
+    if (pg_raft_compact_threshold <= 0)
+        return;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    applied = ctx->log->last_applied;
+    base_idx = ctx->log->base_index;
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (applied - base_idx < pg_raft_compact_threshold)
+        return;
+
+    /*
+     * 基点那一条的 term 必须先拿到：压缩之后它就没了，而 prev 一致性检查与
+     * 选举的日志新旧比较都还要用它。取不到就**不压缩**（宁可日志长一点）。
+     */
+    if (!log_term_at(ctx, applied, &keep_term) || keep_term <= 0)
+        return;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    /*
+     * 快照必须**先于**删行落库：反过来一旦中间崩溃，日志没了、快照也没有，
+     * 落后成员就再也追不上了。raft_snapshot 是 upsert，重复执行无害。
+     */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "INSERT INTO partdist.raft_snapshot "
+                     "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
+                     "SELECT 1, %lld, %lld, "
+                     "COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                     "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                     "now() "
+                     "ON CONFLICT (singleton) DO UPDATE SET "
+                     "last_included_index = EXCLUDED.last_included_index, "
+                     "last_included_term = EXCLUDED.last_included_term, "
+                     "node_map = EXCLUDED.node_map, "
+                     "partition_map = EXCLUDED.partition_map, updated_at = now() "
+                     "WHERE partdist.raft_snapshot.last_included_index <= EXCLUDED.last_included_index",
+                     (long long) applied, (long long) keep_term);
+    if (SPI_execute(sql.data, false, 0) < 0)
+    {
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+    resetStringInfo(&sql);
+
+    appendStringInfo(&sql,
+                     "DELETE FROM partdist.raft_log "
+                     "WHERE group_id = 0 AND log_index <= %lld",
+                     (long long) applied);
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    SpinLockAcquire(&ctx->log->mutex);
+    if (applied > ctx->log->base_index)
+    {
+        ctx->log->base_index = applied;
+        ctx->log->base_term = keep_term;
+    }
+    SpinLockRelease(&ctx->log->mutex);
+
+    persist_hard_state_unlocked(ctx);
+
+    elog(LOG, "pg_raft: 组 0 日志已压缩到 index=%lld term=%lld（%lld 条已由快照取代）",
+         (long long) applied, (long long) keep_term,
+         (long long) (applied - base_idx));
 }
 
 void
@@ -1556,6 +2256,199 @@ send_sql_rpc(RaftPeer *p, const char *sql, bool honor_backoff,
     return ok;
 }
 
+/*
+ * 追平提示：直接问对端「你这一组的 last_log_index 是多少」。
+ *
+ * 为什么需要：本实现的 AppendEntries 响应里没有 conflict hint，`next_index` 只能
+ * 一次退一格。而新当选的 leader 会把所有 peer 的 next_index 初始化成 last+1，
+ * 于是一个落后 N 条的成员要先花 N 个 RPC 才探回到它真正持有的位置 —— 落后几百条
+ * 时，一次追平还没探完就可能被下一次选举打断，重来一遍，看起来像永远追不上。
+ *
+ * 只用于后台追平通道，且**只作起点提示**：AE 的 prev 一致性检查照旧，对端若在
+ * 该位置上持有不同的条目仍会拒绝，leader 继续按老办法逐格回退。因此这里读到
+ * 陈旧或错误的值都不影响正确性，只影响快慢。
+ */
+static int64
+peer_last_log_index(RaftGroupCtx *ctx, RaftPeer *p)
+{
+    PGconn   *conn;
+    PGresult *res;
+    char      sql[192];
+    int64     val = -1;
+
+    if (peer_in_backoff(p))
+        return -1;
+
+    conn = peer_conn_get(p);
+    if (conn == NULL)
+    {
+        peer_mark_result(p, false);
+        return -1;
+    }
+
+    snprintf(sql, sizeof(sql),
+             "SELECT last_log_index FROM partdist.pg_raft_group_status() "
+             "WHERE group_id = %lld",
+             (long long) ctx->group_id);
+
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        val = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+    else if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQclear(res);
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return -1;
+    }
+    PQclear(res);
+    peer_mark_result(p, true);
+    return val;
+}
+
+/*
+ * InstallSnapshot 的发送侧（计划文档 §4 阶段 1 / §12.4 #7）。
+ *
+ * 只服务**控制面（组 0）**：它的状态机就是 partdist.node_map + partition_map，
+ * 有紧凑表示，日志压缩掉的那一段只能靠它传输。数据组的状态机在 P3（物理回放）
+ * 之前就是 parwal 字节流本身，"快照内容"与"日志内容"是同一份东西，装快照等于
+ * 重放日志 —— 那样的快照只会是个假机制，所以这里不做。
+ *
+ * 载荷从 partdist.raft_snapshot 读（apply 时一直在写），因此**必须有 SPI**；
+ * 调用方保证在 client backend 语境里（追平通道 / propose 路径）。
+ * 用 PQexecParams 传参而不是拼串：node_map/partition_map 是任意长 JSON。
+ */
+static bool
+send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx)
+{
+    StringInfoData sql;
+    PGconn        *conn;
+    PGresult      *res;
+    bool           spi_owned;
+    bool           isnull;
+    char          *snap_idx = NULL;
+    char          *snap_term = NULL;
+    char          *node_map = NULL;
+    char          *partition_map = NULL;
+    char           s_term[32];
+    char           s_leader[16];
+    const char    *params[6];
+    int64          rt = 0;
+    int            ok_flag = 0;
+    bool           sent = false;
+    MemoryContext  oldctx;
+
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+        return false;
+    if (peer_in_backoff(p))
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT last_included_index::text, last_included_term::text, "
+                     "       node_map::text, partition_map::text "
+                     "  FROM partdist.raft_snapshot WHERE singleton = 1 "
+                     "   AND last_included_index >= %lld",
+                     (long long) base_idx);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc desc = SPI_tuptable->tupdesc;
+
+        oldctx = MemoryContextSwitchTo(TopTransactionContext);
+        snap_idx = TextDatumGetCString(SPI_getbinval(tup, desc, 1, &isnull));
+        snap_term = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
+        node_map = TextDatumGetCString(SPI_getbinval(tup, desc, 3, &isnull));
+        partition_map = TextDatumGetCString(SPI_getbinval(tup, desc, 4, &isnull));
+        MemoryContextSwitchTo(oldctx);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (snap_idx == NULL || node_map == NULL || partition_map == NULL)
+    {
+        elog(WARNING,
+             "pg_raft: 组 0 已压缩到 %lld，但快照表里没有可用载荷，无法为落后成员装快照",
+             (long long) base_idx);
+        return false;
+    }
+
+    conn = peer_conn_get(p);
+    if (conn == NULL)
+    {
+        peer_mark_result(p, false);
+        return false;
+    }
+
+    snprintf(s_term, sizeof(s_term), "%lld", (long long) term);
+    snprintf(s_leader, sizeof(s_leader), "%d", pg_raft_node_id);
+    params[0] = s_term;
+    params[1] = s_leader;
+    params[2] = snap_idx;
+    params[3] = snap_term;
+    params[4] = node_map;
+    params[5] = partition_map;
+
+    res = PQexecParams(conn,
+                       "SELECT partdist.pg_raft_install_snapshot("
+                       "$1::bigint, $2::int, $3::bigint, $4::bigint, $5::text, $6::text)",
+                       6, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        sent = parse_resp2(PQgetvalue(res, 0, 0), &rt, &ok_flag);
+    else if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQclear(res);
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return false;
+    }
+    else
+        elog(WARNING, "pg_raft: InstallSnapshot 到 node %d 失败: %s",
+             p->node_id, PQerrorMessage(conn));
+    PQclear(res);
+    peer_mark_result(p, true);
+
+    if (!sent)
+        return false;
+
+    if (rt > term)
+    {
+        step_down_if_higher(ctx, rt);
+        return true;            /* 已降级，本轮到此为止 */
+    }
+
+    if (ok_flag)
+    {
+        int   slot = peer_slot_of(p);
+        int64 installed;
+
+        /*
+         * 游标要按**快照行里的 index** 记，不能按调用方传进来的 base_idx。
+         * 取载荷的 WHERE 是 `last_included_index >= base_idx`：两者之间又压缩了
+         * 一轮的话，对端装到的是更新的那个点。此时若按 base_idx 记 match/next，
+         * leader 下一轮会去补 base_idx+1 —— 那条在对端已随压缩删掉，prev 检查
+         * 取不到 term 只能拒绝，白白退一轮 nextIndex 才重新触发快照。
+         */
+        installed = strtoll(snap_idx, NULL, 10);
+        if (installed < base_idx)
+            installed = base_idx;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        if (ctx->log->peer_match_index[slot] < installed)
+            ctx->log->peer_match_index[slot] = installed;
+        if (ctx->log->peer_next_index[slot] < installed + 1)
+            ctx->log->peer_next_index[slot] = installed + 1;
+        SpinLockRelease(&ctx->log->mutex);
+        elog(LOG, "pg_raft: 已向 node %d 安装组 0 快照（last_included_index=%lld）",
+             p->node_id, (long long) installed);
+        return true;
+    }
+    return false;
+}
+
 static bool
 send_rpc_msg(RaftPeer *p, const char *msg, int64 *resp_term, int *resp_flag)
 {
@@ -1686,11 +2579,15 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     int   leader_id = pg_raft_node_id;
     int64 prev_idx;
     int64 prev_term = 0;
+    int64 next_idx;
+    int64 last_idx;
+    int64 base_idx;
     int64 leader_commit;
     RaftLogEntry entry;
     int64 rt;
     int   ok_flag;
     bool  has_entry;
+    bool  prev_known = false;
     bool  repl_ready;
     char *data_hex = NULL;
 
@@ -1723,14 +2620,65 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     {
         RaftLogEntry *pe = log_slot(ctx, prev_idx);
         if (pe->index == prev_idx)
+        {
             prev_term = pe->term;
+            prev_known = true;
+        }
     }
-    has_entry = (ctx->log->peer_next_index[peer_slot] <= ctx->log->last_log_index &&
-                 log_get_entry_locked(ctx, ctx->log->peer_next_index[peer_slot], &entry));
+    else
+        prev_known = true;
+    next_idx = ctx->log->peer_next_index[peer_slot];
+    last_idx = ctx->log->last_log_index;
+    base_idx = ctx->log->base_index;
+    if (prev_idx > 0 && prev_idx == base_idx)
+    {
+        prev_term = ctx->log->base_term;    /* prev 恰好是压缩基点 */
+        prev_known = true;
+    }
+    has_entry = (next_idx <= last_idx &&
+                 log_get_entry_locked(ctx, next_idx, &entry));
     SpinLockRelease(&ctx->log->mutex);
 
     if (!repl_ready)
         return;
+
+    /*
+     * 对端需要的条目已被压缩掉（next_index 落在基点或更早）：日志里没有了，
+     * 只能装快照。需要 SPI 读快照载荷，因此只在 client backend 语境下做；
+     * BGW tick 里就先跳过，等追平通道那一轮。
+     */
+    if (base_idx > 0 && next_idx <= base_idx && raft_spi_ctx)
+    {
+        if (send_install_snapshot(ctx, &peers[peer_slot], term, base_idx))
+            return;
+    }
+
+    /*
+     * 环外回退：peer 落后超过环容量时，prev 与待发条目都已滑出环窗口。
+     * SPI 语境（propose / pg_raft_catchup）下从 SQL 日志读回来，这样落后
+     * 任意远的 follower 都能被逐条追平；BGW tick 无 SPI，维持原行为
+     * （prev_term=0 → 对端拒 → next_index 递减 → 仅心跳），不改变时序语义。
+     */
+    if (raft_spi_ctx)
+    {
+        RaftLogEntry old;
+
+        if (!prev_known && log_get_entry_sql(ctx, prev_idx, &old))
+        {
+            prev_term = old.term;
+            prev_known = true;
+        }
+        if (!has_entry && next_idx <= last_idx &&
+            log_get_entry_sql(ctx, next_idx, &entry))
+            has_entry = true;
+    }
+
+    /*
+     * prev 无从取证时不能硬发：prev_term 会当成 0 送出去，对端必拒，
+     * 白白把 next_index 往下推。不发条目、只发心跳（保持对端选举计时器）。
+     */
+    if (!prev_known)
+        has_entry = false;
 
     /*
      * 数据组的条目必须带上真实 parwal 字节；取字节要 SPI，BGW tick 里拿不到，
@@ -1738,7 +2686,7 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
      */
     if (has_entry && strcmp(entry.op_type, RAFT_OP_PARWAL) == 0)
     {
-        if (!data_shipping_allowed)
+        if (!raft_spi_ctx)
             has_entry = false;
         else
         {
@@ -2241,7 +3189,6 @@ static void
 discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
 {
     int   i;
-    int64 drop_plsn = -1;
 
     if (idx <= 0)
         return;
@@ -2249,13 +3196,6 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     SpinLockAcquire(&ctx->log->mutex);
     if (idx > ctx->log->commit_index && idx == ctx->log->last_log_index)
     {
-        RaftLogEntry *dropped = log_slot(ctx, idx);
-
-        /* 记下被丢弃条目的 partition_lsn，出锁后据此截断 parwal */
-        if (dropped->index == idx &&
-            strcmp(dropped->op_type, RAFT_OP_PARWAL) == 0)
-            drop_plsn = entry_partition_lsn(dropped->payload);
-
         log_truncate_after_locked(ctx, idx - 1);
         for (i = 0; i < RAFT_MAX_PEERS; i++)
         {
@@ -2267,9 +3207,31 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     }
     SpinLockRelease(&ctx->log->mutex);
 
-    /* 日志截断了，字节也必须跟着截断（SPI 不能在自旋锁内做） */
-    if (drop_plsn > 0)
-        data_group_truncate_parwal(ctx, drop_plsn - 1);
+    /*
+     * ★ leader 侧失败回滚**不再截断 parwal 字节**（2026-08-03 修，raft_17
+     * 阶段二实测抓获的丢数据）。
+     *
+     * 此前这里按被丢弃条目的 plsn 调 partwal_truncate_to(plsn-1)。问题：
+     * parwal 流里 plsn 之后可能已经躺着**并发事务**在 [A] 落盘的记录 ——
+     * 截断连它们一起删。受害 backend 的复制挂钩随后看到
+     * last_data_plsn >= flush_lsn（游标被回滚），循环空转、静默返回，
+     * 其事务**带着"已复制"的假象提交**，而它的数据既不在本地 parwal
+     * 也没到任何 follower（raft_17 阶段二实测：失多数派下 13/240 行
+     * 如此漏网提交）。
+     *
+     * 现在失败条目的字节留在盘上成为"孤儿"：last_data_plsn 未推进，
+     * 下一次复制（同一或另一 backend）会按同一 plsn 重新 propose 同一
+     * 字节 —— 恢复多数派后自然收敛；仍失多数派则照样失败、事务照样
+     * 中止。代价是 parwal 流里可能存有**已中止事务**的 DATA 记录
+     * （"中止事务不在 plsn 空间留渣"的说法作废）——这与 2PC 设计一致：
+     * DATA 记录本就可能属于中止的事务，可见性由标记/决议闭合
+     * （DTX_2PC_DESIGN.md §5、FRD §7.6），当前阶段 follower 只存字节
+     * 不回放，无正确性影响。
+     *
+     * follower 侧的 AppendEntries 冲突截断（handle_append_entries）
+     * **保留** —— 那才是必须的：换 leader 后同一 plsn 会承载不同记录，
+     * 幂等去重会错误保留旧字节。
+     */
 
     delete_log_entry_sql(ctx, idx);
     persist_hard_state_unlocked(ctx);
@@ -2299,6 +3261,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
      * 先把已提交的积压 apply 掉再 append：重启后恢复出的 last_applied 可能
      * 远低于环窗口，此时容量检查(last_log_index - last_applied)会误判环满、
      * 拒绝一切新提案；group_apply_pending 里的控制面快进会先把游标追平。
+     *
      */
     group_apply_pending(ctx);
 
@@ -2314,7 +3277,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
         return 0;
 
     persist_log_entry_sql(ctx, idx, term, op_type, payload, false);
-    data_shipping_allowed = true;
+    raft_spi_ctx = true;
     acks = sync_replicate_index(ctx, idx, term);
 
     SpinLockAcquire(&ctx->log->mutex);
@@ -2339,7 +3302,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
              (long long) term,
              acks,
              majority);
-        data_shipping_allowed = false;
+        raft_spi_ctx = false;
         discard_uncommitted_entry(ctx, idx);
         return 0;
     }
@@ -2347,7 +3310,7 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     /* 多数派提交后，继续推送到所有 Follower 再 apply（控制面需全节点一致） */
     mark_log_committed_sql(ctx, committed_upto);
     flush_replication(ctx, idx, term);
-    data_shipping_allowed = false;
+    raft_spi_ctx = false;
     group_apply_pending(ctx);
     return idx;
 }
@@ -2452,7 +3415,6 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                       const char *entry_data_hex,
                       int64 *out_term, int *success)
 {
-    RaftLogEntry prev;
     bool         has_entry = (entry_idx > 0 && entry_op != NULL && entry_payload != NULL);
     int64        commit_to_mark;
     int64        conflict_plsn = -1;
@@ -2482,32 +3444,92 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     reset_election_deadline_locked(ctx);
     SpinLockRelease(&ctx->cons->mutex);
 
-    SpinLockAcquire(&ctx->log->mutex);
-
+    /*
+     * prev 一致性检查也要能看到环外条目（对端正在追平我这个落后很远的节点时，
+     * prev 必然已滑出我的环窗口）。log_get_entry_ext 内部自己取/放锁，
+     * 因此必须在进入下面的临界区之前做完。RPC 处理跑在真正的 client backend
+     * 里，SPI 天然可用 —— 这一侧不受 BGW 无 SPI 的限制。
+     */
     if (prev_idx > 0)
     {
-        if (!log_get_entry_locked(ctx, prev_idx, &prev) || prev.term != prev_term)
-        {
-            SpinLockRelease(&ctx->log->mutex);
+        int64 my_prev_term;
+        bool  prev_ok;
+
+        raft_spi_ctx = true;
+        prev_ok = (log_term_at(ctx, prev_idx, &my_prev_term) &&
+                   my_prev_term == prev_term);
+        raft_spi_ctx = false;
+
+        if (!prev_ok)
             return true;
-        }
     }
+
+    SpinLockAcquire(&ctx->log->mutex);
 
     if (has_entry)
     {
+        bool already_present = false;
+
         if (entry_idx <= ctx->log->last_log_index)
         {
             RaftLogEntry *exist = log_slot(ctx, entry_idx);
-            if (exist->index == entry_idx &&
-                (exist->term != entry_term ||
-                 strcmp(exist->op_type, entry_op) != 0 ||
-                 strcmp(exist->payload, entry_payload) != 0))
+            RaftLogEntry  old;
+            bool          have_old = false;
+
+            if (exist->index == entry_idx)
             {
-                if (strcmp(exist->op_type, RAFT_OP_PARWAL) == 0)
-                    conflict_plsn = entry_partition_lsn(exist->payload);
-                log_truncate_after_locked(ctx, entry_idx - 1);
+                old = *exist;
+                have_old = true;
             }
+            else
+            {
+                /*
+                 * 环外的老条目：leader 正在补发我早就持有的一段。此时不能按
+                 * "槽位对不上"直接拒 —— 那正是落后超过环容量的节点永远追不上
+                 * 的第二道闸（第一道在 leader 侧的 log_get_entry_sql 回读）。
+                 * 也不能盲信：与 SQL 日志里的那一行逐字段比对再判定。
+                 */
+                SpinLockRelease(&ctx->log->mutex);
+                raft_spi_ctx = true;
+                have_old = log_get_entry_sql(ctx, entry_idx, &old);
+                raft_spi_ctx = false;
+                SpinLockAcquire(&ctx->log->mutex);
+
+                if (!have_old)
+                {
+                    /* 环外且日志里也没有 = 空洞，拒绝，让 leader 继续回退 */
+                    SpinLockRelease(&ctx->log->mutex);
+                    return true;
+                }
+            }
+
+            /*
+             * 冲突判据只看 term —— 这既是 Raft 的原始规则（同 index 同 term 的
+             * 条目必然出自同一个 leader、内容相同），也是这里**必须**这么写的
+             * 现实原因：`partdist.raft_log.payload` 是 jsonb，读回来的文本被
+             * 规范化过（键序、冒号后的空格），与 leader 线上发来的原始 JSON
+             * 文本逐字节不等。按文本比就会把每一条环外条目都判成冲突并截断，
+             * 实测把控制面日志从 347 条削到 35 条（2026-08-05 实测踩到）。
+             * 同理，重启后 restore 灌回环里的也是规范化文本，环内比文本一样不可靠。
+             */
+            if (old.term != entry_term)
+            {
+                if (strcmp(old.op_type, RAFT_OP_PARWAL) == 0)
+                    conflict_plsn = entry_partition_lsn(old.payload);
+                log_truncate_after_locked(ctx, entry_idx - 1);
+                /*
+                 * SQL 行必须与环同时截断：有了环外回读之后，留在表里的旧行
+                 * 会被重新读出来当作"本节点持有的条目"，重启 restore 也会把
+                 * 它们灌回环。删除必须发生在下面的 append 之前。
+                 */
+                SpinLockRelease(&ctx->log->mutex);
+                delete_log_entries_after_sql(ctx, entry_idx - 1);
+                SpinLockAcquire(&ctx->log->mutex);
+            }
+            else
+                already_present = true;
         }
+
         if (entry_idx == ctx->log->last_log_index + 1)
         {
             /*
@@ -2525,14 +3547,13 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
         }
-        else if (entry_idx <= ctx->log->last_log_index)
+        else if (already_present)
         {
-            RaftLogEntry *e = log_slot(ctx, entry_idx);
-            if (e->index != entry_idx)
-            {
-                SpinLockRelease(&ctx->log->mutex);
-                return true;
-            }
+            /*
+             * 已持有完全相同的这一条（环内或环外）——重传。不重复 append，
+             * 但**继续往下走**：数据组还要确认字节确实在盘上（SQL 行先于
+             * 字节写，崩溃可能只留下行），data_entry_store 幂等，落成功才 ack。
+             */
             SpinLockRelease(&ctx->log->mutex);
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
@@ -2611,6 +3632,15 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
     }
 
+    /*
+     * 机会性补齐成员集（DTX_2PC_DESIGN.md §9.2）；补不上也照常收条目。
+     * 理由同 pg_raft_rpc：leader 只向自己成员集里的节点发 AppendEntries，
+     * 多数派算术是 leader 按它自己的成员集做的，本节点落盘+ack 不会让谁算错。
+     * 成员集未知只剥夺**主动**参与（竞选/当选/提案），不剥夺被动接收 ——
+     * 否则 hearsay 引导路径被砍，全新分片永远建不起来。
+     */
+    (void) group_resolve_membership(&ctx);
+
     if (PG_NARGS() > 10 && !PG_ARGISNULL(10))
     {
         bytea *raw = PG_GETARG_BYTEA_PP(10);
@@ -2632,6 +3662,142 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
         pfree(entry_payload);
     if (entry_data_hex)
         pfree(entry_data_hex);
+
+    snprintf(out, sizeof(out), "%lld %d", (long long) out_term, success);
+    PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_install_snapshot);
+
+/*
+ * InstallSnapshot 的接收侧（控制面专用，见 send_install_snapshot 的注释）。
+ *
+ * 处理顺序按 Raft 论文 §7：
+ *   1. term 落后直接拒（只回自己的 term）；
+ *   2. 认 leader、重置选举计时器（快照传输期间不该被误判为失联）；
+ *   3. **若本地在 last_included_index 上恰好持有同 term 的条目**，保留其后的
+ *      日志尾巴（对端只是想让我跳过前面那段）；否则整段日志作废 —— 那意味着
+ *      我持有的是另一条历史；
+ *   4. 用快照内容整体替换状态机（node_map / partition_map），并把路由层
+ *      同步一遍；
+ *   5. 基点、三个游标、hardstate 落定。
+ *
+ * 这一整套跑在 RPC 的 client backend 里，SPI 天然可用。
+ */
+Datum
+pg_raft_install_snapshot(PG_FUNCTION_ARGS)
+{
+    int64        in_term = PG_GETARG_INT64(0);
+    int          leader_id = PG_GETARG_INT32(1);
+    int64        last_idx = PG_GETARG_INT64(2);
+    int64        last_term = PG_GETARG_INT64(3);
+    char        *node_map = text_to_cstring(PG_GETARG_TEXT_PP(4));
+    char        *partition_map = text_to_cstring(PG_GETARG_TEXT_PP(5));
+    RaftGroupCtx ctx;
+    int64        my_term_at_idx = 0;
+    bool         keep_tail;
+    int64        out_term = 0;
+    int          success = 0;
+    char         out[64];
+
+    if (RaftGroups == NULL || !pg_raft_raft_enabled)
+        PG_RETURN_TEXT_P(cstring_to_text("0 0"));
+
+    parse_peers();
+    if (!raft_control_ctx(&ctx))
+        PG_RETURN_TEXT_P(cstring_to_text("0 0"));
+
+    restore_hard_state_if_needed(&ctx);
+    restore_persistent_log_if_needed(&ctx);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    if (in_term > ctx.cons->current_term)
+    {
+        ctx.cons->current_term = in_term;
+        ctx.cons->voted_for = 0;
+    }
+    out_term = ctx.cons->current_term;
+    if (in_term < ctx.cons->current_term)
+    {
+        SpinLockRelease(&ctx.cons->mutex);
+        snprintf(out, sizeof(out), "%lld 0", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+    ctx.cons->state = RAFT_FOLLOWER;
+    ctx.cons->leader_id = leader_id;
+    reset_election_deadline_locked(&ctx);
+    SpinLockRelease(&ctx.cons->mutex);
+
+    /* 已经不比快照旧就什么都不用做（重发幂等） */
+    SpinLockAcquire(&ctx.log->mutex);
+    if (ctx.log->base_index >= last_idx)
+    {
+        SpinLockRelease(&ctx.log->mutex);
+        snprintf(out, sizeof(out), "%lld 1", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+    SpinLockRelease(&ctx.log->mutex);
+
+    raft_spi_ctx = true;
+    keep_tail = (log_term_at(&ctx, last_idx, &my_term_at_idx) &&
+                 my_term_at_idx == last_term);
+    raft_spi_ctx = false;
+
+    if (!pg_raft_apply_snapshot_state(node_map, partition_map))
+    {
+        snprintf(out, sizeof(out), "%lld 0", (long long) out_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+
+    /*
+     * 日志行：保留尾巴时只删基点及之前；整段作废时连尾巴一起删 ——
+     * 那段尾巴是另一条历史，留着会在 restore 时被灌回环。
+     */
+    if (!keep_tail)
+        delete_log_entries_after_sql(&ctx, last_idx);
+    {
+        StringInfoData sql;
+        bool           spi_owned;
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            if (raft_log_table_ready())
+            {
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "DELETE FROM partdist.raft_log "
+                                 "WHERE group_id = 0 AND log_index <= %lld",
+                                 (long long) last_idx);
+                (void) SPI_execute(sql.data, false, 0);
+                pfree(sql.data);
+            }
+            raft_persist_spi_end(spi_owned);
+        }
+    }
+
+    SpinLockAcquire(&ctx.log->mutex);
+    ctx.log->base_index = last_idx;
+    ctx.log->base_term = last_term;
+    if (!keep_tail || ctx.log->last_log_index < last_idx)
+        ctx.log->last_log_index = last_idx;
+    if (ctx.log->commit_index < last_idx)
+        ctx.log->commit_index = last_idx;
+    /*
+     * apply 游标**回拨**到 last_idx，不是只往上抬。状态机刚被整表替换成
+     * "截至 last_idx 的那一份"，保留下来的尾巴（last_idx+1..）必须在它上面
+     * 重放一遍才对得上；只抬不降的话，本地 last_applied 若已经越过 last_idx，
+     * 那段尾巴就永远不会再 apply —— 状态机反而**倒退**成快照那一刻的样子。
+     * 控制面的 apply 全是幂等 upsert（partition_map 还带任期栅栏），重放无害。
+     */
+    ctx.log->last_applied = last_idx;
+    SpinLockRelease(&ctx.log->mutex);
+
+    persist_hard_state_unlocked(&ctx);
+    success = 1;
+
+    elog(LOG, "pg_raft: 已安装组 0 快照 last_included=(%lld,%lld)，%s",
+         (long long) last_idx, (long long) last_term,
+         keep_tail ? "保留其后的日志尾巴" : "整段日志作废");
 
     snprintf(out, sizeof(out), "%lld %d", (long long) out_term, success);
     PG_RETURN_TEXT_P(cstring_to_text(out));
@@ -2690,6 +3856,25 @@ pg_raft_rpc(PG_FUNCTION_ARGS)
         pfree(msg);
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
     }
+
+    /*
+     * 机会性地从控制面 partition_map 补齐成员集（DTX_2PC_DESIGN.md §9.2）：
+     * 补上了本节点就能主动参与该组（竞选/心跳）；补不上也**照常应答**。
+     *
+     * 为什么这里不能拒绝应答：候选人只会向**它自己成员集里的节点**发
+     * RequestVote（peer_in_group 过滤），所以收到 RV 就意味着对方认为本节点
+     * 是成员；票数算术是候选人按它自己的（已知的）成员集做的，本节点投票
+     * 不会让任何人算错多数派。反过来，拒绝应答会砍掉一条**有意设计**的引导
+     * 路径：数据组按计划文档 §11.5.2 的约定"只在 placement 节点先建组，
+     * 其余成员靠 hearsay 自动建组后再补 create 固化成员集"，首次选举时
+     * partition_map 尚无登记（登记正是由当选 leader 上报产生的），
+     * 一律拒绝会让全新分片永远选不出 leader（实测 raft_14/15/16/17 全挂）。
+     *
+     * 真正的危险是**成员集未知的节点主动竞选/当选**（它会把多数派算成全体
+     * 节点并向全集群广播）——那条路由 group_tick 里的 group_has_member 门禁
+     * 挡住，见 group_membership_known() 的注释。
+     */
+    (void) group_resolve_membership(&ctx);
 
     restore_hard_state_if_needed(&ctx);
     SpinLockAcquire(&ctx.cons->mutex);
@@ -2786,6 +3971,27 @@ pg_raft_group_create(PG_FUNCTION_ARGS)
 
     parse_peers();
     n_members = extract_members(arr, members);
+
+    /*
+     * ★ 不接受"成员集未知"的数据组（DTX_2PC_DESIGN.md §9.2）。
+     * p_members 的 SQL 默认值是 NULL，此前会直接建出一个 n_members == 0 的组，
+     * 而旧语义把它当"全体节点"——该组于是向全集群广播选举、把多数派算成 5/9，
+     * 实测导致真正的数据持有者掉成 follower、分片不可用。
+     * 现在：先从控制面 partition_map 导出；导不出来就直接报错，不建这种组。
+     */
+    if (n_members == 0)
+        n_members = group_members_from_partition_map(group_id, members);
+
+    if (n_members == 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_raft: 数据组 %lld 的成员集未知，拒绝建组",
+                        (long long) group_id),
+                 errdetail("数据组的多数派必须按真实副本集计算；分片副本集是全体节点的"
+                           "真子集，空成员集不能当作\"全体节点\"。"),
+                 errhint("显式给出成员集：partdist.pg_raft_group_create(%lld, ARRAY[...]::int[])；"
+                         "或先让控制面把该分区登记进 partdist.partition_map。",
+                         (long long) group_id)));
 
     /* master 只做协调与登记，不作任何分区的数据副本（主/从都不行） */
     if (pg_raft_coordinator_node_id > 0)
@@ -2895,14 +4101,16 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
     {
         RaftGroupState *g = &RaftGroups->groups[i];
         RaftGroupCtx    ctx;
-        Datum           values[8];
-        bool            nulls[8];
+        Datum           values[10];
+        bool            nulls[10];
         int             state;
         int64           term;
         int             leader_id;
         int64           last_idx;
         int64           commit_idx;
         int64           applied;
+        int64           base_idx;
+        int64           base_term;
 
         if (!g->in_use)
             continue;
@@ -2922,6 +4130,8 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         last_idx = ctx.log->last_log_index;
         commit_idx = ctx.log->commit_index;
         applied = ctx.log->last_applied;
+        base_idx = ctx.log->base_index;
+        base_term = ctx.log->base_term;
         SpinLockRelease(&ctx.log->mutex);
 
         memset(nulls, 0, sizeof(nulls));
@@ -2934,6 +4144,8 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         values[5] = Int64GetDatum(commit_idx);
         values[6] = Int64GetDatum(applied);
         values[7] = Int32GetDatum(group_cluster_size(&ctx));
+        values[8] = Int64GetDatum(base_idx);
+        values[9] = Int64GetDatum(base_term);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
@@ -2955,6 +4167,7 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     bool         spi_owned;
     bool         isnull;
     char        *orig_lsn = NULL;
+    char         orig_lsn_buf[32];
     int          rmid = 0;
     int          info = 0;
     int          flags = 0;
@@ -2982,50 +4195,68 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
     {
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
+        elog(WARNING,
+             "pg_raft: 组 %lld 读不到本地 parwal 记录 plsn=%lld(local_oid=%lld)——"
+             "该 partition_lsn 在本节点不存在",
+             (long long) ctx->group_id, (long long) partition_lsn,
+             (long long) local_oid);
         return 0;
     }
     /*
-     * ★ isnull 必须先判再转。partwal_read_record 是 OUT 参数形式的函数：
-     * 记录读不出来时它返回**一行全 NULL**，而不是零行 —— 上面
-     * `SPI_processed == 0` 那道门根本拦不住。此时
-     *     TextDatumGetCString(SPI_getbinval(...))  →  pg_detoast_datum_packed(NULL)
-     * 当场 SIGSEGV，**打死整个节点**（postmaster 随即
-     * "terminating any other active server processes; reinitializing"），
-     * 而调用方本来只该收到一个事务级 ERROR。
+     * ★ 逐列判 NULL（2026-08-03 修，gdb 实锤的 SIGSEGV）。
      *
-     * 实测栈（pg_partdist 的 SIGSEGV 回溯）：
-     *   InitPostgres → CommitTransactionCommand → PartWALXactCallback
-     *   → ... → pg_raft_partwal_replicate → data_propose_one
-     *   → text_to_cstring → pg_detoast_datum_packed
+     * partwal_read_record 查不到记录时 PG_RETURN_NULL() —— 在
+     * `SELECT ... FROM f(...)` 形态下这不是"零行"，而是**一行全 NULL**
+     * （SPI_processed == 1），上面的 SPI_processed == 0 挡不住它。
+     * 此前对第 1 列直接 TextDatumGetCString(0) → text_to_cstring(NULL)
+     * → pg_detoast_datum_packed 解引用空指针，si_addr=0x0。
      *
-     * 一个节点级崩溃能把该分区组打到失去多数派，进而让 follower 追不平、
-     * 文件 diff 大面积不一致 —— 排查时极易被误判成回放逻辑的偶发缺陷。
+     * 何时会读到不存在的 plsn：历史上是 leader 失败回滚的
+     * partwal_truncate_to 把并发事务的字节一起截掉（该截断已随本次修复
+     * 移除，见 discard_uncommitted_entry）；今后仍可能出现的场景是
+     * 归队 follower 被 AppendEntries 冲突截断后本地游标短暂超前，以及
+     * 段文件损坏/被运维清理。无论成因，正确行为都是按"记录不存在"
+     * 返回 0 —— 调用方 ERROR、事务中止；绝不是崩掉整个节点。
      */
     {
-        Datum d = SPI_getbinval(SPI_tuptable->vals[0],
-                                SPI_tuptable->tupdesc, 1, &isnull);
+        Datum d;
+        bool  null1;
 
-        if (isnull)
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &null1);
+        if (!null1)
+        {
+            /*
+             * ★ 拷出 SPI 上下文（顺手修的同族隐患）：TextDatumGetCString 的
+             * 结果分配在 SPI proc context 里，raft_persist_spi_end（内部
+             * SPI_finish）会释放它 —— 旧代码在 end 之后仍拿它拼 payload，
+             * 是潜伏的 use-after-free，只是该内存至今未被覆写过。
+             */
+            strlcpy(orig_lsn_buf, TextDatumGetCString(d), sizeof(orig_lsn_buf));
+            orig_lsn = orig_lsn_buf;
+        }
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        rmid = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+        info = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
+        gxid = isnull ? 0 : DatumGetInt64(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
+        nbytes = isnull ? 0 : DatumGetInt32(d);
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
+        flags = isnull ? PARTWAL_FLAG_DATA : DatumGetInt32(d);
+
+        if (null1)
         {
             pfree(sql.data);
             raft_persist_spi_end(spi_owned);
-            ereport(ERROR,
-                    (errmsg("pg_raft: 分区 %lld 的记录 plsn=%lld 读不出头部"
-                            "（partwal_read_record 返回空行）",
-                            (long long) local_oid, (long long) partition_lsn)));
+            elog(WARNING,
+                 "pg_raft: 组 %lld 本地 parwal 无记录 plsn=%lld(local_oid=%lld，"
+                 "可能已被失多数派回滚截断)，按 propose 失败处理",
+                 (long long) ctx->group_id, (long long) partition_lsn,
+                 (long long) local_oid);
+            return 0;
         }
-        orig_lsn = TextDatumGetCString(d);
     }
-    rmid = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 2, &isnull));
-    info = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 3, &isnull));
-    gxid = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 4, &isnull));
-    nbytes = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                         SPI_tuptable->tupdesc, 5, &isnull));
-    flags = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-                                        SPI_tuptable->tupdesc, 6, &isnull));
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 
@@ -3045,7 +4276,28 @@ data_propose_one(RaftGroupCtx *ctx, int64 partition_lsn)
 
     pfree(payload.data);
 
-    if (idx > 0 && partition_lsn > ctx->g->last_data_plsn)
+    if (idx <= 0)
+    {
+        int state;
+        int64 last_idx, commit_idx, applied;
+
+        SpinLockAcquire(&ctx->cons->mutex);
+        state = ctx->cons->state;
+        SpinLockRelease(&ctx->cons->mutex);
+        SpinLockAcquire(&ctx->log->mutex);
+        last_idx = ctx->log->last_log_index;
+        commit_idx = ctx->log->commit_index;
+        applied = ctx->log->last_applied;
+        SpinLockRelease(&ctx->log->mutex);
+
+        elog(WARNING,
+             "pg_raft: 组 %lld propose plsn=%lld 失败(state=%d last_log_index=%lld "
+             "commit_index=%lld last_applied=%lld 环容量=%d 成员数=%d)",
+             (long long) ctx->group_id, (long long) partition_lsn, state,
+             (long long) last_idx, (long long) commit_idx, (long long) applied,
+             RAFT_LOG_CAPACITY, group_cluster_size(ctx));
+    }
+    else if (partition_lsn > ctx->g->last_data_plsn)
         ctx->g->last_data_plsn = partition_lsn;
     return idx;
 }
@@ -3082,6 +4334,385 @@ pg_raft_data_propose(PG_FUNCTION_ARGS)
 }
 
 /*
+ * 后台追平通道（计划文档 §12.4 #5 的后半段）。
+ *
+ * 缺口：数据条目只在 client backend 的 propose 路径下发，环外条目也只有 SPI
+ * 语境才读得回来。于是**没有写入流量时，落后的 follower 不会自行收敛** ——
+ * 掉线重启的副本要等下一笔业务写入才被顺带补齐；一直没有写入就一直不补。
+ * 落后超过环容量（128）时更糟：连下一笔写入也补不动，静默永久卡死。
+ *
+ * 本函数就是那条通道：由 TopologyMonitor 经 libpq 自连周期触发（与
+ * force_probe / dtx_recover_prepared 同一手法），因而跑在**真正的 client
+ * backend** 里 —— SPI 可用，既能读 parwal 字节，也能回读环外条目。
+ *
+ * 语义边界（务必保持）：
+ *   - 只补发**已存在**的条目，不产生新提案，不改变"多数派才提交"的语义；
+ *     commit_index 仍由 compute_new_commit_index 按多数派 match 推进。
+ *   - 只在本节点是该组 leader 时做事；非 leader 组直接跳过。
+ *   - 与 prepare 路径共用复制认领位，但**取不到就跳过**（非阻塞）：追平是
+ *     尽力而为的后台工作，绝不能去和事务提交路径抢锁、更不能让它等待。
+ *   - 每组每轮的补发条数有上限，避免一次调用把 tick 拖得过久。
+ */
+#define RAFT_CATCHUP_MAX_ROUNDS  256
+
+PG_FUNCTION_INFO_V1(pg_raft_catchup);
+
+Datum
+pg_raft_catchup(PG_FUNCTION_ARGS)
+{
+    int   i;
+    int64 shipped = 0;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT64(0);
+
+    parse_peers();
+    if (n_peers == 0)
+        PG_RETURN_INT64(0);
+
+    restore_groups_if_needed();
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        RaftGroupCtx    ctx;
+        int             state;
+        int             round;
+
+        if (!g->in_use)
+            continue;
+
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+
+        SpinLockAcquire(&ctx.cons->mutex);
+        state = ctx.cons->state;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (state != RAFT_LEADER)
+            continue;
+
+        if (!group_membership_known(&ctx))
+            continue;
+
+        if (!replicate_try_claim(&ctx))
+            continue;
+
+        raft_spi_ctx = true;
+        PG_TRY();
+        {
+            int p0;
+
+            restore_persistent_log_if_needed(&ctx);
+
+            /* 先按对端自报的 last_log_index 给 next_index 一个起点（只降不升） */
+            for (p0 = 0; p0 < n_peers; p0++)
+            {
+                int64 hint;
+                int64 cur_next;
+
+                if (!peer_in_group(&ctx, p0))
+                    continue;
+
+                SpinLockAcquire(&ctx.log->mutex);
+                cur_next = ctx.log->peer_next_index[p0];
+                SpinLockRelease(&ctx.log->mutex);
+
+                if (cur_next <= 1)
+                    continue;
+
+                hint = peer_last_log_index(&ctx, &peers[p0]);
+                if (hint < 0)
+                    continue;
+
+                SpinLockAcquire(&ctx.log->mutex);
+                if (ctx.log->peer_next_index[p0] > hint + 1)
+                    ctx.log->peer_next_index[p0] = hint + 1;
+                SpinLockRelease(&ctx.log->mutex);
+            }
+
+            for (round = 0; round < RAFT_CATCHUP_MAX_ROUNDS; round++)
+            {
+                int64 last_idx;
+                bool  any_behind = false;
+                bool  any_change = false;
+                int   p;
+
+                CHECK_FOR_INTERRUPTS();
+
+                SpinLockAcquire(&ctx.log->mutex);
+                last_idx = ctx.log->last_log_index;
+                SpinLockRelease(&ctx.log->mutex);
+
+                for (p = 0; p < n_peers; p++)
+                {
+                    int64 before;
+                    int64 after;
+                    int64 next_before;
+                    int64 next_after;
+
+                    if (!peer_in_group(&ctx, p))
+                        continue;
+
+                    SpinLockAcquire(&ctx.log->mutex);
+                    before = ctx.log->peer_match_index[p];
+                    next_before = ctx.log->peer_next_index[p];
+                    SpinLockRelease(&ctx.log->mutex);
+
+                    if (before >= last_idx)
+                        continue;
+
+                    any_behind = true;
+
+                    /* 不可达对端在退避窗口里，send_sql_rpc 自己会跳过 */
+                    replicate_to_peer(&ctx, p);
+
+                    SpinLockAcquire(&ctx.log->mutex);
+                    after = ctx.log->peer_match_index[p];
+                    next_after = ctx.log->peer_next_index[p];
+                    SpinLockRelease(&ctx.log->mutex);
+
+                    if (after > before)
+                        shipped += after - before;
+                    /*
+                     * next_index **下探**同样算进展：新当选的 leader 会把所有
+                     * peer 的 next_index 初始化成 last+1，落后很远的成员要先被
+                     * 一步步探回到它真正持有的位置（本实现的 AppendEntries 响应
+                     * 不带 conflict hint），这一段一条都发不出去。若把"没发出
+                     * 条目"当成没进展而收手，一次调用只能下探一格，追平会慢到
+                     * 看起来像没生效 —— 首版实测就是这样卡在 0。
+                     */
+                    if (after != before || next_after != next_before)
+                        any_change = true;
+                }
+
+                /* 全都追平了，或者这一轮什么都没动（对端不可达）：收手 */
+                if (!any_behind || !any_change)
+                    break;
+            }
+
+            /* 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派 */
+            leader_replicate_and_commit(&ctx);
+            group_apply_pending(&ctx);
+        }
+        PG_FINALLY();
+        {
+            raft_spi_ctx = false;
+            replicate_release(&ctx);
+        }
+        PG_END_TRY();
+    }
+
+    PG_RETURN_INT64(shipped);
+}
+
+/*
+ * 本节点是否是**任何一个**组的 leader（纯 shmem 读，BGW 可调）。
+ * TopologyMonitor 用它决定要不要为追平通道开一条自连接。
+ */
+bool
+pg_raft_any_group_leader_local(void)
+{
+    int i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return false;
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        int             state;
+
+        if (!g->in_use)
+            continue;
+
+        SpinLockAcquire(&g->cons.mutex);
+        state = g->cons.state;
+        SpinLockRelease(&g->cons.mutex);
+
+        if (state == RAFT_LEADER)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * 本组 prepare 复制的串行化（DTX_2PC_DESIGN.md §9.1）。
+ *
+ * 为什么需要：让路窗口修复之后，并发 backend 不再各自提前返回，而是**都会**
+ * 对同一个分区调用复制挂钩。若不串行，两个 backend 会同时读到同一个
+ * last_data_plsn 并各自 propose 同一段 plsn —— 字节层面无害（follower 落盘幂等、
+ * apply 单调），但每条重复提案都白占一个 RAFT_LOG_CAPACITY(128) 的环槽位，
+ * 高并发下会把环烧满并触发背压。串行之后，后到者进入临界区时 last_data_plsn
+ * 已被推进，循环直接空转返回。
+ *
+ * 回收：正常路径由 PG_FINALLY 释放（覆盖 ERROR）；持有者 FATAL/被杀时其
+ * PGPROC 消失，等待者按 BackendPidGetProc() 回收（liveness 检查必须在**出
+ * 自旋锁之后**做 —— 它内部要拿 ProcArrayLock，自旋锁下不允许再取 LWLock）。
+ * 硬崩溃走 postmaster 全局重启，shmem 重建，无残留。
+ *
+ * 复用 RaftGroups->mutex：它原本只护注册表（in_use/group_id/members），
+ * 这里扩到"每组的复制认领位"。二者都是短临界区、无嵌套取锁，安全。
+ */
+#define RAFT_REPLICATE_CLAIM_TIMEOUT_MS  60000
+
+static void
+replicate_claim(RaftGroupCtx *ctx)
+{
+    long waited_us = 0;
+
+    for (;;)
+    {
+        bool got = false;
+        int  holder = 0;
+
+        SpinLockAcquire(&RaftGroups->mutex);
+        if (!ctx->g->replicate_in_progress)
+        {
+            ctx->g->replicate_in_progress = true;
+            ctx->g->replicate_pid = MyProcPid;
+            got = true;
+        }
+        else
+            holder = ctx->g->replicate_pid;
+        SpinLockRelease(&RaftGroups->mutex);
+
+        if (got)
+            return;
+
+        /* 持有者还活着吗？（出锁后做：BackendPidGetProc 会取 ProcArrayLock） */
+        if (holder != 0 && holder != MyProcPid &&
+            BackendPidGetProc(holder) == NULL)
+        {
+            SpinLockAcquire(&RaftGroups->mutex);
+            if (ctx->g->replicate_in_progress &&
+                ctx->g->replicate_pid == holder)
+            {
+                ctx->g->replicate_pid = MyProcPid;
+                got = true;
+            }
+            SpinLockRelease(&RaftGroups->mutex);
+
+            if (got)
+            {
+                elog(WARNING,
+                     "pg_raft: 组 %lld 的复制认领位由已消失的 backend %d 持有，已回收",
+                     (long long) ctx->group_id, holder);
+                return;
+            }
+        }
+
+        if (waited_us >= RAFT_REPLICATE_CLAIM_TIMEOUT_MS * 1000L)
+            ereport(ERROR,
+                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                     errmsg("pg_raft: 等待组 %lld 的复制认领位超过 %d ms，prepare 失败",
+                            (long long) ctx->group_id,
+                            RAFT_REPLICATE_CLAIM_TIMEOUT_MS),
+                     errdetail("持有者 backend %d 可能卡在对端 RPC 上。", holder)));
+
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(1000L);       /* 1ms */
+        waited_us += 1000L;
+    }
+}
+
+/*
+ * 非阻塞版认领：取不到就返回 false。后台追平通道用它 —— 追平是尽力而为的
+ * 后台工作，绝不能排队等在事务提交路径（prepare 复制）后面。
+ */
+static bool
+replicate_try_claim(RaftGroupCtx *ctx)
+{
+    bool got = false;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (!ctx->g->replicate_in_progress)
+    {
+        ctx->g->replicate_in_progress = true;
+        ctx->g->replicate_pid = MyProcPid;
+        got = true;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    return got;
+}
+
+static void
+replicate_release(RaftGroupCtx *ctx)
+{
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (ctx->g->replicate_in_progress && ctx->g->replicate_pid == MyProcPid)
+    {
+        ctx->g->replicate_in_progress = false;
+        ctx->g->replicate_pid = 0;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+}
+
+/*
+ * 把本组的 parwal 增量复制到多数派，直到（含）cur_plsn。
+ *
+ * 调用方必须已持有本组的复制认领位（replicate_claim）。任何一条未达多数派
+ * 即 ERROR —— 对 prepare 路径是"事务中止"，对决议路径是"决议未成立"。
+ *
+ * 增量下界必须在**进入临界区之后**读取：等待认领位期间，并发 backend 很可能
+ * 已经把这一段复制完了，此时循环空转即返回。
+ *
+ * 为什么决议记录也必须走"整段增量"而不是只 propose 自己那一条：follower 的
+ * AppendPartWALRecordAt 遇到 plsn 空洞会 ERROR（不留洞是物理回放的前提），
+ * 单独 propose 决议那一条会因为前面缺记录而拿不到 ack。
+ */
+static void
+replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
+{
+    int64 last;
+    int64 plsn;
+
+    last = ctx->g->last_data_plsn;
+    if (last == 0)
+    {
+        int64 p;
+
+        /* 重启后运行期游标为 0：从环内最后一条 OP_PARWAL 回推 */
+        SpinLockAcquire(&ctx->log->mutex);
+        for (p = ctx->log->last_log_index; p > 0 &&
+             p > ctx->log->last_log_index - RAFT_LOG_CAPACITY; p--)
+        {
+            RaftLogEntry e;
+
+            if (log_get_entry_locked(ctx, p, &e) &&
+                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            {
+                last = entry_partition_lsn(e.payload);
+                break;
+            }
+        }
+        SpinLockRelease(&ctx->log->mutex);
+        if (last > 0)
+            ctx->g->last_data_plsn = last;
+    }
+
+    for (plsn = last + 1; plsn <= cur_plsn; plsn++)
+    {
+        /*
+         * group_propose 只在拿到多数派 ack 之后才返回 idx > 0，而 follower
+         * 是**先 fsync 再 ack** 的（运输层加固 §11.5.1 #1/#3）——所以
+         * "返回成功" 严格等价于 "该条目已在多数派持久化"。
+         * prepare 路径靠它得到 prepared 语义；决议路径靠它得到**提交点**。
+         */
+        int64 idx = data_propose_one(ctx, plsn);
+
+        if (idx <= 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派",
+                            partition_id, (long long) ctx->group_id,
+                            (long long) plsn)));
+    }
+}
+
+/*
  * prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
  *
  * 由 pg_partdist 的 PartWALFlush 在事务 PRE_COMMIT / PRE_PREPARE 时经
@@ -3107,8 +4738,6 @@ pg_raft_partwal_replicate(Oid partition_id)
     bool         isnull;
     int64        gid = 0;
     int64        cur = 0;
-    int64        last;
-    int64        plsn;
     int          state;
 
     if (!pg_raft_raft_enabled || RaftGroups == NULL)
@@ -3145,6 +4774,23 @@ pg_raft_partwal_replicate(Oid partition_id)
     if (!raft_group_ctx(gid, &ctx))
         return;                 /* 无数据组：行为与接线前一致 */
 
+    /*
+     * ★ 成员集未知的数据组拒绝参与 prepare（DTX_2PC_DESIGN.md §9.2）。
+     * 先尝试从控制面 partition_map 导出；仍未知则 **ERROR 中止事务**，
+     * 而不是"跳过复制照常提交" —— 后者等于让写入在没有任何多数派保证的
+     * 情况下返回成功，正是本项目刚修掉的那类丢数据形态。
+     */
+    if (!group_resolve_membership(&ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld)的成员集未知，写入被拒",
+                        partition_id, (long long) gid),
+                 errdetail("数据组的多数派必须按真实副本集计算；partition_map 中没有该分区的登记，"
+                           "无法确定副本集。"),
+                 errhint("先让控制面登记该分区，或在各副本节点执行 "
+                         "partdist.pg_raft_group_create(%lld, ARRAY[...]::int[])。",
+                         (long long) gid)));
+
     restore_hard_state_if_needed(&ctx);
     restore_persistent_log_if_needed(&ctx);
 
@@ -3161,40 +4807,28 @@ pg_raft_partwal_replicate(Oid partition_id)
     if (cur <= 0)
         return;
 
-    /* 增量下界：优先用运行期游标；重启后从环内最后一条 OP_PARWAL 回推 */
-    last = ctx.g->last_data_plsn;
-    if (last == 0)
+    /*
+     * cur 是取自本地 parwal 的当前 flush 点，它必然 >= 本事务刚落盘的那些记录的
+     * partition_lsn —— group commit 让路时本事务的记录是被并发 backend 写下去的，
+     * 但"写下去"发生在 flushed_upto 推进之前，所以到这里 cur 已经覆盖它们。
+     * 因此"复制到 cur"是覆盖本事务的安全上界（DTX_2PC_DESIGN.md §9.1）。
+     */
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
     {
-        int64 p;
-
-        SpinLockAcquire(&ctx.log->mutex);
-        for (p = ctx.log->last_log_index; p > 0 &&
-             p > ctx.log->last_log_index - RAFT_LOG_CAPACITY; p--)
-        {
-            RaftLogEntry e;
-
-            if (log_get_entry_locked(&ctx, p, &e) &&
-                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
-            {
-                last = entry_partition_lsn(e.payload);
-                break;
-            }
-        }
-        SpinLockRelease(&ctx.log->mutex);
-        if (last > 0)
-            ctx.g->last_data_plsn = last;
+        /*
+         * 增量下界必须在**进入临界区之后**重新读取：等待期间并发 backend
+         * 很可能已经把这一段（含本事务的记录）复制完了，此时循环空转即返回。
+         */
+        replicate_group_upto(&ctx, cur, partition_id);
     }
-
-    for (plsn = last + 1; plsn <= cur; plsn++)
+    PG_FINALLY();
     {
-        int64 idx = data_propose_one(&ctx, plsn);
-
-        if (idx <= 0)
-            ereport(ERROR,
-                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                     errmsg("pg_raft: 分区 %u(组 %lld) record %lld 复制未达多数派，prepare 失败，事务中止",
-                            partition_id, (long long) gid, (long long) plsn)));
+        in_txn_replication = false;
+        replicate_release(&ctx);
     }
+    PG_END_TRY();
 }
 
 /*
@@ -3244,4 +4878,2192 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_INT32(dropped);
+}
+
+/* ================================================================== */
+/* DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）                              */
+/* ================================================================== */
+
+/*
+ * dtx_write_decision — 在协调组写一条 DECISION 记录并复制到多数派。
+ *
+ * **这是全局提交点**：只有 replicate_group_upto 返回（= 该记录已在协调组的
+ * 多数派 fsync 落盘）之后，事务才算正式提交（用户方案阶段 2 第 4 步）。
+ * 任何一步失败都 ERROR —— 决议不成立，调用方不得向客户端返回成功。
+ *
+ * 调用方必须已确认本节点是协调组 leader，并已持有复制认领位。
+ * 返回该 DECISION 记录的 partition_lsn。
+ */
+static int64
+dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
+                   int32 verdict, uint64 commit_ts,
+                   const char *participants_sql)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int64 plsn = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR, (errmsg("pg_raft: dtx 决议需要 SPI")));
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT partdist.partwal_append_dtx_record("
+                     "%u::oid, 2, %lld::bigint, %lld::bigint, %llu::bigint, %d, %s)",
+                     (unsigned) local_oid, (long long) dtxid,
+                     (long long) ctx->group_id, (unsigned long long) commit_ts,
+                     verdict, participants_sql);
+    if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            plsn = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (plsn <= 0)
+        ereport(ERROR,
+                (errmsg("pg_raft: 组 %lld 写 DECISION 记录失败（dtxid=%lld）",
+                        (long long) ctx->group_id, (long long) dtxid)));
+
+    /* ★ 提交点：这一步返回即"决议已在协调组多数派持久化" */
+    replicate_group_upto(ctx, plsn, (Oid) local_oid);
+
+    /*
+     * 本地索引。其余成员由 data_entry_apply 在 apply 该条目时各自写入，
+     * 因此协调组切主后新 leader 手里天然有全表（§6.2）。
+     */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_decision"
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                         "VALUES (%lld, %lld, %d, %llu, %s, %lld) "
+                         "ON CONFLICT (dtxid) DO NOTHING",
+                         (long long) dtxid, (long long) ctx->group_id, verdict,
+                         (unsigned long long) commit_ts, participants_sql,
+                         (long long) plsn);
+        (void) SPI_execute(sql.data, false, 0);
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+    }
+    return plsn;
+}
+
+/* 查已有决议；返回 verdict，0 = 尚无决议 */
+static int32
+dtx_lookup_decision(int64 dtxid)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int32 verdict = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                     (long long) dtxid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            verdict = DatumGetInt16(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return verdict;
+}
+
+/*
+ * 协调组的公共前置：解析组、确认成员集已知、确认本节点是 leader。
+ * 不是 leader 返回 false（调用方应返回 NULL，由上层按 partition_map 重新寻址）。
+ */
+static bool
+dtx_coord_ctx(int64 coord_gsid, RaftGroupCtx *ctx, int64 *local_oid)
+{
+    int state;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return false;
+    parse_peers();
+    restore_groups_if_needed();
+
+    if (!raft_group_ctx(coord_gsid, ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 协调组 %lld 在本节点不存在",
+                        (long long) coord_gsid)));
+    if (!group_resolve_membership(ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 协调组 %lld 的成员集未知，无法做决议",
+                        (long long) coord_gsid)));
+
+    restore_hard_state_if_needed(ctx);
+    restore_persistent_log_if_needed(ctx);
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    state = ctx->cons->state;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (state != RAFT_LEADER)
+        return false;
+
+    *local_oid = group_local_partition(ctx);
+    if (*local_oid <= 0)
+        ereport(ERROR,
+                (errmsg("pg_raft: 协调组 %lld 在本节点没有对应分片",
+                        (long long) coord_gsid)));
+    return true;
+}
+
+/* 把 int8[] 渲染成可嵌进 SQL 的字面量；NULL/空 → '{}'::bigint[] */
+static char *
+dtx_participants_sql(ArrayType *arr)
+{
+    StringInfoData buf;
+    Datum *elems;
+    bool  *nulls;
+    int    n = 0;
+    int    i;
+    bool   first = true;
+
+    initStringInfo(&buf);
+    appendStringInfoString(&buf, "ARRAY[");
+    if (arr != NULL)
+    {
+        deconstruct_array(arr, INT8OID, 8, true, 'd', &elems, &nulls, &n);
+        for (i = 0; i < n; i++)
+        {
+            if (nulls[i])
+                continue;
+            if (!first)
+                appendStringInfoChar(&buf, ',');
+            appendStringInfo(&buf, "%lld", (long long) DatumGetInt64(elems[i]));
+            first = false;
+        }
+    }
+    appendStringInfoString(&buf, "]::bigint[]");
+    return buf.data;
+}
+
+/*
+ * partdist.dtx_decide(coord_gsid, dtxid, verdict, participants[]) → int
+ *
+ * 在协调组 leader 上执行。返回最终生效的 verdict（1=COMMIT 2=ABORT）；
+ * 本节点不是协调组 leader 时返回 NULL —— 调用方据此按 partition_map 重新寻址。
+ *
+ * **决议槽一次性**：若该 dtxid 已有决议（例如恢复守护抢先写了 ABORT），
+ * 直接返回已有的那个，不覆盖。这是推定中止与正常提交路径并发时的收敛点。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_decide);
+
+Datum
+pg_raft_dtx_decide(PG_FUNCTION_ARGS)
+{
+    int64        coord_gsid = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    int32        verdict = PG_GETARG_INT32(2);
+    ArrayType   *parts = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    RaftGroupCtx ctx;
+    int64        local_oid = 0;
+    int32        existing;
+    char        *parts_sql;
+    uint64       commit_ts;
+
+    if (verdict != 1 && verdict != 2)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_raft: verdict 必须是 1(COMMIT) 或 2(ABORT)")));
+
+    if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
+        PG_RETURN_NULL();
+
+    existing = dtx_lookup_decision(dtxid);
+    if (existing != 0)
+        PG_RETURN_INT32(existing);
+
+    /*
+     * TSO 未建：commit_ts 先用协调者本地时钟（§9.8）。决议的原子性来自 Raft
+     * 多数派，不依赖时间戳；全局快照一致性等 R3/TSO 立项时再收紧。
+     */
+    commit_ts = (verdict == 1) ? (uint64) GetCurrentTimestamp() : 0;
+    parts_sql = dtx_participants_sql(parts);
+
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
+    {
+        /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
+        existing = dtx_lookup_decision(dtxid);
+        if (existing == 0)
+            (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
+                                      commit_ts, parts_sql);
+        else
+            verdict = existing;
+    }
+    PG_FINALLY();
+    {
+        in_txn_replication = false;
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+
+    pfree(parts_sql);
+    PG_RETURN_INT32(verdict);
+}
+
+/*
+ * partdist.dtx_status(coord_gsid, dtxid) → int
+ *
+ * 参与者恢复时查询决议。**推定中止**（§2.2）：查无决议时**先写一条
+ * ABORT DECISION 并达多数派**，再返回 2。
+ *
+ * 这一步不能省 —— 否则"问的时候没有、答完之后原提交路径又把 COMMIT 写进去"
+ * 会让同一事务出现两个互相矛盾的结论。先写后答之后，决议槽已被 ABORT 占住，
+ * 后到的 COMMIT 会被 dtx_decide 的一次性检查挡下。
+ *
+ * 本节点不是协调组 leader 时返回 NULL。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_status);
+
+Datum
+pg_raft_dtx_status(PG_FUNCTION_ARGS)
+{
+    int64        coord_gsid = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    RaftGroupCtx ctx;
+    int64        local_oid = 0;
+    int32        existing;
+    char        *parts_sql;
+
+    if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
+        PG_RETURN_NULL();
+
+    existing = dtx_lookup_decision(dtxid);
+    if (existing != 0)
+        PG_RETURN_INT32(existing);
+
+    parts_sql = dtx_participants_sql(NULL);
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
+    {
+        existing = dtx_lookup_decision(dtxid);
+        if (existing == 0)
+        {
+            (void) dtx_write_decision(&ctx, local_oid, dtxid, 2 /* ABORT */,
+                                      0, parts_sql);
+            existing = 2;
+        }
+    }
+    PG_FINALLY();
+    {
+        in_txn_replication = false;
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+
+    pfree(parts_sql);
+    PG_RETURN_INT32(existing);
+}
+
+/* ================================================================== */
+/* DTX-2PC 恢复守护（参与者侧，DTX_2PC_DESIGN.md §7）                  */
+/* ================================================================== */
+
+/*
+ * gid 编码：shardpg_dtx_<dtxid>_<coord_gsid>（§5.4）
+ *
+ * 为什么把 dtx 信息编进 gid：参与者**崩溃重启后**唯一还在的线索就是
+ * pg_prepared_xacts —— 它是 PG 原生持久化的。任何放在本地表里的映射都可能
+ * 与 prepared 事务不同步，而 gid 与 prepared 事务同生共死。
+ */
+static bool
+dtx_parse_gid(const char *gid, int64 *dtxid, int64 *coord_gsid)
+{
+    long long d = 0, c = 0;
+
+    if (gid == NULL)
+        return false;
+    if (sscanf(gid, "shardpg_dtx_%lld_%lld", &d, &c) != 2)
+        return false;
+    if (d <= 0 || c <= 0)
+        return false;
+    *dtxid = (int64) d;
+    *coord_gsid = (int64) c;
+    return true;
+}
+
+/*
+ * 向协调组现任 leader 问决议。
+ *
+ * 寻址走 partdist.partition_map[coord_gsid].primary_node —— 切主重构（§13）
+ * 保证它随数据组自治选举实时更新，因此**协调者宕机后寻址自动指向新 leader**，
+ * 这正是决议放数据组、而不是放某个固定 worker 的收益。
+ *
+ * 返回 1=COMMIT / 2=ABORT / 0=问不到（对端不是 leader、连不上、元数据没追平），
+ * 0 时调用方保持 prepared 不动，下轮再问 —— 绝不擅自决定。
+ */
+static int
+dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
+{
+    StringInfoData sql;
+    bool      spi_owned;
+    bool      isnull;
+    int       coord_node = 0;
+    int       slot = -1;
+    int       i;
+    int       verdict = 0;
+    char      conninfo[256];
+    char      qry[192];
+    PGconn   *conn;
+    PGresult *res;
+
+    /* 1) 查协调组的现任 primary 节点 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node FROM partdist.partition_map "
+                     " WHERE partition_id = %llu::oid",
+                     (unsigned long long) coord_gsid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+        if (!isnull)
+            coord_node = DatumGetInt32(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (coord_node <= 0)
+        return 0;               /* 元数据还没追平：下轮再问 */
+
+    /* 本节点就是协调者：直接本地调，省一次往返 */
+    if (coord_node == pg_raft_node_id)
+    {
+        if (!raft_persist_spi_begin(&spi_owned))
+            return 0;
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT partdist.dtx_status(%lld, %lld)",
+                         (long long) coord_gsid, (long long) dtxid);
+        if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                    SPI_tuptable->tupdesc, 1, &isnull);
+            if (!isnull)
+                verdict = DatumGetInt32(d);
+        }
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+        return verdict;
+    }
+
+    /* 2) 远端：走 libpq */
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == coord_node)
+        {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        return 0;
+
+    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                            conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return 0;               /* 协调者不可达：保持 prepared，下轮再问 */
+    }
+    snprintf(qry, sizeof(qry), "SELECT partdist.dtx_status(%lld, %lld)",
+             (long long) coord_gsid, (long long) dtxid);
+    res = PQexec(conn, qry);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        verdict = atoi(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    PQfinish(conn);
+    return verdict;
+}
+
+/*
+ * 未走本项目 2PC 的 prepared 事务（快路径 / 写集 ≤ 1 组 / 无纳管分片）按
+ * **Citus 原生规则**闭合：提交点是 master 的本地提交，凭据是
+ * pg_dist_transaction 里有没有该 gid 的**已提交**行。
+ *
+ * 为什么必须由我们来做：§9.4 关掉了 Citus 自己的 2PC 恢复（它会把我们决议为
+ * ABORT 的事务无条件 COMMIT，造成分叉），关掉之后这一类事务就没人收尾了。
+ * 两条规则各管各的：coord_gsid 有值 ⇒ 协调组权威；为空 ⇒ Citus 规则。
+ *
+ * 推定中止的时间窗与 Citus 自己的恢复同源：master 还在跑这笔事务时行尚未提交，
+ * 但那时 prepared 事务的年龄也还没到超时。超时设保守即可，不影响正确性边界。
+ *
+ * 返回 1=COMMIT / 2=ABORT / 0=问不到（master 不可达，保持 prepared）。
+ */
+static int
+dtx_ask_citus_coordinator(const char *gid)
+{
+    int       slot = -1;
+    int       i;
+    int       verdict = 0;
+    char      conninfo[256];
+    PGconn   *conn;
+    PGresult *res;
+    char     *quoted;
+    StringInfoData qry;
+
+    if (pg_raft_coordinator_node_id <= 0)
+        return 0;
+
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == pg_raft_coordinator_node_id)
+        {
+            slot = i;
+            break;
+        }
+    if (slot < 0)
+        return 0;
+
+    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                            conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+
+    /*
+     * ★ initiator 存活栅栏（2026-08-04 审查补上）。
+     *
+     * pg_dist_transaction 的行在 master **本地提交之前不可见**。若 master 只是
+     * 慢（发起 backend 还活着、尚未走到本地提交），凭"行不可见"就推定中止，
+     * 会把一笔 master 随后会成功提交的事务在参与者上回滚 —— 分叉提交。
+     * Citus 自己的恢复靠共享内存里的活跃分布式事务号拦这个窗口；我们按 §9.4
+     * 把它关掉了，就必须自己补等价物：gid 里恰好编着发起 backend 的 pid
+     * （citus_<group>_<pid>_<txn>_<conn>），它还在 master 的 pg_stat_activity
+     * 里就先不动，下轮再看。pid 复用只会造成多等一轮，是保守方向。
+     *
+     * ★ 顺序敏感：必须**先**查 pid、**后**查行。pid 已消失意味着
+     * "若它曾提交，提交必先于退出"，随后的行查询必然看得见该提交；
+     * 反过来先查行再查 pid，就存在"查行时未提交、查 pid 前刚提交并退出"
+     * 的窗口 —— 行不可见 + pid 不在 ⇒ 误判 ABORT，丢一笔已提交事务。
+     */
+    {
+        long long g_group = 0, g_pid = 0, g_txn = 0, g_conn = 0;
+
+        if (sscanf(gid, "citus_%lld_%lld_%lld_%lld",
+                   &g_group, &g_pid, &g_txn, &g_conn) == 4 && g_pid > 0)
+        {
+            char alive_qry[128];
+            bool alive = false;
+
+            snprintf(alive_qry, sizeof(alive_qry),
+                     "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld",
+                     g_pid);
+            res = PQexec(conn, alive_qry);
+            if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+                !PQgetisnull(res, 0, 0))
+                alive = (atoi(PQgetvalue(res, 0, 0)) > 0);
+            else
+                alive = true;   /* 查不动就当活着：保守方向，下轮再来 */
+            PQclear(res);
+
+            if (alive)
+            {
+                PQfinish(conn);
+                return 0;
+            }
+        }
+    }
+
+    quoted = PQescapeLiteral(conn, gid, strlen(gid));
+    if (quoted == NULL)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+    initStringInfo(&qry);
+    appendStringInfo(&qry,
+                     "SELECT count(*) FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
+                     quoted);
+    PQfreemem(quoted);
+
+    res = PQexec(conn, qry.data);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        verdict = (atoi(PQgetvalue(res, 0, 0)) > 0) ? 1 : 2;
+    PQclear(res);
+    pfree(qry.data);
+    PQfinish(conn);
+    return verdict;
+}
+
+/*
+ * 按 gid 取本节点的参与登记：coord_gsid（0 = master 未下发过）与本节点在这笔
+ * 事务里写过的分区组。返回 false 表示查无此登记（legacy gid / 该表不存在）。
+ *
+ * ★ coord_gsid 为 NULL 的语义是推定中止的支点：master 严格"先下发协调组、
+ * 后做决议"，所以查到 NULL 就意味着**决议必然还没做过**。
+ */
+static bool
+dtx_lookup_participant(const char *gid, int64 *dtxid, int64 *coord_gsid,
+                       int64 *gsids, int max_gsids, int *ngsids)
+{
+    StringInfoData sql;
+    bool           found = false;
+    char          *quoted;
+
+    *dtxid = 0;
+    *coord_gsid = 0;
+    *ngsids = 0;
+
+    quoted = quote_literal_cstr(gid);
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT dtxid, coalesce(coord_gsid, 0), gsids "
+                     "  FROM partdist.dtx_participant WHERE gid = %s", quoted);
+    pfree(quoted);
+
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool   isnull;
+        Datum  d;
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+        if (!isnull)
+        {
+            *dtxid = DatumGetInt64(d);
+            found = true;
+        }
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
+        if (!isnull)
+            *coord_gsid = DatumGetInt64(d);
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+        if (!isnull)
+        {
+            ArrayType *arr = DatumGetArrayTypeP(d);
+            Datum     *elems;
+            bool      *nulls;
+            int        n = 0;
+            int        i;
+
+            deconstruct_array(arr, INT8OID, 8, true, 'd', &elems, &nulls, &n);
+            for (i = 0; i < n && *ngsids < max_gsids; i++)
+                if (!nulls[i])
+                    gsids[(*ngsids)++] = DatumGetInt64(elems[i]);
+        }
+    }
+    pfree(sql.data);
+    return found;
+}
+
+/*
+ * partdist.dtx_recover_prepared(timeout_ms) → int
+ *
+ * 参与者侧的恢复守护（§7）：扫描本节点上**超时未闭合**的 prepared 事务，
+ * 向协调组问决议并据此 COMMIT/ROLLBACK PREPARED，同时在该分区的 parwal 流里
+ * 补写 DTX_COMMIT / DTX_ABORT 标记。返回本轮处理掉的事务数。
+ *
+ * 超时只影响"多久开始问"，不影响正确性：与正常路径（master 驱动的阶段 3）
+ * 并发执行也安全——COMMIT PREPARED 对同一 gid 只会成功一次，标记记录按
+ * dtxid 幂等。设保守一点是为了别和正常路径抢答。
+ *
+ * 问不到决议（协调者不可达/正在选举/元数据没追平）时**保持 prepared 不动**，
+ * 绝不擅自决定——推定中止的权力只在协调组手里（由它先写 ABORT 决议达多数派）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_recover_prepared);
+
+Datum
+pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
+{
+    int32          timeout_ms = PG_ARGISNULL(0) ? 30000 : PG_GETARG_INT32(0);
+    StringInfoData sql;
+    bool           spi_owned;
+    int            handled = 0;
+    int            ntodo = 0;
+    int            i;
+    char         **gids = NULL;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT32(0);
+    parse_peers();
+
+    /* 1) 取出待处理的 gid 列表（先取完再逐个处理：处理会改 pg_prepared_xacts） */
+    if (!raft_persist_spi_begin(&spi_owned))
+        PG_RETURN_INT32(0);
+    initStringInfo(&sql);
+    /*
+     * 用 strpos 而不是 LIKE：gid 前缀里含 '_'（LIKE 的单字符通配符），
+     * 而 '%' 又要在 appendStringInfo 里转义，两层转义极易写错 ——
+     * 初版写成 LIKE 'shardpg_dtx=%%' ESCAPE '='，转义后是字面量 "shardpg_dtx%"，
+     * **永远匹配不到任何 gid**，恢复守护静默空转。
+     */
+    appendStringInfo(&sql,
+                     "SELECT gid FROM pg_prepared_xacts "
+                     " WHERE (strpos(gid, 'shardpg_dtx_') = 1 OR strpos(gid, 'citus_') = 1) "
+                     "   AND prepared < now() - interval '%d milliseconds' "
+                     " ORDER BY prepared LIMIT 64",
+                     timeout_ms);
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        ntodo = (int) SPI_processed;
+        gids = (char **) palloc(sizeof(char *) * ntodo);
+        for (i = 0; i < ntodo; i++)
+            gids[i] = SPI_getvalue(SPI_tuptable->vals[i],
+                                   SPI_tuptable->tupdesc, 1);
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    /* 2) 逐个问决议并闭合 */
+    for (i = 0; i < ntodo; i++)
+    {
+        int64 dtxid = 0;
+        int64 coord_gsid = 0;
+        int64 mygsids[64];
+        int   nmygsids = 0;
+        int   verdict;
+        int   k;
+
+        /*
+         * 决议的寻址依据，按优先级：
+         *   a) partdist.dtx_participant（正常路径，Citus gid 走这里）——
+         *      coord_gsid 有值 ⇒ 协调组权威；为 NULL ⇒ 决议必然未做过，
+         *      按 Citus 原生规则闭合（快路径 / 无纳管分片的事务）；
+         *   b) gid 自带的 shardpg_dtx_<dtxid>_<coord>（机制测试用的自造 gid）。
+         */
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+        (void) dtx_lookup_participant(gids[i], &dtxid, &coord_gsid,
+                                      mygsids, lengthof(mygsids), &nmygsids);
+        raft_persist_spi_end(spi_owned);
+
+        /*
+         * ★ 协调组的来源有两个，**gid 里编的那个优先**（§5.4）：
+         * 登记行里 coord_gsid 为 NULL 只说明"master 没下发过"，
+         * 而 shardpg_dtx_<dtxid>_<coord> 这种 gid 本身就带着协调组。
+         * 初版写成"登记行查到了就不再看 gid"，于是自造 gid 的事务被当成
+         * 未走 2PC、按 Citus 规则去问 pg_dist_transaction（那里当然没有），
+         * 结果**该提交的事务被推定中止回滚**（raft_21 A 段抓到）。
+         * 真正的 Citus gid 解析不出协调组，coord_gsid 仍为 0，照旧走 Citus 规则。
+         */
+        if (coord_gsid <= 0)
+        {
+            int64 g_dtxid = 0;
+            int64 g_coord = 0;
+
+            if (dtx_parse_gid(gids[i], &g_dtxid, &g_coord))
+            {
+                if (dtxid == 0)
+                    dtxid = g_dtxid;
+                coord_gsid = g_coord;
+            }
+        }
+        /*
+         * ★ 登记缺失的 citus gid 也必须能闭合（2026-08-04 审查补上）。
+         * 走到这里的 gid 只可能是 citus_% / shardpg_dtx_%（扫描已过滤）。
+         * citus gid 查无登记的来源：该 prepared 事务产生时接线是关的
+         * （dtx_2pc_enabled=off），或历史版本的异步登记随崩溃丢失。
+         * 原实现在这里直接 continue —— 这类事务从此**没有任何人**收尾
+         * （Citus 自己的恢复已被 §9.4 关掉），prepared 事务连同行锁永久滞留。
+         * 处置：从 citus gid 解析出 dtxid（只为日志可读；verdict 本身按 gid
+         * 查 pg_dist_transaction，不需要 dtxid），按 Citus 规则闭合；
+         * 无登记 ⇒ 无 gsids ⇒ 不补标记。
+         */
+        if (dtxid == 0 && !dtx_dtxid_from_gid(gids[i], &dtxid))
+            continue;           /* 不认识的 gid：完全不碰 */
+
+        if (coord_gsid > 0)
+            verdict = dtx_ask_coordinator(coord_gsid, dtxid);
+        else
+            verdict = dtx_ask_citus_coordinator(gids[i]);
+
+        if (verdict != 1 && verdict != 2)
+            continue;           /* 问不到：保持 prepared，下轮再来 */
+
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+
+        /*
+         * 标记要补在**本节点自己写过的**分区组上，不是协调组上 ——
+         * 一个参与者通常并不承载协调组的分片。没有登记（legacy gid）时退回
+         * 协调组，保持旧行为。
+         */
+        if (nmygsids == 0 && coord_gsid > 0)
+            mygsids[nmygsids++] = coord_gsid;
+
+        /*
+         * ★ COMMIT/ROLLBACK PREPARED **不能经 SPI 执行**：它们不允许出现在
+         * 事务块里，而 SQL 函数体永远在调用方的事务里 —— SPI 跑必然报
+         * "COMMIT PREPARED cannot run inside a transaction block"。
+         * 只能像 TopologyMonitor 的 self-probe 那样，经 libpq 连回本节点，
+         * 让它作为**顶层语句**执行。
+         *
+         * 先闭合事务、再补标记记录。顺序无关正确性（决议已在协调组持久化，
+         * 是终局的），但闭合优先能尽快释放 prepared 事务持有的锁。
+         */
+        {
+            char      selfconn[256];
+            char      cmd[256];
+            PGconn   *sc;
+            PGresult *sres;
+
+            pg_raft_format_conninfo("127.0.0.1", PostPortNumber,
+                                    selfconn, sizeof(selfconn));
+            sc = PQconnectdb(selfconn);
+            if (PQstatus(sc) != CONNECTION_OK)
+            {
+                elog(WARNING, "pg_raft: dtx 恢复：连回本节点失败: %s",
+                     PQerrorMessage(sc));
+                PQfinish(sc);
+                raft_persist_spi_end(spi_owned);
+                continue;
+            }
+            snprintf(cmd, sizeof(cmd), "%s PREPARED '%s'",
+                     (verdict == 1) ? "COMMIT" : "ROLLBACK", gids[i]);
+            sres = PQexec(sc, cmd);
+            if (PQresultStatus(sres) == PGRES_COMMAND_OK)
+                handled++;
+            else
+                elog(WARNING, "pg_raft: dtx 恢复：%s 失败: %s",
+                     cmd, PQerrorMessage(sc));
+            PQclear(sres);
+            PQfinish(sc);
+        }
+
+        for (k = 0; k < nmygsids; k++)
+        {
+            int64 local_oid = 0;
+            bool  isnull;
+
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.local_partition_for_shard(%lld)",
+                             (long long) mygsids[k]);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                        SPI_tuptable->tupdesc, 1, &isnull);
+
+                if (!isnull)
+                    local_oid = DatumGetInt64(d);
+            }
+            pfree(sql.data);
+
+            if (local_oid <= 0)
+                continue;       /* 本节点不承载这个分片：没有 parwal 流可补 */
+
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.partwal_append_dtx_record("
+                             "%u::oid, %d, %lld::bigint, %lld::bigint)",
+                             (unsigned) local_oid,
+                             (verdict == 1) ? 3 : 4,   /* DTX_COMMIT / DTX_ABORT */
+                             (long long) dtxid, (long long) coord_gsid);
+            (void) SPI_execute(sql.data, false, 1);
+            pfree(sql.data);
+        }
+        raft_persist_spi_end(spi_owned);
+
+        elog(LOG, "pg_raft: dtx 恢复：gid=%s 决议=%s，已闭合",
+             gids[i], (verdict == 1) ? "COMMIT" : "ABORT");
+    }
+
+    /*
+     * 回执清扫（§9.7 acked）：本节点已闭合（prepared 已不在）但登记还在的行，
+     * 向协调组 leader 回执本节点写过的组；被接受后删除登记行。协调组 leader
+     * 收齐全部参与组的回执后写 FORGET 记录（dtx_ack 内触发），决议行随 apply
+     * 在**全体成员**上删除 —— 决议的 GC 由此闭环。coord 为 NULL 的行（快路径/
+     * 机制测试）没有决议、无回执可言，留给 dtx_gc_participant 按龄清理。
+     */
+    dtx_ack_sweep();
+
+    /*
+     * FORGET 重试清扫：acked 已收齐但 FORGET 尚未写成（当时失多数派等）的
+     * 决议行，由现任协调组 leader 补写。acked 是 leader 本地的 GC 提示，
+     * 选举转移会丢——那些行保守地留在表里（正确性不受影响），见 §9.7。
+     */
+    dtx_forget_sweep();
+
+    /*
+     * 顺手做参与登记的 GC（§9.7）：dtx_gc_participant 此前没有任何自动调用方
+     * ——prepare 失败留下的孤儿行、已闭合事务的行会无限累积（2026-08-04 审查
+     * 发现，与"恢复守护无人调用"同一类缺口）。它只删"已无对应 prepared 事务
+     * 且超龄（默认 1h）"的行，有 prepared 在就绝不删（那是恢复寻址的唯一线索），
+     * 安全幂等；失败就等下轮。
+     */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        (void) SPI_execute("SELECT partdist.dtx_gc_participant()", false, 1);
+        raft_persist_spi_end(spi_owned);
+    }
+
+    /*
+     * pg_dist_transaction 的 GC（§9.4 残留边界 → §9.7）：只在 Citus 协调节点、
+     * 每 6 轮（约 1 分钟）一次。Citus 的恢复本来兼任这张表的 GC，被 §9.4 关掉
+     * 后行只增不减；而它是 citus 规则的真相源，删错一行 = 把仍在等收尾的事务
+     * 错判成 ABORT，所以删除条件是"发起 backend 已死 && 所有节点都已无该 gid
+     * 的 prepared 事务"，任一节点不可达即整轮放弃。
+     */
+    if (pg_raft_coordinator_node_id > 0 &&
+        pg_raft_node_id == pg_raft_coordinator_node_id)
+    {
+        static int gc_tick = 0;
+
+        if (++gc_tick >= 6)
+        {
+            gc_tick = 0;
+            (void) dtx_gc_dist_transaction();
+        }
+    }
+
+    PG_RETURN_INT32(handled);
+}
+
+/* ================================================================== */
+/* DTX-2PC 决议 GC：回执（acked）与 FORGET（DTX_2PC_DESIGN.md §9.7）    */
+/* ================================================================== */
+
+/*
+ * 与 dtx_coord_ctx 同一套前置，但**任何不满足都静默返回 false**，不 ERROR。
+ * 清扫路径用：清扫是尽力而为的后台工作，一个组的异常不该杀掉整轮守护。
+ */
+static bool
+dtx_coord_ctx_soft(int64 coord_gsid, RaftGroupCtx *ctx, int64 *local_oid)
+{
+    int state;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return false;
+    if (!raft_group_ctx(coord_gsid, ctx))
+        return false;
+    if (!group_resolve_membership(ctx))
+        return false;
+
+    restore_hard_state_if_needed(ctx);
+    restore_persistent_log_if_needed(ctx);
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    state = ctx->cons->state;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (state != RAFT_LEADER)
+        return false;
+
+    *local_oid = group_local_partition(ctx);
+    return (*local_oid > 0);
+}
+
+/*
+ * 在协调组日志里追加一条 FORGET 记录并复制到多数派。
+ * 调用方必须已确认 leader 身份并持有复制认领位。
+ * 决议行的删除**不在这里做**——由每个成员（含 leader 自己）apply 该条目时
+ * 执行，删除因此走与写入相同的复制路径，全体成员同步回收。
+ */
+static void
+dtx_forget_append(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid)
+{
+    StringInfoData sql;
+    bool  spi_owned;
+    bool  isnull;
+    int64 plsn = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR, (errmsg("pg_raft: dtx FORGET 需要 SPI")));
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT partdist.partwal_append_dtx_record("
+                     "%u::oid, 5, %lld::bigint, %lld::bigint)",
+                     (unsigned) local_oid, (long long) dtxid,
+                     (long long) ctx->group_id);
+    if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        if (!isnull)
+            plsn = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (plsn <= 0)
+        ereport(ERROR,
+                (errmsg("pg_raft: 组 %lld 写 FORGET 记录失败（dtxid=%lld）",
+                        (long long) ctx->group_id, (long long) dtxid)));
+
+    replicate_group_upto(ctx, plsn, (Oid) local_oid);
+}
+
+/*
+ * partdist.dtx_ack(coord_gsid, dtxid, gsids[]) → bool
+ *
+ * 参与者回执（§9.7）：在协调组 leader 上把 gsids 并进该决议的 acked。
+ * 非 leader 返回 NULL（调用方按 partition_map 重新寻址）。
+ * 行不存在返回 true —— 已被 FORGET（或从未有决议），对回执方都算闭环。
+ * acked 收齐（⊇ participants 且非空）即写 FORGET 记录复制到多数派；
+ * FORGET 失败则 ERROR，acked 已记下（leader 本地），下轮清扫重试。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_ack);
+
+Datum
+pg_raft_dtx_ack(PG_FUNCTION_ARGS)
+{
+    int64        coord_gsid = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    ArrayType   *arr = PG_ARGISNULL(2) ? NULL : PG_GETARG_ARRAYTYPE_P(2);
+    RaftGroupCtx ctx;
+    int64        local_oid = 0;
+    char        *gsids_sql;
+    StringInfoData sql;
+    bool         spi_owned;
+    bool         row_exists = false;
+    bool         complete = false;
+
+    if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
+        PG_RETURN_NULL();
+
+    gsids_sql = dtx_participants_sql(arr);
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR, (errmsg("pg_raft: dtx_ack 需要 SPI")));
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "UPDATE partdist.dtx_decision SET acked = "
+                     " (SELECT coalesce(array_agg(DISTINCT t.x ORDER BY t.x), '{}'::bigint[]) "
+                     "    FROM unnest(acked || %s) AS t(x)) "
+                     " WHERE dtxid = %lld "
+                     " RETURNING acked @> participants AND participants <> '{}'::bigint[]",
+                     gsids_sql, (long long) dtxid);
+    if (SPI_execute(sql.data, false, 1) == SPI_OK_UPDATE_RETURNING &&
+        SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        row_exists = true;
+        if (!isnull)
+            complete = DatumGetBool(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    pfree(gsids_sql);
+
+    if (row_exists && complete)
+    {
+        replicate_claim(&ctx);
+        in_txn_replication = true;
+        PG_TRY();
+        {
+            dtx_forget_append(&ctx, local_oid, dtxid);
+        }
+        PG_FINALLY();
+        {
+            in_txn_replication = false;
+            replicate_release(&ctx);
+        }
+        PG_END_TRY();
+    }
+
+    PG_RETURN_BOOL(true);
+}
+
+/*
+ * 回执清扫（守护每轮调用）。逐行经 libpq 送达协调组 leader（对自己也走
+ * libpq——统一软失败语义，一行失败不影响其余），被接受后删登记行。
+ */
+static void
+dtx_ack_sweep(void)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int            n = 0;
+    int            i;
+    char         **gids = NULL;
+    long long     *dtxids = NULL;
+    long long     *coords = NULL;
+    char         **gsids_txt = NULL;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    initStringInfo(&sql);
+    appendStringInfoString(&sql,
+        "SELECT p.dtxid, p.gid, p.coord_gsid, p.gsids::text "
+        "  FROM partdist.dtx_participant p "
+        " WHERE p.coord_gsid IS NOT NULL "
+        "   AND p.noted_at < now() - interval '5 seconds' "
+        "   AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts x WHERE x.gid = p.gid) "
+        " LIMIT 16");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        n = (int) SPI_processed;
+        gids = (char **) palloc(sizeof(char *) * n);
+        dtxids = (long long *) palloc(sizeof(long long) * n);
+        coords = (long long *) palloc(sizeof(long long) * n);
+        gsids_txt = (char **) palloc(sizeof(char *) * n);
+        for (i = 0; i < n; i++)
+        {
+            char *v;
+
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            dtxids[i] = v ? atoll(v) : 0;
+            gids[i] = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+            coords[i] = v ? atoll(v) : 0;
+            gsids_txt[i] = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
+        }
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    for (i = 0; i < n; i++)
+    {
+        int       coord_node = 0;
+        int       slot = -1;
+        int       j;
+        char      conninfo[256];
+        StringInfoData qry;
+        PGconn   *conn;
+        PGresult *res;
+        bool      acked_ok = false;
+
+        if (dtxids[i] <= 0 || coords[i] <= 0 ||
+            gids[i] == NULL || gsids_txt[i] == NULL)
+            continue;
+
+        /* 协调组现任 leader */
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+        initStringInfo(&qry);
+        appendStringInfo(&qry,
+                         "SELECT primary_node FROM partdist.partition_map "
+                         " WHERE partition_id = %llu::oid",
+                         (unsigned long long) coords[i]);
+        if (SPI_execute(qry.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            bool  isnull;
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                    1, &isnull);
+
+            if (!isnull)
+                coord_node = DatumGetInt32(d);
+        }
+        pfree(qry.data);
+        raft_persist_spi_end(spi_owned);
+        if (coord_node <= 0)
+            continue;
+
+        if (coord_node == pg_raft_node_id)
+            pg_raft_format_conninfo("127.0.0.1", PostPortNumber,
+                                    conninfo, sizeof(conninfo));
+        else
+        {
+            for (j = 0; j < n_peers; j++)
+                if (peers[j].node_id == coord_node)
+                {
+                    slot = j;
+                    break;
+                }
+            if (slot < 0)
+                continue;
+            pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                                    conninfo, sizeof(conninfo));
+        }
+
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            PQfinish(conn);
+            continue;
+        }
+        initStringInfo(&qry);
+        appendStringInfo(&qry,
+                         "SELECT partdist.dtx_ack(%lld, %lld, '%s'::bigint[])",
+                         coords[i], dtxids[i], gsids_txt[i]);
+        res = PQexec(conn, qry.data);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+            !PQgetisnull(res, 0, 0) &&
+            strcmp(PQgetvalue(res, 0, 0), "t") == 0)
+            acked_ok = true;
+        PQclear(res);
+        PQfinish(conn);
+        pfree(qry.data);
+
+        if (!acked_ok)
+            continue;           /* 非 leader / 不可达：下轮再来 */
+
+        /* 回执已被 leader 记下（或已 FORGET）：登记行的使命结束 */
+        if (!raft_persist_spi_begin(&spi_owned))
+            break;
+        initStringInfo(&qry);
+        appendStringInfo(&qry,
+                         "DELETE FROM partdist.dtx_participant "
+                         " WHERE dtxid = %lld AND gid = %s",
+                         dtxids[i], quote_literal_cstr(gids[i]));
+        (void) SPI_execute(qry.data, false, 0);
+        pfree(qry.data);
+        raft_persist_spi_end(spi_owned);
+    }
+}
+
+/*
+ * FORGET 重试清扫：本地 dtx_decision 里 acked 已收齐但行还在的决议，
+ * 若本节点仍是该协调组的 leader 就补写 FORGET。
+ */
+static void
+dtx_forget_sweep(void)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int            n = 0;
+    int            i;
+    long long     *dtxids = NULL;
+    long long     *coords = NULL;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    initStringInfo(&sql);
+    appendStringInfoString(&sql,
+        "SELECT dtxid, coord_gsid FROM partdist.dtx_decision "
+        " WHERE participants <> '{}'::bigint[] AND acked @> participants "
+        " LIMIT 8");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        n = (int) SPI_processed;
+        dtxids = (long long *) palloc(sizeof(long long) * n);
+        coords = (long long *) palloc(sizeof(long long) * n);
+        for (i = 0; i < n; i++)
+        {
+            char *v;
+
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            dtxids[i] = v ? atoll(v) : 0;
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            coords[i] = v ? atoll(v) : 0;
+        }
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    for (i = 0; i < n; i++)
+    {
+        RaftGroupCtx ctx;
+        int64        local_oid = 0;
+
+        if (dtxids[i] <= 0 || coords[i] <= 0)
+            continue;
+        if (!dtx_coord_ctx_soft(coords[i], &ctx, &local_oid))
+            continue;           /* 不是这组的 leader：由现任 leader 负责 */
+
+        replicate_claim(&ctx);
+        in_txn_replication = true;
+        PG_TRY();
+        {
+            dtx_forget_append(&ctx, local_oid, dtxids[i]);
+        }
+        PG_FINALLY();
+        {
+            in_txn_replication = false;
+            replicate_release(&ctx);
+        }
+        PG_END_TRY();
+    }
+}
+
+/*
+ * pg_dist_transaction 的 GC（§9.7）。返回删除行数；-1 = 本轮放弃
+ * （有节点不可达，保守不删）。删除条件（缺一不可）：
+ *   1) 发起 backend 已死（gid 里编的 pid 不在本机 pg_stat_activity）——
+ *      活着说明 master 可能还没走完提交，行随时会被用到；
+ *   2) 每个 peer 节点都确认无该 gid 的 prepared 事务 —— 有 prepared 在，
+ *      这行就是它按 citus 规则收尾的真相源，删了会被错判成 ABORT。
+ */
+static int
+dtx_gc_dist_transaction(void)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int            n = 0;
+    int            i, j;
+    char         **gids = NULL;
+    bool          *keep = NULL;
+    int            deleted = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return -1;
+
+    /* 表不存在（非 Citus 库）直接返回 */
+    initStringInfo(&sql);
+    appendStringInfoString(&sql,
+        "SELECT to_regclass('pg_catalog.pg_dist_transaction') IS NOT NULL");
+    {
+        bool present = false;
+
+        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            bool  isnull;
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                    1, &isnull);
+
+            present = !isnull && DatumGetBool(d);
+        }
+        pfree(sql.data);
+        if (!present)
+        {
+            raft_persist_spi_end(spi_owned);
+            return 0;
+        }
+    }
+
+    /*
+     * 候选 = 发起 backend 已死的行。存活栅栏在同一条 SQL 里做（都在本机）：
+     * gid 第二段是发起 backend 的 pid。
+     */
+    initStringInfo(&sql);
+    appendStringInfoString(&sql,
+        "SELECT DISTINCT t.gid FROM pg_catalog.pg_dist_transaction t "
+        " WHERE (split_part(t.gid, '_', 3) ~ '^[0-9]+$') "
+        "   AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a "
+        "                    WHERE a.pid = split_part(t.gid, '_', 3)::int) "
+        " LIMIT 128");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        n = (int) SPI_processed;
+        gids = (char **) palloc(sizeof(char *) * n);
+        keep = (bool *) palloc0(sizeof(bool) * n);
+        for (i = 0; i < n; i++)
+            gids[i] = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (n == 0)
+        return 0;
+
+    /* 逐节点确认无 prepared；任一节点不可达 ⇒ 整轮放弃 */
+    parse_peers();
+    for (j = 0; j < n_peers; j++)
+    {
+        char      conninfo[256];
+        PGconn   *conn;
+        PGresult *res;
+        StringInfoData qry;
+        int       r;
+
+        pg_raft_format_conninfo(peers[j].host, peers[j].port,
+                                conninfo, sizeof(conninfo));
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            elog(DEBUG1, "pg_raft: dist_transaction GC：节点 %d 不可达，本轮放弃",
+                 peers[j].node_id);
+            PQfinish(conn);
+            return -1;
+        }
+
+        initStringInfo(&qry);
+        appendStringInfoString(&qry,
+            "SELECT gid FROM pg_prepared_xacts WHERE gid = ANY(ARRAY[");
+        for (i = 0; i < n; i++)
+        {
+            char *esc = PQescapeLiteral(conn, gids[i], strlen(gids[i]));
+
+            if (esc == NULL)
+                continue;
+            appendStringInfo(&qry, "%s%s", (i == 0) ? "" : ",", esc);
+            PQfreemem(esc);
+        }
+        appendStringInfoString(&qry, "]::text[])");
+
+        res = PQexec(conn, qry.data);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        {
+            PQclear(res);
+            PQfinish(conn);
+            pfree(qry.data);
+            return -1;
+        }
+        for (r = 0; r < PQntuples(res); r++)
+        {
+            const char *g = PQgetvalue(res, r, 0);
+
+            for (i = 0; i < n; i++)
+                if (strcmp(gids[i], g) == 0)
+                    keep[i] = true;
+        }
+        PQclear(res);
+        PQfinish(conn);
+        pfree(qry.data);
+    }
+
+    /* 删除全网确认已闭合的行 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return -1;
+    for (i = 0; i < n; i++)
+    {
+        if (keep[i] || gids[i] == NULL)
+            continue;
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
+                         quote_literal_cstr(gids[i]));
+        if (SPI_execute(sql.data, false, 0) == SPI_OK_DELETE)
+            deleted += (int) SPI_processed;
+        pfree(sql.data);
+    }
+    raft_persist_spi_end(spi_owned);
+
+    if (deleted > 0)
+        elog(LOG, "pg_raft: dist_transaction GC：清理 %d 行（全网确认已闭合）", deleted);
+    return deleted;
+}
+
+/* SQL 包装：测试与手工运维入口 */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_gc_dist_transaction);
+
+Datum
+pg_raft_dtx_gc_dist_transaction(PG_FUNCTION_ARGS)
+{
+    (void) fcinfo;
+    parse_peers();
+    PG_RETURN_INT32(dtx_gc_dist_transaction());
+}
+
+/* ================================================================== */
+/* DTX-2PC 升主 in-doubt 闭合（DTX_2PC_DESIGN.md §9.6，机制先行）        */
+/* ================================================================== */
+
+/*
+ * 全网找一笔事务的决议。返回 1=COMMIT 2=ABORT 0=找不到（保持 in-doubt）。
+ *
+ * 优先级（每一级都是"能给出终局答案才返回"）：
+ *   a) 本地登记里有 coord_gsid ⇒ 问协调组现任 leader（dtx_status，含推定
+ *      中止的权威——查无决议时它会先写 ABORT 达多数派再答复）；
+ *   b) 本地 dtx_decision（本节点是协调组成员时 apply 已建好索引）；
+ *   c) 广播全部 peer 的 dtx_decision —— 决议在协调组多数派上都有索引行，
+ *      任何一个成员可达即命中；
+ *   d) citus 形态的 dtxid：按前缀查 master 的 pg_dist_transaction（带发起者
+ *      存活栅栏）。**只有"行在 ⇒ COMMIT"是终局的**；行不在不能推出 ABORT
+ *      ——决议可能存在于此刻不可达的协调组里，而我们不知道协调组是谁、
+ *      也就无法把推定中止**写下来**（§2.2：先写 ABORT 决议再答复）。
+ *
+ * 找不到就返回 0，调用方保持 in-doubt。这与 §7 的守护同一条纪律：
+ * 拿不到权威答案绝不擅自决定。
+ */
+static int
+dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int            verdict = 0;
+    int            j;
+
+    /* a) 登记里的协调组：权威通道 */
+    if (reg_coord > 0)
+    {
+        verdict = dtx_ask_coordinator(reg_coord, dtxid);
+        if (verdict == 1 || verdict == 2)
+            return verdict;
+    }
+
+    /* b) 本地决议索引 */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                         (long long) dtxid);
+        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            bool  isnull;
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                    1, &isnull);
+
+            if (!isnull)
+                verdict = (int) DatumGetInt16(d);
+        }
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+        if (verdict == 1 || verdict == 2)
+            return verdict;
+    }
+
+    /* c) 广播 peer 的决议索引 */
+    for (j = 0; j < n_peers; j++)
+    {
+        char      conninfo[256];
+        char      qry[128];
+        PGconn   *conn;
+        PGresult *res;
+
+        if (peers[j].node_id == pg_raft_node_id)
+            continue;
+        pg_raft_format_conninfo(peers[j].host, peers[j].port,
+                                conninfo, sizeof(conninfo));
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            PQfinish(conn);
+            continue;
+        }
+        snprintf(qry, sizeof(qry),
+                 "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                 (long long) dtxid);
+        res = PQexec(conn, qry);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+            !PQgetisnull(res, 0, 0))
+            verdict = atoi(PQgetvalue(res, 0, 0));
+        PQclear(res);
+        PQfinish(conn);
+        if (verdict == 1 || verdict == 2)
+            return verdict;
+    }
+
+    /* d) citus 形态：按 gid 前缀问 master（只认 COMMIT） */
+    {
+        long long g_group = (long long) ((((uint64) dtxid) >> 55) & 0xFF);
+        long long g_pid = (long long) ((((uint64) dtxid) >> 33) & 0x3FFFFF);
+        long long g_txn = (long long) (((uint64) dtxid) & 0x1FFFFFFFFLL);
+
+        if (g_pid > 0 && g_txn > 0 && pg_raft_coordinator_node_id > 0)
+        {
+            int       slot = -1;
+            char      conninfo[256];
+            char      qry[256];
+            PGconn   *conn;
+            PGresult *res;
+
+            for (j = 0; j < n_peers; j++)
+                if (peers[j].node_id == pg_raft_coordinator_node_id)
+                {
+                    slot = j;
+                    break;
+                }
+            if (slot >= 0)
+            {
+                pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                                        conninfo, sizeof(conninfo));
+                conn = PQconnectdb(conninfo);
+                if (PQstatus(conn) == CONNECTION_OK)
+                {
+                    bool alive = true;
+
+                    /* 发起者存活栅栏（先查 pid 后查行，顺序敏感，§9.4） */
+                    snprintf(qry, sizeof(qry),
+                             "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld",
+                             g_pid);
+                    res = PQexec(conn, qry);
+                    if (PQresultStatus(res) == PGRES_TUPLES_OK &&
+                        PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
+                        alive = (atoi(PQgetvalue(res, 0, 0)) > 0);
+                    PQclear(res);
+
+                    if (!alive)
+                    {
+                        snprintf(qry, sizeof(qry),
+                                 "SELECT count(*) FROM pg_catalog.pg_dist_transaction "
+                                 " WHERE gid LIKE 'citus\\_%lld\\_%lld\\_%lld\\_%%'",
+                                 g_group, g_pid, g_txn);
+                        res = PQexec(conn, qry);
+                        if (PQresultStatus(res) == PGRES_TUPLES_OK &&
+                            PQntuples(res) == 1 && !PQgetisnull(res, 0, 0) &&
+                            atoi(PQgetvalue(res, 0, 0)) > 0)
+                            verdict = 1;
+                        PQclear(res);
+                    }
+                    PQfinish(conn);
+                }
+                else
+                    PQfinish(conn);
+            }
+        }
+    }
+
+    return verdict;
+}
+
+/*
+ * partdist.dtx_close_indoubt(partition_id) → int
+ *
+ * 对本节点该分区的 parwal 流做 §9.6 的 in-doubt 闭合：找出"有 DTX_PREPARE、
+ * 无 DECISION/COMMIT/ABORT"的 dtxid，全网求决议，找到就补写闭合标记。
+ * 返回本轮闭合的事务数；找不到决议的保持 in-doubt（NOTICE 报数），
+ * 调用方（升主序列/重试循环）下轮再来。
+ *
+ * 机制先行（§10.1）：函数本身不依赖惰性回放——它按**事务粒度**问决议补标记，
+ * 不做任何元组级可见性判定。升主序列落地时在追平之后、对外服务之前调它。
+ * 补写的标记本轮不主动复制（升主语境下本节点即将成为 leader，随后的
+ * propose/心跳会带出去）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_close_indoubt);
+
+Datum
+pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
+{
+    Oid            partition_id = PG_GETARG_OID(0);
+    StringInfoData sql;
+    bool           spi_owned;
+    int            n = 0;
+    int            i;
+    long long     *dtxids = NULL;
+    int            closed = 0;
+    int            unresolved = 0;
+
+    if (!pg_raft_raft_enabled)
+        PG_RETURN_INT32(0);
+    parse_peers();
+
+    /* 1) in-doubt 清单：PREPARE 可见、闭合（DECISION/COMMIT/ABORT）不可见 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        PG_RETURN_INT32(0);
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "WITH recs AS ("
+        "  SELECT d.kind, d.dtxid"
+        "    FROM generate_series(1, partdist.get_partition_flush_lsn(%u::oid)) g"
+        "    LEFT JOIN LATERAL partdist.partwal_read_dtx_record(%u::oid, g) d ON true"
+        "   WHERE d.dtxid IS NOT NULL) "
+        "SELECT dtxid FROM recs WHERE kind = 1 "
+        "EXCEPT "
+        "SELECT dtxid FROM recs WHERE kind IN (2, 3, 4) "
+        "LIMIT 64",
+        (unsigned) partition_id, (unsigned) partition_id);
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+
+        n = (int) SPI_processed;
+        dtxids = (long long *) palloc(sizeof(long long) * n);
+        for (i = 0; i < n; i++)
+        {
+            char *v = SPI_getvalue(SPI_tuptable->vals[i],
+                                   SPI_tuptable->tupdesc, 1);
+
+            dtxids[i] = v ? atoll(v) : 0;
+        }
+        MemoryContextSwitchTo(old);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    /* 2) 逐笔求决议、补标记 */
+    for (i = 0; i < n; i++)
+    {
+        long long reg_coord = 0;
+        int       verdict;
+
+        if (dtxids[i] <= 0)
+            continue;
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT coord_gsid FROM partdist.dtx_participant "
+                             " WHERE dtxid = %lld AND coord_gsid IS NOT NULL LIMIT 1",
+                             dtxids[i]);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                bool  isnull;
+                Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                        SPI_tuptable->tupdesc, 1, &isnull);
+
+                if (!isnull)
+                    reg_coord = (long long) DatumGetInt64(d);
+            }
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+        }
+
+        verdict = dtx_resolve_verdict_anywhere((int64) dtxids[i], (int64) reg_coord);
+        if (verdict != 1 && verdict != 2)
+        {
+            unresolved++;
+            continue;
+        }
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.partwal_append_dtx_record("
+                             "%u::oid, %d, %lld::bigint, %lld::bigint)",
+                             (unsigned) partition_id,
+                             (verdict == 1) ? 3 : 4,
+                             dtxids[i], reg_coord);
+            if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT)
+                closed++;
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+        }
+        elog(LOG, "pg_raft: in-doubt 闭合：分区 %u dtxid=%lld → %s",
+             partition_id, dtxids[i], (verdict == 1) ? "COMMIT" : "ABORT");
+    }
+
+    if (unresolved > 0)
+        ereport(NOTICE,
+                (errmsg("pg_raft: 分区 %u 仍有 %d 笔 in-doubt 事务找不到决议，保持不动",
+                        partition_id, unresolved)));
+
+    PG_RETURN_INT32(closed);
+}
+
+/* ================================================================== */
+/* DTX-2PC master 侧驱动（DTX_2PC_DESIGN.md §3.3 / §9.3）              */
+/* ================================================================== */
+
+/*
+ * 挂在内核补丁 0004 的 pre_record_commit_hook 上：Citus 已把
+ * PREPARE TRANSACTION 发给全部参与者并收齐应答，本地 commit record 尚未写入。
+ * 这里 ereport(ERROR) 仍然能把整个事务干净地翻进 abort 路径。
+ *
+ * 三步（顺序是正确性的一部分，不能调换）：
+ *   1) 逐参与节点读 partdist.dtx_local_participant(dtxid) 合并出**真实写集**
+ *      —— 只读参与者返回空数组，天然被剔除（§8.3）；
+ *   2) 写集 ≤ 1 组 ⇒ 快路径，不做决议直接返回（§3.4）；否则算
+ *      coord_gsid = participants[dtxid % n]，并**先**把它下发到全部参与节点；
+ *   3) 到协调组现任 leader 上调 partdist.dtx_decide() —— 该决议记录在协调组
+ *      达多数派持久化即为**全局提交点**，返回 COMMIT 之后本函数才放行，
+ *      客户端随后收到的 COMMIT 成功因此是有多数派保证的。
+ *
+ * 为什么第 2 步的下发必须严格早于第 3 步：参与者崩溃重启后只能靠
+ * partdist.dtx_participant.coord_gsid 找协调组。若先决议后下发，就会出现
+ * "全局已 COMMIT、参与者却查不到协调组"的不可解状态；反过来则永远安全 ——
+ * coord_gsid 为 NULL 蕴含决议尚未做过，推定中止（回滚）是正确答案。
+ */
+
+/* Citus gid → dtxid。**镜像**实现，权威在 pg-partdist-src/src/dtx/dtx_participant.c
+ * 的 DtxidFromGid()：两个扩展之间无编译期依赖，改一处必须同步改另一处。 */
+static bool
+dtx_dtxid_from_gid(const char *gid, int64 *dtxid)
+{
+    long long group = 0, pid = 0, txn = 0, conn = 0;
+    long long d = 0, c = 0;
+
+    if (gid == NULL)
+        return false;
+
+    if (sscanf(gid, "citus_%lld_%lld_%lld_%lld", &group, &pid, &txn, &conn) == 4)
+    {
+        if (pid <= 0 || txn <= 0)
+            return false;
+        *dtxid = ((int64) (group & 0xFF) << 55) |
+                 ((int64) (pid & 0x3FFFFF) << 33) |
+                 ((int64) (txn & 0x1FFFFFFFFLL));
+        return (*dtxid > 0);
+    }
+    if (sscanf(gid, "shardpg_dtx_%lld_%lld", &d, &c) == 2 && d > 0)
+    {
+        *dtxid = (int64) d;
+        return true;
+    }
+    return false;
+}
+
+/* ---- 每 backend 的 libpq 连接缓存（每事务重连太贵） ---- */
+#define DTX_CONN_CACHE_MAX 16
+
+typedef struct DtxConnCacheEntry
+{
+    char    host[NAMEDATALEN];
+    int     port;
+    PGconn *conn;
+} DtxConnCacheEntry;
+
+static DtxConnCacheEntry dtx_conns[DTX_CONN_CACHE_MAX];
+static int               dtx_nconns = 0;
+
+static PGconn *
+dtx_get_conn(const char *host, int port)
+{
+    char conninfo[256];
+    int  i;
+    int  slot = -1;
+
+    for (i = 0; i < dtx_nconns; i++)
+        if (dtx_conns[i].port == port && strcmp(dtx_conns[i].host, host) == 0)
+        {
+            slot = i;
+            break;
+        }
+
+    if (slot >= 0)
+    {
+        if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
+            return dtx_conns[slot].conn;
+        PQreset(dtx_conns[slot].conn);
+        if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
+            return dtx_conns[slot].conn;
+        PQfinish(dtx_conns[slot].conn);
+        dtx_conns[slot].conn = NULL;
+    }
+
+    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+
+    if (slot < 0)
+    {
+        if (dtx_nconns >= DTX_CONN_CACHE_MAX)
+        {
+            /* 缓存满：牺牲第 0 槽（拓扑规模远小于 16，实际到不了这里） */
+            PQfinish(dtx_conns[0].conn);
+            slot = 0;
+        }
+        else
+            slot = dtx_nconns++;
+        strlcpy(dtx_conns[slot].host, host, NAMEDATALEN);
+        dtx_conns[slot].port = port;
+    }
+
+    dtx_conns[slot].conn = PQconnectdb(conninfo);
+    if (PQstatus(dtx_conns[slot].conn) != CONNECTION_OK)
+    {
+        char *msg = pstrdup(PQerrorMessage(dtx_conns[slot].conn));
+
+        PQfinish(dtx_conns[slot].conn);
+        dtx_conns[slot].conn = NULL;
+        if (slot == dtx_nconns - 1)
+            dtx_nconns--;
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_FAILURE),
+                 errmsg("pg_raft: DTX 驱动连不上参与节点 %s:%d", host, port),
+                 errdetail("%s", msg)));
+    }
+    return dtx_conns[slot].conn;
+}
+
+/* 把 int8[] 的文本形式 "{1,2,3}" / "{}" 解析进 out，返回元素个数 */
+static int
+dtx_parse_int8_array(const char *text, int64 *out, int max)
+{
+    const char *p = text;
+    int         n = 0;
+
+    if (p == NULL)
+        return 0;
+    while (*p != '\0' && *p != '{')
+        p++;
+    if (*p == '{')
+        p++;
+    while (*p != '\0' && *p != '}' && n < max)
+    {
+        char *end = NULL;
+        long long v;
+
+        while (*p == ',' || *p == ' ')
+            p++;
+        if (*p == '\0' || *p == '}')
+            break;
+        v = strtoll(p, &end, 10);
+        if (end == p)
+            break;
+        out[n++] = (int64) v;
+        p = end;
+    }
+    return n;
+}
+
+static int
+dtx_cmp_int64(const void *a, const void *b)
+{
+    int64 x = *(const int64 *) a;
+    int64 y = *(const int64 *) b;
+
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+/* 在远端节点上执行一条返回单值的 SQL；返回值需 pfree，NULL 表示 SQL NULL */
+static char *
+dtx_remote_scalar(const char *host, int port, const char *sql)
+{
+    PGconn   *conn = dtx_get_conn(host, port);
+    PGresult *res = PQexec(conn, sql);
+    char     *out = NULL;
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        char *msg = pstrdup(PQerrorMessage(conn));
+
+        PQclear(res);
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_EXCEPTION),
+                 errmsg("pg_raft: DTX 驱动在 %s:%d 上执行失败", host, port),
+                 errdetail("%s", msg),
+                 errhint("SQL: %s", sql)));
+    }
+    if (PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
+        out = pstrdup(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    return out;
+}
+
+#define DTX_MAX_PARTICIPANT_NODES  RAFT_MAX_PEERS
+#define DTX_MAX_PARTICIPANT_GROUPS 512
+
+/*
+ * 本库是否装了 Citus 的两张目录表。必须在 SPI 已连接、快照已压好的状态下调用。
+ *
+ * 缓存策略：只缓存"有"。缓存"没有"会让同一 session 里后建的 citus 扩展
+ * 永远看不见；而"有"之后再消失只可能是 DROP EXTENSION citus，那种情况下
+ * 本节点也早就不是 Citus 协调者了。
+ */
+static bool dtx_citus_present = false;
+
+static bool
+dtx_citus_catalog_present(void)
+{
+    bool isnull;
+
+    if (dtx_citus_present)
+        return true;
+
+    if (SPI_execute("SELECT to_regclass('pg_catalog.pg_dist_transaction') IS NOT NULL "
+                    "   AND to_regclass('pg_catalog.pg_dist_node') IS NOT NULL",
+                    true, 1) != SPI_OK_SELECT || SPI_processed == 0)
+        return false;
+
+    dtx_citus_present = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                   SPI_tuptable->tupdesc, 1, &isnull))
+                        && !isnull;
+    return dtx_citus_present;
+}
+
+typedef struct DtxNodeAddr
+{
+    char host[NAMEDATALEN];
+    int  port;
+} DtxNodeAddr;
+
+static void
+dtx_master_pre_record_commit(void)
+{
+    StringInfoData  sql;
+    bool            spi_owned;
+    int64           dtxid = 0;
+    DtxNodeAddr     nodes[DTX_MAX_PARTICIPANT_NODES];
+    int             nnodes = 0;
+    int64           parts[DTX_MAX_PARTICIPANT_GROUPS];
+    int             nparts = 0;
+    int64           coord_gsid;
+    int             coord_node = 0;
+    int             i, j;
+    int             verdict = 0;
+
+    if (!pg_raft_raft_enabled || !pg_raft_dtx_2pc_enabled)
+        return;
+    /*
+     * 只有 Citus 协调节点会驱动 2PC。这条判据同时是本 hook 的**性能闸门**：
+     * worker 上的每一次本地提交都会进来，必须在做任何 SQL 之前退出。
+     */
+    if (pg_raft_coordinator_node_id <= 0 ||
+        pg_raft_node_id != pg_raft_coordinator_node_id)
+        return;
+    if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
+        return;
+
+    /* ---- 1) 本事务刚写进 pg_dist_transaction 的行 = 已 prepare 的参与节点 ---- */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+
+    /*
+     * ★ 本库不一定装了 Citus。pg_raft/pg_partdist 在
+     * shared_preload_libraries 里，因此**每个库**的每次提交都会进这个 hook ——
+     * 包括一个全新的、连 citus 扩展都还没建的库。直接引用
+     * pg_catalog.pg_dist_transaction 会在解析期就报 relation does not exist，
+     * 于是连 `CREATE EXTENSION pg_partdist` 本身都提交不了
+     * （2026-08-04：正是 raft_19 A 段的全新库冒烟抓到的 —— 常规回归全都跑在
+     * 已装 Citus 的库上，完全静默）。
+     */
+    if (!dtx_citus_catalog_present())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfoString(
+        &sql,
+        "SELECT t.gid, n.nodename, n.nodeport "
+        "  FROM pg_catalog.pg_dist_transaction t "
+        "  JOIN pg_catalog.pg_dist_node n "
+        "    ON n.groupid = t.groupid AND n.noderole = 'primary' "
+        " WHERE t.xmin = pg_catalog.pg_current_xact_id()::xid");
+
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        for (i = 0; i < (int) SPI_processed; i++)
+        {
+            char *gid = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            char *host = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            char *portstr = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+            int   port = (portstr != NULL) ? atoi(portstr) : 0;
+            bool  dup = false;
+
+            if (dtxid == 0 && !dtx_dtxid_from_gid(gid, &dtxid))
+                continue;           /* 不是我们认识的 gid 形态 */
+            if (host == NULL || port <= 0)
+                continue;
+
+            for (j = 0; j < nnodes; j++)
+                if (nodes[j].port == port && strcmp(nodes[j].host, host) == 0)
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup && nnodes < DTX_MAX_PARTICIPANT_NODES)
+            {
+                strlcpy(nodes[nnodes].host, host, NAMEDATALEN);
+                nodes[nnodes].port = port;
+                nnodes++;
+            }
+        }
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (dtxid == 0 || nnodes == 0)
+        return;                     /* 不是跨节点的 Citus 2PC 事务 */
+
+    /* ---- 2) 逐节点取真实写集（只读参与者返回空数组，自动剔除） ---- */
+    for (i = 0; i < nnodes; i++)
+    {
+        char   qry[128];
+        char  *arr;
+        int64  got[DTX_MAX_PARTICIPANT_GROUPS];
+        int    ngot;
+
+        snprintf(qry, sizeof(qry),
+                 "SELECT partdist.dtx_local_participant(%lld)", (long long) dtxid);
+        arr = dtx_remote_scalar(nodes[i].host, nodes[i].port, qry);
+        if (arr == NULL)
+            continue;
+        ngot = dtx_parse_int8_array(arr, got, DTX_MAX_PARTICIPANT_GROUPS);
+        pfree(arr);
+
+        for (j = 0; j < ngot && nparts < DTX_MAX_PARTICIPANT_GROUPS; j++)
+        {
+            int  k;
+            bool dup = false;
+
+            for (k = 0; k < nparts; k++)
+                if (parts[k] == got[j])
+                {
+                    dup = true;
+                    break;
+                }
+            if (!dup)
+                parts[nparts++] = got[j];
+        }
+    }
+
+    /*
+     * 快路径（§3.4）：写集 ≤ 1 个分区组时不做决议。
+     * 0 组 = 没写任何纳管分片（退化为接线前行为）；
+     * 1 组 = 该组自己的 quorum 已经覆盖本事务的全部数据，再走一轮决议没有
+     * 任何额外保证，只有额外延迟。
+     */
+    if (nparts <= 1)
+        return;
+
+    qsort(parts, nparts, sizeof(int64), dtx_cmp_int64);
+    coord_gsid = parts[(uint64) dtxid % (uint64) nparts];
+
+    /* ---- 3) 先下发协调组（必须严格早于决议，理由见函数头注释） ---- */
+    for (i = 0; i < nnodes; i++)
+    {
+        char  qry[160];
+        char *r;
+
+        snprintf(qry, sizeof(qry),
+                 "SELECT partdist.dtx_note_coord(%lld, %lld)",
+                 (long long) dtxid, (long long) coord_gsid);
+        r = dtx_remote_scalar(nodes[i].host, nodes[i].port, qry);
+        if (r != NULL)
+            pfree(r);
+    }
+
+    /* ---- 4) 到协调组现任 leader 上做决议 ---- */
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR,
+                (errmsg("pg_raft: DTX 决议无法建立 SPI 连接")));
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT primary_node FROM partdist.partition_map "
+                     " WHERE partition_id = %llu::oid",
+                     (unsigned long long) coord_gsid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        if (!isnull)
+            coord_node = DatumGetInt32(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+
+    if (coord_node <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分布式事务 %lld 的协调组 %lld 查不到现任 leader",
+                        (long long) dtxid, (long long) coord_gsid),
+                 errdetail("partdist.partition_map 尚未追平该组的主节点登记。")));
+
+    parse_peers();
+    {
+        int   slot = -1;
+        char  qry[512];
+        char *r;
+        int   n;
+
+        for (i = 0; i < n_peers; i++)
+            if (peers[i].node_id == coord_node)
+            {
+                slot = i;
+                break;
+            }
+        if (slot < 0)
+            ereport(ERROR,
+                    (errmsg("pg_raft: 协调组 %lld 的 leader 节点 %d 不在 pg_raft.peers 里",
+                            (long long) coord_gsid, coord_node)));
+
+        n = snprintf(qry, sizeof(qry),
+                     "SELECT partdist.dtx_decide(%lld, %lld, 1, ARRAY[",
+                     (long long) coord_gsid, (long long) dtxid);
+        for (i = 0; i < nparts && n < (int) sizeof(qry) - 32; i++)
+            n += snprintf(qry + n, sizeof(qry) - n, "%s%lld",
+                          (i == 0) ? "" : ",", (long long) parts[i]);
+        snprintf(qry + n, sizeof(qry) - n, "]::bigint[])");
+
+        r = dtx_remote_scalar(peers[slot].host, peers[slot].port, qry);
+        if (r == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 节点 %d 不是协调组 %lld 的 leader，无法做决议",
+                            coord_node, (long long) coord_gsid),
+                     errhint("协调组正在选举或 partition_map 未追平；重试本事务即可。")));
+        verdict = atoi(r);
+        pfree(r);
+    }
+
+    if (verdict != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                 errmsg("pg_raft: 分布式事务 %lld 的全局决议是 ABORT", (long long) dtxid),
+                 errdetail("协调组 %lld 的日志里已有一条 ABORT 决议（多半是恢复守护"
+                           "在推定中止时抢先写入）。决议槽一次性，不可翻盘。",
+                           (long long) coord_gsid)));
+
+    elog(DEBUG1, "pg_raft: dtx %lld COMMIT（协调组 %lld，参与组 %d 个）",
+         (long long) dtxid, (long long) coord_gsid, nparts);
+}
+
+/*
+ * 参与者自治登记的落地实现（pg_partdist 经 rendezvous variable
+ * "partdist_dtx_note_participant_hook" 调用）。
+ *
+ * 必须写在**独立事务**里：调用点在 XACT_EVENT_PRE_PREPARE，本事务下一步就要
+ * 变成 prepared，写在里面就永远不会有别的会话看得见。独立事务在 PG 里只能靠
+ * libpq 自连接完成（与恢复守护跑 COMMIT PREPARED 同一手法）。
+ *
+ * ★ 登记必须**同步提交**（2026-08-04 审查改正）。初版用了
+ * synchronous_commit=off，理由是"崩溃会让 prepared 事务连同登记一起消失"——
+ * 这个理由**不成立**：登记发生在 [B]（PREPARE TRANSACTION 的 WAL fsync）
+ * **之前**，节点在 [B] 之后崩溃时 prepared 事务是持久的，而异步提交的登记行
+ * 可能没落盘。后果有两层：a) master 收齐 ack 后来读写集，本节点答空 ⇒
+ * 写集缺一块，协调组选取与 participants[] 都按错的集合算；b) 本节点重启后
+ * 这笔 prepared 事务查无登记 ⇒ 拿不到 coord_gsid，只能退回 Citus 规则，
+ * 而它的数据其实归协调组决议管辖。同步提交的持久序恰好压住 [B]：
+ * 登记落盘 < [B] < ack ⇒ "prepared 存在 ⇒ 登记必在"。一次小事务的 fsync
+ * 换写集完整性，值得。
+ */
+bool
+pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
+                             const int64 *gsids, int ngsids)
+{
+    StringInfoData sql;
+    PGconn        *conn;
+    PGresult      *res;
+    bool           ok = false;
+    int            i;
+    char           selfconn[256];
+
+    if (gid == NULL)
+        return true;
+
+    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
+    conn = PQconnectdb(selfconn);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        elog(WARNING, "pg_raft: DTX 参与登记连回本节点失败: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    initStringInfo(&sql);
+    appendStringInfoString(&sql, "SELECT partdist.dtx_note_participant(");
+    appendStringInfo(&sql, "%lld, ", (long long) dtxid);
+    {
+        char *q = PQescapeLiteral(conn, gid, strlen(gid));
+
+        if (q == NULL)
+        {
+            pfree(sql.data);
+            PQfinish(conn);
+            return false;
+        }
+        appendStringInfoString(&sql, q);
+        PQfreemem(q);
+    }
+    appendStringInfoString(&sql, ", ARRAY[");
+    for (i = 0; i < ngsids; i++)
+        appendStringInfo(&sql, "%s%lld", (i == 0) ? "" : ",", (long long) gsids[i]);
+    appendStringInfoString(&sql, "]::bigint[])");
+
+    res = PQexec(conn, sql.data);
+    ok = (PQresultStatus(res) == PGRES_TUPLES_OK ||
+          PQresultStatus(res) == PGRES_COMMAND_OK);
+    if (!ok)
+        elog(WARNING, "pg_raft: DTX 参与登记失败: %s", PQerrorMessage(conn));
+    PQclear(res);
+    pfree(sql.data);
+    PQfinish(conn);
+    return ok;
+}
+
+/* _PG_init 调用：装内核补丁 0004 的挂点 + 参与登记挂点 */
+void
+pg_raft_dtx_install_hooks(void)
+{
+    void **rv;
+
+    pre_record_commit_hook = dtx_master_pre_record_commit;
+
+    rv = find_rendezvous_variable("partdist_dtx_note_participant_hook");
+    *rv = (void *) pg_raft_dtx_note_participant;
 }

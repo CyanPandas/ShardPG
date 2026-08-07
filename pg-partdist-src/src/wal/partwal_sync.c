@@ -145,7 +145,8 @@ FreePartWALPendingContent(void)
 }
 
 /*
- * 本事务（本 backend）碰过的分区集合 —— MARKER 与复制挂钩的唯一依据。
+ * 本事务（本 backend）碰过的分区集合 —— MARKER、复制挂钩与 DTX 接线的
+ * 唯一依据（DTX_2PC_DESIGN.md §9.1）。
  *
  * 为什么不像原来那样从 PartWALCtl->slots 里推导：group commit 下 peer backend
  * 可能已经把本事务的槽位消费掉了，此时本 backend 的 PartWALFlush 会在
@@ -160,6 +161,13 @@ static Oid *partwal_my_touched  = NULL;
 static int  partwal_my_ntouched = 0;
 static int  partwal_my_touched_cap = 0;
 
+/*
+ * PartWALNoteTouched — 登记"本事务写过分区 partition_id"。
+ *
+ * 必须在**释放 PartWALCtl->lock 之后**调用：这里会 palloc，而 palloc 在
+ * LWLock 下不安全（与本文件捕获 WAL 字节的做法同理）。
+ * 集合通常只有 1~2 个元素（一个事务很少跨很多分片），线性去重足够。
+ */
 static void
 PartWALNoteTouched(Oid partition_id)
 {
@@ -183,6 +191,38 @@ PartWALNoteTouched(Oid partition_id)
     }
 
     partwal_my_touched[partwal_my_ntouched++] = partition_id;
+}
+
+/*
+ * 对外的触达集合读写接口（DTX 接线用，声明见 partwal_sync.h）。
+ *
+ * PartWALCopyTouched 必须在 PartWALFlush() **之前**调用：flush 末尾的
+ * PartWALReplicateTouched() 会把集合清空。
+ */
+int
+PartWALTouchedCount(void)
+{
+    return partwal_my_ntouched;
+}
+
+int
+PartWALCopyTouched(Oid *out, int max)
+{
+    int n = partwal_my_ntouched;
+
+    if (out != NULL && max > 0)
+    {
+        int copy = (n < max) ? n : max;
+
+        memcpy(out, partwal_my_touched, copy * sizeof(Oid));
+    }
+    return n;
+}
+
+void
+PartWALNoteTouchedPartition(Oid partition_id)
+{
+    PartWALNoteTouched(partition_id);
 }
 
 /* ================================================================== */
@@ -363,6 +403,10 @@ PartWALInsert(XLogRecPtr end_lsn,
                             "overwriting unconsumed entry",
                             PartWALCtl->write_pos)));
 
+        /*
+         * 记下分区号供出锁后登记触达集合 —— entry 指向共享哈希表，
+         * 释放锁之后不得再解引用。
+         */
         match_partition    = entry->partition_id;
         slot->partition_id = match_partition;
         slot->relfilenode  = match_rfn;
@@ -395,7 +439,7 @@ PartWALInsert(XLogRecPtr end_lsn,
      * 且 palloc 不能在 LWLock 下做 —— 所以 partition_id 在锁内先取到局部变量，
      * 不能出锁后再解 entry（shmem 哈希项出锁即不保证有效）。
      */
-    if (wrote_slot)
+    if (wrote_slot && OidIsValid(match_partition))
         PartWALNoteTouched(match_partition);
 
     /*
@@ -536,6 +580,27 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
     XLogRecord *record;
     char       *errormsg = NULL;
     char       *buf;
+    MemoryContext oldctx;
+
+    /*
+     * ★ reader 与其全部内部缓冲必须活在 TopMemoryContext（2026-08-03 修）。
+     *
+     * 本函数只在 PRE_COMMIT 的 PartWALFlush 里被调用（group-commit 场景为
+     * peer backend 的槽位回读字节），彼时 CurrentMemoryContext 是**事务级**
+     * 上下文。此前 XLogReaderAllocate 未切换 context：static 指针跨事务存活，
+     * 而 reader 结构与内部缓冲（readBuf/readRecordBuf/errormsg_buf）随事务
+     * 结束被释放 —— 第二次进来就是 use-after-free，写穿的是**下一个事务**
+     * 复用同一块内存后放进去的 palloc chunk。症状：并发写入下 backend 报
+     * `pfree called with invalid pointer 0x...`（每次同一地址：fork 出的
+     * backend 分配序列相同）或直接 SIGSEGV，节点整体进 crash recovery。
+     * 串行负载永远走不到这条回读路径，所以此前从未暴露。
+     *
+     * 同理，XLogReadRecord 期间的**懒分配**（decode_buffer 首次读取时创建、
+     * readRecordBuf 遇长记录扩容）也发生在"调用时"的 context 里，所以整个
+     * 读取过程都必须在 TopMemoryContext 下执行，不能只包 Allocate。
+     * ERROR 逃逸时 context 由事务中止路径统一恢复，无需 PG_TRY。
+     */
+    oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
     if (raw_reader == NULL)
     {
@@ -545,11 +610,15 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
                                                    .segment_close = PartWALCloseSegment),
                                         NULL);
         if (raw_reader == NULL)
+        {
+            MemoryContextSwitchTo(oldctx);
             return false;
+        }
     }
 
     XLogBeginRead(raw_reader, start_lsn);
     record = XLogReadRecord(raw_reader, &errormsg);
+    MemoryContextSwitchTo(oldctx);
     if (record == NULL)
     {
         ereport(WARNING,
@@ -842,8 +911,17 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
     if (upto_lsn == InvalidXLogRecPtr)
     {
         partwal_my_max_lsn = InvalidXLogRecPtr;
-        partwal_my_ntouched = 0;
-        return;  /* no inserts from this backend */
+
+        /*
+         * 本 backend 没有经 WAL 插入挂钩产生过待落盘记录，但触达集合仍可能
+         * 非空 —— DTX 接线会在第一次 flush 之后**直接**往段文件追加
+         * DTX_PREPARE 标记并重新登记触达分区，正是靠这条路径把标记复制出去。
+         * 复制挂钩取的是"当前 flush 点"，直接追加的记录已经在盘上，覆盖成立；
+         * 挂钩是区间式的，空集合 / 无新字节时等价于 no-op。集合本身不在这里
+         * 清（归 PartWALEndTxn / PartWALAbort），与 D1 纯结构变更路径同规则。
+         */
+        PartWALReplicateTouched();
+        return;
     }
 
     /*
@@ -1264,7 +1342,15 @@ PartWALReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr,
         return -1;
 
     count = read(state->seg.ws_file, readBuf, XLOG_BLCKSZ);
-    return (count < 0) ? -1 : (int) count;
+
+    /*
+     * 短读按失败处理（page_read 回调的契约是"至少 reqLen 字节"）。
+     * 此前 count < reqLen 也当成功返回，readBuf 尾部是未初始化内存 ——
+     * AssembleRawWALRecord 有 CRC 兜底，但 XLogReadRecord 路径会拿它当
+     * 页头解析。wal_init_zero=on 时段文件预分配为整段，正常读不满页的
+     * 只有文件被并发回收/截断的窗口，此时就该失败重来。
+     */
+    return (count < reqLen) ? -1 : (int) count;
 }
 
 static void

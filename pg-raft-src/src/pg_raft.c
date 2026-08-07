@@ -1082,6 +1082,54 @@ _PG_init(void)
         *rv = (void *) pg_raft_partwal_replicate;
     }
 
+    DefineCustomBoolVariable("pg_raft.dtx_2pc_enabled",
+                             "启用跨分区事务的 DTX-2PC：master 侧决议驱动 + 参与者自治登记。",
+                             "关闭后跨分区事务退回 Citus 原生 2PC（提交点在 master 本地），"
+                             "跨分区原子性不再有多数派保证。",
+                             &pg_raft_dtx_2pc_enabled, true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.catchup_interval_ms",
+                            "后台追平通道的运行间隔（0=关闭）。",
+                            "本节点为 leader 的每个组，把落后成员按 nextIndex 逐条补齐。"
+                            "TopologyMonitor 经 libpq 自连接调 partdist.pg_raft_catchup()，"
+                            "因而跑在 client backend 里（BGW 无 SPI，取不到 parwal 字节，"
+                            "也回读不了环外条目）。关闭后落后副本只能等下一次业务写入顺带补齐。",
+                            &pg_raft_catchup_interval_ms, 5000, 0, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.compact_threshold",
+                            "控制面日志压缩阈值：已 apply 的条目超过该数量即压缩（0=关）。",
+                            "压缩会把 partdist.raft_log 里 last_applied 之前的行删掉，"
+                            "并把基点记进 hardstate；被删掉的那一段之后只能靠 "
+                            "partdist.pg_raft_install_snapshot() 传给落后成员。"
+                            "只作用于控制面（组 0）——数据组的状态机在物理回放之前就是 "
+                            "parwal 字节流本身，压缩它的正解是日志外部化。",
+                            &pg_raft_compact_threshold, 500, 0, 1000000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.dtx_recover_interval_ms",
+                            "DTX-2PC 参与者恢复守护的自动运行间隔（0=关闭自动运行）。",
+                            "每个节点的 TopologyMonitor 按该间隔经 libpq 自连接调"
+                            " partdist.dtx_recover_prepared()，收尾超时未闭合的 in-doubt 事务。",
+                            &pg_raft_dtx_recover_interval_ms, 10000, 0, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.dtx_recover_timeout_ms",
+                            "prepared 事务超过该年龄才会被恢复守护处理。",
+                            "只影响\"多久开始问\"，不影响正确性；设保守以免与正常路径的"
+                            "阶段 3 抢答（DTX_2PC_DESIGN.md §7）。",
+                            &pg_raft_dtx_recover_timeout_ms, 30000, 1000, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    /*
+     * DTX-2PC 接线（DTX_2PC_DESIGN.md §9.3）：
+     *   pre_record_commit_hook   —— 内核补丁 0004 开的挂点，master 侧做决议；
+     *   partdist_dtx_note_participant_hook —— pg_partdist 在 prepare 时调，
+     *   经 libpq 独立事务把本节点写集登记出去（libpq 由 pg_raft 持有）。
+     */
+    pg_raft_dtx_install_hooks();
+
     register_topology_worker();
 }
 
