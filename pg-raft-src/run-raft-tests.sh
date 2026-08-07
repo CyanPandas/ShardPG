@@ -1401,58 +1401,6 @@ else
 fi
 
 # ------------------------------------------------------------------
-# raft_26: 数据组日志外部化 E1（计划文档 §11.10）
-# 用例本体在 test/raft_26_log_runs_externalize.sh（自带夹具与清理，可独立跑）。
-# ------------------------------------------------------------------
-section "raft_26 数据组日志外部化 E1"
-
-start_all_nodes
-sleep 2
-RAFT_26_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" \
-                bash "${SCRIPT_DIR}/test/raft_26_log_runs_externalize.sh" 2>&1) && RAFT_26_RC=0 || RAFT_26_RC=$?
-echo "$RAFT_26_OUT" | sed 's/^/    /'
-if [[ "$RAFT_26_RC" -eq 0 ]]; then
-  ok "raft_26_log_runs_externalize"
-else
-  bad "raft_26_log_runs_externalize($(echo "$RAFT_26_OUT" | tail -1))"
-fi
-
-# ------------------------------------------------------------------
-# raft_27: 数据组日志外部化 E2（计划文档 §11.10）
-# 用例本体在 test/raft_27_data_catchup_from_parwal.sh（自带夹具与清理，可独立跑）。
-# 用时较长：要提案 140 条（> 环容量 128）才谈得上"只能靠重建"。
-# ------------------------------------------------------------------
-section "raft_27 数据组环外条目从 parwal 重建"
-
-start_all_nodes
-sleep 2
-RAFT_27_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" \
-                bash "${SCRIPT_DIR}/test/raft_27_data_catchup_from_parwal.sh" 2>&1) && RAFT_27_RC=0 || RAFT_27_RC=$?
-echo "$RAFT_27_OUT" | sed 's/^/    /'
-if [[ "$RAFT_27_RC" -eq 0 ]]; then
-  ok "raft_27_data_catchup_from_parwal"
-else
-  bad "raft_27_data_catchup_from_parwal($(echo "$RAFT_27_OUT" | tail -1))"
-fi
-
-# ------------------------------------------------------------------
-# raft_28: 数据组日志外部化 E3（计划文档 §11.10）
-# 用例本体在 test/raft_28_data_log_no_sql_rows.sh（自带夹具与清理，可独立跑）。
-# ------------------------------------------------------------------
-section "raft_28 数据组写路径去 raft_log"
-
-start_all_nodes
-sleep 2
-RAFT_28_OUT=$(CONTAINER="$CONTAINER" BASE_PORT="$BASE_PORT" N_WORKERS="$N_WORKERS" \
-                bash "${SCRIPT_DIR}/test/raft_28_data_log_no_sql_rows.sh" 2>&1) && RAFT_28_RC=0 || RAFT_28_RC=$?
-echo "$RAFT_28_OUT" | sed 's/^/    /'
-if [[ "$RAFT_28_RC" -eq 0 ]]; then
-  ok "raft_28_data_log_no_sql_rows"
-else
-  bad "raft_28_data_log_no_sql_rows($(echo "$RAFT_28_OUT" | tail -1))"
-fi
-
-# ------------------------------------------------------------------
 section "汇总"
 echo ""
 echo "通过: ${PASS}  失败: ${FAIL}"

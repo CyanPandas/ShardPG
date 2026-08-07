@@ -101,20 +101,12 @@ static bool in_txn_replication = false;
  * 避免升级时丢掉 current_term/voted_for 造成任期回退。
  * v3 起再增加 base_index/base_term —— 日志压缩的基点（快照 last_included_*）。
  * 低版本文件读上来时基点为 0，等价于"没压缩过"，语义与压缩前完全一致。
- * v4 起增加 last_log_index（计划文档 §11.10 E3）：数据组不再往
- * partdist.raft_log 逐条写行之后，**日志末端只剩这一个持久化来源** ——
- * 它不能从段文件推出来，leader 的 pg_parwal 里躺着大量还没被提案的记录
- * （demux 按本地提交不停地写，提案是另一条路径按需追上去的），拿
- * max(partition_lsn) 当末端会凭空多出一截从未复制过的"条目"。
- * 这个字段是零额外开销：persist_hard_state_unlocked() 本来就在每条 append
- * 之后被调用一次。
  */
-#define RAFT_HARDSTATE_VERSION 4
+#define RAFT_HARDSTATE_VERSION 3
 #define RAFT_HARDSTATE_VERSION_MIN 1
 /* v1 布局 = v2 去掉末尾的 last_applied，用 offsetof 取以免手算漏掉结构体填充 */
 #define RAFT_HARDSTATE_V1_SIZE  offsetof(RaftHardStateFile, last_applied)
 #define RAFT_HARDSTATE_V2_SIZE  offsetof(RaftHardStateFile, base_index)
-#define RAFT_HARDSTATE_V3_SIZE  offsetof(RaftHardStateFile, last_log_index)
 
 /* group 0 = 控制面；其余为数据面分区组 */
 #define RAFT_CONTROL_GROUP  INT64CONST(0)
@@ -213,7 +205,6 @@ typedef struct RaftHardStateFile
     int64  last_applied;
     int64  base_index;      /* v3：日志压缩基点 = 快照 last_included_index */
     int64  base_term;       /* v3：该条目的 term = 快照 last_included_term */
-    int64  last_log_index;  /* v4：日志末端（数据组外部化后唯一的持久来源） */
 } RaftHardStateFile;
 
 bool  pg_raft_raft_enabled = false;
@@ -1036,7 +1027,6 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     SpinLockAcquire(&ctx->log->mutex);
     hs.base_index = ctx->log->base_index;
     hs.base_term = ctx->log->base_term;
-    hs.last_log_index = ctx->log->last_log_index;
     SpinLockRelease(&ctx->log->mutex);
 
     fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -1139,8 +1129,6 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         hs.last_applied = 0;    /* v1 没有该字段，退化为"从 0 起重放" */
     if (hs.version < 3)
         hs.base_index = hs.base_term = 0;   /* v1/v2：从未压缩过 */
-    if (hs.version < 4)
-        hs.last_log_index = 0;              /* v1..v3：末端只能靠日志恢复 */
 
     SpinLockAcquire(&ctx->cons->mutex);
     if (hs.current_term > ctx->cons->current_term)
@@ -1160,16 +1148,6 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         ctx->log->base_index = hs.base_index;
         ctx->log->base_term = hs.base_term;
     }
-    /*
-     * 日志末端**只对数据组**从 hardstate 恢复（§11.10 E3）：外部化之后
-     * 数据组的 raft_log 里已经没有行了，末端没有别的来源。
-     * 控制面维持原样从 partdist.raft_log 数出来 —— 那条路径还带着
-     * "表被清空/重建时把游标钳回真实末端"的既有逻辑（clamped_hardstate），
-     * 这里若也塞一个末端进去会把那套钳制绕过去。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP &&
-        hs.last_log_index > ctx->log->last_log_index)
-        ctx->log->last_log_index = hs.last_log_index;
     /*
      * 压缩基点之前的条目已经不存在了，三个游标都不能落在基点之下 ——
      * 否则 apply 会去取一条永远取不到的条目而永久卡住。
@@ -1214,84 +1192,6 @@ raft_log_table_ready(void)
                         true, 1) == SPI_OK_SELECT && SPI_processed > 0);
 }
 
-/*
- * 数据组日志外部化 E1（计划文档 §11.10）：段式边界表是否已就绪。
- * 与 raft_log_table_ready 同样是"装了扩展但还没跑 setup"时的兜底。
- */
-static bool
-raft_runs_table_ready(void)
-{
-    return (SPI_execute("SELECT 1 FROM information_schema.tables "
-                        "WHERE table_schema = 'partdist' "
-                        "AND table_name = 'raft_log_runs'",
-                        true, 1) == SPI_OK_SELECT && SPI_processed > 0);
-}
-
-/*
- * 维护数据组的段式边界表（§11.10 E1）。**调用方必须已在 SPI 语境里**。
- *
- * 一个 run 是"从 start_index 起连续若干条，plsn 自 start_plsn 起同步 +1，
- * term 恒定"。只有两种情况需要新开一行：换届（term 变了），或 plsn 跳号
- * （失败路径没把编号用掉）。稳态下一届只有一行 —— 这正是它能替代逐条
- * 存映射的原因。
- *
- * 插入点选在 index 上会**自动截短**上一个 run（run 只延伸到下一行的
- * start_index 为止），所以冲突改写不需要额外的修补动作。
- */
-static void
-data_run_record_spi(RaftGroupCtx *ctx, int64 index, int64 term, int64 plsn)
-{
-    StringInfoData sql;
-    bool           isnull;
-    int64          r_start_index = 0;
-    int64          r_start_plsn = 0;
-    int64          r_term = 0;
-    bool           have_run = false;
-
-    if (ctx->group_id == RAFT_CONTROL_GROUP || index <= 0 || plsn <= 0)
-        return;
-    if (!raft_runs_table_ready())
-        return;
-
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "SELECT start_index, start_plsn, term "
-                     "FROM partdist.raft_log_runs "
-                     "WHERE group_id = %lld AND start_index <= %lld "
-                     "ORDER BY start_index DESC LIMIT 1",
-                     (long long) ctx->group_id, (long long) index);
-    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-    {
-        HeapTuple tup = SPI_tuptable->vals[0];
-        TupleDesc desc = SPI_tuptable->tupdesc;
-
-        r_start_index = DatumGetInt64(SPI_getbinval(tup, desc, 1, &isnull));
-        r_start_plsn = DatumGetInt64(SPI_getbinval(tup, desc, 2, &isnull));
-        r_term = DatumGetInt64(SPI_getbinval(tup, desc, 3, &isnull));
-        have_run = true;
-    }
-
-    /* 现有 run 已经覆盖到这一条且对得上：无事可做（重传走的就是这条路） */
-    if (have_run && r_term == term &&
-        r_start_plsn + (index - r_start_index) == plsn)
-    {
-        pfree(sql.data);
-        return;
-    }
-
-    resetStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "INSERT INTO partdist.raft_log_runs "
-                     "(group_id, start_index, start_plsn, term) "
-                     "VALUES (%lld, %lld, %lld, %lld) "
-                     "ON CONFLICT (group_id, start_index) DO UPDATE SET "
-                     "start_plsn = EXCLUDED.start_plsn, term = EXCLUDED.term",
-                     (long long) ctx->group_id, (long long) index,
-                     (long long) plsn, (long long) term);
-    (void) SPI_execute(sql.data, false, 0);
-    pfree(sql.data);
-}
-
 static void
 delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
 {
@@ -1308,25 +1208,6 @@ delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
     }
 
     initStringInfo(&sql);
-
-    /*
-     * 段式边界表要跟着回滚（§11.10 E1）。这个函数只被
-     * discard_uncommitted_entry 用（失多数派丢弃末尾那一条），而 run 是在
-     * persist_log_entry_sql 里、**先于**复制就写下去的 —— 不删的话会留下一个
-     * 指向不存在条目的段起点，此后所有 >= 它的 index 都会被按错误的 plsn 重建。
-     * E3 起数据组没有 raft_log 行了，这里就只剩删 run 这一件事。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP && raft_runs_table_ready())
-    {
-        appendStringInfo(&sql,
-                         "DELETE FROM partdist.raft_log_runs "
-                         "WHERE group_id = %lld AND start_index >= %lld",
-                         (long long) ctx->group_id, (long long) index);
-        (void) SPI_execute(sql.data, false, 0);
-        resetStringInfo(&sql);
-    }
-
-    /* 数据组这张表里只剩非 OP_PARWAL 条目，同样要跟着回滚 */
     appendStringInfo(&sql,
                      "DELETE FROM partdist.raft_log "
                      "WHERE group_id = %lld AND log_index = %lld",
@@ -1360,23 +1241,6 @@ delete_log_entries_after_sql(RaftGroupCtx *ctx, int64 index)
     }
 
     initStringInfo(&sql);
-
-    /*
-     * 段式边界表要截（§11.10 E1）。跨过截断点的那个 run **保留** ——
-     * 它对 <= index 的条目仍然成立，run 只延伸到下一行为止，后面被删掉的
-     * 那几行本来就是它的终点。E3 起数据组没有 raft_log 行，只剩这一件事。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP && raft_runs_table_ready())
-    {
-        appendStringInfo(&sql,
-                         "DELETE FROM partdist.raft_log_runs "
-                         "WHERE group_id = %lld AND start_index > %lld",
-                         (long long) ctx->group_id, (long long) index);
-        (void) SPI_execute(sql.data, false, 0);
-        resetStringInfo(&sql);
-    }
-
-    /* 数据组这张表里只剩非 OP_PARWAL 条目，同样要跟着截 */
     appendStringInfo(&sql,
                      "DELETE FROM partdist.raft_log "
                      "WHERE group_id = %lld AND log_index > %lld",
@@ -1466,91 +1330,8 @@ log_get_entry_sql(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
 }
 
 /*
- * 数据组的环外取条目：从 parwal 按 run 重建（计划文档 §11.10 E2）。
- *
- * 数据组条目的内容本来就在段文件里，raft_log 里那份是冗余的镜像。E2 起
- * 数据组的读路径**只认段文件**（E3 会把那份镜像的写入一并撤掉）——
- * 重建不出来就当作"本节点没有这一条"，让 leader 继续回退，绝不去 raft_log
- * 里捞一份可能与段文件不一致的影子。
- */
-static bool
-log_get_entry_parwal(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
-{
-    StringInfoData sql;
-    bool           spi_owned;
-    bool           found = false;
-
-    if (ctx->group_id == RAFT_CONTROL_GROUP || index <= 0)
-        return false;
-    if (!raft_persist_spi_begin(&spi_owned))
-        return false;
-    if (!raft_runs_table_ready())
-    {
-        raft_persist_spi_end(spi_owned);
-        return false;
-    }
-
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "SELECT term, payload FROM partdist.pg_raft_entry_from_parwal(%lld, %lld)",
-                     (long long) ctx->group_id, (long long) index);
-    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-    {
-        HeapTuple tup = SPI_tuptable->vals[0];
-        TupleDesc desc = SPI_tuptable->tupdesc;
-        bool      tnull;
-        bool      pnull;
-        Datum     dterm;
-        Datum     dpayload;
-
-        dterm = SPI_getbinval(tup, desc, 1, &tnull);
-        dpayload = SPI_getbinval(tup, desc, 2, &pnull);
-        /*
-         * 查不到 run、或该 plsn 在本节点段文件里不存在时，SQL 函数返回的是
-         * 一行全 NULL（不是零行）—— 与 partwal_read_record 同样的形态，
-         * 必须逐列判 NULL，否则 TextDatumGetCString(0) 直接段错误
-         * （2026-08-03 在 data_propose_one 上用 gdb 实锤过同一个坑）。
-         */
-        if (!tnull && !pnull)
-        {
-            char *payload = TextDatumGetCString(dpayload);
-
-            out->index = index;
-            out->term = DatumGetInt64(dterm);
-            strlcpy(out->op_type, RAFT_OP_PARWAL, RAFT_OP_LEN);
-            strlcpy(out->payload, payload, RAFT_PAYLOAD_MAX);
-            pfree(payload);
-            found = true;
-        }
-    }
-    pfree(sql.data);
-    raft_persist_spi_end(spi_owned);
-    return found;
-}
-
-/*
- * 环外那一级取条目：控制面从 partdist.raft_log 回读，数据组从 parwal 按 run
- * 重建（§11.10 E2）。两条路径的返回语义相同 —— true 表示"本节点确实持有
- * index 这一条，内容在 *out 里"。
- */
-static bool
-log_get_entry_durable(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
-{
-    /*
-     * 数据组先按 run 从段文件重建（OP_PARWAL 条目走这条）；取不到再落到
-     * raft_log —— 那里只可能剩**非 OP_PARWAL** 的条目（见 persist_log_entry_sql
-     * 里的说明）。E2 时这里刻意不回退，理由是"别读到与字节不一致的影子"；
-     * E3 把 OP_PARWAL 的行撤干净之后，那种影子已经不存在了，回退是安全的。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP &&
-        log_get_entry_parwal(ctx, index, out))
-        return true;
-    return log_get_entry_sql(ctx, index, out);
-}
-
-/*
- * 两级取条目：先查环（无锁开销最小），环外再落到持久层。
- * **不得**在持有 log->mutex 时调用（第二级要走 SPI）。
+ * 两级取条目：先查环（无锁开销最小），环外再落到 SQL 日志。
+ * **不得**在持有 log->mutex 时调用（SQL 那一级要走 SPI）。
  * 非 SPI 语境（BGW tick）退化为只查环，行为与加这条回读之前完全一致。
  */
 static bool
@@ -1565,7 +1346,7 @@ log_get_entry_ext(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
     if (got || !raft_spi_ctx)
         return got;
 
-    return log_get_entry_durable(ctx, index, out);
+    return log_get_entry_sql(ctx, index, out);
 }
 
 static void
@@ -1716,31 +1497,6 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
         return;
     }
 
-    /*
-     * 数据组**不再往 raft_log 写行**（§11.10 E3）：条目内容本来就在段文件里，
-     * 这里只维护段式边界表（term 与 index↔plsn 的对应）。所有落库路径都经过
-     * 本函数 —— leader 的 group_propose、follower 的首次 append、以及重传 ——
-     * 所以一处改完三条路径都变。
-     *
-     * 控制面照旧：它的条目载荷是元数据 JSON，没有第二个副本。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP &&
-        op_type != NULL && strcmp(op_type, RAFT_OP_PARWAL) == 0)
-    {
-        data_run_record_spi(ctx, index, term, entry_partition_lsn(payload));
-        raft_persist_spi_end(spi_owned);
-        return;
-    }
-
-    /*
-     * ★ 只有 OP_PARWAL 条目才外部化 —— 它的内容在段文件里有第二份，raft_log
-     * 那份才是冗余。数据组通过公开接口 pg_raft_group_propose() 提上来的**其他
-     * op_type 没有这第二份**（raft_12 用的就是 OP_TEST），一并撤掉的话它们就
-     * 既不在 raft_log 也不在 run 里 —— 重启后重建不出来、末端被下调，条目静默
-     * 丢失。E3 首版正是这么写的，raft_12 当场判出来（"raft_log 行数 0 与
-     * last_log_index 3 不一致"）。这类条目照旧走下面的 INSERT。
-     */
-
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "INSERT INTO partdist.raft_log "
@@ -1861,95 +1617,6 @@ restore_groups_if_needed(void)
 }
 
 /*
- * 数据组的重启恢复（计划文档 §11.10 E3）。
- *
- * 外部化之后数据组的 partdist.raft_log 里已经没有行了，恢复的三件事各有来源：
- *   末端 last_log_index —— hardstate v4（**不能**从段文件推：leader 的 pg_parwal
- *                          里有大量还没被提案的记录，见 v4 那段注释）；
- *   (term, plsn) 映射   —— partdist.raft_log_runs；
- *   环里的内容          —— 按 index 逐条重建（OP_PARWAL 走 parwal 记录头部，
- *                          非 OP_PARWAL 条目仍在 raft_log 里，由
- *                          log_get_entry_durable 一并覆盖），只灌最近
- *                          RAFT_LOG_CAPACITY 条（更老的走环外重建那条路）。
- *
- * 重建不出来时**把末端下调到能连续重建出来的位置**并告警，而不是硬撑着
- * 声称持有。下调是保守方向：本节点只会显得比实际更旧（leader 重发即可），
- * 绝不会冒充持有一条其实没有的条目 —— 后者会直接破坏 Leader Completeness。
- * 调用方保证已在 SPI 语境里（本函数由 restore_persistent_log_if_needed 调用）。
- */
-static void
-restore_data_log_from_parwal(RaftGroupCtx *ctx)
-{
-    int64 last_idx;
-    int64 base_idx;
-    int64 lo;
-    int64 i;
-    int64 good_upto;
-
-    SpinLockAcquire(&ctx->log->mutex);
-    last_idx = ctx->log->last_log_index;
-    base_idx = ctx->log->base_index;
-    SpinLockRelease(&ctx->log->mutex);
-
-    if (last_idx <= 0)
-        return;
-
-    lo = last_idx - RAFT_LOG_CAPACITY + 1;
-    if (lo < base_idx + 1)
-        lo = base_idx + 1;
-    if (lo < 1)
-        lo = 1;
-
-    /*
-     * 从后往前重建：末端连不上就往回退，退到哪算哪。正着扫的话中间断一条
-     * 就得决定"是留个空洞还是截断"，而空洞在环里等于一条永远取不到的条目。
-     */
-    good_upto = lo - 1;
-    for (i = last_idx; i >= lo; i--)
-    {
-        RaftLogEntry e;
-
-        /* 用 durable 而不是 parwal：数据组里还可能有非 OP_PARWAL 条目 */
-        if (!log_get_entry_durable(ctx, i, &e))
-            break;
-
-        SpinLockAcquire(&ctx->log->mutex);
-        {
-            RaftLogEntry *slot = log_slot(ctx, i);
-
-            slot->index = e.index;
-            slot->term = e.term;
-            strlcpy(slot->op_type, e.op_type, RAFT_OP_LEN);
-            strlcpy(slot->payload, e.payload, RAFT_PAYLOAD_MAX);
-        }
-        SpinLockRelease(&ctx->log->mutex);
-        good_upto = i;
-    }
-
-    if (good_upto > lo)
-    {
-        /*
-         * 末端那一段重建不出来（段文件被截、run 行缺失、或是 E1 之前留下的
-         * 老条目）。把末端拉回到确实重建出来的位置。
-         */
-        elog(WARNING,
-             "pg_raft: 组 %lld 重启恢复：index %lld..%lld 无法从 parwal 重建，"
-             "末端由 %lld 下调到 %lld（本节点将按更旧的日志参与复制）",
-             (long long) ctx->group_id, (long long) lo,
-             (long long) (good_upto - 1), (long long) last_idx,
-             (long long) (good_upto - 1));
-
-        SpinLockAcquire(&ctx->log->mutex);
-        ctx->log->last_log_index = good_upto - 1;
-        if (ctx->log->commit_index > ctx->log->last_log_index)
-            ctx->log->commit_index = ctx->log->last_log_index;
-        if (ctx->log->last_applied > ctx->log->commit_index)
-            ctx->log->last_applied = ctx->log->commit_index;
-        SpinLockRelease(&ctx->log->mutex);
-    }
-}
-
-/*
  * Load durable log state into shared memory after postmaster restart.
  * This is intentionally called only from SQL/client backend paths, not from
  * the Raft BGWorker, because restoring requires SPI and Citus hooks.
@@ -1982,23 +1649,6 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
      */
     if (!raft_persist_spi_begin(&spi_owned))
         return;
-
-    /*
-     * 数据组走外部化那条路（§11.10 E3）：raft_log 里已经没有它的行了，
-     * 末端来自 hardstate v4、映射来自 run、内容从段文件重建。
-     */
-    if (ctx->group_id != RAFT_CONTROL_GROUP)
-    {
-        if (!raft_runs_table_ready())
-        {
-            raft_persist_spi_end(spi_owned);
-            return;
-        }
-        restore_data_log_from_parwal(ctx);
-        ctx->g->log_restored = true;
-        raft_persist_spi_end(spi_owned);
-        return;
-    }
 
     if (!raft_log_table_ready())
     {
@@ -3003,8 +2653,7 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
 
     /*
      * 环外回退：peer 落后超过环容量时，prev 与待发条目都已滑出环窗口。
-     * SPI 语境（propose / pg_raft_catchup）下从持久层读回来（控制面查
-     * partdist.raft_log，数据组按 run 从 parwal 重建，§11.10 E2），这样落后
+     * SPI 语境（propose / pg_raft_catchup）下从 SQL 日志读回来，这样落后
      * 任意远的 follower 都能被逐条追平；BGW tick 无 SPI，维持原行为
      * （prev_term=0 → 对端拒 → next_index 递减 → 仅心跳），不改变时序语义。
      */
@@ -3012,13 +2661,13 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
     {
         RaftLogEntry old;
 
-        if (!prev_known && log_get_entry_durable(ctx, prev_idx, &old))
+        if (!prev_known && log_get_entry_sql(ctx, prev_idx, &old))
         {
             prev_term = old.term;
             prev_known = true;
         }
         if (!has_entry && next_idx <= last_idx &&
-            log_get_entry_durable(ctx, next_idx, &entry))
+            log_get_entry_sql(ctx, next_idx, &entry))
             has_entry = true;
     }
 
@@ -3755,60 +3404,6 @@ pg_raft_consensus_last_applied(void)
 
 /* ---- AppendEntries 接收方 ---- */
 
-/*
- * 把 follower 侧的字节落盘包进子事务（2026-08-05 加，raft_26 D 段实测抓获）。
- *
- * data_entry_store() 里那条 SPI_execute 调的是 partwal_follower_append，而
- * AppendPartWALRecordAt 遇到 plsn 空洞是 **ereport(ERROR)**，不是返回 false ——
- * 于是它直接 longjmp 出整个 RPC 函数，调用点那句 `if (!data_entry_store(...))`
- * 里的收尾代码一行都执行不到。症状：follower 的环与 last_log_index 已经推进，
- * 字节却没落盘，末端反而比 leader 还多一条（实测 follower 28 / leader 27）。
- * 危害不在复制（leader 会重发），而在**选举** —— 日志新旧比较看的就是
- * last_log_index，虚高一条就可能凭一条并不持有的条目赢下选举。
- *
- * 包成子事务之后错误可捕获，调用点才能把那一条撤掉。
- */
-static bool
-data_entry_store_guarded(RaftGroupCtx *ctx, const char *payload,
-                         const char *data_hex)
-{
-    MemoryContext oldcxt = CurrentMemoryContext;
-    ResourceOwner oldowner = CurrentResourceOwner;
-    bool          ok;
-
-    if (!IsTransactionState())
-        return data_entry_store(ctx, payload, data_hex);
-
-    BeginInternalSubTransaction(NULL);
-    PG_TRY();
-    {
-        ok = data_entry_store(ctx, payload, data_hex);
-        ReleaseCurrentSubTransaction();
-        MemoryContextSwitchTo(oldcxt);
-        CurrentResourceOwner = oldowner;
-    }
-    PG_CATCH();
-    {
-        ErrorData *edata;
-
-        MemoryContextSwitchTo(oldcxt);
-        edata = CopyErrorData();
-        FlushErrorState();
-        RollbackAndReleaseCurrentSubTransaction();
-        MemoryContextSwitchTo(oldcxt);
-        CurrentResourceOwner = oldowner;
-
-        elog(WARNING,
-             "pg_raft: 组 %lld 落盘失败（%s），该条目不 ack 并从本地日志撤回",
-             (long long) ctx->group_id, edata->message);
-        FreeErrorData(edata);
-        ok = false;
-    }
-    PG_END_TRY();
-
-    return ok;
-}
-
 static bool
 handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                       int64 prev_idx, int64 prev_term,
@@ -3894,7 +3489,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                  */
                 SpinLockRelease(&ctx->log->mutex);
                 raft_spi_ctx = true;
-                have_old = log_get_entry_durable(ctx, entry_idx, &old);
+                have_old = log_get_entry_sql(ctx, entry_idx, &old);
                 raft_spi_ctx = false;
                 SpinLockAcquire(&ctx->log->mutex);
 
@@ -3986,34 +3581,8 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      */
     if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0)
     {
-        if (!data_entry_store_guarded(ctx, entry_payload, entry_data_hex))
-        {
-            /*
-             * ★ 落盘失败必须把刚 append 进来的那一条**撤掉**（2026-08-05 修，
-             * raft_26 D 段实测抓获：follower 末端 28、leader 27，比 leader 还多）。
-             *
-             * 原先只是 return（不 ack），可环里、last_log_index 已经推进过了 ——
-             * 本节点于是"持有"一条自己根本没有字节的条目。危害不在复制（leader
-             * 会重发），而在**选举**：日志新旧比较看的就是 last_log_index，
-             * 虚高一条就可能凭一条并不持有的条目赢下选举，当选后再把它当作
-             * 自己的日志发给别人。
-             *
-             * 只撤末尾那一条（entry_idx == last_log_index 时才成立）；重传
-             * 命中 already_present 的情形不会走到这里之外的分支，撤了也无害
-             * —— 那条本来就还没落盘。
-             */
-            SpinLockAcquire(&ctx->log->mutex);
-            if (entry_idx == ctx->log->last_log_index &&
-                entry_idx > ctx->log->commit_index)
-            {
-                log_truncate_after_locked(ctx, entry_idx - 1);
-                SpinLockRelease(&ctx->log->mutex);
-                delete_log_entries_after_sql(ctx, entry_idx - 1);
-            }
-            else
-                SpinLockRelease(&ctx->log->mutex);
+        if (!data_entry_store(ctx, entry_payload, entry_data_hex))
             return true;
-        }
     }
 
     persist_hard_state_unlocked(ctx);

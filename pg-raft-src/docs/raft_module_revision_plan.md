@@ -7,16 +7,20 @@
 
 ---
 
-## 0. 当前状态速览（2026-08-06）
+## 0. 当前状态速览（2026-08-07）
 
-代码基线：`shardpg-4.0` @ `6181655`。回归基线：`run-raft-tests.sh` **59/59**
-（拓扑 1c+8w）+ `test_shard_identity_p0.sh` **10/10**。
+代码基线：`shardpg-4.0`，回归基线 `run-raft-tests.sh` **56/56**（拓扑 1c+8w）
++ `test_shard_identity_p0.sh` **10/10**。
+
+> ⏪ **2026-08-07：数据组日志外部化（§11.10 的 E1–E4）已整条回滚。**
+> 代码回到 `ace619a` 的形态 —— **项目中不存在任何日志外部化**。
+> 回滚范围与验证见 **§0.4**。交接以此状态为准。
 
 ### 0.1 已经做完的（每项都有回归覆盖）
 
 | 能力 | 落地形态 | 回归 |
 |---|---|---|
-| 控制面 Raft 安全语义 | 选举限制、任期栅栏、HardState 持久化（现 v4） | raft_01–11 |
+| 控制面 Raft 安全语义 | 选举限制、任期栅栏、HardState 持久化（现 **v3**） | raft_01–11 |
 | **切主重构** | 分区组内自治选举 → 上报 group 0 登记（任期栅栏）→ 落各节点 `pg_dist_placement` | raft_14/15（§13） |
 | **事务 prepare 接线** | `PartWALFlush` 挂钩自动逐条 `data_propose_one`，无手工 propose | raft_16（§14） |
 | 数据面多组（P1/P2） | 每分区一个 Raft 组，组间选举/复制隔离；平凡 apply 推进 `applied_part_lsn` | raft_12/13 |
@@ -24,7 +28,9 @@
 | **DTX-2PC 第 0–5 步** | 决议进数据组；内核补丁 0004 把决议接进客户端提交路径 | raft_17–23（详见 2PC 文档） |
 | **后台追平通道** | `pg_raft_catchup()` + TopologyMonitor 经 libpq 自触发；含环外条目回读 | raft_24 |
 | **控制面日志压缩 + InstallSnapshot** | `compact_threshold` 触发压缩；基点随 HardState v3 持久化 | raft_25 |
-| **数据组日志外部化 E1–E3** 🧊 已冻结 | 段式边界表 `raft_log_runs`；读写两条路径都切到 parwal；末端随 HardState v4。**整条线 2026-08-07 冻结，见 §0.4** | raft_26/27/28（§11.10） |
+
+> ⏪ 曾经出现在本表的「数据组日志外部化 E1–E3」**已于 2026-08-07 整条回滚**，
+> 连同 raft_26/27/28 三个用例一并移除（回归基线 59 → 56）。详见 §0.4。
 
 ### 0.2 尚未做的（按阻断强度排序）
 
@@ -32,7 +38,7 @@
 |---|---|---|---|
 | **1** | **集群级 xid 区间租约** | **P3 的硬门槛**。各分区 leader 独立分配 xid，而 clog 是节点全局共享的 —— 一个节点托管来自不同 leader 的多个分区副本时，相同 xid 在本地 clog 相撞。FRD 明确写着方案 A 落地前"多 shard 共存于一个 follower 的配置不可上线"，**而这正是本架构的默认形态** | §11.5.2 #1、§12.4 #2 |
 | **2** | **P3 物理回放本体** | follower 堆表始终为空 ⇒ 切主后新主没有历史数据 ⇒ 切主只能"机制先行"，生产语义未放行 | §12.4 #6、§13.6 #1 |
-| **3** | **外部化 E4：去环 + 抬 `RAFT_MAX_GROUPS`** 🧊 **已冻结** | 每节点最多 31 个数据组，与"每节点几十上百分区"直接冲突。E1–E3 已把日志内容搬出去，**但 ring 本体还在**（见 §0.3）。**2026-08-07 起整条外部化线（含已落地的 E1–E3）冻结，见 §0.4** | §11.10 E4 |
+| **3** | **数据组日志外部化 E1–E4（整条）** ⏪ **已回滚，退回未开工** | 每节点最多 31 个数据组，与"每节点几十上百分区"直接冲突（见 §0.3）。E1–E3 曾落地又于 2026-08-07 整条回滚，**现状等同从未做过**；`raft_log` 双写与 shmem ring 都原样保留 | §0.4、§11.10（设计留档） |
 | **4** | **2PC 第 6 步** | 升主 in-doubt 清理的**接线**（函数本体 `dtx_close_indoubt` 已有）+ 快路径分叉归队规则；需与惰性回放 promotion 路径合流 | 2PC 文档 §9.5/§9.6 |
 | **5** | **成员变更 joint consensus** | 只能建组时定死成员集，副本集变更（扩缩容、换节点）无安全路径 | §2.3 |
 | 6 | 数据组的压缩 / InstallSnapshot | 现在数据组"快照内容"与"日志内容"是同一份东西，装快照等于重放日志 —— 要等 P3 才谈得上 | §4 阶段 1 |
@@ -66,47 +72,60 @@ typedef struct RaftGroupTable { ... RaftGroupState groups[RAFT_MAX_GROUPS]; };
 编译期定长**分配 —— 不按需增长，空槽位照样占内存。
 
 于是「调大常量」不是解法：500 个分区组 ⇒ 约 51 MB shmem，且绝大多数槽位是空的。
-**正解是让数据组不再持有 ring**（§11.10 E4）：E1–E3 已经把日志**内容**搬到 parwal
-段文件、把 (term, plsn) 映射搬到 `raft_log_runs`、把末端搬到 HardState v4，
-ring 目前只剩"最近 128 条的读缓存"这一个作用。E4 把它拿掉之后每组的 shmem
-从 ~105 KB 降到几百字节（几个游标 + peer 进度数组），常量才谈得上抬。
+**正解是让数据组不再持有 ring**（§11.10 E4），但那要先把 ring 承载的东西搬走
+——**外部化已于 2026-08-07 整条回滚（§0.4），所以现在 ring 仍然承载全部内容**：
+日志内容在环里、`raft_log` 里各有一份，(term, plsn) 无外部映射，日志末端靠
+`raft_log` 重建。抬常量的前置条件一件都不具备。
 
-> 顺带澄清一个易混点：ring 早已**不是追平的上限** —— 落后超过 128 条的成员
-> 可以靠环外重建追平（raft_24/27）。它现在只是**内存占用**的上限。
+> 顺带澄清一个易混点：ring **不是追平的上限** —— 落后超过 128 条的成员可以靠
+> 回读 `partdist.raft_log` 重建环外条目来追平（raft_24 覆盖）。它是**内存占用**的上限。
 
-> 🧊 **E4 已冻结（2026-08-07）**，因此上述"抬常量"暂不发生。当前 32 组上限
-> 对 1c+8w 拓扑下的验证与演示是够用的（每节点托管的分片数远小于 31），
-> 它阻断的是**规模化形态**，不是当前功能验证。详见 §0.4。
+### 0.4 ⏪ 数据组日志外部化：整条线已回滚（2026-08-07）
 
-### 0.4 🧊 数据组日志外部化：整条线冻结（2026-08-07）
+**用户指令**：E1–E3 也全部回滚，按"无任何日志外部化"的状态交接。
 
-**范围**：§11.10 的 E1–E4 **全部**冻结 —— 不只是未开工的 E4，**已经落地的
-E1/E2/E3 同样冻结**。
+**回滚方式**：`git revert` 三个代码提交（`6181655` E3 / `bd4cfd8` E2 / `d4ff6d9` E1），
+保留历史不改写。验证口径是 `git diff ace619a -- . ':!*docs/*'` **为空**
+——代码逐字节回到外部化开工之前。
 
-**冻结的含义**（给接手/合并的人）：
+**回滚掉了什么**：
 
-| 做什么 | 允许？ |
+| 曾经引入 | 现状 |
 |---|---|
-| E1–E3 已合入的代码继续留在主线上跑 | ✅ 是。它们已随 `d4ff6d9`/`bd4cfd8`/`6181655` 合入，回归 raft_26/27/28 全绿，**不回滚** |
-| 开工 E4（去环、抬 `RAFT_MAX_GROUPS`） | ❌ 否，需项目负责人明确指令 |
-| 对 E1–E3 做重构、优化、扩展 | ❌ 否 |
-| 修 E1–E3 引入的**正确性缺陷** | ⚠️ 可以，但先报备 —— 属于止血，不属于推进 |
-| 合并物理回放分支时顺手"统一"这块的实现 | ❌ 否。合并冲突按"保留 4.0 侧现状"处理 |
+| `partdist.raft_log_runs` 段式边界表 | 表定义已从 `sql/pg_raft--1.0.sql` 与 `setup-raft.sh` 移除 |
+| `partdist.pg_raft_entry_from_parwal(group_id, index)` | 函数已移除 |
+| `log_get_entry_parwal()` / `log_get_entry_durable()` 的 parwal 分派 | 移除；数据组环外条目**回到从 `partdist.raft_log` 回读** |
+| `persist_log_entry_sql` 对数据组 `OP_PARWAL` 的写入分流 | 移除；**所有条目一律照写 `raft_log`**（双写恢复） |
+| `restore_data_log_from_parwal()` / `data_entry_store_guarded()` | 移除 |
+| HardState **v4**（`last_log_index` 字段） | 退回 **v3**；日志末端重新由 `raft_log` 恢复 |
+| 用例 raft_26 / raft_27 / raft_28 | 三个文件删除，`run-raft-tests.sh` 摘除；回归基线 59 → **56** |
 
-**为什么要写清楚**：这条线正处在"做了一半"的形态 —— 数据组的日志内容、
-(term, plsn) 映射、日志末端已经分别搬到 parwal 段文件 / `raft_log_runs` /
-HardState v4，而 ring 本体还在。这种中间态很容易被接手的人误读成"重构进行中，
-应该继续往下推"。它不是；它是一个**被有意冻住的稳定中间态**，回归全绿，
-可以直接在其上做物理回放。
+**回滚的运行期影响（重要，接手必读）**：
 
-**冻结对其他工作的影响**：
+1. **磁盘上遗留的 v4 hardstate 会被整个丢弃。** v3 代码的校验是
+   `hs.version > RAFT_HARDSTATE_VERSION` ⇒ 打 WARNING "忽略损坏的 hardstate 文件"
+   并 `return` —— term / voted_for / commit_index / last_applied / base_index
+   **全部丢失**，该组从零状态起。这不是崩溃，是静默丢状态（丢 `voted_for`
+   直接破坏选举安全性）。
+2. **E3 期间写入的数据组条目在 `raft_log` 里没有行。** 回滚后代码回去读
+   `raft_log`，那些条目读不出来，表现为数据组日志凭空变短。
+3. 结论：**回滚后不能在旧数据上直接跑，必须重建 `pg-cluster-data`。**
+   本次已重建并复跑回归（见下）。
+
+**回滚后的验证**：编译无 error/warning；`nm` 确认产物中无外部化符号；
+就地重建 9 节点 `pg-cluster-data`（group0 leader=node1，1s 收敛）；
+`run-raft-tests.sh` **56/56**、`test_shard_identity_p0.sh` **10/10**。
+
+**回滚对其他工作的影响**：
 
 - **不阻断物理回放（P3）**。P3 依赖的是"段文件里有完整、连续、已达多数派的
-  字节流"，而 E1–E3 恰好强化了这一点（数据组现在**只认段文件**）。
-- **不阻断 2PC 第 6 步**。2PC 文档 §9.9（raft 日志 SQL 行与用户事务同命）
-  已随 E3 基本消解，该结论继续有效。
-- **确实阻断规模化**：`RAFT_MAX_GROUPS = 32` 维持不变。任何"每节点托管几十上百
-  分区"的设计讨论，结论都是"当前形态不支持，需先解冻 E4"。
+  字节流"，而这由 demux 落盘 + Raft 多数派提供，与日志存在哪儿无关。
+- **不阻断 2PC 第 6 步**。
+- **让合并变简单了**：外部化曾经带来的头号合并冲突（`pg_raft_entry_from_parwal`
+  硬编码 `w.xid`，与 replay 侧改名后的 `gxid` 相撞）**随回滚一并消失**，见 §15.2。
+- **2PC 文档 §9.9 退回未解决**：`raft_log` 双写恢复，"raft 日志 SQL 行与用户事务
+  同命"这条隐患回到 E3 之前的状态。
+- **规模化仍然阻断**：`RAFT_MAX_GROUPS = 32` 不变，且现在连前置条件都没了。
 
 ### 0.5 文档导航
 
@@ -114,7 +133,7 @@ HardState v4，而 ring 本体还在。这种中间态很容易被接手的人�
 |---|---|
 | 两层 Raft 的定位与目标架构 | §3、§11.1–§11.4 |
 | 分区级 Raft 的工程分期（P0–P3） | §11.5 |
-| **数据组日志外部化（E1–E4）** 🧊 已冻结 | §0.4（冻结范围）、§11.10（设计与已落地部分） |
+| **数据组日志外部化（E1–E4）** ⏪ 已回滚 | §0.4（回滚范围与影响）、§11.10（设计留档，未落地） |
 | **与物理回放分支合并的交接要点** | §15 |
 | 切主重构：自治选举 → 上报 → 路由层 | §13 |
 | 事务 prepare 接线 | §14 |
@@ -230,9 +249,10 @@ Raft log 来运输；物理回放（redo）是骑在其上的应用层，见 §1
 - **xid/clog 跨 leader 冲突未解**（§11.5.2 #1，最硬的阻断项）。
 - `RAFT_MAX_GROUPS = 32`，与“每节点托管几十上百分区”冲突；日志仍在定长 ring
   （`RAFT_LOG_CAPACITY = 128`，落后超容量时靠拒写背压），未外部化到 parwal，无日志压缩。
-  **→ 2026-08-05/06 部分关闭**：控制面压缩 + InstallSnapshot 已落地（raft_25）；
-  数据组日志外部化 E1–E3 已落地（raft_26/27/28，§11.10）——内容、映射、末端都已
-  搬出 shmem。**`RAFT_MAX_GROUPS` 本身仍是 32**，因为 ring 结构还在，见 §0.3。
+  **→ 2026-08-05/06 部分关闭**：控制面压缩 + InstallSnapshot 已落地（raft_25，**未回滚**）。
+  数据组日志外部化 E1–E3 也曾落地，但**已于 2026-08-07 整条回滚**（§0.4）——
+  日志重新是"shmem ring + `partdist.raft_log` 双写"，未外部化。
+  **`RAFT_MAX_GROUPS` 仍是 32**，且现在连抬它的前置条件都不具备，见 §0.3。
 - ~~**组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按全体 peers 算多数派；~~
   **→ 2026-08-03 已修**（`DTX_2PC_DESIGN.md` §9.2，回归 raft_18）：数据组的空成员集
   语义由"全体节点"改为"**未知**"，未知的节点不竞选/不当选/不提案（**被动应答
@@ -648,9 +668,9 @@ PartWAL 接入链路：
 | `raft_23_dtx_close_indoubt` | **升主 in-doubt 闭合机制（`DTX_2PC_DESIGN.md` §9.6，机制先行）+ 混合写集告警（§9.4）**，用例本体在 `test/raft_23_dtx_close_indoubt.sh`（可独立跑），五段：A 有登记 ⇒ `dtx_status` 权威通道，推定中止先落库，流为 `1,2,4`（协调组即自身时 ABORT 决议兼任闭合）；B 无登记、决议在**成员不相交的另一个组** ⇒ 广播 peers 的决议索引命中，闭合 COMMIT；C citus 形态 dtxid ⇒ 前缀查 `pg_dist_transaction`（带发起者存活栅栏，只认 COMMIT）；D **四级阶梯全落空 ⇒ 保持 in-doubt 不动、重复调用幂等**——不知道协调组是谁就无法把推定中止写下来，绝不无凭据闭合；E 纳管+非纳管混合写集在 PREPARE 时收到 WARNING。剩给第 6 步的只是把函数插进升主序列与合流验收 | ✅ |
 | `raft_24_background_catchup` | **后台追平通道（§12.4 #5）**，用例本体在 `test/raft_24_background_catchup.sh`（可独立跑），四段：A **关掉通道（`catchup_interval_ms=0`）+ 无任何写入 ⇒ 必须不收敛**——这一半就是对照，没有它，B 段的收敛无法归因；B 打开通道（reload 生效，顺带走一遍 SIGHUP 通路）后仍不写入任何数据，落后成员在窗口内条数+逐字节指纹追平；C **落后 >128 条（超环容量）也能追平**，走的是环外条目从 `partdist.raft_log` 回读；D 追平**不产生新条目**（`last_log_index` 前后不变）且收敛后再调返回 0。**夹具两个硬约束**：① 段文件基线必须 `partwal_truncate_to(oid,0)` 清零——OID 复用会让新壳表继承上一轮的记录（raft_13 老教训，本次实测踩到）；② **不能假定领导权落在 placement 节点、更不能假定它不变**——起步时三成员日志都空谁先超时谁当选，且本实现无 PreVote，成员重启会带更高 term 竞选把在任 leader 打成 follower 一轮，所以每次写入前都重新发现 leader 并等路由层跟上。**真对照**（同用例仅换 .so）：只把 `log_get_entry_sql` 摘掉重编，A/B 照过、C 确定性失败（follower 卡在 41、leader 401） | ✅ |
 | `raft_25_snapshot_compaction` | **控制面日志压缩 + InstallSnapshot（§4 阶段 1 / §12.4 #7）**，用例本体在 `test/raft_25_snapshot_compaction.sh`（可独立跑），五段：A 压缩真的发生（基点推进、`raft_log` 里 `<= 基点` 的行为 0、快照行的 `(index, term)` 与基点**成对**一致——配错对会让接收方的 prev 检查永久错位）且压缩后新提案照常提交；B **落后到压缩点之前的成员靠快照追平**；C 装完快照状态机一致（只比**由日志决定**的列：`last_heartbeat`/`updated_at` 是各节点本地 `now()`，比它们是在测设计从未承诺的东西）；D 基点跨重启不丢（hardstate v3）；E **压缩之后重启不丢日志尾巴**（全节点重启后新条目不得落在已存在的 index 上——按压缩前的恢复写法会直接覆盖已提交条目，是 in-build 对照）。**B 的构造有个坑（首版实测踩到）**：压缩只删 SQL 行，shmem 环里最近 128 条还在，leader 照样逐条补得上——只推进 30 条时，把 `send_install_snapshot()` 摘掉的对照构建**也照样通过**（假测试）。必须推进 **>128 条**让环绕过去，那些条目才真的不复存在。**E 的构造也有个坑**：造尾巴之前必须先把 `compact_threshold` 顶高冻住基点，否则那几条 apply 完立刻又触发一次压缩、基点直接追到日志末端，尾巴长度为 0 —— 集群安静时必然如此，只有恰好有后台探测补上新条目才侥幸成立（首次跑套件正是这样蒙混过去的，独立重跑才暴露；用例里留了"尾巴为空即判构造无效"的自检）。**真对照**（同用例仅换 .so）：摘掉发送侧后 B 段确定性失败（落后成员冻结在 539，leader 已到 756） | ✅ |
-| `raft_26_log_runs_externalize` | **数据组日志外部化 E1（§11.10）**，用例本体在 `test/raft_26_log_runs_externalize.sh`（可独立跑），五段：A **重建等价**（每条 `raft_log` 与 `pg_raft_entry_from_parwal()` 重建出来的 (term, payload) 逐条相同 —— 比 jsonb 不比文本，payload 列是 jsonb，读回来已被规范化，比文本会假失败）；B **run 真的是段**（连续同任期的 N 条只占 1 行，退化成逐条一行就只是把 `raft_log` 换了张表）；C **跳号提案失败且不留痕**；D follower 侧同样成立；E **换届另起一段**（停掉 leader 让剩下两个成员在更高任期里选出新 leader，再提案一条）。**判据构造被实测推翻过一次**：首版 C 段写的是【跳号会另起一个 run】，跑出来才发现那是**不存在的状态** —— `AppendPartWALRecordAt()` 对 `expected > last + 1` 直接 ERROR（【物理回放要求流完整有序无 gap】），follower 落不了盘就不 ack、leader 凑不齐多数派、条目被丢弃。改判真实存在的性质之后，反而抓出一个真缺陷：run 写在复制之前，回滚路径不清它就会留下指向不存在条目的段起点。**三重对照**：① 不维护 run ⇒ A 段 27/27 全错；② 退化成逐条一行 ⇒ B 段确定性失败（27 行）；③ in-build：回滚不清 run ⇒ C 段确定性失败 | ✅ |
-| `raft_27_data_catchup_from_parwal` | **数据组日志外部化 E2（§11.10）**，用例本体在 `test/raft_27_data_catchup_from_parwal.sh`（可独立跑），三段：A **落后超过环容量的数据组成员靠重建追平**（成员停机期间提案 140 条 > `RAFT_LOG_CAPACITY`=128，最老那几十条已滑出环窗口，只能从段文件重建），且判据要求**字节真的落盘**（victim 段文件记录数 == leader 日志末端，不只是 `raft_log` 行数对上）；B **缺口必须真的超过环容量**（否则退化成环内追平，把重建摘掉也照样通过 —— raft_25 B 段就这么假过一次）；C 追平后 victim 上每条条目与它自己按 run 重建的结果逐条一致。**真对照**（同用例仅换 .so）：`log_get_entry_parwal()` 直接返回 false ⇒ A 段确定性失败（victim 冻结在 0，leader 已到 140） | ✅ |
-| `raft_28_data_log_no_sql_rows` | **数据组日志外部化 E3（§11.10）**，用例本体在 `test/raft_28_data_log_no_sql_rows.sh`（可独立跑），三段：A **写路径真的瘦了**（提案 N 条之后该组在 `partdist.raft_log` 里是 0 行，而 run 表有行、三个成员段文件各 N 条字节）；B **重启单个成员末端不丢**（末端此后只有 hardstate v4 一个来源）；C **全节点重启后新条目不得落在已存在的 index 上**（Leader Completeness 前置）。**夹具两个硬约束**：① 三成员一律 `partwal_truncate_to(oid,0)` 后由 leader 用 `write_partition_wal_record` 自造 N 条 —— 不能依赖 demux 产出多少条，更不能假定 `pg_parwal/<oid>/` 是干净的（被 DROP 的分片表留下的目录不回收，新表拿到复用 OID 就继承上一轮记录，首版实测报【段文件里 21 条记录，应为 20】）；② 造下一条要提案的记录必须用 `write_partition_wal_record` 本地自增，**不能提案段文件里编号最大的那条** —— follower 追加要求 plsn == 本地 last+1，跳号直接 ERROR、不 ack、凑不齐多数派（首版实测返回 0）。**真对照**：`persist_hard_state_values()` 里把 `hs.last_log_index` 写成 0（= v3 行为）重编 ⇒ B 段确定性失败（重启后末端 1，应为 20） | ✅ |
+| ~~`raft_26_log_runs_externalize`~~ ⏪ **已随 E1–E3 回滚删除（§0.4）；以下为历史留档** | **数据组日志外部化 E1（§11.10）**，用例本体在 `test/raft_26_log_runs_externalize.sh`（可独立跑），五段：A **重建等价**（每条 `raft_log` 与 `pg_raft_entry_from_parwal()` 重建出来的 (term, payload) 逐条相同 —— 比 jsonb 不比文本，payload 列是 jsonb，读回来已被规范化，比文本会假失败）；B **run 真的是段**（连续同任期的 N 条只占 1 行，退化成逐条一行就只是把 `raft_log` 换了张表）；C **跳号提案失败且不留痕**；D follower 侧同样成立；E **换届另起一段**（停掉 leader 让剩下两个成员在更高任期里选出新 leader，再提案一条）。**判据构造被实测推翻过一次**：首版 C 段写的是【跳号会另起一个 run】，跑出来才发现那是**不存在的状态** —— `AppendPartWALRecordAt()` 对 `expected > last + 1` 直接 ERROR（【物理回放要求流完整有序无 gap】），follower 落不了盘就不 ack、leader 凑不齐多数派、条目被丢弃。改判真实存在的性质之后，反而抓出一个真缺陷：run 写在复制之前，回滚路径不清它就会留下指向不存在条目的段起点。**三重对照**：① 不维护 run ⇒ A 段 27/27 全错；② 退化成逐条一行 ⇒ B 段确定性失败（27 行）；③ in-build：回滚不清 run ⇒ C 段确定性失败 | ✅ |
+| ~~`raft_27_data_catchup_from_parwal`~~ ⏪ **已随 E1–E3 回滚删除（§0.4）；以下为历史留档** | **数据组日志外部化 E2（§11.10）**，用例本体在 `test/raft_27_data_catchup_from_parwal.sh`（可独立跑），三段：A **落后超过环容量的数据组成员靠重建追平**（成员停机期间提案 140 条 > `RAFT_LOG_CAPACITY`=128，最老那几十条已滑出环窗口，只能从段文件重建），且判据要求**字节真的落盘**（victim 段文件记录数 == leader 日志末端，不只是 `raft_log` 行数对上）；B **缺口必须真的超过环容量**（否则退化成环内追平，把重建摘掉也照样通过 —— raft_25 B 段就这么假过一次）；C 追平后 victim 上每条条目与它自己按 run 重建的结果逐条一致。**真对照**（同用例仅换 .so）：`log_get_entry_parwal()` 直接返回 false ⇒ A 段确定性失败（victim 冻结在 0，leader 已到 140） | ✅ |
+| ~~`raft_28_data_log_no_sql_rows`~~ ⏪ **已随 E1–E3 回滚删除（§0.4）；以下为历史留档** | **数据组日志外部化 E3（§11.10）**，用例本体在 `test/raft_28_data_log_no_sql_rows.sh`（可独立跑），三段：A **写路径真的瘦了**（提案 N 条之后该组在 `partdist.raft_log` 里是 0 行，而 run 表有行、三个成员段文件各 N 条字节）；B **重启单个成员末端不丢**（末端此后只有 hardstate v4 一个来源）；C **全节点重启后新条目不得落在已存在的 index 上**（Leader Completeness 前置）。**夹具两个硬约束**：① 三成员一律 `partwal_truncate_to(oid,0)` 后由 leader 用 `write_partition_wal_record` 自造 N 条 —— 不能依赖 demux 产出多少条，更不能假定 `pg_parwal/<oid>/` 是干净的（被 DROP 的分片表留下的目录不回收，新表拿到复用 OID 就继承上一轮记录，首版实测报【段文件里 21 条记录，应为 20】）；② 造下一条要提案的记录必须用 `write_partition_wal_record` 本地自增，**不能提案段文件里编号最大的那条** —— follower 追加要求 plsn == 本地 last+1，跳号直接 ERROR、不 ack、凑不齐多数派（首版实测返回 0）。**真对照**：`persist_hard_state_values()` 里把 `hs.last_log_index` 写成 0（= v3 行为）重编 ⇒ B 段确定性失败（重启后末端 1，应为 20） | ✅ |
 | `raft_22_dtx_end_to_end` | **DTX-2PC 端到端（`DTX_2PC_DESIGN.md` §3.3/§3.4/§5.3/§8.3/§9.3）**，用例本体在 `test/raft_22_dtx_end_to_end.sh`（可独立跑），六段：A 前置——二进制导出 `pre_record_commit_hook` 且逐节点 `citus.recover_2pc_interval=-1`；B **真实跨分区事务**提交后协调组有且仅有一条 COMMIT 决议、participants 恰为真实写集、协调组 == `participants_sorted[dtxid % n]`、**且决议在协调组每个成员上都在**；C 三阶段在 parwal 流里逐条可见（参与组 `DATA…,PREPARE,COMMIT` ／协调组 `DATA…,PREPARE,DECISION` 且**无**单独 COMMIT 标记），PREPARE 携带本地 top-level xid 且排在 DATA 之后；D **快路径**：单分区事务不写决议也不写标记；E **只读参与者剔除**：广播 UPDATE 打到全部 8 个分片但只有 1 个真改到行 ⇒ 不产生决议，同时只读参与者仍留 `gsids='{}'` 的登记（它崩溃后自解的唯一线索）；F **协调组失去多数派** ⇒ 事务**提交失败**且无行可见（不允许部分提交），并断言失败原因含"多数派"。**判据构造有两个坑**：① 只停协调组 leader 不行——组内还剩 2/3 会自治选出新 leader 并上报改写路由，决议照样做得出来、事务本就该成功（那正是"协调权随选举转移"在起作用）；② 也不能把协调组的 primary 算进被停的两个里——它同时是数据分片的主节点，停它测的是"主挂了写不进"这个与 2PC 无关的性质。必须停两个**非主**成员：数据主全活着，失败只可能落在 prepare 复制凑不齐多数派。**真对照**：`pg_raft.dtx_2pc_enabled=off` 重跑，B 段确定性失败 | ✅ |
 
 > **run-raft-tests.sh 已于 2026-08-03 改为拓扑自适应**：按容器 `pg-cluster-data/`
@@ -763,10 +783,10 @@ PartWAL 接入链路：
 | **TopologyMonitor 不处理 SIGHUP ⇒ 全部 pg_raft.\* GUC 对 reload 静默无效** | BGWorker 默认不接 SIGHUP；补 `pqsignal(SIGHUP, SignalHandlerForConfigReload)` + 循环里 `ProcessConfigFile`。此前 `raft_enabled`/心跳/选举超时改完 reload 只对新 backend 生效、守护进程要重启才认 —— 直到 raft_21 H（依赖 reload 降 dtx 守护超时）在负载下超时才暴露 | ✅ 2026-08-04 修复 |
 | **压缩之后重启会丢日志尾巴 ⇒ 覆盖已提交条目（2026-08-05 落地压缩时发现并修掉）** | 日志恢复原先按"`last_log_index > 0` 就说明已经有日志了"早退。有了压缩之后，重启时 hardstate 会先把 `last_log_index` 顶到基点（基点之前的条目已被快照取代，游标不能落在它之下），于是恢复被**整段跳过**，表里 `base+1..N` 的尾巴永远灌不回环。对 follower 只是要 leader 重发；对**重启后重新当选的 leader** 就是灾难——它以为日志止于基点，会拿新内容覆盖已提交的 `base+1..`，直接破坏 Leader Completeness。修复=改用每组一个 `log_restored` 标志判"是否已灌过"，并在灌完后把三个游标夹到基点之上。回归 raft_25 E 段（**in-build 对照**：按旧写法重启后新条目会落在已存在的 index 上） | ✅ 已修 |
 | **apply 抛错 ⇒ `apply_in_progress` 永久为真 ⇒ 该节点 apply 游标静默冻结** | 旗在 `apply_one_entry` **之前**置上、之后才清，中间任何 ereport 都会让它永远留在 true，此后每次 `group_apply_pending` 都在"另一个 backend 正在 apply"分支立即返回。实测：一条 payload 违反 `node_map_status_check` 的条目让**九个节点全部**卡在同一 index（`commit_index` 照常前进，无任何告警）；有了压缩之后更糟——基点也跟着不动，既追不上也压不了。修复=把 apply 包进子事务（`apply_one_entry_guarded`），控制面按既有"跳过安全"语义跳过、数据面保留游标下轮重试，**旗一定清掉** | ✅ 2026-08-05 修复 |
-| **demux 异步落盘 ⇒ 段文件清零后又长出一条（2026-08-05 raft_28 实测）** | 夹具里 `INSERT` 提交之后 demux 未必已经把记录写进段文件；此刻 `partwal_truncate_to(oid,0)` 清零，随后那条才落盘 —— 段文件凭空多出一条，判据报【21 条，应为 20】。**清零之后必须复查、连续两次读到 0 才算干净**（`truncate_stable`）。与 OID 复用继承上一轮记录是同一类坑的两个来源：一个是上一轮的残留，一个是本轮还没写完 | ✅ 已在 raft_27/28 夹具修正 |
-| **只按【组】判要不要外部化 ⇒ 非 OP_PARWAL 条目静默丢失（2026-08-05 raft_12 判出）** | E3 首版对**所有**数据组条目停写 `raft_log`，但只给 `OP_PARWAL` 记 run。数据组还有公开路径 `pg_raft_group_propose(group_id, op_type, payload)` 可提任意 op_type 的条目（raft_12 用的就是 `OP_TEST`），这类条目**在段文件里没有第二份** —— 于是既不在 `raft_log` 也不在 run 里，重启后重建不出来、末端被下调，条目静默丢失。判据本身没有过时：对 `OP_TEST` 条目【行数 == last_log_index】本就该成立，是【OP_PARWAL 的行是冗余的】被错误推广成了【数据组的行都是冗余的】。修复=按 op_type 分流：只有 `OP_PARWAL` 外部化，其余照旧写 `raft_log`；读路径先按 run 重建、取不到再回退 `raft_log` | ✅ 2026-08-05 修 |
-| **follower 落盘失败时末端虚高 ⇒ 可能凭一条并不持有的条目赢下选举（2026-08-05 raft_26 D 段实测抓获）** | `data_entry_store()` 里那条 SPI_execute 调的是 `partwal_follower_append`，而 `AppendPartWALRecordAt` 遇到 plsn 空洞是 **ereport(ERROR)** 而非返回 false —— 它直接 longjmp 出整个 RPC 函数，调用点 `if (!data_entry_store(...))` 里的收尾一行都执行不到。于是 follower 的环与 `last_log_index` 已经推进、字节却没落盘，末端反而比 leader 还多一条（实测 follower 28 / leader 27）。危害不在复制（leader 会重发），而在**选举**：日志新旧比较看的就是 `last_log_index`。修复=把落盘包进子事务（`data_entry_store_guarded`）使错误可捕获，捕获后把刚 append 的那一条从环与 run 里撤掉 | ✅ 2026-08-05 修 |
-| **后台追平通道会悄悄填掉用例要测的缺口 ⇒ 假测试（2026-08-05 raft_27 实测）** | TopologyMonitor 每 `catchup_interval_ms` 自触发一轮追平，成员一起来就被补上几十条；等用例测缺口时已从 140 缩到 99，低于环容量 128，于是【只能靠环外重建】的前提不再成立 —— 把重建摘掉也照样通过。**凡是要测【落后多少】的用例，夹具必须先 `catchup_interval_ms=0` 关掉后台通道**，让追平只能由显式调用完成，归因才干净 | ✅ 已在 raft_27 夹具修正 |
+| **demux 异步落盘 ⇒ 段文件清零后又长出一条（2026-08-05 raft_28 实测；用例已随 §0.4 回滚，但这条教训对任何操作段文件的夹具都成立）** | 夹具里 `INSERT` 提交之后 demux 未必已经把记录写进段文件；此刻 `partwal_truncate_to(oid,0)` 清零，随后那条才落盘 —— 段文件凭空多出一条，判据报【21 条，应为 20】。**清零之后必须复查、连续两次读到 0 才算干净**（`truncate_stable`）。与 OID 复用继承上一轮记录是同一类坑的两个来源：一个是上一轮的残留，一个是本轮还没写完 | ✅ 已在 raft_27/28 夹具修正 |
+| **只按【组】判要不要外部化 ⇒ 非 OP_PARWAL 条目静默丢失（2026-08-05 raft_12 判出；⏪ 缺陷与修复都在 E3 里，已随 §0.4 回滚）** | E3 首版对**所有**数据组条目停写 `raft_log`，但只给 `OP_PARWAL` 记 run。数据组还有公开路径 `pg_raft_group_propose(group_id, op_type, payload)` 可提任意 op_type 的条目（raft_12 用的就是 `OP_TEST`），这类条目**在段文件里没有第二份** —— 于是既不在 `raft_log` 也不在 run 里，重启后重建不出来、末端被下调，条目静默丢失。判据本身没有过时：对 `OP_TEST` 条目【行数 == last_log_index】本就该成立，是【OP_PARWAL 的行是冗余的】被错误推广成了【数据组的行都是冗余的】。修复=按 op_type 分流：只有 `OP_PARWAL` 外部化，其余照旧写 `raft_log`；读路径先按 run 重建、取不到再回退 `raft_log` | ✅ 2026-08-05 修 |
+| **follower 落盘失败时末端虚高 ⇒ 可能凭一条并不持有的条目赢下选举（2026-08-05 raft_26 D 段实测抓获；⏪ 该缺陷与它的修复都在 E2/E3 里，已随 §0.4 一并回滚 —— 但 `AppendPartWALRecordAt` 遇空洞是 ereport(ERROR) 而非返回 false 这个事实不变，凡是用它落盘的新代码都要防这一手）** | `data_entry_store()` 里那条 SPI_execute 调的是 `partwal_follower_append`，而 `AppendPartWALRecordAt` 遇到 plsn 空洞是 **ereport(ERROR)** 而非返回 false —— 它直接 longjmp 出整个 RPC 函数，调用点 `if (!data_entry_store(...))` 里的收尾一行都执行不到。于是 follower 的环与 `last_log_index` 已经推进、字节却没落盘，末端反而比 leader 还多一条（实测 follower 28 / leader 27）。危害不在复制（leader 会重发），而在**选举**：日志新旧比较看的就是 `last_log_index`。修复=把落盘包进子事务（`data_entry_store_guarded`）使错误可捕获，捕获后把刚 append 的那一条从环与 run 里撤掉 | ✅ 2026-08-05 修 |
+| **后台追平通道会悄悄填掉用例要测的缺口 ⇒ 假测试（2026-08-05 raft_27 实测；用例已随 §0.4 回滚，教训对任何测「落后多少」的用例都成立）** | TopologyMonitor 每 `catchup_interval_ms` 自触发一轮追平，成员一起来就被补上几十条；等用例测缺口时已从 140 缩到 99，低于环容量 128，于是【只能靠环外重建】的前提不再成立 —— 把重建摘掉也照样通过。**凡是要测【落后多少】的用例，夹具必须先 `catchup_interval_ms=0` 关掉后台通道**，让追平只能由显式调用完成，归因才干净 | ✅ 已在 raft_27 夹具修正 |
 | **按 payload 文本判日志冲突 ⇒ 误截断（2026-08-05 自造并当场修掉）** | `raft_log.payload` 是 **jsonb**，读回来的文本被规范化过（键序、冒号后空格），与 leader 线上发来的原始 JSON 逐字节不等。环外回读一落地，"同 index 但文本不同即冲突"的写法就把**每一条**环外条目判成冲突并截断——实测把控制面日志从 347 条削到 35 条。改回 Raft 原始规则：**冲突只看 term**（同 index 同 term 必出自同一 leader）。同理，重启后 restore 灌回环里的也是规范化文本，环内比文本一样不可靠 | ✅ 已修 |
 | **group-commit 让路窗口使 prepare 的多数派保证失效** | per-backend 触达集合 + 提前返回路径也触发复制挂钩；prepare 语义改为"等 `commit_index` 覆盖本事务记录"（`DTX_2PC_DESIGN.md` §9.1） | ✅ 已修，回归 raft_17（确定性让路构造） |
 | 每分区 Raft group 实现成本高 | 分期落地 P0→P3，控制面保持为组 0 不回退 | ✅ P0–P2 完成 |
@@ -1117,7 +1137,8 @@ leader 的字节追加到**另一个编号**上，再从那个编号读回来比
    冲突。单纯调大会让 shmem 随组数线性膨胀(每组一个 128 条 × 768B 的 ring)，正确解法是
    "数据组日志外部化到 parwal 段文件，shmem 只留游标" —— **设计已于 2026-08-05 定稿，
    见 §11.10**（段式边界表 `raft_log_runs` 提供 term 与 index↔plsn 对应，载荷从
-   `PartWALRecord` 头部重建；分 E1–E4 四期落地）。
+   `PartWALRecord` 头部重建；分 E1–E4 四期落地）。⏪ **该设计目前一件都未落地**：
+   E1–E3 曾实现又于 2026-08-07 整条回滚（§0.4），E4 从未开工。
 3. **组成员集不随 RPC 传播**：自动建组的 follower 成员集为空，按**全体 peers** 算多数派。
    分区副本集是全体节点的**子集**，所以这在真实拓扑下算出的多数派是错的。成员集必须来自
    控制面下发的 `partition_map`，而不是"从收到的报文里听说"。
@@ -1173,11 +1194,17 @@ P0/P1 对应阶段 4 的结构前置;P2 兑现阶段 2→3 过渡中"数据真�
 P3 兑现阶段 3 的多副本同步语义与 §10 审查差距 #1(主从切换落到数据层)。§10 审查差距
 #3(全局身份)即 P0。
 
-### 11.10 数据组日志外部化到 parwal（设计，2026-08-05 定稿）🧊 **整条线已冻结（2026-08-07）**
+### 11.10 数据组日志外部化到 parwal（设计，2026-08-05 定稿）⏪ **整条线已回滚（2026-08-07）**
 
-> 🧊 **冻结声明**：本节 E1–E4 **全部**冻结 —— E1/E2/E3 已合入且回归全绿，**保持原样不动、
-> 不回滚、不继续优化**；E4 **不开工**。冻结的准确范围与"允许/不允许做什么"见 **§0.4**。
-> 本节以下内容作为**设计留档**保留，供理解现有代码，不作为待办清单。
+> ⏪ **回滚声明**：本节 E1–E4 **在代码中一件都不存在**。E1/E2/E3 曾于 2026-08-05/06
+> 落地并通过 raft_26/27/28，已于 2026-08-07 按用户指令整条 `git revert`；E4 从未开工。
+> 回滚范围、运行期影响与验证见 **§0.4**。
+>
+> **本节以下内容是设计留档，不是待办清单，也不描述当前代码。** 保留它有两个用处：
+> 一是里面记录的几条结论是踩坑得来的（`log_index ≡ partition_lsn` 不是不变式、
+> 日志末端不能从段文件推出来、已提交条目的 plsn 天然连续、run 必须随失败回滚一起删），
+> 将来若解冻可直接复用；二是理解"为什么 `RAFT_MAX_GROUPS` 抬不上去"需要这段推导。
+> 各分期下方标注的 ✅ 是**当时**的状态，现已全部回滚 —— 读的时候请以本框为准。
 
 
 §11.5.2 #2 把 `RAFT_MAX_GROUPS = 32` 列为阻断项，并指出正解是"外部化到 parwal 段文件，
@@ -1674,31 +1701,20 @@ L1/R1 的全部成果**，此后各自前进。这是一次真正的双向合并
 | `e2a5a7d` | `reproduce-env.sh` 的 V6 按实际 follower 数自适应 | 4.0 是 1c+8w，**应当采纳** |
 
 **4.0 侧 18 个独有提交**：切主重构（§13）、prepare 接线（§14）、DTX-2PC 第 0–5 步、
-成员集显式化、后台追平通道、控制面压缩 + InstallSnapshot、外部化 E1–E3（🧊 已冻结，§0.4）。
+成员集显式化、后台追平通道、控制面压缩 + InstallSnapshot。
+（外部化 E1–E3 的三个提交也在其中，但已被 2026-08-07 的三个 revert 抵消，
+合并时净效果为零 —— 见 §0.4。）
 
 ### 15.2 ⚠️ 必炸清单（合并后不修就一定坏，按确定性排序）
 
-**#1 `partwal_read_record` 的 OUT 列 `xid` → `gxid`，会直接打死数据组的环外重建。**
+> ⏪ **原 #1 已随外部化回滚而消失（2026-08-07）**。它曾是本清单里唯一"确定会坏"的一条：
+> replay 侧 R2 把 `partwal_read_record` 的 OUT 列 `xid` 改名 `gxid`，而本线 E1 引入的
+> `pg_raft_entry_from_parwal()` 硬编码了 `w.xid`，合并后必报"列不存在"、数据组环外
+> 重建全线失效。**该函数现已随 E1 一并删除，冲突点不复存在**，`partwal_read_record`
+> 的调用方回到只有 C 代码一处（`data_entry_fetch_hex`，按列序号取值，改名不影响）。
+> 保留这段记录，是因为若将来解冻外部化，这个坑会原样回来。
 
-replay 侧 R2 把记录头的 `TransactionId xid`（32 位）换成了
-`GlobalTransactionId gxid`（64 位，`(node_id << 48) | local_xid`），
-`partwal_read_record` 的输出列随之改名。而本线 E1 引入的
-`pg_raft_entry_from_parwal()`（`pg-raft-src/sql/pg_raft--1.0.sql`，另有一份同名定义在
-`pg-raft-src/setup-raft.sh`）里**硬编码了 `w.xid`**：
-
-```sql
-format('{"partition_lsn":%s,"orig_lsn":"%s","rmid":%s,"info":%s,'
-       '"xid":%s,"nbytes":%s,"flags":%s}',
-       ..., w.orig_lsn::text, w.rmid, w.info, w.xid, length(w.data), w.flags)
-```
-
-合并后这句会**报"列 w.xid 不存在"**，于是数据组的环外条目一条也重建不出来 ——
-而 E2/E3 之后数据组**只认段文件**（不再回落 `raft_log`），后果是：落后超过
-`RAFT_LOG_CAPACITY=128` 的成员永远追不平，重启恢复时末端被一路下调。
-**两处定义都要改**，字段名同时改成 `gxid`（replay 侧 `data_propose_one` 的解析已按
-名字匹配，并对老的 `,"xid"` 做了兜底，所以改名是安全的）。
-
-**#2 `PARTWAL_FLAG_CLASS_MASK` 不含 DTX 位，会把 DTX 记录喂给 `rm_redo`。**
+**#1 `PARTWAL_FLAG_CLASS_MASK` 不含 DTX 位，会把 DTX 记录喂给 `rm_redo`。**
 
 - replay 侧：`PARTWAL_FLAG_CLASS_MASK = 0x07`（DATA/MARKER/CTRL），
   `PartWALRecordIsData(rec)` = `(flags & (MARKER|CTRL)) == 0`
@@ -1710,7 +1726,7 @@ format('{"partition_lsn":%s,"orig_lsn":"%s","rmid":%s,"info":%s,'
 `XLogRecord` 送进 `GetRmgr(rmid).rm_redo` —— 直接 PANIC 或写坏数据页。
 另外注意两边的宏名不同（`CLASS_MASK` vs `NON_DATA_MASK`），机械合并容易只留一个。
 
-**#3 `PartWALRecord` 尾部 8 字节的含义在两个版本间不同，混版段文件会读出垃圾。**
+**#2 `PartWALRecord` 尾部 8 字节的含义在两个版本间不同，混版段文件会读出垃圾。**
 
 两边 `sizeof(PartWALRecord)` **都是 40 字节**（4.0 侧 36 字节字段 + 4 字节尾部填充），
 但偏移 32–39 的含义不同：
@@ -1725,16 +1741,18 @@ format('{"partition_lsn":%s,"orig_lsn":"%s","rmid":%s,"info":%s,'
 **合并后首次启动前建议清空 `pg_parwal/`**：跨版本混流的段文件没有真实价值，
 留着只会制造难查的偶发。
 
-**#4 `raft_consensus.c` 双向修改同一处 —— 但语义一致，别机械选边。**
+**#3 `raft_consensus.c` 双向修改同一处 —— 但语义一致，别机械选边。**
 
 replay 侧 `6624c08` 也改了 `data_propose_one`：描述符从 `{...,"xid":T,...}` 变成
-`{...,"flags":F,"gxid":G,...}`，**并且独立修掉了与本线 `6181655` 相同的那个
+`{...,"flags":F,"gxid":G,...}`，**并且独立修掉了与本线 `97d5421` 相同的那个
 `partwal_read_record` 返回全 NULL 行导致 `TextDatumGetCString(NULL)` SIGSEGV 打死节点
-的缺陷**（两边注释几乎逐字相同）。合并时取 replay 侧的字段方案 + 本线的其余改动，
-**不要**因为"两边都改了同一段"就整块选一边 —— 本线在同一文件里还有切主、追平通道、
-外部化 E1–E3 的大量改动。
+的缺陷**（两边注释几乎逐字相同）。**这个修复在本线属于 2PC 第 1b 步、不属于外部化，
+2026-08-07 的回滚没有碰它**（已复核：`raft_consensus.c` 里逐列判 NULL 与
+"拷出 SPI 上下文"两处都在）。合并时取 replay 侧的字段方案 + 本线的其余改动，
+**不要**因为"两边都改了同一段"就整块选一边 —— 本线在同一文件里还有切主、
+追平通道、DTX-2PC 的大量改动。
 
-**#5 `partwal_sync.c` 是最难的一处冲突（replay +527 行，4.0 侧重写了 `PartWALFlush`）。**
+**#4 `partwal_sync.c` 是最难的一处冲突（replay +527 行，4.0 侧重写了 `PartWALFlush`）。**
 
 本线在 `PartWALFlush` 里做的是正确性修复（§9.1 group-commit 让路窗口：提前返回路径
 也必须调复制挂钩、触达集合改 per-backend 记录），replay 侧做的是 R2 事务层接线。
@@ -1746,7 +1764,7 @@ replay 侧 `6624c08` 也改了 `data_propose_one`：描述符从 `{...,"xid":T,.
 这条不变式一旦破掉，症状是"PREPARE 返回成功但字节从未达多数派"，
 测试**未必**当场变红（`DTX_2PC_DESIGN.md` §9.1 记录了它当初是怎么潜伏的）。
 
-**#6 `CTRL` 分类在两边的状态相反。**
+**#5 `CTRL` 分类在两边的状态相反。**
 
 本线文档一直写"`PARTWAL_FLAG_CTRL` 是零使用点的预留位"——这在 4.0 分支上属实，
 但 replay 侧 D1/D2 已经在用它承载 `FILESET_UPDATE` / `FREEZE_UPDATE`。
@@ -1756,15 +1774,15 @@ replay 侧 `6624c08` 也改了 `data_propose_one`：描述符从 `{...,"xid":T,.
 
 | 文件 | 冲突性质 | 原则 |
 |---|---|---|
-| `include/partition_wal_header.h` | 头格式 v2 vs v3、flags 位空间 | **取 replay 的 v3 头 + 本线的 DTX 位**，判定宏取并集（§15.2 #2/#3） |
+| `include/partition_wal_header.h` | 头格式 v2 vs v3、flags 位空间 | **取 replay 的 v3 头 + 本线的 DTX 位**，判定宏取并集（§15.2 #1/#2） |
 | `src/wal/partwal_sync.c` | 双向大改同一函数 | 逐段人工合并，事后验 [A]<[B] 不变式（§15.2 #5） |
 | `src/raft_consensus.c` | 双向大改 | 取 replay 的描述符字段方案，其余保留本线（§15.2 #4） |
-| `sql/pg_partdist--1.0.sql`、`sql/pg_raft--1.0.sql`、`setup-raft.sh` | OUT 列改名连锁 | 全仓库搜 `w.xid` / `"xid":` 并改 `gxid`（§15.2 #1） |
+| `sql/pg_partdist--1.0.sql` | R2 改了 `partwal_read_record` 的 OUT 列名 | 取 replay 侧。⏪ 外部化回滚后 SQL 侧**已无**依赖该列名的调用方，连锁改动消失 |
 | `src/raft_boundary.c` | 两边都加了写入路径 | 取并集：DTX 记录写入（本线）+ CTRL 记录写入（replay） |
 | `pg-install/`、`patches/` | 两边各自补过 | **取 replay 的 `4740239`**：它带 `scripts/check_pg_install_patched.sh` 前置自检，比本线 `468a518` 的做法更稳 |
 | `pg-raft-src/reproduce-env.sh` | V6 断言 | 取 replay 的自适应版本（`e2a5a7d`），4.0 是 1c+8w 拓扑 |
 | `docs/*.md` | 各自追加 | **全部保留双方内容**，不要相互覆盖 |
-| 外部化相关（`raft_log_runs`、`pg_raft_entry_from_parwal`、hardstate v4） | — | 🧊 **按 §0.4 保留 4.0 侧现状**，除 §15.2 #1 那处必修 |
+| 外部化相关（`raft_log_runs`、`pg_raft_entry_from_parwal`、hardstate v4） | — | ⏪ **不存在**：已整条回滚（§0.4）。若合并时冒出这些名字，说明选错了 revert 前的版本 |
 
 ### 15.4 合并后的验收门槛
 
@@ -1772,9 +1790,10 @@ replay 侧 `6624c08` 也改了 `data_propose_one`：描述符从 `{...,"xid":T,.
 
 1. 编译：`pg_partdist` + `pg_raft` 干净编过（注意 `docker cp` 的 mtime 陷阱 —— cp 后必须
    `touch` 再 `make`，否则装的是旧 `.so`）；`make install` 之后**必须重启节点**。
-2. `pg-raft-src/test_shard_identity_p0.sh` —— **10/10**（需环境里已存在分布式表）。
-3. `pg-raft-src/run-raft-tests.sh` —— **59/59**（1c+8w）。其中 raft_26/27/28 直接验
-   §15.2 #1：那处不改就必红。
+2. `pg-raft-src/test_shard_identity_p0.sh` —— **10/10**（需环境里已存在分布式表；
+   raft 套件末尾会 DROP 掉自建的分布式表，所以要先建一张再跑）。
+3. `pg-raft-src/run-raft-tests.sh` —— **56/56**（1c+8w）。
+   注意用 `CONTAINER=pg-citus-raft-container` 覆盖，默认值是 raft4 环境的容器名。
 4. replay 侧的 `pg-partdist-src/tests/`：`test_lazy_replay_l1.sh`、
    `test_follower_replay_r1.sh`、`test_txn_layer_r2.sh`、`test_ddl_fileset_d1.sh`、
    `test_freeze_sync_d2.sh`、`test_local_wal_conflict.sh`。
