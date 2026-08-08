@@ -1122,6 +1122,20 @@ _PG_init(void)
                             &pg_raft_dtx_recover_timeout_ms, 30000, 1000, 3600000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomIntVariable("pg_raft.promote_catchup_slice_ms",
+                            "升主前置每个 BGW tick 最多推进多久的物理回放追平。",
+                            "切片是为了不让追平久占 tick —— 同一个 tick 还要给其余各组"
+                            "发心跳，久占会触发别组的无谓改选。没追完下个 tick 接着追。",
+                            &pg_raft_promote_catchup_slice_ms, 2000, 100, 60000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.promote_catchup_deadline_ms",
+                            "升主前置累计超过该时长仍未追平时，按可用性优先放行上报。",
+                            "追不平就永不上报会让分片永久无主，比读到旧数据更糟。"
+                            "放行时打 WARNING，把这个取舍显式化。设 0 表示永不放行。",
+                            &pg_raft_promote_catchup_deadline_ms, 60000, 0, 3600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     /*
      * DTX-2PC 接线（DTX_2PC_DESIGN.md §9.3）：
      *   pre_record_commit_hook   —— 内核补丁 0004 开的挂点，master 侧做决议；

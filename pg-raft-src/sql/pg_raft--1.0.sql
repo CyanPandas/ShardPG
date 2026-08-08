@@ -347,3 +347,79 @@ $fn$;
 
 COMMENT ON FUNCTION pg_raft_group_reset() IS
     '清空本节点全部数据面 Raft 组(shmem 状态 + HardState 文件 + 注册表 + 日志);控制面 group 0 不受影响。';
+
+-- ------------------------------------------------------------------
+-- 升主前置：与惰性回放 promotion 路径合流（DTX_2PC_DESIGN.md §0.0 第 6 步 a）
+-- ------------------------------------------------------------------
+--
+-- 数据组自治选举胜出之后、**向控制面上报之前**调用（调用点在
+-- raft_consensus.c 的 data_group_try_report）。返回 false 表示"还不能上报"，
+-- 调用方保留 report_pending、下个 tick 重试。
+--
+-- 为什么放在上报之前而不是 group 0 的 apply 里：
+--   a) apply 里做追平会**阻塞整个控制面** —— 惰性回放平时一条 redo 都不做，
+--      升主时的积压可能很大，group 0 是串行 apply 的，一卡全卡；
+--   b) 放在上报前，"追不平就不上报"天然等价于"追不平就不翻 pg_dist_placement"，
+--      而路由正是在 apply 里紧跟着登记翻的（raft_apply.c）。顺序天生正确。
+--
+-- 每次调用只推进最多 p_timeout_ms 毫秒（BGW tick 还要发心跳，不能久占），
+-- 没追平就返回 false 等下一 tick 继续 —— 分片切成小片，心跳不受影响。
+CREATE OR REPLACE FUNCTION pg_raft_promote_prepare(
+    p_group_id BIGINT,
+    p_timeout_ms INTEGER DEFAULT 2000)
+    RETURNS BOOLEAN
+    LANGUAGE plpgsql VOLATILE
+AS $promo$
+DECLARE
+    loid    OID;
+    is_armed BOOLEAN;
+    app     BIGINT;
+    bound   BIGINT;
+    got     BIGINT;
+BEGIN
+    loid := partdist.local_partition_for_shard(p_group_id);
+    IF loid IS NULL OR loid = 0 THEN
+        RETURN true;            -- 本节点没有该分片，无事可做
+    END IF;
+
+    SELECT s.armed, s.applied INTO is_armed, app
+      FROM partdist.replay_status() s WHERE s.shard = loid;
+    IF NOT FOUND OR is_armed IS NOT TRUE THEN
+        -- 本节点没有该分片的副本回放配置（没 replay_set_locmap / 没 arm）。
+        -- 这不是错误：它可能一直就是该组的 leader，或副本回放尚未启用。
+        RETURN true;
+    END IF;
+
+    -- 追平上界取 Raft 已提交位点，绝不碰未提交条目（惰性回放的核心不变式）。
+    bound := partdist.get_follower_applied_part_lsn(loid);
+    IF bound IS NULL THEN bound := 0; END IF;
+
+    IF bound > app THEN
+        BEGIN
+            got := partdist.replay_catchup(loid::regclass, bound, p_timeout_ms);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主追平 shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+            RETURN false;
+        END;
+        IF got IS NULL OR got < bound THEN
+            RETURN false;       -- 这一片没追完，下个 tick 接着追
+        END IF;
+    END IF;
+
+    -- 追平之后才闭合 in-doubt：判决要按已回放到位的流来求，顺序不能反。
+    -- 尽力而为 —— 闭合失败不该把一个已经追平的副本挡在升主之外，
+    -- 恢复守护（dtx_recover_prepared）随后仍会周期性重试。
+    BEGIN
+        PERFORM partdist.dtx_close_indoubt(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主闭合 in-doubt shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+
+    RETURN true;
+END
+$promo$;
+
+COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
+    '升主前置：把本节点该分片的物理回放追平到 Raft 已提交位点，再闭合 in-doubt 分布式事务。返回 false 表示尚未追平，调用方应稍后重试而不要上报为新主。';

@@ -81,6 +81,8 @@ extern bool pg_raft_any_group_leader_local(void);
 extern bool pg_raft_dtx_2pc_enabled;
 extern int  pg_raft_dtx_recover_interval_ms;
 extern int  pg_raft_dtx_recover_timeout_ms;
+extern int  pg_raft_promote_catchup_slice_ms;
+extern int  pg_raft_promote_catchup_deadline_ms;
 extern void pg_raft_dtx_install_hooks(void);
 extern bool pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
                                          const int64 *gsids, int ngsids);

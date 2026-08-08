@@ -661,6 +661,33 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
 #define PARTWAL_WRITER_CACHE_MAX  32
 
 /*
+ * 排空顺序的排序缓冲与比较器（见 PartWALFlush 里 drain_order 的长注释）。
+ *
+ * 数组是文件级 static 而不是栈上变量：PARTWAL_BUFFER_SLOTS 条 int 有 32KB，
+ * 放栈上太大；也不能 palloc —— 这段代码持 PartWALCtl->lock，而本文件的规矩是
+ * 锁下不 palloc。static 在这里安全：PartWALFlush 全程持排他锁，同一进程内
+ * 不会重入，跨进程各有各的副本。
+ */
+static int drain_order[PARTWAL_BUFFER_SLOTS];
+
+static int
+PartWALSlotCmp(const void *a, const void *b)
+{
+    const PartWALSlot *sa = &PartWALCtl->slots[*(const int *) a];
+    const PartWALSlot *sb = &PartWALCtl->slots[*(const int *) b];
+
+    if (sa->orig_lsn < sb->orig_lsn)
+        return -1;
+    if (sa->orig_lsn > sb->orig_lsn)
+        return 1;
+    if (sa->start_lsn < sb->start_lsn)
+        return -1;
+    if (sa->start_lsn > sb->start_lsn)
+        return 1;
+    return 0;
+}
+
+/*
  * PartWALBuildTxnMarker — 组装本事务的 MARKER 载荷（FRD §4.3）。
  *
  * 返回 palloc 出来的缓冲区，*out_len 是 24 + 4*nsubxacts。
@@ -1027,17 +1054,42 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
 
     PG_TRY();
     {
+        /*
+         * ★ 排空顺序必须按 orig_lsn，不能按环槽下标（2026-08-08 修）。
+         *
+         * write_pos 每 PARTWAL_BUFFER_SLOTS 条回绕一次。一笔事务的记录跨过
+         * 下标 0 时（例如占了 8190、8191、0、1 四个槽），按下标遍历会**先**
+         * 排空 0、1 —— 而那两条的 orig_lsn 更大。于是更新的 WAL 记录拿到更小的
+         * partition_lsn，段号又由 orig_lsn 换算，结果是"段文件名升序 ≠ plsn 升序"。
+         *
+         * 回放器有 qsort 兜底不受影响，但 TruncatePartWALTo / partwal_find_record /
+         * GetLastWrittenPartitionLSN 三处都硬依赖那个不变式：倒置会让截断删掉
+         * 本该保留的记录，留下永久空洞，replay worker 从此无限重启。
+         *
+         * 排序键取 (orig_lsn, start_lsn)：同一条 WAL 记录可能命中多个分区各占
+         * 一个槽，orig_lsn 相同，用 start_lsn 兜底保持确定性。
+         */
+        int  nsorted = 0;
+
         for (i = 0; drain_needed && i < PARTWAL_BUFFER_SLOTS; i++)
         {
-            PartWALSlot        *slot = &PartWALCtl->slots[i];
-            PartitionWALWriter *writer = NULL;
-            int                 j;
-            bool                cache_it;
+            PartWALSlot *slot = &PartWALCtl->slots[i];
 
             if (!slot->valid)
                 continue;
             if (slot->orig_lsn > upto_lsn)
                 continue;
+            drain_order[nsorted++] = i;
+        }
+        if (nsorted > 1)
+            qsort(drain_order, nsorted, sizeof(int), PartWALSlotCmp);
+
+        for (i = 0; i < nsorted; i++)
+        {
+            PartWALSlot        *slot = &PartWALCtl->slots[drain_order[i]];
+            PartitionWALWriter *writer = NULL;
+            int                 j;
+            bool                cache_it;
 
             /* Look for cached writer for this partition */
             for (j = 0; j < ncached; j++)

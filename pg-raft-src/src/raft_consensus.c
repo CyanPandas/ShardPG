@@ -211,6 +211,9 @@ bool  pg_raft_raft_enabled = false;
 bool  pg_raft_dtx_2pc_enabled = true;
 int   pg_raft_dtx_recover_interval_ms = 10000;
 int   pg_raft_dtx_recover_timeout_ms  = 30000;
+/* 升主前置：每 tick 最多推进多久 / 多久之后按可用性优先放行（见 data_group_promote_prepare） */
+int   pg_raft_promote_catchup_slice_ms    = 2000;
+int   pg_raft_promote_catchup_deadline_ms = 60000;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
@@ -2782,6 +2785,111 @@ send_heartbeats(RaftGroupCtx *ctx)
 /* ---- 选举 ---- */
 
 /*
+ * data_group_promote_prepare — 上报前把本节点该分片"准备成主"。
+ *
+ * 做两件事（实现在 partdist.pg_raft_promote_prepare，见 pg_raft--1.0.sql）：
+ * 把惰性回放追平到 Raft 已提交位点、闭合 in-doubt 分布式事务。
+ *
+ * 三个约束决定了它必须长这样：
+ *   a) 本函数跑在 BGW tick 里，**没有 SPI**，只能走 libpq 自连接（与 DTX 参与
+ *      登记、恢复守护跑 COMMIT PREPARED 同一手法）；
+ *   b) tick 还要给其余各组发心跳，**不能久占** —— 所以每次只推进
+ *      pg_raft.promote_catchup_slice_ms 毫秒，没追完返回 false，下个 tick 接着追。
+ *      惰性回放平时一条 redo 都不做，升主时的积压可能很大，必须切片；
+ *   c) 追不平就永不上报会让分片**永久无主**，比读到旧数据更糟。所以设
+ *      pg_raft.promote_catchup_deadline_ms 兜底：超过它就带 WARNING 放行，
+ *      把"可用性优先"这个取舍显式化，而不是让它静默发生。
+ *
+ * 截止期按 (group_id, 首次尝试时刻) 记在 BGW 进程本地 —— 单进程、组数有上限，
+ * 不值得为它动共享内存结构。进程重启即重新计时，语义上等价于重新开始追平。
+ */
+static bool
+data_group_promote_prepare(int64 group_id)
+{
+    static struct {
+        int64       group_id;
+        TimestampTz first_try;
+    } deadline_state[RAFT_MAX_GROUPS];
+    static bool  deadline_init = false;
+
+    PGconn      *conn;
+    PGresult    *res;
+    char         selfconn[256];
+    char         sql[256];
+    bool         ok = false;
+    int          i;
+    int          slot = -1;
+    int          free_slot = -1;
+    TimestampTz  now = GetCurrentTimestamp();
+
+    if (!deadline_init)
+    {
+        memset(deadline_state, 0, sizeof(deadline_state));
+        deadline_init = true;
+    }
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        if (deadline_state[i].group_id == group_id)
+        {
+            slot = i;
+            break;
+        }
+        if (free_slot < 0 && deadline_state[i].group_id == 0)
+            free_slot = i;
+    }
+    if (slot < 0 && free_slot >= 0)
+    {
+        slot = free_slot;
+        deadline_state[slot].group_id = group_id;
+        deadline_state[slot].first_try = now;
+    }
+
+    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
+    conn = PQconnectdb(selfconn);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        elog(WARNING, "pg_raft: 升主前置连回本节点失败: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    snprintf(sql, sizeof(sql),
+             "SELECT partdist.pg_raft_promote_prepare(%lld, %d)",
+             (long long) group_id, pg_raft_promote_catchup_slice_ms);
+
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        ok = (PQgetvalue(res, 0, 0)[0] == 't');
+    else
+        elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
+             (long long) group_id, PQerrorMessage(conn));
+    PQclear(res);
+    PQfinish(conn);
+
+    if (ok)
+    {
+        if (slot >= 0)
+            deadline_state[slot].group_id = 0;   /* 释放，下次升主重新计时 */
+        return true;
+    }
+
+    if (slot >= 0 &&
+        TimestampDifferenceExceeds(deadline_state[slot].first_try, now,
+                                   pg_raft_promote_catchup_deadline_ms))
+    {
+        elog(WARNING,
+             "pg_raft: 组 %lld 升主前置超过 %d ms 仍未完成，按可用性优先放行上报"
+             "（该副本可能尚未追平，升主后读到的可能是旧数据）",
+             (long long) group_id, pg_raft_promote_catchup_deadline_ms);
+        deadline_state[slot].group_id = 0;
+        return true;
+    }
+
+    return false;
+}
+
+/*
  * 数据组新任 leader 向控制面登记（切主重构的上报半程）。
  *
  * BGW tick 上下文无 SPI，投递走 libpq：向 group 0 当前 leader（常态是 master）
@@ -2824,6 +2932,17 @@ data_group_try_report(RaftGroupCtx *ctx)
     SpinLockRelease(&ctx0.cons->mutex);
     if (leader0 <= 0)
         return;                 /* 控制面暂无主，下个 tick 重试 */
+
+    /*
+     * ★ 与惰性回放 promotion 路径合流（DTX_2PC_DESIGN.md §0.0 第 6 步 a）。
+     *
+     * 上报**之前**先把本节点该分片的物理回放追平到 Raft 已提交位点，并闭合
+     * in-doubt 分布式事务。没做完就不上报 —— 控制面 apply 是"登记 partition_map
+     * → 翻 pg_dist_placement"一气呵成的，不上报就等于不翻路由，
+     * "追不平不对外服务"这条承诺由此天然成立，且完全不阻塞 group 0。
+     */
+    if (!data_group_promote_prepare(ctx->group_id))
+        return;                 /* 还没追平/闭合完，保留 report_pending 下个 tick 继续 */
 
     /*
      * secondaries = 本组成员集去掉自己。成员集未知（hearsay 自动建组，members
@@ -6758,6 +6877,101 @@ typedef struct DtxNodeAddr
     int  port;
 } DtxNodeAddr;
 
+/*
+ * dtx_master_try_write_abort — 尽力在协调组写一条**显式** ABORT 决议。
+ *
+ * 何时该调：master 已经把 coord_gsid 下发给全体参与者、但决议没能做成的
+ * 每一条失败出口。此后参与者收尾时会去协调组问决议；有这条显式记录，
+ * 它们当场就能得到 ABORT，不必等恢复守护的超时（pg_raft.dtx_recover_timeout_ms，
+ * 默认 30s）到点后由 dtx_status 反向把 ABORT 创造出来。
+ *
+ * **纯优化，不是正确性所必需**：写不成也没关系，presumed abort 兜底
+ * （DTX_2PC_DESIGN.md §2.2/§7）—— 决议槽一次性，先到的那条获胜，
+ * 这里写的 ABORT 与恢复路径后来写的 ABORT 是同一个结论。
+ *
+ * 因此全程吞掉错误：调用点马上就要 ereport(ERROR) 抛出真正的失败原因，
+ * 不能让"补写 ABORT 失败"这种次要错误把它盖掉。
+ *
+ * 覆盖不到的一类失败要说清楚：**参与者 prepare 失败**时 master 的
+ * CommitTransaction() 根本没走到，本函数所在的 pre_record_commit_hook
+ * 从不触发。那条路径不需要决议 —— Citus 会同步对全体已 prepared 的连接发
+ * ROLLBACK PREPARED，没有参与者会滞留 in-doubt（除非它同时崩溃，
+ * 而那正是 presumed abort 的适用场景）。
+ */
+static void
+dtx_master_try_write_abort(int64 coord_gsid, int64 dtxid,
+                           const int64 *parts, int nparts)
+{
+    PG_TRY();
+    {
+        bool  spi_owned;
+        int   coord_node = 0;
+        int   slot = -1;
+        int   i;
+        char  qry[512];
+        char *r;
+        int   n;
+        StringInfoData s;
+
+        if (!raft_persist_spi_begin(&spi_owned))
+            return;
+        initStringInfo(&s);
+        appendStringInfo(&s,
+                         "SELECT primary_node FROM partdist.partition_map "
+                         " WHERE partition_id = %llu::oid",
+                         (unsigned long long) coord_gsid);
+        if (SPI_execute(s.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            bool  isnull;
+            Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                    SPI_tuptable->tupdesc, 1, &isnull);
+
+            if (!isnull)
+                coord_node = DatumGetInt32(d);
+        }
+        pfree(s.data);
+        raft_persist_spi_end(spi_owned);
+
+        if (coord_node <= 0)
+            return;
+
+        parse_peers();
+        for (i = 0; i < n_peers; i++)
+            if (peers[i].node_id == coord_node)
+            {
+                slot = i;
+                break;
+            }
+        if (slot < 0)
+            return;
+
+        n = snprintf(qry, sizeof(qry),
+                     "SELECT partdist.dtx_decide(%lld, %lld, 2, ARRAY[",
+                     (long long) coord_gsid, (long long) dtxid);
+        for (i = 0; i < nparts && n < (int) sizeof(qry) - 32; i++)
+            n += snprintf(qry + n, sizeof(qry) - n, "%s%lld",
+                          (i == 0) ? "" : ",", (long long) parts[i]);
+        snprintf(qry + n, sizeof(qry) - n, "]::bigint[])");
+
+        r = dtx_remote_scalar(peers[slot].host, peers[slot].port, qry);
+        if (r != NULL)
+        {
+            elog(LOG, "pg_raft: dtx %lld 已写入显式 ABORT 决议（协调组 %lld，verdict=%s）",
+                 (long long) dtxid, (long long) coord_gsid, r);
+            pfree(r);
+        }
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+        elog(LOG,
+             "pg_raft: dtx %lld 补写显式 ABORT 决议未成功，退回推定中止"
+             "（参与者将在恢复守护超时后从协调组取到 ABORT）",
+             (long long) dtxid);
+    }
+    PG_END_TRY();
+}
+
 static void
 dtx_master_pre_record_commit(void)
 {
@@ -6882,6 +7096,7 @@ dtx_master_pre_record_commit(void)
 
     /*
      * 快路径（§3.4）：写集 ≤ 1 个分区组时不做决议。
+     * （下面 dtx_master_try_write_abort 的前置声明见文件上方。）
      * 0 组 = 没写任何纳管分片（退化为接线前行为）；
      * 1 组 = 该组自己的 quorum 已经覆盖本事务的全部数据，再走一轮决议没有
      * 任何额外保证，只有额外延迟。
@@ -6906,6 +7121,13 @@ dtx_master_pre_record_commit(void)
             pfree(r);
     }
 
+    /*
+     * 从这里往下，coord_gsid 已经下发给全体参与者了 —— 它们此后一旦需要收尾，
+     * 会去协调组问决议。所以本段的**每一条失败出口**都要先尽力写一条显式
+     * ABORT 决议再抛错，否则参与者只能等恢复守护的超时（默认 30s）到点后
+     * 由 dtx_status 反向把 ABORT 创造出来。语义两者相同，差的是这段等待。
+     */
+
     /* ---- 4) 到协调组现任 leader 上做决议 ---- */
     if (!raft_persist_spi_begin(&spi_owned))
         ereport(ERROR,
@@ -6928,11 +7150,14 @@ dtx_master_pre_record_commit(void)
     raft_persist_spi_end(spi_owned);
 
     if (coord_node <= 0)
+    {
+        dtx_master_try_write_abort(coord_gsid, dtxid, parts, nparts);
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_raft: 分布式事务 %lld 的协调组 %lld 查不到现任 leader",
                         (long long) dtxid, (long long) coord_gsid),
                  errdetail("partdist.partition_map 尚未追平该组的主节点登记。")));
+    }
 
     parse_peers();
     {
@@ -6948,9 +7173,12 @@ dtx_master_pre_record_commit(void)
                 break;
             }
         if (slot < 0)
+        {
+            dtx_master_try_write_abort(coord_gsid, dtxid, parts, nparts);
             ereport(ERROR,
                     (errmsg("pg_raft: 协调组 %lld 的 leader 节点 %d 不在 pg_raft.peers 里",
                             (long long) coord_gsid, coord_node)));
+        }
 
         n = snprintf(qry, sizeof(qry),
                      "SELECT partdist.dtx_decide(%lld, %lld, 1, ARRAY[",
@@ -6962,11 +7190,14 @@ dtx_master_pre_record_commit(void)
 
         r = dtx_remote_scalar(peers[slot].host, peers[slot].port, qry);
         if (r == NULL)
+        {
+            dtx_master_try_write_abort(coord_gsid, dtxid, parts, nparts);
             ereport(ERROR,
                     (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                      errmsg("pg_raft: 节点 %d 不是协调组 %lld 的 leader，无法做决议",
                             coord_node, (long long) coord_gsid),
                      errhint("协调组正在选举或 partition_map 未追平；重试本事务即可。")));
+        }
         verdict = atoi(r);
         pfree(r);
     }
