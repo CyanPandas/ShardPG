@@ -179,6 +179,22 @@ kinds_of() {
                    partdist.local_partition_for_shard($2), g) d ON true;"
 }
 
+# 只取 DTX 记录的 kind 序列。
+#
+# ★ 收尾断言必须用这个而不是 kinds_of：2PC 的两段式事务标记（MARKER 类，
+# DTX_2PC_DESIGN.md §3.3 阶段 3）会紧跟在 DTX_PREPARE / DTX_COMMIT 之后落进
+# 同一条流，在 kinds_of 里显示为 '0'，于是全序列变成 ...,1,0,3,0 —— 用
+# "以 ,1,3 收尾" 去匹配必然失败。要验的是 **DTX 子序列**的三阶段顺序，
+# 标记的存在与否由 tests/test_dtx_commit_marker_tx2.sh 专门覆盖。
+dtx_kinds_of() {
+  q "$1" "SELECT string_agg(d.kind::text, ',' ORDER BY g)
+            FROM generate_series($3::bigint + 1, partdist.get_partition_flush_lsn(
+                   partdist.local_partition_for_shard($2))) g
+            JOIN LATERAL partdist.partwal_read_dtx_record(
+                   partdist.local_partition_for_shard($2), g) d ON true
+           WHERE d.kind IS NOT NULL;"
+}
+
 BASE0=$(plsn_of "${PORTS[0]}" "${GIDS[0]}")
 BASE1=$(plsn_of "${PORTS[1]}" "${GIDS[1]}")
 
@@ -240,11 +256,17 @@ BASE_COORD=$([[ $COORD_IDX -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
 BASE_PART=$([[ $PART_IDX  -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
 K_COORD=$(kinds_of "${PORTS[$COORD_IDX]}" "${GIDS[$COORD_IDX]}" "$BASE_COORD")
 K_PART=$(kinds_of  "${PORTS[$PART_IDX]}"  "${GIDS[$PART_IDX]}"  "$BASE_PART")
+D_COORD=$(dtx_kinds_of "${PORTS[$COORD_IDX]}" "${GIDS[$COORD_IDX]}" "$BASE_COORD")
+D_PART=$(dtx_kinds_of  "${PORTS[$PART_IDX]}"  "${GIDS[$PART_IDX]}"  "$BASE_PART")
 
-[[ "$K_PART" == *",1,3" ]] \
-  || fail "C: 参与组的 kind 序列应以 DATA...,PREPARE(1),COMMIT(3) 收尾，实际 '${K_PART}'"
-[[ "$K_COORD" == *",1,2" ]] \
-  || fail "C: 协调组的 kind 序列应以 DATA...,PREPARE(1),DECISION(2) 收尾，实际 '${K_COORD}'"
+# DTX 子序列的三阶段顺序（标记记录不参与，见 dtx_kinds_of 的注释）
+[[ "$D_PART" == "1,3" ]] \
+  || fail "C: 参与组的 DTX 序列应为 PREPARE(1),COMMIT(3)，实际 '${D_PART}'（全序列 '${K_PART}'）"
+[[ "$D_COORD" == "1,2" ]] \
+  || fail "C: 协调组的 DTX 序列应为 PREPARE(1),DECISION(2)，实际 '${D_COORD}'（全序列 '${K_COORD}'）"
+# DATA 必须排在第一条 DTX 记录之前（原断言里 ",1" 前缀所表达的语义）
+[[ "$K_PART" == 0,* ]] \
+  || fail "C: 参与组流内第一条应是 DATA 记录，实际全序列 '${K_PART}'"
 [[ "$K_COORD" != *",3"* ]] \
   || fail "C: 协调组不应另写 DTX_COMMIT 标记（§5.3 DECISION 兼任），实际 '${K_COORD}'"
 [[ "${K_PART%%,*}" == "0" && "${K_COORD%%,*}" == "0" ]] \

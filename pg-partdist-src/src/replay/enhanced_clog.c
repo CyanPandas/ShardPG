@@ -33,6 +33,7 @@
 
 #include "enhanced_clog.h"
 
+#include "access/transam.h"      /* InvalidTransactionId */
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/memutils.h"
@@ -158,6 +159,15 @@ EnhancedClogWriteStatus(GlobalTransactionId gxid,
                         uint64 start_ts, uint64 commit_ts,
                         TxnStatus status)
 {
+    EnhancedClogWriteStatusWithParent(gxid, start_ts, commit_ts, status,
+                                      InvalidTransactionId);
+}
+
+void
+EnhancedClogWriteStatusWithParent(GlobalTransactionId gxid,
+                                  uint64 start_ts, uint64 commit_ts,
+                                  TxnStatus status, TransactionId parent_xid)
+{
     uint16            node_id = GxidNodeId(gxid);
     uint64            local_xid = GxidLocalXid(gxid);
     uint32            segno;
@@ -172,10 +182,11 @@ EnhancedClogWriteStatus(GlobalTransactionId gxid,
     segno = (uint32) (local_xid / GCLOG_XIDS_PER_SEGMENT);
     off   = (off_t) (local_xid % GCLOG_XIDS_PER_SEGMENT) * GCLOG_SLOT_SIZE;
 
-    memset(&slot, 0, sizeof(slot));   /* reserved 与任何将来字段都归零 */
-    slot.start_ts  = start_ts;
-    slot.commit_ts = commit_ts;
-    slot.status    = (uint32) status;
+    memset(&slot, 0, sizeof(slot));   /* 任何将来字段都归零 */
+    slot.start_ts   = start_ts;
+    slot.commit_ts  = commit_ts;
+    slot.status     = (uint32) status;
+    slot.parent_xid = (uint32) parent_xid;
 
     fd = GClogOpenSegFile(node_id, segno, true);
 
@@ -239,6 +250,45 @@ EnhancedClogReadStatus(GlobalTransactionId gxid, TxnStatus *status,
 
     if (nb == 0)
         return true;            /* 读到文件尾之外 = 洞 */
+
+    /*
+     * 子事务的判决跟随顶层（见 enhanced_clog.h 里 parent_xid 的注释）。
+     * 只跳一层：xactGetCommittedChildren() 给的是拍平的全部后代，
+     * 所以任何子事务的 parent_xid 都直接指向顶层，不存在链式嵌套。
+     * 顶层若仍是 TXN_PREPARED（判决还没到），原样返回未决 —— 未决即不可见，
+     * 正是 2PC in-doubt 期间要的语义。
+     */
+    if ((TxnStatus) slot.status == TXN_PREPARED &&
+        slot.parent_xid != InvalidTransactionId)
+    {
+        EnhancedClogSlot  pslot;
+        uint32            psegno;
+        off_t             poff;
+        int               pfd;
+
+        psegno = (uint32) ((uint64) slot.parent_xid / GCLOG_XIDS_PER_SEGMENT);
+        poff   = (off_t) ((uint64) slot.parent_xid % GCLOG_XIDS_PER_SEGMENT)
+                 * GCLOG_SLOT_SIZE;
+
+        pfd = GClogOpenSegFile(node_id, psegno, false);
+        if (pfd >= 0)
+        {
+            do {
+                nb = pg_pread(pfd, &pslot, sizeof(pslot), poff);
+            } while (nb < 0 && errno == EINTR);
+            CloseTransientFile(pfd);
+
+            if (nb == (ssize_t) sizeof(pslot) &&
+                (TxnStatus) pslot.status != TXN_RUNNING)
+            {
+                /* 时间戳也取父亲的：整棵提交树共享一个提交时刻 */
+                if (status != NULL)     *status = (TxnStatus) pslot.status;
+                if (start_ts != NULL)   *start_ts = slot.start_ts;
+                if (commit_ts != NULL)  *commit_ts = pslot.commit_ts;
+                return true;
+            }
+        }
+    }
 
     if (status != NULL)     *status = (TxnStatus) slot.status;
     if (start_ts != NULL)   *start_ts = slot.start_ts;

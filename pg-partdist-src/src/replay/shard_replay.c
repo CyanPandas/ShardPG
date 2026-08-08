@@ -771,10 +771,11 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
     op       = hdr->info & XLOG_XACT_OPMASK;
     subxacts = TxnMarkerSubxacts(m);
 
-    if (op != XLOG_XACT_COMMIT && op != XLOG_XACT_ABORT)
+    if (op != XLOG_XACT_COMMIT && op != XLOG_XACT_ABORT &&
+        op != XLOG_XACT_PREPARE)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu MARKER 的 info=0x%02X "
-                        "既不是 COMMIT 也不是 ABORT",
+                        "不是 COMMIT/ABORT/PREPARE",
                         ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn, hdr->info)));
 
@@ -814,6 +815,24 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
         for (i = 0; i < m->nsubxacts; i++)
             EnhancedClogWriteStatus(MakeGlobalXid(origin, subxacts[i]),
                                     m->start_ts, m->commit_ts, TXN_COMMITTED);
+    }
+    else if (op == XLOG_XACT_PREPARE)
+    {
+        /*
+         * 2PC 的第一段（DTX_2PC_DESIGN.md §3.3）：判决还没到，整棵提交树
+         * 先落成 TXN_PREPARED = 未决 = 不可见 —— 与"从未写过"的空洞槽同义，
+         * 因此中途崩溃、或决议永远不来，语义都是安全的。
+         *
+         * 子事务额外记下 parent_xid：COMMIT PREPARED 那条语句跑在**另一个
+         * 事务**里，拿不到本事务的子事务清单，所以第二段的 COMMIT 标记只
+         * 携带顶层 xid。读路径靠这条链把子事务解析到顶层的判决上
+         * （见 enhanced_clog.h 里 parent_xid 的注释）。
+         */
+        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_PREPARED);
+        for (i = 0; i < m->nsubxacts; i++)
+            EnhancedClogWriteStatusWithParent(MakeGlobalXid(origin, subxacts[i]),
+                                              m->start_ts, 0, TXN_PREPARED,
+                                              (TransactionId) GxidLocalXid(gxid));
     }
     else
         EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_ABORTED);

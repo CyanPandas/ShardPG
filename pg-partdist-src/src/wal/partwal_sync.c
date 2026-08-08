@@ -667,8 +667,9 @@ ReadRawWALRecordAt(XLogRecPtr start_lsn, XLogRecPtr expect_end_lsn,
  * 时间戳先用本地 TimestampTz（微秒，单调够用）；TSO 就位后只换取值来源，
  * 字段宽度与磁盘格式都不动。
  */
-static char *
-PartWALBuildTxnMarker(bool committed, uint32 *out_len)
+char *
+PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
+                          uint32 *out_len)
 {
     TransactionId  *children = NULL;
     int             nchildren;
@@ -680,7 +681,7 @@ PartWALBuildTxnMarker(bool committed, uint32 *out_len)
      * 在增强型 CLOG 中没有 COMMITTED 记录，天然不可见，SAVEPOINT 回滚语义
      * 由"缺席"表达，不需要额外的中止清单。
      */
-    nchildren = committed ? xactGetCommittedChildren(&children) : 0;
+    nchildren = with_children ? xactGetCommittedChildren(&children) : 0;
     if (nchildren < 0)
         nchildren = 0;
 
@@ -689,7 +690,8 @@ PartWALBuildTxnMarker(bool committed, uint32 *out_len)
 
     m = (TxnMarkerPayload *) buf;
     m->start_ts  = (uint64) GetCurrentTransactionStartTimestamp();
-    m->commit_ts = committed ? (uint64) GetCurrentTimestamp() : UINT64CONST(0);
+    m->commit_ts = with_commit_ts ? (uint64) GetCurrentTimestamp()
+                                  : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
     m->reserved  = 0;
 
@@ -698,6 +700,13 @@ PartWALBuildTxnMarker(bool committed, uint32 *out_len)
                (size_t) nchildren * sizeof(TransactionId));
 
     return buf;
+}
+
+static char *
+PartWALBuildTxnMarker(bool committed, uint32 *out_len)
+{
+    /* 单机路径：提交才收集子事务、才带提交时间戳 */
+    return PartWALBuildMarkerPayload(committed, committed, out_len);
 }
 
 /*
@@ -721,6 +730,58 @@ PartWALAppendTxnMarker(PartitionWALWriter *writer, XLogRecPtr orig_lsn,
                         payload, payload_len,
                         MakeGlobalXid(PartDistLocalNodeId(), xid),
                         PARTWAL_FLAG_MARKER);
+}
+
+/*
+ * PartWALAppendMarkerFor — 给指定分区独立追加一条 MARKER 并 fsync（2PC 用）。
+ *
+ * 与 PartWALFlush 内联的那条标记写入路径的区别，全在"标记属于谁"：
+ * 单机事务的标记 xid 就是当前事务的 xid，可以就地取；而 2PC 的
+ * COMMIT/ABORT 标记是在 **COMMIT PREPARED 那条语句自己的事务**里补写的，
+ * 被标记的是那笔早已 prepared 的事务，xid 必须由调用方显式给出
+ * （见 DTX_2PC_DESIGN.md §3.3 阶段 3）。
+ *
+ * op 取 XLOG_XACT_PREPARE / XLOG_XACT_COMMIT / XLOG_XACT_ABORT。
+ *
+ * orig_lsn 传 0：标记不是 WAL 记录。段号因此沿用 writer 从 checkpoint
+ * 恢复出来的当前段（AppendPartWALRecordAt 对 orig_lsn==0 有专门守卫），
+ * 不会把标记甩到 1 号段去。
+ *
+ * 自己取 PartWALCtl->lock —— 调用方（PRE_PREPARE 接线、阶段 3）此刻都不持有。
+ */
+void
+PartWALAppendMarkerFor(Oid partition_id, TransactionId xid, uint8 op,
+                       const char *payload, uint32 payload_len)
+{
+    PartitionWALWriter *w;
+
+    if (!TransactionIdIsValid(xid))
+        return;                 /* 无 xid 可标记：无账可记 */
+
+    if (PartWALCtl != NULL)
+        LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    PG_TRY();
+    {
+        InitPartitionWALDirectory(partition_id);
+        w = CreatePartitionWALWriter(partition_id, InvalidRelFileNumber);
+        if (w == NULL)
+            ereport(ERROR,
+                    (errmsg("pg_partdist: 无法为分区 %u 打开 writer 写 2PC 标记",
+                            partition_id)));
+
+        AppendPartWALRecord(w, InvalidXLogRecPtr,
+                            RM_XACT_ID, op,
+                            payload, payload_len,
+                            MakeGlobalXid(PartDistLocalNodeId(), xid),
+                            PARTWAL_FLAG_MARKER);
+        DestroyPartitionWALWriter(w);   /* flush + fsync */
+    }
+    PG_FINALLY();
+    {
+        if (PartWALCtl != NULL)
+            LWLockRelease(PartWALCtl->lock);
+    }
+    PG_END_TRY();
 }
 
 static void PartWALReplicateTouched(void);

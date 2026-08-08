@@ -215,8 +215,28 @@ PartDistDtxPrePrepareFinish(void)
      */
     gsids = (int64 *) palloc(sizeof(int64) * (ntouched > 0 ? ntouched : 1));
 
+    /*
+     * 2PC 标记的第一段：PREPARE 标记（DTX_2PC_DESIGN.md §3.3）。
+     *
+     * DTX_PREPARE 记录服务的是"升主时闭合 in-doubt"，它不参与事务判决 ——
+     * 回放侧对 DTX 类记录只推游标。真正让 follower 记账的只有 MARKER 类记录，
+     * 所以这里必须另发一条。
+     *
+     * 载荷带子事务清单、**不带** commit_ts：此刻还没提交。整棵提交树在
+     * follower 上落成 TXN_PREPARED（未决＝不可见），等第二段的 COMMIT/ABORT
+     * 标记来定性。子事务靠槽里的 parent_xid 跟随顶层，因为第二段是在
+     * COMMIT PREPARED 自己的事务里补写的，那里拿不到本事务的子事务清单。
+     *
+     * 必须在 SPI_connect 之前组装：SPI 会把 CurrentMemoryContext 切到它的
+     * 过程上下文，SPI_finish 时连载荷一起释放。
+     */
     {
     int n_unmanaged = 0;
+    char   *prep_marker = NULL;
+    uint32  prep_marker_len = 0;
+
+    if (ntouched > 0 && TransactionIdIsValid(xid))
+        prep_marker = PartWALBuildMarkerPayload(true, false, &prep_marker_len);
 
     if (ntouched > 0)
     {
@@ -254,6 +274,12 @@ PartDistDtxPrePrepareFinish(void)
                                    0 /* coord_gsid：prepare 时 master 还没算出来 */,
                                    0 /* commit_ts */, 0 /* verdict */,
                                    NULL, 0, xid);
+
+            /* 紧随其后的 PREPARE 标记：让 follower 的增强型 CLOG 记上这棵树 */
+            if (prep_marker != NULL)
+                PartWALAppendMarkerFor(touched[i], xid, XLOG_XACT_PREPARE,
+                                       prep_marker, prep_marker_len);
+
             PartWALNoteTouchedPartition(touched[i]);
             gsids[ngsids++] = gsid;
         }
@@ -275,6 +301,9 @@ PartDistDtxPrePrepareFinish(void)
                         (long long) dtx_pending_dtxid, n_unmanaged),
                  errdetail("非纳管部分不受协调组决议保护；master 在决议后、"
                            "本地提交前崩溃存在两套规则分叉的窗口。")));
+
+    if (prep_marker != NULL)
+        pfree(prep_marker);
     }
 
     /* 2) 再复制一轮，把 PREPARE 标记也推到多数派（失败即 ERROR，事务中止） */
@@ -333,6 +362,9 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
     int            i;
     StringInfoData sql;
     bool           pushed = false;
+    TransactionId  prepared_xid = InvalidTransactionId;
+    char          *fin_marker = NULL;
+    uint32         fin_marker_len = 0;
 
     if (!pg_partdist_dtx_2pc_enabled)
         return;
@@ -377,18 +409,45 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
     }
     pfree(sql.data);
 
+    /*
+     * ★ 被标记事务的**本地 top-level xid**（DTX_2PC_DESIGN.md §3.3 阶段 3）。
+     *
+     * 标记要落在那笔 prepared 事务头上，而不是 COMMIT PREPARED 这条语句
+     * 自己的事务上 —— 两者是不同的 xid，用错了 follower 就把判决记到一个
+     * 无关事务上，被标记的事务反而永远未决。
+     *
+     * 本钩子跑在 standard_ProcessUtility **之前**，此刻 prepared 事务仍在
+     * pg_prepared_xacts 里，是最直接也最不需要额外持久化状态的取法。
+     * 走 ::text::bigint 是为了不依赖 xid 类型的 Datum 表示。
+     */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT transaction::text::bigint FROM pg_prepared_xacts "
+                     " WHERE gid = %s", quote_literal_cstr(gid));
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                SPI_tuptable->tupdesc, 1, &isnull);
+
+        if (!isnull)
+            prepared_xid = (TransactionId) DatumGetInt64(d);
+    }
+    pfree(sql.data);
+
+    /*
+     * 载荷不带子事务清单：这里是**另一个事务**，xactGetCommittedChildren()
+     * 返回的是它自己的（空）清单。被 prepared 事务的子事务已由第一段的
+     * PREPARE 标记写成 TXN_PREPARED 且带 parent_xid，读路径会把它们解析到
+     * 顶层的判决上（见 enhanced_clog.h）。
+     */
+    if (TransactionIdIsValid(prepared_xid))
+        fin_marker = PartWALBuildMarkerPayload(false, committed, &fin_marker_len);
+
     for (i = 0; i < ngsids; i++)
     {
         Oid   local_oid;
         int64 gsid = gsids[i];
-
-        /*
-         * 协调组跳过：它的 DECISION{verdict=COMMIT} 对本组而言语义上就等于
-         * DTX_COMMIT（§5.3 "省一轮"）。ABORT 路径下协调组通常连决议都没有
-         * （推定中止），补一条 ABORT 标记是有意义的，所以只在 COMMIT 时跳过。
-         */
-        if (committed && gsid == coord_gsid)
-            continue;
 
         local_oid = InvalidOid;
         initStringInfo(&sql);
@@ -409,13 +468,37 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
         if (!OidIsValid(local_oid))
             continue;
 
-        (void) AppendDtxRecord(local_oid,
-                               committed ? DTX_COMMIT : DTX_ABORT,
-                               dtxid, coord_gsid,
-                               committed ? (int64) GetCurrentTimestamp() : 0,
-                               0, NULL, 0, InvalidTransactionId);
+        /*
+         * 协调组跳过 DTX 记录：它的 DECISION{verdict=COMMIT} 对本组而言语义上
+         * 就等于 DTX_COMMIT（§5.3 "省一轮"）。ABORT 路径下协调组通常连决议都
+         * 没有（推定中止），补一条 DTX_ABORT 是有意义的，所以只在 COMMIT 时跳。
+         */
+        if (!(committed && gsid == coord_gsid))
+            (void) AppendDtxRecord(local_oid,
+                                   committed ? DTX_COMMIT : DTX_ABORT,
+                                   dtxid, coord_gsid,
+                                   committed ? (int64) GetCurrentTimestamp() : 0,
+                                   0, NULL, 0, InvalidTransactionId);
+
+        /*
+         * ★ 事务标记则**每个参与组都要写**，协调组也不例外。
+         *
+         * 上面那条"省一轮"只对 DTX 记录成立：DECISION 是 DTX 类记录，回放侧
+         * 对它只推游标、不记账。真正让 follower 的增强型 CLOG 得出判决的只有
+         * MARKER 类记录，协调组所在分片的副本同样需要它 —— 少写一条，那个
+         * 分片上这笔事务就永远停在未决。
+         */
+        if (fin_marker != NULL)
+            PartWALAppendMarkerFor(local_oid, prepared_xid,
+                                   committed ? XLOG_XACT_COMMIT
+                                             : XLOG_XACT_ABORT,
+                                   fin_marker, fin_marker_len);
+
         PartWALNoteTouchedPartition(local_oid);
     }
+
+    if (fin_marker != NULL)
+        pfree(fin_marker);
 
     if (pushed)
         PopActiveSnapshot();

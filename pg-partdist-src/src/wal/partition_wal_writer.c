@@ -709,7 +709,20 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
                 break;
             }
 
-            last_kept_lsn = rec.orig_lsn;
+            /*
+             * ★ 非 WAL 记录（orig_lsn==0：DTX / 部分 CTRL）**不得**把
+             * last_kept_lsn 拉回 0 —— 它会经下面的 WritePartWALCheckpoint
+             * 写进 checkpoint 的 last_wal_lsn，而那是"当前段号"的持久化依据。
+             * 与写入侧 AppendPartWALRecordAt 里的同款守卫成对（见那里的注释）。
+             *
+             * 2PC 负载下这不是边角情况：PartDistDtxPrePrepareFinish 是在
+             * PartWALFlush **之后**追加 DTX 记录的，所以流尾常年是 orig_lsn=0
+             * 的记录，截断切点落在上面的概率很高。一旦落 0，后续记录会被写进
+             * 1 号段（段名序与 plsn 序倒置），且 DemuxCrashRecovery 会因
+             * scan_start 无效而整个跳过 WAL 重扫描。
+             */
+            if (rec.orig_lsn != InvalidXLogRecPtr)
+                last_kept_lsn = rec.orig_lsn;
             off += (off_t) (sizeof(PartWALRecord) + rec.data_len);
             if (lseek(fd, off, SEEK_SET) != off)
                 break;

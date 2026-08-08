@@ -185,19 +185,29 @@ CREATE OR REPLACE FUNCTION partdist.partwal_notify_primary_switch(
     RETURNS void LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_notify_primary_switch';
 -- P2 数据面 Raft 组的 parwal 边界函数(已安装的 pg_partdist 扩展不会重跑安装脚本)
--- DTX-2PC：read_record 增加 OUT flags，follower_append 增加 p_flags —— 复制通道
--- 丢了 flags，DTX/标记记录在副本上会退化成 DATA 记录（DTX_2PC_DESIGN.md §5.5）。
+--
+-- ★ 这里的声明必须与 pg-partdist-src/sql/pg_partdist--1.0.sql 逐字一致（parwal-3.0
+-- 布局：OUT flags 在前、OUT gxid 在后；follower_append 的实参序是 p_flags, p_gxid,
+-- p_data）。上面那个 DO $mig$ 块会先把已装的正确声明 DROP 掉，而 CREATE EXTENSION
+-- IF NOT EXISTS 对已装扩展是空操作、不会把它补回来 —— 所以**本函数就是集群里这两个
+-- 声明的最终形态**，写错即全集群生效。
+--
+-- 2026-08-08 实测过一次代价：这里若停留在 4.0 的 (OUT xid, OUT flags) 布局，而 C 侧
+-- 填的是 values[3]=flags/values[4]=gxid，则 data_propose_one 的 "SELECT ... gxid ..."
+-- 直接报 column "gxid" does not exist，**整个数据组 propose 全线中止**；
+-- follower_append 因参数类型表不同会形成**重载**而非替换，走旧重载会把 bytea 指针
+-- 当 gxid 读 → 段错误。改这两处声明前先对一遍安装脚本。
 CREATE OR REPLACE FUNCTION partdist.partwal_read_record(
     p_partition_id OID, p_partition_lsn BIGINT,
     OUT orig_lsn PG_LSN, OUT rmid INTEGER, OUT info INTEGER,
-    OUT xid BIGINT, OUT flags INTEGER, OUT data BYTEA)
+    OUT flags INTEGER, OUT gxid BIGINT, OUT data BYTEA)
     RETURNS record LANGUAGE c STRICT STABLE
     AS 'pg_partdist', 'pg_partdist_partwal_read_record';
 -- 运输层加固：follower 按 leader 指定的 partition_lsn 落盘（多了一个参数）
 CREATE OR REPLACE FUNCTION partdist.partwal_follower_append(
     p_partition_id OID, p_partition_lsn BIGINT, p_orig_lsn PG_LSN,
-    p_rmid INTEGER, p_info INTEGER, p_xid BIGINT, p_data BYTEA,
-    p_flags INTEGER)
+    p_rmid INTEGER, p_info INTEGER, p_flags INTEGER, p_gxid BIGINT,
+    p_data BYTEA)
     RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_partwal_follower_append';
 CREATE OR REPLACE FUNCTION partdist.partwal_append_dtx_record(
@@ -297,6 +307,26 @@ CREATE OR REPLACE FUNCTION partdist.follower_set_applied_part_lsn(
     p_partition_id OID, p_applied_part_lsn BIGINT)
     RETURNS BOOLEAN LANGUAGE c STRICT VOLATILE
     AS 'pg_partdist', 'pg_partdist_follower_set_applied_part_lsn';
+-- 上面那个 DO $mig$ 块为了改 OUT 参数，把这几个函数从 pg_partdist 扩展里
+-- 解绑并 DROP 掉了；重建之后必须再认回去，否则它们变成**游离对象**，
+-- 下一次 DROP EXTENSION / CREATE EXTENSION 循环会报
+-- "function ... is not a member of extension" 而整体失败（同 :50-54 记的坑）。
+DO $readd$
+DECLARE
+  sig TEXT;
+BEGIN
+  FOREACH sig IN ARRAY ARRAY[
+    'partdist.partwal_read_record(OID, BIGINT)',
+    'partdist.partwal_follower_append(OID, BIGINT, PG_LSN, INTEGER, INTEGER, INTEGER, BIGINT, BYTEA)',
+    'partdist.partwal_truncate_to(OID, BIGINT)'
+  ] LOOP
+    BEGIN
+      EXECUTE format('ALTER EXTENSION pg_partdist ADD FUNCTION %s', sig);
+    EXCEPTION WHEN OTHERS THEN NULL;   -- 已是成员/扩展不存在：忽略
+    END;
+  END LOOP;
+END
+$readd$;
 SQL
 }
 

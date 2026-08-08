@@ -235,6 +235,28 @@ extern int   PartWALTouchedCount(void);
 extern void  PartWALNoteTouchedPartition(Oid partition_id);
 
 /* ------------------------------------------------------------------ */
+/* 2PC 事务标记（DTX_2PC_DESIGN.md §3.3 阶段 3）                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 组装一条 MARKER 载荷（TxnMarkerPayload）。
+ *   with_children  = 是否收集本事务的已提交子事务清单
+ *   with_commit_ts = 是否带提交时间戳（PREPARE 标记不带：还没提交）
+ * 返回 palloc 的缓冲区，调用方负责 pfree。
+ */
+extern char *PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
+                                       uint32 *out_len);
+
+/*
+ * 给指定分区独立追加一条 MARKER 并 fsync，标记的事务由 xid 显式给出。
+ * op = XLOG_XACT_PREPARE / XLOG_XACT_COMMIT / XLOG_XACT_ABORT。
+ * 内部自取 PartWALCtl->lock；调用方不得已持有。
+ */
+extern void  PartWALAppendMarkerFor(Oid partition_id, TransactionId xid,
+                                    uint8 op,
+                                    const char *payload, uint32 payload_len);
+
+/* ------------------------------------------------------------------ */
 /* WAL range scan (used by DemuxCrashRecovery)                         */
 /* ------------------------------------------------------------------ */
 

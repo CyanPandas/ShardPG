@@ -60,8 +60,25 @@ typedef struct EnhancedClogSlot
     uint64      start_ts;       /* 事务启动时间戳                      */
     uint64      commit_ts;      /* 提交时间戳；ABORTED 时为 0          */
     uint32      status;         /* TxnStatus                           */
-    uint32      reserved;       /* 显式补齐，恒为 0                    */
+    uint32      parent_xid;     /* 见下；0 = 顶层事务（旧槽的补齐位）  */
 } EnhancedClogSlot;
+
+/*
+ * parent_xid —— 子事务到顶层事务的链接，语义抄内核 pg_subtrans。
+ *
+ * 为什么需要它：2PC 事务的判决分两次到达。PREPARE 时我们知道整棵提交树
+ * （顶层 + 已提交子事务清单），但还不知道判决；COMMIT PREPARED 时知道了
+ * 判决，却拿不到子事务清单 —— 那条语句跑在**另一个事务**里，
+ * xactGetCommittedChildren() 返回的是它自己的（空）清单。
+ *
+ * 于是 PREPARE 标记把整棵树写成 TXN_PREPARED，并给每个子事务槽记下
+ * parent_xid；COMMIT/ABORT 标记只需写顶层一条，读路径遇到
+ * "status==TXN_PREPARED 且 parent_xid!=0" 时改问父亲。一跳即可 ——
+ * xactGetCommittedChildren() 返回的是**拍平**的全部后代。
+ *
+ * 兼容性：该字段就是原来的 reserved，历史槽一律为 0 = 无父 = 按自身状态
+ * 判定，与改动前逐字节等价。
+ */
 
 #define GCLOG_SLOT_SIZE         ((uint32) sizeof(EnhancedClogSlot))
 
@@ -80,6 +97,15 @@ typedef struct EnhancedClogSlot
 extern void EnhancedClogWriteStatus(GlobalTransactionId gxid,
                                     uint64 start_ts, uint64 commit_ts,
                                     TxnStatus status);
+
+/*
+ * 同上，但额外记下 parent_xid（顶层事务的**本地** xid，与 gxid 同节点）。
+ * 只有 2PC 的 PREPARE 标记会用到；parent_xid=0 时与上面那个完全等价。
+ */
+extern void EnhancedClogWriteStatusWithParent(GlobalTransactionId gxid,
+                                              uint64 start_ts, uint64 commit_ts,
+                                              TxnStatus status,
+                                              TransactionId parent_xid);
 
 /* 读一条判决。未写过的槽返回 true 且 status = TXN_RUNNING（空洞语义）。
  * 段文件不存在同样按空洞处理。R3 读路径的入口，本期供验收用例核账。 */

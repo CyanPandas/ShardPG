@@ -306,39 +306,58 @@ pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 	PartitionWALWriter *writer;
 
 	/*
-	 * relfilenode 只用于 checkpoint 记账；follower 侧沿用 partition_id 本身，
-	 * 与 demux 崩溃恢复对该目录的既有约定一致。
-	 */
-	writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
-	if (writer == NULL)
-		ereport(ERROR,
-				(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
-						partition_id)));
-
-	/*
-	 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。
+	 * ★ 与其余段文件写入者互斥（见 AppendDtxRecord 里那段长注释）。
 	 *
-	 * 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一个
-	 * pg_parwal 目录树下既有本地 demux 写入、也有 follower 收到的复制流。
-	 * 若 follower 用本地计数器，编号空间会和 leader 的永久错位，
-	 * applied_part_lsn 指向的记录在本地根本不存在。
-	 *
-	 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
-	 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
+	 * 本函数虽然按 leader 指定的编号落盘、不做自增分配，但它同样要
+	 * 读-改-写 checkpoint：writer 从 checkpoint 播种 last_partition_lsn，
+	 * 落盘后回写。与并发的 PartWALFlush 交错会让"顺序追加"被误判成
+	 * 重传去重（silently 丢字节）或空洞（ERROR 拒绝 ack）。
 	 */
-	(void) AppendPartWALRecordAt(writer,
-								 (uint64) partition_lsn,
-								 orig_lsn,
-								 (uint8) rmid,
-								 (uint8) info,
-								 VARDATA_ANY(data),
-								 (uint32) VARSIZE_ANY_EXHDR(data),
-								 (GlobalTransactionId) gxid,
-								 (uint8) flags);
+	if (PartWALCtl != NULL)
+		LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		/*
+		 * relfilenode 只用于 checkpoint 记账；follower 侧沿用 partition_id 本身，
+		 * 与 demux 崩溃恢复对该目录的既有约定一致。
+		 */
+		writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
+		if (writer == NULL)
+			ereport(ERROR,
+					(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
+							partition_id)));
 
-	/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
-	FlushPartitionWALWriter(writer, true);
-	DestroyPartitionWALWriter(writer);
+		/*
+		 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。
+		 *
+		 * 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一个
+		 * pg_parwal 目录树下既有本地 demux 写入、也有 follower 收到的复制流。
+		 * 若 follower 用本地计数器，编号空间会和 leader 的永久错位，
+		 * applied_part_lsn 指向的记录在本地根本不存在。
+		 *
+		 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
+		 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
+		 */
+		(void) AppendPartWALRecordAt(writer,
+									 (uint64) partition_lsn,
+									 orig_lsn,
+									 (uint8) rmid,
+									 (uint8) info,
+									 VARDATA_ANY(data),
+									 (uint32) VARSIZE_ANY_EXHDR(data),
+									 (GlobalTransactionId) gxid,
+									 (uint8) flags);
+
+		/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
+		FlushPartitionWALWriter(writer, true);
+		DestroyPartitionWALWriter(writer);
+	}
+	PG_FINALLY();
+	{
+		if (PartWALCtl != NULL)
+			LWLockRelease(PartWALCtl->lock);
+	}
+	PG_END_TRY();
 
 	PG_RETURN_INT64(partition_lsn);
 }
@@ -459,36 +478,68 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 		memcpy(DtxPayloadParticipants(payload), partvals,
 			   sizeof(int64) * nparts);
 
-	InitPartitionWALDirectory(partition_id);
-	writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
-	if (writer == NULL)
-		ereport(ERROR,
-				(errmsg("partwal_append_dtx_record: 无法为分区 %u 创建写入器",
-						partition_id)));
-
 	/*
-	 * orig_lsn 恒为 0：DTX 记录不是 WAL 记录，没有 leader 侧 end LSN。
-	 * 回放侧按 flags 在分派处就把它路由走，永不进 rm_redo，也永不用它盖页 LSN。
-	 * info 存 DtxRecordKind（不是 XLog info）；rmid 存 RM_XACT_ID 仅为可读性。
+	 * ★ 必须持 PartWALCtl->lock（2026-08-08 修，实测复现）。
 	 *
-	 * xid：PREPARE 标记要带本分区上的本地 top-level xid —— 升主回放时，
-	 * "这笔 in-doubt 的本地事务属于哪个全局事务"就只剩这一条线索（DATA 记录
-	 * 里只有 xid，没有 dtx 信息）。恢复守护补写的 COMMIT/ABORT 标记不在原事务
-	 * 里，传 InvalidTransactionId。
+	 * partition_lsn 不是从共享内存分配的：CreatePartitionWALWriter 从**磁盘
+	 * checkpoint 文件**播种 writer->last_partition_lsn，AppendPartWALRecord
+	 * 在**进程私有内存**里 +1，落盘后再回写 checkpoint —— 一次彻头彻尾的
+	 * read-modify-write。本函数此前是全树唯一不加锁的事务外写入者，于是：
+	 *
+	 *   backend A（本函数，PRE_PREPARE 写 DTX 记录）读到 checkpoint=100
+	 *   backend B（PartWALFlush，持锁 drain）也读到 100，分配 101、写盘、回写
+	 *   backend A 继续，也分配 101 —— 两条记录同号，且 expected==0 走自增分支，
+	 *   AppendPartWALRecordAt 的重号校验根本碰不到，**静默**。
+	 *
+	 * 后果是静默的副本分歧：按编号回读只返回第一条，另一条永不进 Raft、
+	 * 永不到 follower，而流里没有空洞、没有任何报错。实测在一张 2 分片表上
+	 * 并发跑 120 笔跨分片 2PC + 120 笔单分片 INSERT，604 条记录只有 582 个
+	 * 不同编号 —— 22 条重号，每条都是"一条 DTX + 一条 DATA"。
+	 *
+	 * 调用点（PRE_PREPARE 的 PartDistDtxPrePrepareFinish、COMMIT PREPARED 的
+	 * 阶段 3、以及 SQL 入口）此时都不持有该锁，不会自锁。
 	 */
-	AppendPartWALRecord(writer,
-						InvalidXLogRecPtr,
-						(uint8) RM_XACT_ID,
-						(uint8) kind,
-						(const char *) payload,
-						(uint32) paylen,
-						TransactionIdIsValid(xid)
-							? MakeGlobalXid(PartDistLocalNodeId(), xid)
-							: InvalidGlobalXid,
-						PARTWAL_FLAG_DTX);
-	FlushPartitionWALWriter(writer, true);
-	assigned = writer->last_partition_lsn;
-	DestroyPartitionWALWriter(writer);
+	if (PartWALCtl != NULL)
+		LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		InitPartitionWALDirectory(partition_id);
+		writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
+		if (writer == NULL)
+			ereport(ERROR,
+					(errmsg("partwal_append_dtx_record: 无法为分区 %u 创建写入器",
+							partition_id)));
+
+		/*
+		 * orig_lsn 恒为 0：DTX 记录不是 WAL 记录，没有 leader 侧 end LSN。
+		 * 回放侧按 flags 在分派处就把它路由走，永不进 rm_redo，也永不用它盖页 LSN。
+		 * info 存 DtxRecordKind（不是 XLog info）；rmid 存 RM_XACT_ID 仅为可读性。
+		 *
+		 * xid：PREPARE 标记要带本分区上的本地 top-level xid —— 升主回放时，
+		 * "这笔 in-doubt 的本地事务属于哪个全局事务"就只剩这一条线索（DATA 记录
+		 * 里只有 xid，没有 dtx 信息）。恢复守护补写的 COMMIT/ABORT 标记不在原事务
+		 * 里，传 InvalidTransactionId。
+		 */
+		AppendPartWALRecord(writer,
+							InvalidXLogRecPtr,
+							(uint8) RM_XACT_ID,
+							(uint8) kind,
+							(const char *) payload,
+							(uint32) paylen,
+							TransactionIdIsValid(xid)
+								? MakeGlobalXid(PartDistLocalNodeId(), xid)
+								: InvalidGlobalXid,
+							PARTWAL_FLAG_DTX);
+		FlushPartitionWALWriter(writer, true);
+		assigned = writer->last_partition_lsn;
+		DestroyPartitionWALWriter(writer);
+	}
+	PG_FINALLY();
+	{
+		if (PartWALCtl != NULL)
+			LWLockRelease(PartWALCtl->lock);
+	}
+	PG_END_TRY();
 	pfree(payload);
 
 	return assigned;
