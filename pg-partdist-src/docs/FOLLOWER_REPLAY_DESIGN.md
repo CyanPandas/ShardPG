@@ -62,6 +62,21 @@ secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo �
   **生产升主路径必须显式传 commit_index**。
 - 触发入口经 rendezvous variable `partdist_replay_catchup_hook` 导出给 pg_raft,
   两个扩展无编译期依赖。
+
+  > ⚠️ **该 rendezvous 变量长期是"导出了但没人取"** —— pg_raft 只消费
+  > `partdist_partwal_replicate_hook` 与 `partdist_dtx_note_participant_hook`
+  > 两个,升主路径从不调它,新主可能在一个字节都没回放的情况下就开始对外服务
+  > (`raft_apply.c` 的注释自己承认"此桥只保证机制先行")。
+  >
+  > **2026-08-08 已接上**(提交 `7711bc1`),但**不是**经这个 rendezvous 变量:
+  > 实际接在 pg_raft 的"自治选举胜出 → 向控制面上报"之间
+  > (`data_group_try_report` → 新增 SQL `partdist.pg_raft_promote_prepare`),
+  > 因为调用点在 BGW tick 里**没有 SPI**,而追平前要先把 shardid 解析成本地 OID、
+  > 之后还要闭合 in-doubt,都需要 SQL —— 走 libpq 自连接反而比 C 函数指针直接。
+  > 该 rendezvous 变量因此仍是零消费者,保留待用。
+  > 完整理由(为什么不接在 group 0 的 apply 里、切片与截止期怎么定)见
+  > `pg-partdist-src/docs/DTX_2PC_DESIGN.md` **§12.1**;
+  > 验收见 `tests/test_promote_catchup_tx3.sh`(19/19)。
 - 追平失败被 `PG_TRY` 捕获落到 `FAILED`,不拖垮 worker(shmem worker 崩溃会连带
   整个节点重置);游标在 `apply_checkpoint` 里,下次触发只补未完成的部分。
 

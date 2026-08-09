@@ -14,20 +14,33 @@
 >
 ---
 
-## 0.0 状态速览（2026-08-06）
+## 0.0 状态速览（2026-08-08）
 
-代码基线：`shardpg-4.0`（日志外部化已于 2026-08-07 整条回滚，见 raft 计划 §0.4）。<br>回归：`run-raft-tests.sh` **56/56** + P0 **10/10**。
+代码基线：**`shardpg-TX`**（= `shardpg-replay` 稳定点 `fd8e99d` 与 `shardpg-4.0`
+尖端 `fadf2eb` 的双向合并，合并提交 `f58437f`）。合并的逐文件依据见
+raft 计划 **§15**。<br>
+回归：`run-raft-tests.sh` **56/56** + P0 **10/10** + 回放六套件
+（canary 7 / R1 56 / L1 48 / R2 48 / D1 81 / D2 15）+ 跨线联测
+TX1 51 / TX2 35 / TX3 19，**全零 FAIL**。
 
-**已落地**：§10 的第 **0–5 步全部完成并验收**（raft_17–23）。跨分区事务**已经真的
-走 2PC** —— 内核补丁 0004 开的 `pre_record_commit_hook` 把决议接进了客户端提交路径，
-**决议在协调组达多数派持久化的那一刻就是全局提交点**。
-
-**只剩第 6 步**，两件事，都不是 2PC 内部问题，而是它与惰性回放 promotion 路径合流：
+**已落地**：§10 的第 **0–5 步**（raft_17–23）**与第 6 步的 (a)**。跨分区事务
+**已经真的走 2PC** —— 内核补丁 0004 开的 `pre_record_commit_hook` 把决议接进了
+客户端提交路径，**决议在协调组达多数派持久化的那一刻就是全局提交点**。
 
 | | 内容 | 现状 |
 |---|---|---|
-| a | **升主 in-doubt 清理的接线** | 函数本体 `dtx_close_indoubt()` 已实现并单测通过（raft_23 五段），**只差插进升主序列 + 端到端验收** |
-| b | **快路径分叉的归队规则**（§9.5） | 方案已选定 (b)：接受窗口，归队时对分叉分片强制重做物理基线。**规则未实装** |
+| a | **升主 in-doubt 清理的接线** | ✅ **2026-08-08 完成**（提交 `7711bc1`）。接在"自治选举胜出 → 向控制面上报"之间，不是接在 group 0 的 apply 里 —— 详见 §12.1。验收 `tests/test_promote_catchup_tx3.sh` **19/19** |
+| b | **快路径分叉的归队规则**（§9.5） | 方案已选定 (b)：接受窗口，归队时对分叉分片强制重做物理基线。**规则仍未实装** |
+
+**2026-08-08 合并期同批交付的另外三项**（都不在原 §10 计划里，是合并暴露出来的）：
+
+| | 内容 | 提交 |
+|---|---|---|
+| c | **阶段 3 的 COMMIT/ABORT 标记**（§12.2）—— 此前 2PC 事务在段流里**一条 MARKER 都没有**，follower 账本上永远未决 | `4ddcd96` |
+| d | **显式 ABORT 决议**（§12.3）—— master 在下发 `coord_gsid` 之后的失败出口先尽力写 verdict=2，省掉参与者等恢复超时 | `7711bc1` |
+| e | 合并暴露的 4 个运行期缺陷（plsn 重号、`setup-raft.sh` 覆盖旧签名、DTX 记录被喂进 `rm_redo`、截断把 `last_wal_lsn` 清零）| `46df57d` / `4ddcd96` / `7711bc1` |
+
+**已知未做（性能优化项，不影响正确性）**：Prepare 阶段的**组间并行**，见 §12.4。
 
 **读本文的顺序**：§0 概括 → §3 协议（正常路径/快路径）→ §5 记录格式 →
 §6 状态机 → §7 恢复 → **§9 索引表**（哪些还没解决）→ §10 落地顺序。
@@ -1239,3 +1252,150 @@ PREPARE 标记在用户事务内 propose 仍有窄窗口，与现状同级风险
   而本文 §5.1 写的是"沿用 parwal-2.0 的 40 字节头"。头**总长仍是 40 字节**，
   但尾部 8 字节的含义变了；§5.1 与 §5.5 的字段描述需随合并同步更新。
   合并的完整必炸清单见 **raft 计划 §15**。
+
+
+---
+
+## 12. 2026-08-08 合并期交付（shardpg-TX）
+
+本节记录合并到 `shardpg-TX` 之后新做的四件事。前三件已实装并验收，第四件是
+明确留下的性能优化项。
+
+### 12.1 升主与惰性回放 promotion 路径合流（第 6 步 a，已完成）
+
+**接线之前这条路是断的**，三处实证：
+
+- `pg_partdist` 导出的 rendezvous 变量 `partdist_replay_catchup_hook`（注释写明
+  "pg_raft 在选举胜出、准备把某分区提升为 primary 时取用"），**pg_raft 一次都
+  没取用过** —— 它只消费 `partdist_partwal_replicate_hook` 与
+  `partdist_dtx_note_participant_hook` 两个；
+- `dtx_close_indoubt()` 生产代码**零调用点**，只有 `raft_23` 测试脚本调过；
+- 升主序列（`raft_apply.c` 的 `pg_raft_apply_partition_primary`）是
+  "登记 `partition_map` → 通知 partdist → 翻 `pg_dist_placement`（路由立刻切走）"，
+  而那个通知 `pg_partdist_partwal_notify_primary_switch` **整个函数体只有一行
+  `ereport(LOG)`**。`raft_apply.c` 自己的注释也承认："此桥只保证'机制先行'，
+  切主后立即服务读写要等回放追平"。
+
+⇒ 新主可能在**一个字节都没回放**的情况下就开始对外服务。
+
+**接在哪里："自治选举胜出 → 向控制面上报"之间**，即
+`raft_consensus.c` 的 `data_group_try_report()` 调用新增的
+`partdist.pg_raft_promote_prepare(group_id, slice_ms)`。
+
+**为什么不接在 group 0 的 apply 里**（这是本节最重要的一句）：惰性回放平时
+一条 redo 都不做，升主时的积压可能很大；而 group 0 是**串行 apply** 的，
+在那里做追平会把整个控制面卡死。放在上报之前则有一条天然的等价关系 ——
+**不上报 ⇒ 控制面不登记 ⇒ 路由不翻**，"追不平不对外服务"由此成立，
+且完全不占用 group 0。
+
+三个约束塑造了它的形态：
+
+| 约束 | 后果 |
+|---|---|
+| 调用点在 BGW tick 里，**没有 SPI** | 走 libpq 自连接（与 DTX 参与登记、恢复守护跑 `COMMIT PREPARED` 同一手法） |
+| 同一个 tick 还要给其余各组**发心跳** | 每次只推进 `pg_raft.promote_catchup_slice_ms`（默认 2s），没追完返回 false、下个 tick 接着追。久占会触发别组无谓改选 |
+| 追不平就永不上报会让分片**永久无主** | `pg_raft.promote_catchup_deadline_ms`（默认 60s，设 0 为永不放行）兜底放行并打 WARNING，把"可用性优先"这个取舍显式化而不是让它静默发生 |
+
+两个顺序不变式：追平上界取 **Raft 已提交位点**
+（`partdist.get_follower_applied_part_lsn`），绝不碰未提交条目；
+**闭合 in-doubt 在追平之后**（判决要按已回放到位的流来求）。闭合失败不阻塞
+升主 —— 恢复守护 `dtx_recover_prepared` 随后仍会周期性重试。
+
+**验收** `tests/test_promote_catchup_tx3.sh`（19/19）。它的价值全在两条断言的
+对照上：切主前 follower 是"字节收齐 47/47、`applied=0`、壳表为空"（惰性前提
+成立），杀掉 leader 之后，新主**被登记为 primary 的那一刻** `applied=47`、
+壳表 40 行齐全。接线之前这里必然是 `applied=0` + 壳表空。
+
+### 12.2 阶段 3 的 COMMIT/ABORT 标记（已完成）
+
+**合并暴露的缺口**：全树唯一写 MARKER 的入口是 `PartWALFlush(write_marker=true)`，
+而 `write_marker=true` 只出现在单机事务的 `XACT_EVENT_PRE_COMMIT`。Citus 分布式
+写入走 `PRE_PREPARE`（传 false），阶段 3 那次 `PartWALFlush(Invalid,false)` 又
+必然在"本 backend 无插入"处提前返回 —— **把参数改成 true 也没用，它是个死参数**；
+即便走到，用的 xid 也是 `COMMIT PREPARED` 自身事务的，不是 prepared 事务的。
+
+⇒ 跨分区事务的 gxid 在 follower 的增强型 CLOG 里恒为空洞 = `TXN_RUNNING` = 未决。
+且无兜底：DTX 的 COMMIT/ABORT/DECISION 闭合记录恒带 `InvalidTransactionId`
+（gxid=0），`partwal_read_dtx_record` 也不返回头部 gxid。
+
+**做成两段式**，因为 `COMMIT PREPARED` 跑在**另一个事务**里，
+`xactGetCommittedChildren()` 拿不到那笔 prepared 事务的子事务清单：
+
+1. **PRE_PREPARE** 追加 PREPARE 标记（`info = XLOG_XACT_PREPARE`），带整棵提交树
+   的子事务清单、不带 `commit_ts`。follower 把整棵树记为 `TXN_PREPARED`
+   （未决＝不可见），并给每个子事务槽记下 `parent_xid`；
+2. **COMMIT/ROLLBACK PREPARED** 追加 COMMIT/ABORT 标记，只带顶层 xid
+   （取自 `pg_prepared_xacts` —— 钩子跑在 `standard_ProcessUtility` **之前**，
+   那时 prepared 事务还在），随后经既有复制挂钩推到多数派；
+3. **读路径**遇到 `TXN_PREPARED && parent_xid != 0` 改问父亲，一跳解析
+   （抄内核 `pg_subtrans`）。`parent_xid` 复用 `EnhancedClogSlot` 原有的 4 字节
+   `reserved`，历史槽恒 0 = 无父，改动前后逐字节兼容。
+
+**一处纠正**：阶段 3 原本对协调组跳过（其 `DECISION{verdict=COMMIT}` 语义等价于
+`DTX_COMMIT`，§5.3 的"省一轮"）。那只对 **DTX 记录**成立 —— DECISION 是 DTX 类
+记录，回放侧对它只推游标、不记账。**MARKER 必须每个参与组都写，协调组不能跳**，
+否则协调组所在分片的副本账本会漏掉这笔事务。
+
+验收 `tests/test_dtx_commit_marker_tx2.sh`（35/35），核心断言是
+"follower 顶层事务判为 committed（修复前恒为 running）"。
+
+### 12.3 显式 ABORT 决议（已完成，但只覆盖得到一半）
+
+master 在**下发 `coord_gsid` 之后**的每一条失败出口（协调组查不到现任 leader /
+leader 不在 `peers` / 对端不是 leader），先尽力写一条 `verdict=2` 的显式 ABORT
+决议再抛原错。参与者此后收尾时当场就能拿到 ABORT，不必等
+`pg_raft.dtx_recover_timeout_ms`（默认 30s）到点后由 `dtx_status` 反向创造。
+
+**纯优化，不是正确性所必需**：写不成就退回 presumed abort（§2.2/§7），决议槽
+一次性、先到者获胜，两条路写出的是同一个结论。因此实现全程吞错 —— 不能让
+"补写 ABORT 失败"这种次要错误盖掉真正的失败原因。
+
+**覆盖不到的一半要说清楚**：用户方案里"任意分片组未能进入 prepared ⇒ 直接生成
+Abort Decision"这一条**无法在 master 侧实现，也不需要**。参与者 prepare 失败时
+master 的 `CommitTransaction()` 根本没走到，`pre_record_commit_hook` 从不触发；
+而那条路径不需要决议 —— Citus 会同步对全体已 prepared 的连接发
+`ROLLBACK PREPARED`，没有参与者会滞留 in-doubt（除非它同时崩溃，而那正是
+presumed abort 的适用场景）。
+
+### 12.4 Prepare 阶段的组间并行（**性能优化项，本期不做**）
+
+用户原始方案里 Prepare 阶段的措辞是"对事务涉及的每个分片组 Si **并行**执行
+Raft 多数派持久化"。**当前实现是三层嵌套串行**：
+
+| 层次 | 位置 | 形态 |
+|---|---|---|
+| 组与组之间 | `partwal_sync.c` `PartWALReplicateTouched()` | `for (i...) fn(touched[i])` 逐组同步阻塞 |
+| 组内记录之间 | `raft_consensus.c` `replicate_group_upto()` | `for (plsn = last+1 ... cur)` 每条一次往返 |
+| 组内 peer 之间 | `raft_consensus.c` `sync_replicate_index()` | `for (i < n_peers)` + 阻塞 `PQexec` |
+
+关键路径上的远端往返次数约为
+`Σ_组 ((该组本事务的 DATA 记录数 + 2) × 该组 peer 数)`，每次往返对端都含一次
+fsync。**对正确性无影响**（各组的多数派持久化互不依赖，任一失败即 ERROR 中止
+事务，且全部发生在 [B] 之前），纯粹是延迟代价。
+
+需要澄清一点：**节点之间是并行的** —— Citus 原生就是异步发
+`PREPARE TRANSACTION` 再统一 `WaitForAllConnections`。缺的只是**同一参与者节点内
+多个分片组之间**。
+
+**动手前必须知道的硬约束**（否则会白做一遍）：`peers[]` 是**节点级全局数组，
+每个 peer 只有一条缓存连接**，所有分片组共用。所以光把调用侧改成并发，
+组 A 与组 B 发往同一个 peer 节点时仍会在那条连接上排队 —— 组间并行拿不到。
+
+真要做，三件事缺一不可：
+
+1. **异步 / pipeline 化的 RPC 层**。现在全是阻塞 `PQexec`，全文件零处
+   `PQsendQuery` / `PQconsumeInput` / `PQisBusy`。要么给每个 (组, peer) 开独立
+   连接 + 异步轮询，要么用 libpq 的 pipeline 模式（PG 14+ 支持）在同一条连接上
+   把多组的 AppendEntries 背靠背压出去；
+2. **复制挂钩改批接口**：`fn(partition_id)` → `fn(partitions[], n)`，否则谈不上
+   让多组的 RPC 在途重叠；
+3. **每组一个 ack 状态机**，各自判多数派、各自推进 `commit_index`，并正确处理
+   中途的任期变化、连接重置、部分 ack。
+
+**另有一个收益更大且正交的优化**：上表第二层 —— `replicate_group_upto` 现在
+每条记录一次往返，一笔事务在某组写了 10 条记录就是 10 轮串行往返。把多条 entry
+合进一次 AppendEntries 的收益比组间并行更大，改动面也小得多（需改
+`pg_raft_append_entries` 的协议签名）。**若要动这块，建议先做 entry 合批。**
+
+⚠️ 这三层都在共识核心路径上，而现有 56/56 未必抓得住"部分 ack + 任期切换"
+这类时序缺陷。**建议作为带失败注入测试的独立专项**，不要顺手改。

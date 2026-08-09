@@ -230,7 +230,11 @@ fi
 # ------------------------------------------------------------------
 section "5. Raft 回归用例(11 项)"
 
-for rf in raft_01_leader_election.sql raft_03_split_brain_guard.sql; do
+# raft_01 在协调节点跑即可；raft_03 **必须**在非 leader 节点上跑 ——
+# 它验的是"非 leader 上 propose 被拒"，跑在 leader 上等于没验
+# （原版靠 SQL 里的 node_id<>1 自我跳过，而协调节点 node_id 恒为 1，
+#  于是断言体一行都没执行过）。
+for rf in raft_01_leader_election.sql; do
   if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -f "${RAFT_TEST_DIR}/${rf}" &>/dev/null; then
     ok "${rf}"
   else
@@ -314,6 +318,16 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
       ok "raft_06_stale_requestvote_rejected.sql"
     else
       bad "raft_06_stale_requestvote_rejected.sql"
+    fi
+    # raft_03 同样必须在**非 leader** 端口上跑：它验的是"非 leader 上 propose
+    # 被拒"。此前它跟 raft_01 一起被固定在 -p 5432（协调节点）上跑，而 SQL 里
+    # 用 `node_id <> 1` 自我跳过、协调节点 node_id 恒为 1 ⇒ 断言体一行没执行过，
+    # 把 leader 门禁整个删掉也照样 PASS。现已改成无条件断言 + 跑在这里。
+    if $PSQL -p "$FOLLOWER_TEST_PORT" -U postgres -v ON_ERROR_STOP=1 \
+         -f "${RAFT_TEST_DIR}/raft_03_split_brain_guard.sql" &>/dev/null; then
+      ok "raft_03_split_brain_guard.sql"
+    else
+      bad "raft_03_split_brain_guard.sql"
     fi
   else
     bad "raft_06_stale_requestvote_rejected.sql(leader 预热日志失败)"

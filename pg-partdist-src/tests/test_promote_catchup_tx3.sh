@@ -140,6 +140,27 @@ if [[ -n "$newp" && "$newp" != "$pnode" && "$newp" != "0" ]]; then
 
   nmax=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off; SELECT coalesce(max(id),0) FROM ${TBL}" | tail -1)
   check "新主壳表内容完整（max(id)=${NROWS}）" "$nmax" "$NROWS"
+
+  # ★ 对照组：**未当选**的那个 follower 必须仍然 applied=0。
+  #
+  # 没有这一条，[2]（字节到齐时 applied=0）与 [4]（十几秒后 applied>=tip）
+  # 这两条断言，任何 naptime 大于二者间隔的**全局**后台追平机制都能同时满足 ——
+  # 也就是说"是升主接线追的平"和"某个全局机制碰巧追上了"分不开。
+  # 夹具本来就有两个 follower，只有一个当选，这个天然对照组不用白不用。
+  other=""
+  for p in $f1 $f2; do [[ "$p" != "$newport" ]] && other=$p; done
+  if [[ -n "$other" ]]; then
+    ooid=$(PSQL $other -Atc "SELECT partdist.local_partition_for_shard(${GID})")
+    oapp=$(PSQL $other -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${ooid}")
+    check "对照：未当选的 follower :${other} applied 仍为 0（证明追平是升主路径干的）" \
+          "$oapp" "0"
+  fi
+
+  # 兜底放行会让上面那条 applied 断言失去意义（"可用性优先"直接放行上报，
+  # 追平未完成也登记）。必须确认本轮走的不是那条路。
+  relax=$(docker exec "$CONTAINER" bash -c \
+    "grep -c '按可用性优先放行上报' /work/pg-cluster-data/worker*.log 2>/dev/null | awk -F: '{s+=\$2} END {print s+0}'")
+  check "本轮未触发 deadline 兜底放行（否则 applied 断言不成立）" "$relax" "0"
 fi
 
 echo "========== [5] 收尾：拉起原 leader =========="

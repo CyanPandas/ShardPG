@@ -7,10 +7,19 @@
 
 ---
 
-## 0. 当前状态速览（2026-08-07）
+## 0. 当前状态速览（2026-08-08）
 
-代码基线：`shardpg-4.0`，回归基线 `run-raft-tests.sh` **56/56**（拓扑 1c+8w）
-+ `test_shard_identity_p0.sh` **10/10**。
+代码基线：**`shardpg-TX`** —— §15 描述的那次双向合并**已经完成**
+（合并提交 `f58437f`，`shardpg-replay@fd8e99d` × `shardpg-4.0@fadf2eb`）。
+回归基线：`run-raft-tests.sh` **56/56**（拓扑 1c+8w）+ `test_shard_identity_p0.sh`
+**10/10** + 回放六套件（canary 7 / R1 56 / L1 48 / R2 48 / D1 81 / D2 15）
++ 跨线联测 TX1 51 / TX2 35 / TX3 19，**全零 FAIL**。
+
+> **合并已完成 —— §15 从"给执行合并的人看"变成"合并实际是怎么做的"。**
+> 逐文件决策与踩到的坑见 **§15.6**（新增）。合并之后又交付了三批：
+> 4 个运行期缺陷修复（`46df57d`/`4ddcd96`）、2PC 阶段 3 的 COMMIT 标记
+> （`4ddcd96`）、升主合流 + 显式 ABORT 决议 + plsn 分配顺序（`7711bc1`）。
+> 2PC 侧的完整叙述见 `pg-partdist-src/docs/DTX_2PC_DESIGN.md` **§12**。
 
 > ⏪ **2026-08-07：数据组日志外部化（§11.10 的 E1–E4）已整条回滚。**
 > 代码回到 `ace619a` 的形态 —— **项目中不存在任何日志外部化**。
@@ -1833,3 +1842,76 @@ replay 侧 `6624c08` 也改了 `data_propose_one`：描述符从 `{...,"xid":T,.
   判定式仍是设计描述。
 
 这两项归 MVCC/事务处理分工，本线未触碰。
+
+
+---
+
+## 15.6 合并的实际执行记录（2026-08-07/08，事后补记）
+
+§15.1–§15.5 是合并**之前**写给执行者的交接。合并已于 2026-08-07 完成，本节记
+实际发生了什么 —— 与预判不符的地方尤其值得看。
+
+### 与预判一致的
+
+§15.2 的必炸清单基本都命中了：记录头的 flags 位空间（取 replay v3 的 64 位
+`gxid` + 本线的 `PARTWAL_FLAG_DTX`，判定宏取并集）、`partwal_sync.c` 的双向大改、
+`raft_consensus.c` 描述符字段、`raft_boundary.c` 取并集，处理原则都按 §15.3 执行。
+
+### 预判之外的（四个运行期缺陷，全部是合并缝隙或合并放大）
+
+门禁全绿之后做定向审查才发现的，**没有一条会被当时已有的用例抓到**：
+
+1. **DTX 记录被喂进 `rm_redo`**（§15.4 第 5 项点名的两线交汇盲区，实锤）。
+   `shard_replay.c` 五阶段回放的分派处，非 MARKER/CTRL 一律落进
+   `ApplyDataRecord`；DTX 载荷是 `DtxRecord` 不是 `XLogRecord`，且它的 rmid
+   恰好是 `RM_XACT_ID`，看起来像正常 xact 记录。已补显式 DTX 分支（只推游标）。
+2. **`partition_lsn` 重号（最严重，实测复现）**。`AppendDtxRecord` 与
+   `partwal_follower_append` 是仅有的两个**不持 `PartWALCtl->lock`** 就写段文件的
+   事务外写入者，而 plsn 由**磁盘 checkpoint 播种、进程私有内存 +1** 分配 ——
+   两个写者读到同一份 checkpoint 就发同一个号，`expected==0` 走自增分支、
+   重号校验碰不到，**静默**。实测：一张 2 分片表上并发跑 120 笔跨分片 2PC +
+   120 笔单分片 INSERT，604 条记录只有 582 个不同编号（22 条重号，每条都是
+   "一条 DTX + 一条 DATA"）。后果是按编号回读只返回首条，另一条永不进 Raft ⇒
+   **副本静默分歧，流里没有空洞、没有任何报错**。修法是把两者纳入同一把锁；
+   复跑同一脚本 846 条记录、846 个不同编号、0 重号。
+3. **`setup-raft.sh` 把 4.0 旧签名覆盖装回集群库**。`ensure_boundary_functions()`
+   仍按 `(OUT xid, OUT flags)` / `(p_xid, p_data, p_flags)` 重建，而同脚本的
+   `DO $mig$` 会先 DROP 掉正确的 3.0 声明、`CREATE EXTENSION IF NOT EXISTS`
+   又补不回来。踩到即 `data_propose_one` 报 `column "gxid" does not exist`
+   ⇒ **整个数据组 propose 全线中止**；`follower_append` 因参数类型表不同会形成
+   **重载**而非替换，走旧重载会把 bytea 指针当 gxid 读 ⇒ 段错误。
+   **危险在于 `run-raft-tests.sh` 在缺 pg_raft 或未收敛时会自动调它** ——
+   一次普通测试就能毒化集群。已改回 3.0 布局并新增 `DO $readd$` 把重建的函数
+   认回扩展（否则留成游离对象，下次 DROP/CREATE EXTENSION 循环整体失败）。
+4. **`TruncatePartWALTo` 把 checkpoint 的 `last_wal_lsn` 写成 0**。截断扫描无条件
+   `last_kept_lsn = rec.orig_lsn`，漏了写入侧同场景的 `orig_lsn != Invalid` 守卫。
+   2PC 负载下流尾常年是 `orig_lsn=0` 的 DTX 记录，切点落上面即清零 ⇒ 段号错乱
+   （§9 里 2026-08-04 修过的老缺陷复活）+ `DemuxCrashRecovery` 跳过 WAL 重扫描。
+
+另有一条**已知未修**：`PartWALFlush` 的 drain 曾按环槽下标序分配 plsn，跨环回绕
+时更新的记录会拿到更小的编号 —— 这条已于 `7711bc1` 改为按 `(orig_lsn, start_lsn)`
+排序后落盘。
+
+### 三处测试判据在合并后过期（非产品缺陷，但会误导）
+
+- `raft_19` B 段断言"leader 侧所有记录 flags 都是 1" —— R2 起每笔事务尾部有
+  COMMIT MARKER（flags=2），已改为 `flags ∈ {1,2,4}` + 另断言确实存在 flags=1；
+- `raft_22` C 段用旧列名 `xid` 查 `partwal_read_record`（parwal-3.0 已改名 `gxid`），
+  取值恒为空串；后来又因 §12.2 新增的两段式标记，其 kind 序列判据从
+  `...,1,3` 变成 `...,1,0,3,0`，已改为校验 **DTX 子序列**；
+- `test_shard_identity_p0` [C] 假设"同一 reference 分片在各节点的本地 OID 互异" ——
+  对称新建集群的 OID 计数器几乎同步，互异只是有机分化后的偶然现象，已改为
+  对照 `pg_class` 真值。
+
+**教训**：`psql -Atc` 执行多语句时会把 `SET` 等命令标签一并打进输出，取值必须
+`tail -n1`；否则拿到的是标签而不是结果，且断言会以一种看起来合理的方式失败。
+
+### 运维上的两个新坑
+
+1. **探针留下的 `pg_dist_transaction` 积压会打挂 `raft_21`**。本环境按 DTX 设计
+   关掉了 Citus 原生 2PC 恢复（`citus.recover_2pc_interval = -1`），所以每笔跨分区
+   事务都在表里留一行，只能靠 `partdist.dtx_gc_dist_transaction()` 收。一次 240 笔
+   的并发探针攒到 818 行，超过 `raft_21` [I] 的有界循环上限（6 轮 × 128 = 768 个
+   候选），该用例遂失败。**跑完任何 2PC 压力探针，循环调 GC 到返回 0 再跑 raft 套件。**
+2. **新增记录类型会打破按 kind 序列/记录条数断言的旧用例**（上文 `raft_22` 即此）。
+   凡是按条数或整串序列断言的脚本，加新记录类型时都要扫一遍。

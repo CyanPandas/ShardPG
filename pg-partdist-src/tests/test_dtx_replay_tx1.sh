@@ -168,7 +168,13 @@ ndtx_a=$(PSQL $pport_a -Atc "
 ndtx_b=$(PSQL $pport_b -Atc "
   SELECT count(*) FROM generate_series($((b4_b+1)), ${af_b}) g,
        LATERAL partdist.partwal_read_record(${loid_b}::oid, g) r WHERE r.flags = 8")
-echo "  （Citus 2PC 路径产生的 DTX 记录：shardA=${ndtx_a} 条，shardB=${ndtx_b} 条）"
+# ★ 必须断言，不能只 echo。这两个数是 TX1 的立身之本 —— 若 DTX 接线整个回归
+# （GUC 总开关关掉、或 PRE_PREPARE / 阶段 3 的挂点丢失），真实 2PC 路径一条 DTX
+# 记录都不产生，而下面 [4] 起全部基于**手工注入**的记录，照样全绿。
+check "真实 2PC 在 shard A 段流留下 DTX 记录（${ndtx_a} 条）" \
+      "$([[ -n "$ndtx_a" && "$ndtx_a" -ge 1 ]] && echo ok)" "ok"
+check "真实 2PC 在 shard B 段流留下 DTX 记录（${ndtx_b} 条）" \
+      "$([[ -n "$ndtx_b" && "$ndtx_b" -ge 1 ]] && echo ok)" "ok"
 
 echo "========== [4] 显式 DTX 记录：flags 端到端保真 =========="
 # 不依赖 Citus 触发条件，直接在两侧 leader 各落一条 DTX_PREPARE(kind=1) ——
