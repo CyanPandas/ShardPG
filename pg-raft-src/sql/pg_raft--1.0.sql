@@ -367,7 +367,7 @@ COMMENT ON FUNCTION pg_raft_group_reset() IS
 CREATE OR REPLACE FUNCTION pg_raft_promote_prepare(
     p_group_id BIGINT,
     p_timeout_ms INTEGER DEFAULT 2000)
-    RETURNS BOOLEAN
+    RETURNS INTEGER
     LANGUAGE plpgsql VOLATILE
 AS $promo$
 DECLARE
@@ -376,10 +376,34 @@ DECLARE
     app     BIGINT;
     bound   BIGINT;
     got     BIGINT;
+    ndiv    BIGINT;
 BEGIN
+    -- 返回值三态：1 = 可以上报；0 = 还没好，稍后重试；**-1 = 分叉，永不上报**。
+    -- 三态而不是布尔，是因为"还没追平"可以被 deadline 兜底放行（可用性优先），
+    -- 而"检测到分叉"绝不能放行 —— 放行等于让一个已知与组分叉的副本当上主库。
     loid := partdist.local_partition_for_shard(p_group_id);
     IF loid IS NULL OR loid = 0 THEN
-        RETURN true;            -- 本节点没有该分片，无事可做
+        RETURN 1;               -- 本节点没有该分片，无事可做
+    END IF;
+
+    -- ★ 第 6 步 b（§9.5）：快路径分叉的归队规则。
+    --
+    -- 必须排在 armed 判断**之前**：分叉的旧 leader 上，该分片是真表而不是
+    -- 副本壳表，多半压根没有回放槽位 —— 若先判 armed 就会直接 RETURN 1 放行，
+    -- 分叉检查形同虚设。
+    ndiv := partdist.pg_raft_check_fastpath_divergence(loid);
+    IF ndiv > 0 THEN
+        RAISE WARNING 'pg_raft: 分片 % (组 %) 检测到快路径分叉：段流里有 % 条本节点写的 '
+                      'COMMIT 标记，其事务在本地 CLOG 却不是 committed。'
+                      '本节点拒绝升主，该分片须重做物理基线后才能重新参选。',
+                      loid, p_group_id, ndiv;
+        -- 顺手把回放槽位下电（若有），避免它以"看似正常"的姿态继续参与。
+        BEGIN
+            PERFORM partdist.replay_disable(loid::regclass);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;               -- 没有槽位/已下电：无所谓
+        END;
+        RETURN -1;
     END IF;
 
     SELECT s.armed, s.applied INTO is_armed, app
@@ -387,7 +411,8 @@ BEGIN
     IF NOT FOUND OR is_armed IS NOT TRUE THEN
         -- 本节点没有该分片的副本回放配置（没 replay_set_locmap / 没 arm）。
         -- 这不是错误：它可能一直就是该组的 leader，或副本回放尚未启用。
-        RETURN true;
+        -- 分叉检查已在上面做过，这里放行是安全的。
+        RETURN 1;
     END IF;
 
     -- 追平上界取 Raft 已提交位点，绝不碰未提交条目（惰性回放的核心不变式）。
@@ -400,10 +425,10 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'pg_raft: 升主追平 shard % (组 %) 失败: %',
                           loid, p_group_id, SQLERRM;
-            RETURN false;
+            RETURN 0;
         END;
         IF got IS NULL OR got < bound THEN
-            RETURN false;       -- 这一片没追完，下个 tick 接着追
+            RETURN 0;           -- 这一片没追完，下个 tick 接着追
         END IF;
     END IF;
 
@@ -417,9 +442,101 @@ BEGIN
                       loid, p_group_id, SQLERRM;
     END;
 
-    RETURN true;
+    RETURN 1;
 END
 $promo$;
 
 COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
-    '升主前置：把本节点该分片的物理回放追平到 Raft 已提交位点，再闭合 in-doubt 分布式事务。返回 false 表示尚未追平，调用方应稍后重试而不要上报为新主。';
+    '升主前置：先查快路径分叉，再把本节点该分片的物理回放追平到 Raft 已提交位点，最后闭合 in-doubt 分布式事务。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=检测到分叉（永不放行，须重做物理基线）。';
+
+-- ------------------------------------------------------------------
+-- 快路径分叉检测（DTX_2PC_DESIGN.md §9.5，第 6 步 b）
+-- ------------------------------------------------------------------
+--
+-- **要检测的窗口**：单分区（快路径）事务沿用 `[A] → quorum → [B]` 时序 ——
+-- 记录与 COMMIT 标记先达组内多数派，leader 本地的 [B]（pg_wal 提交记录 fsync）
+-- 之后才发生。leader 在这两步之间崩溃 ⇒ **组内认为已提交、leader 本地事务却
+-- 中止** ⇒ 旧 leader 与自己的组分叉。
+--
+-- **怎么检测**：段流里的 COMMIT 标记是"本组认为这笔事务提交了"的凭据，
+-- 而本地 CLOG 是"本节点认为它提交了没有"的凭据。两者对同一个 xid 给出相反
+-- 答案，就是分叉的**直接证据**，不需要比对页面。
+--
+-- 只查**本节点写的**标记（gxid 高 16 位 = 本节点 Citus group id）：别的节点
+-- 写的标记，其 xid 在本地 CLOG 里根本没有意义。
+--
+-- **从流尾往回扫，遇到第一个"本地确实提交了"的标记就停**：那笔事务的 [B]
+-- 已经完成，比它更早的事务不可能停在 [A]-[B] 之间。所以扫描量与分叉深度同阶，
+-- 正常情况下第一条就停。p_max_scan 只是防御性上限。
+CREATE OR REPLACE FUNCTION pg_raft_check_fastpath_divergence(
+    p_loid OID,
+    p_max_scan INTEGER DEFAULT 200)
+    RETURNS BIGINT
+    LANGUAGE plpgsql STABLE
+AS $div$
+DECLARE
+    tip      BIGINT;
+    self_gid INTEGER;
+    i        BIGINT;
+    scanned  INTEGER := 0;
+    ndiv     BIGINT  := 0;
+    rec      RECORD;
+    nid      INTEGER;
+    lo       BIGINT;
+    st       TEXT;
+    cur_full BIGINT;
+    full_xid BIGINT;
+BEGIN
+    SELECT groupid INTO self_gid FROM pg_dist_local_group;
+    IF self_gid IS NULL THEN RETURN 0; END IF;
+
+    -- pg_xact_status 接的是 **xid8**（64 位 full xid），而 gxid 低位存的是
+    -- 32 位 TransactionId。要按当前 epoch 还原，不能硬转：epoch 边界上
+    -- 硬转会查到隔了一整个 epoch 的另一笔事务的判决。
+    cur_full := pg_current_xact_id()::text::bigint;
+
+    tip := partdist.get_partition_flush_lsn(p_loid);
+    IF tip IS NULL OR tip <= 0 THEN RETURN 0; END IF;
+
+    i := tip;
+    WHILE i >= 1 AND scanned < p_max_scan LOOP
+        scanned := scanned + 1;
+        BEGIN
+            SELECT r.flags, r.info, r.gxid INTO rec
+              FROM partdist.partwal_read_record(p_loid, i) r;
+        EXCEPTION WHEN OTHERS THEN
+            EXIT;                       -- 读不出来（截断/损坏）：不再往前
+        END;
+
+        -- flags=2 MARKER, info=0 XLOG_XACT_COMMIT
+        IF rec.flags = 2 AND rec.info = 0 THEN
+            nid := (rec.gxid >> 48)::int;
+            lo  := rec.gxid & ((1::bigint << 48) - 1);
+            IF nid = self_gid AND lo > 0 THEN
+                full_xid := cur_full - (cur_full % 4294967296) + lo;
+                IF full_xid > cur_full THEN
+                    full_xid := full_xid - 4294967296;   -- 属上一个 epoch
+                END IF;
+                BEGIN
+                    st := pg_xact_status(full_xid::text::xid8);
+                EXCEPTION WHEN OTHERS THEN
+                    st := NULL;         -- xid 已过 CLOG 截断点：无从判定，跳过
+                END;
+                IF st IS NULL THEN
+                    NULL;
+                ELSIF st = 'committed' THEN
+                    EXIT;               -- [B] 已完成，更早的不可能分叉
+                ELSE
+                    ndiv := ndiv + 1;   -- 流说提交、本地说没有 ⇒ 分叉
+                END IF;
+            END IF;
+        END IF;
+        i := i - 1;
+    END LOOP;
+
+    RETURN ndiv;
+END
+$div$;
+
+COMMENT ON FUNCTION pg_raft_check_fastpath_divergence(OID, INTEGER) IS
+    '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed。返回分叉条数，0 表示无分叉。';

@@ -2817,6 +2817,7 @@ data_group_promote_prepare(int64 group_id)
     char         selfconn[256];
     char         sql[256];
     bool         ok = false;
+    int          verdict = 0;
     int          i;
     int          slot = -1;
     int          free_slot = -1;
@@ -2860,12 +2861,33 @@ data_group_promote_prepare(int64 group_id)
 
     res = PQexec(conn, sql);
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
-        ok = (PQgetvalue(res, 0, 0)[0] == 't');
+        verdict = atoi(PQgetvalue(res, 0, 0));
     else
         elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
              (long long) group_id, PQerrorMessage(conn));
     PQclear(res);
     PQfinish(conn);
+
+    ok = (verdict == 1);
+
+    /*
+     * ★ verdict < 0 = 检测到快路径分叉（DTX_2PC_DESIGN.md §9.5，第 6 步 b）。
+     *
+     * 与"还没追平"不是一回事：追不平是**暂时**状态，可以被 deadline 按
+     * 可用性优先放行；分叉是**已知事实** —— 本节点段流里有它自己写的 COMMIT
+     * 标记，而那笔事务在本地 CLOG 里并没有提交。放行等于让一个已知与组分叉的
+     * 副本当上主库，比"该分片暂时无主"坏得多。所以这里**清掉截止期计时并直接
+     * 返回**，绕过下面那段兜底逻辑，永不放行。
+     *
+     * 恢复手段是重做物理基线（惰性回放的 re-baseline 路径），完成后该分片
+     * 重新 replay_enable 即可再次参选 —— 那时段流与本地 CLOG 不再矛盾。
+     */
+    if (verdict < 0)
+    {
+        if (slot >= 0)
+            deadline_state[slot].group_id = 0;
+        return false;
+    }
 
     if (ok)
     {
