@@ -18,8 +18,14 @@
 # ── 判据（四条，全部是确定性的，无并发/无概率）────────────────────────
 #   A. NULL 成员集 + partition_map 无登记 ⇒ 建组必须**报错拒绝**
 #      （旧行为：建出 cluster_size=9 的组）
-#   B. partition_map 有登记 ⇒ NULL 建组自动导出成员集，cluster_size == 3
-#      （控制面是成员集的权威来源，本地可读，无需新增 RPC）
+#   B. partition_map 有登记 ⇒ NULL 建组自动导出成员集，且**三个成员各自**
+#      算出的 cluster_size 都是 3（控制面是成员集的权威来源，本地可读，
+#      无需新增 RPC）。
+#      ★ 2026-08-09 审查：旧版只在 leader 上读一次 cluster_size，C 段在 F1/F2
+#        上建组后也不检查它们的 cluster_size —— 于是"成员集导出只在 leader 侧
+#        生效、follower 回落到全体节点"这个文件头点名的**本质危险**（同一组在
+#        不同节点上有两套不相交的多数派定义 2/3 vs 5/9）原封不动地能通过。
+#        现在三个成员逐一断言，并加计数守卫确保确实检查了 3 个节点。
 #   C. quorum 按真实成员数：3 成员全在可写；停 1 个（2/3）仍可写；
 #      停 2 个（1/3）必败。旧行为下多数派=5，三个成员全在也写不进去。
 #   D. 非副本节点不被拖入该组（旧行为：5436-5440 会 hearsay 建组）
@@ -97,11 +103,26 @@ A_OUT=$(psql_at "$LEADER_PORT" -tAc "SELECT partdist.pg_raft_group_create(${GID}
 if ! grep -q "成员集未知" <<<"$A_OUT"; then
   fail "A: NULL 成员集建组本应报错拒绝，实际输出：$(tr '\n' ' ' <<<"$A_OUT" | cut -c1-160)"
 fi
-A_CS=$(q "$LEADER_PORT" "SELECT cluster_size FROM partdist.pg_raft_group_status() WHERE group_id=${GID};")
-[[ -z "$A_CS" ]] || fail "A: 建组被拒后不应留下组，实际 cluster_size=${A_CS}"
+# ★ 2026-08-09 审查：旧版写的是
+#     A_CS=$(q ... "SELECT cluster_size ...");  [[ -z "$A_CS" ]] || fail ...
+#   而 q() 吞掉 stderr 并 `|| true` —— 节点不可达、语法写错、扩展没装，统统
+#   产出空串，于是"结果为空 = 建组被拒"这条判据在**任何取数失败**下都成立。
+#   改成 count(*)：先断言拿到的是数字（证明查询真的跑成功了），再判它等于 0。
+A_CS=$(q "$LEADER_PORT" "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id=${GID};")
+[[ "$A_CS" =~ ^[0-9]+$ ]] \
+  || fail "A: 读 pg_raft_group_status 失败（返回 '${A_CS}'），判据无从建立"
+[[ "$A_CS" == "0" ]] || fail "A: 建组被拒后不应留下组，实际残留 ${A_CS} 个组"
 echo "raft_18 A: NULL 成员集 + 无登记 ⇒ 建组被拒且不留残组 ✓"
 
-# ── B. 控制面登记后，NULL 建组自动导出成员集 ──
+# ── B. 控制面登记后，NULL 建组自动导出成员集（三个成员逐一验）──
+# 壳表与身份注册提到 B 之前：B 会让三个成员都建组、随即开始选举，
+# 任一成员都可能当选并把路由切到自己身上；壳表若还没建好，C 段的写入
+# 会打到一个不存在的分片表上（与成员集判据无关的假失败）。
+for port in "$F1_PORT" "$F2_PORT"; do
+  q "$port" "SET citus.enable_ddl_propagation=off;
+             CREATE TABLE IF NOT EXISTS ${TBL}_${GID} (LIKE ${TBL} INCLUDING ALL);" >/dev/null
+  q "$port" "SELECT partdist.rebuild_shard_identity();" >/dev/null
+done
 for port in "${MEMBER_PORTS[@]}"; do
   q "$port" "INSERT INTO partdist.partition_map(partition_id, primary_node, secondary_nodes, primary_term)
              VALUES (${GID}::oid, 2, ARRAY[3,4], 1)
@@ -110,19 +131,22 @@ for port in "${MEMBER_PORTS[@]}"; do
                    secondary_nodes = EXCLUDED.secondary_nodes,
                    primary_term = EXCLUDED.primary_term;" >/dev/null
 done
-q "$LEADER_PORT" "SELECT partdist.pg_raft_group_create(${GID});" >/dev/null
-B_CS=$(q "$LEADER_PORT" "SELECT cluster_size FROM partdist.pg_raft_group_status() WHERE group_id=${GID};")
-[[ "$B_CS" == "3" ]] \
-  || fail "B: 成员集应从 partition_map 导出为 3 个成员，实际 cluster_size=${B_CS:-<无组>}（=${N_WORKERS}+1 说明仍在按全体节点算多数派）"
-echo "raft_18 B: partition_map 登记 ⇒ 成员集自动导出，cluster_size=3 ✓"
-
-# ── C. quorum 按真实成员数（3 成员 ⇒ 多数派 2）──
-for port in "$F1_PORT" "$F2_PORT"; do
-  q "$port" "SET citus.enable_ddl_propagation=off;
-             CREATE TABLE IF NOT EXISTS ${TBL}_${GID} (LIKE ${TBL} INCLUDING ALL);" >/dev/null
-  q "$port" "SELECT partdist.rebuild_shard_identity();" >/dev/null
+for port in "${MEMBER_PORTS[@]}"; do
   q "$port" "SELECT partdist.pg_raft_group_create(${GID});" >/dev/null
 done
+# 逐成员断言 + 计数守卫：数组若为空，下面的 for 一个都不检查而脚本照样往下走
+B_CHECKED=0
+for port in "${MEMBER_PORTS[@]}"; do
+  B_CS=$(q "$port" "SELECT cluster_size FROM partdist.pg_raft_group_status() WHERE group_id=${GID};")
+  [[ "$B_CS" == "3" ]] \
+    || fail "B: 成员 ${port} 上的成员集应从 partition_map 导出为 3 个成员，实际 cluster_size=${B_CS:-<无组>}（=${N_WORKERS}+1 说明该节点仍在按全体节点算多数派 —— 同一组两套多数派定义）"
+  B_CHECKED=$((B_CHECKED + 1))
+done
+(( B_CHECKED == 3 )) \
+  || fail "B: 只检查了 ${B_CHECKED}/3 个成员的 cluster_size，判据未覆盖全部成员"
+echo "raft_18 B: partition_map 登记 ⇒ 成员集自动导出，三个成员 (${MEMBER_PORTS[*]}) 的 cluster_size 均为 3 ✓"
+
+# ── C. quorum 按真实成员数（3 成员 ⇒ 多数派 2）──
 # ★ 不能断言"某个特定节点当选"——Raft 不保证哪个成员赢，三个成员都可能。
 #   （初版就是这么写的，实测 worker3 先超时先当选而挂掉，属于面向结果的错误断言。）
 #   正确做法：等**任一成员**当选，动态确定 leader 与要停的 follower。

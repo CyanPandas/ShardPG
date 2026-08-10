@@ -9,7 +9,14 @@
 --   3. 两组的 leader 不是同一个节点 —— 组间领导权独立，不是"一个全局 leader"；
 --   4. 数据组的日志与控制面日志互不串扰：raft_log 按 group_id 分命名空间，
 --      :gid_a 的条目数 == 该组 last_log_index，且组 0 的日志未被数据组条目污染；
+--      **且 :gid_b 一条日志都没有** —— 驱动只往 A 组 propose，B 组必须保持空。
 --   5. 数据组的已提交条目在本节点（follower）上已 apply（last_applied == commit_index）。
+--
+-- ── 原判据的缺陷（2026-08-09 审查）────────────────────────────────────
+-- 驱动的注释明写"只往 A 组写日志：B 组必须保持空，证明两组日志互不串扰"，
+-- 但本用例旧版**一次都没查过 B 组的日志条数**：只验了 gid_a 的 rows/last_log_index
+-- 与 gid_b 的 state/leader。于是"两组共用一份日志"（B 组把 A 组的条目也收进
+-- 自己的命名空间）这个最该被抓的串扰形态原封不动地能通过。本版补上 4b。
 
 \set ON_ERROR_STOP on
 
@@ -26,9 +33,11 @@ DECLARE
   state_a      TEXT;
   state_b      TEXT;
   lastidx_a    BIGINT;
+  lastidx_b    BIGINT;
   commit_a     BIGINT;
   applied_a    BIGINT;
   rows_a       BIGINT;
+  rows_b       BIGINT;
   rows_ctrl    BIGINT;
   ctrl_lastidx BIGINT;
 BEGIN
@@ -81,6 +90,25 @@ BEGIN
       gid_a, rows_a, lastidx_a;
   END IF;
 
+  -- 4b. B 组必须一条日志都没有：驱动全程只往 A 组 propose。
+  --     两组若共用同一份日志（或 group_id 没参与索引），这里立刻炸。
+  SELECT count(*) INTO rows_b
+  FROM partdist.raft_log WHERE group_id = gid_b;
+  IF rows_b <> 0 THEN
+    RAISE EXCEPTION
+      'raft_12: 数据组 % 从未被 propose,raft_log 里却有 % 行 —— 两组日志串扰',
+      gid_b, rows_b;
+  END IF;
+
+  SELECT last_log_index INTO lastidx_b
+  FROM partdist.pg_raft_group_status() WHERE group_id = gid_b;
+  IF lastidx_b IS DISTINCT FROM 0 THEN
+    RAISE EXCEPTION
+      'raft_12: 数据组 % 从未被 propose,last_log_index 却是 %（期望 0）—— '
+      '组间日志游标未隔离',
+      gid_b, lastidx_b;
+  END IF;
+
   SELECT count(*), coalesce(max(log_index), 0) INTO rows_ctrl, ctrl_lastidx
   FROM partdist.raft_log WHERE group_id = 0;
   IF EXISTS (SELECT 1 FROM partdist.raft_log
@@ -104,7 +132,7 @@ BEGIN
   END IF;
 
   RAISE NOTICE
-    'raft_12 OK: group % leader=node% (log=%), group % leader=node%, 控制面 group0 log=%',
+    'raft_12 OK: group % leader=node% (log=%), group % leader=node% (log=0,行数=0), 控制面 group0 log=%',
     gid_a, leader_a, lastidx_a, gid_b, leader_b, ctrl_lastidx;
 END;
 $$;

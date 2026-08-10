@@ -325,7 +325,13 @@ if grep -qiE "server closed the connection unexpectedly|crash of another server 
   fail "阶段三 burst 期间有节点崩溃——本轮对失多数派判据无参考价值"
 fi
 
-if [[ "$COMMITTED" =~ ^[0-9]+$ ]] && (( COMMITTED > 0 )); then
+# ★ 取不到值必须 fail，不能跳过。q() 是 `psql ... 2>/dev/null || true`，
+# 任何失败都返回空串；空串不匹配 ^[0-9]+$ ⇒ 原来的写法直接跳过 fail ⇒
+# 阶段三这条**最核心**的判据（2PC prepare 性质）变成 no-op 而报绿。
+# 分片表名推导错、leader 在阶段三期间自己也挂了、psql 连不上 —— 都会走到这里。
+[[ "$COMMITTED" =~ ^[0-9]+$ ]] \
+  || fail "阶段三取不到提交行数（COMMITTED='${COMMITTED}'）——判据无从成立，不能算通过"
+if (( COMMITTED > 0 )); then
   fail "失多数派期间仍有 ${COMMITTED} 行提交成功（组 ${GID_A}，id >= ${PHASE3_MIN_A}）——"\
 "存在绕过复制挂钩的提交路径（DTX_2PC_DESIGN.md §9.1 的 prepare 性质被破坏）"
 fi

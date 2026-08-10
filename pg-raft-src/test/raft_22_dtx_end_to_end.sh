@@ -251,6 +251,7 @@ for p in $(member_ports "${MEMBERS[$COORD_IDX]}"); do
 done
 echo "raft_22 B: 决议 dtxid=${DTXID} coord=${COORD} participants=${PARTS}，协调组全体成员均有 ✓"
 
+declare -a PXIDS=()
 # C. 三阶段记录序列
 BASE_COORD=$([[ $COORD_IDX -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
 BASE_PART=$([[ $PART_IDX  -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
@@ -287,7 +288,20 @@ for i in 0 1; do
               partdist.local_partition_for_shard(${GIDS[$i]}), ${PLSN});")
   [[ -n "$PXID" && "$PXID" != "0" ]] \
     || fail "C: 组 ${GIDS[$i]} 的 PREPARE 标记没有携带本地 top-level xid（实际 '${PXID}'）"
+  PXIDS[$i]="$PXID"
 done
+
+# ★ "非零"是弱判据：规格要的是**本分区所在节点的本地** top-level xid ——
+# 升主回放时"这笔 in-doubt 属于哪个全局事务"就只剩这一条线索。写成协调节点的
+# xid、上一笔事务的 xid、或 GetCurrentTransactionIdIfAny() 拿到的子事务 xid，
+# 都能过"非零"，而升主时按它去 pg_prepared_xacts 找不到对应事务 ⇒ in-doubt 永久滞留。
+#
+# 两个参与组在**不同节点**上，各有各的本地 xid 空间，正常情况下不会相等；
+# 若相等，最可能的解释就是两处写的其实是同一个（错误的）来源。
+[[ "${PXIDS[0]}" != "${PXIDS[1]}" ]] \
+  || fail "C: 两个参与组的 PREPARE 标记携带了相同的本地 xid（${PXIDS[0]}）——"\
+"它们在不同节点上，本地 xid 不应相同，多半写的是同一个错误来源"
+echo "raft_22 C: 两参与组的本地 xid 互异（${PXIDS[0]} / ${PXIDS[1]}）✓"
 echo "raft_22 C: 三阶段记录序列 参与组='${K_PART}' 协调组='${K_COORD}'，PREPARE 携带本地 xid ✓"
 
 # C2. 标记必须真的复制出去：两组的**每个成员**最终与 leader 的 kind 序列一致。
@@ -297,17 +311,25 @@ echo "raft_22 C: 三阶段记录序列 参与组='${K_PART}' 协调组='${K_COOR
 for i in 0 1; do
   IFS=',' read -r cm1 cm2 cm3 <<< "${MEMBERS[$i]}"
   BASE_I=$([[ $i -eq 0 ]] && echo "$BASE0" || echo "$BASE1")
-  K_LEADER=$(kinds_of "${PORTS[$i]}" "${GIDS[$i]}" "$BASE_I")
   for n in $cm1 $cm2 $cm3; do
     p=$(( BASE_PORT + n - 1 ))
     [[ "$p" == "${PORTS[$i]}" ]] && continue
     ok=0
     for _ in $(seq 1 30); do
-      [[ "$(kinds_of "$p" "${GIDS[$i]}" "$BASE_I")" == "$K_LEADER" ]] && { ok=1; break; }
+      # ★ leader 侧必须**每轮重读**，不能在循环外冻结一次快照。
+      #
+      # 这条流会持续增长：决议被自动回执后 GC 会补一条 DTX_FORGET(kind=5)
+      # （本文件 D 段的注释自己写着"总数随时间自己变"），阶段 3 的 COMMIT/ABORT
+      # 标记也是异步复制的。拿冻结快照去比，follower 一旦追到**更新**的状态，
+      # 字符串就永远不相等 —— 表现为"30s 未追平"，而实际上它比 leader 快照还全。
+      # 实测失败序列 '0,0,0,1,0,2,0,5,0' vs '0,0,0,1,0,2,0' 正是此形。
+      K_LEADER=$(kinds_of "${PORTS[$i]}" "${GIDS[$i]}" "$BASE_I")
+      K_MEM=$(kinds_of "$p" "${GIDS[$i]}" "$BASE_I")
+      [[ -n "$K_LEADER" && "$K_MEM" == "$K_LEADER" ]] && { ok=1; break; }
       sleep 1
     done
     [[ $ok -eq 1 ]] \
-      || fail "C2: 组 ${GIDS[$i]} 成员 ${p} 的记录序列 30s 未追平 leader（'$(kinds_of "$p" "${GIDS[$i]}" "$BASE_I")' vs '${K_LEADER}'）"
+      || fail "C2: 组 ${GIDS[$i]} 成员 ${p} 的记录序列 30s 未追平 leader（'${K_MEM}' vs '${K_LEADER}'）"
   done
 done
 echo "raft_22 C2: 两组全部成员的 DATA/PREPARE/标记序列与 leader 一致（标记真的复制出去了）✓"

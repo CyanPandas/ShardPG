@@ -138,6 +138,11 @@ wait_leader_and_route() {  # $1=最长秒数；成功后 LEADER_PORT 是组 lead
 converged_within() {  # $1=port $2=秒 → follower 与 leader 条数+指纹一致
   local port=$1 secs=$2 i n lfp ffp fn
   n=$(flush_of "$LEADER_PORT"); lfp=$(fp_of "$LEADER_PORT" "$n")
+  # ★ leader 侧取不到基准就直接判失败，不能一路"未收敛"下去。
+  # A 段要求的是**不收敛**，若 leader 指纹取不到（分片表刚重建、OID 未解析等）
+  # 就会恒返回"未收敛" ⇒ A 恒过 ⇒ 它给 B 段做的归因对照彻底失效。
+  [[ -n "$n" && -n "$lfp" ]] \
+    || fail "converged_within: leader 侧基准取不到（n=${n}）——对照关系不成立"
   for i in $(seq 1 "$secs"); do
     fn=$(flush_of "$port")
     if [[ "$fn" == "$n" ]]; then
@@ -268,6 +273,9 @@ fi
 
 # ── D：追平只补发已存在的条目，且收敛后幂等 ────────────────────────────
 LLI_AFTER=$(last_log_index_of "$LEADER_PORT")
+# 两边都是空串时 "" == "" 为真会静默通过，先证明取到了数字
+[[ "$LLI_BEFORE" =~ ^[0-9]+$ && "$LLI_AFTER" =~ ^[0-9]+$ ]] \
+  || fail "D：last_log_index 取不到（before='${LLI_BEFORE}' after='${LLI_AFTER}'）——幂等判据无从成立"
 [[ "$LLI_BEFORE" == "$LLI_AFTER" ]] \
   || fail "D：追平过程中 leader 的 last_log_index 变了（${LLI_BEFORE} → ${LLI_AFTER}）—— 追平不该产生新条目"
 AGAIN=$(q "$LEADER_PORT" "SELECT partdist.pg_raft_catchup();")

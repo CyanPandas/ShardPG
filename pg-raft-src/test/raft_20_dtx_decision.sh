@@ -32,8 +32,19 @@ GID=""
 LEADER_PORT=""
 FOLLOWER_PORTS=()
 MEMBER_PORTS=($((BASE_PORT + 1)) $((BASE_PORT + 2)) $((BASE_PORT + 3)))
-DTX_OK=900101      # 走正常提交路径的事务
-DTX_PRESUMED=900102  # 从未决议、靠推定中止收敛的事务
+
+# ── dtxid 必须每轮唯一（2026-08-09 审查）────────────────────────────────
+# 旧版是写死的 900101/900102/900103，而清理走的是吞错的 q()（节点不可达、
+# 表不存在、语法错都静默成功）。上一轮遗留的 (dtxid=900102, verdict=2) 会让
+# D 段的三条判据**全部成立**：dtx_status 直接读到旧行就返回 2、索引表里本来
+# 就有 verdict=2、再决议 COMMIT 也因为决议槽一次性而返回 2 —— 于是"查无决议时
+# **先写 ABORT 达多数派再答复**"这条真正的写路径一次都没被执行过。
+# 照 raft_12 的做法给 dtxid 加运行时唯一前缀，并在夹具阶段断言这些 id 在
+# **每个成员**上都不存在，否则 fail-fast（残留意味着判据已被污染）。
+DTX_BASE=$(( 900000000 + ($(date +%s) % 9000000) * 16 ))
+DTX_OK=$((       DTX_BASE + 1 ))   # 走正常提交路径的事务
+DTX_PRESUMED=$(( DTX_BASE + 2 ))   # 从未决议、靠推定中止收敛的事务
+DTX_FGT=$((      DTX_BASE + 3 ))   # F 段：回执收齐后走 FORGET 回收
 
 cleanup() {
   for port in "${MEMBER_PORTS[@]}"; do
@@ -41,7 +52,7 @@ cleanup() {
     node_ctl "$d" -l "/work/pg-cluster-data/${d}.log" start -w -t 30
   done
   for port in "${MEMBER_PORTS[@]}" "$BASE_PORT"; do
-    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_OK}, ${DTX_PRESUMED}, 900103);" >/dev/null
+    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_OK}, ${DTX_PRESUMED}, ${DTX_FGT});" >/dev/null
     if [[ -n "$GID" ]]; then
       q "$port" "SELECT partdist.pg_raft_group_drop(${GID});" >/dev/null
       q "$port" "DELETE FROM partdist.partition_map WHERE partition_id = ${GID}::oid;" >/dev/null
@@ -103,6 +114,23 @@ done
 for port in "${MEMBER_PORTS[@]}"; do
   [[ "$port" == "$LEADER_PORT" ]] || FOLLOWER_PORTS+=("$port")
 done
+
+# ── 夹具前提：三个 dtxid 在**每个成员**上都必须查无此行 ──
+# 只要有一行残留，D 段（推定中止）就会退化成"读到旧决议"，写路径测不到。
+PRE_CHECKED=0
+for port in "${MEMBER_PORTS[@]}" "$BASE_PORT"; do
+  for d in "$DTX_OK" "$DTX_PRESUMED" "$DTX_FGT"; do
+    n=$(q "$port" "SELECT count(*) FROM partdist.dtx_decision WHERE dtxid=${d};")
+    [[ "$n" =~ ^[0-9]+$ ]] \
+      || fail "夹具：节点 ${port} 上读 dtx_decision 失败（返回 '${n}'），无法确认 dtxid 干净"
+    [[ "$n" == "0" ]] \
+      || fail "夹具：节点 ${port} 上 dtxid=${d} 已有 ${n} 行残留 —— 判据会被上一轮结果污染"
+    PRE_CHECKED=$((PRE_CHECKED + 1))
+  done
+done
+(( PRE_CHECKED == (${#MEMBER_PORTS[@]} + 1) * 3 )) \
+  || fail "夹具：dtxid 干净性只检查了 ${PRE_CHECKED} 项，覆盖不全"
+echo "raft_20 夹具: dtxid ${DTX_OK}/${DTX_PRESUMED}/${DTX_FGT} 在全部成员上均无残留 ✓"
 
 # ── A. 非 leader 上决议必须返回 NULL 且不留痕 ──
 A=$(q "${FOLLOWER_PORTS[0]}" \
@@ -180,7 +208,6 @@ echo "raft_20 E: 协调组切主（${OLD_LEADER} → ${NEW_LEADER}）后两笔�
 # ── F. 回执与 FORGET（§9.7 决议 GC）──
 # acked 收齐（⊇ participants）后 leader 写 FORGET 记录复制到多数派，
 # 每个成员 apply 它时**同步**删除本地决议行 —— 删除走与写入相同的复制路径。
-DTX_FGT=900103
 LEADER_PORT=""
 for _ in $(seq 1 30); do
   LEADER_PORT=$(find_leader || true)

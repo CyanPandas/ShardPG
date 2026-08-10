@@ -79,14 +79,45 @@ BEGIN
   END IF;
 
   -- 3. 一条 record 一次备份：条数、进度、连续性
+  --
+  -- ★ 判据不能写成 `n_disk = nrec`（2026-08-10 修）。
+  --
+  -- 流**不是静止的**：D2 的冻结账目发射器按 pg_partdist.freeze_sync_interval_ms
+  -- （默认 60s）的节奏，在**任意事务**的 PRE_COMMIT 上给**每个已注册分片**补一条
+  -- CTRL:FREEZE_UPDATE(flags=4 info=2)，哪怕该分片本身毫无活动。实测：一个静止
+  -- 分片 60s 后 flush_lsn 自己从 7 长到 8。
+  --
+  -- 于是"leader 侧读到 nrec、follower 侧断言恰好 nrec"这种写法是**时序相关**的 ——
+  -- 用例跨过一次 60s 边界就会多出一条，表现为"多了 1 条记录"的假失败
+  -- （本轮 raft_14/22/24 三处同形失败皆此因）。
+  --
+  -- 改法比原判据**更强**而不是更弱：显式刻画"允许多出什么"。
+  --   a) 1..nrec 必须一条不少（下面的 verify + 指纹比对负责"一次且仅一次"）；
+  --   b) 超出 nrec 的部分**只允许是 CTRL 类**——多出任何一条 DATA/MARKER 都说明
+  --      有重复备份或不该来的记录，仍然立即失败。
   n_disk := partdist.count_parwal_records(local_oid);
-  IF n_disk <> nrec THEN
-    RAISE EXCEPTION 'raft_14: 本节点 parwal 有 % 条记录，期望 %（一条 record 一次备份）',
+  IF n_disk < nrec THEN
+    RAISE EXCEPTION 'raft_14: 本节点 parwal 只有 % 条记录，少于应备份的 %（有记录丢失）',
       n_disk, nrec;
   END IF;
   flush_lsn := partdist.get_partition_flush_lsn(local_oid);
-  IF flush_lsn <> nrec THEN
-    RAISE EXCEPTION 'raft_14: flush lsn=% 期望 %', flush_lsn, nrec;
+  IF flush_lsn < nrec THEN
+    RAISE EXCEPTION 'raft_14: flush lsn=% 小于 %（备份未追平）', flush_lsn, nrec;
+  END IF;
+  IF flush_lsn > nrec THEN
+    DECLARE
+      n_noncrtl BIGINT;
+    BEGIN
+      SELECT count(*) INTO n_noncrtl
+        FROM generate_series(nrec + 1, flush_lsn) g,
+             LATERAL partdist.partwal_read_record(local_oid, g) r
+       WHERE r.flags <> 4;          -- 4 = PARTWAL_FLAG_CTRL
+      IF n_noncrtl > 0 THEN
+        RAISE EXCEPTION
+          'raft_14: 超出 nrec=% 的 % 条记录里有 % 条不是 CTRL 类 —— 存在重复备份或多余记录',
+          nrec, flush_lsn - nrec, n_noncrtl;
+      END IF;
+    END;
   END IF;
   IF NOT partdist.verify_partition_wal(local_oid) THEN
     RAISE EXCEPTION 'raft_14: partition_lsn 非严格单调或记录损坏（1..% 应连续无洞）', nrec;

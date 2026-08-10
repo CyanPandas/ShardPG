@@ -34,7 +34,14 @@ P_PORT=$((BASE_PORT + 1))            # P 组 primary = worker1(node2)
 C_PORT=$((BASE_PORT + 2))            # C 组 primary = worker2(node3)
 P_MEMBERS="2,3,4"
 C_MEMBERS="3,4,5"                    # 不含 node2：P 的 leader 上没有 C 的决议索引
-DTX_A=930001; DTX_B=930002; DTX_D=930004
+
+# ── dtxid 必须每轮唯一（2026-08-09 审查，同 raft_20/21）─────────────────
+# 旧版写死 930001/930002/930004，清理走吞错的 q()。上一轮残留的
+# (dtxid=930001, verdict=2) 会让 A 段直接读到旧决议、"推定中止先落库"这条
+# 写路径不被执行；D 段"什么都查不到 ⇒ 保持 in-doubt"更是会被残留决议翻掉。
+# 加运行时唯一前缀，并在夹具阶段逐节点断言这些 dtxid 干净。
+DTX_BASE=$(( 900000000 + ($(date +%s) % 9000000) * 16 + 9 ))
+DTX_A=$(( DTX_BASE + 0 )); DTX_B=$(( DTX_BASE + 1 )); DTX_D=$(( DTX_BASE + 2 ))
 
 cleanup() {
   local port
@@ -110,6 +117,22 @@ done
 
 P_OID=$(q "$P_PORT" "SELECT partdist.local_partition_for_shard(${P_GID});")
 [[ -n "$P_OID" && "$P_OID" != "0" ]] || fail "P 组 leader 上解析不到本地 OID"
+
+# ── 夹具前提：三个 dtxid 在**每个节点**上都必须查无决议 ──
+PRE_CHECKED=0
+for port in $(seq "$BASE_PORT" $((BASE_PORT + 8))); do
+  for d in "$DTX_A" "$DTX_B" "$DTX_D"; do
+    n=$(q "$port" "SELECT count(*) FROM partdist.dtx_decision WHERE dtxid=${d};")
+    [[ "$n" =~ ^[0-9]+$ ]] \
+      || fail "夹具：节点 ${port} 上读 dtx_decision 失败（返回 '${n}'），无法确认 dtxid 干净"
+    [[ "$n" == "0" ]] \
+      || fail "夹具：节点 ${port} 上 dtxid=${d} 已有 ${n} 行残留 —— 判据会被上一轮结果污染"
+    PRE_CHECKED=$((PRE_CHECKED + 1))
+  done
+done
+(( PRE_CHECKED == 27 )) \
+  || fail "夹具：dtxid 干净性只检查了 ${PRE_CHECKED}/27 项，覆盖不全"
+echo "raft_23 夹具: dtxid ${DTX_A}/${DTX_B}/${DTX_D} 在全部 9 个节点上均无残留 ✓"
 
 kinds_for() {  # $1=dtxid → 该 dtxid 在 P 流里的 kind 序列
   q "$P_PORT" "SELECT string_agg(d.kind::text, ',' ORDER BY g)

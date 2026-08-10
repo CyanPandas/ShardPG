@@ -47,11 +47,25 @@ done
 
 echo "拓扑：容器=${CONTAINER} 协调节点目录=${COORD_DIR} 节点数=${N_NODES}(1c+${N_WORKERS}w) 端口=${NODE_PORTS[0]}-${NODE_PORTS[$((N_NODES - 1))]}"
 
+# ── 计数分两栏（2026-08-09 审查）────────────────────────────────────────
+# 环境探针（容器在不在 / 进程起没起 / 端口通不通 / 扩展装没装 / 边界函数在不在 /
+# leader 收没收敛，约 30 项）此前与用例断言混在同一个 PASS 计数里，"56/56"
+# 因此严重高估了回归强度 —— 真正的判据只有 26 条。现在分开计数、分开汇总，
+# 总退出码语义不变（任一栏有 FAIL 即退出 1）。
+ENV_PASS=0
+ENV_FAIL=0
+ENV_WARN=0
 PASS=0
 FAIL=0
 
 ok()   { echo "  [PASS] $*"; PASS=$((PASS + 1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
+okenv()  { echo "  [PASS] $*"; ENV_PASS=$((ENV_PASS + 1)); }
+badenv() { echo "  [FAIL] $*"; ENV_FAIL=$((ENV_FAIL + 1)); }
+# 自动恢复（setup-raft.sh 重装）**不计入 PASS**：
+# 它把"选举活性缺陷/扩展没装"这类真实故障洗成绿色，而 setup-raft.sh 本身
+# 是已知会覆盖旧签名、毒化集群的脚本。记为 WARN，让人看见但不冒充通过。
+warnenv() { echo "  [WARN] $*"; ENV_WARN=$((ENV_WARN + 1)); }
 section() { echo ""; echo "========== $* =========="; }
 
 raft_port_for_node() {
@@ -140,60 +154,92 @@ start_all_nodes() {
   for port in "${NODE_PORTS[@]}"; do
     node_start "$port"
   done
+  wait_cluster_quorum_ready
+}
+
+# 起完节点必须**等到多数派真的可用**，不能只 sleep 一个固定秒数。
+#
+# 2026-08-10 实测：raft_09 加强后会停/起更多节点，raft_10 紧随其后、
+# `start_all_nodes` 后只 sleep 2，结果 propose 撞上
+#   "group 0 reject propose idx=... because quorum ack is insufficient (1/5)"
+# —— 9 节点里只有 leader 自己应答，其余 8 个还在重连。表现成 raft_10 的
+# "raft propose failed"，看着像产品缺陷，实为夹具没等就绪。
+#
+# 判据取"能应答 SELECT 1 的节点数 >= 多数派"且"group 0 有稳定 leader"，
+# 二者缺一不可：选举本身要多数派，但选出之后 follower 仍可能在重连中，
+# 此时 propose 照样凑不齐 ack。
+wait_cluster_quorum_ready() {
+  local need=$(( ${#NODE_PORTS[@]} / 2 + 1 ))
+  local i alive port ldr
+  for i in $(seq 1 60); do
+    alive=0
+    for port in "${NODE_PORTS[@]}"; do
+      [[ "$($PSQL -p "$port" -U postgres -tAc 'SELECT 1' 2>/dev/null)" == "1" ]] \
+        && alive=$(( alive + 1 ))
+    done
+    if (( alive >= need )); then
+      ldr=$($PSQL -p "$BASE_PORT" -U postgres -tAc \
+        "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()" 2>/dev/null || echo "")
+      [[ -n "$ldr" && "$ldr" != "0" ]] && { sleep 2; return 0; }
+    fi
+    sleep 1
+  done
+  echo "  [WARN] 60s 内未等到多数派就绪（alive=${alive}/${#NODE_PORTS[@]}），后续用例可能不稳" >&2
+  return 1
 }
 
 # ------------------------------------------------------------------
-section "1. Docker 与容器"
+section "1. Docker 与容器（环境探针）"
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
-  ok "容器 ${CONTAINER} 运行中"
+  okenv "容器 ${CONTAINER} 运行中"
 else
-  bad "容器未运行 → docker start ${CONTAINER}"
+  badenv "容器未运行 → docker start ${CONTAINER}"
   echo "请先启动容器后再测试"; exit 1
 fi
 
 # ------------------------------------------------------------------
-section "2. 四节点 PostgreSQL 进程"
+section "2. 各节点 PostgreSQL 进程（环境探针）"
 for port in "${NODE_PORTS[@]}"; do
   node=$(raft_node_name_for_port "$port")
   if $PG_CTL -D "/work/pg-cluster-data/${node}" status &>/dev/null; then
-    ok "PostgreSQL ${node} 运行中"
+    okenv "PostgreSQL ${node} 运行中"
   else
     echo "  [INFO] PostgreSQL ${node} 未运行,自动尝试拉起"
     node_start "$port"
     if $PG_CTL -D "/work/pg-cluster-data/${node}" status &>/dev/null; then
-      ok "PostgreSQL ${node} 已自动拉起"
+      okenv "PostgreSQL ${node} 已自动拉起"
     else
-      bad "PostgreSQL ${node} 未运行"
+      badenv "PostgreSQL ${node} 未运行"
     fi
   fi
 done
 
 # ------------------------------------------------------------------
-section "3. 四端口连通"
+section "3. 各端口连通（环境探针）"
 for port in "${NODE_PORTS[@]}"; do
   if $PSQL -p "$port" -U postgres -tAc "SELECT 1" &>/dev/null; then
-    ok "端口 ${port} 可连接"
+    okenv "端口 ${port} 可连接"
   else
-    bad "端口 ${port} 不可连接"
+    badenv "端口 ${port} 不可连接"
   fi
 done
 
 # ------------------------------------------------------------------
-section "4. pg_raft 控制面就绪"
+section "4. pg_raft 控制面就绪（环境探针）"
 raft_ver=$($PSQL -p 5432 -U postgres -tAc "SELECT partdist.pg_raft_version();" 2>/dev/null || echo "")
 if [[ "$raft_ver" == *"1.0"* ]]; then
-  ok "pg_raft 版本: ${raft_ver}"
+  okenv "pg_raft 版本: ${raft_ver}"
 else
   echo "  [INFO] pg_raft 缺失,自动执行 setup-raft.sh 恢复测试环境"
   if docker exec -u postgres "$CONTAINER" bash /work/pg-raft-src/setup-raft.sh &>/dev/null; then
     raft_ver=$($PSQL -p 5432 -U postgres -tAc "SELECT partdist.pg_raft_version();" 2>/dev/null || echo "")
     if [[ "$raft_ver" == *"1.0"* ]]; then
-      ok "pg_raft 版本: ${raft_ver}(自动恢复)"
+      warnenv "pg_raft 原本缺失,setup-raft.sh 自动恢复后版本 ${raft_ver}(不计入通过:环境本不该缺)"
     else
-      bad "pg_raft 自动恢复后仍未安装"
+      badenv "pg_raft 自动恢复后仍未安装"
     fi
   else
-    bad "pg_raft 未安装,且自动恢复失败"
+    badenv "pg_raft 未安装,且自动恢复失败"
   fi
 fi
 
@@ -205,24 +251,26 @@ for port in "${NODE_PORTS[@]}"; do
      ('get_partition_flush_lsn','get_follower_applied_part_lsn','partwal_notify_primary_switch');" \
     2>/dev/null || echo 0)
   if [[ "$fn_cnt" == "3" ]]; then
-    ok "端口 ${port} 三个 raft 边界函数在位"
+    okenv "端口 ${port} 三个 raft 边界函数在位"
   else
-    bad "端口 ${port} raft 边界函数缺失(${fn_cnt}/3)"
+    badenv "端口 ${port} raft 边界函数缺失(${fn_cnt}/3)"
   fi
 done
 
 RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
 if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
-  ok "Raft 当前 leader 端口: ${RAFT_LEADER_PORT}"
+  okenv "Raft 当前 leader 端口: ${RAFT_LEADER_PORT}"
 else
-  echo "  [INFO] 尚未确认 Raft leader,自动执行 setup-raft.sh 重新收敛四节点配置"
+  echo "  [INFO] 尚未确认 Raft leader,自动执行 setup-raft.sh 重新收敛集群配置"
   if docker exec -u postgres "$CONTAINER" bash /work/pg-raft-src/setup-raft.sh &>/dev/null; then
     RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
   fi
   if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
-    ok "Raft 当前 leader 端口: ${RAFT_LEADER_PORT}(自动恢复)"
+    # 这里**绝不能记 PASS**：走到这条分支说明集群自己没能选出 leader，
+    # 那是真实的选举活性缺陷；靠重装脚本把它洗绿等于把缺陷藏起来。
+    warnenv "Raft leader 原本未收敛,setup-raft.sh 重装后 leader 端口 ${RAFT_LEADER_PORT}(不计入通过:疑似选举活性问题)"
   else
-    bad "未能确认 Raft leader"
+    badenv "未能确认 Raft leader"
     RAFT_LEADER_PORT=5432
   fi
 fi
@@ -242,11 +290,40 @@ for rf in raft_01_leader_election.sql; do
   fi
 done
 
+# raft_02 收尾复核（2026-08-09 审查）：原用例在同一个 leader 连接里 propose
+# 再读回本地表 —— follower 侧 apply 整个是死代码也照样全绿。这里对**每个存活
+# 节点**再跑一遍同样的断言（照 raft_15 的逐节点有界重试写法）。
+# 判据只取分区新主（决议写下的事实）；node_map.status 会被 TopologyMonitor
+# 在节点恢复后改回 active，不作判据。
+RAFT_02_OK=0
 if $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
      -f "${RAFT_TEST_DIR}/raft_02_failover_partition.sql" &>/dev/null; then
-  ok "raft_02_failover_partition.sql"
+  RAFT_02_OK=1
+  RAFT_02_WHY=""
+  RAFT_02_CHECKED=0
+  for port in "${NODE_PORTS[@]}"; do
+    $PSQL -p "$port" -U postgres -tAc "SELECT 1" &>/dev/null || continue
+    RAFT_02_CHECKED=$((RAFT_02_CHECKED + 1))
+    if ! RAFT_02_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+           -v tag=raft_02 -v part_id=9102 -v expect_primary=1 \
+           -f "${RAFT_TEST_DIR}/raft_apply_on_every_node.sql" 2>&1); then
+      RAFT_02_OK=0
+      RAFT_02_WHY="节点 ${port}: $(echo "$RAFT_02_ERR" | grep -m1 -i 'ERROR\|raft_02:' | head -c 200)"
+      break
+    fi
+  done
+  # 计数守卫：一个节点都没轮到时上面的循环零个检查、RAFT_02_OK 仍是 1
+  if [[ "$RAFT_02_OK" == "1" ]] && (( RAFT_02_CHECKED < N_NODES )); then
+    RAFT_02_OK=0
+    RAFT_02_WHY="逐节点复核只跑到 ${RAFT_02_CHECKED}/${N_NODES} 个节点"
+  fi
 else
-  bad "raft_02_failover_partition.sql"
+  RAFT_02_WHY="leader 侧用例失败"
+fi
+if [[ "$RAFT_02_OK" == "1" ]]; then
+  ok "raft_02_failover_partition.sql(含 ${N_NODES} 节点逐一 apply 复核)"
+else
+  bad "raft_02_failover_partition.sql(${RAFT_02_WHY})"
 fi
 
 # raft_04 需先停 worker2(node 3);4 节点停 1 个仍有多数派 3/4
@@ -266,12 +343,45 @@ for RAFT_04_TRY in 1 2 3; do
   fi
   sleep 5
 done
-if [[ "$RAFT_04_OK" == "1" ]]; then
-  ok "raft_04_topology_monitor.sql"
-else
-  bad "raft_04_topology_monitor.sql"
-fi
+RAFT_04_WHY="leader 侧用例失败(重试 3 次)"
 node_start 5434
+sleep 2
+
+# raft_04 收尾复核（2026-08-09 审查，同 raft_02）：对每个存活节点逐一断言
+# 分区 9102 的新主已 apply 到本地路由表。期望值取 leader 侧的实际结果，
+# 并先校验它确实落在 9102 声明的副本集 {1,2} 里（用例本体也断言了这一条）。
+if [[ "$RAFT_04_OK" == "1" ]]; then
+  RAFT_04_NEWP=$($PSQL -p "$RAFT_LEADER_PORT" -U postgres -tAc \
+    "SELECT primary_node FROM partdist.partition_map WHERE partition_id = 9102::oid;" \
+    2>/dev/null || echo "")
+  if ! [[ "$RAFT_04_NEWP" =~ ^[0-9]+$ ]] || [[ "$RAFT_04_NEWP" != "1" && "$RAFT_04_NEWP" != "2" ]]; then
+    RAFT_04_OK=0
+    RAFT_04_WHY="leader 上 9102 的新主='${RAFT_04_NEWP}',不在声明的副本集 {1,2} 里"
+  else
+    RAFT_04_CHECKED=0
+    for port in "${NODE_PORTS[@]}"; do
+      $PSQL -p "$port" -U postgres -tAc "SELECT 1" &>/dev/null || continue
+      RAFT_04_CHECKED=$((RAFT_04_CHECKED + 1))
+      if ! RAFT_04_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
+             -v tag=raft_04 -v part_id=9102 -v expect_primary="$RAFT_04_NEWP" \
+             -f "${RAFT_TEST_DIR}/raft_apply_on_every_node.sql" 2>&1); then
+        RAFT_04_OK=0
+        RAFT_04_WHY="节点 ${port}: $(echo "$RAFT_04_ERR" | grep -m1 -i 'ERROR\|raft_04:' | head -c 200)"
+        break
+      fi
+    done
+    if [[ "$RAFT_04_OK" == "1" ]] && (( RAFT_04_CHECKED < N_NODES )); then
+      RAFT_04_OK=0
+      RAFT_04_WHY="逐节点复核只跑到 ${RAFT_04_CHECKED}/${N_NODES} 个节点"
+    fi
+  fi
+fi
+
+if [[ "$RAFT_04_OK" == "1" ]]; then
+  ok "raft_04_topology_monitor.sql(含 ${N_NODES} 节点逐一 apply 复核)"
+else
+  bad "raft_04_topology_monitor.sql(${RAFT_04_WHY})"
+fi
 
 # raft_05: 停掉 leader 之外全部节点(剩 1/4 < 多数派 3),propose 必须失败
 start_all_nodes
@@ -313,37 +423,61 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
         break
       fi
     done
-    if $PSQL -p "$FOLLOWER_TEST_PORT" -U postgres -v ON_ERROR_STOP=1 \
-         -f "${RAFT_TEST_DIR}/raft_06_stale_requestvote_rejected.sql" &>/dev/null; then
-      ok "raft_06_stale_requestvote_rejected.sql"
-    else
-      bad "raft_06_stale_requestvote_rejected.sql"
-    fi
     # raft_03 同样必须在**非 leader** 端口上跑：它验的是"非 leader 上 propose
     # 被拒"。此前它跟 raft_01 一起被固定在 -p 5432（协调节点）上跑，而 SQL 里
     # 用 `node_id <> 1` 自我跳过、协调节点 node_id 恒为 1 ⇒ 断言体一行没执行过，
     # 把 leader 门禁整个删掉也照样 PASS。现已改成无条件断言 + 跑在这里。
+    #
+    # ★ 次序（2026-08-09）：raft_03 必须排在 raft_06 **之前**。raft_06 加强后
+    #   用 curr_term+1 / +2 发 RequestVote（这是绕开 voted_for 短路、让日志新旧
+    #   检查真正被执行的唯一办法），会把该 follower 的 term 顶到高于 leader，
+    #   leader 收到应答后 step_down_if_higher ⇒ 触发一轮改选，这个 follower
+    #   很可能当选。raft_03 跑在它后面就会撞上"被测节点自己成了 leader"。
     if $PSQL -p "$FOLLOWER_TEST_PORT" -U postgres -v ON_ERROR_STOP=1 \
          -f "${RAFT_TEST_DIR}/raft_03_split_brain_guard.sql" &>/dev/null; then
       ok "raft_03_split_brain_guard.sql"
     else
       bad "raft_03_split_brain_guard.sql"
     fi
+    # 保留 psql 错误正文：加强后的判据（陈旧必拒 + 足够新必授）失败时必须能
+    # 一眼看出是哪一侧，否则只报"断言失败"无从诊断。
+    if RAFT_06_ERR=$($PSQL -p "$FOLLOWER_TEST_PORT" -U postgres -v ON_ERROR_STOP=1 \
+         -f "${RAFT_TEST_DIR}/raft_06_stale_requestvote_rejected.sql" 2>&1); then
+      ok "raft_06_stale_requestvote_rejected.sql"
+    else
+      bad "raft_06_stale_requestvote_rejected.sql($(echo "$RAFT_06_ERR" | grep -m1 -i 'ERROR\|raft_06:' | head -c 260))"
+    fi
   else
+    # 这条分支下 raft_03 与 raft_06 **都没跑**，必须各记一条 FAIL ——
+    # 旧版只记一条，26 项用例的分母会悄悄少 1（静默少算而非静默通过，同样要修）。
+    bad "raft_03_split_brain_guard.sql(leader 预热日志失败,未执行)"
     bad "raft_06_stale_requestvote_rejected.sql(leader 预热日志失败)"
   fi
 else
+  bad "raft_03_split_brain_guard.sql(无法确认 leader,未执行)"
   bad "raft_06_stale_requestvote_rejected.sql(无法确认 leader)"
 fi
 
 # raft_07: 未追平 PartWAL 的副本不能被提升
-RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
-if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
-   $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
-     -f "${RAFT_TEST_DIR}/raft_07_uncaught_up_secondary_not_promoted.sql" &>/dev/null; then
+# 有界重试（2026-08-09）：raft_06 加强后会把 term 顶高一轮、触发改选，
+# 紧接着的 propose 可能撞在改选窗口里失败。用例本体幂等（开头/结尾都重置
+# 9107 的 parwal 与 map），重试只避开改选窗口，不放宽任何判据。
+RAFT_07_OK=0
+RAFT_07_ERR=""
+for RAFT_07_TRY in 1 2 3; do
+  RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+  if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
+     RAFT_07_ERR=$($PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+       -f "${RAFT_TEST_DIR}/raft_07_uncaught_up_secondary_not_promoted.sql" 2>&1); then
+    RAFT_07_OK=1
+    break
+  fi
+  sleep 4
+done
+if [[ "$RAFT_07_OK" == "1" ]]; then
   ok "raft_07_uncaught_up_secondary_not_promoted.sql"
 else
-  bad "raft_07_uncaught_up_secondary_not_promoted.sql"
+  bad "raft_07_uncaught_up_secondary_not_promoted.sql($(echo "$RAFT_07_ERR" | grep -m1 -i 'ERROR\|raft_07:' | head -c 260))"
 fi
 
 # raft_08: 停旧 leader → 剩 3/4 仍可选出新 leader → 旧 leader 回归为 follower
@@ -382,11 +516,35 @@ else
   bad "raft_08_old_leader_rejoins_as_follower.sql(无法确认初始 leader)"
 fi
 
-# raft_09: HardState 崩溃恢复 — follower immediate 停机重启后 term/日志/复制必须连续
+# raft_09: HardState 崩溃恢复 — follower immediate 停机重启后 term/voted_for/
+#          日志/复制必须连续。
+#
+# ── 原编排的缺陷（2026-08-09 审查）──────────────────────────────────────
+#  1) 前置只 `test -f .../pg_raft_hardstate` 验文件**在不在**、不验内容 ——
+#     文件被写成 56 个 0 字节也照过；
+#  2) TERM_BEFORE/IDX_BEFORE 用 `2>/dev/null || echo 0` 兜底，基线抓不到就退化
+#     成 0，用例里 `term_now >= 0`/`idx_now >= 0` 变成**恒真断言**。现在抓不到
+#     直接判失败；
+#  3) 用例本体只验 "term 不回退"，而 leader 心跳会把 term 顶回来 —— 见
+#     raft_09_hardstate_crash_recovery.sql 头部。真正的风险是 voted_for 丢失。
+#     这里补两件事：(a) 崩溃前**确定性地**把 voted_for 顶成非零（给一个虚拟
+#     候选人发一次同 term 的 RequestVote：拒了说明本来就非零，授了就是它）；
+#     (b) 停机后直接解码盘上的 hardstate（56 字节定长结构），重启后**第一时间**
+#     再发一次 RequestVote 做行为侧对照。三项测量值交给 SQL 用例判定。
+HS_MAGIC_EXPECT=1380468308     # 'RHFT' 小端，raft_consensus.c RAFT_HARDSTATE_MAGIC
+HS_SIZE_EXPECT=56              # sizeof(RaftHardStateFile)（v3）
+RAFT_09_VOTE_CAND=96           # 崩溃前用来把 voted_for 顶成非零的虚拟候选人
+RAFT_09_PROBE_CAND=95          # 重启后用来试探"能否重复投票"的**新**候选人
+
 start_all_nodes
 sleep 2
+RAFT_09_OK=0
+RAFT_09_WHY="无法确认 leader"
+RAFT_09_PRE_OK=0
+RAFT_09_PRE_WHY="未执行"
 RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
 if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
+  RAFT_09_WHY="崩溃前预热决议失败"
   if $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
        -c "SELECT partdist.pg_raft_propose_node_status(99, 'active')" &>/dev/null; then
     sleep 1
@@ -398,42 +556,103 @@ if [[ -n "${RAFT_LEADER_PORT:-}" ]]; then
       fi
     done
     TERM_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
-      "SELECT current_term FROM partdist.pg_raft_get_cluster_status();" 2>/dev/null || echo 0)
+      "SELECT current_term FROM partdist.pg_raft_get_cluster_status();" 2>/dev/null || echo "")
     IDX_BEFORE=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
-      "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log WHERE group_id = 0;" 2>/dev/null || echo 0)
+      "SELECT COALESCE(max(log_index), 0) FROM partdist.raft_log WHERE group_id = 0;" 2>/dev/null || echo "")
     CRASH_DIR=$(raft_node_name_for_port "$CRASH_PORT")
 
-    $PG_CTL stop -D "/work/pg-cluster-data/${CRASH_DIR}" -m immediate 2>/dev/null || true
-    sleep 1
-
-    if docker exec -u postgres "$CONTAINER" test -f "/work/pg-cluster-data/${CRASH_DIR}/pg_raft_hardstate"; then
-      ok "raft_09 前置: ${CRASH_DIR} 崩溃后 pg_raft_hardstate 文件在盘"
+    # ★ 基线抓不到就 fail-fast：旧版的 `|| echo 0` 会把整组断言变成恒真
+    if ! [[ "$TERM_BEFORE" =~ ^[0-9]+$ ]] || [[ "$TERM_BEFORE" -le 0 ]] || \
+       ! [[ "$IDX_BEFORE" =~ ^[0-9]+$ ]]; then
+      RAFT_09_WHY="崩溃前基线取不到(term='${TERM_BEFORE}' idx='${IDX_BEFORE}')"
+      RAFT_09_PRE_WHY="崩溃前基线取不到,前置检查无从建立"
     else
-      bad "raft_09 前置: ${CRASH_DIR} 缺少 pg_raft_hardstate 持久化文件"
-    fi
-
-    node_start "$CRASH_PORT"
-    sleep 2
-
-    RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
-    if [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
-       $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
-         -c "SELECT partdist.pg_raft_propose_node_status(99, 'down')" &>/dev/null; then
-      if $PSQL -p "$CRASH_PORT" -U postgres -v ON_ERROR_STOP=1 \
-           -v term_before="$TERM_BEFORE" -v idx_before="$IDX_BEFORE" \
-           -f "${RAFT_TEST_DIR}/raft_09_hardstate_crash_recovery.sql" &>/dev/null; then
-        ok "raft_09_hardstate_crash_recovery.sql"
+      # 让 voted_for 确定性地非零：同 term + 足够新的日志 + 虚拟候选人。
+      # 授票条件三个 && 里，term 与日志两条都成立，唯一变量就是 voted_for：
+      #   返回 1 ⇒ 原本 voted_for=0，现在被置成 RAFT_09_VOTE_CAND；
+      #   返回 0 ⇒ 原本 voted_for 已是别的非零节点（它自己投过的那个）。
+      # 两种情况下崩溃时盘上的 voted_for 都必然非零。
+      RAFT_09_SEED=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
+        "SELECT partdist.pg_raft_rpc('RV ${TERM_BEFORE} ${RAFT_09_VOTE_CAND} 999999999 999999999');" \
+        2>/dev/null || echo "")
+      if ! [[ "$RAFT_09_SEED" =~ ^[0-9]+\ [01]$ ]]; then
+        RAFT_09_WHY="崩溃前 voted_for 预置失败(RV 应答='${RAFT_09_SEED}')"
+        RAFT_09_PRE_WHY="崩溃前 voted_for 预置失败"
       else
-        bad "raft_09_hardstate_crash_recovery.sql"
+        sleep 1
+        $PG_CTL stop -D "/work/pg-cluster-data/${CRASH_DIR}" -m immediate 2>/dev/null || true
+        sleep 1
+
+        # ── 前置：解码盘上的 hardstate，验**内容**而不只是文件在不在 ──
+        HS_PATH="/work/pg-cluster-data/${CRASH_DIR}/pg_raft_hardstate"
+        HS_SIZE=$(docker exec "$CONTAINER" bash -lc "stat -c %s '${HS_PATH}' 2>/dev/null" || echo "")
+        HS_MAGIC=$(docker exec "$CONTAINER" bash -lc \
+          "od -A n -t u4 -j 0 -N 4 '${HS_PATH}' 2>/dev/null | tr -d ' \n'" || echo "")
+        HS_TERM=$(docker exec "$CONTAINER" bash -lc \
+          "od -A n -t d8 -j 8 -N 8 '${HS_PATH}' 2>/dev/null | tr -d ' \n'" || echo "")
+        HS_VOTED=$(docker exec "$CONTAINER" bash -lc \
+          "od -A n -t d4 -j 16 -N 4 '${HS_PATH}' 2>/dev/null | tr -d ' \n'" || echo "")
+
+        if [[ "$HS_SIZE" != "$HS_SIZE_EXPECT" ]]; then
+          RAFT_09_PRE_WHY="${CRASH_DIR} 的 pg_raft_hardstate 长度=${HS_SIZE:-<无文件>},期望 ${HS_SIZE_EXPECT}"
+        elif [[ "$HS_MAGIC" != "$HS_MAGIC_EXPECT" ]]; then
+          RAFT_09_PRE_WHY="hardstate 魔数=${HS_MAGIC:-空},期望 ${HS_MAGIC_EXPECT}(文件全零/损坏)"
+        elif ! [[ "$HS_TERM" =~ ^[0-9]+$ ]] || ! [[ "$HS_VOTED" =~ ^-?[0-9]+$ ]]; then
+          RAFT_09_PRE_WHY="hardstate 的 term/voted_for 解码失败(term='${HS_TERM}' voted='${HS_VOTED}')"
+        else
+          RAFT_09_PRE_OK=1
+        fi
+
+        node_start "$CRASH_PORT"
+
+        # ── 行为侧对照：重启后**第一时间**（leader 心跳把 term 顶回来之前）
+        #    用崩溃前的 term + 一个全新候选人 + 刻意造得足够新的日志发 RV。
+        #    三个授票条件里 term 与日志都成立，只剩 voted_for 能拒 ——
+        #    拒了才证明 voted_for 真的从盘上恢复了。
+        RAFT_09_RV=""
+        for attempt in $(seq 1 20); do
+          RAFT_09_RV=$($PSQL -p "$CRASH_PORT" -U postgres -tAc \
+            "SELECT partdist.pg_raft_rpc('RV ${TERM_BEFORE} ${RAFT_09_PROBE_CAND} 999999999 999999999');" \
+            2>/dev/null || echo "")
+          [[ "$RAFT_09_RV" =~ ^[0-9]+\ [01]$ ]] && break
+          sleep 0.3
+        done
+        RV_TERM=$(echo "$RAFT_09_RV" | awk '{print $1}')
+        RV_FLAG=$(echo "$RAFT_09_RV" | awk '{print $2}')
+
+        sleep 2
+        RAFT_LEADER_PORT=$(raft_wait_leader_port || true)
+        if ! [[ "$RAFT_09_RV" =~ ^[0-9]+\ [01]$ ]]; then
+          RAFT_09_WHY="重启后 RequestVote 探针拿不到应答('${RAFT_09_RV}')"
+        elif [[ -n "${RAFT_LEADER_PORT:-}" ]] && \
+             $PSQL -p "$RAFT_LEADER_PORT" -U postgres -v ON_ERROR_STOP=1 \
+               -c "SELECT partdist.pg_raft_propose_node_status(99, 'down')" &>/dev/null; then
+          if RAFT_09_ERR=$($PSQL -p "$CRASH_PORT" -U postgres -v ON_ERROR_STOP=1 \
+               -v term_before="$TERM_BEFORE" -v idx_before="$IDX_BEFORE" \
+               -v hs_term="$HS_TERM" -v hs_voted="$HS_VOTED" \
+               -v rv_term="$RV_TERM" -v rv_flag="$RV_FLAG" \
+               -f "${RAFT_TEST_DIR}/raft_09_hardstate_crash_recovery.sql" 2>&1); then
+            RAFT_09_OK=1
+          else
+            RAFT_09_WHY="$(echo "$RAFT_09_ERR" | grep -m1 -i 'ERROR\|raft_09:' | head -c 300)"
+          fi
+        else
+          RAFT_09_WHY="重启后 leader 追加决议失败"
+        fi
       fi
-    else
-      bad "raft_09_hardstate_crash_recovery.sql(重启后 leader 追加决议失败)"
     fi
-  else
-    bad "raft_09_hardstate_crash_recovery.sql(崩溃前预热决议失败)"
   fi
+fi
+
+if [[ "$RAFT_09_PRE_OK" == "1" ]]; then
+  ok "raft_09 前置: ${CRASH_DIR:-?} 崩溃后 hardstate 内容完好(len=${HS_SIZE:-?} term=${HS_TERM:-?} voted_for=${HS_VOTED:-?})"
 else
-  bad "raft_09_hardstate_crash_recovery.sql(无法确认 leader)"
+  bad "raft_09 前置: ${RAFT_09_PRE_WHY}"
+fi
+if [[ "$RAFT_09_OK" == "1" ]]; then
+  ok "raft_09_hardstate_crash_recovery.sql"
+else
+  bad "raft_09_hardstate_crash_recovery.sql(${RAFT_09_WHY})"
 fi
 
 # raft_10: 追平副本中必须提升 applied_part_lsn 最大者,switch 点来自真实写入路径
@@ -860,16 +1079,30 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
     RAFT_14_PRIMARY_ID=$(( RAFT_14_PRIMARY_PORT - 5431 ))
 
     # (a) 形态:其余 worker 建同构壳表(表名=分片表名),rebuild 注册 shard_identity
+    #
+    # ★ 2026-08-09 审查：旧版是 `建表命令 && ARR+=(...)` —— 建壳表失败就**静默
+    #   不追加**，随后 `for port in "${ARR[@]}"` 的 follower 断言零个都不跑，而
+    #   RAFT_14_OK 仍是 1 ⇒ 整个复制判据静默通过。改成建表失败即 fail-fast，
+    #   并在断言前加数组长度守卫（照 raft_17 第 111 行的写法）。
+    RAFT_14_SHELL_OK=1
     for port in 5433 5434 5435; do
       if [[ "$port" != "$RAFT_14_PRIMARY_PORT" ]]; then
-        $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
+        if $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
           "SET citus.enable_ddl_propagation=off;
            CREATE TABLE IF NOT EXISTS ${RAFT_14_TABLE}_${RAFT_14_GID}
-             (LIKE ${RAFT_14_TABLE} INCLUDING ALL);" &>/dev/null \
-          && RAFT_14_FOLLOWER_PORTS+=("$port")
+             (LIKE ${RAFT_14_TABLE} INCLUDING ALL);" &>/dev/null; then
+          RAFT_14_FOLLOWER_PORTS+=("$port")
+        else
+          RAFT_14_SHELL_OK=0
+          RAFT_14_WHY="节点 ${port} 建同构壳表 ${RAFT_14_TABLE}_${RAFT_14_GID} 失败"
+        fi
       fi
       $PSQL -p "$port" -U postgres -c "SELECT partdist.rebuild_shard_identity();" &>/dev/null || true
     done
+    if (( ${#RAFT_14_FOLLOWER_PORTS[@]} != 2 )); then
+      RAFT_14_SHELL_OK=0
+      RAFT_14_WHY="follower 端口只凑齐 ${#RAFT_14_FOLLOWER_PORTS[@]}/2 个(${RAFT_14_FOLLOWER_PORTS[*]:-空})"
+    fi
 
     # 只在 placement 节点先建组:它先发起选举,leader 落在有数据的节点;
     # 其他成员靠 hearsay 自动建组,选出 leader 后再补 group_create 固化成员集
@@ -927,8 +1160,11 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
             sleep 1
           done
 
-          if [[ -n "$RAFT_14_TERM" ]]; then
+          if [[ "$RAFT_14_SHELL_OK" != "1" ]]; then
+            :   # RAFT_14_WHY 已在建壳表处写好，RAFT_14_OK 保持 0
+          elif [[ -n "$RAFT_14_TERM" ]]; then
             RAFT_14_OK=1
+            # 数组守卫：为空/不足 2 时下面的 for 一个断言都不跑而 OK 仍为 1
             for port in "${RAFT_14_FOLLOWER_PORTS[@]}"; do
               # 保留 psql 的错误正文：只报"断言失败"不可诊断（2026-08-04 教训）
               if ! RAFT_14_ERR=$($PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 \
@@ -1133,16 +1369,28 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
   if [[ -n "$RAFT_16_GID" && -n "$RAFT_16_PRIMARY_PORT" ]]; then
     RAFT_16_PRIMARY_ID=$(( RAFT_16_PRIMARY_PORT - 5431 ))
 
+    # ★ 2026-08-09 审查：与 raft_14 同一处静默通过 —— 建壳表失败静默不追加，
+    #   后面 `for port in "${RAFT_16_FOLLOWER_PORTS[@]}"` 零个检查而 RAFT_16_OK
+    #   仍为 1（三段判据里第 1、3 段都靠这个数组）。改成 fail-fast + 长度守卫。
+    RAFT_16_SHELL_OK=1
     for port in 5433 5434 5435; do
       if [[ "$port" != "$RAFT_16_PRIMARY_PORT" ]]; then
-        $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
+        if $PSQL -p "$port" -U postgres -v ON_ERROR_STOP=1 -c \
           "SET citus.enable_ddl_propagation=off;
            CREATE TABLE IF NOT EXISTS ${RAFT_16_TABLE}_${RAFT_16_GID}
-             (LIKE ${RAFT_16_TABLE} INCLUDING ALL);" &>/dev/null \
-          && RAFT_16_FOLLOWER_PORTS+=("$port")
+             (LIKE ${RAFT_16_TABLE} INCLUDING ALL);" &>/dev/null; then
+          RAFT_16_FOLLOWER_PORTS+=("$port")
+        else
+          RAFT_16_SHELL_OK=0
+          RAFT_16_WHY="节点 ${port} 建同构壳表 ${RAFT_16_TABLE}_${RAFT_16_GID} 失败"
+        fi
       fi
       $PSQL -p "$port" -U postgres -c "SELECT partdist.rebuild_shard_identity();" &>/dev/null || true
     done
+    if (( ${#RAFT_16_FOLLOWER_PORTS[@]} != 2 )); then
+      RAFT_16_SHELL_OK=0
+      RAFT_16_WHY="follower 端口只凑齐 ${#RAFT_16_FOLLOWER_PORTS[@]}/2 个(${RAFT_16_FOLLOWER_PORTS[*]:-空})"
+    fi
 
     $PSQL -p "$RAFT_16_PRIMARY_PORT" -U postgres -c \
       "SELECT partdist.pg_raft_group_create(${RAFT_16_GID}, ${RAFT_16_MEMBER_IDS});" &>/dev/null || true
@@ -1171,8 +1419,11 @@ if $PSQL -p 5432 -U postgres -v ON_ERROR_STOP=1 -c \
                   LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${RAFT_16_GID}), g) r
            ) sub;" 2>/dev/null || echo "")
 
-        if [[ "$RAFT_16_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC" -gt 0 && -n "$RAFT_16_MD5" ]]; then
+        if [[ "$RAFT_16_SHELL_OK" != "1" ]]; then
+          :   # RAFT_16_WHY 已在建壳表处写好，RAFT_16_OK 保持 0
+        elif [[ "$RAFT_16_NREC" =~ ^[0-9]+$ ]] && [[ "$RAFT_16_NREC" -gt 0 && -n "$RAFT_16_MD5" ]]; then
           RAFT_16_OK=1
+          # 数组守卫已在建壳表处做过（长度必须 == 2），这里的 for 保证至少跑两次
           for port in "${RAFT_16_FOLLOWER_PORTS[@]}"; do
             if ! raft16_follower_converged "$port" "$RAFT_16_NREC" "$RAFT_16_MD5"; then
               RAFT_16_OK=0
@@ -1417,11 +1668,20 @@ fi
 # ------------------------------------------------------------------
 section "汇总"
 echo ""
-echo "通过: ${PASS}  失败: ${FAIL}"
-if [[ $FAIL -eq 0 ]]; then
-  echo ">>> Raft 回归全部通过（拓扑 1c+${N_WORKERS}w）<<<"
+ENV_TOTAL=$((ENV_PASS + ENV_FAIL + ENV_WARN))
+CASE_TOTAL=$((PASS + FAIL))
+TOTAL_FAIL=$((ENV_FAIL + FAIL))
+echo "环境检查: ${ENV_PASS}/${ENV_TOTAL}（告警 ${ENV_WARN} 项:自动恢复不计通过）"
+echo "用例断言: ${PASS}/${CASE_TOTAL}"
+echo "合计通过: $((ENV_PASS + PASS))  失败: ${TOTAL_FAIL}"
+if [[ $TOTAL_FAIL -eq 0 ]]; then
+  if [[ $ENV_WARN -gt 0 ]]; then
+    echo ">>> Raft 回归无失败项,但有 ${ENV_WARN} 项环境告警（拓扑 1c+${N_WORKERS}w）<<<"
+  else
+    echo ">>> Raft 回归全部通过（拓扑 1c+${N_WORKERS}w）<<<"
+  fi
   exit 0
 else
-  echo ">>> 存在 ${FAIL} 项失败,请根据上方 [FAIL] 排查 <<<"
+  echo ">>> 存在 ${TOTAL_FAIL} 项失败,请根据上方 [FAIL] 排查 <<<"
   exit 1
 fi

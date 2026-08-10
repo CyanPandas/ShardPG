@@ -1,5 +1,12 @@
 -- 未追平 PartWAL 的副本不能被 Raft failover 自动提升为新 primary。
 -- 该用例使用一个不可连接的虚拟旧 primary，避免破坏四节点 Raft 多数派。
+--
+-- ── 原判据的缺陷（2026-08-09 审查）────────────────────────────────────
+-- 夹具明明写了 **5** 条 PartWAL 记录再 demux_flush，switch_partition_lsn 因此
+-- 必须恰好是 5（raft_10 用同一夹具、断言的就是 `<> 5` 即失败）。
+-- 旧版这里只写 `switch_lsn <= 0` ⇒ 只要 flush 进度是任意正数就过：
+-- 少 flush 了几条、把 5 条合成 1 条、甚至读到上一轮残留的进度，都照样绿。
+-- 改成精确值 5。
 
 SET citus.enable_ddl_propagation = off;
 
@@ -24,8 +31,10 @@ BEGIN
   SELECT partdist.get_partition_flush_lsn(9107::oid)
     INTO switch_lsn;
 
-  IF switch_lsn <= 0 THEN
-    RAISE EXCEPTION 'raft_07: expected positive switch_partition_lsn, got %', switch_lsn;
+  -- 夹具写了 5 条记录 ⇒ switch_partition_lsn 必须恰好 5（与 raft_10 同判据）
+  IF switch_lsn <> 5 THEN
+    RAISE EXCEPTION
+      'raft_07: expected switch_partition_lsn=5 from real write path, got %', switch_lsn;
   END IF;
 END
 $$;

@@ -42,10 +42,18 @@ TBL=raft21_dtx
 GID=""
 LEADER_PORT=""
 MEMBER_PORTS=($((BASE_PORT + 1)) $((BASE_PORT + 2)) $((BASE_PORT + 3)))
-DTX_C=910001   # 有 COMMIT 决议
-DTX_A=910002   # 从未决议 → 推定中止
-DTX_F=910003   # 未超时，不该被动
-DTX_U=910004   # 协调组不可达
+
+# ── dtxid 必须每轮唯一（2026-08-09 审查，同 raft_20）────────────────────
+# 旧版写死 910001..910005，清理走吞错的 q()。上一轮残留的决议行会让 B 段
+# （从未决议 ⇒ 推定中止）读到旧的 verdict=2 而"通过"，真正的写路径不被执行；
+# C/D 段"不该产生决议"的断言也会被残留行直接判失败或误判。
+# 加运行时唯一前缀，并在夹具阶段逐成员断言这些 dtxid 干净。
+DTX_BASE=$(( 900000000 + ($(date +%s) % 9000000) * 16 + 4 ))
+DTX_C=$(( DTX_BASE + 0 ))   # 有 COMMIT 决议
+DTX_A=$(( DTX_BASE + 1 ))   # 从未决议 → 推定中止
+DTX_F=$(( DTX_BASE + 2 ))   # 未超时，不该被动
+DTX_U=$(( DTX_BASE + 3 ))   # 协调组不可达
+DTX_H=$(( DTX_BASE + 4 ))   # H 段：BGW 守护自动闭合
 
 cleanup() {
   local port gid
@@ -60,7 +68,7 @@ cleanup() {
                               OR gid ~ '^citus_0_[0-9]+_(77700|88800)[0-9]_0$';"); do
       q "$port" "ROLLBACK PREPARED '${g}';" >/dev/null
     done
-    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_C},${DTX_A},${DTX_F},${DTX_U},910005);" >/dev/null
+    q "$port" "DELETE FROM partdist.dtx_decision WHERE dtxid IN (${DTX_C},${DTX_A},${DTX_F},${DTX_U},${DTX_H});" >/dev/null
     q "$port" "ALTER SYSTEM RESET pg_raft.dtx_recover_timeout_ms;" >/dev/null
     q "$port" "SELECT pg_reload_conf();" >/dev/null
     if [[ -n "$GID" ]]; then
@@ -115,6 +123,22 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [[ -n "$LEADER_PORT" ]] || fail "30s 内协调组没选出 leader"
+
+# ── 夹具前提：五个 dtxid 在**每个成员**上都必须查无此行 ──
+PRE_CHECKED=0
+for port in "${MEMBER_PORTS[@]}"; do
+  for d in "$DTX_C" "$DTX_A" "$DTX_F" "$DTX_U" "$DTX_H"; do
+    n=$(q "$port" "SELECT count(*) FROM partdist.dtx_decision WHERE dtxid=${d};")
+    [[ "$n" =~ ^[0-9]+$ ]] \
+      || fail "夹具：节点 ${port} 上读 dtx_decision 失败（返回 '${n}'），无法确认 dtxid 干净"
+    [[ "$n" == "0" ]] \
+      || fail "夹具：节点 ${port} 上 dtxid=${d} 已有 ${n} 行残留 —— 判据会被上一轮结果污染"
+    PRE_CHECKED=$((PRE_CHECKED + 1))
+  done
+done
+(( PRE_CHECKED == ${#MEMBER_PORTS[@]} * 5 )) \
+  || fail "夹具：dtxid 干净性只检查了 ${PRE_CHECKED} 项，覆盖不全"
+echo "raft_21 夹具: dtxid ${DTX_C}..${DTX_H} 在全部成员上均无残留 ✓"
 
 # partition_map 的 primary_node 必须指向真实 leader，恢复守护才寻址得到
 LEADER_NODE=$((LEADER_PORT - BASE_PORT + 1))
@@ -257,7 +281,6 @@ for port in "${MEMBER_PORTS[@]}"; do
   q "$port" "UPDATE partdist.partition_map SET primary_node=${LEADER_NODE}
               WHERE partition_id=${GID}::oid;" >/dev/null
 done
-DTX_H=910005
 q "$LEADER_PORT" "ALTER SYSTEM SET pg_raft.dtx_recover_timeout_ms = 1000;" >/dev/null
 q "$LEADER_PORT" "SELECT pg_reload_conf();" >/dev/null
 make_prepared "$DTX_H" 1008 || fail "H: 造 prepared 事务失败"
