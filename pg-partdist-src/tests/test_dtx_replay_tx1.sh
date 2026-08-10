@@ -270,7 +270,7 @@ page_compare() {  # page_compare <gid> <pport> <fp>
     # 主堆才有权威掩码口径；索引/TOAST 只做主堆比对之外的存在性确认
     [[ "$key" != 0.* ]] && continue
     errf=$(mktemp)
-    same=$(DEX python3 /tmp/pagecmp.py "${pdata}/${lrel}" "${fdata}/${frel}" </dev/null 2>"$errf")
+    same=$(DEX python3 /tmp/pagecmp.py --kind=heap "${pdata}/${lrel}" "${fdata}/${frel}" </dev/null 2>"$errf")
     ncmp=$((ncmp+1))
     check "shard ${gid}: follower :$fp ${key}(主堆) 洞外逐字节一致" "$same" "IDENTICAL_OUTSIDE_HOLE"
     [[ "$same" != "IDENTICAL_OUTSIDE_HOLE" ]] && sed 's/^/        /' "$errf"

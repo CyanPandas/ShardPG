@@ -225,6 +225,20 @@ echo "========== [7] 刷盘 + 逐页 diff（MAIN + VM，页头/行指针/元组/
 PSQL $pport -q -c "CHECKPOINT;" >/dev/null
 docker cp "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" "$CONTAINER":/tmp/pagecmp.py >/dev/null 2>&1
 DEX chmod +x /tmp/pagecmp.py 2>/dev/null || true
+
+# 按 fileset 的 role 与 fork 推出 pagecmp 的掩码口径。
+#   role 0/2 = 主堆 / TOAST 堆 → heap
+#   role 1/3 = 索引 / TOAST 索引 → btree（**不能**用堆规则：IndexTuple 只有
+#              8 字节头，堆元组那套偏移掩到的是索引键本身）
+#   _vm fork → vm（VM 页没有"空闲空洞"，套堆规则会把整张位图掩掉）
+pagecmp_kind() {   # $1=key(role.ord)  $2=fork("" 或 "_vm")
+  [[ "$2" == "_vm" ]] && { echo vm; return; }
+  case "${1%%.*}" in
+    1|3) echo btree ;;
+    *)   echo heap ;;
+  esac
+}
+
 sleep 4   # > replay_checkpoint_interval_ms，等 follower 的 apply checkpoint 刷脏落盘
 
 pdata=$(PSQL $pport -Atc "SHOW data_directory")
@@ -245,7 +259,7 @@ lead_paths=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; ${FILE
 
 diff_one_follower() {  # <fport> <fdata> <标签>
   local fp=$1 fdata=$2 tag=$3
-  local frows ncmp=0
+  local frows ncmp=0 nempty=0
   frows=$(PSQL $fp -Atc "SET citus.enable_ddl_propagation=off; ${FILESET_PATHS_SQL}" | grep ',')
 
   # 成员清单先读进数组：循环体里的 `docker exec -i` 会把 `while read` 的标准
@@ -272,10 +286,19 @@ diff_one_follower() {  # <fport> <fdata> <标签>
       check "${tag} ${key}${fork:-.main} 大小一致(${lsz})" "$fsz" "$lsz"
       local same errf
       errf=$(mktemp)
-      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" </dev/null 2>"$errf")
+      local kind; kind=$(pagecmp_kind "$key" "$fork")
+      same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "$lpath" "$fpath" </dev/null 2>"$errf")
       ncmp=$((ncmp + 1))
-      check "${tag} ${key}${fork:-.main} 洞外逐字节一致" \
-            "$same" "IDENTICAL_OUTSIDE_HOLE"
+      # ★ IDENTICAL_EMPTY = 两侧都是 0 字节，**比较了零个页面**，不构成一致的证据。
+      # 主堆（role 0）必须有内容 —— 空了说明整条重填/回放路径失效；
+      # TOAST 堆与索引可以合法为空（没有超长值就不会有 TOAST 页）。
+      # 旧版本把这种情况一律算作"逐字节一致"，等于给零覆盖发通行证。
+      local want="IDENTICAL_OUTSIDE_HOLE"
+      if [[ "${key%%.*}" != "0" && "$same" == "IDENTICAL_EMPTY" ]]; then
+        want="IDENTICAL_EMPTY"
+        nempty=$((nempty + 1))
+      fi
+      check "${tag} ${key}${fork:-.main} 洞外逐字节一致${WANTED_EMPTY_NOTE:-}" "$same" "$want"
       # 差在哪个字段比"差了几个字节"有用得多 —— 失败时把定性明细打出来
       if [[ "$same" != "IDENTICAL_OUTSIDE_HOLE" ]]; then
         echo "        ---- 差异定性（leader=${lpath##*/} follower=${fpath##*/}）----"

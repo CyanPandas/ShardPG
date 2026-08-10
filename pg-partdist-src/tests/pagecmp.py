@@ -32,12 +32,29 @@ mask_* 辅助，把"主备之间本来就不保证相同"的字段统一涂成 M
      redo 也不写 —— 主备残留内容不同是常态。
      （实测就栽在这一条上：R1 报的"洞外 4 字节差异"全部落在这里。）
 
-用法: pagecmp.py <leader_file> <follower_file>
+★ 掩码规则**按页类型分派**（2026-08-10 修）。此前无差别套用堆页规则，
+两处后果都是"真损坏也判一致"：
+
+  - **VM fork**：VM 页由 PageInit 建立，pd_lower 恒为 24、pd_upper 恒为 8192，
+    位图就写在 [24, 8192) 里 —— 而"空洞"掩码正是 range(pd_lower, pd_upper)，
+    于是**整张位图被掩掉**，只剩 20 字节页头参与比较。实测：位图完全相反
+    （0xFF vs 0x00）的两张 VM 页判为 IDENTICAL。回放 XLOG_HEAP2_VISIBLE 时
+    漏位或落错块，一概测不出来。VM 页没有"空闲空洞"这个概念，套用堆页规则
+    是类型错误，现改为整页严格比较。
+  - **btree 页**：lp_len >= 23 的项会被当作堆元组去掩 t_cid(off+8..11) 与
+    t_infomask(off+20..21)，而 IndexTuple 头只有 8 字节 —— 那两段**就是索引
+    键数据**。现按内核 btree_mask() 的口径处理：掩空洞 + 提示位 + 行指针的
+    LP_DEAD 位 + 特殊区的 BTP_HAS_GARBAGE，**不碰元组内容**。
+
+另外：0 页文件此前判 IDENTICAL（比了零个页面）。现输出独立标记
+IDENTICAL_EMPTY，让"这里本该有内容"的调用方能区分出来。
+
+用法: pagecmp.py [--kind=heap|btree|vm] <leader_file> <follower_file>
+      kind 由调用方按 fileset 的 role 传入：0/2(主堆/TOAST 堆)=heap，
+      1/3(索引/TOAST 索引)=btree，_vm 后缀的文件=vm。缺省 heap。
 输出: 一行 "IDENTICAL_OUTSIDE_HOLE" 或 "DIFF <掩码之外的差异字节数>"，
       并在 stderr 打印每页明细。退出码 0=一致。
 
-注意：掩码规则是**堆页专用**的（走行指针 + 元组头布局）。索引页要另配
-btree_mask/hash_mask 等，本脚本不适用。
 """
 import struct
 import sys
@@ -80,6 +97,14 @@ HEAP_XMAX_INVALID    = 0x0800
 
 MAXALIGN_SIZE = 8
 
+# ---- BTPageOpaqueData（src/include/access/nbtree.h），位于页尾 ----
+# btpo_prev(4) btpo_next(4) btpo_level(4) btpo_flags(2) xact(4) = 16 字节，
+# btpo_flags 在特殊区起始 +12 处。
+BTPO_SIZE            = 16
+BTPO_FLAGS_REL_OFF   = 12
+BTP_HAS_GARBAGE      = 0x0040   # 内核 btree_mask() 明确掩掉这一位
+BTP_LEAF             = 0x0001
+
 
 def maxalign(n):
     return (n + MAXALIGN_SIZE - 1) & ~(MAXALIGN_SIZE - 1)
@@ -97,6 +122,36 @@ def line_pointers(page, lower):
                     (itemid >> 15) & 0x3,       # lp_flags
                     (itemid >> 17) & 0x7FFF))   # lp_len
     return out
+
+
+def masked_offsets_btree(page, lower, upper):
+    """
+    btree 页的掩码集合，口径抄内核 btree_mask()（src/backend/access/nbtree/nbtxlog.c）：
+    mask_page_hint_bits + mask_unused_space + 叶页的 LP_DEAD 位 + BTP_HAS_GARBAGE。
+    **不解析元组内容** —— IndexTuple 只有 8 字节头，堆元组那套偏移套上去
+    掩到的是索引键本身。
+    """
+    m = set()
+    m.update(range(PD_PRUNE_XID_OFF, PD_PRUNE_XID_OFF + 4))
+    m.update(range(lower, upper))                      # 空闲空洞
+
+    # 行指针的 lp_flags：LP_DEAD 是**提示**，由读取者顺手置上、不写 WAL，
+    # 主备不一致是常态（内核 mask_lp_flags 做同样的事）。itemid 的
+    # bit15-16 是 lp_flags，落在第 1、2 字节上，整两字节掩掉最省事且够用。
+    for i in range((max(lower, PD_LINP_OFF) - PD_LINP_OFF) // 4):
+        base = PD_LINP_OFF + 4 * i
+        m.add(base + 1)
+        m.add(base + 2)
+
+    return m
+
+
+def btpo_flags_off(page):
+    """btree 特殊区里 btpo_flags 的页内偏移；不是合法 btree 页则返回 None。"""
+    (special,) = struct.unpack_from('<H', page, PD_SPECIAL_OFF)
+    if 0 < special <= BLCKSZ - BTPO_SIZE:
+        return special + BTPO_FLAGS_REL_OFF
+    return None
 
 
 def masked_offsets(page, lower, upper):
@@ -166,13 +221,25 @@ def infomask_violations(pa, pb, lower):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: pagecmp.py <leader_file> <follower_file>", file=sys.stderr)
+    kind = 'heap'
+    args = []
+    for a_ in sys.argv[1:]:
+        if a_.startswith('--kind='):
+            kind = a_.split('=', 1)[1]
+        else:
+            args.append(a_)
+    if kind not in ('heap', 'btree', 'vm'):
+        print("unknown --kind=%s（可选 heap|btree|vm）" % kind, file=sys.stderr)
+        return 2
+
+    if len(args) != 2:
+        print("usage: pagecmp.py [--kind=heap|btree|vm] <leader> <follower>",
+              file=sys.stderr)
         return 2
 
     try:
-        a = open(sys.argv[1], 'rb').read()
-        b = open(sys.argv[2], 'rb').read()
+        a = open(args[0], 'rb').read()
+        b = open(args[1], 'rb').read()
     except OSError as e:
         print("DIFF open_error")
         print(e, file=sys.stderr)
@@ -181,6 +248,35 @@ def main():
     if len(a) != len(b):
         print("DIFF size %d vs %d" % (len(a), len(b)))
         return 1
+
+    # ★ 0 页文件此前直接判 IDENTICAL —— 比了零个页面。用独立标记吐出来，
+    # 让"这里本该有内容"的调用方能把它和真正的一致区分开
+    # （典型漏网场景：TRUNCATE 把 follower 截 0 之后 FPI 完全没到，
+    #  leader 侧新 relfilenode 也还是 0 块，两边都空 ⇒ 整条重填路径失效而全绿）。
+    if len(a) == 0:
+        print("IDENTICAL_EMPTY")
+        print("两侧均为 0 字节：比较了零个页面，不构成内容一致的证据", file=sys.stderr)
+        return 0
+
+    # ---- VM fork：整页严格比较 ----
+    #
+    # VM 页没有"空闲空洞"这个概念：PageInit 之后 pd_lower 恒为 24、
+    # pd_upper 恒为 8192，位图就写在这两者之间。套用堆页的空洞掩码等于把
+    # 整张位图掩掉（实测位图完全相反也判一致）。VM 的每一位都由
+    # XLOG_HEAP2_VISIBLE 或堆记录的清位动作驱动，全部写 WAL ⇒ 物理副本上
+    # 应当逐字节相同，没有可豁免的字段。
+    if kind == 'vm':
+        diffs = [i for i in range(len(a)) if a[i] != b[i]]
+        for off in diffs[:32]:
+            print("    VM 偏移 %5d  leader=0x%02X follower=0x%02X"
+                  % (off, a[off], b[off]), file=sys.stderr)
+        if diffs:
+            print("DIFF %d" % len(diffs))
+            return 1
+        print("IDENTICAL_OUTSIDE_HOLE")
+        print("VM fork 整页逐字节一致（%d 页，无掩码）" % (len(a) // BLCKSZ),
+              file=sys.stderr)
+        return 0
 
     outside_total = 0
     masked_total = 0
@@ -202,7 +298,18 @@ def main():
                   % (p, lower_a, upper_a))
             return 1
 
-        masked = masked_offsets(pa, lower_a, upper_a)
+        if kind == 'btree':
+            masked = masked_offsets_btree(pa, lower_a, upper_a)
+            # btpo_flags 只豁免 BTP_HAS_GARBAGE 一位，其余结构位严格比较
+            bfo = btpo_flags_off(pa)
+            if bfo is not None:
+                (ba_,) = struct.unpack_from('<H', pa, bfo)
+                (bb_,) = struct.unpack_from('<H', pb, bfo)
+                if (ba_ & ~BTP_HAS_GARBAGE) == (bb_ & ~BTP_HAS_GARBAGE):
+                    masked.add(bfo)
+                    masked.add(bfo + 1)
+        else:
+            masked = masked_offsets(pa, lower_a, upper_a)
 
         # pd_flags：只豁免三个提示位，其余位严格比较
         (fa,) = struct.unpack_from('<H', pa, PD_FLAGS_OFF)
@@ -213,7 +320,7 @@ def main():
 
         outside = [i for i in range(BLCKSZ)
                    if pa[i] != pb[i] and i not in masked]
-        viol = infomask_violations(pa, pb, lower_a)
+        viol = [] if kind == 'btree' else infomask_violations(pa, pb, lower_a)
 
         nmask = sum(1 for i in range(BLCKSZ) if pa[i] != pb[i] and i in masked)
         outside_total += len(outside) + len(viol)

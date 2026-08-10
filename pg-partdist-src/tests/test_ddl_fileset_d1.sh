@@ -161,6 +161,20 @@ check "follower2 追平基线（${a2}/${lp}）" "$([[ "$a2" -ge "$lp" ]] && echo
 # ---- 页面比对工具（判据同 R1：内核 heap_mask() 掩码之外逐字节一致）----
 docker cp "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" "$CONTAINER":/tmp/pagecmp.py >/dev/null 2>&1
 DEX chmod +x /tmp/pagecmp.py 2>/dev/null || true
+
+# 按 fileset 的 role 与 fork 推出 pagecmp 的掩码口径。
+#   role 0/2 = 主堆 / TOAST 堆 → heap
+#   role 1/3 = 索引 / TOAST 索引 → btree（**不能**用堆规则：IndexTuple 只有
+#              8 字节头，堆元组那套偏移掩到的是索引键本身）
+#   _vm fork → vm（VM 页没有"空闲空洞"，套堆规则会把整张位图掩掉）
+pagecmp_kind() {   # $1=key(role.ord)  $2=fork("" 或 "_vm")
+  [[ "$2" == "_vm" ]] && { echo vm; return; }
+  case "${1%%.*}" in
+    1|3) echo btree ;;
+    *)   echo heap ;;
+  esac
+}
+
 pdata=$(PSQL $pport -Atc "SHOW data_directory")
 
 # fileset 里的 relnum 是 **relfilenode**，不是关系 OID —— 两者只在关系刚建好时
@@ -192,7 +206,7 @@ diff_follower() {  # diff_follower <fport> <标签>
   # 循环体里的 `docker exec -i` 会把循环自己的标准输入一并吞掉，于是第一行
   # 之后的成员被静默跳过 —— 表现是"全 PASS 但只比了主堆"。
   local -a rows
-  local ncmp=0
+  local ncmp=0 nempty=0
   mapfile -t rows <<< "$lead_paths"
 
   local lrow
@@ -224,8 +238,17 @@ diff_follower() {  # diff_follower <fport> <标签>
       [[ "$lex" == "y" && "$fex" == "y" ]] || continue
       lsz=$(DEX stat -c %s "$lpath" </dev/null); fsz=$(DEX stat -c %s "$fpath" </dev/null)
       check "${tag} ${key}${fork:-.main} 大小一致(${lsz})" "$fsz" "$lsz"
-      same=$(DEX python3 /tmp/pagecmp.py "$lpath" "$fpath" </dev/null 2>/dev/null)
-      check "${tag} ${key}${fork:-.main} 掩码外逐字节一致" "$same" "IDENTICAL_OUTSIDE_HOLE"
+      local kind; kind=$(pagecmp_kind "$key" "$fork")
+      same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "$lpath" "$fpath" </dev/null 2>/dev/null)
+      # ★ IDENTICAL_EMPTY = 两侧都是 0 字节，**比较了零个页面**，不构成一致的证据。
+      # 主堆（role 0）必须有内容 —— 空了说明整条重填/回放路径失效；
+      # TOAST 堆与索引可以合法为空（没有超长值就不会有 TOAST 页）。
+      # 旧版本把这种情况一律算作"逐字节一致"，等于给零覆盖发通行证。
+      local want="IDENTICAL_OUTSIDE_HOLE"
+      if [[ "${key%.*}" != "0" && "$same" == "IDENTICAL_EMPTY" ]]; then
+        want="IDENTICAL_EMPTY"; nempty=$((nempty + 1))
+      fi
+      check "${tag} ${key}${fork:-.main} 掩码外逐字节一致" "$same" "$want"
       ncmp=$((ncmp + 1))
     done
   done
@@ -291,7 +314,17 @@ check "replay_catchup 报出结构栅栏" \
 check "follower1 状态 = needs_struct" "$(fstate $f1)" "needs_struct"
 
 after_applied=$(fapplied $f1)
-check "游标停在 CTRL 之前（未推进：${before_applied}→${after_applied}）" \
+# ★ 判据必须是"游标一个字节都没推进"，不是"没追到尖端"（2026-08-10 修）。
+#
+# 原判据只写 `after_applied < lp`，而上面取的 before_applied 从头到尾没被比较过。
+# 于是**栅栏晚跳一条**——回放器先消费了 CTRL:FILESET_UPDATE、又把新索引的第一个
+# FPI 灌进本地那个尚未重建的旧索引文件，然后才停——此时
+# after_applied = ctrl_plsn + k 仍然 < lp，照样 PASS。
+# 而这正是本脚本头注释里说的"静默损坏，比停下来难查得多"的那个场景：
+# 判据放过了它自己声明要防的东西。
+check "游标一个字节都没推进（${before_applied}→${after_applied}）" \
+      "$after_applied" "$before_applied"
+check "游标确实没追到尖端（${after_applied} < ${lp}）" \
       "$([[ "$after_applied" -lt "$lp" ]] && echo ok)" "ok"
 check "follower1 locmap 仍是 4 对（未换表）" \
       "$(PSQL $f1 -Atc "SELECT count(*) FROM partdist.replay_locmap('${shard_tbl}')")" "4"
