@@ -25,6 +25,14 @@ DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 
 check() {  # check <名字> <实际> <期望>
+  # ★ 空值守卫：两个命令替换都失败时 "" == "" 会静默判通过。
+  # 典型漏网：D1 用 leader_relnum / locmap_leader_relnum 互比文件号，
+  # 若 shard_fileset() 因登记被丢弃而返回 0 行，两边都是空串 ⇒
+  # "文件号确实换了"与"locmap 已换到新文件号"**双双恒真**。
+  # 期望值本身就是空串的场景本项目里不存在，所以一律要求非空。
+  if [[ -z "$2" ]]; then
+    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return
+  fi
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
@@ -333,7 +341,7 @@ check "follower 壳表行数 == leader(${lead_cnt})（冻结元组可读，验�
 echo
 health_check_no_crash
 health_check_no_drops
-
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then
   echo "R1 验收：全部通过"

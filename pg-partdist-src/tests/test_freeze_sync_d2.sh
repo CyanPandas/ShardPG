@@ -27,6 +27,14 @@ PASS=0; FAIL=0
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 check() {
+  # ★ 空值守卫：两个命令替换都失败时 "" == "" 会静默判通过。
+  # 典型漏网：D1 用 leader_relnum / locmap_leader_relnum 互比文件号，
+  # 若 shard_fileset() 因登记被丢弃而返回 0 行，两边都是空串 ⇒
+  # "文件号确实换了"与"locmap 已换到新文件号"**双双恒真**。
+  # 期望值本身就是空串的场景本项目里不存在，所以一律要求非空。
+  if [[ -z "$2" ]]; then
+    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return
+  fi
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
@@ -86,7 +94,14 @@ echo "  shard=${gid} leader=:${pport} follower=:${f1}"
 gucv=$(PSQL $pport -Atc "SHOW pg_partdist.freeze_sync_interval_ms" 2>/dev/null | tail -1)
 check "leader 侧 freeze_sync_interval_ms=0（[0] 已设）" "$gucv" "0"
 
-PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('${shard_tbl}')" >/dev/null
+# ★ 夹具三要素（fileset 注册 / locmap 配对 / arm）必须各自有判据。
+# 原先三处全是 >/dev/null 不看返回值：注册若返回 0 行，下面 roles/ords/... 全是
+# 空串，replay_set_locmap 收到空数组，回放根本建立不起来 —— 而本用例真正断言的
+# 是"账目同步"，leader 侧照样推进 relfrozenxid，follower 侧取到的仍是初值，
+# 判据会以一种和"冻结账目没发过来"完全一样的方式失败，把人引到错误的方向。
+# L1 在同位置是有这两条的（nrels/np 都对 4），D2 漏了。
+nrels=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('${shard_tbl}')" | tail -1)
+check "leader fileset 注册（主堆+PK+TOAST堆+TOAST索引）" "$nrels" "4"
 rows=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT role||','||ord||','||spc||','||db||','||relnum FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role,ord" | grep ',')
 roles=$(echo "$rows"|cut -d, -f1|paste -sd,); ords=$(echo "$rows"|cut -d, -f2|paste -sd,)
 spcs=$(echo "$rows"|cut -d, -f3|paste -sd,);  dbs=$(echo "$rows"|cut -d, -f4|paste -sd,)
@@ -98,7 +113,8 @@ DROP TABLE IF EXISTS ${shard_tbl};
 CREATE TABLE ${shard_tbl} (LIKE d2_freeze INCLUDING ALL);
 ALTER TABLE ${shard_tbl} SET (autovacuum_enabled = off);
 SQL
-  PSQL $fp -Atc "SELECT partdist.replay_set_locmap('${shard_tbl}', ARRAY[${roles}], ARRAY[${ords}], ARRAY[${spcs}]::oid[], ARRAY[${dbs}]::oid[], ARRAY[${rels}]::oid[])" >/dev/null
+  np=$(PSQL $fp -Atc "SELECT partdist.replay_set_locmap('${shard_tbl}', ARRAY[${roles}], ARRAY[${ords}], ARRAY[${spcs}]::oid[], ARRAY[${dbs}]::oid[], ARRAY[${rels}]::oid[])" | tail -1)
+  check "follower :$fp locmap 配对" "$np" "4"
 done
 
 # 取某侧的 relfrozenxid（role: main / toast）。
@@ -142,6 +158,10 @@ for fp in $f1 $f2; do
   PSQL $fp -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null
   PSQL $fp -q -c "SELECT partdist.replay_enable('${shard_tbl}');" >/dev/null
 done
+# arm 也要有判据：armed=false 时后面的追平全是空转，而"账目没同步"的表象一样
+f1oid=$(PSQL $f1 -Atc "SELECT partdist.local_partition_for_shard(${gid})" | tail -1)
+check "follower :$f1 已 armed" \
+      "$(PSQL $f1 -Atc "SELECT armed FROM partdist.replay_status() WHERE shard=${f1oid}" | tail -1)" "t"
 
 leader_oid=$(PSQL $pport -Atc "SELECT partdist.local_partition_for_shard(${gid})" | tail -1)
 check "取到 leader 侧本地分区 OID" "$([[ -n "$leader_oid" && "$leader_oid" != "0" ]] && echo ok)" "ok"
@@ -243,16 +263,24 @@ check "follower 距 anti-wraparound 阈值 < 50%" \
       "$(awk -v p="${pct:-999}" 'BEGIN{print (p<50)?"ok":"no"}')" "ok"
 
 echo "========== [6] 幂等：不再变化时不应重复发射 =========="
-plsn_a=$(lead_plsn)
+# ★ 判据改成直接数 CTRL 记录，不再用"全流增量 <= 20"这个魔数。
+# 旧判据数的是**所有**记录（DATA 也算），而一次 INSERT 本来就只产生个位数记录，
+# 于是"每个事务都重发一条 FREEZE_UPDATE"这个正要被排除的行为，增量 7 依旧 <= 20
+# —— 判据对它是瞎的。本用例 [0] 已把 freeze_sync_interval_ms 设为 0，
+# PartWALFreezeCheckDue(0) 表示**每次提交都检查**，所以这里考的正是
+# ShardFreezeEmitOne 的幂等：账目没变就一条都不该发。期望值是 0，不是"少一点"。
+ctrl_count() {  # 数 leader 流里的 CTRL 记录（PARTWAL_FLAG_CTRL = 0x04）
+  PSQL $pport -Atc "SELECT count(*) FROM partdist.check_partition_wal(${leader_oid}) WHERE flags & 4 <> 0" | tail -1
+}
+ctrl_a=$(ctrl_count)
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "SELECT count(*) FROM d2_freeze;" >/dev/null
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO d2_freeze SELECT 900,'x','small';"
-plsn_b=$(lead_plsn)
-# 一次 INSERT 的记录数很小；若每个事务都重发 FREEZE_UPDATE，增量会明显更大。
-# 这里只做粗判：增量不应超过 20 条。
-delta=$((plsn_b - plsn_a))
-echo "  两次采样间流增量 = ${delta} 条"
-check "冻结账目未变时不重复发射（增量 ${delta} <= 20）" \
-      "$([[ "$delta" -le 20 ]] && echo ok)" "ok"
+ctrl_b=$(ctrl_count)
+echo "  CTRL 记录数：${ctrl_a} → ${ctrl_b}"
+check "取到了 CTRL 计数（否则下面的'未增加'恒真）" \
+      "$([[ "$ctrl_a" =~ ^[0-9]+$ && "$ctrl_b" =~ ^[0-9]+$ ]] && echo ok || echo "no(${ctrl_a}/${ctrl_b})")" "ok"
+check "★ 冻结账目未变时一条都不重发（CTRL 增量 $((ctrl_b - ctrl_a)) = 0）" \
+      "$([[ "$ctrl_a" =~ ^[0-9]+$ && "$ctrl_b" == "$ctrl_a" ]] && echo ok || echo "no(+$((ctrl_b - ctrl_a)))")" "ok"
 
 echo
 echo "========== 清理 =========="
@@ -271,6 +299,6 @@ done
 echo
 health_check_no_crash
 health_check_no_drops
-
+health_check_worker_pool
 echo "==================== 结果：PASS=${PASS} FAIL=${FAIL} ===================="
 [[ "$FAIL" -eq 0 ]] || exit 1

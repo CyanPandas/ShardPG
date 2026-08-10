@@ -97,10 +97,20 @@ setup_replication() {  # setup_replication <gid> <pport> <f1> <f2>
   local shard_tbl="tx1_dtx_${gid}"
   local pnode=$((pport - 5431)) f1node=$((f1 - 5431)) f2node=$((f2 - 5431))
 
-  local nrels
+  # 期望值从 catalog 推导，不写死也不用 `-ge`。
+  # `-ge 2` 这类下界判据的问题：register_shard_fileset 少登记了 TOAST 或某个
+  # 索引，它照样通过 —— 而漏登记正是 follower 侧"未知 relfilelocator"PANIC
+  # 的来源（FRD §13 约束 1）。精确值 = 主堆 1 + 表上索引数 +（有 TOAST 时
+  # TOAST 堆 1 + TOAST 索引数）。
+  local nrels want_rels
+  want_rels=$(PSQL $pport -Atc "SET citus.override_table_visibility=false;
+      SELECT 1 + (SELECT count(*) FROM pg_index WHERE indrelid = c.oid)
+             + CASE WHEN c.reltoastrelid <> 0
+                    THEN 1 + (SELECT count(*) FROM pg_index WHERE indrelid = c.reltoastrelid)
+                    ELSE 0 END
+      FROM pg_class c WHERE c.oid = '${shard_tbl}'::regclass" | tail -1)
   nrels=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('${shard_tbl}')" | tail -1)
-  check "shard ${gid}: fileset 注册（主堆+PK=2，无 TOAST 索引才 2；实际 ${nrels}）" \
-        "$([[ -n "$nrels" && "$nrels" -ge 2 ]] && echo ok)" "ok"
+  check "shard ${gid}: fileset 注册成员数（catalog 推导应为 ${want_rels}）" "$nrels" "$want_rels"
 
   local fsrows roles ords spcs dbs rels
   fsrows=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT role||','||ord||','||spc||','||db||','||relnum FROM partdist.shard_fileset('${shard_tbl}') ORDER BY role, ord" | grep ',')
@@ -261,22 +271,54 @@ page_compare() {  # page_compare <gid> <pport> <fp>
   lrows=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; ${fs_sql}" | grep ',')
   frows=$(PSQL $fp   -Atc "SET citus.override_table_visibility=false; ${fs_sql}" | grep ',')
 
-  local lkv fkv key lrel frel same errf
-  while IFS= read -r lkv; do
+  # ★ 原先这里只比主堆：非主堆成员一律 `continue` 跳过。注释写的是"索引/TOAST
+  # 只做存在性确认"，但上一行的存在性 check **只在映射缺失时才触发** —— 映射
+  # 正常时一条断言都不下。也就是说 TX1 对索引与 TOAST 的回放结果**零覆盖**：
+  # 索引页回放错了、TOAST 段没跟上，本用例照样全 PASS。
+  # L1 早已证明 pagecmp 的 btree 掩码口径可用（role 1/3 走 --kind=btree），
+  # 这里按同一口径把全部成员都比上。
+  local -a rows; local lkv
+  mapfile -t rows <<< "$lrows"
+  local fkv key lrel frel same errf want kind nmemb=0
+  for lkv in "${rows[@]}"; do
+    [[ -n "$lkv" ]] || continue
+    nmemb=$((nmemb+1))
     key=${lkv%%,*}; lrel=${lkv#*,}
     fkv=$(echo "$frows" | grep "^${key}," || true)
     [[ -z "$fkv" ]] && { check "shard ${gid}:${fp} ${key} follower 侧有映射" "missing" "present"; continue; }
     frel=${fkv#*,}
-    # 主堆才有权威掩码口径；索引/TOAST 只做主堆比对之外的存在性确认
-    [[ "$key" != 0.* ]] && continue
+    check "shard ${gid}:${fp} ${key} follower 侧有映射" "present" "present"
+    case "${key%%.*}" in
+      1|3) kind=btree ;;
+      *)   kind=heap  ;;
+    esac
     errf=$(mktemp)
-    same=$(DEX python3 /tmp/pagecmp.py --kind=heap "${pdata}/${lrel}" "${fdata}/${frel}" </dev/null 2>"$errf")
+    same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "${pdata}/${lrel}" "${fdata}/${frel}" </dev/null 2>"$errf")
     ncmp=$((ncmp+1))
-    check "shard ${gid}: follower :$fp ${key}(主堆) 洞外逐字节一致" "$same" "IDENTICAL_OUTSIDE_HOLE"
-    [[ "$same" != "IDENTICAL_OUTSIDE_HOLE" ]] && sed 's/^/        /' "$errf"
+    # IDENTICAL_EMPTY = 两侧都是 0 字节，**比较了零个页面**，不构成一致的证据。
+    # 主堆（role 0）空了说明整条回放路径失效；索引/TOAST 可以合法为空。
+    #
+    # IDENTICAL_EXCEPT_PDLSN = 内容全同、只有 pd_lsn 不同。本用例的值全是
+    # 'cross-a'/'bulk123' 这类短串，从不产生 TOAST，于是 TOAST 索引(role 3)
+    # 只有一张谁也没写过的空元页：两侧各自由本地 WAL 建成，`_bt_initmetapage`
+    # 确定所以内容全同，LSN 各是各的。根因是夹具用 `CREATE TABLE (LIKE ...)`
+    # 建壳表，而 FRD §13 约束 2 要求副本由 leader 分片**物理拷贝**初始化 ——
+    # 凡是回放真正写过的页，pd_lsn 取自 leader 的 orig_lsn（§8.2）不会有这问题。
+    # 只对非主堆收这个结论；主堆出现它就是真缺陷。
+    want="IDENTICAL_OUTSIDE_HOLE"
+    if [[ "${key%%.*}" != "0" ]]; then
+      [[ "$same" == "IDENTICAL_EMPTY"        ]] && want="IDENTICAL_EMPTY"
+      [[ "$same" == "IDENTICAL_EXCEPT_PDLSN" ]] && want="IDENTICAL_EXCEPT_PDLSN"
+    fi
+    local note=""
+    [[ "$want" != "IDENTICAL_OUTSIDE_HOLE" ]] && note="［判据放宽为 ${want}］"
+    check "shard ${gid}: follower :$fp ${key}(${kind}) 洞外逐字节一致${note}" "$same" "$want"
+    [[ "$same" != "$want" ]] && sed 's/^/        /' "$errf"
     rm -f "$errf"
-  done <<< "$lrows"
-  check "shard ${gid}: follower :$fp 至少比对了 1 个主堆文件" "$([[ "$ncmp" -ge 1 ]] && echo ok)" "ok"
+  done
+  # 比对数必须覆盖**全部** fileset 成员，否则"全 PASS"只说明跳过得干净
+  check "shard ${gid}: follower :$fp 比对覆盖全部 ${nmemb} 个成员（实比 ${ncmp}）" \
+        "$([[ "$nmemb" -ge 1 && "$ncmp" -eq "$nmemb" ]] && echo ok || echo "no(${ncmp}/${nmemb})")" "ok"
 }
 page_compare "$gid_a" "$pport_a" "$f1_a"
 page_compare "$gid_a" "$pport_a" "$f2_a"
@@ -286,7 +328,7 @@ page_compare "$gid_b" "$pport_b" "$f2_b"
 echo ""
 health_check_no_crash
 health_check_no_drops
-
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "TX1 跨线联测：全部通过"; else echo "TX1 跨线联测：存在 FAIL"; fi
 

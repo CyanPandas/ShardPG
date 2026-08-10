@@ -1468,3 +1468,85 @@ C 侧 `data_group_promote_prepare` 对 `-1` 直接清掉截止期计时并返回
 推回来，机制与 D1 的 fileset 内容灌注同源）尚未接成一键操作，目前需要运维走
 "重建壳表 → `replay_set_locmap` → `replay_enable`"这条既有路径。闸已经把不安全的
 状态挡在门外，这一步是可用性优化而不是正确性缺口。
+
+---
+
+## 13. 2026-08-10 验证层加固与两个产品缺陷
+
+§12 交付之后做了一轮**针对验收本身**的审查：不看"是不是全 PASS"，只看每条断言
+在判据失效时会不会**静默通过**。抓到的问题分两类。
+
+### 13.1 产品缺陷：回放 worker 池按"启动过几个"限流 ⇒ 常驻 worker 泄漏
+
+`ReplayLauncherMain` 用只增的 `nworkers_started` 限池，又补了"任何槽位都没被
+认领就把它归零"的放宽。而 worker 是**常驻**的（主循环只在节点关机时退出），
+`replay_disable` 只让它释放认领 —— 于是每经历一次 arm → disable → arm 就永久
+多一个 worker。**每个用例收尾都 disable，所以是每轮每节点漏一个。**
+
+实测：`replay_workers=1` 的节点上同时活着 4 个 worker，`bgw_name` 全是
+`replay worker 0`（计数器被反复清零的直接痕迹）；本环境 08-08 的日志里已刷出过
+`max_worker_processes 不足`。撞上限之后该节点**再也拉不起任何回放 worker**，
+follower 静默停止追平，并连带饿死 Citus 维护进程等其他动态 bgworker。
+
+改为持 `BackgroundWorkerHandle` 数组、每轮用 `GetBackgroundWorkerPid() ==
+BGWH_STOPPED` 回收后按**存活数**限池。详见 FRD §13 约束 14。
+
+**为什么它躲过了全部验收**：这个泄漏不让任何功能断言变红，只让环境越来越脆，
+症状是"每轮失败的用例都不一样"—— 和 FRD 约束 12/13 的表现撞在一起，极易被
+归因成偶发的回放缺陷。现加 `health_check_worker_pool` 兜住。
+
+### 13.2 验收缺陷：取证的日志路径被别的用例改道，检查静默失效
+
+`test_local_wal_conflict.sh` 用 `pg_ctl -l <datadir>/lwc_restart.log` 重启节点后
+**没还回去**，此后这两个节点的 stderr 永久改道，约定路径上的文件 mtime 冻结。
+后果不止是 L1 取不到崩溃证据 —— `lib_node_health.sh` 的两个 glob 谁也匹配不到
+新目标，**这两个节点上"本轮无节点崩溃"退化成空检查**。
+
+修法：`health_node_log` / `health_live_logs` 一律解析
+`readlink /proc/$(head -1 <datadir>/postmaster.pid)/fd/2`，问内核要真实去向；
+LWC 改回约定路径并用行号基线取证，不留污染。
+
+同源的一条：**`pg_postmaster_start_time()` 不能用来证明"节点崩过"**。`kill -9`
+一个挂 shmem 的 bgworker 会让 postmaster **重新初始化整个集群**（辅助进程 pid
+全换新），但 postmaster 自己不重启，启动时刻纹丝不动。要取内核证词
+（`reinitializing` / `was not properly shut down`），且只扫本轮新增的行。
+
+### 13.3 其余加固
+
+| 位置 | 原判据 | 问题 | 现判据 |
+|---|---|---|---|
+| L1 V4 | `sleep 2` 后 pgrep 抓 worker 再 kill | 150 行回放是毫秒级，抓到的多半是正在退出的进程，kill 落空、节点根本没重置，而后续断言照样全 PASS | 用 `replay_debug_delay_ms` 造确定的存活窗口；并改为**分两批**追平，先落一个持久化的中间游标，崩溃后断言 `durable` 不回退 |
+| L1 V4 | `applied` 列 | 节点重置后没有 worker，shmem `applied` 读出 0 是**正确**语义，拿它断言必然失败 | 改看 `durable`（`replay_status()` 现读 apply_checkpoint 文件） |
+| L1 V3 | 只断言"applied 未动" | 第二批字节若压根没复制过来，applied 当然不动 —— "惰性"一个字节都没被检验 | 先断言字节到货 + 确实有新字节，再断言未回放 |
+| TX1 §6 | 非主堆成员 `continue` 跳过 | 注释说"只做存在性确认"，但那条 check 只在映射**缺失**时触发；索引/TOAST 回放结果**零覆盖** | 全成员逐字节比对（role 1/3 走 `--kind=btree`），并断言比对数 == 成员数 |
+| TX1/TX2/TX3 | `nrels -ge 1`（或 2） | 漏登记 TOAST 或某个索引照样通过，而漏登记正是 follower 侧"未知 relfilelocator" PANIC 的来源 | 期望值从 catalog 推导，精确相等 |
+| D2 夹具 | `register_shard_fileset` / `replay_set_locmap` / `replay_enable` 三处全 `>/dev/null` | 注册返回 0 行时 locmap 收到空数组，回放建立不起来，而失败表象与"冻结账目没发过来"完全一样 | 三条各自下判据（成员数 4 / 配对 4 / `armed=t`） |
+
+另外产品侧补了**槽位与 `pg_parwal/<oid>` 目录的回收**（FRD §13 约束 15）：
+二者原先只增不删，表 DROP 之后槽位仍占着、目录仍留在盘上，跑久了槽位耗尽。
+
+### 13.4 补上索引比对后当场抓到的一条：空 TOAST 索引元页的 pd_lsn
+
+TX1 把索引/TOAST 纳入逐字节比对之后，四组 leader/follower 全部报 `3.0`
+（TOAST 索引）差 3-4 字节。差异**全部落在偏移 4..7**，即 `pd_lsn` 的低 32 位
+（0..3 的 xlogid 相同），页内容逐字节一致。
+
+定性：TX1 写的值全是 `'cross-a'` / `'bulk123'` 这类短串，**从不产生 TOAST**。
+于是 TOAST 堆是 0 页（走 `IDENTICAL_EMPTY`），而 TOAST 索引始终有一张
+谁也没写过的空元页 —— 两侧各自由本地 WAL 建成，`_bt_initmetapage` 是确定性的
+所以内容全同，`pd_lsn` 却各带各的本地值。
+
+**根因在夹具不在产品**：FRD §13 约束 2 要求副本由 leader 分片**物理拷贝**初始化，
+而验收脚本一律用 `CREATE TABLE (LIKE ... INCLUDING ALL)` 建壳表。凡是回放真正
+写过的页，`pd_lsn` 取自 leader 的 `orig_lsn`（§8.2），两侧自然一致，所以这个
+差距一直藏在"回放从未碰过的页"里没露头。
+
+判据处理：`pagecmp.py` 新增第三种结论 `IDENTICAL_EXCEPT_PDLSN`（内容全同、
+仅 pd_lsn 不同），**只对非主堆收**，主堆出现它就是真缺陷。没有把 pd_lsn 直接
+掩掉 —— 掩掉就等于对"回放写过的页 LSN 没跟上"这类真问题也一并失明。
+
+**顺带的风险提示**（属 FRD §13 约束 12 那一类，未立项）：这张元页的本地 LSN
+若**高于**将来 leader 第一次写 TOAST 索引时那条记录的 `orig_lsn`，redo 的
+`lsn <= PageGetLSN(page)` 判断会**跳过**该更新，形成真分歧。生产路径按约束 2
+走物理拷贝就不存在这个窗口；但只要还允许 `CREATE TABLE (LIKE ...)` 这条捷径
+初始化副本，这个窗口就在。

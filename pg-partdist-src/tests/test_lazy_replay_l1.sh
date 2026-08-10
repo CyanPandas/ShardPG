@@ -30,6 +30,14 @@ DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 
 check() {
+  # ★ 空值守卫：两个命令替换都失败时 "" == "" 会静默判通过。
+  # 典型漏网：D1 用 leader_relnum / locmap_leader_relnum 互比文件号，
+  # 若 shard_fileset() 因登记被丢弃而返回 0 行，两边都是空串 ⇒
+  # "文件号确实换了"与"locmap 已换到新文件号"**双双恒真**。
+  # 期望值本身就是空串的场景本项目里不存在，所以一律要求非空。
+  if [[ -z "$2" ]]; then
+    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return
+  fi
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
@@ -197,7 +205,23 @@ before_app=$(PSQL $f1 -Atc "SELECT applied FROM partdist.replay_status() WHERE s
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c \
   "INSERT INTO l1_lazy SELECT g, 'b'||g, 'small-b' FROM generate_series(501, 600) g;"
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "DELETE FROM l1_lazy WHERE id % 17 = 0;"
-sleep 3
+
+# ★ 先证明"有东西可回放"，再谈"没有回放"。
+# 只断言 applied 未动是不够的：若第二批的字节压根没复制到 follower（复制层断了、
+# 分区组丢主……），applied 当然不会动 —— 这条 ★ 断言就平凡通过，而"惰性"
+# 一个字节都没被检验。V1 对第一批有这条到货断言，V3 漏了。
+lead_plsn2=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${leader_oid})")
+f1_bytes2=""
+for t in $(seq 1 30); do
+  f1_bytes2=$(PSQL $f1 -Atc "SELECT partdist.get_partition_flush_lsn(${foid})")
+  [[ -n "$f1_bytes2" && "$f1_bytes2" -ge "$lead_plsn2" ]] && break
+  sleep 1
+done
+check "第二批字节已复制到 follower（${f1_bytes2} ≥ leader ${lead_plsn2}）" \
+      "$([[ "$f1_bytes2" =~ ^[0-9]+$ && "$f1_bytes2" -ge "$lead_plsn2" ]] && echo ok || echo "no(${f1_bytes2}/${lead_plsn2})")" "ok"
+check "第二批确实带来了新字节（${lead_plsn2} > 上轮游标 ${before_app}）" \
+      "$([[ "$lead_plsn2" =~ ^[0-9]+$ && "$lead_plsn2" -gt "$before_app" ]] && echo ok || echo "no")" "ok"
+sleep 3   # 字节已到齐，再给"如果它会自己回放"留出充足时间
 check "★ 第二批写入后 applied 未动（仍是 ${before_app}）" \
       "$(PSQL $f1 -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}")" "$before_app"
 
@@ -314,20 +338,53 @@ diff_follower() {  # <fport> <标签>
 diff_follower $f1 "f1"
 diff_follower $f2 "f2"
 
-echo "========== [V4] 追平中途 kill -9 → 重新触发续上 =========="
+echo "========== [V4] 追平中途 kill -9 → 重新触发从 durable 游标续上 =========="
 assert_group_leader "V4 前"
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c \
-  "INSERT INTO l1_lazy SELECT g, 'c'||g, 'small-c' FROM generate_series(1001, 1150) g;"
-lead_plsn=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${leader_oid})")
-
 fdir="worker$((f1 - 5432))"
-# 后台触发追平，追赶过程中杀 worker
+
+# 分两批写。第一批先老老实实追平，落下一个**已持久化的中间游标**；第二批留作
+# 崩溃后的欠账。这样"从 durable 游标续上"是被真正测到的 —— 原来的写法指望
+# kill 恰好落在 apply 中途，那是时序赌博：150 行的回放是毫秒级，sleep 2 之后
+# worker 多半已经退出，pgrep 抓到的是正在消失的进程，kill 落空、节点根本没
+# 重置，而下面的断言照样全 PASS。
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c \
+  "INSERT INTO l1_lazy SELECT g, 'c'||g, 'small-c' FROM generate_series(1001, 1075) g;"
+r=$(catchup_to_leader $f1 "V4-mid"); mid_app=${r%%|*}; mid_tgt=${r##*|}
+check "V4 中间游标已推进到 ${mid_tgt}" \
+      "$([[ "$mid_app" =~ ^[0-9]+$ && -n "$mid_tgt" && "$mid_app" -ge "$mid_tgt" ]] \
+        && echo ok || echo "no(applied=${mid_app})")" "ok"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c \
+  "INSERT INTO l1_lazy SELECT g, 'c'||g, 'small-c' FROM generate_series(1076, 1150) g;"
+
+# kill 的确定性：worker 干完活立刻退出，抓它是跟时序赛跑。用调试 GUC 给它一个
+# 确定的存活窗口（进主循环前先睡 delay_ms），kill 必然落在一个**活着的 shmem
+# worker** 上；而 shmem worker 崩溃 = 整个节点被 postmaster 拖进崩溃恢复
+# （PG 语义，replay_worker.c 里注释写了"实测踩到"）。
+delay_ms=5000
+PSQL $f1 -q -c "ALTER SYSTEM SET pg_partdist.replay_debug_delay_ms=${delay_ms};" >/dev/null 2>&1
+PSQL $f1 -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
+# 日志文件按 /proc/<postmaster>/fd/2 解析，不按 <节点>.log 猜 —— 该约定路径
+# 会被别的用例（LWC 的 pg_ctl -l）改道，改道后老文件永久冻结，在它上面 grep
+# 恒为 0 条，这条断言就成了"永远失败"或（若判据写反）"永远通过"。
+nlog=$(health_node_log "$fdir")
+[[ -z "$nlog" ]] && nlog="/work/pg-cluster-data/${fdir}.log"
+echo "  f1 节点日志：${nlog}"
+logmark=$(DEX bash -c "wc -l < '${nlog}' 2>/dev/null || echo 0" | tr -d '[:space:]')
+
 ( PSQL $f1 -Atc "SELECT partdist.replay_catchup('${shard_tbl}', NULL, 60000)" >/dev/null 2>&1 ) &
-sleep 2
-wpid=$(DEX bash -c "
-  for pid in \$(pgrep -f '[r]eplay worker'); do
-    [ \"\$(readlink /proc/\$pid/cwd 2>/dev/null)\" = \"/work/pg-cluster-data/${fdir}\" ] && { echo \$pid; break; }
-  done")
+wpid=""
+for t in $(seq 1 50); do   # 10s 上限，覆盖 5s 存活窗口
+  wpid=$(DEX bash -c "
+    for pid in \$(pgrep -f '[r]eplay worker'); do
+      [ \"\$(readlink /proc/\$pid/cwd 2>/dev/null)\" = \"/work/pg-cluster-data/${fdir}\" ] && { echo \$pid; break; }
+    done")
+  [[ -n "$wpid" ]] && break
+  sleep 0.2
+done
+# ★ 必须断言"确实找到了 worker"（R1/R2 在同一位置都下了这条，只有 L1 漏了）。
+# 找不到就静默跳过 kill 的话，V4 整段退化成"连续触发两次 catchup"。
+check "找到 f1 节点的 replay worker（存活窗口内）" \
+      "$([[ -n "$wpid" ]] && echo ok || echo "未找到")" "ok"
 if [[ -n "$wpid" ]]; then
   DEX kill -9 "$wpid" 2>/dev/null
   echo "  已 kill -9 worker(pid=$wpid)，节点将整体重置"
@@ -339,14 +396,48 @@ for t in $(seq 1 60); do
   sleep 1
 done
 check "f1 节点从重置中恢复" "$(PSQL $f1 -Atc 'SELECT 1' 2>/dev/null)" "1"
+# 崩溃证据不能用 pg_postmaster_start_time()：kill -9 一个挂 shmem 的 bgworker
+# 会让 postmaster **重新初始化整个集群**（杀光 backend、走崩溃恢复），但
+# postmaster 进程自己不重启 —— 启动时刻纹丝不动。（金丝雀那边用它是对的，
+# 因为那里做的是真正的 pg_ctl stop + start。）
+# 这里改取节点日志里内核自己的证词，并只扫 kill 之后新增的部分，避免被本轮
+# 之前的重置蒙混过关。
+reinit=$(DEX bash -c "tail -n +$((logmark + 1)) '${nlog}' 2>/dev/null | grep -cE 'reinitializing|was not properly shut down'" | tr -d '[:space:]')
+check "节点确实走了一次崩溃重置（日志证据 ${reinit} 条）" \
+      "$([[ "$reinit" =~ ^[0-9]+$ && "$reinit" -ge 1 ]] && echo ok || echo "no(${reinit})")" "ok"
+
+# 关掉存活窗口，否则 postgresql.auto.conf 会让崩溃后每个 worker 都白睡 5s
+PSQL $f1 -q -c "ALTER SYSTEM RESET pg_partdist.replay_debug_delay_ms;" >/dev/null 2>&1
+PSQL $f1 -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
+
+# ★ 这才是 V4 的题眼：崩溃前已持久化的游标不能回退。
+#
+# 取值必须看 durable 这一列，不是 applied：
+#   applied —— 共享内存里的**活进度**，由在跑的 worker 维护；节点整体重置后
+#              没有 worker，读出 0 是正确语义，拿它断言等于必然失败。
+#   durable —— replay_status() 现读 apply_checkpoint 文件（replay_worker.c 里
+#              直接 ReadApplyCheckpoint），才是"崩溃能续上"所依赖的那个游标。
+# 每轮 apply 收尾都会落一次 checkpoint（shard_replay.c 的"每轮收尾"），所以
+# 上面那次追平返回之后，durable 就应当已经 ≥ mid_tgt。
+post=$(PSQL $f1 -Atc "SELECT applied||'/'||durable FROM partdist.replay_status() WHERE shard=${foid}" 2>&1)
+post_app=${post%%/*}; post_dur=${post##*/}
+check "★ 崩溃后落盘游标未回退（durable=${post_dur} ≥ 中间游标 ${mid_tgt}；shmem applied=${post_app} 归零属正常）" \
+      "$([[ "$post_dur" =~ ^[0-9]+$ && "$post_dur" -ge "$mid_tgt" ]] \
+        && echo ok || echo "no(${post})")" "ok"
+
 r=$(catchup_to_leader $f1 "V4"); app1=${r%%|*}; tgt=${r##*|}
 check "重新触发后追平到 ${tgt}" \
-      "$([[ "$app1" =~ ^[0-9]+$ && -n "$tgt" && "$app1" -ge "$tgt" ]] && echo ok)" "ok"
+      "$([[ "$app1" =~ ^[0-9]+$ && -n "$tgt" && "$app1" -ge "$tgt" ]] && echo ok || echo "no(applied=${app1})")" "ok"
+# 崩溃 + 续上之后数据必须与 leader 完全一致 —— 只看游标数字不看内容，
+# 回放漏行/重放导致主键冲突这类问题会从眼皮底下溜过去。
+lead_sum=$(PSQL $pport -Atc "SELECT count(*)||'/'||coalesce(sum(id),0) FROM ${shard_tbl}")
+foll_sum=$(PSQL $f1   -Atc "SELECT count(*)||'/'||coalesce(sum(id),0) FROM ${shard_tbl}")
+check "★ 崩溃续上后 follower 数据与 leader 一致（${lead_sum}）" "$foll_sum" "$lead_sum"
 
 echo
 health_check_no_crash
 health_check_no_drops
-
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 [[ "$FAIL" -eq 0 ]] && echo "L1 惰性回放验收：全部通过" || echo "L1 惰性回放验收：存在 FAIL"
 

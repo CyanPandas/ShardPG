@@ -137,7 +137,10 @@ check "该 xid 本地判决已变为 aborted" \
 
 echo ""
 health_check_no_crash
-
+# 丢提案时的表现正是"全 PASS + 有丢弃 = 运气"（见 lib_node_health.sh 头注释）——
+# 本用例全靠 Raft 把记录/标记送到 follower，必须一并核查。
+health_check_no_drops
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "TX4 快路径分叉归队规则：全部通过"; else echo "TX4 快路径分叉归队规则：存在 FAIL"; fi
 

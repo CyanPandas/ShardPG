@@ -36,6 +36,9 @@
 #include "access/xlog_internal.h"       /* wal_segment_size */
 #include "access/xlogutils.h"
 #include "catalog/pg_class.h"
+#include "common/file_utils.h"          /* — */
+#include "utils/syscache.h"             /* SearchSysCacheExists1（回收用） */
+#include "storage/fd.h"
 #include "postmaster/bgwriter.h"        /* RequestCheckpoint */
 #include "utils/syscache.h"
 #include "catalog/pg_type.h"
@@ -67,11 +70,20 @@ int  replay_checkpoint_interval_ms = 2000;
 int  replay_checkpoint_records     = 512;
 bool replay_trust_local_segments   = false;
 int  replay_debug_delay_ms         = 0;
+int  replay_reclaim_grace_secs     = 300;
 bool replay_debug_trace            = false;
 
 void
 DefineReplayGUCs(void)
 {
+    DefineCustomIntVariable("pg_partdist.replay_reclaim_grace_secs",
+                            "回收陈旧 pg_parwal 目录前的宽限期（秒）。",
+                            "判据是\"目录名那个 OID 在 pg_class 里已不存在\"；"
+                            "宽限期只为避开\"关系刚建、目录已在\"这类窄窗口。"
+                            "设 0 表示不等待。",
+                            &replay_reclaim_grace_secs, 300, 0, 86400,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_partdist.replay_workers",
                             "Replay worker 池大小（FRD §7：池 + 轮转认领）",
                             NULL, &replay_workers,
@@ -192,7 +204,10 @@ ReplaySlotFindLocked(Oid shard_oid, bool create)
         return NULL;
     if (free_idx < 0)
         ereport(ERROR,
-                (errmsg("pg_partdist: 回放槽位已满(%d)", REPLAY_MAX_SHARDS)));
+                (errmsg("pg_partdist: 回放槽位已满(%d)", REPLAY_MAX_SHARDS),
+                 errhint("陈旧槽位（壳表已 DROP 但槽位未释放）可用 "
+                         "partdist.replay_reclaim_stale() 回收；"
+                         "replay_set_locmap() 已在报本错之前自动试过一次。")));
 
     memset(&ReplayCtl->slots[free_idx], 0, sizeof(ReplayShardSlot));
     ReplayCtl->slots[free_idx].shard_oid = shard_oid;
@@ -522,7 +537,26 @@ LauncherRecoverSlots(void)
 void
 ReplayLauncherMain(Datum arg)
 {
-    int nworkers_started = 0;
+    /*
+     * 池上限必须按**当前活着的 worker 数**来限，不能用"本 launcher 启动过
+     * 几个"的计数器。
+     *
+     * 旧写法是 nworkers_started 只增，再配一段"任何槽位都没被认领就把它归零"
+     * 的放宽 —— 两者合起来是个泄漏：worker 是常驻的（主循环只在节点关机时
+     * 退出），而 replay_disable 会让它释放认领；于是每经历一次
+     * arm → disable → arm，launcher 就以为池空了，再拉一个**永久** worker。
+     *
+     * 实测证据：replay_workers=1 的节点上同时活着 4 个 worker，且全部叫
+     * "replay worker 0"（计数器被反复清零留下的直接痕迹）；本环境 08-08 的
+     * 节点日志里已经刷出过 "max_worker_processes 不足" —— 一旦撞上限，
+     * RegisterDynamicBackgroundWorker 会一直失败，该节点**再也拉不起任何
+     * 回放 worker**，follower 从此静默停止追平（且会连带饿死 Citus
+     * 维护进程等其他动态 bgworker）。
+     */
+#define REPLAY_LAUNCH_MAX 64
+    BackgroundWorkerHandle *handles[REPLAY_LAUNCH_MAX];
+    int nhandles       = 0;   /* 存活 worker 数（句柄数） */
+    int next_worker_id = 0;   /* 只增，仅用于 bgw_name，便于区分世代 */
 
     pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
     pqsignal(SIGHUP,  SignalHandlerForConfigReload);
@@ -570,8 +604,24 @@ ReplayLauncherMain(Datum arg)
         }
         LWLockRelease(ReplayCtl->lock);
 
+        /* 回收已退出 worker 的句柄；回收完 nhandles 就是当前存活数 */
+        {
+            int   k = 0;
+            pid_t wpid;
+
+            for (i = 0; i < nhandles; i++)
+            {
+                if (GetBackgroundWorkerPid(handles[i], &wpid) == BGWH_STOPPED)
+                    pfree(handles[i]);
+                else
+                    handles[k++] = handles[i];
+            }
+            nhandles = k;
+        }
+
         /* 有工作且池未满 → 拉起 worker（worker 自行认领并常驻） */
-        while (have_enabled && nworkers_started < replay_workers)
+        while (have_enabled && nhandles < replay_workers &&
+               nhandles < REPLAY_LAUNCH_MAX)
         {
             BackgroundWorker        w;
             BackgroundWorkerHandle *h;
@@ -591,39 +641,38 @@ ReplayLauncherMain(Datum arg)
             snprintf(w.bgw_library_name, BGW_MAXLEN, "pg_partdist");
             snprintf(w.bgw_function_name, BGW_MAXLEN, "ReplayWorkerMain");
             snprintf(w.bgw_name, BGW_MAXLEN,
-                     "pg_partdist replay worker %d", nworkers_started);
+                     "pg_partdist replay worker %d", next_worker_id);
             snprintf(w.bgw_type, BGW_MAXLEN, "pg_partdist replay worker");
             w.bgw_notify_pid = MyProcPid;
 
-            if (!RegisterDynamicBackgroundWorker(&w, &h))
             {
-                ereport(WARNING,
-                        (errmsg("pg_partdist replay: 无法拉起 worker"
-                                "（max_worker_processes 不足？）")));
-                break;
+                MemoryContext oldcxt;
+                bool          ok;
+
+                /* 句柄要跨轮存活，必须分配在长生命周期的上下文里 */
+                oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+                ok = RegisterDynamicBackgroundWorker(&w, &h);
+                MemoryContextSwitchTo(oldcxt);
+
+                if (!ok)
+                {
+                    ereport(WARNING,
+                            (errmsg("pg_partdist replay: 无法拉起 worker"
+                                    "（max_worker_processes 不足？）")));
+                    break;
+                }
             }
-            nworkers_started++;
+            handles[nhandles++] = h;
+            next_worker_id++;
         }
 
         /*
-         * 粗粒度存活检查：认领全空但曾拉起过 worker → 可能全部退出，
-         * 允许重拉（nworkers_started 归零的条件放宽到"无任何认领"）。
+         * 这里原本还有一段"认领全空就把池计数归零"的放宽。它是上面那个泄漏的
+         * 另一半：worker 常驻不退出，而 disable 会释放认领，于是"认领全空"根本
+         * 不等于"worker 都退出了"。改成按句柄数真实统计存活后，这段放宽既无必要
+         * 也有害，删掉。worker 死掉的情形由上面的句柄回收（BGWH_STOPPED）覆盖，
+         * 槽位上的陈旧认领仍由本循环开头那段 kill(pid,0) 检查回收。
          */
-        if (nworkers_started > 0)
-        {
-            bool any_claim = false;
-
-            LWLockAcquire(ReplayCtl->lock, LW_SHARED);
-            for (i = 0; i < REPLAY_MAX_SHARDS; i++)
-                if (ReplayCtl->slots[i].claimed_by != 0)
-                {
-                    any_claim = true;
-                    break;
-                }
-            LWLockRelease(ReplayCtl->lock);
-            if (!any_claim)
-                nworkers_started = 0;
-        }
 
         (void) WaitLatch(MyLatch,
                          WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -963,6 +1012,140 @@ PG_FUNCTION_INFO_V1(pg_partdist_replay_locmap);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_enable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_disable);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_status);
+
+/* ================================================================== */
+/* 陈旧槽位与目录的回收                                                 */
+/* ================================================================== */
+
+/*
+ * ReplayReclaimStale — 回收"关系已经不存在了"的回放槽位与 pg_parwal 目录。
+ *
+ * **要解决的问题**：槽位与目录都只增不减。壳表 DROP 之后槽位不释放、
+ * pg_parwal/<oid>/ 也不删，launcher 重启还会从这些目录把槽位重建出来。
+ * REPLAY_MAX_SHARDS 是 64，占满之后 replay_set_locmap() 直接报"回放槽位已满"，
+ * 新副本一个都建不了；目录则会攒到几百个（实测一天密集测试后每节点 143–148 个）。
+ *
+ * **判据只有一条：该 OID 在 pg_class 里已经不存在。**
+ * 目录名就是本地 shard（或副本壳表）的 OID，关系还在就说明这份流仍有主；
+ * 关系没了，流就是垃圾 —— 无论本节点对该分片是 primary 还是 secondary，
+ * 判据都一样。
+ *
+ * 三条安全约束：
+ *   a) **必须跑在有目录访问的 backend 里**（launcher 只有 SHMEM_ACCESS，
+ *      查不了 pg_class，所以这件事做不进 launcher）；
+ *   b) **被认领的槽位一律不动** —— worker 可能正在其上回放；
+ *   c) **宽限期**：只删 mtime 早于 grace_secs 的目录。目录是在第一条记录落盘时
+ *      创建的、彼时关系必然存在，所以窗口很窄；宽限期是廉价保险，
+ *      免得撞上"关系刚建、尚未对本会话可见"这类边角。
+ *
+ * 返回释放的槽位数与删除的目录数。
+ */
+void
+ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
+{
+    char           dirpath[MAXPGPATH];
+    DIR           *dir;
+    struct dirent *de;
+    time_t         now = time(NULL);
+    int            nslots = 0;
+    int            ndirs = 0;
+    int            i;
+
+    if (ReplayCtl == NULL)
+        ereport(ERROR, (errmsg("replay_reclaim_stale: 回放共享内存未初始化")));
+
+    /* ---- 1) 释放槽位：关系已不存在、且无人认领 ---- */
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+        if (s->shard_oid == InvalidOid)
+            continue;
+        if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
+            continue;                   /* 有活着的 worker 认领着，不动 */
+        if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(s->shard_oid)))
+            continue;                   /* 关系还在 */
+
+        ereport(LOG,
+                (errmsg("pg_partdist replay: 回收陈旧槽位 shard %u（关系已不存在）",
+                        s->shard_oid)));
+        memset(s, 0, sizeof(ReplayShardSlot));
+        nslots++;
+    }
+    LWLockRelease(ReplayCtl->lock);
+
+    /* ---- 2) 删目录：关系已不存在、且过了宽限期 ---- */
+    snprintf(dirpath, MAXPGPATH, "%s/%s", DataDir, PARTITION_WAL_DIR);
+    dir = AllocateDir(dirpath);
+    if (dir != NULL)
+    {
+        while ((de = ReadDir(dir, dirpath)) != NULL)
+        {
+            char        sub[MAXPGPATH];
+            char       *endptr;
+            Oid         oid;
+            struct stat st;
+
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+
+            oid = (Oid) strtoul(de->d_name, &endptr, 10);
+            if (*endptr != '\0' || oid == InvalidOid)
+                continue;               /* 不是 OID 命名的目录，不碰 */
+
+            if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(oid)))
+                continue;               /* ★ 关系还在 —— 这份流仍有主，绝不能删 */
+
+            snprintf(sub, MAXPGPATH, "%s/%s", dirpath, de->d_name);
+            if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode))
+                continue;
+            if (grace_secs > 0 && (now - st.st_mtime) < grace_secs)
+                continue;               /* 还在宽限期内 */
+
+            if (!rmtree(sub, true))
+            {
+                ereport(WARNING,
+                        (errmsg("pg_partdist replay: 删除陈旧目录 %s 失败", sub)));
+                continue;
+            }
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: 回收陈旧目录 pg_parwal/%s"
+                            "（关系已不存在）", de->d_name)));
+            ndirs++;
+        }
+        FreeDir(dir);
+    }
+
+    if (slots_freed != NULL)
+        *slots_freed = nslots;
+    if (dirs_removed != NULL)
+        *dirs_removed = ndirs;
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_replay_reclaim_stale);
+
+Datum
+pg_partdist_replay_reclaim_stale(PG_FUNCTION_ARGS)
+{
+    int         grace = PG_GETARG_INT32(0);
+    int         nslots = 0;
+    int         ndirs = 0;
+    TupleDesc   tupdesc;
+    Datum       values[2];
+    bool        nulls[2] = {false, false};
+
+    ReplayReclaimStale(grace, &nslots, &ndirs);
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "replay_reclaim_stale: 返回类型不是复合类型");
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    values[0] = Int32GetDatum(nslots);
+    values[1] = Int32GetDatum(ndirs);
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
 PG_FUNCTION_INFO_V1(pg_partdist_replay_catchup);
 PG_FUNCTION_INFO_V1(pg_partdist_gclog_status);
 
@@ -1233,6 +1416,27 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
      * 重新打开。彻底的办法是让副本文件永不被本地 WAL 触碰（见 FRD §13 约束 12）。
      */
     RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+
+    /*
+     * 建槽之前先回收一次陈旧槽位与目录。
+     *
+     * 槽位上限是 REPLAY_MAX_SHARDS(64)，而壳表 DROP 之后槽位不会自动释放 ——
+     * 反复建/删副本的环境（尤其测试）会把槽位占满，此后
+     * "回放槽位已满" 让新副本一个都建不了。这里是**唯一**会新建槽位的入口，
+     * 也就是回收的最佳时机：先扫一遍把关系已不存在的槽位与目录清掉，
+     * 再去找空位。判据是"OID 在 pg_class 里已不存在"，关系还在的一律不碰。
+     *
+     * 必须在取锁**之前**做 —— ReplayReclaimStale 自己要取同一把锁。
+     */
+    {
+        int freed = 0, removed = 0;
+
+        ReplayReclaimStale(replay_reclaim_grace_secs, &freed, &removed);
+        if (freed > 0 || removed > 0)
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: 建槽前回收了 %d 个陈旧槽位、"
+                            "%d 个陈旧目录", freed, removed)));
+    }
 
     /* 槽位登记（豁免钩子即刻生效；enabled 仍需 replay_enable） */
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);

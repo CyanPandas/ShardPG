@@ -1584,6 +1584,49 @@ worker 抱着旧表还是撞同一道栅栏。
     回滚。这条路现在**可见了但没修**;修法方向是让数据组的 propose 在多数派
     不足时重试而不是丢弃,或把"已 durable 但未复制"的记录钉住不许截断。
 
+14. **★ worker 池的上限必须按"当前存活数"统计,不能按"启动过几个"** (已修)
+
+    `ReplayLauncherMain` 原先用一个只增的 `nworkers_started` 限池,又补了一段
+    "任何槽位都没被认领就把它归零"的放宽。两者合起来是泄漏:worker 是**常驻**的
+    (主循环只在节点关机时退出),而 `replay_disable` 会让它释放认领——于是
+    "认领全空"根本不等于"worker 都退出了"。每经历一次 arm → disable → arm,
+    launcher 就以为池空了,再拉一个**永久** worker。每个用例收尾都 disable,
+    所以是**每轮每节点漏一个**。
+
+    实测证据:`replay_workers=1` 的节点上同时活着 4 个 worker,且 `bgw_name`
+    全是 `replay worker 0`(计数器被反复清零留下的直接痕迹);本环境 08-08 的
+    节点日志里已刷出过 `max_worker_processes 不足`。撞上限之后
+    `RegisterDynamicBackgroundWorker` 会一直失败,该节点**再也拉不起任何回放
+    worker**,follower 从此静默停止追平,并连带饿死 Citus 维护进程等其他动态
+    bgworker。
+
+    **为什么它躲过了全部验收:**这个泄漏不让任何功能断言变红,只让环境越来越脆。
+    症状是"每轮失败的用例都不一样"——和约束 12/13 的表现撞在一起,极易被归因成
+    偶发的回放缺陷。现改为持有 `BackgroundWorkerHandle` 数组、每轮用
+    `GetBackgroundWorkerPid() == BGWH_STOPPED` 回收句柄后按存活数限池,并删掉
+    那段放宽。顺带一提,`GetBackgroundWorkerPid()` 问的是 postmaster,不受
+    §13 那条"容器里 PID 1 不回收僵尸、`kill(pid,0)` 探活失真"的影响。
+
+    验收侧加了 `health_check_worker_pool`(每节点存活 worker 数 ≤
+    `replay_workers`),否则同类泄漏还是只能靠肉眼看进程表。
+
+15. **★ 槽位与 `pg_parwal/<oid>` 目录必须可回收** (已修)
+
+    回放槽位是定长共享内存数组(`REPLAY_MAX_SHARDS`),`pg_parwal/<oid>` 是每
+    分区一个目录。二者原先**只增不删**:表被 `DROP` 之后,槽位仍占着、目录仍留在
+    盘上。跑得久了槽位耗尽,新分区在 `replay_set_locmap` 阶段直接报"回放槽位已满",
+    而磁盘上堆着一堆再也不会被读的段文件。
+
+    实现:`ReplayReclaimStale(grace_secs, &slots_freed, &dirs_removed)`——
+    释放判据是 `!SearchSysCacheExists1(RELOID, ...)` 且**没有活着的 PID 认领**;
+    删目录判据是 OID 不在 `pg_class` 且 mtime 早于 grace(默认 300s,GUC
+    `pg_partdist.replay_reclaim_grace_secs`)。挂在 `replay_set_locmap` 建槽**之前**
+    自动跑一次,也可手工调 `partdist.replay_reclaim_stale(p_grace_seconds)`。
+
+    grace 的作用是给"刚建好还没进 catalog 可见性"的目录留窗口;双向都实测过:
+    3 个人造陈旧目录被清掉(8→4),而**活着的关系配 grace=0 不动它**(流仍完整 12 条),
+    `DROP TABLE` 之后立刻可回收。
+
 ---
 
 ## 14. 代码落点与分阶段计划

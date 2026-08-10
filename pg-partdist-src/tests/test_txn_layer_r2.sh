@@ -320,6 +320,16 @@ if [[ -n "$wpid" ]]; then
       WHERE r.flags = 2 AND r.info = 0) m,
       LATERAL partdist.gclog_status(${citus_gid}, m.lx) s
     WHERE s.status <> 'committed'")
+  # ★ 计数守卫：这是"没有 X 不满足条件"型的否定式判据，扫到零条标记时
+  # count(*) 恒为 0 而报通过。而它前一步刚做完 kill -9 + 整节点重置，
+  # 正是段流状态最容易异常的时刻（本地流被重建/截断、f1oid 换号都会让内层
+  # 子查询返回空集）。必须先证明确实扫到了标记，这条断言才有意义。
+  nmark=$(PSQL $f1 -Atc "
+    SELECT count(*) FROM generate_series(1, ${lead_now}) g,
+         LATERAL partdist.partwal_read_record(${f1oid}::oid, g) r
+     WHERE r.flags = 2 AND r.info = 0")
+  check "崩溃恢复后段流里仍能扫到 COMMIT 标记（${nmark} 条 >= 1）" \
+        "$([[ -n "$nmark" && "$nmark" -ge 1 ]] && echo ok)" "ok"
   check "段流里每条 COMMIT 标记在 gclog 里都是 committed（掉队 ${nrun} 个）" "$nrun" "0"
 else
   check "找到 f1 的 replay worker（崩溃用例前置）" "" "ok"
@@ -384,7 +394,7 @@ done
 echo ""
 health_check_no_crash
 health_check_no_drops
-
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "R2 事务层验收：全部通过"; else echo "R2 事务层验收：存在 FAIL"; fi
 

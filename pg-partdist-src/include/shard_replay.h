@@ -321,12 +321,21 @@ extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
  */
 extern void ReplaySlotRefreshLocs(Oid shard_oid);
 
+/*
+ * 回收"关系已不存在"的回放槽位与 pg_parwal 目录（槽位上限 REPLAY_MAX_SHARDS）。
+ * **必须在有数据库连接的 backend 里调用** —— 判据要查 pg_class，而 launcher
+ * 只有 SHMEM_ACCESS。被活着的 worker 认领的槽位一律不动。
+ */
+extern void ReplayReclaimStale(int grace_secs, int *slots_freed,
+                               int *dirs_removed);
+
 /* launcher 注册 + GUC 定义（_PG_init 调用） */
 extern void RegisterReplayLauncher(void);
 extern void DefineReplayGUCs(void);
 
 /* GUC 值 */
 extern int  replay_workers;
+extern int  replay_reclaim_grace_secs;
 extern int  replay_naptime_ms;
 extern int  replay_checkpoint_interval_ms;
 extern int  replay_checkpoint_records;

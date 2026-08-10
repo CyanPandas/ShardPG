@@ -280,6 +280,7 @@ def main():
 
     outside_total = 0
     masked_total = 0
+    pdlsn_total = 0
 
     for p in range(len(a) // BLCKSZ):
         pa = a[p * BLCKSZ:(p + 1) * BLCKSZ]
@@ -322,8 +323,18 @@ def main():
                    if pa[i] != pb[i] and i not in masked]
         viol = [] if kind == 'btree' else infomask_violations(pa, pb, lower_a)
 
+        # pd_lsn（偏移 0..7）单独归类。
+        # 回放**写过**的页，pd_lsn 直接取 leader 的 orig_lsn（FRD §8.2），必须相同；
+        # 但回放从未碰过的页（典型：没存过超长值时 TOAST 索引那张空元页）两侧各自
+        # 由本地 WAL 建成 —— `_bt_initmetapage` 是确定性的所以内容全同，只有 LSN
+        # 带着各自的本地值。根因是夹具用 `CREATE TABLE (LIKE ...)` 建壳表，而
+        # FRD §13 约束 2 要求副本由 leader 分片**物理拷贝**初始化。
+        # 单独成一类，好让调用方按 role 决定收不收，而不是笼统算"一致"。
+        pdlsn = [i for i in outside if i < 8]
+        rest  = [i for i in outside if i >= 8]
         nmask = sum(1 for i in range(BLCKSZ) if pa[i] != pb[i] and i in masked)
-        outside_total += len(outside) + len(viol)
+        outside_total += len(rest) + len(viol)
+        pdlsn_total += len(pdlsn)
         masked_total += nmask
 
         print("  page%d hole=[%d,%d) 掩码内差异=%d 掩码外差异=%d infomask 违例=%d"
@@ -336,6 +347,14 @@ def main():
         for (n, lp_off, ma, mb, why) in viol:
             print("    lp[%d] off=%d t_infomask leader=0x%04X follower=0x%04X —— %s"
                   % (n, lp_off, ma, mb, why), file=sys.stderr)
+
+    if outside_total == 0 and pdlsn_total > 0:
+        print("IDENTICAL_EXCEPT_PDLSN")
+        print("内容逐字节一致，仅 pd_lsn 不同（%d 字节）。这只可能出现在**回放从未"
+              "写过**的页上：两侧各自由本地 WAL 建成，内容确定所以全同，LSN 各是各的。"
+              "调用方须按 role 决定收不收 —— 主堆出现这个就是缺陷。" % pdlsn_total,
+              file=sys.stderr)
+        return 0
 
     if outside_total == 0:
         print("IDENTICAL_OUTSIDE_HOLE")

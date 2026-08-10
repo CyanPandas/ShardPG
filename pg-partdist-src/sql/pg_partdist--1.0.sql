@@ -956,3 +956,29 @@ $$;
 
 COMMENT ON FUNCTION replay_freeze_status() IS
     '副本壳表的冻结账目暴露面（FRD §13 约束 5）：pct_to_force 达到 100% 时内核会忽略 autovacuum_enabled=off 强制回卷 vacuum，而副本元组带的是外来 xid，本地无法解释。';
+
+-- ------------------------------------------------------------------
+-- 陈旧回放槽位与 pg_parwal 目录的回收
+-- ------------------------------------------------------------------
+--
+-- 槽位上限 REPLAY_MAX_SHARDS(64)，而壳表 DROP 之后槽位不会自动释放、
+-- pg_parwal/<oid>/ 也不会删 —— launcher 重启还会从这些目录把槽位重建出来。
+-- 反复建/删副本的环境会先攒满目录（实测一天密集测试后每节点 143–148 个），
+-- 再撞上"回放槽位已满"，此后新副本一个都建不了。
+--
+-- 判据只有一条：**目录名那个 OID 在 pg_class 里已经不存在**。目录名就是本地
+-- shard（或副本壳表）的 OID，关系还在就说明这份流仍有主，一律不碰；关系没了，
+-- 流就是垃圾 —— 无论本节点对该分片是 primary 还是 secondary，判据都一样。
+--
+-- 被活着的 worker 认领的槽位一律不动（它可能正在其上回放）。
+-- replay_set_locmap() 会在建槽之前自动调一次，所以正常路径无需手工执行；
+-- 本函数供运维在"目录攒太多但暂时不建新副本"时主动清理。
+CREATE OR REPLACE FUNCTION replay_reclaim_stale(
+    p_grace_seconds INTEGER DEFAULT 300,
+    OUT slots_freed INTEGER,
+    OUT dirs_removed INTEGER)
+    RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_reclaim_stale';
+
+COMMENT ON FUNCTION replay_reclaim_stale(INTEGER) IS
+    '回收关系已不存在的回放槽位与 pg_parwal 目录。判据=OID 不在 pg_class；被活着的 worker 认领的槽位不动。replay_set_locmap 建槽前会自动调用。';

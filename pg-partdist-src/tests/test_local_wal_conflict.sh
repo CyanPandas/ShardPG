@@ -28,6 +28,14 @@ PASS=0; FAIL=0
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 check() {
+  # ★ 空值守卫：两个命令替换都失败时 "" == "" 会静默判通过。
+  # 典型漏网：D1 用 leader_relnum / locmap_leader_relnum 互比文件号，
+  # 若 shard_fileset() 因登记被丢弃而返回 0 行，两边都是空串 ⇒
+  # "文件号确实换了"与"locmap 已换到新文件号"**双双恒真**。
+  # 期望值本身就是空串的场景本项目里不存在，所以一律要求非空。
+  if [[ -z "$2" ]]; then
+    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return
+  fi
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
   else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
 }
@@ -127,12 +135,36 @@ check "崩溃前 follower 元页 btm_root=1（回放生效）" "$before" "1"
 
 echo "========== [4] immediate 崩溃 + 重启 =========="
 fdir="worker$((f1 - 5432))"
+# ★ 必须证明崩溃**真的发生了**，不能只看 SELECT 1 能连上。
+#
+# 本脚本存在的唯一理由是"那个修复还在不在"（本地 pg_wal 崩溃恢复会不会覆盖
+# 回放结果）。而 stop 与 start 的退出码此前全被丢弃：stop 因任何原因失败
+# （节点仍在跑）⇒ start 报 "already running" 也被吞掉 ⇒ **一次 redo 都没发生**
+# ⇒ 下面 btm_root 那条断言平凡通过。整个金丝雀对"根本没崩过"是瞎的。
+# 判据取重启前后的 pg_postmaster_start_time() 必须不同 —— 那是"进程换了一条命"
+# 的直接证据，比退出码更难糊弄。
+start_before=$(PSQL $f1 -Atc "SELECT pg_postmaster_start_time()" 2>/dev/null)
+# ★ 必须重启回**约定的**日志路径（/work/pg-cluster-data/<节点>.log）。
+# 早先这里写的是 <datadir>/lwc_restart.log，只为让下面那条 grep 好写，代价是
+# 本用例跑完后 worker1/worker2 的日志**永久改道**：约定路径上的文件从此冻结，
+# 而 lib_node_health 的两个 glob 谁也匹配不到新目标 —— 此后所有套件在这两个
+# 节点上的 health_check_no_crash 都是空检查（实测：节点确实重置了，日志一行没多）。
+# 自己的取证改用行号基线，同样精确，且不留污染。
+logmark=$(DEX bash -c "wc -l < /work/pg-cluster-data/${fdir}.log 2>/dev/null || echo 0" | tr -d '[:space:]')
 DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/${fdir}" -m immediate stop >/dev/null 2>&1
 DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/${fdir}" -w -t 60 \
-    -l "/work/pg-cluster-data/${fdir}/lwc_restart.log" start >/dev/null 2>&1
+    -l "/work/pg-cluster-data/${fdir}.log" start >/dev/null 2>&1
 up=no
 for t in $(seq 1 90); do [[ "$(PSQL $f1 -Atc 'SELECT 1' 2>/dev/null)" == "1" ]] && { up=yes; break; }; sleep 1; done
 check "follower 节点从崩溃中恢复" "$up" "yes"
+start_after=$(PSQL $f1 -Atc "SELECT pg_postmaster_start_time()" 2>/dev/null)
+check "崩溃确实发生过（postmaster 启动时刻已改变）" \
+      "$([[ -n "$start_before" && -n "$start_after" && "$start_before" != "$start_after" ]] && echo ok)" "ok"
+# 再取一条内核自己的证词：崩溃恢复必然打这行日志。只看重启之后新增的部分，
+# 免得被日志里**上一轮**留下的同一行蒙混过关（append 模式下这行会越积越多）。
+crashlines=$(DEX bash -c "tail -n +$((logmark + 1)) /work/pg-cluster-data/${fdir}.log 2>/dev/null | grep -c 'database system was not properly shut down'" | tr -d '[:space:]')
+check "重启日志里有崩溃恢复的证据（新增 ${crashlines} 条）" \
+      "$([[ "$crashlines" =~ ^[0-9]+$ && "$crashlines" -ge 1 ]] && echo ok || echo "no(${crashlines})")" "ok"
 
 after=$(btm_root $f1)
 check "崩溃恢复**没有**覆盖回放结果（btm_root 仍为 1）" "$after" "1"

@@ -57,8 +57,16 @@ for p in 5433 5434 5435 5436 5437 5438 5439 5440; do
 done
 echo "  shard=${GID} leader=:${PA} followers=:${f1} :${f2}"
 
+# 期望值从 catalog 推导（理由同 TX1/TX2：`-ge 1` 漏登记 TOAST/索引也照样通过，
+# 而漏登记正是 follower 侧"未知 relfilelocator"PANIC 的来源，FRD §13 约束 1）。
+want_rels=$(PSQL $PA -Atc "SET citus.override_table_visibility=false;
+    SELECT 1 + (SELECT count(*) FROM pg_index WHERE indrelid = c.oid)
+           + CASE WHEN c.reltoastrelid <> 0
+                  THEN 1 + (SELECT count(*) FROM pg_index WHERE indrelid = c.reltoastrelid)
+                  ELSE 0 END
+    FROM pg_class c WHERE c.oid = '${TBL}'::regclass" | tail -1)
 nrels=$(PSQL $PA -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('${TBL}')" | tail -1)
-check "leader fileset 注册" "$([[ -n "$nrels" && "$nrels" -ge 1 ]] && echo ok)" "ok"
+check "leader fileset 注册成员数（catalog 推导应为 ${want_rels}）" "$nrels" "$want_rels"
 fsrows=$(PSQL $PA -Atc "SET citus.override_table_visibility=false; SELECT role||','||ord||','||spc||','||db||','||relnum FROM partdist.shard_fileset('${TBL}') ORDER BY role, ord" | grep ',')
 roles=$(echo "$fsrows" | cut -d, -f1 | paste -sd,); ords=$(echo "$fsrows" | cut -d, -f2 | paste -sd,)
 spcs=$(echo "$fsrows" | cut -d, -f3 | paste -sd,);  dbs=$(echo "$fsrows" | cut -d, -f4 | paste -sd,)
@@ -172,7 +180,10 @@ check "原 leader 已恢复" "$(PSQL $PA -Atc 'SELECT 1' 2>/dev/null)" "1"
 
 echo ""
 health_check_no_crash
-
+# 丢提案时的表现正是"全 PASS + 有丢弃 = 运气"（见 lib_node_health.sh 头注释）——
+# 本用例全靠 Raft 把记录/标记送到 follower，必须一并核查。
+health_check_no_drops
+health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "TX3 升主合流：全部通过"; else echo "TX3 升主合流：存在 FAIL"; fi
 
