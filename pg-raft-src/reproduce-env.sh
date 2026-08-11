@@ -15,9 +15,17 @@
 #
 # 用法:
 #   ./reproduce-env.sh up        # 克隆 + 起容器 + 编扩展 + initdb + 接线 + 等收敛
-#   ./reproduce-env.sh verify    # 六项一致性/功能校验（V1..V6）
+#   ./reproduce-env.sh verify    # 六项一致性/功能校验（V1..V6，冒烟）
+#   ./reproduce-env.sh test      # 全量验收十套件，对齐分支记录的回归数字
 #   ./reproduce-env.sh destroy   # 删容器 + 删克隆目录
 #   ./reproduce-env.sh all       # up + verify
+#   ./reproduce-env.sh full      # up + verify + test（要几小时，但这才是"复现到已验证状态"）
+#
+# ⚠ 宿主机同时只放得下**一套** 9 节点环境。默认 ENV_NAME=pg-citus-tx 与现有开发
+#   环境同名，[0/6] 会因容器/目录已存在而直接 die（不覆盖）。要在旁边另起一套做
+#   对照，必须同时换名并把现有那套停掉：
+#       docker stop pg-citus-tx-container
+#       ENV_NAME=pg-citus-tx2 ./reproduce-env.sh full
 #
 # 可覆盖的环境变量:
 #   ENV_NAME=pg-citus-tx              环境名（容器名/目录名前缀）
@@ -327,6 +335,59 @@ do_verify() {
 }
 
 # =========================== destroy ============================
+# 跑全量验收套件。
+#
+# ★ 为什么 verify 之外还要这个：V1..V6 只证明"环境起得来、拓扑对、单分片组能复制"，
+# 不证明复现出来的环境与被验证过的那个**行为一致**。分支上每个提交都附了全量回归
+# 数字（当前 438/0），只有把这十个套件跑一遍才对得上。
+#
+# 脚本跑在**宿主机**，靠 CONTAINER 环境变量指到容器，所以直接复用克隆里的那份，
+# 不需要往容器里拷。
+do_test() {
+  local t rc o line total_p=0 total_f=0 bad=0
+  local suites
+  # SUITES 可覆盖，用于只跑某几个（空格分隔的套件名，不带 .sh）
+  read -r -a suites <<< "${SUITES:-test_local_wal_conflict test_txn_layer_r2 \
+test_lazy_replay_l1 test_ddl_fileset_d1 test_freeze_sync_d2 test_follower_replay_r1 \
+test_dtx_replay_tx1 test_dtx_commit_marker_tx2 test_promote_catchup_tx3 \
+test_fastpath_divergence_tx4}"
+  docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" \
+    || die "容器 $CONTAINER 没在跑，先 $0 up"
+  [[ -d "$CLONE_DIR/pg-partdist-src/tests" ]] \
+    || die "找不到 $CLONE_DIR/pg-partdist-src/tests，先 $0 up"
+
+  echo "========== 全量验收（${#suites[@]} 个套件，容器 ${CONTAINER}）=========="
+  for t in "${suites[@]}"; do
+    printf '  %-34s ' "$t"
+    # ★ 必须写成 `... || rc=$?`：脚本顶部是 set -e，而验收套件的退出码就是 FAIL 数，
+    # 写成 `o=$(...); rc=$?` 的话第一个失败的套件会**直接终止整个 test**，
+    # 后面的套件根本不跑，还会漏掉下面那条"无结果行"的守卫。
+    rc=0
+    o=$(CONTAINER="$CONTAINER" bash "$CLONE_DIR/pg-partdist-src/tests/${t}.sh" 2>&1) || rc=$?
+    # `|| true` 不能省：顶部是 set -o pipefail，grep 没匹配到就返回 1，
+    # 整条管道失败 ⇒ 赋值触发 errexit ⇒ 整个 test 在这里断掉，
+    # 下面那条"无结果行 = 异常退出"的守卫永远等不到执行。
+    line=$(grep -oE '结果：PASS=[0-9]+ FAIL=[0-9]+' <<< "$o" | tail -1 || true)
+    if [[ -z "$line" ]]; then
+      # 没打出结果行 = 脚本中途挂了，绝不能当成通过
+      echo "异常退出(rc=$rc，无结果行)"; bad=$((bad+1))
+      tail -15 <<< "$o" | sed 's/^/        /'
+      continue
+    fi
+    echo "$line"
+    total_p=$((total_p + $(sed -E 's/.*PASS=([0-9]+).*/\1/' <<< "$line")))
+    total_f=$((total_f + $(sed -E 's/.*FAIL=([0-9]+).*/\1/' <<< "$line")))
+    if [[ "$rc" -ne 0 ]]; then
+      bad=$((bad+1))
+      grep -E '^  FAIL' <<< "$o" | sed 's/^/        /' || true
+    fi
+  done
+  echo "========== 合计 PASS=${total_p} FAIL=${total_f}（异常套件 ${bad} 个）=========="
+  [[ "$total_f" -eq 0 && "$bad" -eq 0 ]] \
+    && echo "复现环境与分支记录的验收状态一致。" \
+    || { echo "与分支记录不一致，别把它当作可用环境。"; return 1; }
+}
+
 do_destroy() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 && echo "容器 ${CONTAINER} 已删" || echo "容器 ${CONTAINER} 不存在"
   rm -rf "$CLONE_ROOT" && echo "目录 ${CLONE_ROOT} 已删"
@@ -335,7 +396,9 @@ do_destroy() {
 case "${1:-all}" in
   up)      do_up ;;
   verify)  do_verify ;;
+  test)    do_test ;;
   destroy) do_destroy ;;
   all)     do_up; do_verify ;;
-  *)       die "用法: $0 {up|verify|destroy|all}" ;;
+  full)    do_up; do_verify; do_test ;;
+  *)       die "用法: $0 {up|verify|test|destroy|all|full}" ;;
 esac

@@ -6935,8 +6935,27 @@ dtx_master_try_write_abort(int64 coord_gsid, int64 dtxid,
         int   n;
         StringInfoData s;
 
+        /*
+         * ★ 本块内的提前退出一律 goto done，**不能 return**。
+         *
+         * 从 PG_TRY() 块里 return 会跳过 PG_END_TRY()，而恢复
+         * PG_exception_stack 的正是 PG_END_TRY()。于是该指针继续指向本函数
+         * 这个**已经退栈**的帧里的 _local_sigjmp_buf，之后同一 backend 里任何
+         * 一次 ereport(ERROR) 都会 siglongjmp 进死帧 —— glibc 的
+         * _FORTIFY_SOURCE 检查到栈指针方向不对就 abort()：
+         *     *** longjmp causes uninitialized stack frame ***: terminated
+         *     server process was terminated by signal 6: Aborted
+         *     DETAIL: Failed process was running: COMMIT;
+         * 2026-08-10 在全新复现环境 pg-citus-tx2 上实测到（coordinator 崩、
+         * TX1 的跨分区事务提交失败）。偶发：要先走到这几个提前退出之一，
+         * 之后同一 backend 再发生一次 ERROR 才触发，所以暖环境连跑四轮全量
+         * 都没碰上。
+         *
+         * 三个退出点都没有待清理的资源（raft_persist_spi_end 在下面已调过），
+         * 所以 goto 与原来的 return 语义等价，只是让 PG_END_TRY() 必定执行。
+         */
         if (!raft_persist_spi_begin(&spi_owned))
-            return;
+            goto done;
         initStringInfo(&s);
         appendStringInfo(&s,
                          "SELECT primary_node FROM partdist.partition_map "
@@ -6955,7 +6974,7 @@ dtx_master_try_write_abort(int64 coord_gsid, int64 dtxid,
         raft_persist_spi_end(spi_owned);
 
         if (coord_node <= 0)
-            return;
+            goto done;
 
         parse_peers();
         for (i = 0; i < n_peers; i++)
@@ -6965,7 +6984,7 @@ dtx_master_try_write_abort(int64 coord_gsid, int64 dtxid,
                 break;
             }
         if (slot < 0)
-            return;
+            goto done;
 
         n = snprintf(qry, sizeof(qry),
                      "SELECT partdist.dtx_decide(%lld, %lld, 2, ARRAY[",
@@ -6982,6 +7001,8 @@ dtx_master_try_write_abort(int64 coord_gsid, int64 dtxid,
                  (long long) dtxid, (long long) coord_gsid, r);
             pfree(r);
         }
+done:
+        ;   /* 统一出口：落到这里就走 PG_END_TRY()，不绕过它 */
     }
     PG_CATCH();
     {

@@ -1550,3 +1550,43 @@ TX1 把索引/TOAST 纳入逐字节比对之后，四组 leader/follower 全部�
 `lsn <= PageGetLSN(page)` 判断会**跳过**该更新，形成真分歧。生产路径按约束 2
 走物理拷贝就不存在这个窗口；但只要还允许 `CREATE TABLE (LIKE ...)` 这条捷径
 初始化副本，这个窗口就在。
+
+### 13.5 显式 ABORT 决议里的 `PG_TRY` 提前 return（signal 6 崩溃，已修）
+
+2026-08-10 在**全新复现环境** pg-citus-tx2（`reproduce-env.sh full`，克隆
+commit `e1cbbad`）上跑全量，TX1 报两条失败：
+
+```
+FAIL  跨分区事务提交成功、两行可读（实际='' 期望='2'）
+FAIL  本轮无节点崩溃（signal 11/6 或 PANIC）（实际='1' 期望='0'）
+```
+
+coordinator 日志：
+
+```
+*** longjmp causes uninitialized stack frame ***: terminated
+LOG:  server process (PID 15302) was terminated by signal 6: Aborted
+DETAIL:  Failed process was running: COMMIT;
+```
+
+**根因**：§12.3 落地的 `dtx_master_try_write_abort()`（`raft_consensus.c:6924`）
+在 `PG_TRY()` 块内有三处 `return;`。从 `PG_TRY` 块里 return 会跳过
+`PG_END_TRY()`，而恢复 `PG_exception_stack` 的正是它 —— 该指针于是继续指向
+本函数**已经退栈**的帧里的 `_local_sigjmp_buf`，之后同一 backend 里任何一次
+`ereport(ERROR)` 都会 `siglongjmp` 进死帧，glibc `_FORTIFY_SOURCE` 检查到栈指针
+方向不对即 `abort()`。
+
+**为什么偶发**：要先走到那三个提前退出之一（协调组主节点查不到、不在 peers 里、
+或 SPI 起不来），之后同一 backend 再发生一次 ERROR 才触发。崩溃前 14 秒日志里
+有一次分区主切换（`apply partition primary partition=102023 old_primary=0
+new_primary=2`），正是让 `coord_node <= 0` / `slot < 0` 成真的那类窗口。
+
+**修法**：三处 `return;` 改 `goto done;`，`done:` 标签置于 TRY 块末尾，
+`PG_END_TRY()` 必定执行。三个退出点都没有待清理资源（`raft_persist_spi_end`
+在其前已调过），语义等价。全树扫过一遍，只此一个函数有这个写法。
+
+**方法论结论（比这个 bug 本身更值得记）**：同一份代码，暖环境 pg-citus-tx 上
+连跑四轮全量（438/0）一次都没崩；换到全新克隆的环境，第一次跑就崩了。
+**"在长期使用的环境上全绿"不能代替"从零复现一次"** —— 时序相关的缺陷会被
+暖环境的既有状态（已收敛的路由、已存在的 partition_map 行、稳定的 leader）
+系统性地掩盖。`reproduce-env.sh full` 应当作为发版前的固定动作。
