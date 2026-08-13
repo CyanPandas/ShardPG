@@ -460,9 +460,10 @@ shard_xid_for_current_xact(Oid shard)
 	sxid = shard_xid_allocate(shard);
 
 	/*
-	 * T1.6/T1.7：登记 RUNNING + 持有者原生 xid（此刻原生 xid 必已分配 ——
-	 * 0005 让 heap_* 顶部先 GetCurrentTransactionId 再换号）。登记失败
-	 * （表满）则本次领号作废（跳号无害），映射未推进。
+	 * T2.3：先落 clog RUNNING 账再进活跃表（都在 RegisterRunning 里，含
+	 * 持有者原生 xid——此刻原生 xid 必已分配，0005 让 heap_* 顶部先
+	 * GetCurrentTransactionId 再换号）。任一步失败则本次领号作废（跳号
+	 * 无害），映射未推进。
 	 */
 	ShardCommitRegisterRunning(shard, sxid, GetCurrentTransactionId());
 

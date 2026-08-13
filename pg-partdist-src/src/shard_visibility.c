@@ -1,22 +1,28 @@
 /*
- * shard_visibility.c — TX-TSO-MVCC P1：T1.6 可见性临时桩 + T1.7 行锁反查 +
- *                      T1.8 安全网骨架，实现内核补丁 0006 的
- *                      shard_visibility_hooks（access/shard_stamp.h）。
+ * shard_visibility.c — TX-TSO-MVCC 可见性裁决（内核补丁 0006 的
+ *                      shard_visibility_hooks 实现，access/shard_stamp.h）。
  *
- * 设计出处：TX_TSO_MVCC_DESING.md §4、TX_TSO_MVCC_DEV_PLAN.md T1.6–T1.8。
- * 语义速查（P1 桩）：
- *   - xid 状态四值：我自己的（后端映射命中）/ RUNNING / ABORTED / 已提交
- *     （共享表缺席即提交 —— COMMIT 时删除条目，见 shard_visibility.h）。
- *   - 已提交即全局可见：P1 没有 commit_ts/start_ts，可见性没有时间点语义
- *     （近似 read-committed）；P2 在同一分叉里原位换成
+ * 设计出处：TX_TSO_MVCC_DESING.md §4/§5.3、TX_TSO_MVCC_DEV_PLAN.md T1.6–T1.8
+ * （分叉结构）+ T2.3（真相源换持久分片 clog）。
+ *
+ * 语义速查（T2.3 起）：
+ *   - xid 状态四值：我自己的（后端映射命中）/ RUNNING / ABORTED / COMMITTED。
+ *   - 裁决顺序：后端映射 → 共享内存**活跃表**（本次启动内 RUNNING 的事务，
+ *     兼行锁反查）→ 后端**终局缓存** → **分片 clog**（真相源，pg_shard_clog）。
+ *   - clog 全零/空洞 = RUNNING = 不可见 —— 崩溃后未决事务天然不可见（T2.4
+ *     认领改判 ABORTED），P1 桩"缺席=已提交"的崩溃漏判在此消失。
+ *   - COMMITTED/ABORTED 是终局态，后端缓存永不失效（DROP+OID 复用的极端
+ *     场景由注册前清目录 + 实践上的后端换代覆盖，P2 已知边界）。
+ *   - 仍无 ts：已提交即可见（近似 read-committed）；P3 原位换成
  *     "status=COMMITTED 且 commit_ts < start_ts"。
  *   - 自见性按元组原始 cid 近似：同事务内"插入后又更新/删除同一行"会把
  *     cmin 覆盖成 cmax（内核 AdjustCmax 对分片 xid 不生成 combo cid），
- *     该场景 P1 记录为已知限制，验收用例避开。
+ *     记录为已知限制，验收用例避开。
  *   - 一律不读不写 hint 位（§4.5）。
  */
 #include "pg_partdist.h"
 #include "shard_xid.h"
+#include "shard_clog.h"
 #include "shard_visibility.h"
 
 #include "access/htup_details.h"
@@ -29,6 +35,7 @@
 #include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/snapshot.h"
 
 /* ---- T1.8 GUC ---- */
@@ -41,10 +48,7 @@ static const struct config_enum_entry shard_safety_mode_options[] = {
 	{NULL, 0, false}
 };
 
-/* ---- 临时提交表（T1.6 桩 + T1.7 反查合一） ---- */
-
-#define SHARD_ENTRY_RUNNING		1
-#define SHARD_ENTRY_ABORTED		2
+/* ---- 活跃表（本次启动内 RUNNING 的分片事务；兼 T1.7 行锁反查） ---- */
 
 typedef struct ShardCommitKey
 {
@@ -55,12 +59,40 @@ typedef struct ShardCommitKey
 typedef struct ShardCommitEntry
 {
 	ShardCommitKey key;
-	uint8		status;			/* RUNNING / ABORTED */
-	TransactionId native_xid;	/* RUNNING 持有者的原生 top xid（反查表） */
+	TransactionId native_xid;	/* 持有者的原生 top xid（反查表） */
 } ShardCommitEntry;
 
 static HTAB *ShardCommitHash = NULL;
 static LWLock *ShardCommitLock = NULL;
+
+/* ---- 后端终局缓存（COMMITTED/ABORTED 不可变，读一次 clog 记住） ---- */
+
+typedef struct ShardVerdictCacheEntry
+{
+	ShardCommitKey key;
+	uint8		status;			/* TXN_COMMITTED / TXN_ABORTED */
+} ShardVerdictCacheEntry;
+
+static HTAB *verdict_cache = NULL;
+
+static ShardVerdictCacheEntry *
+verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
+{
+	if (verdict_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(ShardCommitKey);
+		ctl.entrysize = sizeof(ShardVerdictCacheEntry);
+		ctl.hcxt = TopMemoryContext;
+		verdict_cache = hash_create("pg_partdist shard verdict cache",
+									256, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return (ShardVerdictCacheEntry *) hash_search(verdict_cache, key,
+												  action, NULL);
+}
 
 /* ---- 内部：xid 状态判定 ---- */
 
@@ -77,31 +109,61 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid)
 {
 	ShardCommitKey key;
 	ShardCommitEntry *e;
-	SxidState	st;
+	ShardVerdictCacheEntry *ce;
+	TxnStatus	st;
 
 	if (native_xid)
 		*native_xid = InvalidTransactionId;
+
+	/* 0/1/2 保留号按原生语义恒可见（Frozen/Bootstrap）——防御，正常不出现 */
+	if (sxid < FirstNormalTransactionId)
+		return SXID_COMMITTED;
 
 	if (ShardXidMineForShard(shard) == sxid)
 		return SXID_MY_OWN;
 
 	key.shard = shard;
 	key.sxid = sxid;
+
+	/* 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O */
 	LWLockAcquire(ShardCommitLock, LW_SHARED);
 	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
 										 HASH_FIND, NULL);
-	if (e == NULL)
-		st = SXID_COMMITTED;	/* 缺席=已提交（P1 桩语义） */
-	else if (e->status == SHARD_ENTRY_ABORTED)
-		st = SXID_ABORTED;
-	else
+	if (e != NULL)
 	{
-		st = SXID_RUNNING;
 		if (native_xid)
 			*native_xid = e->native_xid;
+		LWLockRelease(ShardCommitLock);
+		return SXID_RUNNING;
 	}
 	LWLockRelease(ShardCommitLock);
-	return st;
+
+	/* 终局缓存 */
+	ce = verdict_cache_search(&key, HASH_FIND);
+	if (ce != NULL)
+		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+
+	/* 分片 clog（真相源）。全零/空洞 = RUNNING = 未决不可见（§5.3）。 */
+	st = ShardClogReadStatus(shard, sxid);
+	switch (st)
+	{
+		case TXN_COMMITTED:
+		case TXN_ABORTED:
+			ce = verdict_cache_search(&key, HASH_ENTER);
+			ce->status = (uint8) st;
+			return (st == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+
+		case TXN_PREPARED:
+			/* P4 之前不该出现；按 §4.2"未决=不可见、读者不阻塞"处理 */
+		case TXN_RUNNING:
+		default:
+			/*
+			 * clog RUNNING 且不在活跃表：要么是崩溃遗留的无主事务（T2.4
+			 * 认领改判 ABORTED），要么理论上的落账竞态窗——两者按未决处理
+			 * 都正确（不可见）。native_xid 无从给出，等待路径自行处置。
+			 */
+			return SXID_RUNNING;
+	}
 }
 
 /* ---- T1.8 守卫点 ---- */
@@ -350,8 +412,9 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 
 /*
  * T1.7：heap_delete/heap_update 冲突路径的等待翻译。返回后内核 goto l1/l2
- * 重评（判定收敛在 sv_satisfies_update 里）。孤儿 RUNNING（持有者不在了条目
- * 还挂着）直接 ERROR —— P1 不做认领（§6 推 P2），报错好过忙等自旋。
+ * 重评（判定收敛在 sv_satisfies_update 里）。孤儿 RUNNING（clog 未决但活跃
+ * 表无持有者）直接 ERROR —— 静默返回会让调用方 BeingModified→等待→重评
+ * 无限自旋；T2.4 认领落地后此路径改为触发认领。
  */
 static void
 sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
@@ -366,8 +429,15 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (shard_xid_state(shard, sxid, &native) != SXID_RUNNING)
 		return;					/* 已结束，重评即可 */
 
-	if (!TransactionIdIsValid(native) ||
-		TransactionIdIsCurrentTransactionId(native))
+	if (!TransactionIdIsValid(native))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("分片 %u 的 xid %u 是无主 RUNNING（clog 未决且活跃表无持有者）",
+						shard, sxid),
+				 errdetail("崩溃遗留的未决事务待认领改判 ABORTED（T2.4）；"
+						   "报错好过忙等自旋。")));
+
+	if (TransactionIdIsCurrentTransactionId(native))
 		return;					/* 防御：自己等自己必死锁 */
 
 	if (TransactionIdIsInProgress(native))
@@ -379,7 +449,7 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("分片 %u 的 xid %u 是无主 RUNNING 条目（持有者原生 xid %u 已不在）",
 						shard, sxid, native),
-				 errdetail("P1 不支持无主条目认领（设计 §6.5 推 P2）。")));
+				 errdetail("持有者后端异常消亡；等 T2.4 认领或重启集群。")));
 }
 
 static const ShardVisibilityHooks sv_hooks = {
@@ -403,7 +473,14 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	if (ShardCommitHash == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("pg_partdist 临时提交表未初始化")));
+				 errmsg("pg_partdist 分片活跃表未初始化")));
+
+	/*
+	 * T2.3：先落 clog RUNNING 账（§5.3"首写落账"），再进活跃表。落账失败则
+	 * 领号作废（跳号无害），fail-closed。此刻 sxid 尚未写进任何元组，读者
+	 * 不可能查到它 —— 两步之间无竞态窗。
+	 */
+	ShardClogSetRunning(shard, sxid);
 
 	key.shard = shard;
 	key.sxid = sxid;
@@ -415,46 +492,52 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 		LWLockRelease(ShardCommitLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("P1 临时提交表已满（上限 %d 条）",
+				 errmsg("分片活跃表已满（上限 %d 条）",
 						SHARD_COMMIT_MAX_ENTRIES),
-				 errhint("重启集群清空；P2 分片 clog 落地后本表移除。")));
+				 errhint("活跃分片事务数不该有这个量级；查泄漏。")));
 	}
-	e->status = SHARD_ENTRY_RUNNING;
 	e->native_xid = native_xid;
 	LWLockRelease(ShardCommitLock);
 }
 
+/*
+ * 事务结束：先写 clog 终局判决（真相源，判决写自带 fsync），再摘活跃表条目。
+ * 顺序不能反 —— 反过来会出现"两处都查不到"的窗口，读者会把已提交事务当
+ * RUNNING 处理还好，把已中止的当 RUNNING 也还好（都不可见），但等待路径会
+ * 撞无主 ERROR；正序只有"活跃表仍命中"的瞬时窗，语义无害。
+ *
+ * 在 COMMIT/ABORT 回调上下文执行：此刻事务结局已成事实，判决写失败没有
+ * 可用的 ERROR 语义（提交后 ERROR 会引发对已提交事务的递归中止）——升
+ * PANIC 借崩溃恢复走 0007 redo 重做落账，失败方式正确。
+ */
 void
 ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 {
 	ShardCommitKey key;
-	ShardCommitEntry *e;
 
 	if (ShardCommitHash == NULL)
 		return;
 
+	PG_TRY();
+	{
+		ShardClogSetVerdict(shard, sxid, committed);
+	}
+	PG_CATCH();
+	{
+		ereport(PANIC,
+				(errmsg("pg_partdist: 分片 clog 判决写入失败（分片 %u，xid %u，%s），"
+						"崩溃恢复将由补丁 0007 redo 补齐",
+						shard, sxid, committed ? "COMMITTED" : "ABORTED")));
+	}
+	PG_END_TRY();
+
 	key.shard = shard;
 	key.sxid = sxid;
 	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	if (committed)
-	{
-		/* 删除即提交点（缺席=已提交，P1 桩） */
-		if (hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL) == NULL)
-			elog(WARNING,
-				 "pg_partdist: 提交时临时提交表缺 RUNNING 条目（分片 %u，xid %u）",
-				 shard, sxid);
-	}
-	else
-	{
-		e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
-											 HASH_FIND, NULL);
-		if (e != NULL)
-			e->status = SHARD_ENTRY_ABORTED;
-		else
-			elog(WARNING,
-				 "pg_partdist: 中止时临时提交表缺 RUNNING 条目（分片 %u，xid %u）",
-				 shard, sxid);
-	}
+	if (hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL) == NULL)
+		elog(WARNING,
+			 "pg_partdist: 事务结束时活跃表缺条目（分片 %u，xid %u）",
+			 shard, sxid);
 	LWLockRelease(ShardCommitLock);
 }
 

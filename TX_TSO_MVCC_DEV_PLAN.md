@@ -441,7 +441,7 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   "编辑脚本替换表反向重建基线再 diff"法（正/反 dry-run 自检过）；pg-install
   同步 bin/postgres + xact.h + shard_stamp.h，README 七行 nm 自检过。
 
-#### T2.3 可见性桩原位替换（`src/shard_visibility.c`）
+#### T2.3 可见性桩原位替换（`src/shard_visibility.c`）——✅ 已完成（2026-08-13）
 
 - **改**：临时提交表退役，判定改查分片 clog：RUNNING（含全零）= 不可见（非本
   事务）、COMMITTED = 可见、ABORTED = 不可见；自见性仍走后端映射（不变）；
@@ -452,6 +452,22 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   RUNNING → 不可见 → T2.4 判 ABORTED。
 - **验收**：P1 两套件全绿（45/45 + 49/49，判据不变）；新增崩溃点用例：RUNNING
   落账后崩 → 数据不可见；提交记录落盘后、clog 标记前崩 → 恢复后数据可见。
+- **实施记要（2026-08-13）**：改动收敛在 `shard_xid_state()` 一个函数——裁决
+  顺序改为 后端映射(自见) → 共享内存活跃表(RUNNING+持有者原生xid，兼行锁
+  反查) → 后端终局缓存(COMMITTED/ABORTED 不可变，TopMemoryContext 本地
+  hash，免每元组文件 I/O) → 分片 clog 真相源(全零/空洞=RUNNING=不可见)。
+  保留号 0/1/2 防御性恒可见（原生 Frozen/Bootstrap 语义）。活跃表条目瘦身
+  （去 status 列，表内即 RUNNING）；RegisterRunning 先落 clog RUNNING 账再进
+  表（此刻 sxid 未进任何元组，无竞态窗）；MarkEnded 先写判决后摘条目——
+  **判决写失败在 COMMIT/ABORT 回调里没有可用的 ERROR 语义（提交后 ERROR 会
+  递归中止已提交事务），升 PANIC 借崩溃恢复走 0007 redo 补齐**；无主 RUNNING
+  在等待路径立即 ERROR（静默返回会 BeingModified→等待→重评无限自旋），T2.4
+  改为触发认领。验收 15/15 绿：未提交崩→count=0 且 clog 挂 RUNNING 待认领；
+  提交+回滚后崩→**count=3（桩时代 4，T2.2 复现的漏判在此收口）**；崩前正常
+  路径回调即时判决可查（COMMITTED/ABORTED）；活体跨会话 RUNNING 不可见/提交
+  后可见。P1 两套件回归 **45/45 + 49/49 全绿**（判据不变，三方 pagecmp 含
+  follower 追平不受扰）。测试说明（规则③）：白名单空时新增路径不可达，
+  未跑其余基线套件；438 全量留 P2 出口。
 
 #### T2.4 无主 RUNNING 认领（恢复期，普通事务分支）
 
