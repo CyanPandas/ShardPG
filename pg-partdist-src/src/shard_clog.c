@@ -215,6 +215,22 @@ ShardClogReadStatus(Oid shard, TransactionId sxid)
 	return (TxnStatus) slot.status;
 }
 
+/*
+ * 0007 redo 钩子：崩溃恢复重放 commit/abort 记录时重做判决。
+ * 幂等（重复 redo 写同样字节）；ShardClogSetVerdict 自带 fsync，ERROR 会
+ * 中止恢复——与原生 clog 写盘失败同级别，正确的失败方式。
+ */
+void
+ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed)
+{
+	int			i;
+
+	for (i = 0; i < nxids; i++)
+		ShardClogSetVerdict((Oid) pairs[2 * i],
+							(TransactionId) pairs[2 * i + 1],
+							committed);
+}
+
 /* ================= DROP TABLE 提交时点 GC ================= */
 
 #define SHARD_CLOG_PENDING_DROPS_MAX 16

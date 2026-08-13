@@ -593,10 +593,32 @@ ShardXidShmemInit(void)
 	LWLockRelease(AddinShmemInitLock);
 }
 
+/*
+ * 0007：把本事务的 (shard, sxid) 对交给 XactLogCommitRecord/AbortRecord
+ * 写进记录体。**在临界区内被调**——只拷静态缓冲，不 palloc 不 ereport。
+ */
+static uint32 wal_pair_buf[2 * SHARD_XID_MAX_PER_XACT];
+
+static int
+shard_xact_wal_list_impl(uint32 **pairs)
+{
+	int			i;
+
+	for (i = 0; i < xact_map_n; i++)
+	{
+		wal_pair_buf[2 * i] = (uint32) xact_map[i].shard;
+		wal_pair_buf[2 * i + 1] = (uint32) xact_map[i].sxid;
+	}
+	*pairs = wal_pair_buf;
+	return xact_map_n;
+}
+
 void
 ShardXidInstallHook(void)
 {
 	shard_relation_xid_hook = shard_relation_xid_impl;
+	shard_xact_wal_list_hook = shard_xact_wal_list_impl;
+	shard_xact_redo_hook = ShardClogXactRedo;
 	RegisterXactCallback(shard_xid_xact_callback, NULL);
 }
 

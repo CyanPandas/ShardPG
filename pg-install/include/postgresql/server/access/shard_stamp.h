@@ -73,4 +73,22 @@ typedef struct ShardVisibilityHooks
 
 extern PGDLLIMPORT const ShardVisibilityHooks *shard_visibility_hooks;
 
+/* ---- 0007：commit/abort 记录体分片 xid 列表 ---- */
+
+/*
+ * 收集本事务的分片 xid 对写进 commit/abort 记录体。返回对数，*pairs 指向
+ * 2n 个 uint32（shard,sxid 交错）的静态缓冲。**在临界区内被调**：实现
+ * 不得 palloc / ereport(ERROR)。
+ */
+typedef int (*shard_xact_wal_list_hook_type) (uint32 **pairs);
+extern PGDLLIMPORT shard_xact_wal_list_hook_type shard_xact_wal_list_hook;
+
+/*
+ * 崩溃恢复：把 commit/abort 记录体里的对列表交扩展重做分片 clog 落账
+ * （幂等；在 startup 进程里执行）。
+ */
+typedef void (*shard_xact_redo_hook_type) (int nxids, const uint32 *pairs,
+										   bool committed);
+extern PGDLLIMPORT shard_xact_redo_hook_type shard_xact_redo_hook;
+
 #endif							/* SHARD_STAMP_H */

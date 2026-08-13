@@ -76,6 +76,13 @@ extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed);
 /* 读状态。空洞/段不存在 = TXN_RUNNING。 */
 extern TxnStatus ShardClogReadStatus(Oid shard, TransactionId sxid);
 
+/*
+ * 补丁 0007 的 redo 钩子实现：把 commit/abort 记录体里的 (shard,sxid) 对
+ * 列表重做成判决（幂等）。在 startup 进程里跑，签名与
+ * shard_xact_redo_hook_type 一致。
+ */
+extern void ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed);
+
 /* ---- DROP TABLE 生命周期（提交时点 GC）---- */
 extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);

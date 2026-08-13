@@ -412,7 +412,7 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   根本不执行**——验收断言全体改"多语句 + tail -1"，已入坑清单）。其余套件
   按规则③不跑（分叉路径未动，白名单空=零开销谓词一次比较）。
 
-#### T2.2 内核补丁 0007（commit/abort 记录体扩展 + redo 落账）
+#### T2.2 内核补丁 0007（commit/abort 记录体扩展 + redo 落账）——✅ 已完成（2026-08-13，`patches/0007-shard-xact-record-xids.patch` 269 行）
 
 - **改**：`xl_xact_commit/abort` 增可选块携带本事务 (分片oid, 分片xid) 列表
   （新 xinfo 位，无分片写时记录体零变化）；填充与提交后标记由扩展侧钩子完成
@@ -423,6 +423,23 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   兜底。
 - **验收**：补丁可独立反打；无分片写事务记录体零变化（普通表零扰动）；带分片写
   的 commit/abort 记录 pg_waldump 可辨；崩溃点注入后 redo 补齐 clog 状态。
+- **实施记要（2026-08-13）**：按 P2_PRECHECK 结论三落地——xinfo bit 9 +
+  `xl_xact_shard_xids`（紧凑 uint32 交错对，无补齐），块插在 DROPPED_STATS 之后
+  两侧一致（origin 之后不保证对齐，避开）；改 4 文件：xact.h（位/结构/parsed 两
+  结构扩列）、shard_stamp.h（两钩子声明）、xact.c（钩子变量 + 两构造函数决策/
+  注册 + 两 redo 尾）、rmgrdesc/xactdesc.c（两解析 + desc 打印）。**收集钩子在
+  临界区内被调**（XactLogCommitRecord 有 Assert(CritSectionCount>0)），契约
+  写死：不得 palloc/ereport，扩展侧返回静态缓冲。扩展接线：shard_xid.c 收集
+  impl + ShardXidInstallHook 装两钩子；shard_clog.c `ShardClogXactRedo`（startup
+  进程跑，SetVerdict 自带 fsync，失败即中止恢复=正确失败方式）。
+  验收 17/17 绿：nm 双符号、COMMIT/ABORT 记录 pg_waldump 均见 `shard xids:
+  oid/xid`、原生事务零块、崩溃 redo 后 COMMITTED/ABORTED 双向补齐、二次重启
+  判决持久、DROP GC 回归。**桩缺陷实景复现**：崩后临时提交表清零致回滚行漏判
+  可见（count 4≠3）而 clog 已有正解 ABORTED——T2.3 切可见性到 clog 即收口，
+  该期望移入 T2.3 验收。金丝雀 4 套全绿（local_wal_conflict 9/0、r2 50/0、
+  P1 两套件 45/45+49/49——三方 pagecmp 带 0007 依然成立）。补丁导出用
+  "编辑脚本替换表反向重建基线再 diff"法（正/反 dry-run 自检过）；pg-install
+  同步 bin/postgres + xact.h + shard_stamp.h，README 七行 nm 自检过。
 
 #### T2.3 可见性桩原位替换（`src/shard_visibility.c`）
 
