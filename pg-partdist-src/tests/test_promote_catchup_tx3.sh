@@ -143,7 +143,18 @@ if [[ -n "$newp" && "$newp" != "$pnode" && "$newp" != "0" ]]; then
   check "新主 applied=${napp} 已达切主前位点 ${tip}（修复前恒为 0）" \
         "$([[ -n "$napp" && "$napp" -ge "$tip" ]] && echo ok)" "ok"
 
-  nrows=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM ${TBL}" | tail -1)
+  # applied 位点达标 ≠ 行可见性同刻就绪：判决应用（marker→gclog→读路径）
+  # 有异步尾巴，重载下会拉宽（P3 出口全量跑实测 0 行、单跑即绿，TX1 夹具
+  # 竞态同族）。有界等待收敛断言 + 打印滞后量保留可观测性；15s 仍不收敛
+  # 才是真回归（届时深查 R3 读路径的 xid_map/gclog 快照依赖）。
+  nrows=""
+  vt=0
+  for vt in $(seq 0 15); do
+    nrows=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM ${TBL}" | tail -1)
+    [[ "$nrows" == "$NROWS" ]] && break
+    sleep 1
+  done
+  [[ "$vt" -gt 0 ]] && echo "  （行可见性在 applied 达标后又滞后了 ${vt}s）"
   check "新主壳表读到切主前写入的全部 ${NROWS} 行" "$nrows" "$NROWS"
 
   nmax=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off; SELECT coalesce(max(id),0) FROM ${TBL}" | tail -1)
