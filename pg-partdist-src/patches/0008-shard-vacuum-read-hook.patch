@@ -1,7 +1,7 @@
 --- a/src/include/access/shard_stamp.h
 +++ b/src/include/access/shard_stamp.h
-@@ -91,4 +91,18 @@
- 										   bool committed);
+@@ -93,4 +93,18 @@
+ 										   uint64 commit_ts, bool committed);
  extern PGDLLIMPORT shard_xact_redo_hook_type shard_xact_redo_hook;
  
 +/* ---- 0008：vacuum 类读判定（T2.6，ANALYZE 读侧） ---- */

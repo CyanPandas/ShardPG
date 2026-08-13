@@ -104,6 +104,12 @@ tso_configured(void)
 	return tso_conninfo != NULL && tso_conninfo[0] != '\0';
 }
 
+bool
+TsoConfigured(void)
+{
+	return tso_configured();
+}
+
 /* ---- 活跃集合维护 ---- */
 
 static int64

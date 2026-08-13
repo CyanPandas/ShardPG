@@ -67,14 +67,21 @@ typedef struct ShardClogSlot
 
 #define SHARD_CLOG_DIR				"pg_shard_clog"
 
-/* 首写本分片时落 RUNNING 账（写全零槽，只扩文件不 fsync） */
-extern void ShardClogSetRunning(Oid shard, TransactionId sxid);
+/* 首写本分片时落 RUNNING 账（T3.3 起携带事务 start_ts；遗留模式 0）。
+ * 只扩文件不 fsync。 */
+extern void ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts);
 
-/* 写终局判决（COMMITTED / ABORTED），立即 fsync。幂等。 */
-extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed);
+/* 写终局判决（COMMITTED / ABORTED），立即 fsync。幂等。
+ * T3.3：COMMITTED 携带 TSO commit_ts（遗留模式 0——对一切快照可见，恰是
+ * P2 语义）；ABORTED 恒 0。读改写保留既有 start_ts 列（§5.3 行五列）。 */
+extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
+								int64 commit_ts);
 
 /* 读状态。空洞/段不存在 = TXN_RUNNING。 */
 extern TxnStatus ShardClogReadStatus(Oid shard, TransactionId sxid);
+
+/* 读整槽（T3.3 可见性要 commit_ts）。空洞/不存在返回 false（=RUNNING 全 0）。 */
+extern bool ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out);
 
 /*
  * T2.4 认领原语：把 [from, to) 里所有 RUNNING（含全零洞）改判 ABORTED，
@@ -88,7 +95,8 @@ extern int ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to);
  * 列表重做成判决（幂等）。在 startup 进程里跑，签名与
  * shard_xact_redo_hook_type 一致。
  */
-extern void ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed);
+extern void ShardClogXactRedo(int nxids, const uint32 *pairs,
+							  uint64 commit_ts, bool committed);
 
 /* ---- DROP TABLE 生命周期（提交时点 GC）---- */
 extern void ShardClogRememberDrop(Oid shard);

@@ -919,7 +919,7 @@ ShardMvccEnsureWatermarkFile(Oid relid)
 static uint32 wal_pair_buf[2 * SHARD_XID_MAX_PER_XACT];
 
 static int
-shard_xact_wal_list_impl(uint32 **pairs)
+shard_xact_wal_list_impl(uint32 **pairs, uint64 *commit_ts)
 {
 	int			i;
 
@@ -929,6 +929,14 @@ shard_xact_wal_list_impl(uint32 **pairs)
 		wal_pair_buf[2 * i + 1] = (uint32) xact_map[i].sxid;
 	}
 	*pairs = wal_pair_buf;
+
+	/*
+	 * commit_ts = PRE_COMMIT 暂存值（R-P3-1：暂存失败在 PRE_COMMIT 即 ERROR，
+	 * 提交路径必经 CallXactCallbacks(PRE_COMMIT) ⇒ 到达这里暂存必已就绪或
+	 * 本就是遗留模式 0）。abort 记录构造也走本钩子：abort 路径无 PRE_COMMIT、
+	 * 暂存自然为 0，redo 侧按 committed 标志区分，0 属正常。
+	 */
+	*commit_ts = (uint64) TsoStashedCommitTs();
 	return xact_map_n;
 }
 

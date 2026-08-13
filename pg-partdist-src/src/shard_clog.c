@@ -18,6 +18,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "utils/builtins.h"
 #include "common/relpath.h"
 
 StaticAssertDecl(sizeof(ShardClogSlot) == 32,
@@ -159,48 +160,54 @@ ShardClogWriteSlot(Oid shard, TransactionId sxid,
 }
 
 void
-ShardClogSetRunning(Oid shard, TransactionId sxid)
+ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts)
 {
 	ShardClogSlot slot;
 
-	memset(&slot, 0, sizeof(slot));	/* 全零 = RUNNING，字面即语义 */
+	memset(&slot, 0, sizeof(slot));	/* 全零 = RUNNING；start_ts 是附注列 */
+	slot.start_ts = (uint64) start_ts;
 	ShardClogWriteSlot(shard, sxid, &slot, false);
 }
 
 void
-ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed)
+ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
+					int64 commit_ts)
 {
 	ShardClogSlot slot;
 
-	memset(&slot, 0, sizeof(slot));
+	/* 读改写：保留 RUNNING 落账时写下的 start_ts（§5.3 行五列） */
+	if (!ShardClogReadSlot(shard, sxid, &slot))
+		memset(&slot, 0, sizeof(slot));
 	slot.status = (uint32) (committed ? TXN_COMMITTED : TXN_ABORTED);
+	slot.commit_ts = committed ? (uint64) commit_ts : 0;
 	ShardClogWriteSlot(shard, sxid, &slot, true);
 }
 
-TxnStatus
-ShardClogReadStatus(Oid shard, TransactionId sxid)
+bool
+ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 {
 	uint32		segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
 	off_t		off = (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT)
 		* SHARD_CLOG_SLOT_SIZE;
-	ShardClogSlot slot;
 	int			fd;
 	ssize_t		nb;
 
+	memset(out, 0, sizeof(*out));	/* 缺席 = 全零 = RUNNING */
+
 	/* 0/1/2 保留号永不落账；防御性按未决处理 */
 	if (sxid < FirstNormalTransactionId)
-		return TXN_RUNNING;
+		return false;
 
 	fd = ShardClogOpenSegFile(shard, segno, false);
 	if (fd < 0)
-		return TXN_RUNNING;		/* 整段没建过 = 全洞 = 未决 */
+		return false;			/* 整段没建过 = 全洞 = 未决 */
 
 	do
 	{
-		nb = pg_pread(fd, &slot, sizeof(slot), off);
+		nb = pg_pread(fd, out, sizeof(*out), off);
 	} while (nb < 0 && errno == EINTR);
 
-	if (nb != (ssize_t) sizeof(slot) && nb != 0)
+	if (nb != (ssize_t) sizeof(*out) && nb != 0)
 	{
 		CloseTransientFile(fd);
 		ereport(ERROR,
@@ -211,8 +218,19 @@ ShardClogReadStatus(Oid shard, TransactionId sxid)
 	CloseTransientFile(fd);
 
 	if (nb == 0)
-		return TXN_RUNNING;		/* 文件尾之外 = 洞 */
+	{
+		memset(out, 0, sizeof(*out));	/* 文件尾之外 = 洞 */
+		return false;
+	}
+	return true;
+}
 
+TxnStatus
+ShardClogReadStatus(Oid shard, TransactionId sxid)
+{
+	ShardClogSlot slot;
+
+	(void) ShardClogReadSlot(shard, sxid, &slot);
 	return (TxnStatus) slot.status;
 }
 
@@ -302,7 +320,8 @@ ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to)
  * 中止恢复——与原生 clog 写盘失败同级别，正确的失败方式。
  */
 void
-ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed)
+ShardClogXactRedo(int nxids, const uint32 *pairs, uint64 commit_ts,
+				  bool committed)
 {
 	int			i;
 
@@ -310,7 +329,7 @@ ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed)
 	{
 		ShardClogSetVerdict((Oid) pairs[2 * i],
 							(TransactionId) pairs[2 * i + 1],
-							committed);
+							committed, (int64) commit_ts);
 		/* T2.5：顺手累计影子推进（水位文件缺失/落后时的发号起点兜底） */
 		ShardXidRedoAdvance((Oid) pairs[2 * i],
 							(TransactionId) pairs[2 * i + 1]);
@@ -391,6 +410,22 @@ ShardClogAtAbort(void)
  * 正式并入扩展 SQL 文件随 T2.4 的显式函数一批做。
  */
 
+PG_FUNCTION_INFO_V1(partdist_shard_clog_read_full);
+Datum
+partdist_shard_clog_read_full(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	ShardClogSlot slot;
+	char		buf[96];
+
+	(void) ShardClogReadSlot(shard, sxid, &slot);
+	snprintf(buf, sizeof(buf),
+			 "st=%u sts=" UINT64_FORMAT " cts=" UINT64_FORMAT,
+			 slot.status, slot.start_ts, slot.commit_ts);
+	PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
 PG_FUNCTION_INFO_V1(partdist_shard_claim);
 Datum
 partdist_shard_claim(PG_FUNCTION_ARGS)
@@ -421,13 +456,13 @@ partdist_shard_clog_write(PG_FUNCTION_ARGS)
 	switch ((TxnStatus) status)
 	{
 		case TXN_RUNNING:
-			ShardClogSetRunning(shard, sxid);
+			ShardClogSetRunning(shard, sxid, 0);
 			break;
 		case TXN_COMMITTED:
-			ShardClogSetVerdict(shard, sxid, true);
+			ShardClogSetVerdict(shard, sxid, true, 0);
 			break;
 		case TXN_ABORTED:
-			ShardClogSetVerdict(shard, sxid, false);
+			ShardClogSetVerdict(shard, sxid, false, 0);
 			break;
 		default:
 			ereport(ERROR,

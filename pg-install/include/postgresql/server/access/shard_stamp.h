@@ -77,18 +77,20 @@ extern PGDLLIMPORT const ShardVisibilityHooks *shard_visibility_hooks;
 
 /*
  * 收集本事务的分片 xid 对写进 commit/abort 记录体。返回对数，*pairs 指向
- * 2n 个 uint32（shard,sxid 交错）的静态缓冲。**在临界区内被调**：实现
- * 不得 palloc / ereport(ERROR)。
+ * 2n 个 uint32（shard,sxid 交错）的静态缓冲；*commit_ts 填 TSO 提交时间戳
+ * （PRE_COMMIT 已暂存的值——**本钩子在临界区内被调**：实现不得 palloc /
+ * ereport(ERROR) / 做任何 RPC，只拷内存；abort 路径暂存缺席自然为 0）。
  */
-typedef int (*shard_xact_wal_list_hook_type) (uint32 **pairs);
+typedef int (*shard_xact_wal_list_hook_type) (uint32 **pairs,
+											  uint64 *commit_ts);
 extern PGDLLIMPORT shard_xact_wal_list_hook_type shard_xact_wal_list_hook;
 
 /*
  * 崩溃恢复：把 commit/abort 记录体里的对列表交扩展重做分片 clog 落账
- * （幂等；在 startup 进程里执行）。
+ * （幂等；在 startup 进程里执行）。commit_ts 来自记录体（abort 为 0）。
  */
 typedef void (*shard_xact_redo_hook_type) (int nxids, const uint32 *pairs,
-										   bool committed);
+										   uint64 commit_ts, bool committed);
 extern PGDLLIMPORT shard_xact_redo_hook_type shard_xact_redo_hook;
 
 /* ---- 0008：vacuum 类读判定（T2.6，ANALYZE 读侧） ---- */

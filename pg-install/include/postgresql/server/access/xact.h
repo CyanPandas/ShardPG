@@ -386,10 +386,14 @@ typedef struct xl_xact_prepare
  * TX-TSO-MVCC（补丁 0007）：本事务写过的 (分片 Oid, 分片 xid) 对，随
  * commit/abort 记录体落盘，供崩溃恢复重做分片 clog 落账（设计 §8-②）。
  * 紧凑 uint32 交错排列 [shard0, sxid0, shard1, sxid1, ...]，无补齐。
+ * commit_ts（T3.3）拆 lo/hi 两个 uint32 —— 块起点仅保证 4 字节对齐，
+ * 解析是直接指针转型，uint64 字段会产生非对齐读；abort 记录恒 0。
  */
 typedef struct xl_xact_shard_xids
 {
 	int			nxids;
+	uint32		commit_ts_lo;
+	uint32		commit_ts_hi;
 	uint32		xids[FLEXIBLE_ARRAY_MEMBER];	/* 2*nxids 个 uint32 */
 } xl_xact_shard_xids;
 #define MinSizeOfXactShardXids offsetof(xl_xact_shard_xids, xids)
@@ -428,6 +432,7 @@ typedef struct xl_xact_parsed_commit
 
 	int			nshardxids;		/* 0007：分片 xid 对数 */
 	uint32	   *shardxids;		/* 2*nshardxids 个 uint32（shard,sxid 交错） */
+	uint64		shard_commit_ts;	/* 0007/T3.3：TSO commit_ts；abort=0 */
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
@@ -457,6 +462,7 @@ typedef struct xl_xact_parsed_abort
 
 	int			nshardxids;		/* 0007：分片 xid 对数 */
 	uint32	   *shardxids;		/* 2*nshardxids 个 uint32（shard,sxid 交错） */
+	uint64		shard_commit_ts;	/* 0007/T3.3：TSO commit_ts；abort=0 */
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;

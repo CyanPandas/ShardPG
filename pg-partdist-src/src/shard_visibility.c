@@ -13,8 +13,8 @@
  *     认领改判 ABORTED），P1 桩"缺席=已提交"的崩溃漏判在此消失。
  *   - COMMITTED/ABORTED 是终局态，后端缓存永不失效（DROP+OID 复用的极端
  *     场景由注册前清目录 + 实践上的后端换代覆盖，P2 已知边界）。
- *   - 仍无 ts：已提交即可见（近似 read-committed）；P3 原位换成
- *     "status=COMMITTED 且 commit_ts < start_ts"。
+ *   - T3.3 起真 SI（§4.1）：COMMITTED 且 commit_ts < start_ts 才可见，
+ *     xmax 对称；遗留模式（TSO 未配置，start_ts=0）退回 P2"已提交即可见"。
  *   - 自见性按元组原始 cid 近似：同事务内"插入后又更新/删除同一行"会把
  *     cmin 覆盖成 cmax（内核 AdjustCmax 对分片 xid 不生成 combo cid），
  *     记录为已知限制，验收用例避开。
@@ -23,6 +23,7 @@
 #include "pg_partdist.h"
 #include "shard_xid.h"
 #include "shard_clog.h"
+#include "tso.h"
 #include "shard_visibility.h"
 
 #include "access/heapam.h"
@@ -73,6 +74,7 @@ typedef struct ShardVerdictCacheEntry
 {
 	ShardCommitKey key;
 	uint8		status;			/* TXN_COMMITTED / TXN_ABORTED */
+	int64		commit_ts;		/* T3.3：COMMITTED 的 TSO commit_ts（0=遗留） */
 } ShardVerdictCacheEntry;
 
 static HTAB *verdict_cache = NULL;
@@ -107,15 +109,18 @@ typedef enum SxidState
 } SxidState;
 
 static SxidState
-shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid)
+shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
+				int64 *cts_out)
 {
 	ShardCommitKey key;
 	ShardCommitEntry *e;
 	ShardVerdictCacheEntry *ce;
-	TxnStatus	st;
+	ShardClogSlot slot;
 
 	if (native_xid)
 		*native_xid = InvalidTransactionId;
+	if (cts_out)
+		*cts_out = 0;
 
 	/* 0/1/2 保留号按原生语义恒可见（Frozen/Bootstrap）——防御，正常不出现 */
 	if (sxid < FirstNormalTransactionId)
@@ -143,7 +148,11 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid)
 	/* 终局缓存 */
 	ce = verdict_cache_search(&key, HASH_FIND);
 	if (ce != NULL)
+	{
+		if (cts_out)
+			*cts_out = ce->commit_ts;
 		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+	}
 
 	/*
 	 * T2.4：咨询 clog 前确保认领已跑（读路径入口；发号路径在分配时已触发）。
@@ -152,14 +161,18 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid)
 	(void) ShardXidEnsureClaimed(shard);
 
 	/* 分片 clog（真相源）。全零/空洞 = RUNNING = 未决不可见（§5.3）。 */
-	st = ShardClogReadStatus(shard, sxid);
-	switch (st)
+	(void) ShardClogReadSlot(shard, sxid, &slot);
+	switch ((TxnStatus) slot.status)
 	{
 		case TXN_COMMITTED:
 		case TXN_ABORTED:
 			ce = verdict_cache_search(&key, HASH_ENTER);
-			ce->status = (uint8) st;
-			return (st == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+			ce->status = (uint8) slot.status;
+			ce->commit_ts = (int64) slot.commit_ts;
+			if (cts_out)
+				*cts_out = (int64) slot.commit_ts;
+			return ((TxnStatus) slot.status == TXN_COMMITTED)
+				? SXID_COMMITTED : SXID_ABORTED;
 
 		case TXN_PREPARED:
 			/* P4 之前不该出现；按 §4.2"未决=不可见、读者不阻塞"处理 */
@@ -208,13 +221,23 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 {
 	HeapTupleHeader tuple = htup->t_data;
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
+	int64		my_ts;
+	int64		cts = 0;
 
 	if (!OidIsValid(shard))
 		return false;
 
 	ShardAccessGate(shard, "MVCC 读");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL))
+	/*
+	 * T3.3 真 SI：快照 = 本事务 start_ts（懒取，事务内恒定——PG 层隔离级别
+	 * 与此无关，分片表天然 REPEATABLE 语义）。遗留模式 my_ts=0 ⇒ 退回 P2
+	 * "已提交即可见"。首次调用可能经 libpq 取号（持有缓冲区共享锁时的一次
+	 * RPC——P3 接受，P3_PRECHECK 结论二成本段；后续全为缓存命中）。
+	 */
+	my_ts = TsoGetStartTs();
+
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
 	{
 		case SXID_MY_OWN:
 			/* 本命令开始之后才插入的行不可见（cid 近似，见文件头） */
@@ -229,7 +252,12 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			*visible = false;
 			return true;
 		case SXID_COMMITTED:
-			/* P1 无 ts：已提交即可见；P2 换 commit_ts < start_ts */
+			/* §4.1：commit_ts < start_ts 才可见（快照之后的提交不可见） */
+			if (my_ts > 0 && cts >= my_ts)
+			{
+				*visible = false;
+				return true;
+			}
 			break;
 	}
 
@@ -240,7 +268,7 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, &cts))
 	{
 		case SXID_MY_OWN:
 			/* 本命令开始之后才删除 ⇒ 本命令仍看得见 */
@@ -252,7 +280,8 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			*visible = true;
 			break;
 		case SXID_COMMITTED:
-			*visible = false;
+			/* xmax 对称：删除的 commit_ts ≥ 快照 ⇒ 删除不可见 ⇒ 行仍可见 */
+			*visible = (my_ts > 0 && cts >= my_ts);
 			break;
 	}
 	return true;
@@ -269,7 +298,7 @@ sv_satisfies_self(HeapTuple htup, Buffer buffer, bool *visible)
 
 	ShardAccessGate(shard, "Self 读");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 			break;				/* 自己的插入立即可见（不看 cid） */
@@ -288,7 +317,7 @@ sv_satisfies_self(HeapTuple htup, Buffer buffer, bool *visible)
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 			*visible = false;	/* 自己的删除立即生效 */
@@ -319,7 +348,7 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 
 	/* 调用方约定：入口已把 snapshot->xmin/xmax 置 Invalid（内核分叉点保证） */
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), &native))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), &native, NULL))
 	{
 		case SXID_MY_OWN:
 			break;
@@ -342,7 +371,7 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), &native))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), &native, NULL))
 	{
 		case SXID_MY_OWN:
 			*visible = false;
@@ -373,7 +402,7 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 
 	ShardAccessGate(shard, "更新判定");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 			if (HeapTupleHeaderGetRawCommandId(tuple) >= curcid)
@@ -397,7 +426,7 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 			/* 本命令删的 = SelfModified；更早命令删的 = 不可见 */
@@ -434,7 +463,7 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (!OidIsValid(shard))
 		return;
 
-	if (shard_xid_state(shard, sxid, &native) != SXID_RUNNING)
+	if (shard_xid_state(shard, sxid, &native, NULL) != SXID_RUNNING)
 		return;					/* 已结束，重评即可 */
 
 	if (!TransactionIdIsValid(native))
@@ -452,7 +481,7 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (TransactionIdIsInProgress(native))
 		XactLockTableWait(native, (Relation) relation, ctid, oper);
 
-	if (shard_xid_state(shard, sxid, NULL) == SXID_RUNNING &&
+	if (shard_xid_state(shard, sxid, NULL, NULL) == SXID_RUNNING &&
 		!TransactionIdIsInProgress(native))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -486,7 +515,7 @@ sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
 
 	ShardAccessGate(shard, "vacuum 类读判定");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 		case SXID_RUNNING:
@@ -506,7 +535,7 @@ sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 		case SXID_RUNNING:
@@ -550,7 +579,7 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	 * 领号作废（跳号无害），fail-closed。此刻 sxid 尚未写进任何元组，读者
 	 * 不可能查到它 —— 两步之间无竞态窗。
 	 */
-	ShardClogSetRunning(shard, sxid);
+	ShardClogSetRunning(shard, sxid, TsoGetStartTs());
 
 	key.shard = shard;
 	key.sxid = sxid;
@@ -590,7 +619,8 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 
 	PG_TRY();
 	{
-		ShardClogSetVerdict(shard, sxid, committed);
+		ShardClogSetVerdict(shard, sxid, committed,
+							committed ? TsoStashedCommitTs() : 0);
 	}
 	PG_CATCH();
 	{

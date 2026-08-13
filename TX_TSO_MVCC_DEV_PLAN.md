@@ -719,7 +719,7 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   防呆经 RPC 传导仍 fail-closed；重建后断连自愈；遗留模式双 0。金丝雀
   test_shard_xid_p1 45/45（遗留模式含新 PRE_COMMIT 臂）+ r2 50/0。
 
-#### T3.3 ts 落账与真 SI 可见性
+#### T3.3 ts 落账与真 SI 可见性——✅ 已完成（2026-08-13，0007 原位改造 v2 296 行）
 
 - **改**：commit 记录体携带 commit_ts（方案按 T3.0 ③）；RUNNING 落账填
   start_ts、判决落账填 commit_ts（正常路径回调 + 0007 redo 双路一致）；
@@ -728,6 +728,24 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
 - **验收**：**不可重复读消失**（A 开始后 B 提交，A 反复读同快照不变——
   P2 近似 RC 时代读得到，P3 读不到）；跨事务序一致；崩溃后 redo 重建的
   ts 与崩前一致（值级断言）。
+- **实施记要（2026-08-13）**：内核 = 0007 原位改造重生成（反打 0008→反打
+  0007→v2 替换表→重打 0008，两补丁均正/反 dry-run 自检）：块头
+  {nxids, commit_ts_lo, commit_ts_hi}；收集钩子签名扩 `uint64 *commit_ts`
+  （临界区内只拷 PRE_COMMIT 暂存，abort 路径暂存缺席=0 属正常，由 redo 的
+  committed 标志区分——**原拟的钩子内 PANIC 第二防线撤销**：钩子分不清
+  commit/abort 构造路径，而 PRE_COMMIT 回调在一切提交路径必先行，第一道
+  防线已完备）；redo 钩子扩 `uint64 commit_ts`；desc 打印
+  `shard commit_ts:`。扩展 = SetRunning 带 start_ts、SetVerdict 带
+  commit_ts 且**读改写保留 start_ts 列**（§5.3 五列）、新增 ReadSlot 整槽
+  读 + `partdist_shard_clog_read_full` 观测函数；`shard_xid_state` 扩
+  cts 出参、终局缓存带 ts；SI 判定：my_ts=TsoGetStartTs() 懒取（首触可能
+  在持缓冲区锁下一次 RPC——P3 接受，已注释），COMMITTED 且 cts≥my_ts ⇒
+  不可见，xmax 对称（删除在快照后 ⇒ 行仍可见）；遗留双向兼容：my_ts=0
+  读者退回 P2 语义、cts=0 历史行对一切快照可见。验收 14/14：ts 三列落账
+  （cts>sts>0）；**不可重复读消失实测**（并发插入 2,2 不变）；**删除对称
+  实测**（3,3 不变）；崩溃 redo commit_ts 值级一致 + waldump 可辨；遗留
+  读者看全量。金丝雀五套（lwc/r2/P1×2/P2）见下。修掉一个隐患：
+  cstring_to_text 隐式声明（缺 builtins.h，int 截断指针）。
 
 #### T3.4 §4.4 冲突中止（first-committer-wins）
 
