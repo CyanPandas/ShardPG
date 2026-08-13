@@ -339,7 +339,7 @@ T2.0 ──┬─ T2.1 ─┬─ T2.3 ─┬─ T2.4
 T2.8 验收套件与 T2.3 起并行开发，出口统跑
 ```
 
-#### T2.0 前置核查（不写代码，产出 `docs/P2_PRECHECK.md`）
+#### T2.0 前置核查（不写代码，产出 `docs/P2_PRECHECK.md`）——✅ 已完成（2026-08-13）
 
 - ① **EnhancedClog 复用面**：现状 = 24B 槽 {start_ts, commit_ts, status,
   parent_xid}、`pg_gclog/<node>/` 稀疏段文件直接寻址、全零槽=RUNNING=未决
@@ -359,6 +359,29 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
 - ⑤ **partition_map 门控字段方案**：加列还是伴表、注册 DDL 入口、基线既有
   partition_map 表默认不打标的保证（P1_PRECHECK 结论 C 的 438 保护延续）。
 - **验收**：五问皆有结论落档；风险登记簿更新。
+- **实施记要（五问定案，全文见 `docs/P2_PRECHECK.md`）**：
+  ① EnhancedClog **共存新实例**——分片键 (Oid, sxid) 塞不进旧域 uint16 node_id
+  编码，参数化=动基线磁盘格式；新建 `shard_clog.c/.h` 克隆 I/O 纪律，旧域零改动。
+  两处实施偏差：目录用独立顶层 **`pg_shard_clog/<oid>/`**（与 pg_shard_xid 对称、
+  DROP GC 一次删两个）；槽 32B = §5.3 五列原文（P2 只用 status）。
+  ② xid_map 是 apply checkpoint **磁盘格式**的一部分（CRC 覆盖快照），删=动基线；
+  分片表路径隔离已 grep 实证成立，物理删除挪 P6。
+  ③ 0007 定案：xinfo **bit 9** = SHARD_XIDS 可选块（bit 0–8 已占）；挂点
+  XactLogCommitRecord:5663 / XactLogAbortRecord:5835 填充钩子 +
+  xact_redo_commit:5979 / xact_redo_abort:6133 落账钩子 + ParseCommit/
+  AbortRecord 各一个 if 块；实测行序 **XACT_EVENT_COMMIT(2335) 在
+  RESOURCE_RELEASE_LOCKS(2360) 之前** ⇒ 既有回调里标记 COMMITTED 即"记录已
+  持久之后、行锁释放之前"，等待者唤醒即见终态；三段闭环（RUNNING 首写落账/
+  记录后标记+redo 补齐/隐式中止靠认领）确认无缝——分片写必有原生 xid ⇒ 必有
+  commit/abort 记录。
+  ④ 认领**懒触发双入口**（发号器槽位首初始化 + 可见性首咨询；只挂写路径不够，
+  UPDATE 撞无主 xmax 先于取号）+ 显式 SQL 函数；扫描上界 = **冻结的启动恢复
+  上限**（取动态水位会误杀重启后新活事务）；认领水位并入水位文件（4B→8B，
+  兼容旧格式）。
+  ⑤ partition_map **尾部加列** `shard_mvcc BOOLEAN DEFAULT false`（实证 tests/sim
+  零位置式 INSERT，加列无破坏）+ 注册函数 bump version + metadata cache O(1)；
+  GUC 白名单降级为并集通道。
+  测试：本任务不写代码，零测试；两条新风险 R-P2-1/R-P2-2 已入 §5。
 
 #### T2.1 分片域 clog（存储层，扩展侧）
 
@@ -474,6 +497,14 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
    既有套件兜底，每个补丁提交前跑。
 4. **临时桩滞留**：T1.6 临时提交表若拖过 P2 不替换，会被后续代码依赖——出口清单
    与代码注释双重标记。
+
+P2 增补（2026-08-13，T2.0 核查产出）：
+
+5. **R-P2-1 解析面回归**：0007 触碰 commit/abort 记录解析（xactdesc/redo/解码
+   三处共用）——无分片块的记录必须逐字节零行为变化；438 全量兜底。
+6. **R-P2-2 认领误杀**：认领扫描上界一旦取成动态发号水位，会把重启后新活事务
+   判 ABORTED（数据静默消失）。上界必须是冻结的启动恢复上限（P2_PRECHECK
+   结论四）；T2.8 必须含"重启后立即开新事务再触发认领"用例。
 
 ---
 
