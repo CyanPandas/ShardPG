@@ -307,9 +307,14 @@ ShardClogXactRedo(int nxids, const uint32 *pairs, bool committed)
 	int			i;
 
 	for (i = 0; i < nxids; i++)
+	{
 		ShardClogSetVerdict((Oid) pairs[2 * i],
 							(TransactionId) pairs[2 * i + 1],
 							committed);
+		/* T2.5：顺手累计影子推进（水位文件缺失/落后时的发号起点兜底） */
+		ShardXidRedoAdvance((Oid) pairs[2 * i],
+							(TransactionId) pairs[2 * i + 1]);
+	}
 }
 
 /* ================= DROP TABLE 提交时点 GC ================= */

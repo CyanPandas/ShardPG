@@ -66,11 +66,23 @@ typedef struct ShardXidSlot
  * 由此归一（P2_PRECHECK 结论四；上限取动态水位会误杀新活事务，R-P2-2）。
  */
 
+/*
+ * T2.5 WAL 影子推进：崩溃恢复期 startup 进程从 0007 commit/abort 记录体的
+ * (分片, 分片xid) 对里累计每分片"已见最大号+1"。与发号器槽位分开存——
+ * 槽位有"存在=已认领"不变式（T2.4），startup 不建槽只记影子。
+ */
+typedef struct ShardXidShadow
+{
+	Oid			shard_relid;	/* InvalidOid = 空 */
+	TransactionId next_hint;	/* redo 已见最大分片 xid + 1 */
+} ShardXidShadow;
+
 typedef struct ShardXidState
 {
 	LWLock	   *lock;			/* 罩全部槽位；水位落盘也在锁内（每 4096 号
 								 * 才一次 fsync，见 SHARD_XID_BATCH） */
 	ShardXidSlot slots[SHARD_XID_MAX_SLOTS];
+	ShardXidShadow shadow[SHARD_XID_MAX_SLOTS];
 } ShardXidState;
 
 static ShardXidState *ShardXidCtl = NULL;
@@ -423,12 +435,28 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	ceiling = Max(alloc_wm, FIRST_SHARD_XID);
 	claim_wm = Max(claim_wm, FIRST_SHARD_XID);
 
+	/*
+	 * T2.5：WAL 影子推进兜底——水位文件缺失/落后时，本次恢复窗口内见过的
+	 * 最大分片 xid + 1 仍抬高起点，已完成事务的号绝不重发（窗口外的有判决
+	 * 兜底：发号路径的终局槽跳过守卫）。文件健在时影子 ≤ 文件，取 Max 无扰。
+	 */
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+		if (ShardXidCtl->shadow[i].shard_relid == shard)
+		{
+			ceiling = Max(ceiling, ShardXidCtl->shadow[i].next_hint);
+			break;
+		}
+
 	if (claim_wm < ceiling)
 	{
 		int			n = ShardClogClaimRange(shard, claim_wm, ceiling);
 
-		/* 认领水位推到上限并落盘（文件必已存在：ceiling>3 ⇒ 发过号） */
-		shard_xid_persist_watermark(shard, alloc_wm, ceiling);
+		/*
+		 * 认领水位推到上限并落盘。alloc 位同步抬到 ceiling——文件缺失而
+		 * 影子抬了上限时，写回 {0, ceiling} 会让下次重启退化（claim_wm >
+		 * alloc_wm 的畸形档），抬高只多跳号、方向安全。
+		 */
+		shard_xid_persist_watermark(shard, Max(alloc_wm, ceiling), ceiling);
 		if (nclaimed)
 			*nclaimed = n;
 	}
@@ -461,24 +489,72 @@ shard_xid_allocate(Oid shard)
 
 	slot = shard_xid_slot_attach(shard, NULL);
 
-	if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("分片 %u 的 32 位 xid 逼近上限 %u，P1 不支持回卷",
-						shard, SHARD_XID_HARD_LIMIT)));
-
-	if (slot->next_xid >= slot->watermark)
+	for (;;)
 	{
-		TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
+		if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("分片 %u 的 32 位 xid 逼近上限 %u，P1 不支持回卷",
+							shard, SHARD_XID_HARD_LIMIT)));
 
-		shard_xid_persist_watermark(shard, new_wm, slot->claim_wm);
-		slot->watermark = new_wm;
+		if (slot->next_xid >= slot->watermark)
+		{
+			TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
+
+			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm);
+			slot->watermark = new_wm;
+		}
+
+		result = slot->next_xid++;
+
+		/*
+		 * T2.5 终局槽跳过守卫：clog 里已有判决的号 = 某段历史已经用过它
+		 * （水位文件缺失/落后才会走到），跳过绝不重发——重发会让新事务的
+		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过；
+		 * 每次分配多一次 pread、无 fsync，可接受。
+		 */
+		if (ShardClogReadStatus(shard, result) == TXN_RUNNING)
+			break;
 	}
-
-	result = slot->next_xid++;
 
 	LWLockRelease(ShardXidCtl->lock);
 	return result;
+}
+
+/*
+ * T2.5：恢复期由 0007 redo 钩子喂入 (分片, 分片xid)，累计每分片影子推进。
+ * startup 进程调用；只记影子不建槽（T2.4"槽位存在=已认领"不变式）。影子
+ * 数组满则静默丢弃——影子是优化性兜底，缺了退化为文件水位语义，不伤正确性
+ * （终局槽跳过守卫仍兜底不重号）。
+ */
+void
+ShardXidRedoAdvance(Oid shard, TransactionId sxid)
+{
+	int			i;
+	int			free_i = -1;
+
+	if (ShardXidCtl == NULL)
+		return;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->shadow[i].shard_relid == shard)
+		{
+			ShardXidCtl->shadow[i].next_hint =
+				Max(ShardXidCtl->shadow[i].next_hint, sxid + 1);
+			LWLockRelease(ShardXidCtl->lock);
+			return;
+		}
+		if (free_i < 0 && ShardXidCtl->shadow[i].shard_relid == InvalidOid)
+			free_i = i;
+	}
+	if (free_i >= 0)
+	{
+		ShardXidCtl->shadow[free_i].next_hint = sxid + 1;
+		ShardXidCtl->shadow[free_i].shard_relid = shard;
+	}
+	LWLockRelease(ShardXidCtl->lock);
 }
 
 /*
