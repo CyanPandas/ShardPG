@@ -52,6 +52,10 @@ extern Oid	ShardXidLookupByOid(Oid reloid);
 /* 本事务在该分片已领的 xid；未领返回 InvalidTransactionId（自见性判定用） */
 extern TransactionId ShardXidMineForShard(Oid shard);
 
+/* T2.4：确保该分片本次启动已完成无主 RUNNING 认领（槽位存在=已认领）。
+ * 发号路径自动触发；可见性读路径在咨询 clog 前调用。返回本次改判条数。 */
+extern int	ShardXidEnsureClaimed(Oid shard);
+
 /* P1 数据保护拦截：VACUUM/ANALYZE/CLUSTER 点名白名单表一律 ERROR
  * （P1_PRECHECK 结论 D：原生 clog 会误判分片 xid，重写/回收路径必须封死） */
 extern void ShardXidUtilityGuard(Node *parsetree);

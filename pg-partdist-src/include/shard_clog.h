@@ -77,6 +77,13 @@ extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed);
 extern TxnStatus ShardClogReadStatus(Oid shard, TransactionId sxid);
 
 /*
+ * T2.4 认领原语：把 [from, to) 里所有 RUNNING（含全零洞）改判 ABORTED，
+ * 已有终局判决与 PREPARED（P4 in-doubt，不许动）原样保留。每段一次 fsync。
+ * 返回改判条数。幂等。
+ */
+extern int ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to);
+
+/*
  * 补丁 0007 的 redo 钩子实现：把 commit/abort 记录体里的 (shard,sxid) 对
  * 列表重做成判决（幂等）。在 startup 进程里跑，签名与
  * shard_xact_redo_hook_type 一致。

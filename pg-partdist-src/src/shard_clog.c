@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "shard_clog.h"
+#include "shard_xid.h"
 
 #include "access/transam.h"
 #include "fmgr.h"
@@ -216,6 +217,86 @@ ShardClogReadStatus(Oid shard, TransactionId sxid)
 }
 
 /*
+ * T2.4 认领：[from, to) 内 RUNNING（含洞）→ ABORTED。逐段处理：段内逐槽
+ * pread 判状态、RUNNING 则 pwrite ABORTED，段收尾一次 fsync。范围来自
+ * "冻结的启动恢复上限"（调用方 shard_xid.c 保证，R-P2-2），本函数只管
+ * 机械改判。PREPARED 保留是 §6.6 第二分支的"不许动"（P4 才有人写它）。
+ */
+int
+ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to)
+{
+	int			claimed = 0;
+	TransactionId sxid;
+
+	if (from < FirstNormalTransactionId)
+		from = FirstNormalTransactionId;
+
+	sxid = from;
+	while (sxid < to)
+	{
+		uint32		segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
+		TransactionId seg_end = (TransactionId) (segno + 1) *
+			SHARD_CLOG_XIDS_PER_SEGMENT;
+		TransactionId upto = Min(to, seg_end);
+		int			fd = ShardClogOpenSegFile(shard, segno, true);
+		bool		dirtied = false;
+
+		for (; sxid < upto; sxid++)
+		{
+			off_t		off = (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT)
+				* SHARD_CLOG_SLOT_SIZE;
+			ShardClogSlot slot;
+			ssize_t		nb;
+
+			do
+			{
+				nb = pg_pread(fd, &slot, sizeof(slot), off);
+			} while (nb < 0 && errno == EINTR);
+
+			if (nb != (ssize_t) sizeof(slot) && nb != 0)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("pg_partdist: 认领读槽失败 shard=%u xid=%u (%zd)",
+								shard, sxid, nb)));
+			}
+			if (nb == (ssize_t) sizeof(slot) &&
+				(TxnStatus) slot.status != TXN_RUNNING)
+				continue;		/* 终局/PREPARED 保留 */
+
+			memset(&slot, 0, sizeof(slot));
+			slot.status = (uint32) TXN_ABORTED;
+			do
+			{
+				nb = pg_pwrite(fd, &slot, sizeof(slot), off);
+			} while (nb < 0 && errno == EINTR);
+			if (nb != (ssize_t) sizeof(slot))
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("pg_partdist: 认领改判失败 shard=%u xid=%u: %m",
+								shard, sxid)));
+			}
+			dirtied = true;
+			claimed++;
+		}
+
+		if (dirtied && pg_fsync(fd) != 0)
+		{
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 认领段 fsync 失败 shard=%u seg=%08X: %m",
+							shard, segno)));
+		}
+		CloseTransientFile(fd);
+	}
+	return claimed;
+}
+
+/*
  * 0007 redo 钩子：崩溃恢复重放 commit/abort 记录时重做判决。
  * 幂等（重复 redo 写同样字节）；ShardClogSetVerdict 自带 fsync，ERROR 会
  * 中止恢复——与原生 clog 写盘失败同级别，正确的失败方式。
@@ -304,6 +385,15 @@ ShardClogAtAbort(void)
  * T2.1 验收与 T2.8 套件直接 CREATE FUNCTION ... '$libdir/pg_partdist' 使用；
  * 正式并入扩展 SQL 文件随 T2.4 的显式函数一批做。
  */
+
+PG_FUNCTION_INFO_V1(partdist_shard_claim);
+Datum
+partdist_shard_claim(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+
+	PG_RETURN_INT32((int32) ShardXidEnsureClaimed(shard));
+}
 
 PG_FUNCTION_INFO_V1(partdist_shard_clog_read);
 Datum

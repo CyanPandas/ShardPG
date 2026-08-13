@@ -55,7 +55,16 @@ typedef struct ShardXidSlot
 	Oid			shard_relid;	/* InvalidOid = 空槽 */
 	TransactionId next_xid;		/* 下一个待发 */
 	TransactionId watermark;	/* 已持久化上界：所有已发号 < watermark */
+	TransactionId claim_wm;		/* T2.4 认领水位：< 它的历史号已全部认领过 */
 } ShardXidSlot;
+
+/*
+ * T2.4 不变式：**槽位存在 ⇒ 该分片本次启动已完成无主 RUNNING 认领**。
+ * 建槽统一走 shard_xid_slot_attach()——先按"冻结的启动恢复上限"（挂槽前
+ * 读到的文件 alloc_wm，此刻本分片必无任何新号已发）认领 [claim_wm, 上限)，
+ * 再挂槽。发号路径与可见性读路径（ShardXidEnsureClaimed）共用，双入口
+ * 由此归一（P2_PRECHECK 结论四；上限取动态水位会误杀新活事务，R-P2-2）。
+ */
 
 typedef struct ShardXidState
 {
@@ -276,31 +285,49 @@ ShardXidLookupByOid(Oid reloid)
 /* ================= T1.2 发号器 ================= */
 
 /*
- * 水位文件：$PGDATA/pg_shard_xid/<oid>，4 字节小端 uint32。
- * 崩溃语义：文件里的值是"已授权发放的上界"，重启从它续发 —— 最多跳
- * SHARD_XID_BATCH 个号，绝不重发（DEV PLAN T1.2 的"跳号无害"裁定）。
+ * 水位文件：$PGDATA/pg_shard_xid/<oid>。
+ * T2.4 起 8 字节小端 {uint32 alloc_wm, uint32 claim_wm}；兼容读 4 字节旧
+ * 格式（缺 claim_wm 按 FIRST_SHARD_XID = 全量补认领，安全方向）。
+ * 崩溃语义：alloc_wm 是"已授权发放的上界"，重启从它续发 —— 最多跳
+ * SHARD_XID_BATCH 个号，绝不重发（DEV PLAN T1.2 的"跳号无害"裁定）；
+ * claim_wm 之下的历史号已全部认领过（RUNNING 已改判 ABORTED）。
  */
-static TransactionId
-shard_xid_read_watermark(Oid shard)
+static void
+shard_xid_read_wm_file(Oid shard, TransactionId *alloc_wm,
+					   TransactionId *claim_wm)
 {
 	char		path[MAXPGPATH];
 	int			fd;
-	uint32		wm;
+	uint32		v[2];
 	int			r;
+
+	*alloc_wm = 0;
+	*claim_wm = 0;
 
 	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
-			return 0;			/* 该分片首次发号 */
+			return;				/* 该分片从未发过号 */
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("无法打开分片 xid 水位文件 \"%s\": %m", path)));
 	}
 
-	r = read(fd, &wm, sizeof(wm));
-	if (r != sizeof(wm))
+	r = read(fd, v, sizeof(v));
+	if (r == (int) sizeof(v))
+	{
+		*alloc_wm = (TransactionId) v[0];
+		*claim_wm = (TransactionId) v[1];
+	}
+	else if (r == (int) sizeof(uint32))
+	{
+		/* 旧 4 字节格式：认领水位按最低值，触发全量补认领 */
+		*alloc_wm = (TransactionId) v[0];
+		*claim_wm = FIRST_SHARD_XID;
+	}
+	else
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("分片 xid 水位文件 \"%s\" 损坏（读到 %d 字节）",
@@ -309,17 +336,19 @@ shard_xid_read_watermark(Oid shard)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("无法关闭分片 xid 水位文件 \"%s\": %m", path)));
-
-	return (TransactionId) wm;
 }
 
 static void
-shard_xid_persist_watermark(Oid shard, TransactionId wm)
+shard_xid_persist_watermark(Oid shard, TransactionId alloc_wm,
+							TransactionId claim_wm)
 {
 	char		tmppath[MAXPGPATH];
 	char		path[MAXPGPATH];
 	int			fd;
-	uint32		v = (uint32) wm;
+	uint32		v[2];
+
+	v[0] = (uint32) alloc_wm;
+	v[1] = (uint32) claim_wm;
 
 	if (MakePGDirectory(SHARD_XID_DIR) < 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -358,6 +387,61 @@ shard_xid_persist_watermark(Oid shard, TransactionId wm)
 }
 
 /*
+ * 找到或建立分片槽位（须持 ShardXidCtl->lock 排它锁调用）。建槽时完成
+ * T2.4 认领：认领上限 = 此刻文件里的 alloc_wm ——"冻结的启动恢复上限"，
+ * 挂槽前本分片必无任何新号已发（发号必先经本函数），新活事务永不进认领
+ * 范围（R-P2-2）。认领或落盘失败即 ERROR，relid 未置、槽位仍空，fail-closed。
+ * nclaimed 非 NULL 时返回本次改判条数（已有槽位 = 0）。
+ */
+static ShardXidSlot *
+shard_xid_slot_attach(Oid shard, int *nclaimed)
+{
+	ShardXidSlot *free_slot = NULL;
+	TransactionId alloc_wm;
+	TransactionId claim_wm;
+	TransactionId ceiling;
+	int			i;
+
+	if (nclaimed)
+		*nclaimed = 0;
+
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+			return &ShardXidCtl->slots[i];
+		if (free_slot == NULL &&
+			ShardXidCtl->slots[i].shard_relid == InvalidOid)
+			free_slot = &ShardXidCtl->slots[i];
+	}
+
+	if (free_slot == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("分片 xid 槽位用尽（上限 %d）", SHARD_XID_MAX_SLOTS)));
+
+	shard_xid_read_wm_file(shard, &alloc_wm, &claim_wm);
+	ceiling = Max(alloc_wm, FIRST_SHARD_XID);
+	claim_wm = Max(claim_wm, FIRST_SHARD_XID);
+
+	if (claim_wm < ceiling)
+	{
+		int			n = ShardClogClaimRange(shard, claim_wm, ceiling);
+
+		/* 认领水位推到上限并落盘（文件必已存在：ceiling>3 ⇒ 发过号） */
+		shard_xid_persist_watermark(shard, alloc_wm, ceiling);
+		if (nclaimed)
+			*nclaimed = n;
+	}
+
+	free_slot->next_xid = ceiling;
+	free_slot->watermark = free_slot->next_xid;
+	free_slot->claim_wm = ceiling;
+	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
+	free_slot->shard_relid = shard;
+	return free_slot;
+}
+
+/*
  * 发一个号。锁内做水位落盘（每 SHARD_XID_BATCH 次分配才一次 fsync；
  * 且分配频率是"每事务每分片"而不是每元组 —— T1.3 的映射缓存住了）。
  * 任何 ERROR 都发生在槽位状态推进之前，fail-closed。
@@ -365,10 +449,8 @@ shard_xid_persist_watermark(Oid shard, TransactionId wm)
 static TransactionId
 shard_xid_allocate(Oid shard)
 {
-	ShardXidSlot *slot = NULL;
-	ShardXidSlot *free_slot = NULL;
+	ShardXidSlot *slot;
 	TransactionId result;
-	int			i;
 
 	if (ShardXidCtl == NULL)
 		ereport(ERROR,
@@ -377,34 +459,7 @@ shard_xid_allocate(Oid shard)
 
 	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
 
-	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
-	{
-		if (ShardXidCtl->slots[i].shard_relid == shard)
-		{
-			slot = &ShardXidCtl->slots[i];
-			break;
-		}
-		if (free_slot == NULL &&
-			ShardXidCtl->slots[i].shard_relid == InvalidOid)
-			free_slot = &ShardXidCtl->slots[i];
-	}
-
-	if (slot == NULL)
-	{
-		TransactionId wm;
-
-		if (free_slot == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					 errmsg("分片 xid 槽位用尽（上限 %d）", SHARD_XID_MAX_SLOTS)));
-
-		wm = shard_xid_read_watermark(shard);
-		free_slot->next_xid = Max(wm, FIRST_SHARD_XID);
-		free_slot->watermark = free_slot->next_xid;
-		/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
-		free_slot->shard_relid = shard;
-		slot = free_slot;
-	}
+	slot = shard_xid_slot_attach(shard, NULL);
 
 	if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
 		ereport(ERROR,
@@ -416,7 +471,7 @@ shard_xid_allocate(Oid shard)
 	{
 		TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
 
-		shard_xid_persist_watermark(shard, new_wm);
+		shard_xid_persist_watermark(shard, new_wm, slot->claim_wm);
 		slot->watermark = new_wm;
 	}
 
@@ -424,6 +479,37 @@ shard_xid_allocate(Oid shard)
 
 	LWLockRelease(ShardXidCtl->lock);
 	return result;
+}
+
+/*
+ * T2.4：确保某分片本次启动已完成无主 RUNNING 认领（可见性读路径入口）。
+ * 槽位存在即已认领（不变式），快路径共享锁一次扫描。返回本次改判条数。
+ */
+int
+ShardXidEnsureClaimed(Oid shard)
+{
+	int			nclaimed = 0;
+	bool		found = false;
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		return 0;				/* shmem 未起（防御） */
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+		{
+			found = true;
+			break;
+		}
+	LWLockRelease(ShardXidCtl->lock);
+	if (found)
+		return 0;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	(void) shard_xid_slot_attach(shard, &nclaimed);
+	LWLockRelease(ShardXidCtl->lock);
+	return nclaimed;
 }
 
 /* ================= T1.3 事务绑定 ================= */

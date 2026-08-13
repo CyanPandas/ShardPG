@@ -133,7 +133,8 @@ r=$(PSQL "$WPORT" -Atc "SELECT v FROM p1_shard WHERE id=3" </dev/null)
 check "终值 = 后者的写入" "$r" "9"
 
 echo "========== [4] 发号崩溃安全（T1.2/T1.5） =========="
-WM=$(DEX od -An -tu4 "${DATADIR}/pg_shard_xid/${OID}" </dev/null | tr -d ' ')
+# T2.4 起水位文件 8 字节 {alloc_wm, claim_wm}，发号水位取第一个 uint32
+WM=$(DEX od -An -tu4 "${DATADIR}/pg_shard_xid/${OID}" </dev/null | awk '{print $1; exit}')
 check "水位文件存在且为 4096 批量（$WM）" "$([[ -n "$WM" && $((WM % 4096)) -eq 3 ]] && echo ok)" "ok"
 pre_md5=$(PSQL "$WPORT" -Atc "SELECT md5(string_agg(encode(get_raw_page('p1_shard',b),'hex'),'' ORDER BY b)) FROM generate_series(0,(pg_relation_size('p1_shard')/8192)::int-1) b" </dev/null)
 
@@ -153,7 +154,7 @@ check "崩溃恢复 redo 页面与崩溃前逐字节一致" "$post_md5" "$pre_md
 PSQL "$WPORT" -q -c "INSERT INTO p1_shard VALUES (30,0,'z');" </dev/null
 xr=$(PSQL "$WPORT" -Atc "SELECT max(t_xmin::text::bigint) FROM heap_page_items(get_raw_page('p1_shard',0)) WHERE t_xmin IS NOT NULL" </dev/null)
 check "重启后从水位续发不重号（= ${WM}）" "$xr" "$WM"
-WM2=$(DEX od -An -tu4 "${DATADIR}/pg_shard_xid/${OID}" </dev/null | tr -d ' ')
+WM2=$(DEX od -An -tu4 "${DATADIR}/pg_shard_xid/${OID}" </dev/null | awk '{print $1; exit}')
 check "水位推进一批（= ${WM}+4096）" "$WM2" "$((WM+4096))"
 
 echo "========== [5] 负向全集（该报错的都报错） =========="

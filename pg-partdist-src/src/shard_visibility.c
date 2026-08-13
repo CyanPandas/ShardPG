@@ -143,6 +143,12 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid)
 	if (ce != NULL)
 		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
 
+	/*
+	 * T2.4：咨询 clog 前确保认领已跑（读路径入口；发号路径在分配时已触发）。
+	 * 崩溃遗留的无主 RUNNING 在此改判 ABORTED，之后才读真相源。
+	 */
+	(void) ShardXidEnsureClaimed(shard);
+
 	/* 分片 clog（真相源）。全零/空洞 = RUNNING = 未决不可见（§5.3）。 */
 	st = ShardClogReadStatus(shard, sxid);
 	switch (st)
@@ -434,7 +440,8 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("分片 %u 的 xid %u 是无主 RUNNING（clog 未决且活跃表无持有者）",
 						shard, sxid),
-				 errdetail("崩溃遗留的未决事务待认领改判 ABORTED（T2.4）；"
+				 errdetail("认领（T2.4）已在 clog 咨询前运行——崩溃遗留不可能到达"
+						   "这里；同启动期内无主属异常（持有者后端消亡？）。"
 						   "报错好过忙等自旋。")));
 
 	if (TransactionIdIsCurrentTransactionId(native))
