@@ -311,9 +311,7 @@ T1.8（安全网骨架，随 T1.6 一起）
 ## 3 P2–P6 里程碑级分解（进入前一期再细化）
 
 - **P2**：已进期，细化为任务级分解见 **§3.1**（T2.0–T2.8，2026-08-13）。
-- **P3**：Proxy 粘性路由 + 会话映射；TSO 内存计数器 + boot 防呆（§2.4）；
-  发号即登记 + GlobalSafeTs 双通道/租约/栅栏（§6.2）；安全网切严格模式；
-  §4.4 冲突中止规则生效。
+- **P3**：已进期，细化为任务级分解见 **§3.2**（T3.0–T3.7，2026-08-13）。
 - **P4**（前置：§9.1 三实验 + §9.2 门禁用例 + pg_raft 解冻）：协调者选定（首写分片）；
   globalXID 分配器；commit_ts 两时机；`dtx_master_pre_record_commit` 搬迁；
   连接加入协议 `partdist_join_global_txn`；三态问询；崩溃矩阵演练。
@@ -609,6 +607,123 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
       45 + 49 + 64；TX1 已知赛跑本轮未触发，比允许基线还干净）
 - [x] patches/README 更新 + pg-install 同步提交成对完成（0007、0008）
       （随 T2.2/T2.6 逐任务成对入库，nm 八行自检过）
+
+### 3.2 P3 详细任务分解（2026-08-13 进期细化）
+
+**目标**：master 薄化起步——TSO 内存计数器落地（§2.4 v1 裁定：不做 TSO 自身
+HA，boot 防呆兜底），ts 进入判定，隔离从"近似 RC"升为**真 SI**（§4.1：可见 ⇔
+COMMITTED 且 commit_ts < start_ts；§4.4 first-committer-wins 串行化冲突）；
+GlobalSafeTs 机制就位（§6.2 双通道/租约/栅栏——消费方 vacuum 在 P5，本期交付
+机制与读出）。出口门禁（里程碑原文）：**竞态注入测试；boot 防呆生效**。
+
+**依赖图**：
+
+```
+T3.0 ──┬─ T3.1 ─┬─ T3.2 ─┬─ T3.3 ─┬─ T3.4
+       │        └─ T3.5  └─ T3.6  │
+       └───────────────────────────┘
+T3.7 验收套件与 T3.3 起并行开发，出口统跑
+```
+
+#### T3.0 前置核查（不写代码，产出 `docs/P3_PRECHECK.md`）
+
+- ① **ts 载体与既有字段核查**：TSO 是逻辑单调计数器（int64，从 1 起）还是
+  混合时戳；盘点既有占位字段（ShardClogSlot.start_ts/commit_ts uint64、
+  `DtxRecordPayload.commit_ts`、`TxnMarkerPayload.start_ts/commit_ts` 及其
+  "本地时钟占位"注释）——换值来源的兼容面。
+- ② **TSO 通路载体**：coordinator 上 pg_partdist shmem 计数器 + SQL 函数
+  （worker 后端经 libpq 缓存连接调用）vs 独立协议 bgworker；连接管理
+  （每后端缓存、断线 fail-closed 绝不本地时钟顶替——§2.2 纪律 2）；
+  取号 RPC 延迟对单分片事务的成本预估。
+- ③ **commit_ts 进提交记录体的补丁方案**：redo 必须能重做带 ts 的落账 ⇒
+  commit 记录要携带 commit_ts。0007 的 xl_xact_shard_xids 块头扩一列
+  （重生成 0007）vs 新补丁 0009 追加块；abort 无需 ts（ABORTED 不参与
+  ts 判定）。
+- ④ **start_ts 懒取偏差论证**：设计 §2.2"事务开始时取"；实现拟在**首次触达
+  分片表时**懒取（每事务至多一次 TSO 交互，纯原生事务零成本）——需论证
+  与时机定理不冲突（懒取点即本事务分片快照点，单调性论证原样成立）。
+- ⑤ **GlobalSafeTs v1 最小面**：登记表（master shmem）+ 搭车/心跳双通道 +
+  租约清除齐备；**栅栏**（worker 提前量 ε 自作废本地快照）在 P3 无 vacuum
+  消费方时做到什么程度（拟：读路径检查本地 start_ts 对应租约是否仍有效，
+  失效即 snapshot too old——机制完整、代价一次内存比较）。
+- ⑥ **Proxy 粘性路由 + 会话映射是否推迟 P4**：P3 无多分片事务、无 MX，
+  该组件在 P3 没有消费方——拟推迟并入 P4（届时与 partdist_join_global_txn
+  连接加入协议一起做），本期只留接口位。裁定理由落档。
+- **验收**：六问皆有结论落档；风险登记簿更新。
+
+#### T3.1 TSO 服务（coordinator：内存计数器 + 发号即登记 + boot 防呆）
+
+- **改**：coordinator shmem 单调 int64 计数器；SQL 接口
+  `partdist_tso_start_ts(node, oldest_or_null)`（**发号即登记**：先把该节点
+  登记更新为 min(携带值, 新号)，后返回新号——一次调用原子，§2.3 铁律）与
+  `partdist_tso_commit_ts()`；**boot 防呆**：首次服务落 `$PGDATA/pg_tso_boot`
+  标记，启动时检测到标记即拒绝发号（fail-closed 响亮停摆，重建流程删标记），
+  §2.4 配套 2。
+- **验收**：单调性（并发取号无重复无回退）；发号即登记原子可见；重启后
+  拒发号且报错指明重建流程；删标记后恢复服务。
+
+#### T3.2 worker 取号通路（后端 libpq + 懒取 + fail-closed）
+
+- **改**：worker 后端缓存到 coordinator 的 libpq 连接（会话生存期，断线
+  重连一次，仍失败即 ERROR——绝不本地时钟顶替）；首次触达分片表懒取
+  start_ts 存后端事务态（XactCallback 清理）；提交路径在提交记录**之前**
+  取 commit_ts（P3 单分片：合法窗口 = 写集确定后、决议持久化前，"尽晚取"）。
+- **验收**：每事务恰一次 start_ts RPC（含只读）；TSO 停摆时分片表读写
+  fail-closed 报错、原生表不受扰；连接断后自愈一次。
+
+#### T3.3 ts 落账与真 SI 可见性
+
+- **改**：commit 记录体携带 commit_ts（方案按 T3.0 ③）；RUNNING 落账填
+  start_ts、判决落账填 commit_ts（正常路径回调 + 0007 redo 双路一致）；
+  可见性判定换 §4.1 原文：COMMITTED 且 commit_ts < start_ts 才可见
+  （xmax 对称）；后端终局缓存连 ts 一起缓存。
+- **验收**：**不可重复读消失**（A 开始后 B 提交，A 反复读同快照不变——
+  P2 近似 RC 时代读得到，P3 读不到）；跨事务序一致；崩溃后 redo 重建的
+  ts 与崩前一致（值级断言）。
+
+#### T3.4 §4.4 冲突中止（first-committer-wins）
+
+- **改**：行锁等待唤醒后加判定：xmax 持有者已提交且 commit_ts >
+  本事务 start_ts ⇒ `serialization failure` 中止（SQLSTATE 40001）；
+  不提供 RC 式 EPQ 重读（挂点在既有 xmax_wait/satisfies_update 臂上收敛）。
+- **验收**：经典 SI 双写用例（并发 UPDATE 同行，后提交者 40001）；
+  不冲突路径（对方先回滚 / commit_ts < start_ts 的历史提交）不误报。
+
+#### T3.5 GlobalSafeTs（机制就位，消费方 P5）
+
+- **改**：master 登记表（节点→最老活跃 ts + 租约期限）；搭车通道（T3.1 已
+  含）+ 周期心跳（worker 侧挂现成 bgworker 周期任务，无事务也报"最老或
+  '无'"）；租约到期清登记；栅栏最小面（按 T3.0 ⑤）；读出函数
+  `partdist_global_safe_ts()`（P5 vacuum 的地基 + 验收观测点）。
+- **验收**：GlobalSafeTs 单调不减；≤ 全集群活跃快照最小 start_ts（并发
+  churn 下断言不变式）；停心跳 → 租约到期后该节点被剔除、SafeTs 恢复推进；
+  栅栏先于剔除生效。
+
+#### T3.6 安全网严格模式收紧（§9.2 第 1 层语义到位）
+
+- **改**：strict 语义从"分片表一切读写拦截"收紧为设计原文"**无 start_ts 读 /
+  无 gxid 写才拦**"（P4 前 gxid 判据 = 分片 xid 绑定存在）；正常路径自动取号
+  后 strict 下应全部放行，只有 TSO 停摆/旁路访问才拦。
+- **验收**：strict 下正常读写全通过；人为清后端 ts 状态/停 TSO 后读写被拦；
+  permissive 行为不变。
+
+#### T3.7 P3 验收套件（出口门禁：竞态注入 + boot 防呆）
+
+- `tests/test_tso_si_p3.sh`：SI 语义矩阵（不可重复读消失/40001 双写/只读
+  零协调）+ **竞态注入**（并发提交 vs 快照的时机定理断言：C < S ⇒ 必可见，
+  循环压测零异常；GlobalSafeTs 不变式并发断言）+ boot 防呆（重启拒发号）
+  + TSO 停摆 fail-closed。工程纪律沿用（计数守卫/</dev/null/健康收尾）。
+- 596 基线（13 套件）保持绿。
+
+#### P3 出口清单（全部勾掉才进 P4）
+
+- [ ] 真 SI 语义用例全绿（不可重复读消失；40001 first-committer-wins）
+- [ ] 竞态注入零异常（时机定理断言 + GlobalSafeTs 不变式，里程碑门禁）
+- [ ] boot 防呆生效（重启拒发号响亮停摆，里程碑门禁）
+- [ ] TSO 停摆 fail-closed（绝不本地时钟顶替）；严格模式收紧语义到位
+- [ ] GlobalSafeTs 机制就位（双通道/租约/栅栏最小面 + 读出函数）
+- [ ] 全量 596（13 套件）+ P3 新套件零新增 FAIL
+- [ ] 文档/补丁/pg-install 成对；Proxy 推迟裁定落档（若 T3.0 ⑥ 定案）
 
 ---
 
