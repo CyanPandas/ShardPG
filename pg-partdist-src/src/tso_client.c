@@ -73,11 +73,75 @@ static int64 cur_start_ts = 0;	/* 本事务分片快照；0 = 未取 */
 static int64 cur_commit_ts = 0; /* PRE_COMMIT 暂存；0 = 未取 */
 static int64 cur_gxid = 0;		/* T4.1：join 注入的全局事务号；0 = 无 */
 static int64 cur_coord_gsid = 0;	/* T4.1：协调者分片组；0 = 未知 */
+
+/*
+ * T4.2 自动 join 通道：驱动端 `SET LOCAL pg_partdist.join_info='gxid,ts,gsid'`
+ * + `SET LOCAL citus.propagate_set_commands='local'`，Citus 把该 SET LOCAL
+ * 原样传播到每条任务连接（实验实证，每连接一次）——参与端 GUC assign 只暂存
+ * （assign 上下文不许 ereport），真正注入推迟到首次取用（TsoGetStartTs），
+ * 冲突/未配置在那里以正常 ERROR 收口。事务结束 GUC 回卷 + 回调双重清理。
+ */
+static char *join_info_string = NULL;
+static int64 pending_join_gxid = 0;
+static int64 pending_join_ts = 0;
+static int64 pending_join_gsid = 0;
 static char tso_last_err[256];	/* 最近一次失败原因（连接被弃后仍可报） */
+
+static bool
+check_join_info(char **newval, void **extra, GucSource source)
+{
+	const char *s = (*newval != NULL) ? *newval : "";
+	long long	g, ts, gs;
+	char		trail;
+
+	if (s[0] == '\0')
+		return true;
+	if (sscanf(s, "%lld,%lld,%lld%c", &g, &ts, &gs, &trail) != 3 ||
+		g <= 0 || ts <= 0 || gs < 0)
+	{
+		GUC_check_errdetail("格式须为 'gxid,start_ts,coord_gsid'（gxid/ts>0，gsid>=0）。");
+		return false;
+	}
+	return true;
+}
+
+static void
+assign_join_info(const char *newval, void *extra)
+{
+	long long	g = 0, ts = 0, gs = 0;
+	char		trail;
+
+	if (newval != NULL && newval[0] != '\0' &&
+		sscanf(newval, "%lld,%lld,%lld%c", &g, &ts, &gs, &trail) == 3)
+	{
+		pending_join_gxid = (int64) g;
+		pending_join_ts = (int64) ts;
+		pending_join_gsid = (int64) gs;
+	}
+	else
+	{
+		pending_join_gxid = 0;
+		pending_join_ts = 0;
+		pending_join_gsid = 0;
+	}
+}
 
 void
 TsoClientDefineGUCs(void)
 {
+	DefineCustomStringVariable(
+		"pg_partdist.join_info",
+		"连接加入协议的传播载体（T4.2）：'gxid,start_ts,coord_gsid'。",
+		"驱动端在事务内 SET LOCAL 本参数（配合 citus.propagate_set_commands="
+		"'local'），Citus 传播到每条任务连接即完成参与端自动 join。",
+		&join_info_string,
+		"",
+		PGC_USERSET,
+		0,
+		check_join_info,
+		assign_join_info,
+		NULL);
+
 	DefineCustomStringVariable(
 		"pg_partdist.tso_conninfo",
 		"到 TSO master 的 libpq 连接串（T3.2）。",
@@ -317,6 +381,23 @@ TsoGetStartTs(void)
 		tso_fence_check();		/* T3.5：持有快照期间的每次取用都过栅栏 */
 		return cur_start_ts;
 	}
+
+	/* T4.2：GUC 通道有待注入三元组 ⇒ 走 join（优先于自取 RPC） */
+	if (pending_join_ts > 0)
+	{
+		TsoInjectStartTs(pending_join_ts);
+		if (cur_gxid != 0 && cur_gxid != pending_join_gxid)
+			ereport(ERROR,
+					(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+					 errmsg("join_info 的 gxid=" INT64_FORMAT
+							" 与已加入的 " INT64_FORMAT " 冲突",
+							pending_join_gxid, cur_gxid)));
+		cur_gxid = pending_join_gxid;
+		if (pending_join_gsid > 0)
+			cur_coord_gsid = pending_join_gsid;
+		return cur_start_ts;
+	}
+
 	if (!tso_configured())
 		return 0;
 
