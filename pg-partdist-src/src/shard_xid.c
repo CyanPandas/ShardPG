@@ -10,6 +10,7 @@
 #include "pg_partdist.h"
 #include "shard_xid.h"
 #include "shard_clog.h"
+#include "tso.h"
 #include "shard_visibility.h"
 
 #include <dirent.h>
@@ -713,6 +714,18 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 
 	switch (event)
 	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			/*
+			 * T3.2：含分片写的事务在此取 commit_ts 暂存（临界区外、提交
+			 * 记录前 = 合法窗口内尽晚，P3_PRECHECK 结论三）。TSO 不可达
+			 * 在这里 ERROR = 事务干净中止（R-P3-1 第一道防线）。遗留模式
+			 * （tso_conninfo 空）内部自跳过。
+			 */
+			if (xact_map_n > 0)
+				TsoStashCommitTs();
+			break;
+
 		case XACT_EVENT_PRE_PREPARE:
 			/*
 			 * P1 禁 2PC 含分片写：PREPARE 后由别的会话 COMMIT/ROLLBACK
@@ -733,6 +746,7 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, true);
 			xact_map_n = 0;
 			ShardClogAtCommit();	/* DROP TABLE 的文件 GC，提交才删 */
+			TsoClientClearActive();
 			break;
 
 		case XACT_EVENT_ABORT:
@@ -741,12 +755,14 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, false);
 			xact_map_n = 0;
 			ShardClogAtAbort();
+			TsoClientClearActive();
 			break;
 
 		case XACT_EVENT_PREPARE:
 			/* 有分片写/DROP 的事务在 PRE_PREPARE 已被拦，这里只会是空的 */
 			xact_map_n = 0;
 			ShardClogAtAbort();
+			TsoClientClearActive();
 			break;
 
 		default:

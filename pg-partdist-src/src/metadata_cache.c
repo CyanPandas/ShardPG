@@ -62,6 +62,7 @@ pg_partdist_shmem_request_hook(void)
 
     /* TX-TSO-MVCC P3：TSO 计数器 + 节点登记表（T3.1） */
     RequestTsoShmem();
+    RequestTsoClientShmem();
 }
 
 void
@@ -133,6 +134,7 @@ pg_partdist_shmem_startup_hook(void)
 
     /* TX-TSO-MVCC P3：TSO 计数器 + 节点登记表（T3.1） */
     TsoShmemInit();
+    TsoClientShmemInit();
 }
 
 /* ---- SPI helpers ---- */

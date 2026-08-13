@@ -18,12 +18,14 @@ OBJS = \
 	src/shard_xid.o \
 	src/shard_clog.o \
 	src/shard_visibility.o \
-	src/tso.o
+	src/tso.o \
+	src/tso_client.o
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql
 
-PG_CPPFLAGS = -I$(CURDIR)/include
+PG_CPPFLAGS = -I$(CURDIR)/include -I$(shell $(PG_CONFIG) --includedir)
+SHLIB_LINK += -L$(shell $(PG_CONFIG) --libdir) -lpq
 
 REGRESS = \
 	01_extension_create \

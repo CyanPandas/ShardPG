@@ -1002,3 +1002,9 @@ CREATE OR REPLACE FUNCTION partdist_tso_commit_ts()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION partdist_tso_status()
 RETURNS text AS 'MODULE_PATHNAME', 'partdist_tso_status' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T3.2）：worker 取号通路的调试/验收入口（内部 C API 为正道）。
+CREATE OR REPLACE FUNCTION partdist_tso_client_start_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_start_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_client_commit_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_commit_ts' LANGUAGE C STRICT;

@@ -32,4 +32,13 @@ extern void TsoDefineGUCs(void);
 extern void RequestTsoShmem(void);
 extern void TsoShmemInit(void);
 
+/* ---- T3.2 worker 取号通路（tso_client.c） ---- */
+extern void TsoClientDefineGUCs(void);
+extern void RequestTsoClientShmem(void);
+extern void TsoClientShmemInit(void);
+extern int64 TsoGetStartTs(void);		/* 懒取 + 事务内缓存；遗留模式=0 */
+extern void TsoStashCommitTs(void);		/* PRE_COMMIT 暂存（临界区外） */
+extern int64 TsoStashedCommitTs(void);	/* 临界区内只读暂存 */
+extern void TsoClientClearActive(void);	/* 事务结束清缓存与活跃槽 */
+
 #endif							/* PARTDIST_TSO_H */

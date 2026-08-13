@@ -534,6 +534,7 @@ _PG_init(void)
      */
     ShardVisibilityDefineGUCs();
     TsoDefineGUCs();
+    TsoClientDefineGUCs();
     ShardVisibilityInstallHooks();
 
     /* Replay GUCs + launcher（FRD §7：worker 池 + 排他认领） */

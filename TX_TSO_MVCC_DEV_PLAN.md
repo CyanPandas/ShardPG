@@ -693,7 +693,7 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   blocked=t，里程碑门禁实测）；删标记重启新纪元从 1 起。金丝雀 r2 单跑
   50/0（shmem 布局/GUC 面变更零扰动）。内核零改动。
 
-#### T3.2 worker 取号通路（后端 libpq + 懒取 + fail-closed）
+#### T3.2 worker 取号通路（后端 libpq + 懒取 + fail-closed）——✅ 已完成（2026-08-13，`src/tso_client.c`）
 
 - **改**：worker 后端缓存到 coordinator 的 libpq 连接（会话生存期，断线
   重连一次，仍失败即 ERROR——绝不本地时钟顶替）；首次触达分片表懒取
@@ -701,6 +701,23 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   取 commit_ts（P3 单分片：合法窗口 = 写集确定后、决议持久化前，"尽晚取"）。
 - **验收**：每事务恰一次 start_ts RPC（含只读）；TSO 停摆时分片表读写
   fail-closed 报错、原生表不受扰；连接断后自愈一次。
+- **实施记要（2026-08-13，两处方案落地调整）**：① 地址来源从 node_map 改
+  **GUC `pg_partdist.tso_conninfo`**——node_map 查询要 SPI，可见性钩子上下文
+  用不了（与 T2.7 同因）；② **遗留模式**：conninfo 空 ⇒ 不 RPC、ts 一律 0
+  （P1/P2 语义原样），否则 596 基线的分片写会在 PRE_COMMIT 撞 TSO 报错；
+  fail-closed 只对"已配置但不可达"生效，strict 收紧归 T3.6。
+  pg_partdist 自链 libpq（PGXS `SHLIB_LINK += -lpq`，ldd 实证）。发号即登记
+  携带值 = 本节点活跃快照集合（shmem 每后端一槽，取号前算 min 随行上报，
+  事务结束清槽；槽满只降 GlobalSafeTs 精度不拦事务——偏小=安全方向）。
+  commit_ts 挂 `XACT_EVENT_PRE_COMMIT`（xact_map_n>0 才取；R-P3-1 第一道
+  防线：此处 ERROR=干净中止）。**实测修掉两个通路 bug**：RPC SQL 字面量
+  `0` 解析成 int4 撞不上 (int,bigint) 签名（显式 CAST）；节点号误用 GUC
+  原始值 -1（改走既有 `PartDistLocalNodeId()` 解析）——顺带把错误路径改成
+  "先存 libpq 错误串再弃连接"，否则 errdetail 永远只剩"连接建立失败"。
+  验收 13/13：同事务缓存命中/跨事务递增/commit>start；发号即登记携带实测
+  （B 携带 A 的活跃快照上报）；TSO 停摆 fail-closed 且原生表零扰；boot
+  防呆经 RPC 传导仍 fail-closed；重建后断连自愈；遗留模式双 0。金丝雀
+  test_shard_xid_p1 45/45（遗留模式含新 PRE_COMMIT 臂）+ r2 50/0。
 
 #### T3.3 ts 落账与真 SI 可见性
 
