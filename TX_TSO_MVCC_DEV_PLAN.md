@@ -747,13 +747,24 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   读者看全量。金丝雀五套（lwc/r2/P1×2/P2）见下。修掉一个隐患：
   cstring_to_text 隐式声明（缺 builtins.h，int 截断指针）。
 
-#### T3.4 §4.4 冲突中止（first-committer-wins）
+#### T3.4 §4.4 冲突中止（first-committer-wins）——✅ 已完成（2026-08-13）
 
 - **改**：行锁等待唤醒后加判定：xmax 持有者已提交且 commit_ts >
   本事务 start_ts ⇒ `serialization failure` 中止（SQLSTATE 40001）；
   不提供 RC 式 EPQ 重读（挂点在既有 xmax_wait/satisfies_update 臂上收敛）。
 - **验收**：经典 SI 双写用例（并发 UPDATE 同行，后提交者 40001）；
   不冲突路径（对方先回滚 / commit_ts < start_ts 的历史提交）不误报。
+- **实施记要（2026-08-13）**：改动收敛在 `sv_satisfies_update` 一处
+  （等待唤醒后 goto l1/l2 重评也到这里，无需另设等待臂检查）：xmax
+  COMMITTED 且 cts ≥ my start_ts ⇒ **直接 ereport 40001**（标准报错文案
+  "could not serialize access due to concurrent update" + errdetail 带两个
+  ts 值）——在扩展层 ERROR 使 EPQ 机器根本不启动，任何 PG 隔离级别下行为
+  一致；xmin 分支加对称防御（快照后诞生的行 TM_Invisible）。cts < my_ts
+  的历史提交结构性到不了该分支（那样的行对本快照不可见、扫描不选中）。
+  遗留模式（my_ts=0）保持 P2 行为（TM_Updated → EPQ 撞行锁禁令）。
+  验收 11/11：经典双写 40001（胜者值保留）；对方回滚不误报（本方成功）；
+  顺序提交不误报；快照内撞并发 DELETE 提交 40001。金丝雀 P1 45/45 +
+  P2 64/64（遗留冲突路径不变）。
 
 #### T3.5 GlobalSafeTs（机制就位，消费方 P5）
 

@@ -396,13 +396,18 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 {
 	HeapTupleHeader tuple = htup->t_data;
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
+	int64		my_ts;
+	int64		cts = 0;
 
 	if (!OidIsValid(shard))
 		return false;
 
 	ShardAccessGate(shard, "更新判定");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
+	/* T3.4：写侧到达这里前必经过扫描（快照已取），通常是缓存命中 */
+	my_ts = TsoGetStartTs();
+
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
 	{
 		case SXID_MY_OWN:
 			if (HeapTupleHeaderGetRawCommandId(tuple) >= curcid)
@@ -416,6 +421,12 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			*result = TM_Invisible;
 			return true;
 		case SXID_COMMITTED:
+			/* 快照之后才诞生的行：对本事务不可见（防御，正常扫描不会选中） */
+			if (my_ts > 0 && cts >= my_ts)
+			{
+				*result = TM_Invisible;
+				return true;
+			}
 			break;
 	}
 
@@ -426,7 +437,7 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, &cts))
 	{
 		case SXID_MY_OWN:
 			/* 本命令删的 = SelfModified；更早命令删的 = 不可见 */
@@ -440,6 +451,25 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			*result = TM_Ok;
 			break;
 		case SXID_COMMITTED:
+
+			/*
+			 * T3.4（§4.4 first-committer-wins）：目标行的删改在本事务快照
+			 * 之后提交 ⇒ 串行化冲突，直接 40001——不提供 RC 式 EPQ 重读
+			 * （在这里 ERROR，EPQ 机器根本不会启动；等待路径唤醒后 goto
+			 * l1/l2 重评也收敛到这里）。遗留模式（my_ts=0）保持 P2 行为：
+			 * 返回 TM_Updated/Deleted，后续 EPQ 撞行锁禁令报错。
+			 * cts < my_ts 的历史提交到不了这里（那样的行对本快照不可见，
+			 * 扫描不会选中；xmin 分支的防御同理）。
+			 */
+			if (my_ts > 0 && cts >= my_ts)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update"),
+						 errdetail("分片 %u 目标行的并发删改 commit_ts=" INT64_FORMAT
+								   " ≥ 本事务 start_ts=" INT64_FORMAT
+								   "（first-committer-wins，设计 §4.4）。",
+								   shard, cts, my_ts),
+						 errhint("重试事务。")));
 			*result = !ItemPointerEquals(&htup->t_self, &tuple->t_ctid) ?
 				TM_Updated : TM_Deleted;
 			break;
