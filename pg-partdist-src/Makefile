@@ -19,7 +19,8 @@ OBJS = \
 	src/shard_clog.o \
 	src/shard_visibility.o \
 	src/tso.o \
-	src/tso_client.o
+	src/tso_client.o \
+	src/gxid.o
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql

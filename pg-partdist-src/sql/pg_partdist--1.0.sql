@@ -1014,3 +1014,10 @@ CREATE OR REPLACE FUNCTION partdist_tso_heartbeat(node int, oldest bigint)
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_heartbeat' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION partdist_global_safe_ts()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_global_safe_ts' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T4.1）：连接加入协议与 globalXID 分配器。
+CREATE OR REPLACE FUNCTION partdist_join_global_txn(gxid bigint, start_ts bigint,
+                                                    coord_gsid bigint DEFAULT 0)
+RETURNS void AS 'MODULE_PATHNAME', 'partdist_join_global_txn' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_gxid_next()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_gxid_next' LANGUAGE C STRICT;

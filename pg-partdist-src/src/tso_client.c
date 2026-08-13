@@ -71,6 +71,8 @@ static TsoClientState *TsoClientCtl = NULL;
 static PGconn *tso_conn = NULL;
 static int64 cur_start_ts = 0;	/* 本事务分片快照；0 = 未取 */
 static int64 cur_commit_ts = 0; /* PRE_COMMIT 暂存；0 = 未取 */
+static int64 cur_gxid = 0;		/* T4.1：join 注入的全局事务号；0 = 无 */
+static int64 cur_coord_gsid = 0;	/* T4.1：协调者分片组；0 = 未知 */
 static char tso_last_err[256];	/* 最近一次失败原因（连接被弃后仍可报） */
 
 void
@@ -177,6 +179,8 @@ TsoClientClearActive(void)
 
 	cur_start_ts = 0;
 	cur_commit_ts = 0;
+	cur_gxid = 0;
+	cur_coord_gsid = 0;
 
 	if (TsoClientCtl == NULL)
 		return;
@@ -468,4 +472,79 @@ TsoRegisterHeartbeatWorker(void)
 	worker.bgw_main_arg = Int32GetDatum(0);
 	worker.bgw_notify_pid = 0;
 	RegisterBackgroundWorker(&worker);
+}
+
+/* ================= T4.1 连接加入协议（§9.2 第 2 层） ================= */
+
+/*
+ * 注入协调者下发的 start_ts（参与者后端不自取、不 RPC）。
+ * 必须登记进本节点活跃集合——否则本节点心跳携带的 oldest 看不见这个远端
+ * 快照，GlobalSafeTs 会越过活跃远端读（P4_PRECHECK 结论五 / R-P4-2）。
+ * 栅栏语义沿用：本节点自己的心跳新鲜度保护该快照。
+ */
+void
+TsoInjectStartTs(int64 ts)
+{
+	if (ts <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("注入的 start_ts 必须 > 0")));
+	if (!tso_configured())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("本节点未配置 TSO（pg_partdist.tso_conninfo），拒绝加入全局事务"),
+				 errdetail("未配置节点没有心跳/栅栏保护，注入快照会脱离 "
+						   "GlobalSafeTs 视野（fail-closed）。")));
+	if (cur_start_ts != 0 && cur_start_ts != ts)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("本事务已持有 start_ts=" INT64_FORMAT
+						"，不能改注 " INT64_FORMAT, cur_start_ts, ts)));
+
+	cur_start_ts = ts;
+	tso_active_register(ts);
+}
+
+int64
+TsoCurrentGxid(void)
+{
+	return cur_gxid;
+}
+
+int64
+TsoCurrentCoordGsid(void)
+{
+	return cur_coord_gsid;
+}
+
+/*
+ * partdist_join_global_txn(gxid, start_ts, coord_gsid) —— 参与者后端登记
+ * 三元组（§9.2 第 2 层）。T4.1 交付直调形态（协调者→参与者的自动发送
+ * 通道 = 发起端登记表 + 参与端回拉，随 T4.2 MX 路由一体接线）。
+ * coord_gsid=0 表示暂未知（§4.2 NULL 不变式的兜底分支照常成立）。
+ */
+PG_FUNCTION_INFO_V1(partdist_join_global_txn);
+Datum
+partdist_join_global_txn(PG_FUNCTION_ARGS)
+{
+	int64		gxid = PG_GETARG_INT64(0);
+	int64		start_ts = PG_GETARG_INT64(1);
+	int64		coord_gsid = PG_GETARG_INT64(2);
+
+	if (gxid <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("gxid 必须 > 0")));
+	if (cur_gxid != 0 && cur_gxid != gxid)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("本事务已加入 gxid=" INT64_FORMAT
+						"，不能改投 " INT64_FORMAT, cur_gxid, gxid)));
+
+	TsoInjectStartTs(start_ts);
+	cur_gxid = gxid;
+	if (coord_gsid > 0)
+		cur_coord_gsid = coord_gsid;
+
+	PG_RETURN_VOID();
 }
