@@ -1,0 +1,328 @@
+/*
+ * shard_clog.c
+ *
+ * 分片级 clog 存储层最小实现（设计 §5.3，P2 T2.1）。
+ * 语义、并发与持久化契约见 shard_clog.h 头注释。
+ */
+#include "postgres.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "shard_clog.h"
+
+#include "access/transam.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
+#include "common/relpath.h"
+
+StaticAssertDecl(sizeof(ShardClogSlot) == 32,
+				 "ShardClogSlot 必须是 32 字节（pg_shard_clog 的磁盘格式）");
+StaticAssertDecl(offsetof(ShardClogSlot, status) == 24,
+				 "status 必须落在偏移 24");
+
+static void
+ShardClogSegPath(char *path, size_t pathlen, Oid shard, uint32 segno)
+{
+	snprintf(path, pathlen, "%s/%s/%u/%08X",
+			 DataDir, SHARD_CLOG_DIR, shard, segno);
+}
+
+static void
+ShardClogDirPath(char *path, size_t pathlen, Oid shard)
+{
+	snprintf(path, pathlen, "%s/%s/%u", DataDir, SHARD_CLOG_DIR, shard);
+}
+
+/* EEXIST 是常态 —— 多后端并发建同一个目录 */
+static void
+ShardClogEnsureDir(Oid shard)
+{
+	char		path[MAXPGPATH];
+
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, SHARD_CLOG_DIR);
+	if (MakePGDirectory(path) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法创建目录 \"%s\": %m", path)));
+
+	ShardClogDirPath(path, MAXPGPATH, shard);
+	if (MakePGDirectory(path) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法创建目录 \"%s\": %m", path)));
+}
+
+/* fsync 分片目录 —— 新建段文件后目录项也要持久（durable_rename 同款纪律） */
+static void
+ShardClogFsyncDir(Oid shard)
+{
+	char		path[MAXPGPATH];
+	int			fd;
+
+	ShardClogDirPath(path, MAXPGPATH, shard);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法打开目录 \"%s\": %m", path)));
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 目录 \"%s\" fsync 失败: %m", path)));
+	}
+	CloseTransientFile(fd);
+}
+
+/*
+ * 打开段文件。create=false 且不存在时返回 -1（读路径当作全洞）。
+ * create=true 时若段是新建的，顺带 fsync 分片目录（*created 告知调用方，
+ * 但目录持久化在本函数内已完成）。调用方负责 CloseTransientFile。
+ */
+static int
+ShardClogOpenSegFile(Oid shard, uint32 segno, bool create)
+{
+	char		path[MAXPGPATH];
+	int			fd;
+
+	ShardClogSegPath(path, MAXPGPATH, shard, segno);
+
+	/* 先试已存在的（多数路径），免掉目录操作 */
+	fd = OpenTransientFile(path, (create ? O_RDWR : O_RDONLY) | PG_BINARY);
+	if (fd >= 0)
+		return fd;
+	if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法打开分片 clog 段 \"%s\": %m", path)));
+	if (!create)
+		return -1;
+
+	ShardClogEnsureDir(shard);
+	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法创建分片 clog 段 \"%s\": %m", path)));
+	ShardClogFsyncDir(shard);
+	return fd;
+}
+
+/* 写一个槽（幂等 pwrite，无锁 —— 论证见头文件）。durable=true 时 fsync 段。 */
+static void
+ShardClogWriteSlot(Oid shard, TransactionId sxid,
+				   const ShardClogSlot *slot, bool durable)
+{
+	uint32		segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
+	off_t		off = (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT)
+		* SHARD_CLOG_SLOT_SIZE;
+	int			fd;
+	ssize_t		nb;
+
+	if (sxid < FirstNormalTransactionId)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_partdist: 分片 clog 拒写保留 xid %u（shard %u）",
+						sxid, shard)));
+
+	fd = ShardClogOpenSegFile(shard, segno, true);
+
+	do
+	{
+		nb = pg_pwrite(fd, slot, sizeof(ShardClogSlot), off);
+	} while (nb < 0 && errno == EINTR);
+
+	if (nb != (ssize_t) sizeof(ShardClogSlot))
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 分片 clog 写入失败 shard=%u xid=%u: %m",
+						shard, sxid)));
+	}
+
+	if (durable && pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 分片 clog 段 fsync 失败 shard=%u seg=%08X: %m",
+						shard, segno)));
+	}
+	CloseTransientFile(fd);
+}
+
+void
+ShardClogSetRunning(Oid shard, TransactionId sxid)
+{
+	ShardClogSlot slot;
+
+	memset(&slot, 0, sizeof(slot));	/* 全零 = RUNNING，字面即语义 */
+	ShardClogWriteSlot(shard, sxid, &slot, false);
+}
+
+void
+ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed)
+{
+	ShardClogSlot slot;
+
+	memset(&slot, 0, sizeof(slot));
+	slot.status = (uint32) (committed ? TXN_COMMITTED : TXN_ABORTED);
+	ShardClogWriteSlot(shard, sxid, &slot, true);
+}
+
+TxnStatus
+ShardClogReadStatus(Oid shard, TransactionId sxid)
+{
+	uint32		segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
+	off_t		off = (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT)
+		* SHARD_CLOG_SLOT_SIZE;
+	ShardClogSlot slot;
+	int			fd;
+	ssize_t		nb;
+
+	/* 0/1/2 保留号永不落账；防御性按未决处理 */
+	if (sxid < FirstNormalTransactionId)
+		return TXN_RUNNING;
+
+	fd = ShardClogOpenSegFile(shard, segno, false);
+	if (fd < 0)
+		return TXN_RUNNING;		/* 整段没建过 = 全洞 = 未决 */
+
+	do
+	{
+		nb = pg_pread(fd, &slot, sizeof(slot), off);
+	} while (nb < 0 && errno == EINTR);
+
+	if (nb != (ssize_t) sizeof(slot) && nb != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 分片 clog 读取不完整 shard=%u xid=%u (%zd/%u)",
+						shard, sxid, nb, SHARD_CLOG_SLOT_SIZE)));
+	}
+	CloseTransientFile(fd);
+
+	if (nb == 0)
+		return TXN_RUNNING;		/* 文件尾之外 = 洞 */
+
+	return (TxnStatus) slot.status;
+}
+
+/* ================= DROP TABLE 提交时点 GC ================= */
+
+#define SHARD_CLOG_PENDING_DROPS_MAX 16
+
+static Oid	pending_drops[SHARD_CLOG_PENDING_DROPS_MAX];
+static int	pending_drops_n = 0;
+
+void
+ShardClogRememberDrop(Oid shard)
+{
+	int			i;
+
+	for (i = 0; i < pending_drops_n; i++)
+		if (pending_drops[i] == shard)
+			return;
+
+	if (pending_drops_n >= SHARD_CLOG_PENDING_DROPS_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_partdist: 单事务最多 DROP %d 张分片打标表",
+						SHARD_CLOG_PENDING_DROPS_MAX)));
+
+	pending_drops[pending_drops_n++] = shard;
+}
+
+bool
+ShardClogHasPendingDrops(void)
+{
+	return pending_drops_n > 0;
+}
+
+/*
+ * 提交时点执行删除。提交已成事实，这里不许 ERROR（会把提交翻成 PANIC 级
+ * 混乱）—— 删不掉只 WARNING，残留是无害孤儿（头文件"已知边界"）。
+ * 崩在提交记录与本函数之间同理：孤儿目录，T2.7 注册前清目录兜底 OID 复用。
+ */
+void
+ShardClogAtCommit(void)
+{
+	int			i;
+
+	for (i = 0; i < pending_drops_n; i++)
+	{
+		char		path[MAXPGPATH];
+		struct stat st;
+
+		ShardClogDirPath(path, MAXPGPATH, pending_drops[i]);
+		/* 目录可能从未建过（表没写过判决）——rmtree 会自己打 WARNING，先探 */
+		if (stat(path, &st) == 0 && !rmtree(path, true))
+			ereport(WARNING,
+					(errmsg("pg_partdist: 分片 clog 目录 \"%s\" 删除不完整，"
+							"残留为无害孤儿", path)));
+
+		snprintf(path, MAXPGPATH, "%s/pg_shard_xid/%u",
+				 DataDir, pending_drops[i]);
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 水位文件 \"%s\" 删除失败: %m", path)));
+	}
+	pending_drops_n = 0;
+}
+
+void
+ShardClogAtAbort(void)
+{
+	pending_drops_n = 0;
+}
+
+/* ================= 验收/运维用 SQL 包装 =================
+ * T2.1 验收与 T2.8 套件直接 CREATE FUNCTION ... '$libdir/pg_partdist' 使用；
+ * 正式并入扩展 SQL 文件随 T2.4 的显式函数一批做。
+ */
+
+PG_FUNCTION_INFO_V1(partdist_shard_clog_read);
+Datum
+partdist_shard_clog_read(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+
+	PG_RETURN_INT32((int32) ShardClogReadStatus(shard, sxid));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_clog_write);
+Datum
+partdist_shard_clog_write(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	int32		status = PG_GETARG_INT32(2);
+
+	switch ((TxnStatus) status)
+	{
+		case TXN_RUNNING:
+			ShardClogSetRunning(shard, sxid);
+			break;
+		case TXN_COMMITTED:
+			ShardClogSetVerdict(shard, sxid, true);
+			break;
+		case TXN_ABORTED:
+			ShardClogSetVerdict(shard, sxid, false);
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("status 只接受 0(RUNNING)/2(COMMITTED)/3(ABORTED)，"
+							"PREPARED 是 P4 的事")));
+	}
+	PG_RETURN_VOID();
+}

@@ -383,7 +383,7 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   GUC 白名单降级为并集通道。
   测试：本任务不写代码，零测试；两条新风险 R-P2-1/R-P2-2 已入 §5。
 
-#### T2.1 分片域 clog（存储层，扩展侧）
+#### T2.1 分片域 clog（存储层，扩展侧）——✅ 已完成（2026-08-13，`src/shard_clog.c` + `include/shard_clog.h`）
 
 - **改**：enhanced_clog 增"**每分片**"域 `pg_gclog/shard_<oid>/`，与既有每来源
   节点域并存互不干扰（T2.0 ① 定案为准）；槽扩 32B {globalXID, start_ts,
@@ -396,6 +396,21 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   回滚不删）——P1 登记的孤儿文件债在此清偿。
 - **验收**：落 RUNNING / 改 COMMITTED / 改 ABORTED / 崩溃重读；稀疏段寻址正确；
   DROP 提交后两类文件消失、回滚不消失；既有每来源节点域回归零扰动。
+- **实施记要（2026-08-13）**：按 P2_PRECHECK 结论一落地——32B 槽（StaticAssert
+  钉死）、`pg_shard_clog/<oid>/` 独立顶层目录、无锁幂等 pwrite。**持久化契约**
+  写进头文件：判决写**立即 fsync**（本目录对 checkpointer 不可见，检查点推过
+  提交记录后崩溃将无 redo 补标——每提交一次 fsync 是 P2 接受的代价）；RUNNING
+  写不 fsync（洞=RUNNING，丢失恒安全，且同段判决 fsync 顺带刷下）；新建段
+  fsync 分片目录一次。DROP GC 挂 ShardXidUtilityGuard 的 DropStmt 分支（标准
+  ProcessUtility **之前**解析名字，执行后 catalog 已查不到）+ shard_xid
+  XactCallback 提交结算（提交时点不许 ERROR，删不掉降 WARNING）；PRE_PREPARE
+  禁令扩含挂起 DROP（GC 无法跟去别的会话结算）。验收 28/28 绿（裸层读写/保留号
+  拒写/跨段寻址两段文件/immediate 崩溃后判决存活/水位文件/DROP 回滚不删提交删/
+  DROP+PREPARE 拒绝）；旧域金丝雀 test_txn_layer_r2 单跑 50/0。测试中修掉
+  1 个实现小缺陷（rmtree 对不存在目录自打 WARNING——先 stat 再删）和 1 个
+  测试法陷阱（**`SELECT fn() IS NULL OR true` 被规划器常量折叠，volatile 函数
+  根本不执行**——验收断言全体改"多语句 + tail -1"，已入坑清单）。其余套件
+  按规则③不跑（分叉路径未动，白名单空=零开销谓词一次比较）。
 
 #### T2.2 内核补丁 0007（commit/abort 记录体扩展 + redo 落账）
 

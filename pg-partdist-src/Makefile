@@ -16,6 +16,7 @@ OBJS = \
 	src/dtx/dtx_participant.o \
 	src/raft_boundary.o \
 	src/shard_xid.o \
+	src/shard_clog.o \
 	src/shard_visibility.o
 
 EXTENSION = pg_partdist

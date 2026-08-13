@@ -9,6 +9,7 @@
  */
 #include "pg_partdist.h"
 #include "shard_xid.h"
+#include "shard_clog.h"
 #include "shard_visibility.h"
 
 #include <unistd.h>
@@ -495,11 +496,12 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			 * P1 禁 2PC 含分片写：PREPARE 后由别的会话 COMMIT/ROLLBACK
 			 * PREPARED，本后端映射已清、临时提交表条目会永挂 RUNNING。
 			 * PRE_PREPARE 是最后一个还能安全 ERROR 的点。
+			 * 含分片表 DROP 的事务同禁：挂起的 GC 无法跟去别的会话结算。
 			 */
-			if (xact_map_n > 0)
+			if (xact_map_n > 0 || ShardClogHasPendingDrops())
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("P1 不支持对含分片打标表写入的事务执行 PREPARE TRANSACTION")));
+						 errmsg("P1 不支持对含分片打标表写入/删除的事务执行 PREPARE TRANSACTION")));
 			break;
 
 		case XACT_EVENT_COMMIT:
@@ -508,6 +510,7 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			for (i = 0; i < xact_map_n; i++)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, true);
 			xact_map_n = 0;
+			ShardClogAtCommit();	/* DROP TABLE 的文件 GC，提交才删 */
 			break;
 
 		case XACT_EVENT_ABORT:
@@ -515,11 +518,13 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			for (i = 0; i < xact_map_n; i++)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, false);
 			xact_map_n = 0;
+			ShardClogAtAbort();
 			break;
 
 		case XACT_EVENT_PREPARE:
-			/* 有分片写的事务在 PRE_PREPARE 已被拦，这里只会是空映射 */
+			/* 有分片写/DROP 的事务在 PRE_PREPARE 已被拦，这里只会是空的 */
 			xact_map_n = 0;
+			ShardClogAtAbort();
 			break;
 
 		default:
@@ -683,5 +688,30 @@ ShardXidUtilityGuard(Node *parsetree)
 
 		if (stmt->relation != NULL)
 			shard_xid_guard_range_var(cfg, stmt->relation, "REINDEX");
+	}
+	else if (IsA(parsetree, DropStmt))
+	{
+		/*
+		 * DROP TABLE 分片打标表：登记提交时点的文件 GC（pg_shard_clog/<oid>
+		 * + pg_shard_xid/<oid>，T2.1）。必须在标准 ProcessUtility 之前解析
+		 * 名字 —— 执行后本事务内 catalog 里已经查不到了。级联删除（DROP
+		 * SCHEMA ... CASCADE）不走这个分支，孤儿文件无害（shard_clog.h
+		 * 已知边界）。
+		 */
+		DropStmt   *stmt = (DropStmt *) parsetree;
+
+		if (stmt->removeType == OBJECT_TABLE)
+		{
+			ListCell   *lc;
+
+			foreach(lc, stmt->objects)
+			{
+				RangeVar   *rv = makeRangeVarFromNameList((List *) lfirst(lc));
+				Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+
+				if (OidIsValid(relid) && oid_whitelisted(cfg, relid))
+					ShardClogRememberDrop(relid);
+			}
+		}
 	}
 }
