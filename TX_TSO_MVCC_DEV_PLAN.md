@@ -669,7 +669,7 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   两条新风险 R-P3-1（无 ts 判决落账 = SI 静默破坏，PRE_COMMIT ERROR +
   钩子 PANIC 双防线）/R-P3-2（双 ts 宇宙串线）已入 §5。本任务零代码零测试。
 
-#### T3.1 TSO 服务（coordinator：内存计数器 + 发号即登记 + boot 防呆）
+#### T3.1 TSO 服务（coordinator：内存计数器 + 发号即登记 + boot 防呆）——✅ 已完成（2026-08-13，`src/tso.c` + `include/tso.h`）
 
 - **改**：coordinator shmem 单调 int64 计数器；SQL 接口
   `partdist_tso_start_ts(node, oldest_or_null)`（**发号即登记**：先把该节点
@@ -679,6 +679,19 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   §2.4 配套 2。
 - **验收**：单调性（并发取号无重复无回退）；发号即登记原子可见；重启后
   拒发号且报错指明重建流程；删标记后恢复服务。
+- **实施记要（2026-08-13）**：新 GUC `pg_partdist.tso_master`（默认 off，
+  只有 master 置 on，非 master 收到调用一律 ERROR——防误连开出第二纪元）+
+  `pg_partdist.tso_lease_ms`（登记租约，T3.5 消费，本期落库即填）。
+  boot 标记顺序铁律：**标记持久（文件+目录 fsync）先于第一个号发出**——
+  崩在中间只多一次"误拦重启"（删标记恢复），绝不"发过号却检测不到"。
+  发号即登记语义：oldest=0（无活跃）⇒ 新号即成为该节点最老活跃；否则
+  min(携带值, 新号)；同一排它锁临界区内完成，无竞态窗。观测入口
+  `partdist_tso_status()`（counter/served/blocked/逐节点登记，验收与 T3.5
+  断言用）。验收 19/19：非 master 拒服务；首号=1 且标记落盘；发号即登记
+  两态（无携带→新号、携带 2→min=2）；**并发唯一性 2 后端×200 全唯一且
+  会话内单调**；重启拒发号响亮停摆（start/commit 双入口 + status
+  blocked=t，里程碑门禁实测）；删标记重启新纪元从 1 起。金丝雀 r2 单跑
+  50/0（shmem 布局/GUC 面变更零扰动）。内核零改动。
 
 #### T3.2 worker 取号通路（后端 libpq + 懒取 + fail-closed）
 

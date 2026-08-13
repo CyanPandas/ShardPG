@@ -5,6 +5,7 @@
 #include "shard_replay.h"
 #include "shard_xid.h"
 #include "shard_visibility.h"
+#include "tso.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -58,6 +59,9 @@ pg_partdist_shmem_request_hook(void)
 
     /* TX-TSO-MVCC P1：临时提交表（T1.6 桩 + T1.7 反查合一） */
     RequestShardCommitShmem();
+
+    /* TX-TSO-MVCC P3：TSO 计数器 + 节点登记表（T3.1） */
+    RequestTsoShmem();
 }
 
 void
@@ -126,6 +130,9 @@ pg_partdist_shmem_startup_hook(void)
 
     /* TX-TSO-MVCC P1：临时提交表（T1.6 桩 + T1.7 反查合一） */
     ShardCommitShmemInit();
+
+    /* TX-TSO-MVCC P3：TSO 计数器 + 节点登记表（T3.1） */
+    TsoShmemInit();
 }
 
 /* ---- SPI helpers ---- */

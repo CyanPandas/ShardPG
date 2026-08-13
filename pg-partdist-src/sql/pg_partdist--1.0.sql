@@ -993,3 +993,12 @@ CREATE OR REPLACE FUNCTION partdist_set_shard_mvcc(rel regclass,
 RETURNS void
 AS 'MODULE_PATHNAME', 'partdist_set_shard_mvcc'
 LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T3.1）：TSO 服务入口（v1 = master 内存计数器，设计 §2.4）。
+-- 只有 pg_partdist.tso_master=on 的节点服务；worker 经 libpq 调用（T3.2）。
+CREATE OR REPLACE FUNCTION partdist_tso_start_ts(node int, oldest bigint)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_start_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_commit_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_status()
+RETURNS text AS 'MODULE_PATHNAME', 'partdist_tso_status' LANGUAGE C STRICT;

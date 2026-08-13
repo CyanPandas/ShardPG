@@ -14,6 +14,7 @@
 #include "dtx_participant.h"
 #include "shard_xid.h"
 #include "shard_visibility.h"
+#include "tso.h"
 
 #include "storage/bufmgr.h"
 
@@ -532,6 +533,7 @@ _PG_init(void)
      * GUC。同样白名单为空即零变化（is_shard_rel 一次比较返回 false）。
      */
     ShardVisibilityDefineGUCs();
+    TsoDefineGUCs();
     ShardVisibilityInstallHooks();
 
     /* Replay GUCs + launcher（FRD §7：worker 池 + 排他认领） */
