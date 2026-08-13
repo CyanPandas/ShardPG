@@ -15,6 +15,8 @@
 | 2 | `0001v2-wal-insert-hook-smgr.patch` | 上者的**增量**：让 hook 对 `RM_SMGR` 这类**无块引用**的记录也触发（`nblocks == 0`） | 物理回放副本必须捕获 smgr create/truncate，否则 VACUUM 尾部截断后副本文件静默分叉（FRD §5.2） |
 | 3 | `0002-flushbuffer-lsn-exempt-hook.patch` | `buffer_flush_lsn_exempt_hook`（`bufmgr.c/.h`） | 物理回放副本的页携带 **origin 坐标**的 LSN，本地 pg_wal 没有那个位置；`FlushBuffer` 对这类页跳过 `XLogFlush`（FRD §8.3） |
 | 4 | `0004-pre-record-commit-hook.patch` | `pre_record_commit_hook`（`xact.c/.h`） | DTX-2PC 的决议挂点：在 `CommitTransaction()` 里、**全部** `XACT_EVENT_PRE_COMMIT` 回调之后、`RecordTransactionCommit()` 之前（`DTX_2PC_DESIGN.md` §9.3） |
+| 5 | `0005-shard-xid-stamping.patch` | `shard_relation_xid_hook`（新头文件 `access/shard_stamp.h`；改 `heapam.c`/`heapam_xlog.h`/`pruneheap.c`） | TX-TSO-MVCC P1：分片表元组 xmin/xmax 改盖**分片 xid**（记录头 xid 保持原生）；insert/multi_insert/update 主数据末尾追加 4 字节分片 xid 尾缀（标志位 `XLH_INSERT_SHARD_XID`/`XLH_UPDATE_SHARD_XID` = 1<<7），redo 从末尾取号保证三方页面逐字节一致；delete/lock 的 xmax 走既有记录体字段零格式变更；分片表禁 on-access 剪枝（P1_PRECHECK 结论 D）、禁行锁/COPY FREEZE/推测插入（`TX_TSO_MVCC_DEV_PLAN.md` T1.4/T1.5） |
+| 6 | `0006-shard-visibility-hooks.patch` | `shard_visibility_hooks`（扩展 `shard_stamp.h`；改 `heapam_visibility.c`/`heapam.c`） | TX-TSO-MVCC P1（T1.6/T1.7 内核部分）：六个 Satisfies* 入口按钩子分叉——MVCC/Self/Dirty/Update 由扩展裁决（分片 xid 绝不进原生 clog/procarray），VacuumHorizon/HistoricMVCC 对分片元组防御性 ERROR，Toast 不分叉（原生路径对正常元组不查 clog，天然安全）；heap_delete/heap_update 冲突等待臂：分片 xmax 经 `xmax_wait` 钩子翻译成持有者**原生 xid** 再等待，然后 `goto l1/l2` 重评（判定收敛在分叉的 SatisfiesUpdate）；`compute_new_xmax_infomask` 三处调用点 + 新元组 xmax 继承对分片表强制 `HEAP_XMAX_INVALID` 简单路径——TM_Ok 到达即旧 xmax 已死且无锁者，原生机器会拿分片 xid 误组 multixact（实测缺陷：`new multixact has more than one updating member`）；heap_delete/update 的 `PageSetPrunable` 对分片表改用原生 xid——redo 用记录头原生 xid 设此提示，普通路径若用分片 xid 则页头分叉（T1.9 实测） |
 
 > **为什么 0004 不能用 XactCallback 代替**：回调是 LIFO 顺序，后加载的扩展反而先
 > 被调用，因此扩展无法表达"在**所有**其它扩展的 PRE_COMMIT 动作都完成之后再做
@@ -36,9 +38,12 @@
 携带的是 **leader 坐标**的 LSN，本地 pg_wal 里根本没有那个位置（FRD §8.3）。
 缺它则刷脏时 `XLogFlush` 会等一个永远不会到来的 LSN。
 
-> **★★ 三个补丁全是 `pg_partdist` 的编译期硬依赖，缺任何一个都编不过。**
-> 实测缺 0002 时的报错：
-> `src/pg_partdist.c: error: 'buffer_flush_lsn_exempt_hook' undeclared`。
+> **★★ 0001/0001v2/0002 加上 0005/0006 都是 `pg_partdist` 的编译期硬依赖，缺
+> 任何一个都编不过。** 实测缺 0002 时的报错：
+> `src/pg_partdist.c: error: 'buffer_flush_lsn_exempt_hook' undeclared`；
+> 缺 0005 时 `src/shard_xid.c` 会因找不到 `access/shard_stamp.h` 直接编译失败；
+> 缺 0006 时 `src/shard_visibility.c` 会因 `ShardVisibilityHooks` 未定义编译失败
+> （2026-08-13 起，两文件分别实现这两个钩子）。
 
 ## 补丁与仓库里 `pg-install/` 的关系（复现路径的关键）
 
@@ -66,6 +71,8 @@ docker exec -u postgres <容器> bash -lc '
 docker cp <容器>:/work/pg-install /tmp/pg-install-new
 cp /tmp/pg-install-new/bin/postgres                                   pg-install/bin/
 cp /tmp/pg-install-new/include/postgresql/server/storage/bufmgr.h     pg-install/include/postgresql/server/storage/
+cp /tmp/pg-install-new/include/postgresql/server/access/shard_stamp.h pg-install/include/postgresql/server/access/   # 0005 新增
+cp /tmp/pg-install-new/include/postgresql/server/access/heapam_xlog.h pg-install/include/postgresql/server/access/   # 0005 改动
 # （新增/改动的头文件按补丁涉及范围补齐）
 ```
 
@@ -76,6 +83,10 @@ grep -c wal_insert_hook               pg-install/include/postgresql/server/acces
 nm -D pg-install/bin/postgres | grep -c wal_insert_hook                                          # 0001v2 应 =1
 grep -c buffer_flush_lsn_exempt_hook  pg-install/include/postgresql/server/storage/bufmgr.h      # 0002  应 >0
 nm -D pg-install/bin/postgres | grep -c buffer_flush_lsn_exempt                                  # 0002  应 =1
+grep -c shard_relation_xid_hook       pg-install/include/postgresql/server/access/shard_stamp.h  # 0005  应 >0
+nm -D pg-install/bin/postgres | grep -c shard_relation_xid_hook                                  # 0005  应 =1
+grep -c ShardVisibilityHooks          pg-install/include/postgresql/server/access/shard_stamp.h  # 0006  应 >0
+nm -D pg-install/bin/postgres | grep -c shard_visibility_hooks                                   # 0006  应 =1
 ```
 
 源码基线 = `postgres-src` submodule 的 `.gitlink` commit + 上述三个补丁。
@@ -87,7 +98,9 @@ cd postgres-src
 for p in 0001-add-wal-insert-hook \
          0001v2-wal-insert-hook-smgr \
          0002-flushbuffer-lsn-exempt-hook \
-         0004-pre-record-commit-hook; do
+         0004-pre-record-commit-hook \
+         0005-shard-xid-stamping \
+         0006-shard-visibility-hooks; do
   patch -p1 --forward < ../pg-partdist-src/patches/$p.patch || exit 1
 done
 ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline
@@ -101,8 +114,8 @@ make -j$(nproc) && make install
 
 ```bash
 nm -D /work/pg-install/bin/postgres | grep -E \
-  'wal_insert_hook|buffer_flush_lsn_exempt_hook|pre_record_commit_hook'
-# 应输出三行
+  'wal_insert_hook|buffer_flush_lsn_exempt_hook|pre_record_commit_hook|shard_relation_xid_hook|shard_visibility_hooks'
+# 应输出五行
 ```
 
 ## ★ `pg-install/` 必须与 `patches/` 同步提交

@@ -14,7 +14,9 @@ OBJS = \
 	src/replay/replay_checkpoint.o \
 	src/replay/replay_worker.o \
 	src/dtx/dtx_participant.o \
-	src/raft_boundary.o
+	src/raft_boundary.o \
+	src/shard_xid.o \
+	src/shard_visibility.o
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql

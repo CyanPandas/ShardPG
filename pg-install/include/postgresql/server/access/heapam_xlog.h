@@ -71,6 +71,8 @@
 
 /* all_frozen_set always implies all_visible_set */
 #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
+/* pg_partdist patch 0005: main data ends with the shard xid (4 bytes) */
+#define XLH_INSERT_SHARD_XID					(1<<7)
 
 /*
  * xl_heap_update flag values, 8 bits are available.
@@ -84,6 +86,8 @@
 #define XLH_UPDATE_CONTAINS_NEW_TUPLE			(1<<4)
 #define XLH_UPDATE_PREFIX_FROM_OLD				(1<<5)
 #define XLH_UPDATE_SUFFIX_FROM_OLD				(1<<6)
+/* pg_partdist patch 0005: main data ends with the shard xid (4 bytes) */
+#define XLH_UPDATE_SHARD_XID					(1<<7)
 
 /* convenience macro for checking whether any form of old tuple was logged */
 #define XLH_UPDATE_CONTAINS_OLD						\

@@ -12,6 +12,8 @@
 #include "shard_replay.h"
 #include "global_mvcc.h"
 #include "dtx_participant.h"
+#include "shard_xid.h"
+#include "shard_visibility.h"
 
 #include "storage/bufmgr.h"
 
@@ -310,6 +312,14 @@ partdist_process_utility(PlannedStmt *pstmt,
                                 context, params, queryEnv, dest, qc);
 
     /*
+     * TX-TSO-MVCC P1：VACUUM/ANALYZE/CLUSTER 点到分片打标表一律拦下 ——
+     * 原生 clog 会误判分片 xid，回收/重写路径会删活元组（P1_PRECHECK 结论 D）。
+     * 白名单为空时一次指针比较即返回。
+     */
+    if (pstmt->utilityStmt != NULL)
+        ShardXidUtilityGuard(pstmt->utilityStmt);
+
+    /*
      * DTX-2PC：截下 PREPARE TRANSACTION '<gid>'。这是**唯一**能同时看到 gid
      * 和本事务触达集合的位置 —— PRE_PREPARE 回调里拿不到 gid（prepareGID 是
      * xact.c 的 static），而语句执行完事务就已经 prepared 了。
@@ -510,6 +520,20 @@ _PG_init(void)
     /* DTX-2PC 接线总开关 */
     PartDistDtxDefineGUCs();
 
+    /*
+     * TX-TSO-MVCC P1（T1.1–T1.3）：白名单 GUC（钩子与回调的安装在下面，
+     * 必须晚于 PartWALXactCallback 注册，见彼处注释）。白名单默认为空 ⇒
+     * 钩子首个比较即返回，既有行为零变化。
+     */
+    ShardXidDefineGUCs();
+
+    /*
+     * TX-TSO-MVCC P1（T1.6–T1.8）：补丁 0006 的可见性分叉钩子 + 安全网
+     * GUC。同样白名单为空即零变化（is_shard_rel 一次比较返回 false）。
+     */
+    ShardVisibilityDefineGUCs();
+    ShardVisibilityInstallHooks();
+
     /* Replay GUCs + launcher（FRD §7：worker 池 + 排他认领） */
     DefineReplayGUCs();
     RegisterReplayLauncher();
@@ -530,6 +554,16 @@ _PG_init(void)
 
     /* Transaction callback: write PartWAL at PRE_COMMIT, discard on ABORT */
     RegisterXactCallback(PartWALXactCallback, NULL);
+
+    /*
+     * TX-TSO-MVCC P1：分片 xid 打标钩子 + 事务回调。**必须在
+     * PartWALXactCallback 之后注册**——回调按 LIFO 调用，后注册者先执行：
+     * PRE_PREPARE 的"含分片写禁 PREPARE"禁令要在 PartWAL 把字节刷进
+     * 分区流（并触发 raft 复制）之前发作，否则被判死刑的事务字节已进流，
+     * 中止还会打断在途复制，让 leader 本地 plsn 跑到多数派已提交位点前头
+     * （T1.9 实测：follower 追平永远差一条）。
+     */
+    ShardXidInstallHook();
 }
 
 /* ---- SQL-callable functions ---- */

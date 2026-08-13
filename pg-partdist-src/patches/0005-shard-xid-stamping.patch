@@ -1,0 +1,311 @@
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index b251653540..61474406d6 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -75,6 +75,48 @@
+ #include "utils/snapmgr.h"
+ #include "utils/spccache.h"
+ #include "utils/syscache.h"
++#include "access/shard_stamp.h"
++
++/* pg_partdist patch 0005: shard-managed relations stamp tuples with the
++ * extension-supplied per-shard xid instead of the native xid.  The record
++ * header xid stays native; redo re-derives the shard xid from the record
++ * body (see shard_stamp.h). */
++shard_relation_xid_hook_type shard_relation_xid_hook = NULL;
++
++static inline TransactionId
++shard_stamp_xid(Relation relation, TransactionId xid, bool *is_shard)
++{
++	TransactionId sxid;
++
++	if (shard_relation_xid_hook &&
++		shard_relation_xid_hook(relation, true, &sxid))
++	{
++		if (is_shard)
++			*is_shard = true;
++		return sxid;
++	}
++	if (is_shard)
++		*is_shard = false;
++	return xid;
++}
++
++static inline bool
++shard_relation_p(Relation relation)
++{
++	return shard_relation_xid_hook &&
++		shard_relation_xid_hook(relation, false, NULL);
++}
++
++static inline TransactionId
++shard_xid_from_maindata(XLogReaderState *record)
++{
++	Size		len = XLogRecGetDataLen(record);
++	TransactionId sxid;
++
++	memcpy(&sxid, XLogRecGetData(record) + len - sizeof(TransactionId),
++		   sizeof(TransactionId));
++	return sxid;
++}
+ 
+ 
+ static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
+@@ -1885,11 +1927,20 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
+ 			int options, BulkInsertState bistate)
+ {
+ 	TransactionId xid = GetCurrentTransactionId();
++	bool		xid_is_shard = false;
+ 	HeapTuple	heaptup;
+ 	Buffer		buffer;
+ 	Buffer		vmbuffer = InvalidBuffer;
+ 	bool		all_visible_cleared = false;
+ 
++	xid = shard_stamp_xid(relation, xid, &xid_is_shard);
++	if (unlikely(xid_is_shard &&
++				 (options & (HEAP_INSERT_FROZEN | HEAP_INSERT_SPECULATIVE))))
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("COPY FREEZE and speculative insertion are not supported on shard-managed relation \"%s\"",
++						RelationGetRelationName(relation))));
++
+ 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
+ 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
+ 		   RelationGetNumberOfAttributes(relation));
+@@ -2010,8 +2061,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
+ 				xlrec.flags |= XLH_INSERT_ON_TOAST_RELATION;
+ 		}
+ 
++		if (xid_is_shard)
++			xlrec.flags |= XLH_INSERT_SHARD_XID;
++
+ 		XLogBeginInsert();
+ 		XLogRegisterData((char *) &xlrec, SizeOfHeapInsert);
++		if (xid_is_shard)
++			XLogRegisterData((char *) &xid, sizeof(TransactionId));
+ 
+ 		xlhdr.t_infomask2 = heaptup->t_data->t_infomask2;
+ 		xlhdr.t_infomask = heaptup->t_data->t_infomask;
+@@ -2156,6 +2212,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+ 				  CommandId cid, int options, BulkInsertState bistate)
+ {
+ 	TransactionId xid = GetCurrentTransactionId();
++	bool		xid_is_shard = false;
+ 	HeapTuple  *heaptuples;
+ 	int			i;
+ 	int			ndone;
+@@ -2179,6 +2236,13 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+ 	saveFreeSpace = RelationGetTargetPageFreeSpace(relation,
+ 												   HEAP_DEFAULT_FILLFACTOR);
+ 
++	xid = shard_stamp_xid(relation, xid, &xid_is_shard);
++	if (unlikely(xid_is_shard && (options & HEAP_INSERT_FROZEN)))
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("COPY FREEZE is not supported on shard-managed relation \"%s\"",
++						RelationGetRelationName(relation))));
++
+ 	/* Toast and set header data in all the slots */
+ 	heaptuples = palloc(ntuples * sizeof(HeapTuple));
+ 	for (i = 0; i < ntuples; i++)
+@@ -2421,8 +2485,13 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+ 			if (need_tuple_data)
+ 				bufflags |= REGBUF_KEEP_DATA;
+ 
++			if (xid_is_shard)
++				xlrec->flags |= XLH_INSERT_SHARD_XID;
++
+ 			XLogBeginInsert();
+ 			XLogRegisterData((char *) xlrec, tupledata - scratch.data);
++			if (xid_is_shard)
++				XLogRegisterData((char *) &xid, sizeof(TransactionId));
+ 			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
+ 
+ 			XLogRegisterBufData(0, tupledata, totaldatalen);
+@@ -2579,7 +2648,8 @@ heap_delete(Relation relation, ItemPointer tid,
+ 			TM_FailureData *tmfd, bool changingPart)
+ {
+ 	TM_Result	result;
+-	TransactionId xid = GetCurrentTransactionId();
++	TransactionId xid = shard_stamp_xid(relation,
++										GetCurrentTransactionId(), NULL);
+ 	ItemId		lp;
+ 	HeapTupleData tp;
+ 	Page		page;
+@@ -3049,7 +3119,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
+ 			TU_UpdateIndexes *update_indexes)
+ {
+ 	TM_Result	result;
+-	TransactionId xid = GetCurrentTransactionId();
++	TransactionId xid = shard_stamp_xid(relation,
++										GetCurrentTransactionId(), NULL);
+ 	Bitmapset  *hot_attrs;
+ 	Bitmapset  *sum_attrs;
+ 	Bitmapset  *key_attrs;
+@@ -4396,6 +4467,12 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 	bool		have_tuple_lock = false;
+ 	bool		cleared_all_frozen = false;
+ 
++	if (unlikely(shard_relation_p(relation)))
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("row-level locking is not supported on shard-managed relation \"%s\"",
++						RelationGetRelationName(relation))));
++
+ 	*buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
+ 	block = ItemPointerGetBlockNumber(tid);
+ 
+@@ -8931,6 +9008,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
+ 	xl_heap_header xlhdr_idx;
+ 	uint8		info;
+ 	uint16		prefix_suffix[2];
++	TransactionId shard_new_xmin = InvalidTransactionId;
+ 	uint16		prefixlen = 0,
+ 				suffixlen = 0;
+ 	XLogRecPtr	recptr;
+@@ -9011,6 +9089,11 @@ log_heap_update(Relation reln, Buffer oldbuf,
+ 		xlrec.flags |= XLH_UPDATE_PREFIX_FROM_OLD;
+ 	if (suffixlen > 0)
+ 		xlrec.flags |= XLH_UPDATE_SUFFIX_FROM_OLD;
++	if (shard_relation_p(reln))
++	{
++		xlrec.flags |= XLH_UPDATE_SHARD_XID;
++		shard_new_xmin = HeapTupleHeaderGetRawXmin(newtup->t_data);
++	}
+ 	if (need_tuple_data)
+ 	{
+ 		xlrec.flags |= XLH_UPDATE_CONTAINS_NEW_TUPLE;
+@@ -9128,6 +9211,9 @@ log_heap_update(Relation reln, Buffer oldbuf,
+ 						 old_key_tuple->t_len - SizeofHeapTupleHeader);
+ 	}
+ 
++	if (xlrec.flags & XLH_UPDATE_SHARD_XID)
++		XLogRegisterData((char *) &shard_new_xmin, sizeof(TransactionId));
++
+ 	/* filtering by origin on a row level is much more efficient */
+ 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
+ 
+@@ -9860,7 +9946,10 @@ heap_xlog_insert(XLogReaderState *record)
+ 		htup->t_infomask2 = xlhdr.t_infomask2;
+ 		htup->t_infomask = xlhdr.t_infomask;
+ 		htup->t_hoff = xlhdr.t_hoff;
+-		HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
++		HeapTupleHeaderSetXmin(htup,
++							   (xlrec->flags & XLH_INSERT_SHARD_XID) ?
++							   shard_xid_from_maindata(record) :
++							   XLogRecGetXid(record));
+ 		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+ 		htup->t_ctid = target_tid;
+ 
+@@ -9999,7 +10088,10 @@ heap_xlog_multi_insert(XLogReaderState *record)
+ 			htup->t_infomask2 = xlhdr->t_infomask2;
+ 			htup->t_infomask = xlhdr->t_infomask;
+ 			htup->t_hoff = xlhdr->t_hoff;
+-			HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
++			HeapTupleHeaderSetXmin(htup,
++							   (xlrec->flags & XLH_INSERT_SHARD_XID) ?
++							   shard_xid_from_maindata(record) :
++							   XLogRecGetXid(record));
+ 			HeapTupleHeaderSetCmin(htup, FirstCommandId);
+ 			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
+ 			ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
+@@ -10272,7 +10364,10 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
+ 		htup->t_infomask = xlhdr.t_infomask;
+ 		htup->t_hoff = xlhdr.t_hoff;
+ 
+-		HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
++		HeapTupleHeaderSetXmin(htup,
++							   (xlrec->flags & XLH_UPDATE_SHARD_XID) ?
++							   shard_xid_from_maindata(record) :
++							   XLogRecGetXid(record));
+ 		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+ 		HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
+ 		/* Make sure there is no forward chain link in t_ctid */
+diff --git a/src/backend/access/heap/pruneheap.c b/src/backend/access/heap/pruneheap.c
+index c2c20d4b3b..bf893249f1 100644
+--- a/src/backend/access/heap/pruneheap.c
++++ b/src/backend/access/heap/pruneheap.c
+@@ -27,6 +27,14 @@
+ #include "utils/snapmgr.h"
+ #include "utils/rel.h"
+ #include "utils/snapmgr.h"
++#include "access/shard_stamp.h"
++
++static inline bool
++shard_relation_p_prune(Relation relation)
++{
++	return shard_relation_xid_hook &&
++		shard_relation_xid_hook(relation, false, NULL);
++}
+ 
+ /* Working data for heap_page_prune and subroutines */
+ typedef struct
+@@ -123,6 +131,12 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
+ 	if (RecoveryInProgress())
+ 		return;
+ 
++	/* pg_partdist patch 0005: shard-managed relations must not be pruned by
++	 * native machinery -- their tuple xids live in the per-shard xid space
++	 * and native clog/horizon checks would misjudge them (P1_PRECHECK D). */
++	if (shard_relation_p_prune(relation))
++		return;
++
+ 	/*
+ 	 * XXX: Magic to keep old_snapshot_threshold tests appear "working". They
+ 	 * currently are broken, and discussion of what to do about them is
+diff --git a/src/include/access/heapam_xlog.h b/src/include/access/heapam_xlog.h
+index db65621cf3..dd9376e6a6 100644
+--- a/src/include/access/heapam_xlog.h
++++ b/src/include/access/heapam_xlog.h
+@@ -71,6 +71,8 @@
+ 
+ /* all_frozen_set always implies all_visible_set */
+ #define XLH_INSERT_ALL_FROZEN_SET				(1<<5)
++/* pg_partdist patch 0005: main data ends with the shard xid (4 bytes) */
++#define XLH_INSERT_SHARD_XID					(1<<7)
+ 
+ /*
+  * xl_heap_update flag values, 8 bits are available.
+@@ -84,6 +86,8 @@
+ #define XLH_UPDATE_CONTAINS_NEW_TUPLE			(1<<4)
+ #define XLH_UPDATE_PREFIX_FROM_OLD				(1<<5)
+ #define XLH_UPDATE_SUFFIX_FROM_OLD				(1<<6)
++/* pg_partdist patch 0005: main data ends with the shard xid (4 bytes) */
++#define XLH_UPDATE_SHARD_XID					(1<<7)
+ 
+ /* convenience macro for checking whether any form of old tuple was logged */
+ #define XLH_UPDATE_CONTAINS_OLD						\
+diff --git a/src/include/access/shard_stamp.h b/src/include/access/shard_stamp.h
+new file mode 100644
+index 0000000000..98139f4e3b
+--- /dev/null
++++ b/src/include/access/shard_stamp.h
+@@ -0,0 +1,28 @@
++/*
++ * shard_stamp.h  (pg_partdist patch 0005)
++ *
++ * Hook that lets an extension supply per-shard tuple xids for shard-managed
++ * relations.  Contract:
++ *   - returns false if the relation is not shard-managed (caller uses the
++ *     native xid as usual);
++ *   - returns true if it is; when assign==true, *sxid is set to the shard
++ *     xid bound to the current top-level transaction for this relation's
++ *     shard (allocated lazily on first use; the hook must ereport(ERROR)
++ *     for cases it does not support, e.g. subtransactions).
++ * The WAL record header xid always stays native; insert/multi_insert/update
++ * records carry the shard xid as the LAST sizeof(TransactionId) bytes of
++ * their main data, flagged by XLH_INSERT_SHARD_XID / XLH_UPDATE_SHARD_XID.
++ * delete/lock need no extra payload: their xmax already travels in the
++ * record body.
++ */
++#ifndef SHARD_STAMP_H
++#define SHARD_STAMP_H
++
++struct RelationData;
++
++typedef bool (*shard_relation_xid_hook_type) (struct RelationData *relation,
++											  bool assign,
++											  TransactionId *sxid);
++extern PGDLLIMPORT shard_relation_xid_hook_type shard_relation_xid_hook;
++
++#endif							/* SHARD_STAMP_H */

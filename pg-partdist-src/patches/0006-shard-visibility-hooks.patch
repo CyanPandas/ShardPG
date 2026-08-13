@@ -1,0 +1,303 @@
+--- a/src/include/access/shard_stamp.h
++++ b/src/include/access/shard_stamp.h
+@@ -25,4 +25,52 @@
+ 											  TransactionId *sxid);
+ extern PGDLLIMPORT shard_relation_xid_hook_type shard_relation_xid_hook;
+ 
++
++/*
++ * patch 0006: extension-supplied tuple visibility for shard-managed
++ * relations.
++ *
++ * Shard tuples carry per-shard xids in xmin/xmax, so every native
++ * clog/procarray consultation would misjudge them; each Satisfies* entry
++ * point forks on these hooks before touching native state.  Contract:
++ *   - is_shard_rel must be cheap (called on visibility hot paths) and must
++ *     not touch catalogs;
++ *   - each satisfies_* returns true if it decided (*visible / *result
++ *     filled in), false = not shard-managed, caller continues natively;
++ *   - implementations must neither read nor write hint bits;
++ *   - xmax_wait translates a shard xmax to its holder's native xid and
++ *     blocks until that transaction ends; the caller then re-evaluates
++ *     from scratch (heap_delete/heap_update goto l1/l2).
++ * HeapTupleSatisfiesToast is deliberately NOT forked (it consults no
++ * clog/procarray for normal tuples), but toast DELETION does reach
++ * HeapTupleSatisfiesUpdate -- the extension's is_shard_rel therefore
++ * must recognize toast relations of shard tables (it keeps a
++ * backend-local toast->owner map fed by the stamping hook, which always
++ * runs first within heap_delete).
++ */
++#include "access/htup.h"
++#include "access/tableam.h"
++#include "storage/buf.h"
++#include "storage/itemptr.h"
++#include "storage/lmgr.h"
++#include "utils/snapshot.h"
++
++typedef struct ShardVisibilityHooks
++{
++	bool		(*is_shard_rel) (Oid tableOid);
++	bool		(*satisfies_mvcc) (HeapTuple htup, Snapshot snapshot,
++								   Buffer buffer, bool *visible);
++	bool		(*satisfies_self) (HeapTuple htup, Buffer buffer,
++								   bool *visible);
++	bool		(*satisfies_dirty) (HeapTuple htup, Snapshot snapshot,
++									Buffer buffer, bool *visible);
++	bool		(*satisfies_update) (HeapTuple htup, CommandId curcid,
++									 Buffer buffer, TM_Result *result);
++	void		(*xmax_wait) (struct RelationData *relation,
++							  TransactionId sxid,
++							  ItemPointer ctid, XLTW_Oper oper);
++} ShardVisibilityHooks;
++
++extern PGDLLIMPORT const ShardVisibilityHooks *shard_visibility_hooks;
++
+ #endif							/* SHARD_STAMP_H */
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -2736,6 +2736,25 @@
+ 		infomask = tp.t_data->t_infomask;
+ 
+ 		/*
++		 * patch 0006: xmax is a shard xid.  Translate it to the holder's
++		 * native xid and wait via the extension, then re-evaluate from
++		 * scratch -- the forked HeapTupleSatisfiesUpdate delivers the
++		 * post-wait verdict, so none of the hint-bit logic below runs
++		 * for shard tuples.
++		 */
++		if (shard_relation_p(relation))
++		{
++			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
++			heap_acquire_tuplock(relation, &(tp.t_self), LockTupleExclusive,
++								 LockWaitBlock, &have_tuple_lock);
++			if (shard_visibility_hooks && shard_visibility_hooks->xmax_wait)
++				shard_visibility_hooks->xmax_wait(relation, xwait,
++												  &(tp.t_self), XLTW_Delete);
++			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
++			goto l1;
++		}
++
++		/*
+ 		 * Sleep until concurrent transaction ends -- except when there's a
+ 		 * single locker and it's our own transaction.  Note we don't care
+ 		 * which lock mode the locker has, because we need the strongest one.
+@@ -2905,7 +2924,16 @@
+ 	 */
+ 	MultiXactIdSetOldestMember();
+ 
++	/*
++	 * patch 0006: on shard relations a TM_Ok verdict means any existing
++	 * xmax is dead (the visibility fork only returns TM_Ok for absent or
++	 * aborted shard xmax) and lockers cannot exist; force the
++	 * no-prior-xmax path -- the native machinery below would consult
++	 * native clog/procarray/multixact state on a shard xid.
++	 */
+ 	compute_new_xmax_infomask(HeapTupleHeaderGetRawXmax(tp.t_data),
++							  shard_relation_p(relation) ?
++							  (uint16) (tp.t_data->t_infomask | HEAP_XMAX_INVALID) :
+ 							  tp.t_data->t_infomask, tp.t_data->t_infomask2,
+ 							  xid, LockTupleExclusive, true,
+ 							  &new_xmax, &new_infomask, &new_infomask2);
+@@ -2919,7 +2947,12 @@
+ 	 * the subsequent page pruning will be a no-op and the hint will be
+ 	 * cleared.
+ 	 */
+-	PageSetPrunable(page, xid);
++	/* patch 0006: match redo, which stamps the native record-header xid
++	 * here; the hint is never consulted for shard relations (pruning is
++	 * skipped) but must stay byte-identical across normal path / crash
++	 * redo / physical replay. */
++	PageSetPrunable(page, shard_relation_p(relation) ?
++					GetCurrentTransactionId() : xid);
+ 
+ 	if (PageIsAllVisible(page))
+ 	{
+@@ -3377,6 +3410,22 @@
+ 		infomask = oldtup.t_data->t_infomask;
+ 
+ 		/*
++		 * patch 0006: shard xmax -- translate + wait via the extension,
++		 * then re-evaluate from scratch (see heap_delete).
++		 */
++		if (shard_relation_p(relation))
++		{
++			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
++			heap_acquire_tuplock(relation, &(oldtup.t_self), *lockmode,
++								 LockWaitBlock, &have_tuple_lock);
++			if (shard_visibility_hooks && shard_visibility_hooks->xmax_wait)
++				shard_visibility_hooks->xmax_wait(relation, xwait,
++												  &oldtup.t_self, XLTW_Update);
++			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
++			goto l2;
++		}
++
++		/*
+ 		 * Now we have to do something about the existing locker.  If it's a
+ 		 * multi, sleep on it; we might be awakened before it is completely
+ 		 * gone (or even not sleep at all in some cases); we need to preserve
+@@ -3596,7 +3645,16 @@
+ 	 * If the tuple we're updating is locked, we need to preserve the locking
+ 	 * info in the old tuple's Xmax.  Prepare a new Xmax value for this.
+ 	 */
++	/*
++	 * patch 0006: on shard relations a TM_Ok verdict means any existing
++	 * xmax is dead (the visibility fork only returns TM_Ok for absent or
++	 * aborted shard xmax) and lockers cannot exist; force the
++	 * no-prior-xmax path -- the native machinery below would consult
++	 * native clog/procarray/multixact state on a shard xid.
++	 */
+ 	compute_new_xmax_infomask(HeapTupleHeaderGetRawXmax(oldtup.t_data),
++							  shard_relation_p(relation) ?
++							  (uint16) (oldtup.t_data->t_infomask | HEAP_XMAX_INVALID) :
+ 							  oldtup.t_data->t_infomask,
+ 							  oldtup.t_data->t_infomask2,
+ 							  xid, *lockmode, true,
+@@ -3610,7 +3668,8 @@
+ 	 * tuple.  (In rare cases that might also be InvalidTransactionId and yet
+ 	 * not have the HEAP_XMAX_INVALID bit set; that's fine.)
+ 	 */
+-	if ((oldtup.t_data->t_infomask & HEAP_XMAX_INVALID) ||
++	if (shard_relation_p(relation) ||	/* patch 0006: lockers impossible */
++		(oldtup.t_data->t_infomask & HEAP_XMAX_INVALID) ||
+ 		HEAP_LOCKED_UPGRADED(oldtup.t_data->t_infomask) ||
+ 		(checked_lockers && !locker_remains))
+ 		xmax_new_tuple = InvalidTransactionId;
+@@ -3713,7 +3772,10 @@
+ 		 * updating, because the potentially created multixact would otherwise
+ 		 * be wrong.
+ 		 */
++		/* patch 0006: same as above -- old shard xmax is dead here */
+ 		compute_new_xmax_infomask(HeapTupleHeaderGetRawXmax(oldtup.t_data),
++								  shard_relation_p(relation) ?
++								  (uint16) (oldtup.t_data->t_infomask | HEAP_XMAX_INVALID) :
+ 								  oldtup.t_data->t_infomask,
+ 								  oldtup.t_data->t_infomask2,
+ 								  xid, *lockmode, false,
+@@ -3935,7 +3997,12 @@
+ 	 * not to optimize for aborts.  Note that heap_xlog_update must be kept in
+ 	 * sync if this decision changes.
+ 	 */
+-	PageSetPrunable(page, xid);
++	/* patch 0006: match redo, which stamps the native record-header xid
++	 * here; the hint is never consulted for shard relations (pruning is
++	 * skipped) but must stay byte-identical across normal path / crash
++	 * redo / physical replay. */
++	PageSetPrunable(page, shard_relation_p(relation) ?
++					GetCurrentTransactionId() : xid);
+ 
+ 	if (use_hot_update)
+ 	{
+--- a/src/backend/access/heap/heapam_visibility.c
++++ b/src/backend/access/heap/heapam_visibility.c
+@@ -79,6 +79,11 @@
+ #include "utils/builtins.h"
+ #include "utils/combocid.h"
+ #include "utils/snapmgr.h"
++#include "access/shard_stamp.h"
++
++/* pg_partdist patch 0006: extension-supplied tuple visibility for
++ * shard-managed relations.  NULL = native behavior everywhere. */
++const ShardVisibilityHooks *shard_visibility_hooks = NULL;
+ 
+ 
+ /*
+@@ -176,6 +181,15 @@
+ 	Assert(ItemPointerIsValid(&htup->t_self));
+ 	Assert(htup->t_tableOid != InvalidOid);
+ 
++	/* patch 0006: shard tuples never consult native clog/procarray */
++	if (shard_visibility_hooks)
++	{
++		bool		visible;
++
++		if (shard_visibility_hooks->satisfies_self(htup, buffer, &visible))
++			return visible;
++	}
++
+ 	if (!HeapTupleHeaderXminCommitted(tuple))
+ 	{
+ 		if (HeapTupleHeaderXminInvalid(tuple))
+@@ -465,6 +479,16 @@
+ 	Assert(ItemPointerIsValid(&htup->t_self));
+ 	Assert(htup->t_tableOid != InvalidOid);
+ 
++	/* patch 0006: shard tuples never consult native clog/procarray */
++	if (shard_visibility_hooks)
++	{
++		TM_Result	sres;
++
++		if (shard_visibility_hooks->satisfies_update(htup, curcid, buffer,
++													 &sres))
++			return sres;
++	}
++
+ 	if (!HeapTupleHeaderXminCommitted(tuple))
+ 	{
+ 		if (HeapTupleHeaderXminInvalid(tuple))
+@@ -753,6 +777,16 @@
+ 	snapshot->xmin = snapshot->xmax = InvalidTransactionId;
+ 	snapshot->speculativeToken = 0;
+ 
++	/* patch 0006: shard tuples never consult native clog/procarray */
++	if (shard_visibility_hooks)
++	{
++		bool		visible;
++
++		if (shard_visibility_hooks->satisfies_dirty(htup, snapshot, buffer,
++													&visible))
++			return visible;
++	}
++
+ 	if (!HeapTupleHeaderXminCommitted(tuple))
+ 	{
+ 		if (HeapTupleHeaderXminInvalid(tuple))
+@@ -967,6 +1001,16 @@
+ 	Assert(ItemPointerIsValid(&htup->t_self));
+ 	Assert(htup->t_tableOid != InvalidOid);
+ 
++	/* patch 0006: shard tuples never consult native clog/procarray */
++	if (shard_visibility_hooks)
++	{
++		bool		visible;
++
++		if (shard_visibility_hooks->satisfies_mvcc(htup, snapshot, buffer,
++												   &visible))
++			return visible;
++	}
++
+ 	if (!HeapTupleHeaderXminCommitted(tuple))
+ 	{
+ 		if (HeapTupleHeaderXminInvalid(tuple))
+@@ -1205,6 +1249,17 @@
+ 
+ 	*dead_after = InvalidTransactionId;
+ 
++	/* patch 0006: no vacuum-style liveness math exists for shard xids;
++	 * every legitimate caller is fenced off (prune skipped, VACUUM/
++	 * ANALYZE/CLUSTER/CREATE INDEX intercepted), so reaching here with a
++	 * shard tuple is a fenced-path escape -- fail closed. */
++	if (shard_visibility_hooks &&
++		shard_visibility_hooks->is_shard_rel(htup->t_tableOid))
++		ereport(ERROR,
++				(errcode(ERRCODE_INTERNAL_ERROR),
++				 errmsg("vacuum-style visibility check reached shard-managed relation %u",
++						htup->t_tableOid)));
++
+ 	/*
+ 	 * Has inserting transaction committed?
+ 	 *
+@@ -1596,6 +1651,14 @@
+ 	Assert(ItemPointerIsValid(&htup->t_self));
+ 	Assert(htup->t_tableOid != InvalidOid);
+ 
++	/* patch 0006: logical decoding is banned on shard-managed relations */
++	if (shard_visibility_hooks &&
++		shard_visibility_hooks->is_shard_rel(htup->t_tableOid))
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("logical decoding is not supported on shard-managed relation %u",
++						htup->t_tableOid)));
++
+ 	/* inserting transaction aborted */
+ 	if (HeapTupleHeaderXminInvalid(tuple))
+ 	{

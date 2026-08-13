@@ -3,6 +3,8 @@
 #include "partition_wal.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
+#include "shard_xid.h"
+#include "shard_visibility.h"
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -50,6 +52,12 @@ pg_partdist_shmem_request_hook(void)
 
     /* Replay 认领槽位 + 副本豁免哈希（FRD §7/§13.10/补丁 0002） */
     RequestReplayShmem();
+
+    /* TX-TSO-MVCC P1：每分片 xid 发号器槽位（T1.2） */
+    RequestShardXidShmem();
+
+    /* TX-TSO-MVCC P1：临时提交表（T1.6 桩 + T1.7 反查合一） */
+    RequestShardCommitShmem();
 }
 
 void
@@ -112,6 +120,12 @@ pg_partdist_shmem_startup_hook(void)
 
     /* Initialise replay control (claim slots + flush-exempt data) */
     ReplayShmemInit();
+
+    /* TX-TSO-MVCC P1：每分片 xid 发号器（T1.2） */
+    ShardXidShmemInit();
+
+    /* TX-TSO-MVCC P1：临时提交表（T1.6 桩 + T1.7 反查合一） */
+    ShardCommitShmemInit();
 }
 
 /* ---- SPI helpers ---- */
