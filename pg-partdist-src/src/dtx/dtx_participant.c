@@ -24,6 +24,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "tso.h"					/* T4.4：TsoMarkerCommitTs 换源 */
 
 #include <string.h>
 
@@ -477,7 +478,7 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
             (void) AppendDtxRecord(local_oid,
                                    committed ? DTX_COMMIT : DTX_ABORT,
                                    dtxid, coord_gsid,
-                                   committed ? (int64) GetCurrentTimestamp() : 0,
+                                   committed ? TsoMarkerCommitTs() : 0,
                                    0, NULL, 0, InvalidTransactionId);
 
         /*

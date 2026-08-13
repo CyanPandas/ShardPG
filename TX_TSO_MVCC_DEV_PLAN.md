@@ -1027,6 +1027,30 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   不自动生效）。金丝雀：lwc 9/0、**r1 58/0**（无丢弃检查从"跳过"转实测后首
   次全绿）、l1 57/0、d1 84/0。步骤②（决议搬迁 + ts 换源 + placement 传播）
   继续。
+- **实施记要·步骤②（2026-08-13，决议搬迁 + ts 换源，验收 39/0）**：
+  ① **闸门 MX 化**（§9.1"换节点跑"定案落地）：撤除
+  `pg_raft_coordinator_node_id` 身份判据；替补性能闸 = citus_internal
+  application_name 前缀先行退出（参与侧任务提交零开销）+ pg_dist_transaction
+  xmin 探针兜底。② **决议原子携带 TSO commit_ts**：dtx_decide 增第 5 参
+  （SQL DEFAULT 0 + C 侧 PG_NARGS 兼容双签名；活库经 ALTER EXTENSION
+  DROP/ADD 换签名，扩展成员身份保留）；驱动节点在"全部票齐"点经 rendezvous
+  `partdist_tso_dtx_decision_ts_fn` 取新号（§2-4 两时机，不预取不缓存，
+  fail-closed），**取号即覆盖 PRE_COMMIT 暂存** → 本地分片 0007 尾块与决议
+  同 ts 自洽（MARKER 早值残留 → R-P4-3）；TSO 不可达 ⇒ 先尽力写显式 ABORT
+  决议再抛（本段既有纪律）。③ **ts 换源收口**：`TsoMarkerCommitTs()`
+  统一 MARKER/DTX_COMMIT 记录 ts 源（遗留=本地时钟逐字节不变，TSO=事务内
+  暂存懒取，同事务三处同 ts）；partwal_sync/dtx_participant 两处换源。
+  ④ **placement 传播确认**：raft_apply.c **零改动收案**——group0 apply 本就
+  在每成员节点各自落本地 pg_dist_placement，MX 元数据同步使九节点都持表后
+  传播天然达成（验收 9/9 一致实测）；已登记分片的裸提案（任期 0）被任期
+  栅栏拦下 9/9 不动（翻转须走带任期的切主上报链，属 raft_14/15 机制）。
+  验收 39/0：遗留决议 ts=本地时钟宇宙（8.4e14）/TSO 决议 ts=逻辑值且**决议
+  行复制并 apply 到组内 follower**（多数派落盘 + #39 批量 DTX 逐条登记通道
+  一并实证）/不持分片 worker 驱动决议照常/local_execution=off 工作绕法/
+  **盲区显式复现**（R-P4-4）/fail-closed 拒事务+显式 ABORT/零崩溃零丢弃。
+  夹具坑两枚：TX1 同款"没等 partition_map 登记"（收敛等待 + 单分片预热写
+  修复，逐轮劣化即其表现）；PG TimestampTz 纪元 2000 年（2026≈8.4e14 µs，
+  阈值断言别按 Unix 纪元写）。
 
 #### T4.5 广播与恢复（崩溃矩阵行 1–3 的机制面）
 
@@ -1106,6 +1130,19 @@ P3 增补（2026-08-13，T3.0 核查产出）：
    粒度对齐，不得假设一节点一 prepared。
 8b. **R-P4-2 注入 ts 漏登记**：远端后端注入 start_ts 不进本地活跃集合 ⇒
    GlobalSafeTs 越过活跃远端读；T4.1 验收须含"远端持快照期间 safe 被钉住"。
+8c. **R-P4-3 驱动事务的 MARKER 早值**（T4.4 换源实装时登记）：驱动事务的
+   MARKER 载荷在 PRE_COMMIT 组装（早于远端 PREPARE），携带的是票齐前的暂存
+   ts；决议 ts 在票齐点取号并覆盖暂存 → 0007 尾块（主本可见性）与决议同 ts
+   自洽，但 follower 增强 CLOG 由 MARKER 驱动，存在 [早值, 决议ts) 的副本早
+   可见窗口。T4.5 广播以决议 ts 幂等重写参与分片判决时收口；收口前副本读
+   一致性依赖该窗口不被跨越（惰性回放场景实测排期进 T4.7 矩阵）。
+8d. **R-P4-4 本地执行参与者漏出写集**（T4.4 验收实测复现）：worker 驱动且
+   本节点持有写分片时，本分片写走 Citus local execution、不进
+   pg_dist_transaction，legacy 写集探针看不见它 ⇒ nparts 少 1，两组写可能
+   被误判为快路径漏决议。T4.5 参与者集合改由 join 登记（gxid/活跃集合）装
+   配时闭合；interim 运行纪律：驱动节点不持写分片，或会话内
+   SET citus.enable_local_execution=off（验收腿 2 实证工作绕法）。验收含
+   "盲区复现"断言，T4.5 闭合时该断言应翻红提醒改写。
 8. **R-P3-2 双 ts 宇宙串线**：TSO 逻辑值与 MARKER/DTX 本地时钟占位值在 P3
    并存（实证当前零比较点）；任何新代码不得让两者进入同一比较；P4 换源前
    全量重审计。

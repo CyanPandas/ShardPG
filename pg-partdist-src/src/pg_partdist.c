@@ -552,6 +552,17 @@ _PG_init(void)
         *rv = (void *) ShardReplayCatchUp;
     }
 
+    /*
+     * T4.4：决议点取号出口。pg_raft 的 dtx_master_pre_record_commit 在
+     * "全部 PREPARE 已成功"点取 commit_ts（§2-4 两时机；未配置 TSO 返回 0，
+     * 决议侧回退本地时钟）。经 rendezvous variable 传递，无编译期依赖。
+     */
+    {
+        void **rv = find_rendezvous_variable("partdist_tso_dtx_decision_ts_fn");
+
+        *rv = (void *) PartDistTsoDtxDecisionTs;
+    }
+
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
     TsoRegisterHeartbeatWorker();   /* T3.5：GlobalSafeTs 心跳/续租 */

@@ -57,6 +57,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"        /* GetCurrentTimestamp（TSO 就位前的时间源）*/
+#include "tso.h"                    /* T4.4：TsoMarkerCommitTs 换源 */
 
 /*
  * 切主重构·prepare 接线（计划文档 §4 阶段 3 四步设计的第 2 步）。
@@ -691,7 +692,8 @@ PartWALSlotCmp(const void *a, const void *b)
  * PartWALBuildTxnMarker — 组装本事务的 MARKER 载荷（FRD §4.3）。
  *
  * 返回 palloc 出来的缓冲区，*out_len 是 24 + 4*nsubxacts。
- * 时间戳先用本地 TimestampTz（微秒，单调够用）；TSO 就位后只换取值来源，
+ * 时间戳源已收口（T4.4）：TsoMarkerCommitTs —— 遗留模式=本地 TimestampTz
+ * （微秒，与先前逐字节一致），TSO 模式=本事务暂存的 TSO commit_ts；
  * 字段宽度与磁盘格式都不动。
  */
 char *
@@ -717,7 +719,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
 
     m = (TxnMarkerPayload *) buf;
     m->start_ts  = (uint64) GetCurrentTransactionStartTimestamp();
-    m->commit_ts = with_commit_ts ? (uint64) GetCurrentTimestamp()
+    m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
                                   : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
     m->reserved  = 0;

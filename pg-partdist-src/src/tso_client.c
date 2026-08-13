@@ -441,6 +441,49 @@ TsoStashedCommitTs(void)
 	return cur_commit_ts;
 }
 
+/*
+ * T4.4 换源：MARKER / DTX 记录的 commit_ts 取值源。
+ *
+ * 遗留模式（未配置 TSO）：本地时钟 —— 行为与换源前逐字节一致，tx1/tx2/tx4
+ * 基线断言不动。
+ * TSO 模式：返回本事务的 PRE_COMMIT 暂存值（懒取：首次调用即取号），保证
+ * 同一事务的 MARKER、0007 尾块、DTX 记录用同一个 ts。COMMIT PREPARED 的
+ * 阶段 3 跑在另一个工具事务里，取到的是该工具事务的新号 —— 晚于决议 ts，
+ * 方向保守（副本迟可见、不早可见）；决议 ts 的精确回填走 T4.5 广播。
+ * fail-closed 由 tso_rpc 保证（不可达即 ERROR，绝不回退本地时钟）。
+ */
+int64
+TsoMarkerCommitTs(void)
+{
+	if (!tso_configured())
+		return (int64) GetCurrentTimestamp();
+	TsoStashCommitTs();
+	return cur_commit_ts;
+}
+
+/*
+ * T4.4：决议点取号（pg_raft 经 rendezvous "partdist_tso_dtx_decision_ts_fn"
+ * 调用）。"全部 PREPARE 持久确认之后、决议持久化之前"的新号（§2-4 两时机，
+ * 不预取不缓存）；未配置 TSO 返回 0（决议侧回退本地时钟，遗留宇宙不混）。
+ *
+ * ★ 取到的决议 ts **覆盖**本事务的 PRE_COMMIT 暂存：驱动事务自己的
+ * PRE_COMMIT 早于 Citus 的远端 PREPARE（回调顺序，Citus 居首纪律），
+ * 暂存值早于"票齐"点、不能作决议 ts；覆盖之后，本地分片 0007 尾块在
+ * 提交记录里携带的就是决议 ts —— 驱动节点本地分片的可见性与全局提交点
+ * 自洽（PRE_COMMIT 已组装的 MARKER 载荷仍是早值，见 R-P4-3，T4.5 收口）。
+ */
+int64
+PartDistTsoDtxDecisionTs(void)
+{
+	int64		ts;
+
+	if (!tso_configured())
+		return 0;
+	ts = tso_rpc("SELECT partdist_tso_commit_ts()", "dtx_decision_ts");
+	cur_commit_ts = ts;
+	return ts;
+}
+
 /* ================= 验收/调试 SQL 包装 ================= */
 
 PG_FUNCTION_INFO_V1(partdist_tso_client_start_ts);

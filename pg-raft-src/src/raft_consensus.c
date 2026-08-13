@@ -43,6 +43,7 @@
 #include "access/xact.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/guc.h"               /* application_name：MX 闸门（T4.4） */
 
 #include <errno.h>
 #include <signal.h>
@@ -5698,6 +5699,8 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     int64        dtxid = PG_GETARG_INT64(1);
     int32        verdict = PG_GETARG_INT32(2);
     ArrayType   *parts = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    int64        p_commit_ts = (PG_NARGS() > 4 && !PG_ARGISNULL(4))
+                               ? PG_GETARG_INT64(4) : 0;
     RaftGroupCtx ctx;
     int64        local_oid = 0;
     int32        existing;
@@ -5717,10 +5720,14 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
         PG_RETURN_INT32(existing);
 
     /*
-     * TSO 未建：commit_ts 先用协调者本地时钟（§9.8）。决议的原子性来自 Raft
-     * 多数派，不依赖时间戳；全局快照一致性等 R3/TSO 立项时再收紧。
+     * T4.4 换源：驱动节点在"全部票齐"点从 TSO 取的 commit_ts 经参数传入
+     * （p_commit_ts > 0），决议记录原子携带之 —— 多数派落盘即提交点（§2-6）。
+     * 未配置 TSO 的遗留路径 p_commit_ts = 0：沿用协调者本地时钟（§9.8），
+     * 行为与换源前逐字节一致。决议的原子性来自 Raft 多数派，不依赖时间戳。
      */
-    commit_ts = (verdict == 1) ? (uint64) GetCurrentTimestamp() : 0;
+    commit_ts = (verdict == 1)
+        ? (p_commit_ts > 0 ? (uint64) p_commit_ts : (uint64) GetCurrentTimestamp())
+        : 0;
     parts_sql = dtx_participants_sql(parts);
 
     replicate_claim(&ctx);
@@ -7515,15 +7522,23 @@ dtx_master_pre_record_commit(void)
     int             coord_node = 0;
     int             i, j;
     int             verdict = 0;
+    int64           dtx_cts = 0;
 
     if (!pg_raft_raft_enabled || !pg_raft_dtx_2pc_enabled)
         return;
     /*
-     * 只有 Citus 协调节点会驱动 2PC。这条判据同时是本 hook 的**性能闸门**：
-     * worker 上的每一次本地提交都会进来，必须在做任何 SQL 之前退出。
+     * T4.4 决议搬迁（§9.1 MX 定案）：整条 DTX 链在**哪个节点驱动事务就在
+     * 哪个节点成立**（本地 pg_dist_transaction 就是驱动者自己写的），协调
+     * 节点身份判据随之撤除 —— MX worker 驱动的 2PC 同样在此做决议。
+     *
+     * 性能闸门的替补：① Citus 内部任务连接（application_name 前缀
+     * "citus_internal"）只当参与者、永远不是驱动者，先行退出 —— 参与侧
+     * 每条任务提交零开销；② 其余本地提交靠下面 pg_dist_transaction 的
+     * xmin 探针过滤 —— 该表平时为空（GC 及时），探针是一次只读小查询
+     * （代价挂 R-P4-3 风险单持续观察）。
      */
-    if (pg_raft_coordinator_node_id <= 0 ||
-        pg_raft_node_id != pg_raft_coordinator_node_id)
+    if (application_name != NULL &&
+        strncmp(application_name, "citus_internal", 14) == 0)
         return;
     if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
         return;
@@ -7657,6 +7672,30 @@ dtx_master_pre_record_commit(void)
      * 由 dtx_status 反向把 ABORT 创造出来。语义两者相同，差的是这段等待。
      */
 
+    /* ---- 3.5) 决议 commit_ts："全部票齐"点取号（§2-4 两时机） ---- */
+    {
+        static void **tso_dts_rv = NULL;
+
+        if (tso_dts_rv == NULL)
+            tso_dts_rv = find_rendezvous_variable("partdist_tso_dtx_decision_ts_fn");
+        if (*tso_dts_rv != NULL)
+        {
+            int64 (*fn)(void) = (int64 (*)(void)) *tso_dts_rv;
+
+            PG_TRY();
+            {
+                dtx_cts = fn();     /* 未配置 TSO = 0（决议侧回退本地时钟） */
+            }
+            PG_CATCH();
+            {
+                /* fail-closed：TSO 不可达 ⇒ 先尽力写显式 ABORT 再抛（本段纪律） */
+                dtx_master_try_write_abort(coord_gsid, dtxid, parts, nparts);
+                PG_RE_THROW();
+            }
+            PG_END_TRY();
+        }
+    }
+
     /* ---- 4) 到协调组现任 leader 上做决议 ---- */
     if (!raft_persist_spi_begin(&spi_owned))
         ereport(ERROR,
@@ -7712,10 +7751,11 @@ dtx_master_pre_record_commit(void)
         n = snprintf(qry, sizeof(qry),
                      "SELECT partdist.dtx_decide(%lld, %lld, 1, ARRAY[",
                      (long long) coord_gsid, (long long) dtxid);
-        for (i = 0; i < nparts && n < (int) sizeof(qry) - 32; i++)
+        for (i = 0; i < nparts && n < (int) sizeof(qry) - 64; i++)
             n += snprintf(qry + n, sizeof(qry) - n, "%s%lld",
                           (i == 0) ? "" : ",", (long long) parts[i]);
-        snprintf(qry + n, sizeof(qry) - n, "]::bigint[])");
+        snprintf(qry + n, sizeof(qry) - n, "]::bigint[], %lld)",
+                 (long long) dtx_cts);
 
         r = dtx_remote_scalar(peers[slot].host, peers[slot].port, qry);
         if (r == NULL)

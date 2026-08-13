@@ -133,11 +133,12 @@ CREATE OR REPLACE FUNCTION dtx_decide(
     p_coord_gsid bigint,
     p_dtxid bigint,
     p_verdict integer,
-    p_participants bigint[] DEFAULT NULL
+    p_participants bigint[] DEFAULT NULL,
+    p_commit_ts bigint DEFAULT 0
 ) RETURNS integer LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_decide';
 
-COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[]) IS
+COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
     '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
 
 CREATE OR REPLACE FUNCTION dtx_status(

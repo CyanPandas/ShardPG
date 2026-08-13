@@ -39,6 +39,8 @@ extern void TsoClientShmemInit(void);
 extern int64 TsoGetStartTs(void);		/* 懒取 + 事务内缓存；遗留模式=0 */
 extern void TsoStashCommitTs(void);		/* PRE_COMMIT 暂存（临界区外） */
 extern int64 TsoStashedCommitTs(void);	/* 临界区内只读暂存 */
+extern int64 TsoMarkerCommitTs(void);	/* T4.4：MARKER/DTX 记录 ts 源（遗留=本地时钟） */
+extern int64 PartDistTsoDtxDecisionTs(void);	/* T4.4：决议点取号（遗留=0；rendezvous 出口） */
 extern void TsoClientClearActive(void);	/* 事务结束清缓存与活跃槽 */
 extern bool TsoConfigured(void);		/* conninfo 非空 = TSO 模式 */
 
