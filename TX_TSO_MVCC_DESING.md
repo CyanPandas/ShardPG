@@ -569,7 +569,7 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 | 分片表逻辑解码 | 禁 | 解码按原生 xid 组事务 |
 | 分片表原生流复制热备读 | 本来就不用 | 本项目用自己的回放 |
 | 分片表异步提交（synchronous_commit=off） | 禁 | 可见性/提交点语义只许断言已持久事实（§4.5）；[A]<[B] 与多数派提交点均以同步提交为前提 |
-| CIC / CLUSTER / VACUUM FULL | 分叉或禁【待定】 | 快照等待/重写按原生机制 |
+| CIC / CLUSTER / VACUUM FULL | **禁（V4 已裁定，2026-08-13）**；P5 freeze/回收全章落地后再评估 CLUSTER/VACUUM FULL，CIC 随索引专项 | CIC 的多快照阶段与 validate 等待全按原生 xid 机制，且 P 期分片表本就禁索引；CLUSTER/VACUUM FULL 走 rewriteheap 的 freeze/裁决会拿分片 xid 查原生 clog，且换 relfilenode 需 fileset 重绑（复制面）。ANALYZE 已于 T2.6 解禁（补丁 0008 读侧分叉，只判不收） |
 | Citus rebalancer / move_shard_placement / undistribute_table / alter_distributed_table | 禁 | 原生快照读分片表 = 静默错读；与 raft 管理的放置冲突；搬分片 = 后续 raft 成员变更专项（§9.2） |
 | 含分片写的 PREPARE TRANSACTION | P1 禁（PRE_PREPARE 拦截，且拦截先于 PartWAL 刷流——回调 LIFO 序，见 DEV PLAN T1.9 记要） | 后端映射/临时提交表无法跨会话延续 prepared 事务；若字节先进流再中止，还会打断在途复制、让 leader plsn 跑到多数派前头（T1.9 实测） |
 | 分片打标表的 Citus 路由写（coordinator 经手的 INSERT/UPDATE/DELETE/COPY） | P1 禁——验收与使用一律 leader 直写 | 本分支 Citus 分布式写一律 2PC（PREPARE TRANSACTION，DTX 链路即建于其上）→ 撞上一条禁令，事务在 PREPARE 点中止（T1.9 实测两轮）；2PC × 打标的接线 = P4 正题（决议搬迁 + MX） |
@@ -582,7 +582,9 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 1. **Citus 内部路径审计**：执行方案已敲定（四层，§9.2），余两个核实点——
    ① Citus 连接建立点枚举的完备性（普通查询/COPY/repartition/中间结果）；
    ② 引用表现状（已交付系统是否有引用表写；第一期倾向建表后只读）。
-2. **CIC/CLUSTER 等维护命令**的分叉 vs 第一期禁用。
+2. ~~CIC/CLUSTER 等维护命令的分叉 vs 第一期禁用~~——**已裁定第一期禁用**
+   （2026-08-13，V4，理由入 §10 行内；CLUSTER/VACUUM FULL 在 P5 出口再评估，
+   CIC 随索引专项）。
 3. （已记为后续优化，非待定）死元组清除与前缀截断解耦；vacuum 代设 hint
    （§4.5 演进路径）；"本页已洁净"位图之外的免趟加速。
 

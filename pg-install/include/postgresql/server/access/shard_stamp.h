@@ -91,4 +91,18 @@ typedef void (*shard_xact_redo_hook_type) (int nxids, const uint32 *pairs,
 										   bool committed);
 extern PGDLLIMPORT shard_xact_redo_hook_type shard_xact_redo_hook;
 
+/* ---- 0008：vacuum 类读判定（T2.6，ANALYZE 读侧） ---- */
+
+/*
+ * 分片元组的 HeapTupleSatisfiesVacuumHorizon 裁决。返回 true 表示已
+ * 裁决（*res 有效）；返回 false 走原生路径（非分片表）。约定：
+ *   - 只允许产出 LIVE / INSERT_IN_PROGRESS / DELETE_IN_PROGRESS /
+ *     RECENTLY_DEAD / DEAD（中止插入）——"只判不收"：RECENTLY_DEAD 由
+ *     内核分叉点配新鲜原生 xid 作 dead_after，一切提升检查落保守分支；
+ *   - 钩子未装而元组是分片的 ⇒ 分叉点 fail-closed ERROR（0006 语义）。
+ */
+typedef bool (*shard_vacuum_read_hook_type) (HeapTuple htup, Buffer buffer,
+											 int *res);
+extern PGDLLIMPORT shard_vacuum_read_hook_type shard_vacuum_read_hook;
+
 #endif							/* SHARD_STAMP_H */

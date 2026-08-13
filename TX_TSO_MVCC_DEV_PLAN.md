@@ -520,7 +520,7 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   残余风险（登记不修）：文件缺失 + 检查点窗口外未提交持久孤儿 双重故障下
   仍可能重号——文件缺失属运维事故，且该号历史无判决、复活面有限。
 
-#### T2.6 ANALYZE 读侧分叉 + V4 裁定（§8-⑤ 读侧）
+#### T2.6 ANALYZE 读侧分叉 + V4 裁定（§8-⑤ 读侧）——✅ 已完成（2026-08-13，`patches/0008-shard-vacuum-read-hook.patch` 72 行）
 
 - **改**：SatisfiesVacuum 入口对分片元组按 clog 分叉（RUNNING→进行中、
   COMMITTED→活、ABORTED→死判定，但 P2 **只判不收**——回收页面动作是 P5）；
@@ -528,6 +528,23 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   禁用）在此裁定并落设计 §11 + 核实点表**。
 - **验收**：ANALYZE 分片表成功且统计行数近实际；VACUUM/CLUSTER/CIC 仍报错；
   V4 状态更新。
+- **实施记要（2026-08-13）**：补丁 0008 = `HeapTupleSatisfiesVacuumHorizon`
+  分片分支从 0006 防御 ERROR 改为 `shard_vacuum_read_hook` 裁决，钩子未装保持
+  fail-closed。**"只判不收"的机械保证**：committed-deleted 给 RECENTLY_DEAD，
+  分叉点配 `ReadNextTransactionId()` 作 dead_after——两个调用方
+  （HeapTupleSatisfiesVacuum 的 OldestXmin 比较、NonVacuumable 的 GlobalVis
+  提升）拿新鲜原生 xid 必落保守分支，永不提升 DEAD；中止插入给 DEAD（语义
+  准确，回收动作者全被禁/屏蔽，只进 ANALYZE 死行统计）。扩展侧
+  `sv_satisfies_vacuum` 复用 shard_xid_state 四态；**autovacuum 硬盾**——
+  autovacuum 不经 ProcessUtility guard，钩子里 IsAutoVacuumWorkerProcess 即
+  ERROR（分片表纪律 autovacuum_enabled=off，撞进来 fail-closed）。guard 改动：
+  ANALYZE（含整库）放行，VACUUM/VACUUM ANALYZE/FULL 维持禁（P5）。V4 裁定
+  **第一期禁用**落档设计 §10/§11 + 核实点表（CIC 随索引专项、CLUSTER/FULL
+  P5 出口再评估）。验收 17/17：混合状态表（20 活+5 删+3 回滚）ANALYZE 成功
+  且 reltuples=20 精确、活动事务行不入统计、整库 ANALYZE 放行、七条禁令面
+  维持。P1 套件"ANALYZE 点名"负向翻正向（计数守卫 13→12），回归 45/45。
+  pg-install 成对同步（bin/postgres + shard_stamp.h），README 至 0008
+  （nm 八行）。
 
 #### T2.7 门控切换 partition_map 驱动（P1 债）
 
@@ -564,7 +581,7 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
 | V1 | 原生表 hint 位 vs pagecmp 既有处理（§4.5） | T1.0 | ✅ 已完成（P1_PRECHECK 结论 A） |
 | V2 | Citus 连接建立点枚举完备性（§9.2 ①） | P4 前 | 未做 |
 | V3 | 引用表使用现状与只读裁定（§9.2 ②） | P4 前 | 未做 |
-| V4 | CIC/CLUSTER 分叉 vs 禁用裁定（§11） | P2 期间定 | 未做 |
+| V4 | CIC/CLUSTER 分叉 vs 禁用裁定（§11） | P2 期间定 | ✅ 已裁定（2026-08-13 T2.6：第一期禁用，理由入设计 §10；P5 出口再评估 CLUSTER/VACUUM FULL，CIC 随索引专项） |
 | V5 | Citus 13.1 worker 驱动 2PC 行为一致性（§9.1 实验一） | P4 前 | 未做 |
 
 ---

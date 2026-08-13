@@ -830,13 +830,20 @@ ShardXidUtilityGuard(Node *parsetree)
 	if (IsA(parsetree, VacuumStmt))
 	{
 		VacuumStmt *stmt = (VacuumStmt *) parsetree;
-		const char *cmd = stmt->is_vacuumcmd ? "VACUUM" : "ANALYZE";
 		ListCell   *lc;
+
+		/*
+		 * T2.6：ANALYZE 放行——读侧判活走 0008 钩子（shard_visibility.c 的
+		 * sv_satisfies_vacuum，只判不收）。VACUUM（含 VACUUM ANALYZE/FULL）
+		 * 维持禁到 P5（页面动作/freeze 全章）。
+		 */
+		if (!stmt->is_vacuumcmd)
+			return;
 
 		if (stmt->rels == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("P1: 分片打标白名单非空时不允许整库 %s", cmd),
+					 errmsg("分片打标白名单非空时不允许整库 VACUUM"),
 					 errhint("请点名不含分片打标表的目标表。")));
 
 		foreach(lc, stmt->rels)
@@ -846,9 +853,9 @@ ShardXidUtilityGuard(Node *parsetree)
 			if (OidIsValid(vrel->oid) && oid_whitelisted(cfg, vrel->oid))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("P1: %s 不允许作用于分片打标表（OID %u）",
-								cmd, vrel->oid)));
-			shard_xid_guard_range_var(cfg, vrel->relation, cmd);
+						 errmsg("VACUUM 不允许作用于分片打标表（OID %u，P5 前禁）",
+								vrel->oid)));
+			shard_xid_guard_range_var(cfg, vrel->relation, "VACUUM");
 		}
 	}
 	else if (IsA(parsetree, ClusterStmt))

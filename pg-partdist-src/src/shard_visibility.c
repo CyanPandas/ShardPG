@@ -25,10 +25,12 @@
 #include "shard_clog.h"
 #include "shard_visibility.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/shard_stamp.h"
 #include "access/xact.h"
 #include "miscadmin.h"
+#include "postmaster/autovacuum.h"
 #include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
@@ -459,6 +461,67 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 				 errdetail("持有者后端异常消亡；等 T2.4 认领或重启集群。")));
 }
 
+/*
+ * T2.6（配内核补丁 0008）：vacuum 类读判定——ANALYZE 的采样判活走这里。
+ * "只判不收"：committed-deleted 给 RECENTLY_DEAD（内核分叉点配新鲜原生
+ * dead_after，一切提升检查落保守分支）；中止插入给 DEAD（语义准确，回收类
+ * 动作者全被禁/屏蔽，DEAD 只进 ANALYZE 的死行统计）。autovacuum 不经
+ * ProcessUtility guard，这里补硬盾——分片表纪律上 autovacuum_enabled=off，
+ * 万一撞进来 fail-closed。
+ */
+static bool
+sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
+
+	if (!OidIsValid(shard))
+		return false;
+
+	if (IsAutoVacuumWorkerProcess())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("autovacuum 触及分片打标表（OID %u）——该表必须保持 "
+						"autovacuum_enabled=off", htup->t_tableOid)));
+
+	ShardAccessGate(shard, "vacuum 类读判定");
+
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL))
+	{
+		case SXID_MY_OWN:
+		case SXID_RUNNING:
+			*res = (int) HEAPTUPLE_INSERT_IN_PROGRESS;
+			return true;
+		case SXID_ABORTED:
+			*res = (int) HEAPTUPLE_DEAD;
+			return true;
+		case SXID_COMMITTED:
+			break;
+	}
+
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+	{
+		*res = (int) HEAPTUPLE_LIVE;
+		return true;
+	}
+
+	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL))
+	{
+		case SXID_MY_OWN:
+		case SXID_RUNNING:
+			*res = (int) HEAPTUPLE_DELETE_IN_PROGRESS;
+			break;
+		case SXID_ABORTED:
+			*res = (int) HEAPTUPLE_LIVE;
+			break;
+		case SXID_COMMITTED:
+			*res = (int) HEAPTUPLE_RECENTLY_DEAD;
+			break;
+	}
+	return true;
+}
+
 static const ShardVisibilityHooks sv_hooks = {
 	sv_is_shard_rel,
 	sv_satisfies_mvcc,
@@ -597,4 +660,5 @@ void
 ShardVisibilityInstallHooks(void)
 {
 	shard_visibility_hooks = &sv_hooks;
+	shard_vacuum_read_hook = sv_satisfies_vacuum;	/* 0008（T2.6） */
 }

@@ -158,8 +158,8 @@ WM2=$(DEX od -An -tu4 "${DATADIR}/pg_shard_xid/${OID}" </dev/null | awk '{print 
 check "水位推进一批（= ${WM}+4096）" "$WM2" "$((WM+4096))"
 
 echo "========== [5] 负向全集（该报错的都报错） =========="
-# 基线行数动态取：[4] 的崩溃清空了临时提交表，历史中止事务按"缺席=已提交"
-# 复活为可见（P1 桩已知限制），所以不能写死崩溃前的行数。
+# 基线行数动态取（T2.3 起真相源=分片 clog，崩溃不再复活中止行；保留动态
+# 取数以兼容任意历史状态）。
 base_rows=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p1_shard" </dev/null)
 neg() {  # neg <名字> <期望片段> <SQL...>
   local name=$1 frag=$2; shift 2
@@ -174,7 +174,9 @@ neg "FOR UPDATE"          "row-level locking is not supported" -c "SELECT id FRO
 neg "FOR SHARE"           "row-level locking is not supported" -c "SELECT id FROM p1_shard WHERE id=2 FOR SHARE;"
 neg "SERIALIZABLE 读"     "SERIALIZABLE 隔离级别"           -c "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM p1_shard; ROLLBACK;"
 neg "VACUUM 点名"         "VACUUM 不允许作用于分片打标表"    -c "VACUUM p1_shard;"
-neg "ANALYZE 点名"        "ANALYZE 不允许作用于分片打标表"   -c "ANALYZE p1_shard;"
+# T2.6：ANALYZE 解禁（0008 读侧分叉，只判不收），负向翻正向
+an26=$(PSQL "$WPORT" -Atc "ANALYZE p1_shard; SELECT 'ok'" </dev/null 2>&1 | tail -1)
+check "ANALYZE 点名（T2.6 起解禁）" "$an26" "ok"
 neg "整库 VACUUM"         "不允许整库 VACUUM"               -c "VACUUM;"
 neg "CLUSTER 点名"        "CLUSTER 不允许作用于分片打标表"   -c "CLUSTER p1_shard;"
 neg "CREATE INDEX 点名"   "CREATE INDEX 不允许作用于分片打标表" -c "CREATE INDEX ON p1_shard(id);"
@@ -182,7 +184,7 @@ neg "PREPARE 含分片写"    "PREPARE TRANSACTION"             -c "BEGIN; INSER
 neg "COPY FREEZE"         "COPY FREEZE"                     -c "BEGIN; TRUNCATE p1_shard; COPY p1_shard FROM PROGRAM 'echo 93,0,x' WITH (FORMAT csv, FREEZE);"
 neg "严格模式读"          "读被拦截"                        -c "SET pg_partdist.shard_safety_mode=strict; SELECT count(*) FROM p1_shard;"
 neg "严格模式写"          "写入被拦截"                      -c "SET pg_partdist.shard_safety_mode=strict; INSERT INTO p1_shard VALUES (92,0,'x');"
-check "负向用例计数守卫（应跑 13 条）" "$NEG_RUN" "13"
+check "负向用例计数守卫（应跑 12 条，T2.6 起 ANALYZE 转正）" "$NEG_RUN" "12"
 r=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p1_shard" </dev/null)
 check "负向用例未破坏数据（行数不变）" "$r" "$base_rows"
 

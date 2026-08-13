@@ -1,0 +1,72 @@
+--- a/src/include/access/shard_stamp.h
++++ b/src/include/access/shard_stamp.h
+@@ -91,4 +91,18 @@
+ 										   bool committed);
+ extern PGDLLIMPORT shard_xact_redo_hook_type shard_xact_redo_hook;
+ 
++/* ---- 0008：vacuum 类读判定（T2.6，ANALYZE 读侧） ---- */
++
++/*
++ * 分片元组的 HeapTupleSatisfiesVacuumHorizon 裁决。返回 true 表示已
++ * 裁决（*res 有效）；返回 false 走原生路径（非分片表）。约定：
++ *   - 只允许产出 LIVE / INSERT_IN_PROGRESS / DELETE_IN_PROGRESS /
++ *     RECENTLY_DEAD / DEAD（中止插入）——"只判不收"：RECENTLY_DEAD 由
++ *     内核分叉点配新鲜原生 xid 作 dead_after，一切提升检查落保守分支；
++ *   - 钩子未装而元组是分片的 ⇒ 分叉点 fail-closed ERROR（0006 语义）。
++ */
++typedef bool (*shard_vacuum_read_hook_type) (HeapTuple htup, Buffer buffer,
++											 int *res);
++extern PGDLLIMPORT shard_vacuum_read_hook_type shard_vacuum_read_hook;
++
+ #endif							/* SHARD_STAMP_H */
+--- a/src/backend/access/heap/heapam_visibility.c
++++ b/src/backend/access/heap/heapam_visibility.c
+@@ -85,6 +85,9 @@
+  * shard-managed relations.  NULL = native behavior everywhere. */
+ const ShardVisibilityHooks *shard_visibility_hooks = NULL;
+ 
++/* patch 0008: vacuum-style read adjudication for shard tuples (T2.6) */
++shard_vacuum_read_hook_type shard_vacuum_read_hook = NULL;
++
+ 
+ /*
+  * SetHintBits()
+@@ -1249,16 +1252,34 @@
+ 
+ 	*dead_after = InvalidTransactionId;
+ 
+-	/* patch 0006: no vacuum-style liveness math exists for shard xids;
+-	 * every legitimate caller is fenced off (prune skipped, VACUUM/
+-	 * ANALYZE/CLUSTER/CREATE INDEX intercepted), so reaching here with a
+-	 * shard tuple is a fenced-path escape -- fail closed. */
++	/* patch 0006/0008: shard tuples never consult native clog/procarray.
++	 * 0008 hands adjudication to the extension (ANALYZE read side); with
++	 * no hook installed the 0006 fail-closed ERROR is preserved -- the
++	 * remaining reclaim-side callers (prune skipped, VACUUM/CLUSTER/
++	 * CREATE INDEX intercepted) stay fenced off. */
+ 	if (shard_visibility_hooks &&
+ 		shard_visibility_hooks->is_shard_rel(htup->t_tableOid))
++	{
++		int			res = 0;
++
++		if (shard_vacuum_read_hook != NULL &&
++			shard_vacuum_read_hook(htup, buffer, &res))
++		{
++			/*
++			 * RECENTLY_DEAD must carry a valid native dead_after for the
++			 * callers' promotion checks; a fresh native xid keeps every
++			 * one of them on the conservative branch (judge, never
++			 * reclaim).
++			 */
++			if ((HTSV_Result) res == HEAPTUPLE_RECENTLY_DEAD)
++				*dead_after = ReadNextTransactionId();
++			return (HTSV_Result) res;
++		}
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INTERNAL_ERROR),
+ 				 errmsg("vacuum-style visibility check reached shard-managed relation %u",
+ 						htup->t_tableOid)));
++	}
+ 
+ 	/*
+ 	 * Has inserting transaction committed?
