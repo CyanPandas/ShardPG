@@ -766,7 +766,7 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
   顺序提交不误报；快照内撞并发 DELETE 提交 40001。金丝雀 P1 45/45 +
   P2 64/64（遗留冲突路径不变）。
 
-#### T3.5 GlobalSafeTs（机制就位，消费方 P5）
+#### T3.5 GlobalSafeTs（机制就位，消费方 P5）——✅ 已完成（2026-08-13）
 
 - **改**：master 登记表（节点→最老活跃 ts + 租约期限）；搭车通道（T3.1 已
   含）+ 周期心跳（worker 侧挂现成 bgworker 周期任务，无事务也报"最老或
@@ -775,6 +775,25 @@ T3.7 验收套件与 T3.3 起并行开发，出口统跑
 - **验收**：GlobalSafeTs 单调不减；≤ 全集群活跃快照最小 start_ts（并发
   churn 下断言不变式）；停心跳 → 租约到期后该节点被剔除、SafeTs 恢复推进；
   栅栏先于剔除生效。
+- **实施记要（2026-08-13）**：master 侧 = `partdist_tso_heartbeat(node,
+  oldest)`（续租即报最老，返回 lease_ms 供栅栏计算）+ 惰性过期清扫（safe
+  计算时租约过期登记清"无"，无需 master 侧定时器）+ `tso_compute_safe_locked`
+  （候选=min(租约内活跃 oldest)，全无活跃=counter；**单调钳制**，候选倒退
+  WARNING 保存量）+ 读出/status 扩 safe 字段。worker 侧 = **新常驻心跳
+  bgworker**（每节点一个，lease/3 周期，未配置 conninfo 时静默轮询；失败不
+  死由栅栏兜底）+ **栅栏**挂 TsoGetStartTs 缓存命中路径（now > last_beat +
+  lease−lease/4 ⇒ ERRCODE_SNAPSHOT_TOO_OLD"栅栏作废"，先于 master 到期剔除
+  生效）；续租登记 = start_ts RPC 与心跳成功（commit_ts 不续租不算数）。
+  **实测抓出一个 P0 级坑**：bgworker 无数据库连接，`PartDistLocalNodeId()`
+  的 Citus catalog 查询直接 SIGSEGV，且 bgworker 崩溃 → postmaster 全进程
+  reinit → 秒级循环拖垮节点（"节点崩溃的不可见性"再现，worker1 一度 221 次
+  段错误 + 卡 shutting down 需 immediate 重启）——修法：节点号缓存进
+  shmem（首个取号后端写入，worker 只读；未知即跳过心跳——没人取过号就没有
+  快照需要续租）。测试法教训：单次 `-c` 多语句是一个 PQexec 整体返回，
+  后台会话取中间值必须走 stdin 逐语句。验收 11/11：safe==最老活跃（实测
+  钉在 A 的 start_ts）；活跃清空后随心跳推进且单调；伪节点租约 3s 过期后
+  safe 越过；**栅栏实测**（coordinator 停机 ~2.25s 后快照内第二次读被作废，
+  先于 3s 剔除）。金丝雀 r2 50/0 + P1 45/45 + P2 64/64。
 
 #### T3.6 安全网严格模式收紧（§9.2 第 1 层语义到位）
 

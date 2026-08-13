@@ -1008,3 +1008,9 @@ CREATE OR REPLACE FUNCTION partdist_tso_client_start_ts()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_start_ts' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION partdist_tso_client_commit_ts()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_commit_ts' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T3.5）：GlobalSafeTs——心跳续租（worker bgworker 调用）与读出。
+CREATE OR REPLACE FUNCTION partdist_tso_heartbeat(node int, oldest bigint)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_heartbeat' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_global_safe_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_global_safe_ts' LANGUAGE C STRICT;

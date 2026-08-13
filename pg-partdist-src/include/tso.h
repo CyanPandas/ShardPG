@@ -42,4 +42,8 @@ extern int64 TsoStashedCommitTs(void);	/* 临界区内只读暂存 */
 extern void TsoClientClearActive(void);	/* 事务结束清缓存与活跃槽 */
 extern bool TsoConfigured(void);		/* conninfo 非空 = TSO 模式 */
 
+/* ---- T3.5 GlobalSafeTs（心跳 bgworker + 栅栏） ---- */
+extern void TsoRegisterHeartbeatWorker(void);
+extern PGDLLEXPORT void TsoHeartbeatWorkerMain(Datum main_arg);
+
 #endif							/* PARTDIST_TSO_H */

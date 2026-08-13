@@ -25,9 +25,15 @@
 #include "fmgr.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
 
 /* ---- GUC ---- */
 
@@ -46,6 +52,15 @@ typedef struct TsoActiveEntry
 typedef struct TsoClientState
 {
 	LWLock	   *lock;
+	int32		node_id;		/* 本节点号缓存：首个取号后端写入（-1=未知）。
+								 * 心跳 bgworker 无数据库连接，不能做 Citus
+								 * catalog 查询（实测 SIGSEGV 循环拖垮节点），
+								 * 只读这里；未知则跳过心跳——没人取过号就
+								 * 没有快照需要续租保护。 */
+	TimestampTz last_beat_ok;	/* T3.5 栅栏：最近一次租约续期成功时刻
+								 * （start_ts RPC 或心跳，二者都在 master
+								 * 侧续租；commit_ts 不续租不算数） */
+	int32		lease_ms;		/* master 返回的租约时长；0=未知 */
 	TsoActiveEntry active[TSO_CLIENT_MAX_ACTIVE];
 } TsoClientState;
 
@@ -92,6 +107,9 @@ TsoClientShmemInit(void)
 	if (!found)
 	{
 		memset(TsoClientCtl->active, 0, sizeof(TsoClientCtl->active));
+		TsoClientCtl->node_id = -1;
+		TsoClientCtl->last_beat_ok = 0;
+		TsoClientCtl->lease_ms = 0;
 		TsoClientCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_tso_client")[0].lock;
 	}
@@ -173,6 +191,50 @@ TsoClientClearActive(void)
 	LWLockRelease(TsoClientCtl->lock);
 }
 
+/* T3.5：续租成功登记（start_ts / 心跳成功后调；lease_ms<=0 只记时刻） */
+static void
+tso_note_lease_renewal(int32 lease_ms)
+{
+	if (TsoClientCtl == NULL)
+		return;
+	LWLockAcquire(TsoClientCtl->lock, LW_EXCLUSIVE);
+	TsoClientCtl->last_beat_ok = GetCurrentTimestamp();
+	if (lease_ms > 0)
+		TsoClientCtl->lease_ms = lease_ms;
+	LWLockRelease(TsoClientCtl->lock);
+}
+
+/*
+ * T3.5 栅栏（护栏二，§6.2）：持有活跃快照期间若本节点已 lease−ε 没续上租
+ * （ε = lease/4），本地先行作废快照——必然先于 master 的到期剔除生效，
+ * 依赖仅时钟漂移速率有界。心跳 worker 每 lease/3 续一次，健康时远够不着。
+ */
+static void
+tso_fence_check(void)
+{
+	TimestampTz beat;
+	int32		lease;
+
+	if (TsoClientCtl == NULL || !tso_configured())
+		return;
+	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+	beat = TsoClientCtl->last_beat_ok;
+	lease = TsoClientCtl->lease_ms;
+	LWLockRelease(TsoClientCtl->lock);
+	if (lease <= 0 || beat == 0)
+		return;					/* 尚无租约信息（本快照刚经 RPC 取得） */
+
+	if (GetCurrentTimestamp() >
+		TimestampTzPlusMilliseconds(beat, lease - lease / 4))
+		ereport(ERROR,
+				(errcode(ERRCODE_SNAPSHOT_TOO_OLD),
+				 errmsg("分片快照被栅栏作废：本节点已 %d ms 未能向 TSO 续租",
+						lease - lease / 4),
+				 errdetail("GlobalSafeTs 护栏二（设计 §6.2）：本地作废必须先于"
+						   " master 租约剔除，否则 vacuum 可能越过活跃快照。"),
+				 errhint("检查 TSO master 连通性后重试事务。")));
+}
+
 /* ---- RPC ---- */
 
 static void
@@ -247,7 +309,10 @@ TsoGetStartTs(void)
 	int64		oldest;
 
 	if (cur_start_ts != 0)
+	{
+		tso_fence_check();		/* T3.5：持有快照期间的每次取用都过栅栏 */
 		return cur_start_ts;
+	}
 	if (!tso_configured())
 		return 0;
 
@@ -265,6 +330,9 @@ TsoGetStartTs(void)
 			 "SELECT partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 (int) PartDistLocalNodeId(), oldest);
 	cur_start_ts = tso_rpc(sql, "start_ts");
+	if (TsoClientCtl->node_id < 0)
+		TsoClientCtl->node_id = (int32) PartDistLocalNodeId();
+	tso_note_lease_renewal(0);	/* start_ts 在 master 侧即续租 */
 	tso_active_register(cur_start_ts);
 	return cur_start_ts;
 }
@@ -303,4 +371,101 @@ partdist_tso_client_commit_ts(PG_FUNCTION_ARGS)
 {
 	TsoStashCommitTs();
 	PG_RETURN_INT64(TsoStashedCommitTs());
+}
+
+/* ================= T3.5 心跳 bgworker ================= */
+
+/*
+ * 发一次心跳（worker 进程调用；失败静默返回 false——worker 不能死，
+ * 由栅栏负责把失联转化为读侧 ERROR）。
+ */
+static bool
+TsoHeartbeatOnce(void)
+{
+	char		sql[128];
+	int64		oldest;
+	int64		lease;
+
+	int32		node;
+
+	if (!tso_configured() || TsoClientCtl == NULL)
+		return false;
+
+	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+	node = TsoClientCtl->node_id;
+	oldest = tso_active_min_locked();
+	LWLockRelease(TsoClientCtl->lock);
+
+	if (node < 0)
+	{
+		if (partdist_node_id >= 0)
+			node = partdist_node_id;	/* GUC 显式给了，无需 catalog */
+		else
+			return false;		/* 节点号未知=从没人取过号，无需续租 */
+	}
+
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist_tso_heartbeat(%d, CAST(" INT64_FORMAT " AS bigint))",
+			 node, oldest);
+	lease = tso_rpc_once(sql);
+	if (lease < 0)
+	{
+		lease = tso_rpc_once(sql);	/* 重连重试一次 */
+		if (lease < 0)
+			return false;
+	}
+	tso_note_lease_renewal((int32) lease);
+	return true;
+}
+
+void
+TsoHeartbeatWorkerMain(Datum main_arg)
+{
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+
+	for (;;)
+	{
+		int			wait_ms = 5000;
+
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending)
+			proc_exit(0);
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		if (tso_configured())
+		{
+			(void) TsoHeartbeatOnce();
+			if (TsoClientCtl != NULL && TsoClientCtl->lease_ms > 0)
+				wait_ms = Max(1000, TsoClientCtl->lease_ms / 3);
+		}
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 wait_ms, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+	}
+}
+
+void
+TsoRegisterHeartbeatWorker(void)
+{
+	BackgroundWorker worker;
+
+	memset(&worker, 0, sizeof(worker));
+	strlcpy(worker.bgw_name, "pg_partdist tso heartbeat", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "pg_partdist tso heartbeat", BGW_MAXLEN);
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 10;	/* 常驻：异常退出 10s 重启 */
+	strlcpy(worker.bgw_library_name, "pg_partdist", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "TsoHeartbeatWorkerMain", BGW_MAXLEN);
+	worker.bgw_main_arg = Int32GetDatum(0);
+	worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&worker);
 }

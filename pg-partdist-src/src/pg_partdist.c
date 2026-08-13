@@ -554,6 +554,7 @@ _PG_init(void)
 
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
+    TsoRegisterHeartbeatWorker();   /* T3.5：GlobalSafeTs 心跳/续租 */
 
     /* Transaction callback: write PartWAL at PRE_COMMIT, discard on ABORT */
     RegisterXactCallback(PartWALXactCallback, NULL);

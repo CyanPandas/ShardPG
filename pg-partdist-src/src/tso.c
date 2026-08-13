@@ -36,6 +36,7 @@ typedef struct TsoState
 {
 	LWLock	   *lock;
 	int64		counter;		/* 下一个待发；从 1 起，0 保留为"无 ts" */
+	int64		safe_ts;		/* T3.5 GlobalSafeTs：单调不减（§6.2） */
 	bool		served;			/* 本次启动是否已服务过（boot 标记已落盘） */
 	bool		boot_blocked;	/* 启动时检测到 boot 标记 ⇒ 拒发号 */
 	TsoNodeEntry nodes[TSO_MAX_NODES];
@@ -92,6 +93,7 @@ TsoShmemInit(void)
 		char		path[MAXPGPATH];
 
 		TsoCtl->counter = 1;
+		TsoCtl->safe_ts = 0;
 		TsoCtl->served = false;
 		for (i = 0; i < TSO_MAX_NODES; i++)
 		{
@@ -254,6 +256,115 @@ partdist_tso_commit_ts(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(ts);
 }
 
+/*
+ * T3.5：租约过期清扫 + GlobalSafeTs 计算（须持排它锁）。
+ * 候选 = min(租约内且有活跃的节点 oldest)；全无活跃 ⇒ counter（已发尽安全）。
+ * 单调不减：候选 < 存量属不变式破坏（登记/栅栏漏了），WARNING 并保存量。
+ */
+static int64
+tso_compute_safe_locked(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	int64		cand = 0;
+	int			i;
+
+	for (i = 0; i < TSO_MAX_NODES; i++)
+	{
+		TsoNodeEntry *e = &TsoCtl->nodes[i];
+
+		if (e->node_id == -1)
+			continue;
+		if (e->lease_deadline < now)
+		{
+			e->oldest_ts = 0;	/* 护栏一：租约到期登记清为"无" */
+			continue;
+		}
+		if (e->oldest_ts > 0 && (cand == 0 || e->oldest_ts < cand))
+			cand = e->oldest_ts;
+	}
+	if (cand == 0)
+		cand = TsoCtl->counter;
+
+	if (cand >= TsoCtl->safe_ts)
+		TsoCtl->safe_ts = cand;
+	else
+		elog(WARNING,
+			 "pg_partdist: GlobalSafeTs 候选 " INT64_FORMAT
+			 " 低于存量 " INT64_FORMAT "（不变式破坏？），保持存量",
+			 cand, TsoCtl->safe_ts);
+	return TsoCtl->safe_ts;
+}
+
+/*
+ * partdist_tso_heartbeat(node, oldest) — 双通道之二：周期心跳（§6.2）。
+ * 无事务也报"最老或无（0）"，即租约续期。返回 lease 毫秒数——worker 侧
+ * 栅栏据此计算作废时限（先于 master 剔除生效）。
+ */
+PG_FUNCTION_INFO_V1(partdist_tso_heartbeat);
+Datum
+partdist_tso_heartbeat(PG_FUNCTION_ARGS)
+{
+	int32		node = PG_GETARG_INT32(0);
+	int64		oldest = PG_GETARG_INT64(1);
+	int			i;
+	int			free_i = -1;
+	TsoNodeEntry *e = NULL;
+
+	tso_service_gate();
+	if (node < 0 || oldest < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("node 须 >=0、oldest 须 >=0（0=无活跃快照）")));
+
+	LWLockAcquire(TsoCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < TSO_MAX_NODES; i++)
+	{
+		if (TsoCtl->nodes[i].node_id == node)
+		{
+			e = &TsoCtl->nodes[i];
+			break;
+		}
+		if (free_i < 0 && TsoCtl->nodes[i].node_id == -1)
+			free_i = i;
+	}
+	if (e == NULL && free_i >= 0)
+	{
+		e = &TsoCtl->nodes[free_i];
+		e->node_id = node;
+	}
+	if (e != NULL)
+	{
+		e->oldest_ts = oldest;
+		e->lease_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+														tso_lease_ms);
+	}
+	LWLockRelease(TsoCtl->lock);
+
+	PG_RETURN_INT64((int64) tso_lease_ms);
+}
+
+/* partdist_global_safe_ts() — 读出（P5 vacuum 的地基 + 验收观测点） */
+PG_FUNCTION_INFO_V1(partdist_global_safe_ts);
+Datum
+partdist_global_safe_ts(PG_FUNCTION_ARGS)
+{
+	int64		safe;
+
+	if (TsoCtl == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_partdist: TSO 共享内存未初始化")));
+	if (!tso_master)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("本节点不是 TSO master（pg_partdist.tso_master=off）")));
+
+	LWLockAcquire(TsoCtl->lock, LW_EXCLUSIVE);
+	safe = tso_compute_safe_locked();
+	LWLockRelease(TsoCtl->lock);
+	PG_RETURN_INT64(safe);
+}
+
 /* partdist_tso_status() — 观测/验收（不发号、不落标记；master 之外也可看） */
 PG_FUNCTION_INFO_V1(partdist_tso_status);
 Datum
@@ -269,8 +380,9 @@ partdist_tso_status(PG_FUNCTION_ARGS)
 
 	initStringInfo(&buf);
 	LWLockAcquire(TsoCtl->lock, LW_SHARED);
-	appendStringInfo(&buf, "counter=" INT64_FORMAT " served=%c blocked=%c",
-					 TsoCtl->counter,
+	appendStringInfo(&buf, "counter=" INT64_FORMAT " safe=" INT64_FORMAT
+					 " served=%c blocked=%c",
+					 TsoCtl->counter, TsoCtl->safe_ts,
 					 TsoCtl->served ? 't' : 'f',
 					 TsoCtl->boot_blocked ? 't' : 'f');
 	for (i = 0; i < TSO_MAX_NODES; i++)
