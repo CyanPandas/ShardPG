@@ -40,10 +40,12 @@
 #include "catalog/pg_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "access/xact.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -57,6 +59,12 @@
 /* 1 coordinator + 16 worker 拓扑共 17 个 group0 成员；parse_peers 超限会静默丢弃 */
 #define RAFT_MAX_PEERS     32
 #define RAFT_LOG_CAPACITY  128
+
+/* data_entry_apply 返回 false 的原因（写进 RaftLogShmem.last_apply_fail） */
+#define RAFT_APPLYFAIL_NONE       0
+#define RAFT_APPLYFAIL_NO_PART    1   /* group_local_partition() <= 0：P0 映射没建好 */
+#define RAFT_APPLYFAIL_NO_SPI     2   /* 拿不到 SPI */
+#define RAFT_APPLYFAIL_SPI_EXEC   3   /* follower_set_applied_part_lsn 执行失败 */
 #define RAFT_OP_LEN        32
 #define RAFT_PAYLOAD_MAX   768
 
@@ -147,7 +155,42 @@ typedef struct RaftLogShmem
     int64        peer_next_index[RAFT_MAX_PEERS];
     int64        peer_match_index[RAFT_MAX_PEERS];
     bool         repl_inited;
-    bool         apply_in_progress;  /* 串行化 apply，保证 N 先于 N+1 生效 */
+    int          apply_owner_pid;   /* 串行化 apply 的认领（0 = 无人持有），
+                                     * 保证 N 先于 N+1 生效。
+                                     *
+                                     * ★ 为什么是 PID 而不是 bool（#39）：持有者
+                                     * 可能死在三条路上，归还机制各不相同 ——
+                                     *   ERROR   → PG_CATCH 归还（longjmp 可接）；
+                                     *   FATAL   → proc_exit 跑 before_shmem_exit
+                                     *             回调但**不走 PG_CATCH**，且
+                                     *             postmaster 对 FATAL 退出不重置
+                                     *             shmem —— bool 版在这里永久泄漏，
+                                     *             该组 apply 从此停摆（实测：对端
+                                     *             节点重置引发的 Connection reset
+                                     *             FATAL 正是 h 轮回归全线卡死的根因）；
+                                     *   kill -9 → postmaster 整体重置节点、重建
+                                     *             shmem，天然清零，无需处理。
+                                     * 回调只清 **owner == MyProcPid** 的认领，
+                                     * 所以必须存 PID。**没有探活、没有抢占** ——
+                                     * 抢占一个还活着的持有者会破坏单写者不变式
+                                     * （上一次尝试因此回退）。*/
+
+    /*
+     * 背压与丢弃计数（§13 约束 13）。**这几个数字是"副本是否还可信"的唯一
+     * 线索**：数据面的提案一旦被丢弃，discard_uncommitted_entry 会把 leader
+     * 自己段里那条也截掉，于是 leader 的 flush_lsn 退回、follower 显示"已追平"
+     * ——而那条记录代表的物理变更（典型是 VACUUM 的尾部截断）**在 leader 上
+     * 已经durable 且不随事务回滚**。分叉就此无痕。有了计数，至少能查出来。
+     */
+    int64        ring_full_waits;   /* 因环满而阻塞等 apply 的次数 */
+    int64        ring_full_drops;   /* 等到超时仍无空位、提案被丢弃的次数 */
+    int64        quorum_drops;      /* 多数派不足导致条目被丢弃的次数 */
+    int64        last_drop_plsn;    /* 最近一次被丢弃的数据条目的 partition_lsn */
+    int          last_apply_fail;   /* data_entry_apply 最近一次返回 false 的原因，
+                                     * 见 RAFT_APPLYFAIL_*。apply 推不动时这是唯一
+                                     * 线索 —— 三条 false 分支从日志上完全看不出
+                                     * 区别，而它们的处置完全不同。 */
+
     RaftLogEntry ring[RAFT_LOG_CAPACITY];
 } RaftLogShmem;
 
@@ -217,6 +260,7 @@ int   pg_raft_promote_catchup_deadline_ms = 60000;
 char *pg_raft_peers = NULL;
 int   pg_raft_election_timeout_ms = 1500;
 int   pg_raft_heartbeat_ms = 400;
+int   pg_raft_propose_wait_ms = 10000;
 int   pg_raft_catchup_interval_ms = 5000;
 int   pg_raft_compact_threshold = 500;
 
@@ -271,12 +315,23 @@ static int64 group_local_partition(RaftGroupCtx *ctx);
 static bool raft_spi_ctx = false;
 
 static bool raft_persist_spi_begin(bool *spi_owned);
+static void group_apply_pending(RaftGroupCtx *ctx);
 static bool dtx_dtxid_from_gid(const char *gid, int64 *dtxid);
 static void dtx_ack_sweep(void);
 static void dtx_forget_sweep(void);
 static int  dtx_gc_dist_transaction(void);
 static void raft_persist_spi_end(bool spi_owned);
 static int64 entry_partition_lsn(const char *payload);
+/* 批量 apply 随批携带的 DTX 登记项（§6.2/§9.7 逐条语义的保留通道） */
+typedef struct DtxApplyItem
+{
+    int64 plsn;
+    int   info;         /* 2=DECISION 5=FORGET */
+} DtxApplyItem;
+static bool  data_apply_advance(RaftGroupCtx *ctx, int64 plsn,
+                                const DtxApplyItem *dtx_items, int ndtx);
+static void  data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid,
+                                int64 plsn, int info);
 static int entry_record_flags(const char *payload);
 static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
@@ -323,7 +378,12 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.commit_index = 0;
     g->log.last_applied = 0;
     g->log.repl_inited = false;
-    g->log.apply_in_progress = false;
+    g->log.apply_owner_pid = 0;
+    g->log.ring_full_waits = 0;
+    g->log.ring_full_drops = 0;
+    g->log.quorum_drops = 0;
+    g->log.last_drop_plsn = 0;
+    g->log.last_apply_fail = RAFT_APPLYFAIL_NONE;
 
     g->last_data_plsn = 0;
     g->replicate_in_progress = false;
@@ -832,16 +892,72 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
 }
 
 /*
+ * data_apply_dtx_one — 单条 DTX 记录的本地登记（调用方持有 SPI）。
+ *
+ * ★ DECISION（info==2，DTX_2PC_DESIGN.md §6.2）：每个组成员在 apply 它时
+ * 各自把决议登记进本地 partdist.dtx_decision。这正是"协调权随 Raft 选举
+ * 自动转移"的落地点：协调组切主后，新 leader 手里天然就有全表，
+ * dtx_status 立刻可答，不需要任何状态搬迁。载荷由 partwal_read_dtx_record
+ * 从**本节点刚落盘的字节**解析，因此 follower 上的登记与 leader 逐字段
+ * 相同。ON CONFLICT DO NOTHING —— 决议槽一次性，重复 apply 幂等。
+ *
+ * ★ FORGET（info==5，§9.7）：presumed abort 的标准收尾。协调组 leader 在
+ * acked ⊇ participants 后追加它并复制到多数派；每个成员 apply 它时把该
+ * dtxid 的决议行从本地索引删除 —— 删除经由组日志复制，所以**全体成员
+ * 同步回收**，选举转移后也不留分叉的表。此后按协议不会再有人来问这笔
+ * 决议（全部写过的参与者都已闭合并留标记）。
+ */
+static void
+data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid, int64 plsn, int info)
+{
+    StringInfoData sql;
+
+    if (info == 5)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.dtx_decision dd "
+                         "USING partdist.partwal_read_dtx_record(%u::oid, %lld) d "
+                         "WHERE dd.dtxid = d.dtxid",
+                         (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_DELETE)
+            elog(WARNING,
+                 "pg_raft: 组 %lld apply FORGET 记录（plsn=%lld）删除决议行失败",
+                 (long long) ctx->group_id, (long long) plsn);
+        pfree(sql.data);
+    }
+    else if (info == 2)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_decision"
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                         "SELECT d.dtxid, d.coord_gsid, d.verdict, d.commit_ts, "
+                         "       coalesce(d.participants, '{}'::bigint[]), %lld "
+                         "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d "
+                         "WHERE d.dtxid IS NOT NULL "
+                         "ON CONFLICT (dtxid) DO NOTHING",
+                         (long long) plsn, (unsigned) local_oid,
+                         (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
+            elog(WARNING,
+                 "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
+                 (long long) ctx->group_id, (long long) plsn);
+        pfree(sql.data);
+    }
+}
+
+/*
  * 数据组的"平凡 apply"：不 redo，只把 applied_part_lsn 推到该条目的
  * partition_lsn。这补上了 follower_partition_map.applied_part_lsn 长期
  * "有表无写入方"的缺口，切主安全线从此比的是真实进度而非占位 0。
  */
 static bool
-data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
+data_apply_advance(RaftGroupCtx *ctx, int64 plsn,
+                   const DtxApplyItem *dtx_items, int ndtx)
 {
     StringInfoData sql;
     bool           spi_owned;
-    int64          plsn = entry_partition_lsn(e->payload);
     int64          local_oid;
     bool           ok;
 
@@ -850,10 +966,16 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
 
     local_oid = group_local_partition(ctx);
     if (local_oid <= 0)
+    {
+        ctx->log->last_apply_fail = RAFT_APPLYFAIL_NO_PART;
         return false;           /* P0 映射还没建好，重试而不是跳过 */
+    }
 
     if (!raft_persist_spi_begin(&spi_owned))
+    {
+        ctx->log->last_apply_fail = RAFT_APPLYFAIL_NO_SPI;
         return false;           /* 拿不到 SPI（如 BGW），下轮再来 */
+    }
 
     /*
      * ★ 只有这条会与 prepared 事务撞锁，所以只跳过它（in_txn_replication）。
@@ -886,63 +1008,44 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
     }
 
     /*
-     * ★ DTX DECISION 记录：每个组成员在 apply 它时各自把决议登记进本地
-     * partdist.dtx_decision（DTX_2PC_DESIGN.md §6.2）。
-     *
-     * 这正是"协调权随 Raft 选举自动转移"的落地点：协调组切主后，新 leader
-     * 手里天然就有全表，dtx_status 立刻可答，不需要任何状态搬迁。
-     *
-     * 判据用 flags 的 DTX 位 + info==DTX_DECISION(2)，与写入侧一致；
-     * 载荷由 partwal_read_dtx_record 从**本节点刚落盘的字节**解析，
-     * 因此 follower 上的登记与 leader 逐字段相同。
-     * ON CONFLICT DO NOTHING —— 决议槽一次性，重复 apply 幂等。
+     * ★ DTX DECISION/FORGET 登记必须**逐条**处理，不随批量合并吞掉
+     * （#39 批量 apply 与 DTX §6.2/§9.7 的合并适配，2026-08-13）。
+     * 游标推进合并成一次没问题 —— 中间值没有读者；但 DECISION(info=2)
+     * 要把决议登记进本地 partdist.dtx_decision、FORGET(info=5) 要删掉
+     * 对应行，每条都有独立副作用。批量扫描按日志序收集 (plsn, info)
+     * 清单随批传入，这里按同一顺序落账；载荷由 partwal_read_dtx_record
+     * 从**本节点已落盘的字节**解析，只需要 plsn，不需要日志条目本身。
      */
-    /*
-     * ★ DTX FORGET 记录（info==5，§9.7）：presumed abort 的标准收尾。
-     * 协调组 leader 在 acked ⊇ participants 后追加它并复制到多数派；
-     * 每个成员 apply 它时把该 dtxid 的决议行从本地索引删除 —— 删除经由
-     * 组日志复制，所以 **全体成员同步回收**，选举转移后也不留分叉的表。
-     * 此后按协议不会再有人来问这笔决议（全部写过的参与者都已闭合并留标记）。
-     */
-    if (ok && (entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
-        entry_record_info(e->payload) == 5)
+    if (ok)
     {
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "DELETE FROM partdist.dtx_decision dd "
-                         "USING partdist.partwal_read_dtx_record(%u::oid, %lld) d "
-                         "WHERE dd.dtxid = d.dtxid",
-                         (unsigned) local_oid, (long long) plsn);
-        if (SPI_execute(sql.data, false, 0) != SPI_OK_DELETE)
-            elog(WARNING,
-                 "pg_raft: 组 %lld apply FORGET 记录（plsn=%lld）删除决议行失败",
-                 (long long) ctx->group_id, (long long) plsn);
-        pfree(sql.data);
-    }
+        int i;
 
-    if (ok && (entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
-        entry_record_info(e->payload) == 2)
-    {
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "INSERT INTO partdist.dtx_decision"
-                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
-                         "SELECT d.dtxid, d.coord_gsid, d.verdict, d.commit_ts, "
-                         "       coalesce(d.participants, '{}'::bigint[]), %lld "
-                         "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d "
-                         "WHERE d.dtxid IS NOT NULL "
-                         "ON CONFLICT (dtxid) DO NOTHING",
-                         (long long) plsn, (unsigned) local_oid,
-                         (long long) plsn);
-        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
-            elog(WARNING,
-                 "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
-                 (long long) ctx->group_id, (long long) plsn);
-        pfree(sql.data);
+        for (i = 0; i < ndtx; i++)
+            data_apply_dtx_one(ctx, local_oid, dtx_items[i].plsn,
+                               dtx_items[i].info);
     }
 
     raft_persist_spi_end(spi_owned);
+    ctx->log->last_apply_fail = ok ? RAFT_APPLYFAIL_NONE : RAFT_APPLYFAIL_SPI_EXEC;
     return ok;
+}
+
+static bool
+data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
+{
+    DtxApplyItem it;
+    int          nit = 0;
+    int64        plsn = entry_partition_lsn(e->payload);
+    int          info = entry_record_info(e->payload);
+
+    if ((entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
+        (info == 2 || info == 5))
+    {
+        it.plsn = plsn;
+        it.info = info;
+        nit = 1;
+    }
+    return data_apply_advance(ctx, plsn, nit ? &it : NULL, nit);
 }
 
 /*
@@ -1425,6 +1528,58 @@ candidate_log_is_up_to_date_locked(RaftGroupCtx *ctx, int64 cand_last_idx,
     return cand_last_idx >= local_last_idx;
 }
 
+/*
+ * wait_for_log_room — 环满时**阻塞等 apply 追上**，而不是直接丢弃提案（§13 约束 13）。
+ *
+ * 为什么必须是等而不是拒：数据面的提案一旦被拒，pg_partdist 侧的复制挂钩报错、
+ * 事务中止 —— 可对 VACUUM 这类调用方，它的物理变更（尾部截断、页面冻结）**在
+ * leader 上已经 durable 且不随事务回滚**。于是 leader 短了、follower 没短，
+ * 而 discard 还会把 leader 段里那条也截掉，分叉从此无痕。
+ * 把"拒绝"换成"背压"，写入侧慢下来，数据不丢。
+ *
+ * 等待是安全的，不会自锁 —— 实测（1 分片 3 副本，分批 INSERT + VACUUM FREEZE）
+ * 环深度会瞬时冲到 86 但每次都回落到 0：**apply 是健康的，环满是突发流量的
+ * 瞬时现象**。会让 apply 真正停住的曾是认领在 FATAL 上泄漏（#39，已由常驻
+ * before_shmem_exit 回调归还）和 data_entry_apply 持续返回 false（超时兜底）。
+ *
+ * 每轮先 group_apply_pending 主动排空（本 backend 能推就自己推），推不动
+ * （另一个 backend 正持有 apply 认领）才睡 1ms 再看。
+ */
+static bool
+wait_for_log_room(RaftGroupCtx *ctx)
+{
+    TimestampTz start = GetCurrentTimestamp();
+    bool        waited = false;
+
+    for (;;)
+    {
+        bool has_room;
+
+        group_apply_pending(ctx);
+
+        SpinLockAcquire(&ctx->log->mutex);
+        has_room = (ctx->log->last_log_index - ctx->log->last_applied
+                    < RAFT_LOG_CAPACITY - 1);
+        if (!has_room && !waited)
+            ctx->log->ring_full_waits++;
+        SpinLockRelease(&ctx->log->mutex);
+
+        if (has_room)
+            return true;
+
+        waited = true;
+
+        if (pg_raft_propose_wait_ms <= 0)
+            return false;       /* 0 = 不等，保留旧行为（诊断用） */
+        if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(),
+                                       pg_raft_propose_wait_ms))
+            return false;
+
+        CHECK_FOR_INTERRUPTS();     /* 用户取消 / 关库要能打断 */
+        pg_usleep(1000L);
+    }
+}
+
 static int64
 log_append_locked(RaftGroupCtx *ctx, int64 term, const char *op_type,
                   const char *payload)
@@ -1798,14 +1953,80 @@ apply_one_entry_guarded(RaftGroupCtx *ctx, const RaftLogEntry *e)
     return ok;
 }
 
+/*
+ * raft_apply_claim_release_on_exit — 本进程退出时归还它还持有的 apply 认领。
+ *
+ * 常驻 before_shmem_exit 回调，每 backend 首次进入 group_apply_pending 时注册
+ * 一次。它覆盖的正是 bool 版泄漏的那条路：FATAL（proc_exit 跑该回调，但既不走
+ * PG_CATCH、postmaster 也不重置 shmem）。正常路径下认领早已归还，这里空转。
+ *
+ * 只清 owner == MyProcPid 的组 —— 别人的认领一个不碰。
+ * 不许在这里 ereport(ERROR)：退出路径上抛错会递归。
+ */
+static void
+raft_apply_claim_release_on_exit(int code, Datum arg)
+{
+    int i;
+
+    if (RaftGroups == NULL)
+        return;
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+
+        if (!g->in_use)
+            continue;
+        SpinLockAcquire(&g->log.mutex);
+        if (g->log.apply_owner_pid == MyProcPid)
+            g->log.apply_owner_pid = 0;
+        SpinLockRelease(&g->log.mutex);
+    }
+}
+
+static bool apply_exit_cb_registered = false;
+
 static void
 group_apply_pending(RaftGroupCtx *ctx)
 {
     RaftLogEntry e;
 
+    /*
+     * 注册要在**取任何自旋锁之前**做：before_shmem_exit 在回调表满时会
+     * ereport(ERROR)，在锁下抛错 = 锁永不归还。每 backend 只注册一次。
+     */
+    if (!apply_exit_cb_registered)
+    {
+        before_shmem_exit(raft_apply_claim_release_on_exit, (Datum) 0);
+        apply_exit_cb_registered = true;
+    }
+
+    /*
+     * ★★★ 用户事务块里的 apply **照常做**（2026-08-13，#39 重放合并决策）。
+     *
+     * #39 存档原本在这里放了 IsTransactionBlock() 闸门：事务块 backend 只等
+     * 不 apply，apply 委托给"干净上下文"。但那次冻结恰好停在委托目标
+     * （bgworker apply）建成之前 —— BGW tick 没有 SPI 干不了，而
+     * pg_raft_catchup 是 leader→follower 的**补发**通道、不做本地 apply。
+     * 闸门落地而委托缺位的结果是 leader 的 apply 全靠自动提交语句偶发排空：
+     * r1 重放实测显式事务洪水下 applied 纹丝不动（last_log=127 commit=127
+     * applied=0，认领无人持有、apply 未报错），环满 → 背压等满 10s → 丢弃。
+     *
+     * 闸门当年要破的跨节点等待环——
+     *     组 X 的 apply ← prepared 事务 T1 持有的 follower_partition_map 行锁
+     *     T1 的 COMMIT PREPARED ← 其它参与者 prepare ← 组 X 的环有空位
+     * ——TX 期已由 in_txn_replication 外科式拆掉：事务内 apply 只跳过那条
+     * 撞锁的 UPSERT，游标照常推进（见 data_apply_advance），环不会被撑满，
+     * 行锁根本不进用户事务。故闸门撤除，保留 #39 的背压/认领/批量/计数。
+     */
+
     for (;;)
     {
         int64 idx;
+        int64 batch_end;
+        int64 batch_plsn;
+        DtxApplyItem dtx_items[RAFT_LOG_CAPACITY];
+        int   ndtx;
         bool  applied_ok;
 
         SpinLockAcquire(&ctx->log->mutex);
@@ -1814,9 +2035,11 @@ group_apply_pending(RaftGroupCtx *ctx)
             SpinLockRelease(&ctx->log->mutex);
             break;
         }
-        if (ctx->log->apply_in_progress)
+        if (ctx->log->apply_owner_pid != 0)
         {
-            /* 另一个 backend 正在 apply 本组，交给它按序做完 */
+            /* 另一个 backend 正在 apply 本组，交给它按序做完。
+             * 刻意**不做** owner == MyProcPid 的例外：本函数不可重入，
+             * 加了例外反而把不可重入悄悄改成可重入（上次因此回退）。 */
             SpinLockRelease(&ctx->log->mutex);
             break;
         }
@@ -1871,7 +2094,79 @@ group_apply_pending(RaftGroupCtx *ctx)
             }
             break;
         }
-        ctx->log->apply_in_progress = true;
+        ctx->log->apply_owner_pid = MyProcPid;
+
+        /*
+         * ★ 数据组把 [idx, commit_index] 的连续段**合并成一次游标推进**。
+         *
+         * 数据条目的 apply = follower_set_applied_part_lsn 单调推进游标，
+         * 逐条推与只推到最后一条**语义等价** —— 中间值没有任何读者。
+         * 而逐条推的代价是每条一次 SPI(UPDATE + WAL)：实测 FPI 洪水下
+         * apply 只有 ~13 条/秒，128 槽的环持续饱和，总有提案等满
+         * propose_wait_ms 被丢弃(m 轮 6 次丢弃全部由此而来，每次丢弃 =
+         * 副本永久分叉)。合并后一批一次 SPI，apply 成本除以批长。
+         *
+         * 只认环里**连续**存在的条目(log_get_entry_locked 失败即止)；
+         * plsn 取批内最大值 —— 重复 propose 同一 plsn 时序上乱不了
+         * (follower_set_applied 本就单调)。控制面不合并：它的 apply
+         * 写的是各不相同的元数据表，逐条语义必须保留。
+         * entry_partition_lsn 是纯字符串扫描(无 palloc/elog)，锁下可用；
+         * 至多 CAPACITY 次，几十微秒。
+         */
+        batch_end  = idx;
+        batch_plsn = 0;
+        ndtx       = 0;
+        if (ctx->group_id != RAFT_CONTROL_GROUP)
+        {
+            RaftLogEntry be;
+            int64        p;
+            int64        pl;
+
+            /*
+             * DTX DECISION/FORGET 逐条语义的保留：扫描时按日志序收集
+             * (plsn, info)，随批传给 data_apply_advance 逐条落账。
+             * entry_record_flags/info 与 entry_partition_lsn 同为纯字符串
+             * 扫描（strstr/sscanf，无 palloc/elog），锁下可用。
+             */
+            if (strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            {
+                batch_plsn = entry_partition_lsn(e.payload);
+                if ((entry_record_flags(e.payload) & PARTWAL_FLAG_DTX) != 0)
+                {
+                    int inf = entry_record_info(e.payload);
+
+                    if (inf == 2 || inf == 5)
+                    {
+                        dtx_items[ndtx].plsn = batch_plsn;
+                        dtx_items[ndtx].info = inf;
+                        ndtx++;
+                    }
+                }
+            }
+            for (p = idx + 1; p <= ctx->log->commit_index; p++)
+            {
+                if (!log_get_entry_locked(ctx, p, &be))
+                    break;
+                if (strcmp(be.op_type, RAFT_OP_PARWAL) == 0)
+                {
+                    pl = entry_partition_lsn(be.payload);
+                    if (pl > batch_plsn)
+                        batch_plsn = pl;
+                    if ((entry_record_flags(be.payload) & PARTWAL_FLAG_DTX) != 0)
+                    {
+                        int inf = entry_record_info(be.payload);
+
+                        if ((inf == 2 || inf == 5) && ndtx < RAFT_LOG_CAPACITY)
+                        {
+                            dtx_items[ndtx].plsn = pl;
+                            dtx_items[ndtx].info = inf;
+                            ndtx++;
+                        }
+                    }
+                }
+                batch_end = p;
+            }
+        }
         SpinLockRelease(&ctx->log->mutex);
 
         /*
@@ -1879,12 +2174,44 @@ group_apply_pending(RaftGroupCtx *ctx)
          * apply 抛错或进程在两者之间死掉，这条就被永久标记为已应用却从未
          * 生效；物理回放下这等于静默丢一条 redo。
          */
-        applied_ok = apply_one_entry_guarded(ctx, &e);
+        /*
+         * ★★ apply 认领必须在抛错路径上归还。控制面走 apply_one_entry_guarded
+         * （子事务内接 ERROR，正常返回 bool），但数据面的 data_apply_advance
+         * 走 SPI（follower_set_applied_part_lsn），任何一次 ERROR 都是
+         * longjmp —— 后面的 SpinLockAcquire 根本不会执行。
+         *
+         * PG_CATCH 只接 ERROR；FATAL 由常驻 before_shmem_exit 回调归还
+         * （raft_apply_claim_release_on_exit），kill -9 由 postmaster 的节点
+         * 重置清零 —— 三条死亡路径各有各的归还机制。修此缺陷前实测：
+         *     last_log=2767 commit=2767 applied=2640（差恰好 127）
+         *     apply 最近一次失败原因：无
+         * 即条目全都提交了、apply 也没报错，纯粹是没人能拿到认领。
+         */
+        PG_TRY();
+        {
+            if (ctx->group_id == RAFT_CONTROL_GROUP)
+                applied_ok = apply_one_entry_guarded(ctx, &e);
+            else if (batch_plsn > 0 || ndtx > 0)
+                applied_ok = data_apply_advance(ctx, batch_plsn,
+                                                dtx_items, ndtx);
+            else
+                applied_ok = true;      /* 批内没有带 plsn 的数据条目 */
+        }
+        PG_CATCH();
+        {
+            SpinLockAcquire(&ctx->log->mutex);
+            if (ctx->log->apply_owner_pid == MyProcPid)
+                ctx->log->apply_owner_pid = 0;
+            SpinLockRelease(&ctx->log->mutex);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
 
         SpinLockAcquire(&ctx->log->mutex);
-        ctx->log->apply_in_progress = false;
-        if (applied_ok && ctx->log->last_applied < idx)
-            ctx->log->last_applied = idx;
+        if (ctx->log->apply_owner_pid == MyProcPid)
+            ctx->log->apply_owner_pid = 0;
+        if (applied_ok && ctx->log->last_applied < batch_end)
+            ctx->log->last_applied = batch_end;
         SpinLockRelease(&ctx->log->mutex);
 
         if (!applied_ok)
@@ -3199,6 +3526,35 @@ pg_raft_consensus_tick(void)
     }
 }
 
+/*
+ * pg_raft_consensus_apply_all_data — 遍历全部数据组做一次 apply drain。
+ * 专供 topology monitor 的心跳 tick 调用（外层已包好事务）；与
+ * group_apply_pending 的认领机制天然互斥，和 RPC backend 并发安全。
+ */
+void
+pg_raft_consensus_apply_all_data(void)
+{
+    int i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        return;
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        RaftGroupCtx    ctx;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        group_apply_pending(&ctx);
+    }
+}
+
 /* ---- Propose（Leader client backend 调用） ---- */
 
 /* 同步复制单条日志；返回收到确认的节点数（含 Leader 自身） */
@@ -3337,6 +3693,22 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     SpinLockAcquire(&ctx->log->mutex);
     if (idx > ctx->log->commit_index && idx == ctx->log->last_log_index)
     {
+        RaftLogEntry dropped;
+
+        /*
+         * ★ #39 留痕（§13 约束 13）：数据条目因多数派不足被丢弃的计数。
+         * 8/3 起 leader 侧不再截断 parwal（字节留作孤儿、同 plsn 重新
+         * propose，多数派恢复后自然收敛），丢弃不再直接等于无痕分叉，
+         * 但丢弃频度仍是复制健康度的直接观测口，flow_stats 靠它。
+         * entry_partition_lsn 纯字符串扫描，锁下可用。
+         */
+        if (log_get_entry_locked(ctx, idx, &dropped) &&
+            strcmp(dropped.op_type, RAFT_OP_PARWAL) == 0)
+        {
+            ctx->log->quorum_drops++;
+            ctx->log->last_drop_plsn = entry_partition_lsn(dropped.payload);
+        }
+
         log_truncate_after_locked(ctx, idx - 1);
         for (i = 0; i < RAFT_MAX_PEERS; i++)
         {
@@ -3403,8 +3775,47 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
      * 远低于环窗口，此时容量检查(last_log_index - last_applied)会误判环满、
      * 拒绝一切新提案；group_apply_pending 里的控制面快进会先把游标追平。
      *
+     * 环仍然满就**阻塞等**（背压），不再直接丢提案 —— 见 wait_for_log_room。
      */
-    group_apply_pending(ctx);
+    if (!wait_for_log_room(ctx))
+    {
+        int64       waits, drops, last_idx, commit_idx, applied;
+        int         failr;
+        int         owner;
+        const char *failtxt;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        ctx->log->ring_full_drops++;
+        waits      = ctx->log->ring_full_waits;
+        drops      = ctx->log->ring_full_drops;
+        last_idx   = ctx->log->last_log_index;
+        commit_idx = ctx->log->commit_index;
+        applied    = ctx->log->last_applied;
+        failr      = ctx->log->last_apply_fail;
+        owner      = ctx->log->apply_owner_pid;
+        SpinLockRelease(&ctx->log->mutex);
+
+        switch (failr)
+        {
+            case RAFT_APPLYFAIL_NO_PART:  failtxt = "本节点没有该组对应的分片（P0 映射）"; break;
+            case RAFT_APPLYFAIL_NO_SPI:   failtxt = "拿不到 SPI"; break;
+            case RAFT_APPLYFAIL_SPI_EXEC: failtxt = "follower_set_applied_part_lsn 执行失败"; break;
+            default:                      failtxt = "无（apply 未报失败，可能是被其他 backend 长时间占着）"; break;
+        }
+
+        ereport(WARNING,
+                (errmsg("pg_raft: group %lld 日志环等待 %d ms 仍无空位，提案被丢弃"
+                        "（累计 等待=%lld 丢弃=%lld）",
+                        (long long) ctx->group_id, pg_raft_propose_wait_ms,
+                        (long long) waits, (long long) drops),
+                 errdetail("last_log=%lld commit=%lld applied=%lld；认领持有者 pid=%d；"
+                           "apply 最近一次失败原因：%s",
+                           (long long) last_idx, (long long) commit_idx,
+                           (long long) applied, owner, failtxt),
+                 errhint("数据组丢提案会让副本与 leader 分叉风险上升（字节留作孤儿等重推），"
+                         "请查 partdist.pg_raft_group_flow_stats()。")));
+        return 0;
+    }
 
     SpinLockAcquire(&ctx->cons->mutex);
     term = ctx->cons->current_term;
@@ -4287,6 +4698,81 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         values[7] = Int32GetDatum(group_cluster_size(&ctx));
         values[8] = Int64GetDatum(base_idx);
         values[9] = Int64GetDatum(base_term);
+
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+
+    PG_RETURN_VOID();
+}
+
+/*
+ * pg_raft_group_flow_stats — 每组的背压 / 丢弃计数（§13 约束 13）。
+ *
+ * **单独开一个函数而不是往 pg_raft_group_status() 加列**：改返回类型要 DROP +
+ * CREATE，而这套 Citus 集群上动扩展对象的代价见 patches/README；新增函数是
+ * 纯增量，老调用方一行不用改。
+ *
+ * 怎么读这几个数：
+ *   ring_full_waits > 0   写入速度短暂超过 apply，已经靠背压吸收，正常。
+ *   ring_full_drops > 0   背压等到超时仍无空位 ⇒ **有提案被丢弃**。
+ *   quorum_drops    > 0   多数派不足导致条目被丢弃，且 leader 段里那条也被截掉。
+ *
+ * 后两个非零就意味着：该分区的副本**可能已与 leader 永久分叉**（leader 的物理
+ * 变更不随事务回滚），需要重做物理基线。last_drop_plsn 给出最早的怀疑点。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_flow_stats);
+Datum
+pg_raft_group_flow_stats(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+    int              i;
+
+    if (rsinfo == NULL || !(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR, (errmsg("pg_raft_group_flow_stats: 需要 materialize 模式")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("pg_raft_group_flow_stats: 返回类型必须是 record")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    if (RaftGroups == NULL)
+        PG_RETURN_VOID();
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        Datum           values[7];
+        bool            nulls[7];
+        int64           depth, waits, drops, qdrops, last_plsn;
+
+        if (!g->in_use)
+            continue;
+
+        SpinLockAcquire(&g->log.mutex);
+        depth     = g->log.last_log_index - g->log.last_applied;
+        waits     = g->log.ring_full_waits;
+        drops     = g->log.ring_full_drops;
+        qdrops    = g->log.quorum_drops;
+        last_plsn = g->log.last_drop_plsn;
+        SpinLockRelease(&g->log.mutex);
+
+        memset(nulls, 0, sizeof(nulls));
+        values[0] = Int64GetDatum(g->group_id);
+        values[1] = Int64GetDatum(depth);
+        values[2] = Int32GetDatum(RAFT_LOG_CAPACITY);
+        values[3] = Int64GetDatum(waits);
+        values[4] = Int64GetDatum(drops);
+        values[5] = Int64GetDatum(qdrops);
+        values[6] = Int64GetDatum(last_plsn);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

@@ -289,6 +289,23 @@ $fn$;
 
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
+CREATE OR REPLACE FUNCTION pg_raft_group_flow_stats()
+    RETURNS TABLE(
+        group_id        bigint,
+        ring_depth      bigint,   -- last_log_index - last_applied
+        ring_capacity   integer,
+        ring_full_waits bigint,   -- 因环满而背压等待的次数（>0 正常）
+        ring_full_drops bigint,   -- 背压超时后被丢弃的提案数（>0 = 可能已分叉）
+        quorum_drops    bigint,   -- 多数派不足被丢弃的条目数（>0 = 可能已分叉）
+        last_drop_plsn  bigint    -- 最近一次被丢弃的数据条目 partition_lsn
+    ) LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_flow_stats';
+
+COMMENT ON FUNCTION pg_raft_group_flow_stats() IS
+'每个 Raft 组的背压/丢弃计数（FRD §13 约束 13）。ring_full_drops 或 quorum_drops '
+'非零意味着有提案被丢弃 —— 数据组上这等于副本可能与 leader 永久分叉（leader 的'
+'物理变更如 VACUUM 尾部截断不随事务回滚），需要重做物理基线。';
+
 COMMENT ON FUNCTION pg_raft_group_status() IS
     '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
     'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'

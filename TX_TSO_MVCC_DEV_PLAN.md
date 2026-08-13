@@ -1008,6 +1008,25 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
 - **验收**：跨分片写事务端到端提交/中止；提交点=多数派落盘实测；
   换源后 tx1/tx2/tx4 基线套件重写断言仍绿；**#39 流控回归**
   （health_check_no_drops 转实测；FPI 洪水下无 log ring full 分叉）。
+- **实施记要·步骤①（2026-08-13，#39 重放先行落地）**：存档 661 行按 8/5 基线
+  制成，TX 树已长千余行 → 11/17 块顺利、6 块拒绝按 .rej 手工移植（GUC 变量、
+  双原型、init 六字段、apply 认领+批量合并+PG_TRY 归还、discard 计数、propose
+  背压）。移植中抓到两处**存档与 TX 树的真语义冲突**：① #39 批量 apply 会吞
+  掉 DTX DECISION(info=2)/FORGET(info=5) 的逐条登记（§6.2/§9.7）——落法：批
+  量扫描按日志序收集 (plsn,info) 清单随批传入 `data_apply_advance`，游标合并
+  推进、登记逐条落账（载荷经 partwal_read_dtx_record 读本节点已落盘字节，只
+  需 plsn 不需条目本身）；② 存档的 IsTransactionBlock 闸门依赖当年冻结时
+  **从未建成**的委托目标（BGW 无 SPI 干不了 apply；pg_raft_catchup 是
+  leader→follower **补发**通道、不做本地 apply），leader 的 apply 只剩自动提
+  交语句偶发排空——r1 实测显式事务洪水下 applied=0/commit=127、认领无人持
+  有、apply 未报错，10s 背压等满后丢 2 条提案，新诊断 WARNING 的 errdetail
+  一击定位；**闸门撤除**，其目标撞锁环由 TX 期 `in_txn_replication` 外科式跳
+  过兜住（只跳撞锁 UPSERT、游标照常推进）。控制面 apply 保留
+  `apply_one_entry_guarded`（8/5 毒丸修复不回退存档的裸调用）。
+  `pg_raft_group_flow_stats()` 九节点手工 CREATE（扩展已装 1.0，改 .sql 文件
+  不自动生效）。金丝雀：lwc 9/0、**r1 58/0**（无丢弃检查从"跳过"转实测后首
+  次全绿）、l1 57/0、d1 84/0。步骤②（决议搬迁 + ts 换源 + placement 传播）
+  继续。
 
 #### T4.5 广播与恢复（崩溃矩阵行 1–3 的机制面）
 

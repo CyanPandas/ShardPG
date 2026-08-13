@@ -1037,6 +1037,12 @@ _PG_init(void)
         return;
     }
 
+    DefineCustomIntVariable("pg_raft.propose_wait_ms",
+                            "日志环满时等待 apply 追上的上限（毫秒）；0 = 不等，直接丢提案。",
+                            "数据组丢提案会让副本与 leader 永久分叉，默认应保持 > 0。",
+                            &pg_raft_propose_wait_ms, 10000, 0, 600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.probe_interval_ms",
                             "Topology probe interval in milliseconds.",
                             NULL, &pg_raft_probe_interval_ms, 3000, 500, 60000,

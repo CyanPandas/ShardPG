@@ -56,6 +56,7 @@ extern int  pg_raft_coordinator_node_id;
 extern bool  pg_raft_raft_enabled;
 extern char *pg_raft_peers;
 extern int   pg_raft_election_timeout_ms;
+extern int   pg_raft_propose_wait_ms;
 extern int   pg_raft_heartbeat_ms;
 
 extern Size pg_raft_consensus_shmem_size(void);
@@ -68,6 +69,7 @@ extern int64 pg_raft_consensus_commit_index(void);
 extern int64 pg_raft_consensus_last_applied(void);
 extern int64 pg_raft_consensus_propose(const char *op_type, const char *payload);
 extern void pg_raft_consensus_apply_pending(void);
+extern void pg_raft_consensus_apply_all_data(void);
 /* prepare 接线：PartWALFlush 经 rendezvous "partdist_partwal_replicate_hook" 调用 */
 extern void pg_raft_partwal_replicate(Oid partition_id);
 
