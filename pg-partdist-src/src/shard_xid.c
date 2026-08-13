@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "access/shard_stamp.h"
+#include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "executor/spi.h"
@@ -728,15 +729,21 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_PRE_PREPARE:
 			/*
-			 * P1 禁 2PC 含分片写：PREPARE 后由别的会话 COMMIT/ROLLBACK
-			 * PREPARED，本后端映射已清、临时提交表条目会永挂 RUNNING。
-			 * PRE_PREPARE 是最后一个还能安全 ERROR 的点。
-			 * 含分片表 DROP 的事务同禁：挂起的 GC 无法跟去别的会话结算。
+			 * T4.3 放行条件：已 join 全局事务（gxid 在手）的分片写允许
+			 * PREPARE——PREPARED 落账与 2PC 段注册在 at_prepare 钩子里做
+			 * （StartPrepare 之后）。未 join 的分片写维持 P1 禁令；含分片
+			 * 表 DROP 的事务仍禁（挂起 GC 无法跨会话结算）。
 			 */
-			if (xact_map_n > 0 || ShardClogHasPendingDrops())
+			if (ShardClogHasPendingDrops())
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("P1 不支持对含分片打标表写入/删除的事务执行 PREPARE TRANSACTION")));
+						 errmsg("不支持对含分片打标表 DROP 的事务执行 PREPARE TRANSACTION")));
+			if (xact_map_n > 0 && TsoCurrentGxid() == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("未加入全局事务的分片写不允许 PREPARE TRANSACTION"),
+						 errhint("经连接加入协议（partdist_join_global_txn / "
+								 "join_info GUC）携带 gxid 后放行。")));
 			break;
 
 		case XACT_EVENT_COMMIT:
@@ -940,12 +947,121 @@ shard_xact_wal_list_impl(uint32 **pairs, uint64 *commit_ts)
 	return xact_map_n;
 }
 
+/* ---- T4.3：分片 2PC 段（补丁 0009） ---- */
+
+typedef struct ShardTwoPhasePayload
+{
+	int64		gxid;
+	int64		start_ts;
+	int32		nxids;
+	uint32		pairs[FLEXIBLE_ARRAY_MEMBER];	/* 2*nxids 个 uint32 */
+} ShardTwoPhasePayload;
+
+/*
+ * StartPrepare 之后的注册点：PREPARED 落账（durable，投票持久前必须已
+ * 持久）+ 2PC 状态段注册（崩溃恢复据此重建）。此刻 xact_map 仍在
+ * （XACT_EVENT_PREPARE 的清理在 EndPrepare 之后）。
+ */
+static void
+shard_at_prepare_impl(void)
+{
+	ShardTwoPhasePayload *p;
+	Size		sz;
+	int			i;
+	int64		gxid;
+	int64		sts;
+
+	if (xact_map_n == 0)
+		return;
+
+	gxid = TsoCurrentGxid();
+	sts = TsoGetStartTs();
+
+	for (i = 0; i < xact_map_n; i++)
+		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
+
+	sz = offsetof(ShardTwoPhasePayload, pairs) +
+		(Size) xact_map_n * 2 * sizeof(uint32);
+	p = (ShardTwoPhasePayload *) palloc(sz);
+	p->gxid = gxid;
+	p->start_ts = sts;
+	p->nxids = xact_map_n;
+	for (i = 0; i < xact_map_n; i++)
+	{
+		p->pairs[2 * i] = (uint32) xact_map[i].shard;
+		p->pairs[2 * i + 1] = (uint32) xact_map[i].sxid;
+	}
+	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
+	pfree(p);
+}
+
+/* 崩溃恢复：重建 PREPARED 落账（幂等；startup 进程执行） */
+static void
+shard_twophase_recover_impl(TransactionId xid, uint16 info,
+							void *recdata, uint32 len)
+{
+	ShardTwoPhasePayload hdr;
+	const char *base = (const char *) recdata;
+	int			i;
+
+	if (len < offsetof(ShardTwoPhasePayload, pairs))
+		return;
+	memcpy(&hdr, base, offsetof(ShardTwoPhasePayload, pairs));
+	for (i = 0; i < hdr.nxids; i++)
+	{
+		uint32		pv[2];
+
+		memcpy(pv, base + offsetof(ShardTwoPhasePayload, pairs) +
+			   (Size) i * 2 * sizeof(uint32), sizeof(pv));
+		ShardClogSetPrepared((Oid) pv[0], (TransactionId) pv[1],
+							 hdr.start_ts, hdr.gxid);
+	}
+}
+
+/*
+ * COMMIT PREPARED：不写终局——判决与 commit_ts 走协调者决议的异步广播/
+ * 问询收敛（§3.1 步骤 ⑦，T4.5）；这里写 ts=0 的 COMMITTED 会破坏 SI
+ * （0 对一切快照可见）。PREPARED 槽保持，读者按 §4.2 三态处置。
+ */
+static void
+shard_twophase_postcommit_impl(TransactionId xid, uint16 info,
+							   void *recdata, uint32 len)
+{
+	elog(DEBUG1, "pg_partdist: 分片 2PC 段 postcommit（终局待决议广播，T4.5）");
+}
+
+/* ABORT PREPARED：中止即终局，写 ABORTED（ts 无意义恒 0） */
+static void
+shard_twophase_postabort_impl(TransactionId xid, uint16 info,
+							  void *recdata, uint32 len)
+{
+	ShardTwoPhasePayload hdr;
+	const char *base = (const char *) recdata;
+	int			i;
+
+	if (len < offsetof(ShardTwoPhasePayload, pairs))
+		return;
+	memcpy(&hdr, base, offsetof(ShardTwoPhasePayload, pairs));
+	for (i = 0; i < hdr.nxids; i++)
+	{
+		uint32		pv[2];
+
+		memcpy(pv, base + offsetof(ShardTwoPhasePayload, pairs) +
+			   (Size) i * 2 * sizeof(uint32), sizeof(pv));
+		ShardClogSetVerdict((Oid) pv[0], (TransactionId) pv[1], false, 0);
+	}
+}
+
 void
 ShardXidInstallHook(void)
 {
 	shard_relation_xid_hook = shard_relation_xid_impl;
 	shard_xact_wal_list_hook = shard_xact_wal_list_impl;
 	shard_xact_redo_hook = ShardClogXactRedo;
+	shard_at_prepare_hook = shard_at_prepare_impl;
+	shard_twophase_recover_hook = shard_twophase_recover_impl;
+	shard_twophase_postcommit_hook = shard_twophase_postcommit_impl;
+	shard_twophase_postabort_hook = shard_twophase_postabort_impl;
 	RegisterXactCallback(shard_xid_xact_callback, NULL);
 }
 

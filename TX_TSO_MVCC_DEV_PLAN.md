@@ -967,13 +967,31 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   元数据同步=零改动（T4.0 实验一）。写栅栏行为属 pg_raft 既有（§9.1 依据
   3），由基线 tx3/tx4 套件持续覆盖，本任务不重复造验收。
 
-#### T4.3 PREPARED 落账 + 三态问询（§4.2）
+#### T4.3 PREPARED 落账 + 三态问询（§4.2）——✅ 已完成（2026-08-13，`patches/0009-shard-twophase-rmgr.patch` 136 行；③ 问询移 T4.5）
 
 - **改**：PREPARE 路径分片 clog 写 PREPARED（含 parent 链起用）；补丁 0009
   （twophase 状态文件扩列，方案按 T4.0 ⑥）；读者撞 PREPARED 三态：
   ① entry start_ts > S 跳过；② coord_gsid NULL 跳过（NULL 不变式）；
   ③ 问协调者组 **leader**，判决幂等回写本分片 clog（读者绝不安装 ABORT）。
 - **验收**：三分支逐一用例；in-doubt 期间读者不阻塞；回写幂等。
+- **实施记要（2026-08-13，一处任务边界裁定）**：**③ 问询实现移 T4.5**——
+  三态里 ①（槽 start_ts > 读者快照）与 ②（gsid 未知=NULL 不变式）的结局都
+  是"跳过=不可见"，与 PREPARED 兜底行为一致；带可见性翻转的 ③ 与决议广播
+  是同一收敛机器，拆开做两遍不如一体落地。内核 0009：twophase rmgr 增
+  SHARD 槽位（recover/postcommit/postabort 经钩子分发）+ **at-prepare 钩子**
+  ——实测顺序坑：PRE_PREPARE 回调先于 StartPrepare，在那里注册 2PC 记录会被
+  StartPrepare 重置吞掉，注册点必须与 AtPrepare_* 同位。扩展侧：PREPARE 放行
+  条件 = 已 join（gxid 在手），未 join 维持 P1 禁令、含 DROP 仍禁；
+  `ShardClogSetPrepared`（durable，投票持久前 PREPARED 已持久，带
+  start_ts+gxid）；2PC 段载荷 {gxid, start_ts, pairs}；recover 幂等重建；
+  postabort 写 ABORTED；**postcommit 不写终局**（写 ts=0 的 COMMITTED 会
+  破坏 SI——判决+commit_ts 走 T4.5 决议广播，interim 行为=PREPARED 保持、
+  读者按 in-doubt 处置）。验收 17/17：未 join 拒/放行落账（st=1 带 sts）/
+  读者 0s 即返不可见/**崩溃恢复双重建**（原生 prepared + clog PREPARED，
+  T2.4 认领对 PREPARED"不许动"首次实测）/ROLLBACK PREPARED→ABORTED/
+  COMMIT PREPARED→interim PREPARED。金丝雀 P1 45/45+P2 64/64+P3 38/38
+  （PREPARE 禁令文案改动与既有负向子串兼容自绿）。pg-install 成对同步，
+  README 至 0009（nm 十二行）。
 
 #### T4.4 决议搬迁 + #39 流控重放（★ 解冻已批准 2026-08-13 选项 b；触碰 pg_raft 的唯一任务）
 

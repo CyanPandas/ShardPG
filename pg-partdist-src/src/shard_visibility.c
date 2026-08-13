@@ -175,7 +175,13 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				? SXID_COMMITTED : SXID_ABORTED;
 
 		case TXN_PREPARED:
-			/* P4 之前不该出现；按 §4.2"未决=不可见、读者不阻塞"处理 */
+			/*
+			 * §4.2 三态（T4.3）：①槽 start_ts > 读者快照 ⇒ 未来提交必不可
+			 * 见——跳过；②coord_gsid 未知 ⇒ NULL 不变式保证决议未做——
+			 * 跳过；③问协调者组 leader 并幂等回写（读者绝不安装 ABORT）
+			 * ——与决议广播同一收敛机器，T4.5 落地。①②③ 在"问询未果"时
+			 * 的结局都是不可见且不阻塞，正是下面的兜底返回。
+			 */
 		case TXN_RUNNING:
 		default:
 			/*

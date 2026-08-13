@@ -107,4 +107,25 @@ typedef bool (*shard_vacuum_read_hook_type) (HeapTuple htup, Buffer buffer,
 											 int *res);
 extern PGDLLIMPORT shard_vacuum_read_hook_type shard_vacuum_read_hook;
 
+/* ---- 0009：分片 2PC 段（twophase rmgr 槽位经钩子分发） ---- */
+
+/*
+ * PREPARE 状态文件里的分片段：{gxid, start_ts, (shard,sxid) 对}。
+ * recover 在崩溃恢复重建 PREPARED 落账；postabort 写 ABORTED 判决；
+ * postcommit 不写终局（判决与 commit_ts 走协调者决议广播，§3.1 步骤 ⑦）。
+ */
+typedef void (*shard_twophase_cb_type) (TransactionId xid, uint16 info,
+										void *recdata, uint32 len);
+extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_recover_hook;
+extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_postcommit_hook;
+extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_postabort_hook;
+
+/*
+ * PrepareTransaction 的记录注册点（StartPrepare 之后、EndPrepare 之前，
+ * AtPrepare_* 同位置）——PRE_PREPARE 回调先于 StartPrepare，在那里
+ * RegisterTwoPhaseRecord 会被 StartPrepare 重置吞掉。
+ */
+typedef void (*shard_at_prepare_hook_type) (void);
+extern PGDLLIMPORT shard_at_prepare_hook_type shard_at_prepare_hook;
+
 #endif							/* SHARD_STAMP_H */

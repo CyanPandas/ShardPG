@@ -77,6 +77,11 @@ extern void ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts);
 extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 								int64 commit_ts);
 
+/* T4.3：PREPARE 落账（durable fsync——投票持久前 PREPARED 必须已持久）。
+ * 带 start_ts 与 gxid（§5.3 五列；parent 链 P4 子事务再起用）。幂等。 */
+extern void ShardClogSetPrepared(Oid shard, TransactionId sxid,
+								 int64 start_ts, int64 gxid);
+
 /* 读状态。空洞/段不存在 = TXN_RUNNING。 */
 extern TxnStatus ShardClogReadStatus(Oid shard, TransactionId sxid);
 

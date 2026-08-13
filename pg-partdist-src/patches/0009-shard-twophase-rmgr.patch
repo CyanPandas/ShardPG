@@ -1,0 +1,136 @@
+--- a/src/include/access/twophase_rmgr.h
++++ b/src/include/access/twophase_rmgr.h
+@@ -26,7 +26,8 @@
+ #define TWOPHASE_RM_PGSTAT_ID		2
+ #define TWOPHASE_RM_MULTIXACT_ID	3
+ #define TWOPHASE_RM_PREDICATELOCK_ID	4
+-#define TWOPHASE_RM_MAX_ID			TWOPHASE_RM_PREDICATELOCK_ID
++#define TWOPHASE_RM_SHARD_ID			5	/* 0009：TX-TSO-MVCC 分片 2PC 段 */
++#define TWOPHASE_RM_MAX_ID			TWOPHASE_RM_SHARD_ID
+ 
+ extern PGDLLIMPORT const TwoPhaseCallback twophase_recover_callbacks[];
+ extern PGDLLIMPORT const TwoPhaseCallback twophase_postcommit_callbacks[];
+--- a/src/include/access/shard_stamp.h
++++ b/src/include/access/shard_stamp.h
+@@ -107,4 +107,25 @@
+ 											 int *res);
+ extern PGDLLIMPORT shard_vacuum_read_hook_type shard_vacuum_read_hook;
+ 
++/* ---- 0009：分片 2PC 段（twophase rmgr 槽位经钩子分发） ---- */
++
++/*
++ * PREPARE 状态文件里的分片段：{gxid, start_ts, (shard,sxid) 对}。
++ * recover 在崩溃恢复重建 PREPARED 落账；postabort 写 ABORTED 判决；
++ * postcommit 不写终局（判决与 commit_ts 走协调者决议广播，§3.1 步骤 ⑦）。
++ */
++typedef void (*shard_twophase_cb_type) (TransactionId xid, uint16 info,
++										void *recdata, uint32 len);
++extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_recover_hook;
++extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_postcommit_hook;
++extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_postabort_hook;
++
++/*
++ * PrepareTransaction 的记录注册点（StartPrepare 之后、EndPrepare 之前，
++ * AtPrepare_* 同位置）——PRE_PREPARE 回调先于 StartPrepare，在那里
++ * RegisterTwoPhaseRecord 会被 StartPrepare 重置吞掉。
++ */
++typedef void (*shard_at_prepare_hook_type) (void);
++extern PGDLLIMPORT shard_at_prepare_hook_type shard_at_prepare_hook;
++
+ #endif							/* SHARD_STAMP_H */
+--- a/src/backend/access/transam/twophase_rmgr.c
++++ b/src/backend/access/transam/twophase_rmgr.c
+@@ -15,19 +15,51 @@
+ #include "postgres.h"
+ 
+ #include "access/multixact.h"
++#include "access/shard_stamp.h"
+ #include "access/twophase_rmgr.h"
+ #include "pgstat.h"
+ #include "storage/lock.h"
+ #include "storage/predicate.h"
+ 
+ 
++/* 0009：分片 2PC 段钩子（默认 NULL = 行为不变；扩展装载） */
++shard_twophase_cb_type shard_twophase_recover_hook = NULL;
++shard_twophase_cb_type shard_twophase_postcommit_hook = NULL;
++shard_twophase_cb_type shard_twophase_postabort_hook = NULL;
++shard_at_prepare_hook_type shard_at_prepare_hook = NULL;
++
++static void
++shard_twophase_recover(TransactionId xid, uint16 info,
++					   void *recdata, uint32 len)
++{
++	if (shard_twophase_recover_hook)
++		shard_twophase_recover_hook(xid, info, recdata, len);
++}
++
++static void
++shard_twophase_postcommit(TransactionId xid, uint16 info,
++						  void *recdata, uint32 len)
++{
++	if (shard_twophase_postcommit_hook)
++		shard_twophase_postcommit_hook(xid, info, recdata, len);
++}
++
++static void
++shard_twophase_postabort(TransactionId xid, uint16 info,
++						 void *recdata, uint32 len)
++{
++	if (shard_twophase_postabort_hook)
++		shard_twophase_postabort_hook(xid, info, recdata, len);
++}
++
+ const TwoPhaseCallback twophase_recover_callbacks[TWOPHASE_RM_MAX_ID + 1] =
+ {
+ 	NULL,						/* END ID */
+ 	lock_twophase_recover,		/* Lock */
+ 	NULL,						/* pgstat */
+ 	multixact_twophase_recover, /* MultiXact */
+-	predicatelock_twophase_recover	/* PredicateLock */
++	predicatelock_twophase_recover,	/* PredicateLock */
++	shard_twophase_recover		/* 0009 Shard */
+ };
+ 
+ const TwoPhaseCallback twophase_postcommit_callbacks[TWOPHASE_RM_MAX_ID + 1] =
+@@ -36,7 +68,8 @@
+ 	lock_twophase_postcommit,	/* Lock */
+ 	pgstat_twophase_postcommit, /* pgstat */
+ 	multixact_twophase_postcommit,	/* MultiXact */
+-	NULL						/* PredicateLock */
++	NULL,						/* PredicateLock */
++	shard_twophase_postcommit	/* 0009 Shard */
+ };
+ 
+ const TwoPhaseCallback twophase_postabort_callbacks[TWOPHASE_RM_MAX_ID + 1] =
+@@ -45,7 +78,8 @@
+ 	lock_twophase_postabort,	/* Lock */
+ 	pgstat_twophase_postabort,	/* pgstat */
+ 	multixact_twophase_postabort,	/* MultiXact */
+-	NULL						/* PredicateLock */
++	NULL,						/* PredicateLock */
++	shard_twophase_postabort	/* 0009 Shard */
+ };
+ 
+ const TwoPhaseCallback twophase_standby_recover_callbacks[TWOPHASE_RM_MAX_ID + 1] =
+@@ -54,5 +88,6 @@
+ 	lock_twophase_standby_recover,	/* Lock */
+ 	NULL,						/* pgstat */
+ 	NULL,						/* MultiXact */
+-	NULL						/* PredicateLock */
++	NULL,						/* PredicateLock */
++	NULL						/* 0009 Shard（本项目无热备） */
+ };
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -2595,6 +2595,10 @@
+ 	AtPrepare_PredicateLocks();
+ 	AtPrepare_PgStat();
+ 	AtPrepare_MultiXact();
++
++	/* 0009：分片 2PC 段注册（必须在 StartPrepare 之后、EndPrepare 之前） */
++	if (shard_at_prepare_hook)
++		shard_at_prepare_hook();
+ 	AtPrepare_RelationMap();
+ 
+ 	/*

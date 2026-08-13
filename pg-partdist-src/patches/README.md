@@ -19,6 +19,7 @@
 | 6 | `0006-shard-visibility-hooks.patch` | `shard_visibility_hooks`（扩展 `shard_stamp.h`；改 `heapam_visibility.c`/`heapam.c`） | TX-TSO-MVCC P1（T1.6/T1.7 内核部分）：六个 Satisfies* 入口按钩子分叉——MVCC/Self/Dirty/Update 由扩展裁决（分片 xid 绝不进原生 clog/procarray），VacuumHorizon/HistoricMVCC 对分片元组防御性 ERROR，Toast 不分叉（原生路径对正常元组不查 clog，天然安全）；heap_delete/heap_update 冲突等待臂：分片 xmax 经 `xmax_wait` 钩子翻译成持有者**原生 xid** 再等待，然后 `goto l1/l2` 重评（判定收敛在分叉的 SatisfiesUpdate）；`compute_new_xmax_infomask` 三处调用点 + 新元组 xmax 继承对分片表强制 `HEAP_XMAX_INVALID` 简单路径——TM_Ok 到达即旧 xmax 已死且无锁者，原生机器会拿分片 xid 误组 multixact（实测缺陷：`new multixact has more than one updating member`）；heap_delete/update 的 `PageSetPrunable` 对分片表改用原生 xid——redo 用记录头原生 xid 设此提示，普通路径若用分片 xid 则页头分叉（T1.9 实测） |
 | 7 | `0007-shard-xact-record-xids.patch` | `shard_xact_wal_list_hook` + `shard_xact_redo_hook`（扩展 `shard_stamp.h`；改 `xact.h`/`xact.c`/`rmgrdesc/xactdesc.c`） | TX-TSO-MVCC P2（T2.2）：`xl_xact_commit/abort` 增 xinfo **bit 9** 可选块，携带本事务 (分片oid, 分片xid) 对列表 + **commit_ts**（T3.3，块头 lo/hi 两个 uint32 规避非对齐读；PRE_COMMIT 取号暂存、临界区内钩子只拷；abort 恒 0）（无分片写时记录体逐字节零变化）；`xact_redo_commit/abort` 尾部钩子把列表交扩展重做分片 clog 落账（幂等）——闭环"提交/中止记录落盘后、clog 标记前崩溃"的窗口；`ParseCommit/AbortRecord` 解析新块，desc 打印 `shard xids: oid/xid`（pg_waldump 可辨）。正常路径 COMMITTED/ABORTED 标记在扩展 XACT_EVENT_COMMIT/ABORT 回调里做——该回调先于行锁释放（xact.c CommitTransaction 实测行序），等待者唤醒即见终态；崩溃隐式中止无记录，由 T2.4 无主 RUNNING 认领兜底 |
 | 8 | `0008-shard-vacuum-read-hook.patch` | `shard_vacuum_read_hook`（扩展 `shard_stamp.h`；改 `heapam_visibility.c`） | TX-TSO-MVCC P2（T2.6）：`HeapTupleSatisfiesVacuumHorizon` 的分片分支从 0006 的防御性 ERROR 改为交扩展裁决（ANALYZE 读侧，"只判不收"：committed-deleted 给 RECENTLY_DEAD 且分叉点配新鲜原生 xid 作 dead_after，一切提升检查落保守分支；中止插入给 DEAD 只进统计）；钩子未装时保持 0006 fail-closed ERROR；回收类动作者不变（剪枝屏蔽、VACUUM/CLUSTER/CIC 仍禁，autovacuum 由扩展侧硬盾拦截） |
+| 9 | `0009-shard-twophase-rmgr.patch` | twophase rmgr 增 `TWOPHASE_RM_SHARD_ID` 槽位（recover/postcommit/postabort 经 `shard_twophase_*_hook` 分发）+ `shard_at_prepare_hook`（`twophase_rmgr.h/.c`、`shard_stamp.h`、`xact.c`） | TX-TSO-MVCC P4（T4.3）：PREPARE 状态文件携带分片段 {gxid, start_ts, (shard,sxid) 对}——崩溃恢复重建 PREPARED 落账；postabort 写 ABORTED 终局；postcommit 不写终局（判决+commit_ts 走协调者决议广播，§3.1 ⑦）；at-prepare 钩子在 StartPrepare 之后注册记录（PRE_PREPARE 太早会被 StartPrepare 重置吞掉——实测顺序坑） |
 
 > **为什么 0004 不能用 XactCallback 代替**：回调是 LIFO 顺序，后加载的扩展反而先
 > 被调用，因此扩展无法表达"在**所有**其它扩展的 PRE_COMMIT 动作都完成之后再做
@@ -40,7 +41,7 @@
 携带的是 **leader 坐标**的 LSN，本地 pg_wal 里根本没有那个位置（FRD §8.3）。
 缺它则刷脏时 `XLogFlush` 会等一个永远不会到来的 LSN。
 
-> **★★ 0001/0001v2/0002 加上 0005/0006/0007/0008 都是 `pg_partdist` 的编译期硬依赖，缺
+> **★★ 0001/0001v2/0002 加上 0005/0006/0007/0008/0009 都是 `pg_partdist` 的编译期硬依赖，缺
 > 任何一个都编不过。** 实测缺 0002 时的报错：
 > `src/pg_partdist.c: error: 'buffer_flush_lsn_exempt_hook' undeclared`；
 > 缺 0005 时 `src/shard_xid.c` 会因找不到 `access/shard_stamp.h` 直接编译失败；
@@ -79,6 +80,7 @@ cp /tmp/pg-install-new/include/postgresql/server/storage/bufmgr.h     pg-install
 cp /tmp/pg-install-new/include/postgresql/server/access/shard_stamp.h pg-install/include/postgresql/server/access/   # 0005 新增（0006/0007/0008 改动）
 cp /tmp/pg-install-new/include/postgresql/server/access/heapam_xlog.h pg-install/include/postgresql/server/access/   # 0005 改动
 cp /tmp/pg-install-new/include/postgresql/server/access/xact.h        pg-install/include/postgresql/server/access/   # 0007 改动
+cp /tmp/pg-install-new/include/postgresql/server/access/twophase_rmgr.h pg-install/include/postgresql/server/access/ # 0009 改动
 # （新增/改动的头文件按补丁涉及范围补齐）
 ```
 
@@ -97,6 +99,8 @@ grep -c XACT_XINFO_HAS_SHARD_XIDS     pg-install/include/postgresql/server/acces
 nm -D pg-install/bin/postgres | grep -cE 'shard_xact_wal_list_hook|shard_xact_redo_hook'         # 0007  应 =2
 grep -c shard_vacuum_read_hook        pg-install/include/postgresql/server/access/shard_stamp.h  # 0008  应 >0
 nm -D pg-install/bin/postgres | grep -c shard_vacuum_read_hook                                   # 0008  应 =1
+grep -c TWOPHASE_RM_SHARD_ID          pg-install/include/postgresql/server/access/twophase_rmgr.h # 0009  应 >0
+nm -D pg-install/bin/postgres | grep -cE 'shard_twophase_.*_hook|shard_at_prepare_hook'          # 0009  应 =4
 ```
 
 源码基线 = `postgres-src` submodule 的 `.gitlink` commit + 上述三个补丁。
@@ -112,7 +116,8 @@ for p in 0001-add-wal-insert-hook \
          0005-shard-xid-stamping \
          0006-shard-visibility-hooks \
          0007-shard-xact-record-xids \
-         0008-shard-vacuum-read-hook; do
+         0008-shard-vacuum-read-hook \
+         0009-shard-twophase-rmgr; do
   patch -p1 --forward < ../pg-partdist-src/patches/$p.patch || exit 1
 done
 ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline
@@ -126,8 +131,8 @@ make -j$(nproc) && make install
 
 ```bash
 nm -D /work/pg-install/bin/postgres | grep -E \
-  'wal_insert_hook|buffer_flush_lsn_exempt_hook|pre_record_commit_hook|shard_relation_xid_hook|shard_visibility_hooks|shard_xact_wal_list_hook|shard_xact_redo_hook|shard_vacuum_read_hook'
-# 应输出八行
+  'wal_insert_hook|buffer_flush_lsn_exempt_hook|pre_record_commit_hook|shard_relation_xid_hook|shard_visibility_hooks|shard_xact_wal_list_hook|shard_xact_redo_hook|shard_vacuum_read_hook|shard_twophase_|shard_at_prepare_hook'
+# 应输出十二行
 ```
 
 ## ★ `pg-install/` 必须与 `patches/` 同步提交

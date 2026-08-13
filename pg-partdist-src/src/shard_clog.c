@@ -183,6 +183,20 @@ ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 	ShardClogWriteSlot(shard, sxid, &slot, true);
 }
 
+void
+ShardClogSetPrepared(Oid shard, TransactionId sxid, int64 start_ts, int64 gxid)
+{
+	ShardClogSlot slot;
+
+	/* 读改写：RUNNING 落账里的 start_ts 若已在，以入参为准（同源同值） */
+	if (!ShardClogReadSlot(shard, sxid, &slot))
+		memset(&slot, 0, sizeof(slot));
+	slot.status = (uint32) TXN_PREPARED;
+	slot.start_ts = (uint64) start_ts;
+	slot.global_xid = (uint64) gxid;
+	ShardClogWriteSlot(shard, sxid, &slot, true);
+}
+
 bool
 ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 {
