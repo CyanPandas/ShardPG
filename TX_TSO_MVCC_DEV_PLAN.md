@@ -913,7 +913,7 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   开启，T4.4 可动工，范围外 pg-raft 改动仍禁止。
   V2/V3/V5 核实点表已更新；R-P4-1/R-P4-2 入 §5。本任务零产品代码。
 
-#### T4.1 连接加入协议 + gxid 分配器（§9.2 第 2 层；不碰 pg_raft）
+#### T4.1 连接加入协议 + gxid 分配器（§9.2 第 2 层；不碰 pg_raft）——✅ 已完成（2026-08-13）
 
 - **改**：`partdist_join_global_txn(gxid, start_ts, coord_gsid)`——参与者后端
   登记三元组（start_ts 注入 tso_client 通道 + 活跃集合登记；coord_gsid 进
@@ -922,6 +922,23 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   gxid 分配器按 T4.0 ④ 落位。
 - **验收**：join 后远端后端读分片表用注入 ts（跨连接快照一致）；未 join 的
   远端写分片表被安全网拦（§9.2 第 1 层已就位）；gxid 崩溃安全不重号。
+- **实施记要（2026-08-13）**：交付三件：① `src/gxid.c`——每节点 shmem
+  计数器 + `pg_gxid_wm` 水位文件（8B、批量 4096、先落盘后发号），编码
+  (节点16b<<48)|序号48b，`partdist_gxid_next()`；② 注入通道
+  `TsoInjectStartTs`——置 cur_start_ts（不自取不 RPC）+ **登记本节点活跃
+  集合**（R-P4-2）+ 未配置 TSO 节点拒绝注入（无心跳/栅栏保护即脱离
+  GlobalSafeTs 视野，fail-closed）+ 改注拒绝；③ `partdist_join_global_txn`
+  直调形态 + 后端三元组状态与 getters（T4.3/T4.4 消费）。
+  **通道定案（T4.2 设计输入）**：既有 DTX 身份靠 PREPARE GID 解析（PREPARE
+  时刻才有），读路径需更早；Citus 13.1 对"每连接前置"无公开扩展点 ⇒ 自动
+  传输 = **发起端登记表 + 参与端回拉**（发起端按 (initiator_group,
+  citus_tx_number) 登记三元组进 shmem，参与端首触分片表时经 node_map 定位
+  发起端回拉一次），随 T4.2 与 MX 路由一体接线；本任务以直调形态过验收。
+  验收 19/19：**跨连接快照一致实测**（参与端 tso_c_start 返回注入 S、快照内
+  2=2 看不见 S 后提交）；**R-P4-2 实测**（远端持注入快照期间 safe 钉在 S、
+  释放后推进）；未 join/无 ts 写被拦、未配置节点拒 join；改注/改投拒绝；
+  gxid 编码/单调/崩溃续发不重号（immediate 崩后序号 4097）。金丝雀
+  P3 38/38 + P2 64/64。
 
 #### T4.2 MX 拓扑与路由（含 Proxy 粘性路由并入）
 
