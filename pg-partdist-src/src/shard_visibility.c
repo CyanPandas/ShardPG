@@ -192,13 +192,22 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 void
 ShardAccessGate(Oid shard, const char *what)
 {
-	if (shard_safety_mode == SHARD_SAFETY_STRICT)
+	/*
+	 * T3.6 收紧（§9.2 第 1 层语义到位）：strict 从"一切拦截"收紧为设计原文
+	 * "无 start_ts 读 / 无 gxid 写才拦"。P3 实现：读写统一以"本事务持有 TSO
+	 * start_ts"为准入（P4 前 gxid 判据 = 分片 xid 绑定，而绑定必伴随取号；
+	 * TSO 已配置时 TsoGetStartTs 自动取号——正常路径 strict 下全放行，只有
+	 * 遗留模式（未配置=旁路无 ts）或 TSO 停摆（取号 ERROR fail-closed）才拦。
+	 */
+	if (shard_safety_mode == SHARD_SAFETY_STRICT && TsoGetStartTs() == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("安全网严格模式：分片打标表（OID %u）的%s被拦截",
+				 errmsg("安全网严格模式：分片打标表（OID %u）的无 ts %s被拦截",
 						shard, what),
-				 errdetail("P3 接入 TSO 后严格语义 = 无 start_ts 读 / 无 gxid "
-						   "写才拦；当前访问两者皆无（§9.2 第 1 层）。")));
+				 errdetail("strict 语义（§9.2 第 1 层）：无 start_ts 读 / 无 "
+						   "gxid 写一律拒绝——本访问未持有 TSO 时间戳"
+						   "（pg_partdist.tso_conninfo 未配置？）。"),
+				 errhint("配置 TSO 后访问将自动取号放行。")));
 
 	if (IsolationIsSerializable())
 		ereport(ERROR,
