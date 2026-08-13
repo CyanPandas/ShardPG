@@ -546,12 +546,32 @@ T2.8 验收套件与 T2.3 起并行开发，出口统跑
   pg-install 成对同步（bin/postgres + shard_stamp.h），README 至 0008
   （nm 八行）。
 
-#### T2.7 门控切换 partition_map 驱动（P1 债）
+#### T2.7 门控切换 partition_map 驱动（P1 债）——✅ 已完成（2026-08-13）
 
 - **改**：分片打标身份从手工 GUC 白名单迁到 partition_map（方案按 T2.0 ⑤：
   加列或伴表 + 注册 DDL）；metadata cache 提供 O(1) 判定；GUC 白名单降级为
   测试便捷通道（两者取并集）；基线既有 partition_map 表默认不打标。
 - **验收**：注册后无 GUC 也打标；未注册表零行为变化；438 门控路径回归。
+- **实施记要（2026-08-13，一处方案落地调整）**：既有 metadata cache 是
+  "懒填 + SPI 加载"，钩子上下文（heapam 深处）用不了——O(1) 判定改为
+  **ShardXidState 内的 mvcc 集合**（64 槽 + `mvcc_n` 无锁快门：0 = 全库无
+  登记表，438 写路径只多一次整型读）。三层结构：**真相 =
+  `partdist.partition_map.shard_mvcc` 列**（尾部加列 DEFAULT false，9 节点
+  已 ALTER 部署 + 建表 SQL 更新）；**启动登记表 = `pg_shard_xid/` 目录**
+  （注册函数预创建 8B 水位文件，ShardXidShmemInit 在 postmaster 启动期扫目录
+  重建集合——不引入第二份持久结构，DROP GC 天然除名）；**运行时 = shmem
+  集合**。注册入口 `partdist_set_shard_mvcc(regclass)`（C+SPI，超级用户）：
+  ① 真相列 UPDATE（无行即拒，登记的必须是已注册分区）② 预创建水位文件
+  ③ 进集合——②③ 不随回滚撤销，失败方向 = 多打标（事实白名单），语义安全；
+  **P2 只进不出**（撤销=DROP，消灭"回滚后列真/集合无"的错配面）。统一谓词
+  `shard_oid_is_mvcc` = GUC 名单 ∪ mvcc 集合，九处调用点收编（含 TOAST 归属、
+  utility guard、DROP GC）。验收 19/19：未登记零变化（原生 xmin）；无
+  partition_map 行拒登记；登记后无 GUC 打标 xmin=3、可见性/ANALYZE/VACUUM
+  禁令全走分片路径；**干净重启后集合从目录重建、新写仍打标**；DROP 全清。
+  金丝雀 lwc 9/0 + r2 50/0 + P1 45/45。已知边界：集合上限 64 张（超限启动
+  WARNING 且该表不再打标——禁用继续使用）；schema 硬限定 partdist. 前缀随
+  既有约定；flag 的跨节点传播沿用 partition_map 既有同步通道（P2 单 leader
+  场景手工/控制面按节点执行）。
 
 #### T2.8 P2 验收套件（与 T2.3 起并行开发）
 

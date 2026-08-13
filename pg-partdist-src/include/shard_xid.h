@@ -59,6 +59,11 @@ extern int	ShardXidEnsureClaimed(Oid shard);
 /* T2.5：恢复期影子推进（0007 redo 钩子逐对喂入，startup 进程调用） */
 extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);
 
+/* T2.7：partition_map 驱动门控——运行时集合登记 + 水位文件预创建
+ * （pg_shard_xid/ 目录 = 启动登记表，ShardXidShmemInit 扫描重建集合） */
+extern void ShardMvccSetAdd(Oid relid);
+extern void ShardMvccEnsureWatermarkFile(Oid relid);
+
 /* P1 数据保护拦截：VACUUM/ANALYZE/CLUSTER 点名白名单表一律 ERROR
  * （P1_PRECHECK 结论 D：原生 clog 会误判分片 xid，重写/回收路径必须封死） */
 extern void ShardXidUtilityGuard(Node *parsetree);

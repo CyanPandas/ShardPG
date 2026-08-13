@@ -12,11 +12,15 @@
 #include "shard_clog.h"
 #include "shard_visibility.h"
 
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/shard_stamp.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "executor/spi.h"
+#include "fmgr.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -83,6 +87,16 @@ typedef struct ShardXidState
 								 * 才一次 fsync，见 SHARD_XID_BATCH） */
 	ShardXidSlot slots[SHARD_XID_MAX_SLOTS];
 	ShardXidShadow shadow[SHARD_XID_MAX_SLOTS];
+
+	/*
+	 * T2.7 partition_map 驱动门控：已登记打标的表 OID 集合。真相 =
+	 * partition_map.shard_mvcc 列（注册函数写）；本集合是运行时判定用的
+	 * 影子，重启时由 ShardXidShmemInit 扫 pg_shard_xid/ 目录重建（注册即
+	 * 预创建水位文件，目录就是启动登记表——不引入第二份持久结构）。
+	 * mvcc_n 作无锁快门：0 = 全库无登记表，438 基线路径只多一次整型读。
+	 */
+	int			mvcc_n;
+	Oid			mvcc_set[SHARD_XID_MAX_SLOTS];
 } ShardXidState;
 
 static ShardXidState *ShardXidCtl = NULL;
@@ -148,6 +162,51 @@ oid_cmp_qsort(const void *a, const void *b)
 	if (oa > ob)
 		return 1;
 	return 0;
+}
+
+static bool oid_whitelisted(ShardRelidsCfg *cfg, Oid relid);
+
+/* ---- T2.7：partition_map 驱动门控（mvcc 集合） ---- */
+
+static bool
+shard_mvcc_set_contains(Oid relid)
+{
+	int			n;
+	int			i;
+	bool		found = false;
+
+	if (ShardXidCtl == NULL)
+		return false;
+	n = ShardXidCtl->mvcc_n;	/* 无锁快门（对齐 int 读；写侧持锁递增） */
+	if (n == 0)
+		return false;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < ShardXidCtl->mvcc_n; i++)
+		if (ShardXidCtl->mvcc_set[i] == relid)
+		{
+			found = true;
+			break;
+		}
+	LWLockRelease(ShardXidCtl->lock);
+	return found;
+}
+
+/* 门控是否开着（GUC 名单非空 或 有登记表）——各入口的零成本早退条件 */
+static inline bool
+shard_gating_active(ShardRelidsCfg *cfg)
+{
+	return (cfg != NULL && cfg->n > 0) ||
+		(ShardXidCtl != NULL && ShardXidCtl->mvcc_n > 0);
+}
+
+/* 统一谓词：GUC 白名单（测试通道）∪ partition_map 登记（正道），取并集 */
+static bool
+shard_oid_is_mvcc(ShardRelidsCfg *cfg, Oid relid)
+{
+	if (cfg != NULL && cfg->n > 0 && oid_whitelisted(cfg, relid))
+		return true;
+	return shard_mvcc_set_contains(relid);
 }
 
 static bool
@@ -250,11 +309,11 @@ ShardXidRelidLookup(Relation relation)
 	ShardRelidsCfg *cfg = shard_relids_cfg;
 	Oid			relid;
 
-	if (cfg == NULL || cfg->n == 0)
+	if (!shard_gating_active(cfg))
 		return InvalidOid;
 
 	relid = RelationGetRelid(relation);
-	if (oid_whitelisted(cfg, relid))
+	if (shard_oid_is_mvcc(cfg, relid))
 		return relid;
 
 	if (relation->rd_rel->relkind == RELKIND_TOASTVALUE)
@@ -265,7 +324,7 @@ ShardXidRelidLookup(Relation relation)
 		/* %c 拒绝尾随字符，确保整名匹配 pg_toast_<oid> */
 		if (sscanf(RelationGetRelationName(relation),
 				   "pg_toast_%u%c", &owner, &trail) == 1 &&
-			oid_whitelisted(cfg, (Oid) owner))
+			shard_oid_is_mvcc(cfg, (Oid) owner))
 		{
 			/* 让可见性钩子的 by-OID 查询也认得这张 TOAST（见 toast_map 注释） */
 			toast_map_note(relid, (Oid) owner);
@@ -282,14 +341,14 @@ ShardXidLookupByOid(Oid reloid)
 	ShardRelidsCfg *cfg = shard_relids_cfg;
 	int			i;
 
-	if (cfg == NULL || cfg->n == 0)
+	if (!shard_gating_active(cfg))
 		return InvalidOid;
-	if (oid_whitelisted(cfg, reloid))
+	if (shard_oid_is_mvcc(cfg, reloid))
 		return reloid;
 	/* TOAST：查后端登记的归属映射（属主须仍在名单内） */
 	for (i = 0; i < toast_map_n; i++)
 		if (toast_map[i].toast == reloid &&
-			oid_whitelisted(cfg, toast_map[i].owner))
+			shard_oid_is_mvcc(cfg, toast_map[i].owner))
 			return toast_map[i].owner;
 	return InvalidOid;
 }
@@ -749,11 +808,92 @@ ShardXidShmemInit(void)
 	if (!found)
 	{
 		memset(ShardXidCtl->slots, 0, sizeof(ShardXidCtl->slots));
+		memset(ShardXidCtl->shadow, 0, sizeof(ShardXidCtl->shadow));
+		memset(ShardXidCtl->mvcc_set, 0, sizeof(ShardXidCtl->mvcc_set));
+		ShardXidCtl->mvcc_n = 0;
 		ShardXidCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_shard_xid")[0].lock;
+
+		/*
+		 * T2.7 启动装载：pg_shard_xid/ 目录就是登记表——注册函数预创建
+		 * 水位文件、DROP GC 删除之。postmaster 启动期单线程，无需持锁。
+		 */
+		{
+			DIR		   *dir = AllocateDir(SHARD_XID_DIR);
+			struct dirent *de;
+
+			while (dir != NULL && (de = ReadDir(dir, SHARD_XID_DIR)) != NULL)
+			{
+				unsigned int oid;
+				char		trail;
+
+				if (sscanf(de->d_name, "%u%c", &oid, &trail) != 1 || oid == 0)
+					continue;	/* "."/".."/"*.tmp" 等一律跳过 */
+				if (ShardXidCtl->mvcc_n >= SHARD_XID_MAX_SLOTS)
+				{
+					elog(WARNING,
+						 "pg_partdist: 打标登记超过 %d 张，OID %u 未装载"
+						 "（该表在重启后不再打标——不可继续使用！）",
+						 SHARD_XID_MAX_SLOTS, oid);
+					continue;
+				}
+				ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n++] = (Oid) oid;
+			}
+			if (dir != NULL)
+				FreeDir(dir);
+		}
 	}
 
 	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * T2.7：把表登进运行时 mvcc 集合（注册函数与测试用；幂等）。
+ */
+void
+ShardMvccSetAdd(Oid relid)
+{
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_partdist 分片 xid 共享内存未初始化")));
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < ShardXidCtl->mvcc_n; i++)
+		if (ShardXidCtl->mvcc_set[i] == relid)
+		{
+			LWLockRelease(ShardXidCtl->lock);
+			return;
+		}
+	if (ShardXidCtl->mvcc_n >= SHARD_XID_MAX_SLOTS)
+	{
+		LWLockRelease(ShardXidCtl->lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("打标登记表已满（上限 %d 张）", SHARD_XID_MAX_SLOTS)));
+	}
+	/* 先写槽位再抬 mvcc_n——无锁快门读侧永远看不到未初始化的槽 */
+	ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n] = relid;
+	ShardXidCtl->mvcc_n++;
+	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
+ * T2.7：为登记表预创建水位文件（{0,0}，8 字节）——让 pg_shard_xid/ 目录
+ * 在首写之前就承担"启动登记表"职责。已存在则不动（幂等）。
+ */
+void
+ShardMvccEnsureWatermarkFile(Oid relid)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", relid);
+	if (stat(path, &st) == 0)
+		return;
+	shard_xid_persist_watermark(relid, 0, 0);
 }
 
 /*
@@ -800,12 +940,12 @@ shard_xid_guard_range_var(ShardRelidsCfg *cfg, RangeVar *rv, const char *cmd)
 	/* 直接点名 TOAST 表（VACUUM pg_toast.pg_toast_NNN）也拦 */
 	if (rv->relname != NULL &&
 		sscanf(rv->relname, "pg_toast_%u%c", &owner, &trail) == 1 &&
-		oid_whitelisted(cfg, (Oid) owner))
+		shard_oid_is_mvcc(cfg, (Oid) owner))
 		relid = (Oid) owner;
 	else
 		relid = RangeVarGetRelid(rv, NoLock, true);
 
-	if (OidIsValid(relid) && oid_whitelisted(cfg, relid))
+	if (OidIsValid(relid) && shard_oid_is_mvcc(cfg, relid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("P1: %s 不允许作用于分片打标表 \"%s\"",
@@ -824,7 +964,7 @@ ShardXidUtilityGuard(Node *parsetree)
 {
 	ShardRelidsCfg *cfg = shard_relids_cfg;
 
-	if (cfg == NULL || cfg->n == 0 || parsetree == NULL)
+	if (!shard_gating_active(cfg) || parsetree == NULL)
 		return;
 
 	if (IsA(parsetree, VacuumStmt))
@@ -850,7 +990,7 @@ ShardXidUtilityGuard(Node *parsetree)
 		{
 			VacuumRelation *vrel = lfirst_node(VacuumRelation, lc);
 
-			if (OidIsValid(vrel->oid) && oid_whitelisted(cfg, vrel->oid))
+			if (OidIsValid(vrel->oid) && shard_oid_is_mvcc(cfg, vrel->oid))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("VACUUM 不允许作用于分片打标表（OID %u，P5 前禁）",
@@ -901,9 +1041,65 @@ ShardXidUtilityGuard(Node *parsetree)
 				RangeVar   *rv = makeRangeVarFromNameList((List *) lfirst(lc));
 				Oid			relid = RangeVarGetRelid(rv, NoLock, true);
 
-				if (OidIsValid(relid) && oid_whitelisted(cfg, relid))
+				if (OidIsValid(relid) && shard_oid_is_mvcc(cfg, relid))
 					ShardClogRememberDrop(relid);
 			}
 		}
 	}
+}
+
+/* ================= T2.7 注册函数（SQL 入口） ================= */
+
+/*
+ * partdist_set_shard_mvcc(regclass) —— 把既有 partition_map 分区登记为
+ * 分片打标表。三步：① 真相列 UPDATE（事务性；无行即 ERROR，登记的必须是
+ * 已注册分区）；② 预创建水位文件（目录=启动登记表，持久）；③ 运行时集合。
+ * ②③ 不随回滚撤销——失败方向是"多打标"（表成为事实白名单成员），语义
+ * 安全；反向（该打标未打标）才是数据损坏。P2 不支持撤销：DROP TABLE 即全清
+ * （回滚错配面直接消灭）。建议在自动提交里调用。
+ */
+PG_FUNCTION_INFO_V1(partdist_set_shard_mvcc);
+Datum
+partdist_set_shard_mvcc(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	bool		enable = PG_GETARG_BOOL(1);
+	char		sql[128];
+	int			ret;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("partdist_set_shard_mvcc 需要超级用户")));
+
+	if (!enable)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("P2 不支持撤销打标登记"),
+				 errhint("DROP TABLE 会连同水位/clog 文件一并清理。")));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("SPI_connect 失败")));
+	snprintf(sql, sizeof(sql),
+			 "UPDATE partdist.partition_map SET shard_mvcc = true"
+			 " WHERE partition_id = %u",
+			 relid);
+	ret = SPI_execute(sql, false, 0);
+	if (ret != SPI_OK_UPDATE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("partition_map 更新失败（SPI %d）", ret)));
+	if (SPI_processed != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("partition_map 里没有分区 %u 的登记行", relid),
+				 errhint("先按既有流程注册分区，再登记打标。")));
+	SPI_finish();
+
+	ShardMvccEnsureWatermarkFile(relid);
+	ShardMvccSetAdd(relid);
+
+	PG_RETURN_VOID();
 }

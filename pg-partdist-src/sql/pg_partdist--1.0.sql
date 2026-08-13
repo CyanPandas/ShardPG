@@ -21,6 +21,9 @@ CREATE TABLE partition_map (
     -- 数据组自治选举出的主副本任期（任期栅栏：apply 只接受不回退的更新）。
     -- 0 = 尚无数据组管理（历史/合成分区，仍走旧"控制面指定"通道）。
     primary_term    BIGINT      NOT NULL DEFAULT 0,
+    -- TX-TSO-MVCC（T2.7）：本分区是否启用分片级 xid 打标（P2 起）。
+    -- 由 partdist_set_shard_mvcc() 翻转；既有行默认 false 保 438 基线。
+    shard_mvcc      BOOLEAN     NOT NULL DEFAULT false,
     CONSTRAINT pk_partition_map PRIMARY KEY (partition_id)
 );
 
@@ -982,3 +985,11 @@ CREATE OR REPLACE FUNCTION replay_reclaim_stale(
 
 COMMENT ON FUNCTION replay_reclaim_stale(INTEGER) IS
     '回收关系已不存在的回放槽位与 pg_parwal 目录。判据=OID 不在 pg_class；被活着的 worker 认领的槽位不动。replay_set_locmap 建槽前会自动调用。';
+
+-- TX-TSO-MVCC（T2.7）：把既有 partition_map 分区登记为分片打标表。
+-- P2 只支持登记不支持撤销（DROP TABLE 即全清）；需超级用户、建议自动提交。
+CREATE OR REPLACE FUNCTION partdist_set_shard_mvcc(rel regclass,
+                                                   enable boolean DEFAULT true)
+RETURNS void
+AS 'MODULE_PATHNAME', 'partdist_set_shard_mvcc'
+LANGUAGE C STRICT;
