@@ -578,6 +578,13 @@ _PG_init(void)
         *rv = (void *) DtxBroadcastDecision;
     }
 
+    /* R-P4-9：恢复守护闭合 prepared 前，先经此把判决落进本节点分片 clog */
+    {
+        void **rv = find_rendezvous_variable("partdist_dtx_apply_decision_fn");
+
+        *rv = (void *) DtxApplyDecisionByDtxid;
+    }
+
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
     TsoRegisterHeartbeatWorker();   /* T3.5：GlobalSafeTs 心跳/续租 */

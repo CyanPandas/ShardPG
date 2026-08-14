@@ -559,6 +559,31 @@ DtxPendingSweep(void)
 				if (!any_rel)
 					any_prepared = false;	/* 表全没了：按残渣注销 */
 			}
+			/*
+			 * ★ 防误杀（2026-08-14 三点追踪抓获）：崩溃重启后 PREPARED 槽的
+			 * 重建（2PC 段 recover）与登记重建（journal 重放）不在同一时刻，
+			 * 清扫若插在"登记已回来、槽还没回来"的空窗里，上面两条自愈判据
+			 * 都会把**活账**当残渣注销——随后守护补取到 commit_ts 想落账时
+			 * 登记已不在，判决永久落不上（实测：16:02:14 清扫注销 →
+			 * 16:02:46 守护补到 dcts=23 却落账返回 0 → 行永久不可见）。
+			 *
+			 * 兜底判据：原生 prepared 事务还在 ⇒ 这笔账**一定是活的**，
+			 * 无论槽/表此刻看起来如何，一律不注销。gid 前缀按 §5.4 两种形态
+			 * 匹配（citus_… 与 shardpg_dtx_…），dtxid 为 0 时退化为不兜底。
+			 */
+			if (!any_prepared && snap[i].dtxid != 0 &&
+				SPI_connect() == SPI_OK_CONNECT)
+			{
+				char		q[192];
+
+				snprintf(q, sizeof(q),
+						 "SELECT 1 FROM pg_prepared_xacts WHERE gid LIKE 'citus\\_%%'"
+						 "    OR gid LIKE 'shardpg\\_dtx\\_%%' LIMIT 1");
+				if (SPI_execute(q, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+					any_prepared = true;	/* 还有活的 prepared：不敢注销 */
+				SPI_finish();
+			}
+
 			if (!any_prepared)
 			{
 				DtxPendingFinalized(snap[i].gxid);
@@ -795,6 +820,43 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 }
 
 /*
+ * R-P4-9：按 dtxid 把判决落进本节点分片 clog（供 pg_raft 恢复守护在
+ * COMMIT/ROLLBACK PREPARED **之前**调用）。
+ *
+ * 为什么必须先落账再闭合：闭合之后原生 prepared 消失，2PC 段随之作废，
+ * 未决登记失去载体——此时若判决还没写进 clog，那些行就永久不可见
+ * （切主后阶段 3 标记的本地写被写栅栏拒，正是这条路的实测形态）。
+ * 反过来"先落账、后闭合"：落账失败可整轮重来（登记还在），闭合失败也
+ * 只是下一轮再闭合一次（落账幂等）。
+ *
+ * 返回落账笔数（0 = 本节点没参与 / 已收敛）。
+ */
+int
+DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
+{
+	DtxPendingEntry snap[DTX_PENDING_MAX];
+	int			nsnap = 0;
+	int			ndone = 0;
+	int			i;
+
+	if (PendingCtl == NULL || dtxid == 0 || (verdict != 1 && verdict != 2))
+		return 0;
+
+	SpinLockAcquire(&PendingCtl->mutex);
+	for (i = 0; i < DTX_PENDING_MAX; i++)
+		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
+			snap[nsnap++] = PendingCtl->e[i];
+	SpinLockRelease(&PendingCtl->mutex);
+
+	for (i = 0; i < nsnap; i++)
+	{
+		dtx_pending_apply_verdict(&snap[i], verdict, commit_ts);
+		ndone++;
+	}
+	return ndone;
+}
+
+/*
  * 广播的接收端：按 dtxid 找本节点未决登记，幂等落账（与清扫同一函数）。
  * 找不到登记 = 本节点没参与 / 已收敛，返回 0；落账成功返回 1。
  */
@@ -805,26 +867,8 @@ partdist_dtx_apply_decision(PG_FUNCTION_ARGS)
 	int64		dtxid = PG_GETARG_INT64(0);
 	int32		verdict = PG_GETARG_INT32(1);
 	int64		cts = PG_GETARG_INT64(2);
-	DtxPendingEntry snap[DTX_PENDING_MAX];
-	int			nsnap = 0;
-	int			ndone = 0;
-	int			i;
 
-	if (PendingCtl == NULL || dtxid == 0 || (verdict != 1 && verdict != 2))
-		PG_RETURN_INT32(0);
-
-	SpinLockAcquire(&PendingCtl->mutex);
-	for (i = 0; i < DTX_PENDING_MAX; i++)
-		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
-			snap[nsnap++] = PendingCtl->e[i];
-	SpinLockRelease(&PendingCtl->mutex);
-
-	for (i = 0; i < nsnap; i++)
-	{
-		dtx_pending_apply_verdict(&snap[i], verdict, cts);
-		ndone++;
-	}
-	PG_RETURN_INT32(ndone);
+	PG_RETURN_INT32(DtxApplyDecisionByDtxid(dtxid, (int) verdict, cts));
 }
 
 /* ---- 心跳工作者的自连触发（无 DB 语境，纯 libpq） ---- */

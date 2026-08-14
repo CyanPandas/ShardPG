@@ -6382,6 +6382,160 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
          * 先闭合事务、再补标记记录。顺序无关正确性（决议已在协调组持久化，
          * 是终局的），但闭合优先能尽快释放 prepared 事务持有的锁。
          */
+
+        /*
+         * ★ R-P4-9（2026-08-14 解冻批次 #3）：**闭合之前**先把判决落进
+         * 本节点的 TX2 分片 clog。
+         *
+         * 缺此一步的实测形态：参与者崩溃且本组已切主时，守护问到决议并
+         * COMMIT PREPARED 闭合成功，但下面补标记的本地写被写栅栏拒
+         * （非 leader 不得本地写）——判决没进分片 clog，而原生 prepared
+         * 已消失、2PC 段随之作废、未决登记失去载体，那些行**永久不可见**。
+         *
+         * 顺序必须是"先落账后闭合"：落账失败可整轮重来（登记还在），
+         * 闭合后失败则无从补救。落账本身幂等（与广播/清扫同一函数）。
+         * 未装 pg_partdist / 遗留模式（登记恒空）时该调用返回 0，行为不变。
+         */
+        {
+            static int (**apply_rv)(int64, int, int64) = NULL;
+
+            if (apply_rv == NULL)
+                apply_rv = (int (**)(int64, int, int64))
+                    find_rendezvous_variable("partdist_dtx_apply_decision_fn");
+            if (*apply_rv != NULL && dtxid != 0)
+            {
+                int   n_applied = 0;
+                int64 dcts = 0;
+                bool  ts_isnull = true;
+
+                /*
+                 * commit_ts 从**本地** dtx_decision 取：决议条目经组日志
+                 * 复制、各成员 apply 时各自登记，所以本节点若参与过这笔
+                 * 事务、其协调组决议必已 apply 到本地（§6.2）。取不到就
+                 * 传 0——落账侧对 ABORT 本就忽略 ts，对 COMMIT 传 0 会被
+                 * 视为遗留语义（对一切快照可见），因此**取不到时不落账**，
+                 * 留给拉取通道带着正确 ts 收敛。
+                 */
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "SELECT commit_ts FROM partdist.dtx_decision "
+                                 " WHERE dtxid = %lld", (long long) dtxid);
+                if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT &&
+                    SPI_processed > 0)
+                {
+                    Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                            SPI_tuptable->tupdesc, 1,
+                                            &ts_isnull);
+
+                    if (!ts_isnull)
+                        dcts = DatumGetInt64(d);
+                }
+                pfree(sql.data);
+
+                /*
+                 * 本地取不到 ⇒ 向协调组 leader 补取一次（决议本就是问来的，
+                 * dtx_peek 是 T4.5 的只读窥视口，绝不写推定中止）。
+                 * 实测必要性：参与者崩溃重启后本地 dtx_decision 尚未 apply
+                 * 回来（决议写在切主后的新 leader 上），只查本地必然落空，
+                 * 判决就永远落不进分片 clog（R-P4-9 首版即栽在这里）。
+                 */
+                if (verdict == 1 && dcts <= 0 && coord_gsid > 0)
+                {
+                    int   cnode = 0;
+                    int   cslot = -1;
+                    int   ci;
+
+                    initStringInfo(&sql);
+                    appendStringInfo(&sql,
+                                     "SELECT primary_node FROM partdist.partition_map "
+                                     " WHERE partition_id = %llu::oid",
+                                     (unsigned long long) coord_gsid);
+                    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT &&
+                        SPI_processed > 0)
+                    {
+                        Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                                SPI_tuptable->tupdesc, 1,
+                                                &ts_isnull);
+
+                        if (!ts_isnull)
+                            cnode = DatumGetInt32(d);
+                    }
+                    pfree(sql.data);
+
+                    for (ci = 0; ci < n_peers && cnode > 0; ci++)
+                        if (peers[ci].node_id == cnode)
+                        {
+                            cslot = ci;
+                            break;
+                        }
+                    if (cslot >= 0 || cnode == pg_raft_node_id)
+                    {
+                        char      pconn[256];
+                        char      pqry[192];
+                        PGconn   *pc;
+                        PGresult *pres;
+
+                        if (cnode == pg_raft_node_id)
+                            pg_raft_format_conninfo("127.0.0.1", PostPortNumber,
+                                                    pconn, sizeof(pconn));
+                        else
+                            pg_raft_format_conninfo(peers[cslot].host,
+                                                    peers[cslot].port,
+                                                    pconn, sizeof(pconn));
+                        pc = PQconnectdb(pconn);
+                        if (PQstatus(pc) == CONNECTION_OK)
+                        {
+                            snprintf(pqry, sizeof(pqry),
+                                     "SELECT commit_ts FROM partdist.dtx_peek(%lld, %lld)",
+                                     (long long) coord_gsid, (long long) dtxid);
+                            pres = PQexec(pc, pqry);
+                            if (PQresultStatus(pres) == PGRES_TUPLES_OK &&
+                                PQntuples(pres) == 1 && !PQgetisnull(pres, 0, 0))
+                                dcts = strtoll(PQgetvalue(pres, 0, 0), NULL, 10);
+                            PQclear(pres);
+                        }
+                        PQfinish(pc);
+                    }
+                }
+
+                /*
+                 * ★ 落账拿不到 commit_ts（协调组正在切主、dtx_peek 的 leader
+                 * 门控合法拒答等）⇒ **本轮不闭合**，留着 prepared 与登记，
+                 * 守护下一轮重来。闭合是不可逆的（原生 prepared 一消失，
+                 * 2PC 段作废、登记失去载体），而多等一轮只是延迟——两害相权，
+                 * 宁可慢，不可丢。ABORT 不需要 ts，照常闭合。
+                 */
+                if (verdict == 1 && dcts <= 0)
+                {
+                    elog(LOG,
+                         "pg_raft: dtx 恢复：dtxid=%lld 取不到 commit_ts，"
+                         "本轮不闭合（保留 prepared 与登记，下轮重试）",
+                         (long long) dtxid);
+                    raft_persist_spi_end(spi_owned);
+                    continue;
+                }
+
+                if (verdict == 2 || dcts > 0)
+                {
+                    PG_TRY();
+                    {
+                        n_applied = (*apply_rv)(dtxid, (int) verdict, dcts);
+                    }
+                    PG_CATCH();
+                    {
+                        FlushErrorState();  /* 落账失败不阻断闭合：下轮重来 */
+                        n_applied = -1;
+                    }
+                    PG_END_TRY();
+                    if (n_applied > 0)
+                        elog(LOG,
+                             "pg_raft: dtx 恢复：dtxid=%lld 判决先落 TX2 分片 clog"
+                             "（%d 笔，cts=%lld）",
+                             (long long) dtxid, n_applied, (long long) dcts);
+                }
+            }
+        }
+
         {
             char      selfconn[256];
             char      cmd[256];

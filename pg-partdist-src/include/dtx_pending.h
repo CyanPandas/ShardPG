@@ -46,6 +46,7 @@ extern bool DtxPendingLookup(int64 gxid, DtxPendingEntry *out);
 extern int	DtxPendingCount(void);
 extern bool DtxPendingContainsDtxid(int64 dtxid);	/* R-P4-5 回执门 */
 extern void DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts);
+extern int	DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts);
 
 /* 清扫核心（需要 backend 语境：SPI + libpq）；返回本轮注销数 */
 extern int	DtxPendingSweep(void);
