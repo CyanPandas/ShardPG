@@ -1050,10 +1050,16 @@ COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
 
 -- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
 -- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。
+-- 注意：单行复合返回（OUT + RETURNS record，proretset=false）。写成
+-- RETURNS TABLE 会被标记为集合返回函数，与 C 侧的单行返回协议不符，
+-- SQL 调用即报 "set-valued function called in context ..."（读者③首轮
+-- 静默失败的根因——清扫通道直调 C 核心不经 SQL，故只有读者路径中招）。
 CREATE OR REPLACE FUNCTION dtx_inquire(
     p_coord_gsid bigint,
-    p_dtxid bigint
-) RETURNS TABLE(verdict integer, commit_ts bigint)
+    p_dtxid bigint,
+    OUT verdict integer,
+    OUT commit_ts bigint
+) RETURNS record
 LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'partdist_dtx_inquire';
 
 -- 清扫一轮本节点未决 2PC 登记（心跳工作者自连周期触发；测试可手动调），
