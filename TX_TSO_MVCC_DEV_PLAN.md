@@ -1165,57 +1165,45 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   错位；另有组建立期选举竞态偶发（20s 就位窗）。**待核尾巴（T4.5② 首查）**：
   守护闭合走 tx 通道（postcommit 不写终局）时，pending 注销与 clog 判决
   落账的先后需逐帧核一次——若注销先于判决落账实锤，即孤儿窗口回归。
-- **实施记要·②决议主动广播（2026-08-14）**：**待核尾巴已结清**——四条
-  注销路径逐条核完（apply_verdict 内先 SetVerdict 后 Finalized；自愈支；
-  postabort 先写 ABORTED 后注销），**无一在判决落账之前注销**，孤儿窗口
-  未回归。**广播落地**：实现放 pg-partdist（`DtxBroadcastDecision`，
-  避免再扩 pg_raft 触碰面），pg_raft 在 `dtx_write_decision` 的**提交点
-  之后**经 rendezvous `partdist_dtx_broadcast_fn` 触发一次，PG_TRY 吞掉
-  一切失败（广播是纯优化，§3.3 允许丢失，拉取仍是兜底真相源）；收件人
-  由 dtx_participant→shard_identity→partition_map→node_map 解析，对端
-  `partdist.dtx_apply_decision(dtxid,verdict,cts)` 按 dtxid 找本节点未决
-  登记、走与清扫同一落账函数幂等落分片 clog。**实证**：新增两条断言
-  "决议返回后零拉取即收敛"首发即绿，A/B 两侧 1–3s 清空登记（run21/22/23
-  连续复现）；峰值 42/45。**真缺陷（广播引入并当场修复）**：广播的 SPI
-  在 `SPI_execute` 抛错路径上不关闭 → 宿主事务收尾报 "transaction left
-  non-empty SPI stack"（提交路径上的泄漏，实测目击）——改 PG_TRY/
-  PG_FINALLY 兜底。**验收语义再对齐**：广播上线后收敛快于断言读数，
-  "登记未决"类瞬时计数断言全部改判为"登记过 ∨ 已收敛"，崩溃腿的重建
-  证据改读 "未决 2PC 日志重放：N 条待收敛" 日志行（实测重放与收敛相隔
-  0.4s，瞬时计数必然读空）。**环境侧发现**：`invalid max offset number`
-  PANIC 首现于本轮改动之前（回放器吃残留 fileset 旧字节），与广播无关；
-  夹具残留（parwal/shard_xid/shard_clog 目录 + 组槽）是崩溃与选举乱象的
-  共同放大器——已加入深度清场流程。
+- **实施记要·②决议主动广播 + 收官（2026-08-14，可信验收 45/0 + 金丝雀 8 套全绿）**
+  ——本条为**合并记要**：本任务期间存在并行会话（见文末事故记录），双方各自
+  记过一版，现按当前代码与最终数字合并去重，技术事实取并集、数字以收官轮为准。
+  **待核尾巴已结清**：四条注销路径逐条核完（学到判决的 apply_verdict 内先
+  SetVerdict 后 Finalized；自愈支；postabort 先写 ABORTED 后注销），**无一在
+  判决落账之前注销**，孤儿窗口未回归。
+  **广播落地**：实现放 pg-partdist（`DtxBroadcastDecision`，避免再扩 pg_raft
+  触碰面），pg_raft 在 `dtx_write_decision` 的**提交点之后**经 rendezvous
+  `partdist_dtx_broadcast_fn` 触发一次，失败全吞（广播是纯优化，§3.3 允许丢失，
+  拉取仍是兜底真相源）；收件人由 dtx_participant → shard_identity →
+  partition_map → node_map 解析，对端 `partdist.dtx_apply_decision(dtxid,
+  verdict,cts)` 按 dtxid 找本节点未决登记、走与清扫同一落账函数幂等落分片 clog。
+  **真缺陷（广播引入并当场修复）**：广播的 SPI 在 `SPI_execute` 抛错路径上
+  不关闭 → 宿主事务收尾报 "transaction left non-empty SPI stack"（提交路径上
+  的泄漏，九节点日志实测目击 26 次）——改 PG_TRY/PG_FINALLY 兜住任何出口。
+  **验收语义对齐**：广播上线后收敛快于断言读数，"登记未决"类瞬时计数断言
+  改判为"登记过 ∨ 已收敛"；崩溃腿的重建证据改读 "未决 2PC 日志重放：N 条
+  待收敛" 日志行（实测重放与收敛相隔 0.4s，瞬时计数必然读空）。
+  **最终验收（收官轮，独占锁 + 净场 + 重启 + 零并发 + 串行）**：
+  `test_dtx_convergence_p4.sh` **45/0，连续两轮一致**；广播零拉取收敛 1–3s、
+  A/B 双侧 clog COMMITTED 1s、ABORT 学习 1s、自动清扫 2s、无决议不阻塞、
+  崩溃腿登记重建 + 原生恢复 + 切主后决议写入与收敛全过、零崩溃零丢弃。
+  金丝雀 p1 45 / p2 64 / p3 38 / lwc 9 / r1 58 / tx1 83 / tx2 43 / tx4 17
+  **全部 0 失败**。至此 T4.5 机制面（未决登记、持久日志、读者③问询、清扫、
+  广播推送、崩溃重建、切主收敛）全部实证闭环；过程中的 R-P4-9 双病灶修复
+  见 §5 风险登记 8f。
+  **环境侧发现**：`invalid max offset number` PANIC 首现于本轮改动之前（回放器
+  吃残留 fileset 旧字节，见 R-P4-8），与广播无关；夹具残留（parwal /
+  shard_xid / shard_clog 目录 + 组槽）是崩溃与选举乱象的共同放大器——已并入
+  深度清场流程。
+  **测试基础设施事故与整改**：Bash 工具"超时移到后台"**不终止进程**，
+  14:30–15:10 一度三份验收并发抢同一套 9 节点集群（并行会话的 run27/28 +
+  我方 run24 残留），双方夹具互删、`shardA` 取空、9/36 崩塌——**run23–run26
+  全部作废**，本记要只采信加锁后的轮次。整改 = 验收脚本入库为
+  `tests/test_dtx_convergence_p4.sh` 并加 **flock 独占锁**（拒绝并发启动）+
+  固定"净场 → 重启 → 零并发核查 → 串行跑"流程。另修真夹具 bug：
+  `psql -Atc "SET …; SELECT …"` 会把 SET 回显混进取值（实测取到字符串 "SET"
+  判空 → 全线假红），改用 PGOPTIONS 传会话参数。
 
-- **实施记要·②决议主动广播（2026-08-14，可信验收 43/2）**：广播实现在
-  pg-partdist（`DtxBroadcastDecision`）——决议达多数派后按 dtx_participant →
-  partition_map → node_map 解析参与节点，推送 `dtx_apply_decision`，对端按
-  dtxid 找未决登记、幂等落分片 clog（与清扫同一落账函数）；pg_raft 决议点经
-  rendezvous `partdist_dtx_broadcast_fn` 触发一次，**纯优化语义**（失败全吞 +
-  PG_CATCH 兜底，绝不打穿提交路径，拉取仍是兜底真相源）。
-  **可信验收 43/2**（独占锁 + 净场 + 串行）：广播零拉取收敛 3s、A/B 双侧
-  clog COMMITTED 1s、ABORT 学习 1s、自动清扫 2s、无决议不阻塞、崩溃腿
-  登记重建 + 原生恢复 + 切主后决议写入全过、零崩溃零丢弃。
-  **待核尾巴已关闭**：四条注销路径（学到判决/自愈/postabort）全部"先写判决、
-  后注销"，孤儿窗口无回归。**剩 2 红 = R-P4-9**（守护闭合不落 TX2 判决）。
-  **测试基础设施事故（教训入账）**：Bash 工具"超时移到后台"**不终止进程**，
-  14:30–15:10 期间一度三份验收并发抢同一套 9 节点集群（外部 run27/28 + 我的
-  run24 残留），双方夹具互删、`shardA` 取空、9/36 崩塌——**run23–run26 全部
-  作废**，本记要只采信加锁后的 clean1。已给验收脚本加 flock 独占锁（拒绝并发
-  启动），并修掉真夹具 bug：`psql -Atc "SET …; SELECT …"` 会把 SET 回显混进
-  取值（实测取到字符串 "SET" 判空 → 全线假红），改用 PGOPTIONS 传会话参数。
-
-- **实施记要·②收官（2026-08-14，可信验收 45/0 + 金丝雀 8 套全绿）**：
-  决议主动广播 + R-P4-9 双病灶修复后，`test_dtx_convergence_p4.sh`
-  **45/0**（连续两轮一致），金丝雀 p1 45 / p2 64 / p3 38 / lwc 9 / r1 58 /
-  tx1 83 / tx2 43 / tx4 17 **全部 0 失败**。至此 T4.5 的机制面（未决登记、
-  持久日志、读者③问询、清扫、广播推送、崩溃重建、切主收敛）全部实证闭环。
-  **测试基础设施事故与整改**：Bash 工具"超时移到后台"不终止进程，
-  14:30–15:10 一度三份验收并发抢同一套 9 节点集群（外部 run27/28 + 我的
-  run24 残留），双方夹具互删致 run23–run26 全部作废；整改 = 验收脚本入库
-  并加 **flock 独占锁**（拒绝并发启动）+ 每轮固定"净场→重启→零并发核查
-  →串行跑"流程。另修真夹具 bug：`psql -Atc "SET …; SELECT …"` 会把 SET
-  回显混进取值（取到字符串 "SET" 判空 → 全线假红），改用 PGOPTIONS。
 
 #### T4.6 §9.2 第 3 层分类处置落地
 
