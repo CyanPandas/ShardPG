@@ -1059,6 +1059,39 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   提交过）；参与分片切主 prepared 状态恢复（T2.4 认领 PREPARED 分支
   "不许动"衔接问询路径）。
 - **验收**：广播丢失下读者问询收敛；矩阵行 1–3 单场景就绪（逐格统跑在 T4.7）。
+- **实施记要·①进行中（2026-08-14，验收 34/7，机制主干全通）**：
+  **架构定案 = 拉取收敛，零 pg_raft 触碰**：参与者 PREPARE 时登记
+  (gxid, coord_gsid, dtxid, start_ts, pairs) 进节点级 shmem 表 + **持久日志**
+  `pg_shard_clog/dtx_pending.jrnl`（OPEN fsync 先于 EndPrepare 刷盘 ⇒
+  "prepared 存在 ⇒ 登记必在"；启动重放+压实；2PC 段 recover 兜底重建——
+  两通道闭掉"COMMIT PREPARED 后崩溃"孤儿窗）。判决收敛三通道：读者③
+  （可见性挂钩撞 PREPARED 且 sts≤S → 自连 dtx_inquire，每事务每 gxid 至多
+  一次 RPC + memo 保同快照跨分片一致）、心跳工作者自连周期清扫、手动
+  dtx_pending_sweep()。问询 = **只读 dtx_peek**（leader 门控，绝不写推定
+  中止）；寻址权威 = 本地 dtx_participant.coord_gsid（§4.2 ②的 NULL 不变
+  式载体），登记携带的 join gsid 只作兜底。2PC 段载荷 v2（+coord_gsid
+  +dtxid，长度判别兼容 v1）。新 SQL：dtx_peek/dtx_inquire/
+  dtx_pending_sweep/count/dump。**已实测通过**：登记 a=1 b=1、决议 cts=TSO
+  值、清扫收敛（手动+心跳自动 4s）、ABORT 学习 st=3、无决议读者 0s 即返
+  不可见、kill -9 后登记 2=2 重建+原生 prepared 恢复+切主后组有 leader。
+  **未过（3 焦点）**：读者③ 自连 RPC 在 5433 静默失败（清扫通道同值全通
+  →疑自连/超时问题）；[7] 崩后清扫需先等 partition_map 主翻转；崩后节点
+  shard_identity 空（rebuild 是手动步）令恢复守护 dtx_status 撞"协调组在
+  本节点没有对应分片"。**实施坑账（本轮抓获）**：① dtx_pending_dtxid 在
+  PrePrepareFinish 后被 Reset 清零、at-prepare 钩子取 0 —— 粘滞变量修复
+  （首轮 11 FAIL 唯一根因）；② shared_preload 库加新符号必须重启 postmaster；
+  ③ 带白名单删分布表被"含 DROP 禁 PREPARE"拦下、表静默存活 → 假阳性
+  连锁（teardown 必须先撤白名单并确认生效）；④ 本地拆表绕 2PC 会打散 MX
+  元数据（各节点 pg_dist 分叉）→ 正解 start_metadata_sync_to_node 全量重推
+  （节点名是 localhost 不是 127.0.0.1）；⑤ rebuild_shard_identity 在悬空
+  pg_dist_shard 行上整体报废 → 已产品级加固（过滤悬空）；⑥ T3.5 心跳
+  工作者 node_id 靠首个取号 backend 入 shmem，夹具必须"引流"否则首笔
+  joined 事务撞 7500ms 租约栅栏；⑦ 合成 dtxid 跨轮撞旧决议行（验收要
+  TRUNCATE dtx_decision 起步）。**风险登记**：R-P4-5 tx 时代回执/FORGET GC
+  按"原生 prepared 已闭合"删决议，不知 TX2 的 clog 收敛还要用——收敛失败
+  期间决议可能被提前遗忘（本轮实测目击）；处置方向：ack 条件并入
+  pending-finalize（涉 pg_raft 守护，待解冻申请或改喂 MARKER 通道），T4.5②
+  处理。
 
 #### T4.6 §9.2 第 3 层分类处置落地
 

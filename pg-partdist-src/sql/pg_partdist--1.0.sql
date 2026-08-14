@@ -398,6 +398,10 @@ BEGIN
     JOIN pg_catalog.pg_class cls
       ON cls.oid = pg_catalog.to_regclass(
                        pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
+    -- T4.5 加固：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
+    -- shard_name() 直接抛错，整个身份重建报废——先滤掉（脏元数据不应
+    -- 波及无关分片的身份映射）。
+    WHERE s.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
     ON CONFLICT (global_shard_id) DO UPDATE
        SET local_oid     = EXCLUDED.local_oid,
            relfilenode   = EXCLUDED.relfilenode,
@@ -1021,3 +1025,43 @@ CREATE OR REPLACE FUNCTION partdist_join_global_txn(gxid bigint, start_ts bigint
 RETURNS void AS 'MODULE_PATHNAME', 'partdist_join_global_txn' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION partdist_gxid_next()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_gxid_next' LANGUAGE C STRICT;
+
+-- ------------------------------------------------------------------
+-- T4.5：未决 2PC 决议收敛（TX_TSO_MVCC_DESING.md §3.3/§4.2）
+-- ------------------------------------------------------------------
+
+-- 只读决议窥视：在协调组 leader 上答该 dtxid 的判决；非 leader 或无决议
+-- 返回 0 行。与 dtx_status 的本质区别：**绝不写推定中止**——这是读者与
+-- 清扫的问询口，"首决胜出"的 ABORT 安装只属于恢复守护（dtx_status）。
+CREATE OR REPLACE FUNCTION dtx_peek(
+    p_coord_gsid bigint,
+    p_dtxid bigint
+) RETURNS TABLE(verdict integer, commit_ts bigint)
+LANGUAGE sql VOLATILE AS $fn$
+    SELECT d.verdict::integer, d.commit_ts::bigint
+      FROM partdist.dtx_decision d
+     WHERE d.dtxid = p_dtxid
+       AND EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
+                    WHERE s.group_id = p_coord_gsid AND s.state = 'leader')
+$fn$;
+
+COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
+    '只读决议窥视（T4.5）：leader 门控（follower 有 apply 滞后会答错），无决议/非 leader 返回 0 行，绝不写推定中止。';
+
+-- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
+-- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。
+CREATE OR REPLACE FUNCTION dtx_inquire(
+    p_coord_gsid bigint,
+    p_dtxid bigint
+) RETURNS TABLE(verdict integer, commit_ts bigint)
+LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'partdist_dtx_inquire';
+
+-- 清扫一轮本节点未决 2PC 登记（心跳工作者自连周期触发；测试可手动调），
+-- 返回收敛笔数。
+CREATE OR REPLACE FUNCTION dtx_pending_sweep()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_pending_sweep';
+
+CREATE OR REPLACE FUNCTION dtx_pending_count()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_pending_count';

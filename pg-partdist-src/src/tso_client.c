@@ -21,6 +21,7 @@
 #include "tso.h"
 #include "global_mvcc.h"
 #include "shard_xid.h"
+#include "dtx_pending.h"
 
 #include "fmgr.h"
 #include "libpq-fe.h"
@@ -572,6 +573,14 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			if (TsoClientCtl != NULL && TsoClientCtl->lease_ms > 0)
 				wait_ms = Max(1000, TsoClientCtl->lease_ms / 3);
 		}
+
+		/*
+		 * T4.5：未决 2PC 清扫兜底（读者问询之外的收敛通道）。本工作者无
+		 * DB 语境，经自连触发 partdist.dtx_pending_sweep() 在干净 backend
+		 * 里做 SPI 寻址 + 远程 peek。登记表空则零开销。
+		 */
+		if (DtxPendingCount() > 0)
+			DtxPendingSelfTriggerSweep();
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

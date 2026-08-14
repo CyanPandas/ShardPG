@@ -1,5 +1,6 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
+#include "dtx_pending.h"
 #include "partition_wal.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
@@ -65,6 +66,9 @@ pg_partdist_shmem_request_hook(void)
     RequestTsoShmem();
     RequestTsoClientShmem();
     RequestGxidShmem();
+
+    /* TX-TSO-MVCC P4：未决 2PC 登记表（T4.5，含持久日志重放） */
+    RequestDtxPendingShmem();
 }
 
 void
@@ -137,6 +141,7 @@ pg_partdist_shmem_startup_hook(void)
     /* TX-TSO-MVCC P3：TSO 计数器 + 节点登记表（T3.1） */
     TsoShmemInit();
     TsoClientShmemInit();
+    DtxPendingShmemInit();
     GxidShmemInit();
 }
 

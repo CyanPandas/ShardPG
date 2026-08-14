@@ -25,6 +25,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "tso.h"					/* T4.4：TsoMarkerCommitTs 换源 */
+#include "dtx_pending.h"			/* T4.5：PartDistPendingDtxid */
 
 #include <string.h>
 
@@ -33,6 +34,24 @@ bool pg_partdist_dtx_2pc_enabled = true;
 /* 本事务待处理的 prepared 事务 gid（TopMemoryContext 里，跨事务边界安全） */
 static char *dtx_pending_gid = NULL;
 static int64 dtx_pending_dtxid = 0;
+
+/*
+ * T4.5：at-prepare 钩子取用的**粘滞** dtxid。
+ *
+ * 不能直接读 dtx_pending_dtxid：PartDistDtxPrePrepareFinish 在登记成功后
+ * 立即 PartDistDtxReset() 清场，而内核的 at-prepare 钩子（StartPrepare 之后）
+ * 晚于它执行——实测取到的恒是 0，未决登记从此查不到决议（首轮验收 11 FAIL
+ * 的唯一根因）。粘滞变量在每次 PartDistDtxNotePrepareGid 进入时刷新
+ * （gid 不可解析则置 0，杜绝上一笔的陈旧值串到本笔），躲过 Reset 存活到
+ * at-prepare 取用。
+ */
+static int64 dtx_sticky_prepare_dtxid = 0;
+
+int64
+PartDistPendingDtxid(void)
+{
+    return dtx_sticky_prepare_dtxid;
+}
 
 /* PRE_PREPARE 里在 flush 之前取的触达分区快照 */
 static Oid  *dtx_touched_snapshot = NULL;
@@ -118,6 +137,7 @@ PartDistDtxNotePrepareGid(const char *gid)
     MemoryContext old;
 
     PartDistDtxReset();
+    dtx_sticky_prepare_dtxid = 0;   /* T4.5：每笔 PREPARE 都刷新，不留陈旧值 */
 
     if (!pg_partdist_dtx_2pc_enabled)
         return;
@@ -128,6 +148,7 @@ PartDistDtxNotePrepareGid(const char *gid)
     dtx_pending_gid = pstrdup(gid);
     MemoryContextSwitchTo(old);
     dtx_pending_dtxid = dtxid;
+    dtx_sticky_prepare_dtxid = dtxid;
 }
 
 /* ------------------------------------------------------------------ */

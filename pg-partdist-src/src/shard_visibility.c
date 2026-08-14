@@ -23,6 +23,7 @@
 #include "pg_partdist.h"
 #include "shard_xid.h"
 #include "shard_clog.h"
+#include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
 
@@ -176,12 +177,43 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 
 		case TXN_PREPARED:
 			/*
-			 * §4.2 三态（T4.3）：①槽 start_ts > 读者快照 ⇒ 未来提交必不可
-			 * 见——跳过；②coord_gsid 未知 ⇒ NULL 不变式保证决议未做——
-			 * 跳过；③问协调者组 leader 并幂等回写（读者绝不安装 ABORT）
-			 * ——与决议广播同一收敛机器，T4.5 落地。①②③ 在"问询未果"时
-			 * 的结局都是不可见且不阻塞，正是下面的兜底返回。
+			 * §4.2 三态（T4.5 落地）：①槽 start_ts > 读者快照 ⇒ 未来提交
+			 * 必不可见——零开销跳过；②未决登记缺失 ⇒ NULL 不变式（登记
+			 * OPEN 持久早于 prepared，缺失 ⇒ 决议必然未做）——跳过；
+			 * ③问协调者组 leader（DtxReaderResolve：memo 保同快照跨分片
+			 * 一致 + 每事务每 gxid 至多一次 RPC；学到即幂等回写本分片
+			 * clog，读者绝不安装推定 ABORT）。问询未果 ⇒ 不可见不阻塞。
+			 * 遗留模式（读者无 ts）不问询，维持 P2 语义。
 			 */
+			{
+				int64		my_ts = TsoGetStartTs();
+
+				if (my_ts > 0 && (int64) slot.start_ts <= my_ts &&
+					slot.global_xid != 0)
+				{
+					int64		dcts = 0;
+					int			vd = DtxReaderResolve((int64) slot.global_xid,
+													  &dcts);
+
+					if (vd == 1)
+					{
+						ce = verdict_cache_search(&key, HASH_ENTER);
+						ce->status = (uint8) TXN_COMMITTED;
+						ce->commit_ts = dcts;
+						if (cts_out)
+							*cts_out = dcts;
+						return SXID_COMMITTED;
+					}
+					if (vd == 2)
+					{
+						ce = verdict_cache_search(&key, HASH_ENTER);
+						ce->status = (uint8) TXN_ABORTED;
+						ce->commit_ts = 0;
+						return SXID_ABORTED;
+					}
+				}
+				return SXID_RUNNING;
+			}
 		case TXN_RUNNING:
 		default:
 			/*

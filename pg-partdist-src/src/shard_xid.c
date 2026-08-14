@@ -10,6 +10,7 @@
 #include "pg_partdist.h"
 #include "shard_xid.h"
 #include "shard_clog.h"
+#include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
 
@@ -953,9 +954,64 @@ typedef struct ShardTwoPhasePayload
 {
 	int64		gxid;
 	int64		start_ts;
+	int64		coord_gsid;		/* T4.5：问询寻址 */
+	int64		dtxid;			/* T4.5：决议键（镜像自 Citus gid） */
 	int32		nxids;
 	uint32		pairs[FLEXIBLE_ARRAY_MEMBER];	/* 2*nxids 个 uint32 */
 } ShardTwoPhasePayload;
+
+/* T4.4 及之前的段格式（升级期恢复兼容） */
+typedef struct ShardTwoPhasePayloadV1
+{
+	int64		gxid;
+	int64		start_ts;
+	int32		nxids;
+	uint32		pairs[FLEXIBLE_ARRAY_MEMBER];
+} ShardTwoPhasePayloadV1;
+
+/*
+ * 段载荷解析（v2/v1 按长度判别，尺寸差 16 字节不会歧义）。
+ * 返回 false = 两版都对不上（损坏/未知），调用方按无段处置。
+ * v1 无 coord_gsid/dtxid → 置 0（问询走不通，靠恢复守护收敛——升级期
+ * 仅存量 prepared 事务受此限）。
+ */
+static bool
+shard_twophase_parse(const void *recdata, uint32 len,
+					 ShardTwoPhasePayload *hdr, const char **pairs_base)
+{
+	const char *base = (const char *) recdata;
+
+	if (len >= offsetof(ShardTwoPhasePayload, pairs))
+	{
+		memcpy(hdr, base, offsetof(ShardTwoPhasePayload, pairs));
+		if (hdr->nxids >= 0 &&
+			len == offsetof(ShardTwoPhasePayload, pairs) +
+				   (Size) hdr->nxids * 2 * sizeof(uint32))
+		{
+			*pairs_base = base + offsetof(ShardTwoPhasePayload, pairs);
+			return true;
+		}
+	}
+	if (len >= offsetof(ShardTwoPhasePayloadV1, pairs))
+	{
+		ShardTwoPhasePayloadV1 v1;
+
+		memcpy(&v1, base, offsetof(ShardTwoPhasePayloadV1, pairs));
+		if (v1.nxids >= 0 &&
+			len == offsetof(ShardTwoPhasePayloadV1, pairs) +
+				   (Size) v1.nxids * 2 * sizeof(uint32))
+		{
+			hdr->gxid = v1.gxid;
+			hdr->start_ts = v1.start_ts;
+			hdr->coord_gsid = 0;
+			hdr->dtxid = 0;
+			hdr->nxids = v1.nxids;
+			*pairs_base = base + offsetof(ShardTwoPhasePayloadV1, pairs);
+			return true;
+		}
+	}
+	return false;
+}
 
 /*
  * StartPrepare 之后的注册点：PREPARED 落账（durable，投票持久前必须已
@@ -985,6 +1041,8 @@ shard_at_prepare_impl(void)
 	p = (ShardTwoPhasePayload *) palloc(sz);
 	p->gxid = gxid;
 	p->start_ts = sts;
+	p->coord_gsid = TsoCurrentCoordGsid();
+	p->dtxid = PartDistPendingDtxid();
 	p->nxids = xact_map_n;
 	for (i = 0; i < xact_map_n; i++)
 	{
@@ -992,6 +1050,14 @@ shard_at_prepare_impl(void)
 		p->pairs[2 * i + 1] = (uint32) xact_map[i].sxid;
 	}
 	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
+
+	/*
+	 * T4.5：未决登记（OPEN fsync 先于 EndPrepare 的 WAL 刷盘 ⇒
+	 * "prepared 存在 ⇒ 登记必在"）。判决落分片 clog 时才注销——
+	 * COMMIT PREPARED 不注销（终局等决议）。
+	 */
+	DtxPendingRegister(gxid, p->coord_gsid, p->dtxid, sts,
+					   xact_map_n, p->pairs);
 	pfree(p);
 }
 
@@ -1001,21 +1067,29 @@ shard_twophase_recover_impl(TransactionId xid, uint16 info,
 							void *recdata, uint32 len)
 {
 	ShardTwoPhasePayload hdr;
-	const char *base = (const char *) recdata;
+	const char *pairs_base;
+	uint32		pairs[2 * DTX_PENDING_MAX_PAIRS];
 	int			i;
 
-	if (len < offsetof(ShardTwoPhasePayload, pairs))
+	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
-	memcpy(&hdr, base, offsetof(ShardTwoPhasePayload, pairs));
 	for (i = 0; i < hdr.nxids; i++)
 	{
 		uint32		pv[2];
 
-		memcpy(pv, base + offsetof(ShardTwoPhasePayload, pairs) +
-			   (Size) i * 2 * sizeof(uint32), sizeof(pv));
+		memcpy(pv, pairs_base + (Size) i * 2 * sizeof(uint32), sizeof(pv));
 		ShardClogSetPrepared((Oid) pv[0], (TransactionId) pv[1],
 							 hdr.start_ts, hdr.gxid);
+		if (i < DTX_PENDING_MAX_PAIRS)
+		{
+			pairs[2 * i] = pv[0];
+			pairs[2 * i + 1] = pv[1];
+		}
 	}
+	/* T4.5：登记表兜底重建（日志重放通常已覆盖，缺了才补） */
+	if (hdr.nxids > 0 && hdr.nxids <= DTX_PENDING_MAX_PAIRS)
+		DtxPendingReRegister(hdr.gxid, hdr.coord_gsid, hdr.dtxid,
+							 hdr.start_ts, hdr.nxids, pairs);
 }
 
 /*
@@ -1036,20 +1110,20 @@ shard_twophase_postabort_impl(TransactionId xid, uint16 info,
 							  void *recdata, uint32 len)
 {
 	ShardTwoPhasePayload hdr;
-	const char *base = (const char *) recdata;
+	const char *pairs_base;
 	int			i;
 
-	if (len < offsetof(ShardTwoPhasePayload, pairs))
+	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
-	memcpy(&hdr, base, offsetof(ShardTwoPhasePayload, pairs));
 	for (i = 0; i < hdr.nxids; i++)
 	{
 		uint32		pv[2];
 
-		memcpy(pv, base + offsetof(ShardTwoPhasePayload, pairs) +
-			   (Size) i * 2 * sizeof(uint32), sizeof(pv));
+		memcpy(pv, pairs_base + (Size) i * 2 * sizeof(uint32), sizeof(pv));
 		ShardClogSetVerdict((Oid) pv[0], (TransactionId) pv[1], false, 0);
 	}
+	/* T4.5：中止即终局，注销未决登记 */
+	DtxPendingFinalized(hdr.gxid);
 }
 
 void
