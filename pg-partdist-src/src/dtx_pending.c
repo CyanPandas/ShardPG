@@ -697,6 +697,136 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 	return 0;
 }
 
+/* ---- T4.5②：决议主动广播（推送通道；拉取仍是兜底真相源） ---- */
+
+/*
+ * DtxBroadcastDecision — 决议多数派落盘后，把判决推给各参与节点。
+ *
+ * 语义（§3.3）：广播是**纯优化**——允许丢失、允许部分失败、绝不阻塞提交
+ * 路径的正确性。收不到的分片由读者问询/清扫拉取收敛（那条路已实测 1s 级）。
+ * 因此这里所有错误都吞掉：宁可少推一次，绝不让广播失败影响已提交事务。
+ *
+ * 收件人来自本节点的 partdist.dtx_participant（参与者自治登记的权威表）
+ * →节点地址经 node_map 解析；对每个节点调一次 dtx_apply_decision，
+ * 对端按 dtxid 找自己的未决登记、幂等落分片 clog（与清扫同一落账函数）。
+ * 由 pg_raft 决议点经 rendezvous "partdist_dtx_broadcast_fn" 调用。
+ */
+void
+DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
+{
+	char		sql[256];
+	char		hosts[16][NAMEDATALEN];
+	int			ports[16];
+	int			nnodes = 0;
+	int			i;
+
+	if (dtxid == 0 || (verdict != 1 && verdict != 2))
+		return;
+
+	/*
+	 * ★ SPI 必须在**任何**出口关闭：本函数跑在 dtx_write_decision 的提交
+	 * 路径上，SPI 泄漏会让宿主事务收尾时报 "transaction left non-empty SPI
+	 * stack"（实测目击）。SPI_execute 抛错时 SPI_finish 走不到——用
+	 * PG_TRY/PG_FINALLY 兜住；广播失败本就允许（拉取通道兜底）。
+	 */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return;
+	PG_TRY();
+	{
+		snprintf(sql, sizeof(sql),
+				 "SELECT DISTINCT n.hostname, n.port "
+				 "  FROM partdist.dtx_participant dp "
+				 "  JOIN partdist.shard_identity si "
+				 "    ON si.global_shard_id = ANY (dp.gsids) "
+				 "  JOIN partdist.partition_map pm "
+				 "    ON pm.partition_id = si.global_shard_id "
+				 "  JOIN partdist.node_map n ON n.node_id = pm.primary_node "
+				 " WHERE dp.dtxid = %lld", (long long) dtxid);
+		if (SPI_execute(sql, true, 0) == SPI_OK_SELECT)
+		{
+			int			np = (int) SPI_processed;
+
+			for (i = 0; i < np && nnodes < 16; i++)
+			{
+				bool		isnull;
+				char	   *h = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 1);
+				Datum		pd = SPI_getbinval(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2,
+											   &isnull);
+
+				if (h == NULL || isnull)
+					continue;
+				strlcpy(hosts[nnodes], h, NAMEDATALEN);
+				ports[nnodes] = DatumGetInt32(pd);
+				nnodes++;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		SPI_finish();
+	}
+	PG_END_TRY();
+
+	for (i = 0; i < nnodes; i++)
+	{
+		char		conninfo[256];
+		PGconn	   *conn;
+		PGresult   *res;
+
+		snprintf(conninfo, sizeof(conninfo),
+				 "host=%s port=%d dbname=postgres user=postgres "
+				 "connect_timeout=2 options='-c statement_timeout=2000'",
+				 hosts[i], ports[i]);
+		conn = PQconnectdb(conninfo);
+		if (PQstatus(conn) != CONNECTION_OK)
+		{
+			PQfinish(conn);
+			continue;			/* 推不到就算了，拉取通道兜底 */
+		}
+		snprintf(sql, sizeof(sql),
+				 "SELECT partdist.dtx_apply_decision(%lld, %d, %lld)",
+				 (long long) dtxid, verdict, (long long) commit_ts);
+		res = PQexec(conn, sql);
+		PQclear(res);
+		PQfinish(conn);
+	}
+}
+
+/*
+ * 广播的接收端：按 dtxid 找本节点未决登记，幂等落账（与清扫同一函数）。
+ * 找不到登记 = 本节点没参与 / 已收敛，返回 0；落账成功返回 1。
+ */
+PG_FUNCTION_INFO_V1(partdist_dtx_apply_decision);
+Datum
+partdist_dtx_apply_decision(PG_FUNCTION_ARGS)
+{
+	int64		dtxid = PG_GETARG_INT64(0);
+	int32		verdict = PG_GETARG_INT32(1);
+	int64		cts = PG_GETARG_INT64(2);
+	DtxPendingEntry snap[DTX_PENDING_MAX];
+	int			nsnap = 0;
+	int			ndone = 0;
+	int			i;
+
+	if (PendingCtl == NULL || dtxid == 0 || (verdict != 1 && verdict != 2))
+		PG_RETURN_INT32(0);
+
+	SpinLockAcquire(&PendingCtl->mutex);
+	for (i = 0; i < DTX_PENDING_MAX; i++)
+		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
+			snap[nsnap++] = PendingCtl->e[i];
+	SpinLockRelease(&PendingCtl->mutex);
+
+	for (i = 0; i < nsnap; i++)
+	{
+		dtx_pending_apply_verdict(&snap[i], verdict, cts);
+		ndone++;
+	}
+	PG_RETURN_INT32(ndone);
+}
+
 /* ---- 心跳工作者的自连触发（无 DB 语境，纯 libpq） ---- */
 
 void

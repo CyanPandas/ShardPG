@@ -571,6 +571,13 @@ _PG_init(void)
         *rv = (void *) DtxPendingContainsDtxid;
     }
 
+    /* T4.5②：决议主动广播（pg_raft 在决议达多数派后触发；推送是纯优化） */
+    {
+        void **rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
+
+        *rv = (void *) DtxBroadcastDecision;
+    }
+
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
     TsoRegisterHeartbeatWorker();   /* T3.5：GlobalSafeTs 心跳/续租 */

@@ -1074,3 +1074,13 @@ CREATE OR REPLACE FUNCTION dtx_pending_sweep()
 CREATE OR REPLACE FUNCTION dtx_pending_count()
     RETURNS integer LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_dtx_pending_count';
+
+-- T4.5②：决议广播的接收端。按 dtxid 找本节点未决登记并幂等落分片 clog，
+-- 返回落账笔数（0 = 本节点没参与 / 已收敛）。推送是优化，拉取（dtx_inquire
+-- / dtx_pending_sweep）仍是兜底真相源。
+CREATE OR REPLACE FUNCTION dtx_apply_decision(
+    p_dtxid bigint,
+    p_verdict integer,
+    p_commit_ts bigint
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_apply_decision';

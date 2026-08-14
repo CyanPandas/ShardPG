@@ -5681,6 +5681,34 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
     }
+
+    /*
+     * T4.5②：决议主动广播（§3.3）。**在提交点之后**触发，纯优化——推不到
+     * 的参与者由读者问询/清扫拉取收敛。实现在 pg_partdist（经 rendezvous
+     * "partdist_dtx_broadcast_fn"），失败一律吞掉，绝不影响已提交事务。
+     */
+    {
+        static void **bcast_rv = NULL;
+
+        if (bcast_rv == NULL)
+            bcast_rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
+        if (*bcast_rv != NULL)
+        {
+            void (*bcast) (int64, int, int64) =
+                (void (*) (int64, int, int64)) *bcast_rv;
+
+            PG_TRY();
+            {
+                bcast(dtxid, (int) verdict, (int64) commit_ts);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();  /* 广播是尽力而为，绝不打穿提交路径 */
+            }
+            PG_END_TRY();
+        }
+    }
+
     return plsn;
 }
 
