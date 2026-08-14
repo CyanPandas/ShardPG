@@ -203,6 +203,13 @@ shard_gating_active(ShardRelidsCfg *cfg)
 		(ShardXidCtl != NULL && ShardXidCtl->mvcc_n > 0);
 }
 
+/* T4.6：门控谓词的对外包装（shard_guard.c 用） */
+bool
+ShardGatingActive(void)
+{
+	return shard_gating_active(shard_relids_cfg);
+}
+
 /* 统一谓词：GUC 白名单（测试通道）∪ partition_map 登记（正道），取并集 */
 static bool
 shard_oid_is_mvcc(ShardRelidsCfg *cfg, Oid relid)

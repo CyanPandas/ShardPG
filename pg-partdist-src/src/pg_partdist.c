@@ -1,6 +1,7 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
 #include "dtx_pending.h"
+#include "shard_guard.h"
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -202,6 +203,13 @@ partdist_executor_start(QueryDesc *queryDesc, int eflags)
             }
         }
     }
+
+    /*
+     * T4.6/§9.2 第 3 层：禁用项拦截（rebalancer / move_shard_placement /
+     * undistribute / alter_distributed_table 等）。放在 routing check 之前，
+     * 无打标表时零成本返回。
+     */
+    ShardGuardCheckPlan(queryDesc->plannedstmt);
 
     /* Call the routing check in write_router.c */
     pg_partdist_executor_start(queryDesc, eflags);

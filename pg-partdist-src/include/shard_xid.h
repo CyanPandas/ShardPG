@@ -32,6 +32,9 @@
 /* 单事务最多触达的分片数（后端本地映射的上限） */
 #define SHARD_XID_MAX_PER_XACT	16
 
+/* T4.6：门控是否开着（GUC 白名单非空 或 有 partition_map 登记） */
+extern bool ShardGatingActive(void);
+
 /* 水位文件所在目录（$PGDATA 下） */
 #define SHARD_XID_DIR			"pg_shard_xid"
 

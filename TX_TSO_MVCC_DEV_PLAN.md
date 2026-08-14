@@ -1205,12 +1205,45 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   判空 → 全线假红），改用 PGOPTIONS 传会话参数。
 
 
-#### T4.6 §9.2 第 3 层分类处置落地
+#### T4.6 §9.2 第 3 层分类处置落地——✅ 已完成（2026-08-14，`src/shard_guard.c` + `tests/test_shard_gating_p4.sh` **20/0**）
 
 - **改**：禁用项拦截（rebalancer/move_shard_placement/undistribute/
   alter_distributed_table）；COPY 协调者 = 首行命中分片；ANALYZE 分叉覆盖
   确认用例；引用表按 V3 裁定（倾向建表后只读）。
 - **验收**：禁用项负向 + 放行项正向 + 安全网触发用例（§9.2 第 4 层门禁雏形）。
+- **实施记要（2026-08-14，验收 20/0）**：**禁用项拦截**落在
+  `src/shard_guard.c`：ExecutorStart 挂点扫顶层 Result 的 targetlist 与
+  RTE_FUNCTION 的函数表达式，命中禁用清单即 ERROR。判据用**函数名**而非
+  OID（Citus 升版本 OID 会变，名字是公开 API）；门控沿用
+  `ShardGatingActive()`（白名单 ∪ partition_map 登记），**无打标表时零成本
+  返回**，非本方案的库与既有基线完全不受影响。清单 7 项覆盖
+  rebalance_table_shards / citus_rebalance_start / citus_move_shard_placement
+  / citus_copy_shard_placement / undistribute_table /
+  citus_schema_undistribute / alter_distributed_table（同名多签名按名字天然
+  全覆盖）。**实测 6 条禁用项全部拦下，门控关闭时零介入**。
+  **真缺陷（首版引入、当场修复）**：walker 直接遍历 plan 树的
+  targetlist/qual → plan 节点里混着执行期专用类型 → `unrecognized node
+  type: 92`，**门控一开每条 SQL 都炸**（实测两个 worker 连 `SELECT 1` 都
+  起不来）；改为只对 TargetEntry->expr 与 RTE 的 funcexpr 递归，避开一切
+  plan 节点类型。
+  **验收边界裁定（本任务的关键认识）**：§9.2 第 3 层管的是"**语句准不准
+  执行**"，不是"提交后可不可见"。放行项的写在纯 Citus 2PC 路径上（无跨
+  分片决议流程）提交后判决落不进分片 clog，行不可见——这是 T4.5 决议链的
+  适用边界（其前提是"有决议可问"），不是 T4.6 的缺陷。故放行断言收敛为
+  "语句执行成功 + 事务内自读一致"，可见性收敛由
+  `test_dtx_convergence_p4.sh`（45/0）专项覆盖。该现象登记为 R-P4-10。
+  **其余腿**：安全网（第 1 层）strict + 无 ts 读分片表 ⇒ 响亮报错 ✓；
+  ANALYZE 分叉覆盖（T2.6 已解禁，读侧走 0008）✓；引用表现状核查 ——
+  本集群 **0 张引用表**，V3「建表后只读」裁定无现存反例 ✓。
+  **夹具坑账（本轮踩全）**：① `citus.shard_count` 本集群默认 32，多语句里
+  的 `SET` 未必落到 create 那一刻 → 改用 `create_distributed_table(...,
+  shard_count := 2)` 参数；② 白名单必须覆盖**全部分片节点 + 协调者**
+  （guard 跑在发起语句的节点上，coordinator 不开门控则禁用项照常执行）；
+  ③ `psql ... </dev/null <<'SQL'` 里 `</dev/null` **夺走 heredoc 的 stdin**，
+  psql 永远等不到输入 → 挂死 33 分钟；④ 被 kill 的轮次会留下 prepared 事务
+  持锁，令后续 DROP 永久等待 → 净场须先回滚遗留 prepared；⑤ 取号失败会让
+  join_info 变成含错误文本的非法值 → 事务**静默回滚**，表现为"COMMIT 成功
+  却无数据"——脚本已加"join 三元组合法性"前置断言。
 
 #### T4.7 P4 验收套件（出口门禁：崩溃矩阵逐格演练）
 
@@ -1281,6 +1314,15 @@ P3 增补（2026-08-13，T3.0 核查产出）：
    自洽，但 follower 增强 CLOG 由 MARKER 驱动，存在 [早值, 决议ts) 的副本早
    可见窗口。T4.5 广播以决议 ts 幂等重写参与分片判决时收口；收口前副本读
    一致性依赖该窗口不被跨越（惰性回放场景实测排期进 T4.7 矩阵）。
+8g. **R-P4-10 纯 Citus 2PC 写的判决落不了账**（2026-08-14 T4.6 验收实测
+   定性，属**适用边界**而非缺陷）：走 §3.3 决议流程的跨分片事务，判决由
+   决议广播/清扫/读者问询三通道收敛（T4.5 已 45/0 实证）；但**不经决议
+   流程**的写（纯 Citus 2PC，如 T4.6 放行项用例）没有决议可问，判决永远
+   落不进分片 clog，提交后行不可见，未决登记持续堆积（实测两分片各 4 笔）。
+   影响面：这类写在本方案语义下本就不该出现（§9.2 第 2 层要求所有分片写
+   经连接加入协议 + §3.3 决议）；处置方向 = 第 1 层安全网在 strict 模式下
+   已能拦住无 ts 写，P5 评估是否把"无决议流程的分片写"也纳入 fail-closed。
+   记此以免后人把"提交后读不到"误判为可见性缺陷。
 8f. **R-P4-9 已修复（2026-08-14 解冻批次 #3，验收 45/0）**：一个症状、
    **两处病灶**，前者长期藏在后者背后——
    (a) *守护闭合不落判决*：切主后阶段 3 标记的本地写被写栅栏拒（非 leader
