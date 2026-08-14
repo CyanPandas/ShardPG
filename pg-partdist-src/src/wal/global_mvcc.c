@@ -17,6 +17,10 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
+
+#include <fcntl.h>
+#include <unistd.h>
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -50,6 +54,54 @@ int partdist_node_id = -1;      /* GUC pg_partdist.node_id */
  * 走 systable 扫描而不是 SPI —— 调用方可能在 flush 路径（PRE_COMMIT）上，
  * 那里已经在一个事务里但不宜再开 SPI 连接。
  */
+/*
+ * groupid 的持久化侧影（T4.5②，R-P4-6 定谳产物）。
+ *
+ * 背景：demux 等**无 DB 连接**的 bgworker 在崩溃恢复扫描里逐条 append 时
+ * 会经 PartDistLocalNodeId() 走到这里；无连接进程的 catcache 是 NULL，
+ * get_relname_relid → SearchCatCache 直接 SIGSEGV → postmaster 整节点重置
+ * （实测 worker1 十二连崩，选举乱象全是它的下游）。
+ *
+ * 修法：backend 首次经 catalog 解析成功后把 groupid 写进
+ * $PGDATA/pg_partdist_groupid；无 DB 语境改读文件。**文件必在**的序论证：
+ * WAL 里能出现分片记录 ⇒ 必有 backend 在线捕获过 ⇒ 该 backend 已解析并
+ * 落盘 groupid。文件缺失 ⇒ 本节点从未有过分片写 ⇒ 恢复扫描不会命中任何
+ * 分片记录，兜底 -1（→节点号 0）不会被真实使用。
+ */
+static void
+partdist_groupid_persist(int32 gid)
+{
+    char        path[MAXPGPATH];
+    char        buf[16];
+    int         fd;
+
+    snprintf(path, sizeof(path), "%s/pg_partdist_groupid", DataDir);
+    fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+        return;                 /* 尽力而为：写不动下次再写 */
+    snprintf(buf, sizeof(buf), "%d\n", gid);
+    if (write(fd, buf, strlen(buf)) > 0)
+        (void) pg_fsync(fd);
+    close(fd);
+}
+
+static int32
+partdist_groupid_from_file(void)
+{
+    char        path[MAXPGPATH];
+    FILE       *fp;
+    int         v = -1;
+
+    snprintf(path, sizeof(path), "%s/pg_partdist_groupid", DataDir);
+    fp = AllocateFile(path, "r");
+    if (fp == NULL)
+        return -1;
+    if (fscanf(fp, "%d", &v) != 1)
+        v = -1;
+    FreeFile(fp);
+    return v;
+}
+
 static int32
 PartDistCitusGroupIdInternal(void)
 {
@@ -58,6 +110,13 @@ PartDistCitusGroupIdInternal(void)
 
     if (cached_group_id != -2)
         return cached_group_id;
+
+    /* 无 DB 连接（demux/纯 shmem worker）：绝不摸 catalog，读持久化侧影 */
+    if (!OidIsValid(MyDatabaseId))
+    {
+        cached_group_id = partdist_groupid_from_file();
+        return cached_group_id;
+    }
 
     oid = get_relname_relid("pg_dist_local_group", PG_CATALOG_NAMESPACE);
     if (!OidIsValid(oid))
@@ -93,6 +152,9 @@ PartDistCitusGroupIdInternal(void)
         cached_group_id = -1;
     }
     PG_END_TRY();
+
+    /* 解析成功即落盘侧影（含 -1："无 Citus 目录"也是稳定结论） */
+    partdist_groupid_persist(cached_group_id);
 
     return cached_group_id;
 }

@@ -1113,6 +1113,40 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   行可见，矩阵行 1 机制单场景闭环。[5] ABORT 学习、[6] 无决议不阻塞、
   [4] 心跳自动清扫多轮复绿。剩余红项集中于翻覆活跃期的 [3]/[6] 收敛时延
   与缓存任务后端 GUC 重载竞态（b=0 偶现）——随 R-P4-6 处置。
+- **实施记要·①收口（2026-08-14 第三轮，验收 40/43，三红同源 R-P4-7）**：
+  **R-P4-6 真凶改判**：不是选举翻覆——是 **demux 一次性恢复 worker 的
+  SIGSEGV→postmaster 整节点重置**（自装 backtrace 抓获完整栈：
+  DemuxCrashRecovery→ScanWALRangeForPartition→MakeGlobalXid(
+  **PartDistLocalNodeId**)→get_relname_relid→SearchCatCache(NULL 目录缓存)
+  ——无 DB 连接 worker 摸 catalog，T3.5 心跳工作者同类死法，潜伏于在线
+  捕获同源代码，被"残留注册逼出宽 WAL 扫描 ∧ 段内有打标记录"点爆，
+  worker1 十二连崩）。**产品修复：groupid 持久化侧影**
+  （$PGDATA/pg_partdist_groupid，backend 首次 catalog 解析成功即落盘，
+  无 DB 语境读文件；"WAL 有分片记录 ⇒ 必有 backend 先解析过 ⇒ 文件必在"
+  的序论证封死静默错号）。**第二产品修复：PREPARE 摘活跃表**——
+  XACT_EVENT_PREPARE 分支还带 T4.3 前旧注释直接丢弃 xact_map，
+  ShardCommitHash 条目不摘 → 持有者是 Citus 池化任务连接（可活极久）→
+  读者先命中活跃表即 RUNNING，决议收敛写进 clog 的 COMMITTED 被**永久
+  遮蔽**（实测池连接一退出行立即可见）——新增 ShardCommitRemove
+  （只摘不判，终局交决议收敛/postabort）。**第三修复：rebuild_shard_identity
+  v2**——v1 只加 WHERE 过滤，SQL 不保证 WHERE 先于 JOIN ON 求值，悬空行
+  仍先炸 shard_name()（worker 身份重建整体报废→dtx_coord_ctx"没有对应
+  分片"→决议全灭）——OFFSET 0 优化栅栏钉死先滤后 join。
+  **验收 40/43**：E2E 决议+读者③/清扫双通道 **1s 收敛**、自动清扫 4s、
+  ABORT 学习、无决议不阻塞、补决议 1s 收敛、kill -9 后登记双通道重建+
+  原生恢复+组切主全过；仅剩崩后决议三连红=**R-P4-7**。
+  **新风险 R-P4-7（解冻申请项）**：复制认领位被"活着但阻塞于对死 peer
+  的无超时 RPC"的持有者长持（探活回收只认死进程），崩后组内 prepare/
+  决议窒息 60s+（实测两笔"等待复制认领位超过 60000 ms"）——修法在
+  pg_raft（RPC 超时 + claim 等待联动 peer 死亡检测），与 #39 apply 认领
+  同构，待用户批准解冻；连同 R-P4-5（回执 ack 后移至 pending-finalize，
+  也涉 pg_raft 守护）建议并批。
+  **夹具坑续**：TSO boot 防呆删标记后必须**重启协调者**（shmem 拒绝态
+  只认重启解锁）；分布式 DROP 打标表死锁环（登记=pg_shard_xid 目录、
+  只有 DROP 成功才 GC、而分布式 DROP 走 2PC 被含-DROP 禁令拦 → 永锁；
+  测试解锁=逐节点本地 DROP 触发合法 GC；**T4.6 需给分布式 DROP 打标表
+  一条合法路径**）；MX 下 worker 也持逻辑表副本，本地清表要清全节点；
+  journal 残项须随 TRUNCATE 一起清（表清日志不清=残项复活）。
 
 #### T4.6 §9.2 第 3 层分类处置落地
 

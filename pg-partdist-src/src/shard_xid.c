@@ -767,7 +767,16 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			break;
 
 		case XACT_EVENT_PREPARE:
-			/* 有分片写/DROP 的事务在 PRE_PREPARE 已被拦，这里只会是空的 */
+			/*
+			 * T4.5：joined 分片写的 PREPARE（T4.3 起合法）在此把活跃表条目
+			 * **只摘不判**——此后"未决"由 clog PREPARED + 未决登记表承载，
+			 * 读者走 §4.2 三态。不摘的话：持有条目的是 Citus 池化任务连接
+			 * （可存活极久），读者先命中活跃表即返 RUNNING，决议收敛写进
+			 * clog 的 COMMITTED 被永久遮蔽（实测：池连接一退出行立即可见，
+			 * 正是本缺陷的指纹）。终局判决绝不在此预写。
+			 */
+			for (i = 0; i < xact_map_n; i++)
+				ShardCommitRemove(xact_map[i].shard, xact_map[i].sxid);
 			xact_map_n = 0;
 			ShardClogAtAbort();
 			TsoClientClearActive();

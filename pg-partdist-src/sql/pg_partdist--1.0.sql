@@ -394,14 +394,17 @@ BEGIN
            cls.relfilenode,
            cls.relname,
            s.logicalrelid
-    FROM pg_catalog.pg_dist_shard s
+    -- T4.5 加固 v2：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
+    -- shard_name() 直接抛错，整个身份重建报废。过滤必须**先于** JOIN 的
+    -- shard_name 求值——SQL 不保证 WHERE 先于 JOIN ON，故用 OFFSET 0
+    -- 优化栅栏把过滤钉死在子查询里（v1 只加 WHERE，实测 planner 仍先
+    -- 求值 shard_name 而炸，worker 上身份重建整体报废）。
+    FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
+           WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
+           OFFSET 0) s
     JOIN pg_catalog.pg_class cls
       ON cls.oid = pg_catalog.to_regclass(
                        pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
-    -- T4.5 加固：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
-    -- shard_name() 直接抛错，整个身份重建报废——先滤掉（脏元数据不应
-    -- 波及无关分片的身份映射）。
-    WHERE s.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
     ON CONFLICT (global_shard_id) DO UPDATE
        SET local_oid     = EXCLUDED.local_oid,
            relfilenode   = EXCLUDED.relfilenode,

@@ -718,6 +718,27 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 	LWLockRelease(ShardCommitLock);
 }
 
+/*
+ * ShardCommitRemove — 只摘活跃表条目，不写任何判决（T4.5）。
+ *
+ * 用于 PREPARE：此后"未决"由 clog PREPARED + 未决登记表承载（读者走
+ * §4.2 三态），活跃表只管本地 RUNNING。终局判决交给决议收敛/postabort，
+ * 绝不在这里预写。条目缺失静默——PREPARE 前崩溃恢复等路径可能已清。
+ */
+void
+ShardCommitRemove(Oid shard, TransactionId sxid)
+{
+	ShardCommitKey key;
+
+	if (ShardCommitHash == NULL)
+		return;
+	key.shard = shard;
+	key.sxid = sxid;
+	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+	(void) hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
+	LWLockRelease(ShardCommitLock);
+}
+
 /* ---- 接线 ---- */
 
 void

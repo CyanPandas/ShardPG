@@ -37,6 +37,7 @@ extern void ShardVisibilityInstallHooks(void);
 
 /* 领号时调用（T1.2 分配路径）：先落 clog RUNNING 账，再进活跃表；
  * 任一步失败领号作废（fail-closed，跳号无害） */
+extern void ShardCommitRemove(Oid shard, TransactionId sxid);
 extern void ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 									   TransactionId native_xid);
 
