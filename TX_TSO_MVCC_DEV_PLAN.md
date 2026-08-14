@@ -1165,6 +1165,27 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   错位；另有组建立期选举竞态偶发（20s 就位窗）。**待核尾巴（T4.5② 首查）**：
   守护闭合走 tx 通道（postcommit 不写终局）时，pending 注销与 clog 判决
   落账的先后需逐帧核一次——若注销先于判决落账实锤，即孤儿窗口回归。
+- **实施记要·②决议主动广播（2026-08-14）**：**待核尾巴已结清**——四条
+  注销路径逐条核完（apply_verdict 内先 SetVerdict 后 Finalized；自愈支；
+  postabort 先写 ABORTED 后注销），**无一在判决落账之前注销**，孤儿窗口
+  未回归。**广播落地**：实现放 pg-partdist（`DtxBroadcastDecision`，
+  避免再扩 pg_raft 触碰面），pg_raft 在 `dtx_write_decision` 的**提交点
+  之后**经 rendezvous `partdist_dtx_broadcast_fn` 触发一次，PG_TRY 吞掉
+  一切失败（广播是纯优化，§3.3 允许丢失，拉取仍是兜底真相源）；收件人
+  由 dtx_participant→shard_identity→partition_map→node_map 解析，对端
+  `partdist.dtx_apply_decision(dtxid,verdict,cts)` 按 dtxid 找本节点未决
+  登记、走与清扫同一落账函数幂等落分片 clog。**实证**：新增两条断言
+  "决议返回后零拉取即收敛"首发即绿，A/B 两侧 1–3s 清空登记（run21/22/23
+  连续复现）；峰值 42/45。**真缺陷（广播引入并当场修复）**：广播的 SPI
+  在 `SPI_execute` 抛错路径上不关闭 → 宿主事务收尾报 "transaction left
+  non-empty SPI stack"（提交路径上的泄漏，实测目击）——改 PG_TRY/
+  PG_FINALLY 兜底。**验收语义再对齐**：广播上线后收敛快于断言读数，
+  "登记未决"类瞬时计数断言全部改判为"登记过 ∨ 已收敛"，崩溃腿的重建
+  证据改读 "未决 2PC 日志重放：N 条待收敛" 日志行（实测重放与收敛相隔
+  0.4s，瞬时计数必然读空）。**环境侧发现**：`invalid max offset number`
+  PANIC 首现于本轮改动之前（回放器吃残留 fileset 旧字节），与广播无关；
+  夹具残留（parwal/shard_xid/shard_clog 目录 + 组槽）是崩溃与选举乱象的
+  共同放大器——已加入深度清场流程。
 
 #### T4.6 §9.2 第 3 层分类处置落地
 
