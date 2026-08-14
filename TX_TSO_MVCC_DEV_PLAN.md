@@ -1147,6 +1147,24 @@ T4.7 崩溃矩阵/门禁套件与 T4.3 起并行开发
   测试解锁=逐节点本地 DROP 触发合法 GC；**T4.6 需给分布式 DROP 打标表
   一条合法路径**）；MX 下 worker 也持逻辑表副本，本地清表要清全节点；
   journal 残项须随 TRUNCATE 一起清（表清日志不清=残项复活）。
+- **实施记要·解冻批次 #2（2026-08-14 用户批准，R-P4-7 + R-P4-5，
+  dd78c4e）**：**R-P4-7 有界 RPC**：新增 pq_exec_bounded /
+  pq_exec_params_bounded（异步发送 + 100ms select 轮询 + 5s 截止；排空
+  半途超时同判失败；超时连接挂着在途查询必弃用重连），换装复制认领临界
+  区内三处（send_sql_rpc / peer_last_log_index / send_install_snapshot）。
+  **实证（run17，41/43）**：崩溃腿全绿——kill -9 后现任 leader 决议写入、
+  清扫 1s 收敛、行可见，"等待复制认领位超过 60000 ms"绝迹。
+  **R-P4-5 回执后移**：dtx_ack_sweep 每行先经 rendezvous
+  "partdist_dtx_pending_check_fn" 问 pg_partdist 未决登记，该 dtxid 本节点
+  TX2 clog 收敛未完成则跳过本轮回执（遗留模式登记恒空、行为逐字节不变）；
+  pg-partdist 侧桥 = DtxPendingContainsDtxid。**自愈二**：登记项 pairs 的
+  分片表已整体不存在（DROP 后 clog 目录残留）⇒ 判残渣注销（全部 oid 查无
+  relation 才动手）。**run18/19 残红定性（非产品缺陷）**：崩后 30s 窗口
+  pg_raft 恢复守护自治接管测试的手工 prepared（问到决议→COMMIT PREPARED→
+  闭合——正是矩阵行 1 的正确系统行为），测试脚本与守护赛跑输掉致断言
+  错位；另有组建立期选举竞态偶发（20s 就位窗）。**待核尾巴（T4.5② 首查）**：
+  守护闭合走 tx 通道（postcommit 不写终局）时，pending 注销与 clog 判决
+  落账的先后需逐帧核一次——若注销先于判决落账实锤，即孤儿窗口回归。
 
 #### T4.6 §9.2 第 3 层分类处置落地
 
