@@ -44,6 +44,7 @@ extern void DtxPendingReRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 extern void DtxPendingFinalized(int64 gxid);
 extern bool DtxPendingLookup(int64 gxid, DtxPendingEntry *out);
 extern int	DtxPendingCount(void);
+extern bool DtxPendingContainsDtxid(int64 dtxid);	/* R-P4-5 回执门 */
 
 /* 清扫核心（需要 backend 语境：SPI + libpq）；返回本轮注销数 */
 extern int	DtxPendingSweep(void);

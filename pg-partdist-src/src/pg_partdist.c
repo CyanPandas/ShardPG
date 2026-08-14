@@ -1,5 +1,6 @@
 #include "pg_partdist.h"
 #include "metadata_cache.h"
+#include "dtx_pending.h"
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -561,6 +562,13 @@ _PG_init(void)
         void **rv = find_rendezvous_variable("partdist_tso_dtx_decision_ts_fn");
 
         *rv = (void *) PartDistTsoDtxDecisionTs;
+    }
+
+    /* R-P4-5：pg_raft 回执守护经此询问 TX2 未决登记，收敛完才许回执 */
+    {
+        void **rv = find_rendezvous_variable("partdist_dtx_pending_check_fn");
+
+        *rv = (void *) DtxPendingContainsDtxid;
     }
 
     /* Register Demux background worker for crash recovery at startup */

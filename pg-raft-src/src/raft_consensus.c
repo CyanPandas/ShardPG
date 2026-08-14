@@ -45,6 +45,8 @@
 #include "utils/timestamp.h"
 #include "utils/guc.h"               /* application_name：MX 闸门（T4.4） */
 
+#include <sys/select.h>              /* R-P4-7：有界 RPC 的 select 轮询 */
+
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -2548,6 +2550,87 @@ peer_conn_get(RaftPeer *p)
     return peer_conn[slot];
 }
 
+/*
+ * R-P4-7（2026-08-14 解冻批次 #2）：有界 RPC 执行。
+ *
+ * PQexec 对"活着但不应答"的对端（半死、恢复中假接受、网络黑洞）可阻塞
+ * 到分钟级；持有复制认领位的 backend 卡在这里，整组 prepare/决议随之窒息
+ * （崩溃矩阵行 1 实测：两笔"等待复制认领位超过 60000 ms"）。异步发送 +
+ * 100ms 粒度轮询截止：超时返回 NULL，调用方按 RPC 失败处置并**重置缓存
+ * 连接**（连接上还挂着在途查询，绝不可复用）。CHECK_FOR_INTERRUPTS 保持
+ * 可打断——从 ERROR 出去时调用链的 PG_FINALLY 会归还认领位。
+ */
+#define RAFT_RPC_EXEC_TIMEOUT_MS 5000
+
+static bool
+pq_wait_ready_bounded(PGconn *conn, TimestampTz start, int timeout_ms)
+{
+    while (PQisBusy(conn))
+    {
+        int         sock = PQsocket(conn);
+        fd_set      rf;
+        struct timeval tv;
+
+        if (sock < 0 ||
+            TimestampDifferenceExceeds(start, GetCurrentTimestamp(),
+                                       timeout_ms))
+            return false;
+        FD_ZERO(&rf);
+        FD_SET(sock, &rf);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100 * 1000;
+        (void) select(sock + 1, &rf, NULL, NULL, &tv);
+        CHECK_FOR_INTERRUPTS();
+        if (!PQconsumeInput(conn))
+            return false;
+    }
+    return true;
+}
+
+static PGresult *
+pq_result_bounded(PGconn *conn, TimestampTz start, int timeout_ms)
+{
+    PGresult   *first;
+    PGresult   *r;
+
+    if (!pq_wait_ready_bounded(conn, start, timeout_ms))
+        return NULL;
+    first = PQgetResult(conn);
+    for (;;)                    /* 排空到 NULL；排空半途超时也作失败 */
+    {
+        if (!pq_wait_ready_bounded(conn, start, timeout_ms))
+        {
+            if (first)
+                PQclear(first);
+            return NULL;
+        }
+        r = PQgetResult(conn);
+        if (r == NULL)
+            break;
+        PQclear(r);
+    }
+    return first;
+}
+
+static PGresult *
+pq_exec_bounded(PGconn *conn, const char *sql)
+{
+    if (!PQsendQuery(conn, sql))
+        return NULL;
+    return pq_result_bounded(conn, GetCurrentTimestamp(),
+                             RAFT_RPC_EXEC_TIMEOUT_MS);
+}
+
+static PGresult *
+pq_exec_params_bounded(PGconn *conn, const char *sql, int nparams,
+                       const char *const *values)
+{
+    if (!PQsendQueryParams(conn, sql, nparams, NULL, values, NULL, NULL, 0))
+        return NULL;
+    return pq_result_bounded(conn, GetCurrentTimestamp(),
+                             RAFT_RPC_EXEC_TIMEOUT_MS);
+}
+
 static bool
 send_sql_rpc(RaftPeer *p, const char *sql, bool honor_backoff,
              int64 *resp_term, int *resp_flag)
@@ -2570,7 +2653,14 @@ send_sql_rpc(RaftPeer *p, const char *sql, bool honor_backoff,
         return false;
     }
 
-    res = PQexec(conn, sql);
+    res = pq_exec_bounded(conn, sql);
+    if (res == NULL)
+    {
+        /* 超时/坏连接：在途查询挂在连接上，必须弃用重连 */
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return false;
+    }
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
         ok = parse_resp2(PQgetvalue(res, 0, 0), resp_term, resp_flag);
     else if (PQstatus(conn) != CONNECTION_OK)
@@ -2622,7 +2712,13 @@ peer_last_log_index(RaftGroupCtx *ctx, RaftPeer *p)
              "WHERE group_id = %lld",
              (long long) ctx->group_id);
 
-    res = PQexec(conn, sql);
+    res = pq_exec_bounded(conn, sql);
+    if (res == NULL)
+    {
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return -1;
+    }
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
         !PQgetisnull(res, 0, 0))
         val = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
@@ -2723,10 +2819,16 @@ send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx
     params[4] = node_map;
     params[5] = partition_map;
 
-    res = PQexecParams(conn,
+    res = pq_exec_params_bounded(conn,
                        "SELECT partdist.pg_raft_install_snapshot("
                        "$1::bigint, $2::int, $3::bigint, $4::bigint, $5::text, $6::text)",
-                       6, NULL, params, NULL, NULL, 0);
+                       6, params);
+    if (res == NULL)
+    {
+        peer_conn_reset(peer_slot_of(p));
+        peer_mark_result(p, false);
+        return false;
+    }
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
         sent = parse_resp2(PQgetvalue(res, 0, 0), &rt, &ok_flag);
     else if (PQstatus(conn) != CONNECTION_OK)
@@ -6533,6 +6635,7 @@ dtx_ack_sweep(void)
     long long     *dtxids = NULL;
     long long     *coords = NULL;
     char         **gsids_txt = NULL;
+    bool         (*dtx_pending_check)(int64) = NULL;
 
     if (!raft_persist_spi_begin(&spi_owned))
         return;
@@ -6569,6 +6672,22 @@ dtx_ack_sweep(void)
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 
+    /*
+     * R-P4-5（2026-08-14 解冻批次 #2）：回执后移。tx 时代的闭合判据是
+     * "原生 prepared 已不在"，但 TX2 的分片 clog 终局要靠决议收敛——
+     * 回执→FORGET 抢在收敛之前会把决议提前遗忘（实测目击）。经 rendezvous
+     * 问 pg_partdist 的未决登记：该 dtxid 在本节点还挂着就跳过本轮回执。
+     * 未装 pg_partdist / 遗留模式（登记恒空）行为与从前逐字节一致。
+     */
+    {
+        static bool (**dtx_pending_check_rv)(int64) = NULL;
+
+        if (dtx_pending_check_rv == NULL)
+            dtx_pending_check_rv = (bool (**)(int64))
+                find_rendezvous_variable("partdist_dtx_pending_check_fn");
+        dtx_pending_check = *dtx_pending_check_rv;
+    }
+
     for (i = 0; i < n; i++)
     {
         int       coord_node = 0;
@@ -6579,6 +6698,9 @@ dtx_ack_sweep(void)
         PGconn   *conn;
         PGresult *res;
         bool      acked_ok = false;
+
+        if (dtx_pending_check != NULL && dtx_pending_check(dtxids[i]))
+            continue;       /* R-P4-5：本节点 TX2 收敛未完成，回执后移 */
 
         if (dtxids[i] <= 0 || coords[i] <= 0 ||
             gids[i] == NULL || gsids_txt[i] == NULL)

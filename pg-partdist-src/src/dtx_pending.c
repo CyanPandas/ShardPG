@@ -334,6 +334,26 @@ DtxPendingLookup(int64 gxid, DtxPendingEntry *out)
 	return found;
 }
 
+/* R-P4-5：pg_raft 回执门经 rendezvous 调用——该 dtxid 是否仍有未决登记 */
+bool
+DtxPendingContainsDtxid(int64 dtxid)
+{
+	bool		found = false;
+	int			i;
+
+	if (dtxid == 0 || PendingCtl == NULL)
+		return false;
+	SpinLockAcquire(&PendingCtl->mutex);
+	for (i = 0; i < DTX_PENDING_MAX; i++)
+		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
+		{
+			found = true;
+			break;
+		}
+	SpinLockRelease(&PendingCtl->mutex);
+	return found;
+}
+
 int
 DtxPendingCount(void)
 {
@@ -493,9 +513,15 @@ DtxPendingSweep(void)
 		}
 
 		/*
-		 * 自愈：pairs 里已无任何 PREPARED 槽 ⇒ 终局已由别的通道写过
+		 * 自愈一：pairs 里已无任何 PREPARED 槽 ⇒ 终局已由别的通道写过
 		 * （postabort、或人为清理），登记是残渣——注销。活的 prepared
 		 * 事务必然带着 PREPARED 槽（at-prepare 同刻写入），不会误伤。
+		 *
+		 * 自愈二（2026-08-14 实测边界）：槽还是 PREPARED，但 pairs 的分片
+		 * 表已整体不存在（表被 DROP 而 clog 目录残留——白名单撤除后 DROP
+		 * 不走 RememberDrop GC 的路径）⇒ 数据都没了，终局无意义，同样是
+		 * 残渣。判据取"全部 pairs 的 shard oid 均查无 relation"，任一存在
+		 * 即不动（绝不误杀活账）。
 		 */
 		{
 			bool		any_prepared = false;
@@ -510,6 +536,28 @@ DtxPendingSweep(void)
 					any_prepared = true;
 					break;
 				}
+			}
+			if (any_prepared && SPI_connect() == SPI_OK_CONNECT)
+			{
+				bool		any_rel = false;
+
+				for (j = 0; j < snap[i].nxids; j++)
+				{
+					char		q[96];
+
+					snprintf(q, sizeof(q),
+							 "SELECT 1 FROM pg_catalog.pg_class WHERE oid = %u",
+							 (unsigned) snap[i].pairs[2 * j]);
+					if (SPI_execute(q, true, 1) == SPI_OK_SELECT &&
+						SPI_processed > 0)
+					{
+						any_rel = true;
+						break;
+					}
+				}
+				SPI_finish();
+				if (!any_rel)
+					any_prepared = false;	/* 表全没了：按残渣注销 */
 			}
 			if (!any_prepared)
 			{
