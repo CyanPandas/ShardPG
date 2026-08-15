@@ -1045,14 +1045,31 @@ LANGUAGE sql VOLATILE AS $fn$
     -- 正是尚未 apply 该决议的成员（决议在多数派上、选举合法），不追平就
     -- 读本地表 ⇒ 谁都问不到判决（实测 90s 不收敛）。drain 幂等、非 leader
     -- 或无该组时返回 -1，不影响下面的门控语义。
+    -- R-P4-13 绕行：本地行缺失时向组内其他成员只读拉取（决议在多数派上是
+    -- 确定事实；只读、不写推定中止、不改"决议一次性"语义）。拉到即幂等补
+    -- 进本地表，下次无需再远程问。
     WITH drained AS (
         SELECT partdist.pg_raft_group_drain_apply(p_coord_gsid) AS applied
+    ), gate AS (
+        SELECT EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
+                        WHERE s.group_id = p_coord_gsid AND s.state = 'leader') AS is_leader
+    ), local_row AS (
+        SELECT d.verdict::integer AS verdict, d.commit_ts::bigint AS commit_ts
+          FROM drained, gate, partdist.dtx_decision d
+         WHERE d.dtxid = p_dtxid AND gate.is_leader
+    ), peer_row AS (
+        SELECT pd.verdict, d2.commit_ts::bigint AS commit_ts
+          FROM gate,
+               LATERAL (SELECT partdist.pg_raft_group_peer_decision(
+                                   p_coord_gsid, p_dtxid) AS verdict) pd
+          LEFT JOIN partdist.dtx_decision d2 ON d2.dtxid = p_dtxid
+         WHERE gate.is_leader
+           AND NOT EXISTS (SELECT 1 FROM local_row)
+           AND pd.verdict IN (1, 2)
     )
-    SELECT d.verdict::integer, d.commit_ts::bigint
-      FROM drained, partdist.dtx_decision d
-     WHERE d.dtxid = p_dtxid
-       AND EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
-                    WHERE s.group_id = p_coord_gsid AND s.state = 'leader')
+    SELECT verdict, commit_ts FROM local_row
+    UNION ALL
+    SELECT verdict, coalesce(commit_ts, 0) FROM peer_row
 $fn$;
 
 COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS

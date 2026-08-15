@@ -5928,6 +5928,108 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
  *
  * 由 dtx_peek 在读表**之前**调用：应答前先把自己追平，答案才是权威的。
  */
+/*
+ * pg_raft_group_peer_decision(group_id, dtxid) → int（verdict，0=未知）
+ *
+ * R-P4-13 绕行（2026-08-15）：本地决议行缺失时，向**组内其他成员**只读拉取
+ * 该决议的 verdict/commit_ts。
+ *
+ * 背景：决议条目在多数派上、日志游标也全 applied，但个别成员的本地
+ * partdist.dtx_decision 仍可能缺行（R-P4-13，apply 侧未走 DTX 登记分支，
+ * 根因待查）。此时若它恰好当选 leader，dtx_peek 的 leader 门控只认本地表
+ * ⇒ 无人可答。既然决议本身在多数派上是**确定的事实**，就直接去问成员 ——
+ * 这不改变正确性边界（只读、不写推定中止、不改变"决议一次性"语义），
+ * 只是把"本地有没有那一行"从可用性的单点依赖上摘掉。
+ *
+ * 只读远端 partdist.dtx_decision（不调 dtx_peek，避免递归与 leader 门控）。
+ * 任一成员答出 1/2 即返回；全部不可达或都没有该行则返回 0。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_peer_decision);
+
+Datum
+pg_raft_group_peer_decision(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    int64        dtxid = PG_GETARG_INT64(1);
+    RaftGroupCtx ctx;
+    int          verdict = 0;
+    int64        cts = 0;
+    int          i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL || dtxid == 0)
+        PG_RETURN_INT32(0);
+
+    parse_peers();
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_INT32(0);
+    if (!group_resolve_membership(&ctx))
+        PG_RETURN_INT32(0);
+
+    for (i = 0; i < n_peers && verdict == 0; i++)
+    {
+        char        conninfo[256];
+        char        qry[192];
+        PGconn     *conn;
+        PGresult   *res;
+
+        if (!peer_in_group(&ctx, i))
+            continue;
+        if (peers[i].node_id == pg_raft_node_id)
+            continue;           /* 本地已经查过了，调用方才来问的 */
+
+        pg_raft_format_conninfo(peers[i].host, peers[i].port,
+                                conninfo, sizeof(conninfo));
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            PQfinish(conn);
+            continue;           /* 不可达就问下一个 */
+        }
+        snprintf(qry, sizeof(qry),
+                 "SELECT verdict, commit_ts FROM partdist.dtx_decision "
+                 " WHERE dtxid = %lld", (long long) dtxid);
+        res = PQexec(conn, qry);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+            !PQgetisnull(res, 0, 0))
+        {
+            verdict = atoi(PQgetvalue(res, 0, 0));
+            if (!PQgetisnull(res, 0, 1))
+                cts = strtoll(PQgetvalue(res, 0, 1), NULL, 10);
+        }
+        PQclear(res);
+        PQfinish(conn);
+    }
+
+    if (verdict != 1 && verdict != 2)
+        PG_RETURN_INT32(0);
+
+    /*
+     * 顺带把学到的决议补进本地表（幂等、ON CONFLICT DO NOTHING）——
+     * 下次就不必再远程问一趟。失败不影响返回值。
+     */
+    {
+        StringInfoData sql;
+        bool           spi_owned;
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "INSERT INTO partdist.dtx_decision"
+                             "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                             "VALUES (%lld, %lld, %d, %lld, '{}'::bigint[], 0) "
+                             "ON CONFLICT (dtxid) DO NOTHING",
+                             (long long) dtxid, (long long) group_id,
+                             verdict, (long long) cts);
+            (void) SPI_execute(sql.data, false, 0);
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+        }
+    }
+
+    PG_RETURN_INT32(verdict);
+}
+
 PG_FUNCTION_INFO_V1(pg_raft_group_drain_apply);
 
 Datum

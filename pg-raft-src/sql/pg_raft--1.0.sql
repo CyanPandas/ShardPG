@@ -143,6 +143,11 @@ COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
 
 -- R-P4-12：把本节点该组的 apply 积压排空（leader 自追平），返回 last_applied。
 -- dtx_peek 在读表前调它——新 leader 可能尚未 apply 决议，先追平再应答。
+-- R-P4-13 绕行：本地决议行缺失时，向组内其他成员只读拉取该决议。
+CREATE OR REPLACE FUNCTION pg_raft_group_peer_decision(p_group_id bigint, p_dtxid bigint)
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_peer_decision';
+
 CREATE OR REPLACE FUNCTION pg_raft_group_drain_apply(p_group_id bigint)
     RETURNS bigint LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_drain_apply';
