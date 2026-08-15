@@ -7828,6 +7828,8 @@ dtx_master_pre_record_commit(void)
     int             verdict = 0;
     int64           dtx_cts = 0;
 
+    elog(LOG, "pg_raft: [R11] 挂钩已进入 raft=%d dtx2pc=%d",
+         pg_raft_raft_enabled ? 1 : 0, pg_raft_dtx_2pc_enabled ? 1 : 0);
     if (!pg_raft_raft_enabled || !pg_raft_dtx_2pc_enabled)
         return;
     /*
