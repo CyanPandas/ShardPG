@@ -557,7 +557,7 @@ if [[ "${ans%%:*}" != "ok" ]]; then
   echo "  ---- M4 诊断 ----"
   echo "    被杀 leader=:$lp  组=$gid_a  dtxid=$DTX4"
   for cand in $pport_a $f1_a $f2_a; do
-    echo "    :$cand 存活=$(PSQL $cand -Atc 'SELECT 1' </dev/null 2>/dev/null | tail -1) 组状态=$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1) 决议行=$(PSQL $cand -Atc "SELECT verdict FROM partdist.dtx_decision WHERE dtxid=${DTX4}" </dev/null 2>/dev/null | tail -1)"
+    echo "    :$cand 存活=$(PSQL $cand -Atc 'SELECT 1' </dev/null 2>/dev/null | tail -1) 组状态=$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1) 决议行=$(PSQL $cand -Atc "SELECT verdict FROM partdist.dtx_decision WHERE dtxid=${DTX4}" </dev/null 2>/dev/null | tail -1) 日志=$(PSQL $cand -Atc "SELECT last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1) drain=$(PSQL $cand -Atc "SELECT partdist.pg_raft_group_drain_apply(${gid_a}::bigint)" </dev/null 2>/dev/null | tail -1)"
   done
 fi
 PSQL $pport_a -q -c "COMMIT PREPARED 'citus_9_777_302_0';" </dev/null >/dev/null 2>&1

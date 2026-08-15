@@ -199,6 +199,47 @@ ShardReplayLoadLocMap(ShardReplayCtx *ctx)
             ctx->local_locs[ctx->nlocal++] = lm.pairs[i].local_loc;
     }
 
+    /*
+     * ★ R-P4-8（2026-08-15 修）：本地文件必须**实际存在**才认领。
+     *
+     * locmap 有效不等于目标还在：表被 DROP 后 locmap 文件仍躺在
+     * pg_parwal/<shard>/ 里（清理只删表，不删回放侧的配对），回放器照旧
+     * 认领、从游标 0 起重放，读到已删/被截断的页面直接
+     * `PANIC: invalid max offset number` —— PANIC 不可捕获，回放本体的
+     * PG_TRY 拦不住，于是**整节点重置 → 再选举 → 再认领 → 再 PANIC**，
+     * 反复自噬（实测 worker3/4 单轮各 16–18 次，term 21→23）。
+     *
+     * 判据取"主堆（role=0）的本地文件存在"：主堆没了就是表没了，索引/TOAST
+     * 的缺失由后续 redo 自行处置（它们本就允许延迟建立）。用 smgrexists
+     * 而非 catalog 查询 —— 回放 worker 无 DB 连接，摸 catalog 会 SIGSEGV
+     * （R-P4-6 的教训）。
+     */
+    for (i = 0; i < lm.npairs; i++)
+    {
+        SMgrRelation smgr;
+
+        if (lm.pairs[i].role != SHARD_REL_MAIN)
+            continue;
+
+        smgr = smgropen(lm.pairs[i].local_loc, InvalidBackendId);
+        if (!smgrexists(smgr, MAIN_FORKNUM))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_partdist replay: shard %u 的本地主堆文件已不存在"
+                            "（relNumber=%u），拒绝认领",
+                            ctx->shard_oid,
+                            (unsigned) lm.pairs[i].local_loc.relNumber),
+                     errdetail("表多半已被 DROP 而 locmap 残留；继续回放会读到"
+                               "已删页面并触发不可捕获的 PANIC（R-P4-8）。"),
+                     errhint("清理该 shard 的 pg_parwal 目录，或重跑 "
+                             "replay_set_locmap() 重新配对。")));
+            hash_destroy(ctx->loc_map);
+            ctx->loc_map = NULL;
+            ctx->nlocal = 0;
+            return false;       /* 调用方按"无有效 locmap"解除 armed */
+        }
+    }
+
     return true;
 }
 
@@ -497,6 +538,41 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 
     REPLAY_TRACE("TRACE data: rm_redo plsn=%llu rmid=%u",
                  (unsigned long long) hdr->partition_lsn, record->xl_rmid);
+
+    /*
+     * ★ R-P4-8 运行时守卫（2026-08-15）：redo 之前确认目标文件还在。
+     *
+     * 认领时的 locmap 校验只查一次；**表可以在认领之后被 DROP**（验收清理
+     * 就这么干），此后每条记录都会 redo 到已删文件上 →
+     * `PANIC: invalid max offset number` → 不可捕获 → 整节点重置 → 再选举
+     * → 再认领 → 再 PANIC，反复自噬。故必须逐条守。
+     *
+     * 目标不存在时**跳过该条**（返回让调用方推进游标）：数据都没了，重放
+     * 无意义；继续往下反而是唯一会炸的路。smgrexists 走本地文件系统，
+     * 无 catalog 依赖（回放 worker 无 DB 连接，R-P4-6 的教训）。
+     */
+    for (id = 0; id <= decoded->max_block_id; id++)
+    {
+        DecodedBkpBlock *blk = &decoded->blocks[id];
+        SMgrRelation     smgr;
+
+        if (!blk->in_use)
+            continue;
+        smgr = smgropen(blk->rlocator, InvalidBackendId);
+        if (!smgrexists(smgr, blk->forknum))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_partdist replay: 目标文件已不存在，跳过该记录"
+                            "（shard %u，plsn=%llu，relNumber=%u fork=%d）",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            (unsigned) blk->rlocator.relNumber,
+                            (int) blk->forknum),
+                     errdetail("表多半在认领之后被 DROP；继续 redo 会触发"
+                               "不可捕获的 PANIC（R-P4-8）。")));
+            return;             /* 跳过本条，游标由调用方推进 */
+        }
+    }
 
     /* 4) 派发原生 redo */
     GetRmgr(record->xl_rmid).rm_redo(ctx->reader);
