@@ -636,6 +636,10 @@ SELECT 'prepared';
 SQL
 )
 check "Q 前置：in-doubt 就位" "$(echo "$pq" | tail -1)" "prepared"
+# ★ 手工 prepared 必须补 note_coord（M3 腿有、Q 腿首版漏了）：清扫/问询
+#   靠 dtx_participant.coord_gsid 寻址协调组，缺它就无从问判决——表现为
+#   决议明明写了、Q3 却永不收敛（60s + 主动 drain 都救不回来）。
+PSQL $pport_a -q -c "SELECT partdist.dtx_note_coord(${DTXQ}, ${gid_a});" </dev/null >/dev/null 2>&1
 t0=$(date +%s)
 qv=$(PSQL $pport_a -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
 t1=$(date +%s)
@@ -648,8 +652,14 @@ check "Q3 前置：决议写入" "$rq" "1"
 PSQL $pport_a -q -c "COMMIT PREPARED 'citus_9_777_303_0';" </dev/null >/dev/null 2>&1
 # 取值用 PSQLV（PGOPTIONS 传可见性参数）——"SET …; SELECT …" 会把 SET 的
 # 回显混进输出，tail -1 取到 "SET" 而非计数（历轮踩过）。
+# Q 腿跑在 M4（杀过 leader）之后，组可能仍在追平：清扫的问询要落到能应答
+# 的 leader 上才有判决可学。与 M4 同款手法——主动 drain 推动自追平，
+# 并给足"选举 + 追平 + 清扫"的时间。
 q3=""
-for t in $(seq 1 30); do
+for t in $(seq 1 60); do
+  for cand in $pport_a $f1_a $f2_a; do
+    PSQL $cand -q -c "SELECT partdist.pg_raft_group_drain_apply(${gid_a}::bigint);" </dev/null >/dev/null 2>&1
+  done
   PSQL $pport_a -q -c "SELECT partdist.dtx_pending_sweep();" </dev/null >/dev/null 2>&1
   c=$(PSQLV $pport_a -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
   [[ "$c" == "1" ]] && { q3="ok:${t}s"; break; }

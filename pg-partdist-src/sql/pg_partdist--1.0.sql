@@ -1041,8 +1041,15 @@ CREATE OR REPLACE FUNCTION dtx_peek(
     p_dtxid bigint
 ) RETURNS TABLE(verdict integer, commit_ts bigint)
 LANGUAGE sql VOLATILE AS $fn$
+    -- R-P4-12：应答前先把**自己**的 apply 积压排空。新当选的 leader 可能
+    -- 正是尚未 apply 该决议的成员（决议在多数派上、选举合法），不追平就
+    -- 读本地表 ⇒ 谁都问不到判决（实测 90s 不收敛）。drain 幂等、非 leader
+    -- 或无该组时返回 -1，不影响下面的门控语义。
+    WITH drained AS (
+        SELECT partdist.pg_raft_group_drain_apply(p_coord_gsid) AS applied
+    )
     SELECT d.verdict::integer, d.commit_ts::bigint
-      FROM partdist.dtx_decision d
+      FROM drained, partdist.dtx_decision d
      WHERE d.dtxid = p_dtxid
        AND EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
                     WHERE s.group_id = p_coord_gsid AND s.state = 'leader')

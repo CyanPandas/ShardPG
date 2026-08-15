@@ -5136,6 +5136,22 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
 
             restore_persistent_log_if_needed(&ctx);
 
+            /*
+             * ★ R-P4-12（2026-08-15 解冻批次 #4，周期化）：先把**本节点自己**
+             * 的 apply 积压排空，再去补发给 follower。
+             *
+             * 新当选的 leader 可能正是尚未 apply 某条决议的成员（决议在多数派
+             * 上、选举合法）；它的本地 dtx_decision 缺那一行，dtx_peek 的
+             * leader 门控又只认本地表 ⇒ 谁都问不到判决。首版把 drain 挂在
+             * dtx_peek 里，只在"有人来问"时才追平——没人问的窗口依旧空转
+             * （实测 T4.7 的 M4/Q3 在 3 轮里各红过 1–2 次，形态一致）。
+             * 挂到这里就变成**周期性自愈**：monitor 每 catchup_interval_ms
+             * 触发一次，且此处已确认本节点是该组 leader、已持复制认领、
+             * 日志已恢复——正是排空的最佳时机。group_apply_pending 幂等，
+             * 无积压时是一次空转。
+             */
+            group_apply_pending(&ctx);
+
             /* 先按对端自报的 last_log_index 给 next_index 一个起点（只降不升） */
             for (p0 = 0; p0 < n_peers; p0++)
             {
@@ -5895,6 +5911,56 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
  *
  * 本节点不是协调组 leader 时返回 NULL。
  */
+/*
+ * pg_raft_group_drain_apply(group_id) → int
+ *
+ * R-P4-12（2026-08-15 解冻批次 #4）：把**本节点自己**这一组的 apply 积压
+ * 排空，返回排空后的 last_applied。
+ *
+ * 为什么需要：杀掉协调组 leader 后，新当选的 leader 可能正是**尚未 apply
+ * 该决议**的成员（决议在多数派上、选举合法）。此时它的本地
+ * partdist.dtx_decision 里没有那一行，dtx_peek 的 leader 门控又只认本地表
+ * ⇒ 谁都问不到判决，in-doubt 收敛被拖到"选举 + 追平"之外（实测 90s 未收敛）。
+ *
+ * pg_raft_catchup() 治不了这个：它是 leader→follower 的**补发**通道，推的是
+ * 别人，推不动 leader 自己。这里直接调 group_apply_pending —— 它本就是
+ * "把已提交但未 apply 的条目按序 apply 掉"，对 leader 同样适用，且幂等。
+ *
+ * 由 dtx_peek 在读表**之前**调用：应答前先把自己追平，答案才是权威的。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_drain_apply);
+
+Datum
+pg_raft_group_drain_apply(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    RaftGroupCtx ctx;
+    int64        applied = -1;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT64(-1);
+
+    parse_peers();
+    restore_groups_if_needed();
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_INT64(-1);        /* 本节点没有该组：无从追平，静默 */
+
+    restore_hard_state_if_needed(&ctx);
+    restore_persistent_log_if_needed(&ctx);
+
+    /*
+     * 排空自身积压。group_apply_pending 内部自带认领与错误处置（#39），
+     * 这里不额外包 PG_TRY —— 让它的既有语义原样生效。
+     */
+    group_apply_pending(&ctx);
+
+    SpinLockAcquire(&ctx.log->mutex);
+    applied = ctx.log->last_applied;
+    SpinLockRelease(&ctx.log->mutex);
+
+    PG_RETURN_INT64(applied);
+}
+
 PG_FUNCTION_INFO_V1(pg_raft_dtx_status);
 
 Datum

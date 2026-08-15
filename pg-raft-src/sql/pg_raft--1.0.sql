@@ -141,6 +141,12 @@ CREATE OR REPLACE FUNCTION dtx_decide(
 COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
     '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
 
+-- R-P4-12：把本节点该组的 apply 积压排空（leader 自追平），返回 last_applied。
+-- dtx_peek 在读表前调它——新 leader 可能尚未 apply 决议，先追平再应答。
+CREATE OR REPLACE FUNCTION pg_raft_group_drain_apply(p_group_id bigint)
+    RETURNS bigint LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_drain_apply';
+
 CREATE OR REPLACE FUNCTION dtx_status(
     p_coord_gsid bigint,
     p_dtxid bigint
