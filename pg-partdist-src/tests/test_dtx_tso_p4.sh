@@ -581,6 +581,23 @@ for t in $(seq 1 45); do
   sleep 1
 done
 
+# ★ R-P4-15 位点取证（2026-08-17）：M4 **每轮**都确定性地杀主+重启，
+#   "崩溃回归的旧主"这一场景在此必然出现 —— 比守着 M5 那个约 1/5 的窗口
+#   高效得多。这里只读状态、不调 promote_prepare（它有追平与闭合 in-doubt
+#   的副作用，会污染现场）。落盘供设计判据用，不参与断言。
+{
+  echo "### M4 后位点快照 $(date '+%H:%M:%S')  组=${gid_a} 原始主=:$pport_a"
+  for cand in $pport_a $f1_a $f2_a; do
+    lo=$(PSQL $cand -Atc "SELECT partdist.local_partition_for_shard(${gid_a}::bigint)" </dev/null 2>/dev/null | tail -1)
+    echo "  :$cand loid=${lo:-无}" \
+         "raft=$(PSQL $cand -Atc "SELECT state||' '||last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" \
+         "收=$(PSQL $cand -Atc "SELECT coalesce((SELECT applied_part_lsn::text FROM partdist.follower_partition_map WHERE partition_id=${lo:-0}),'无行')" </dev/null 2>/dev/null | tail -1)" \
+         "放=$(PSQLV $cand -Atc "SELECT coalesce((SELECT armed||'/'||applied FROM partdist.replay_status() WHERE shard=${lo:-0}::oid),'无槽位')" </dev/null 2>/dev/null | tail -1)" \
+         "物理行数=$(PSQLV $cand -Atc "SELECT count(*) FROM t47d_${gid_a}" </dev/null 2>/dev/null | tail -1)" \
+         "pmap主=$(PSQL $cand -Atc "SELECT primary_node||'/t'||primary_term FROM partdist.partition_map WHERE partition_id=${gid_a}" </dev/null 2>/dev/null | tail -1)"
+  done
+} >> "/tmp/m4_lsn_$$.txt" 2>&1
+
 echo "========== [M5] master(TSO) 不可达 → 事务级 fail-closed =========="
 # ★ M5 取证（2026-08-17 加）：本腿曾观测到 before>after（"4 → 3"，已提交行
 #   变不可见）。怀疑 M4 的切主把 Citus 读路由指到了**回放未追平的副本**。
@@ -605,9 +622,16 @@ m5_snapshot() {   # <标签>
                        WHERE partition_id IN (${gid_a}, ${gid_b})" </dev/null 2>/dev/null ) > "$tmpd/c" &
   for g in "$gid_a:$pport_a $f1_a $f2_a" "$gid_b:$pport_b $f1_b $f2_b"; do
     for p in ${g#*:}; do
-      ( echo "SHARD ${g%%:*} @:$p 物理行数=$(PSQLV $p -Atc "SELECT count(*) FROM t47d_${g%%:*}" </dev/null 2>/dev/null | tail -1)" \
+      # ★ 修 M5 需要判"数据是否落后"，故一并取三项位点：
+      #   loid   = 本节点该分片的 partition_id（无则说明本节点没这分片）
+      #   收=applied_part_lsn（follower_partition_map：已收到并落盘的 parwal 位点）
+      #   放=replay_status().applied（已 redo 进堆的位点）；armed 为空=无回放槽位
+      ( lo=$(PSQL $p -Atc "SELECT partdist.local_partition_for_shard(${g%%:*}::bigint)" </dev/null 2>/dev/null | tail -1)
+        echo "SHARD ${g%%:*} @:$p 物理行数=$(PSQLV $p -Atc "SELECT count(*) FROM t47d_${g%%:*}" </dev/null 2>/dev/null | tail -1)" \
              "raft=$(PSQL $p -Atc "SELECT state||' '||last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${g%%:*}" </dev/null 2>/dev/null | tail -1)" \
-             "回放=$(PSQLV $p -Atc "SELECT armed||' applied='||applied FROM partdist.replay_status() WHERE shard='t47d_${g%%:*}'::regclass" </dev/null 2>/dev/null | tail -1)" ) > "$tmpd/s_${g%%:*}_$p" &
+             "loid=${lo:-无}" \
+             "收=$(PSQL $p -Atc "SELECT coalesce((SELECT applied_part_lsn::text FROM partdist.follower_partition_map WHERE partition_id=${lo:-0}),'无行')" </dev/null 2>/dev/null | tail -1)" \
+             "放=$(PSQLV $p -Atc "SELECT armed||'/'||applied FROM partdist.replay_status() WHERE shard=${lo:-0}::oid" </dev/null 2>/dev/null | tail -1)" ) > "$tmpd/s_${g%%:*}_$p" &
     done
   done
   wait

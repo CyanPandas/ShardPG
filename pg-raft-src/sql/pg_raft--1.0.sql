@@ -438,9 +438,42 @@ BEGIN
     SELECT s.armed, s.applied INTO is_armed, app
       FROM partdist.replay_status() s WHERE s.shard = loid;
     IF NOT FOUND OR is_armed IS NOT TRUE THEN
-        -- 本节点没有该分片的副本回放配置（没 replay_set_locmap / 没 arm）。
-        -- 这不是错误：它可能一直就是该组的 leader，或副本回放尚未启用。
-        -- 分叉检查已在上面做过，这里放行是安全的。
+        -- ★★ R-P4-15（2026-08-17，解冻批次 #5）★★
+        --
+        -- 原逻辑在此无条件 RETURN 1，理由是"没槽位 ⇒ 没什么要追的"。它漏掉
+        -- 了第三种情形：**曾是主、崩溃、带着陈旧数据回来的节点**。这种节点
+        -- 持有的是真表而不是副本壳表，从没被 replay_enable 过，因此天然没有
+        -- 槽位 —— 恰好走这条捷径被放行，其陈旧副本随即成为 Citus 路由目标，
+        -- 已提交的行从读取结果里消失（M5 腿实测 count 4 → 3，两次复现指纹
+        -- 逐项吻合）。
+        --
+        -- 判据取 follower_partition_map.applied_part_lsn（本节点作为 follower
+        -- **已收到并落盘**的分区 WAL 位点）。它 > 0 就意味着有记录躺在
+        -- pg_parwal 里；而"无槽位"意味着这些记录一条都没 redo 进堆 ——
+        -- 收到了却没回放，堆必然落后。实测快照（M4 每轮必现的场景）：
+        --   :5433 raft=follower 12/12/12 收=12 放=无槽位 物理行数=1
+        --   :5435 raft=leader   12/12/12 收=12 放=true/12 物理行数=2
+        -- 收的位点一样，物理行数差一行，差别全在"放"。
+        --
+        -- 为什么是 -1（永不放行）而不是 0（重试）：这种节点**没有 locmap**
+        -- （实测 pg_parwal/<oid>/ 下只有 checkpoint/fileset/freeze，正常
+        -- follower 才有 locmap），装不了槽位、追不上去。返回 0 只会空转到
+        -- pg_raft.promote_catchup_deadline_ms 的"可用性优先"兜底，然后照样
+        -- 被放行 —— 缺陷原样回来，只是晚了一分钟。它与快路径分叉同类：
+        -- 须重做物理基线才能重新参选。
+        --
+        -- 可用性：只排除这一个节点，同组其余带 locmap 的正常副本照常可当选。
+        bound := partdist.get_follower_applied_part_lsn(loid);
+        IF coalesce(bound, 0) > 0 THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 拒绝升主：本节点已收到分区 WAL 到位点 %，'
+                          '却没有回放槽位（这些记录一条都没 redo 进堆），堆数据必然落后。'
+                          '典型成因：本节点曾是该分片的主，崩溃后带着陈旧数据回归。'
+                          '该分片须重做物理基线（建立 locmap 并追平）后才能重新参选。',
+                          loid, p_group_id, bound;
+            RETURN -1;
+        END IF;
+        -- 确实没收到过分区 WAL：本节点一直是该组 leader，或压根没有该分片的
+        -- 副本。分叉检查已在上面做过，这里放行是安全的。
         RETURN 1;
     END IF;
 
@@ -476,7 +509,7 @@ END
 $promo$;
 
 COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
-    '升主前置：先查快路径分叉，再把本节点该分片的物理回放追平到 Raft 已提交位点，最后闭合 in-doubt 分布式事务。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=检测到分叉（永不放行，须重做物理基线）。';
+    '升主前置：先查快路径分叉，再确认"无槽位"不是"带陈旧数据的旧主回归"（R-P4-15），然后把本节点该分片的物理回放追平到 Raft 已提交位点，最后闭合 in-doubt 分布式事务。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=分叉或收到了却回放不了（永不放行，须重做物理基线）。';
 
 -- ------------------------------------------------------------------
 -- 快路径分叉检测（DTX_2PC_DESIGN.md §9.5，第 6 步 b）
