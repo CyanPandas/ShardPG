@@ -171,6 +171,16 @@ echo "========== [1] 夹具：2 分片分布表（先撤残留白名单——带
 #            T4.3 的含-DROP 禁 PREPARE 拦下，表静默存活 → 上一轮假阳性的根源）=========="
 for p in $(seq 5432 5440); do
   PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null 2>&1
+  # ★ R-P4-19：tso_conninfo 也必须逐轮清（原先只在清理阶段对 pport_a/b/COORD
+  #   清，follower 一旦被配过就永久残留）。**产品的 TSO 客户端调的是不带
+  #   schema 的 `SELECT partdist_tso_commit_ts()`**，而扩展装在 partdist
+  #   schema、search_path 只有 "$user",public —— 全靠夹具在 public 建的同名
+  #   垫片（第 ~326 行）解析，而清理阶段又把垫片 DROP 掉（第 ~870 行）。
+  #   于是"垫片不存在的窗口"（上轮清理后 ~ 本轮建垫片前，正好覆盖净场与建表）
+  #   里，任何带 tso_conninfo 的节点一提交就撞 function does not exist ⇒
+  #   fail-closed ⇒ DDL 传播全败。这正是 R-P4-18 塌方的真正机理。
+  #   在这里统一清干净，窗口即消失。
+  PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo;" </dev/null >/dev/null 2>&1
   PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
 done
 # 白名单必须确认撤干净再删表：分布式 DROP 走 2PC，白名单未撤会被
@@ -339,16 +349,24 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 OID_A=$(PSQLV $pport_a -Atc "SELECT 't47d_${gid_a}'::regclass::oid" </dev/null | tail -1)
 OID_B=$(PSQLV $pport_b -Atc "SELECT 't47d_${gid_b}'::regclass::oid" </dev/null | tail -1)
-# ★ 2026-08-17：**只配两个原始主**（一度改成"配齐组内六成员"，引入了严重
-#   回归，已回退，教训记在 R-P4-18）。
-#   回归原因：给 follower 也设 tso_conninfo，等于把它们变成 TSO 客户端 ——
-#   此后它们每次提交都要取 commit_ts，一失败即 fail-closed，DDL 传播到这些
-#   节点全部提交失败，t47d 建不出来，locmap 崩，整套从 49/0 塌到 32/17。
-#   这正是 R-P4-11 记过的机制（"换源后任何提交都取 commit_ts ⇒ 全集群提交
-#   失败、分片表建不出来"）。
-#   教训：配置项要逐项问"这一项为什么需要"，不能把"配齐"当整体动作。
-#   Q 腿并不需要 follower 有 tso_conninfo —— tso_c_start() 是在 $COORD 上调的。
-for spec in "$pport_a:$OID_A" "$pport_b:$OID_B"; do
+# ★ R-P4-19（2026-08-17）：辅助函数 + 打标 + TSO 源配到**组内全部六成员**。
+#   这是 R-P4-18 那次改动的**重做** —— 当时它把整套从 49/0 打到 32/17，
+#   我按"follower 不能配 tso_conninfo"回退了。那个结论是错的：真正的成因是
+#   **垫片生命周期与配置生命周期错位**（详见净场与清理处的注释），已在本轮
+#   修掉（净场逐轮清 tso_conninfo，清理时先清配置再 DROP 垫片）。
+#   为什么必须配 TSO 而不能只配打标：读者没有 start_ts 就施不了可见性判据，
+#   COMMIT PREPARED 后行会立即可见，Q3 退化成不检验任何东西的断言。
+#   （安全网当前是 permissive，故"打标+无 TSO"不报错，只是失去检验意义。）
+#   OID 逐节点解析 —— 各节点的 t47d_<gid> 是各自的表，OID 不同。
+SETUP_SPECS=""
+for pair in "$gid_a:$pport_a $f1_a $f2_a" "$gid_b:$pport_b $f1_b $f2_b"; do
+  g=${pair%%:*}
+  for nd in ${pair#*:}; do
+    o=$(PSQLV $nd -Atc "SELECT 't47d_${g}'::regclass::oid" </dev/null 2>/dev/null | tail -1)
+    [[ "$o" =~ ^[0-9]+$ ]] && SETUP_SPECS="$SETUP_SPECS $nd:$o"
+  done
+done
+for spec in $SETUP_SPECS; do
   pp=${spec%%:*}; oid=${spec#*:}
   PSQL $pp -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.enable_ddl_propagation TO off;
@@ -709,19 +727,21 @@ echo "========== [Q] 三态问询三分支 =========="
 #   建立在空气上 —— Q3 的"永不收敛"实为无物可收敛。
 #   （与 feedback_test_harness_silent_pass 同类：断言必须有能力失败。）
 #
-# 修法：① 显式等待 $pport_a 重掌 leader 再动手（**落点只能是它** —— 只有它
-#   备了辅助函数与打标；一度改成"配到组内全成员"，结果把 follower 变成 TSO
-#   客户端而 fail-closed，整套从 49/0 塌到 32/17，见 R-P4-18）；
+# 修法：① 落点取**当前 leader**（六成员均已备好函数+打标+TSO，见 R-P4-19，
+#   故不再受"只有原始主备了环境"的束缚，也不必干等原始主重掌 leader）；
 #   ② 加 ON_ERROR_STOP=1，让 PREPARE 失败直接暴露为前置失败。
-# 等不到 leader 就如实报前置失败，而不是让 Q3 表现为神秘超时 —— 后者正是
-# R-P4-17 那个假象的来源。
-QNODE=$pport_a
-qlead=""
+# 写入必须落在 raft leader 上 —— 任期栅栏会正确拒绝非 leader 的本地写入
+#（`本节点不是该分区组的 leader`），这是产品的正确行为，夹具要跟随它。
+QNODE=""
 for t in $(seq 1 45); do
-  [[ "$(PSQL $QNODE -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]] && { qlead="ok:${t}s"; break; }
+  for cand in $pport_a $f1_a $f2_a; do
+    [[ "$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]] && { QNODE=$cand; break; }
+  done
+  [[ -n "$QNODE" ]] && break
   sleep 1
 done
-check "Q 前置：落点 :$QNODE 已重掌 leader（$qlead）" "${qlead%%:*}" "ok"
+check "Q 前置：找到分片 A 当前 leader（:${QNODE:-无}）" "$([[ -n "$QNODE" ]] && echo ok)" "ok"
+[[ -z "$QNODE" ]] && QNODE=$pport_a   # 兜底：让后续断言以失败形式暴露，不静默跳过
 # Q1：槽 start_ts > 读者快照 ⇒ 跳过（不可见、不阻塞）
 DTXQ=$(PSQL $COORD -Atc "SELECT ((9::bigint&255)<<55)|((777::bigint&4194303)<<33)|303" </dev/null)
 SQ=$(PSQL $COORD -Atc "SELECT tso_c_start()" </dev/null)
@@ -859,11 +879,16 @@ if [[ "${KEEP_FIXTURE:-0}" != "1" ]]; then
   for p in $COORD $pport_a $pport_b $f1_a $f2_a $f1_b $f2_b; do
     PSQL $p -q -c "DELETE FROM partdist.partition_map WHERE partition_id IN (${gid_a},${gid_b});" </dev/null >/dev/null 2>&1
   done
-  for p in $pport_a $pport_b; do
-    PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null
-    PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo;" </dev/null >/dev/null
-    PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
-    PSQL $p -q -c "DROP FUNCTION IF EXISTS sclog_full(oid,bigint); DROP FUNCTION IF EXISTS pjoin(bigint,bigint,bigint);" </dev/null >/dev/null
+  # ★ R-P4-19：清理顺序要害 —— **先清所有节点的 tso_conninfo，再 DROP 垫片**。
+  #   顺序反了就留下"有配置、无垫片"的窗口（见下方 DROP 与净场处的注释）。
+  #   范围也要全：组内 6 个成员都可能被配过，不能只清两个原始主。
+  for p in $(seq 5432 5440); do
+    PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null 2>&1
+    PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo;" </dev/null >/dev/null 2>&1
+    PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
+  done
+  for p in $pport_a $pport_b $f1_a $f2_a $f1_b $f2_b; do
+    PSQL $p -q -c "DROP FUNCTION IF EXISTS sclog_full(oid,bigint); DROP FUNCTION IF EXISTS pjoin(bigint,bigint,bigint); DROP FUNCTION IF EXISTS tso_c_start();" </dev/null >/dev/null 2>&1
   done
   PSQL $COORD -q -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo;" </dev/null >/dev/null
   PSQL $COORD -q -c "ALTER SYSTEM RESET pg_partdist.tso_master;" </dev/null >/dev/null
