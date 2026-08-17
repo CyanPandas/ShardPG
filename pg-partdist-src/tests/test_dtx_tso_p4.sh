@@ -339,22 +339,16 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 OID_A=$(PSQLV $pport_a -Atc "SELECT 't47d_${gid_a}'::regclass::oid" </dev/null | tail -1)
 OID_B=$(PSQLV $pport_b -Atc "SELECT 't47d_${gid_b}'::regclass::oid" </dev/null | tail -1)
-# ★ 2026-08-17：辅助函数 + 打标 + TSO 源要配到**组内全部成员**，不只原始主。
-#   原先只配 $pport_a/$pport_b，隐含假定"主不会漂"。M4/M5 杀主后 leader 会
-#   落到 follower 上，那里既没有 pjoin/tso_c_start，也没打标 —— 夹具便无法
-#   在新主上做事（Q 腿实测 `function pjoin does not exist`）。
-#   打标必须一并配：QNODE 若未打标，COMMIT PREPARED 后行会立刻可见，Q3 不经
-#   清扫就"通过"，退化成一条不检验任何东西的断言。
-#   OID 逐节点解析 —— 各节点的 t47d_<gid> 是各自的表，OID 不同，不能共用。
-SETUP_SPECS=""
-for pair in "$gid_a:$pport_a $f1_a $f2_a" "$gid_b:$pport_b $f1_b $f2_b"; do
-  g=${pair%%:*}
-  for nd in ${pair#*:}; do
-    o=$(PSQLV $nd -Atc "SELECT 't47d_${g}'::regclass::oid" </dev/null 2>/dev/null | tail -1)
-    [[ "$o" =~ ^[0-9]+$ ]] && SETUP_SPECS="$SETUP_SPECS $nd:$o"
-  done
-done
-for spec in $SETUP_SPECS; do
+# ★ 2026-08-17：**只配两个原始主**（一度改成"配齐组内六成员"，引入了严重
+#   回归，已回退，教训记在 R-P4-18）。
+#   回归原因：给 follower 也设 tso_conninfo，等于把它们变成 TSO 客户端 ——
+#   此后它们每次提交都要取 commit_ts，一失败即 fail-closed，DDL 传播到这些
+#   节点全部提交失败，t47d 建不出来，locmap 崩，整套从 49/0 塌到 32/17。
+#   这正是 R-P4-11 记过的机制（"换源后任何提交都取 commit_ts ⇒ 全集群提交
+#   失败、分片表建不出来"）。
+#   教训：配置项要逐项问"这一项为什么需要"，不能把"配齐"当整体动作。
+#   Q 腿并不需要 follower 有 tso_conninfo —— tso_c_start() 是在 $COORD 上调的。
+for spec in "$pport_a:$OID_A" "$pport_b:$OID_B"; do
   pp=${spec%%:*}; oid=${spec#*:}
   PSQL $pp -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.enable_ddl_propagation TO off;
@@ -691,20 +685,19 @@ echo "========== [Q] 三态问询三分支 =========="
 #   建立在空气上 —— Q3 的"永不收敛"实为无物可收敛。
 #   （与 feedback_test_harness_silent_pass 同类：断言必须有能力失败。）
 #
-# 修法：① 现场重新解析 gid_a 组的当前 leader 作为落点；② 加
-#   ON_ERROR_STOP=1，让 PREPARE 失败直接暴露为前置失败。
-QNODE=""
-for t in $(seq 1 30); do
-  for cand in $pport_a $f1_a $f2_a; do
-    if [[ "$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]]; then
-      QNODE=$cand; break
-    fi
-  done
-  [[ -n "$QNODE" ]] && break
+# 修法：① 显式等待 $pport_a 重掌 leader 再动手（**落点只能是它** —— 只有它
+#   备了辅助函数与打标；一度改成"配到组内全成员"，结果把 follower 变成 TSO
+#   客户端而 fail-closed，整套从 49/0 塌到 32/17，见 R-P4-18）；
+#   ② 加 ON_ERROR_STOP=1，让 PREPARE 失败直接暴露为前置失败。
+# 等不到 leader 就如实报前置失败，而不是让 Q3 表现为神秘超时 —— 后者正是
+# R-P4-17 那个假象的来源。
+QNODE=$pport_a
+qlead=""
+for t in $(seq 1 45); do
+  [[ "$(PSQL $QNODE -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]] && { qlead="ok:${t}s"; break; }
   sleep 1
 done
-check "Q 前置：找到分片 A 当前 leader（:${QNODE:-无}）" "$([[ -n "$QNODE" ]] && echo ok)" "ok"
-[[ -z "$QNODE" ]] && QNODE=$QNODE      # 兜底，让后续断言以失败形式暴露
+check "Q 前置：落点 :$QNODE 已重掌 leader（$qlead）" "${qlead%%:*}" "ok"
 # Q1：槽 start_ts > 读者快照 ⇒ 跳过（不可见、不阻塞）
 DTXQ=$(PSQL $COORD -Atc "SELECT ((9::bigint&255)<<55)|((777::bigint&4194303)<<33)|303" </dev/null)
 SQ=$(PSQL $COORD -Atc "SELECT tso_c_start()" </dev/null)
