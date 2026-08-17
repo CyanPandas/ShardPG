@@ -1711,8 +1711,58 @@ LOG:   background worker "pg_partdist replay worker" ... terminated by signal 6:
 **影响面**：该轮功能全过（48/1，唯一红的就是崩溃检查本身），崩溃发生在回放
 后台进程，未破坏本轮语义。但它是**真崩溃**，不是夹具问题，不可忽略。
 
-**下一步建议**：守卫从"关系是否存在"升级为"记录是否属于本代关系"——
-例如比对段流的 relfilenode/代际标识，游标从 0 起且目标关系为空时拒绝认领。
+**第一次修复尝试：失败（2026-08-17，已如实记录）**
+加了"块号越界则跳过"的守卫，10 轮验证 `8 × 49/0, 2 × 48/1` —— 两次失败仍是
+同一 PANIC，而**新守卫的 WARNING 触发 0 次**。部署确已生效（`.so` 验明含新
+代码），是**判据选错**：PANIC 抛在
+```c
+action = XLogReadBufferForRedo(record, 0, &buffer);
+if (action == BLK_NEEDS_REDO)
+    if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum)
+        elog(PANIC, "invalid max offset number");
+```
+即**页存在、块号在界内、但页太短**。按块号判断的守卫在设计上就够不着。
+该守卫已留在代码里（"记录指向本地不存在的块"本身也该拦），但注释已改写为
+**不冒充修复**。
+
+**一处中途推断的撤销**：我一度把病灶归为"新建空壳表被灌入旧记录"。
+`BLK_NEEDS_REDO` 意味着页 LSN 低于记录 LSN，而 PG 的 redo 靠页 LSN 做幂等
+（页够新就跳过），所以"重放已应用过的记录"走不到 PANIC。该推断已撤销。
+
+**决定性取证（2026-08-17 19:17，两条现场互补）**
+
+worker4（带诊断插桩）：
+```
+认领 shard 520119，游标从 0 起
+诊断: plsn=1 rmid=10 info=0x80 blk=0/0 块数=1 image=0 init=1
+PANIC: invalid max offset number
+```
+对照同一插桩在一次**成功**回放上的输出：记录形状完全相同
+（`plsn=1 rmid=10 info=0x80 init=1`），唯一差别是 **块数=0**。
+⇒ **判别量是本地关系的块数：0 成功、1 崩溃。**
+
+`info=0x80` = `XLOG_HEAP_INSERT | XLOG_HEAP_INIT_PAGE`，redo 会重初始化该页
+（max offset 归零），因此只有当记录的目标 offnum ≥ 2 时才触发上面那个判据。
+即：**流的第一条记录所设想的关系状态，与本地关系的实际状态不是同一代。**
+
+worker3（同轮）：`认领 shard 594132，游标从 10 起` → PANIC。
+⇒ **推翻"游标 0 才触发"这一前提**；我把诊断门控在 `applied_part_lsn == 0`
+是过窄的，worker3 因此没打出诊断行。**触发条件与游标值无关。**
+
+**当前可站住的结论**：被重放的段流与本地关系**不同代**。根因未闭 —— 尚未
+查明"不同代的流为何会被认领"。
+
+**已排除**：块号越界（守卫零触发证否）、重放已应用记录（页 LSN 幂等证否）、
+游标必须为 0（worker3 从 10 起亦崩）。
+
+**下一步（需设计决策，未实施）**：把"代际"显式绑定到流上再校验。
+可用材料：`ShardReplayCtx.locmap_gen`（已存在的 locmap 代次概念）、
+locmap 里记录的 `local_loc.relNumber`。要点是现有守卫 1 只查
+`smgrexists(local_loc)` —— 表被重建后 relNumber 变了，而**旧文件可能因延迟
+unlink 仍然存在**，守卫便会误放行。故校验应改为"locmap 记录的 relNumber
+是否等于该分片当前关系的 relNumber"，不等即拒绝认领。
+此改动涉及代际标识的写入与持久化，**不宜再凭推断直接改**（本条已有一次
+判据选错的失败），需先确认 relfilenode 的可得性与延迟 unlink 的实际行为。
 
 #### P4 出口清单（全部勾掉才进 P5）
 

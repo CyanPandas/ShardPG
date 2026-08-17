@@ -912,6 +912,7 @@ ReplayWorkerMain(Datum arg)
                                 "游标从 %llu 起（惰性：待触发）",
                                 ctx->shard_oid,
                                 (unsigned long long) ctx->applied_part_lsn)));
+
             }
 
             /* 断言认领权仍在手（FRD §13.10 单写者不变式） */

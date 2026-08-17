@@ -572,6 +572,69 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                                "不可捕获的 PANIC（R-P4-8）。")));
             return;             /* 跳过本条，游标由调用方推进 */
         }
+
+        /*
+         * 块号边界检查：记录要落的块号若已超出本地关系的实际大小就跳过。
+         * 只对"不会自建页"的记录生效 —— 带整页镜像（has_image）或标了
+         * WILL_INIT 的记录本就会把页建出来，拦它们反而破坏正常回放。
+         *
+         * ★ 务必看清它**不解决 R-P4-20**（2026-08-17 实测确认）。
+         * R-P4-20 的 PANIC 抛在 heapam.c：
+         *     action = XLogReadBufferForRedo(record, 0, &buffer);
+         *     if (action == BLK_NEEDS_REDO)
+         *         if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum)
+         *             elog(PANIC, "invalid max offset number");
+         * 即**页存在、块号在界内、但页太短**（缺目标 offnum 之前的行指针）。
+         * 本检查按块号判断，够不着那一种 —— 加上它之后 10 轮验证里该
+         * WARNING **一次都没触发**，PANIC 照常复发。留着它是因为"记录指向
+         * 本地不存在的块"本身也该拦，不是因为它修好了什么。
+         */
+        /*
+         * ★ R-P4-20 诊断（2026-08-17）：PANIC 恒在认领后 1ms 内发生，事后
+         * 无从回溯（夹具下一轮就清场）。这里把 redo 之前的几何形状记下来，
+         * 用于分辨两个假说：
+         *   (a) 段流与堆不同代（堆新、段旧）；
+         *   (b) 游标丢失 + 段截断 —— 重放起点落在堆内容之后，形成空洞。
+         * 只在"游标从 0 起"这一出事形态下打，不污染正常日志。
+         * PANIC 的判据是 PageGetMaxOffsetNumber(page)+1 < offnum，靠块数与
+         * 页 LSN 分不出来，但"堆是不是空的"能直接否掉 (a)：空表 redo 会
+         * BLK_NOTFOUND 跳过而非 PANIC。
+         */
+        if (ctx->applied_part_lsn == 0)
+            ereport(LOG,
+                    (errmsg("pg_partdist replay [R-P4-20 诊断]: shard %u plsn=%llu "
+                            "rmid=%u info=0x%02x blk=%u/%u 块数=%u image=%d init=%d",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            (unsigned) record->xl_rmid,
+                            (unsigned) (record->xl_info & ~XLR_INFO_MASK),
+                            (unsigned) id, (unsigned) blk->blkno,
+                            (unsigned) smgrnblocks(smgr, blk->forknum),
+                            blk->has_image ? 1 : 0,
+                            (blk->flags & BKPBLOCK_WILL_INIT) ? 1 : 0)));
+
+        if (!blk->has_image && (blk->flags & BKPBLOCK_WILL_INIT) == 0)
+        {
+            BlockNumber nblocks = smgrnblocks(smgr, blk->forknum);
+
+            if (blk->blkno >= nblocks)
+            {
+                ereport(WARNING,
+                        (errmsg("pg_partdist replay: 记录越出本地关系边界，跳过该记录"
+                                "（shard %u，plsn=%llu，relNumber=%u fork=%d "
+                                "blkno=%u 实际块数=%u）",
+                                ctx->shard_oid,
+                                (unsigned long long) hdr->partition_lsn,
+                                (unsigned) blk->rlocator.relNumber,
+                                (int) blk->forknum,
+                                (unsigned) blk->blkno,
+                                (unsigned) nblocks),
+                         errdetail("本地关系比记录所设想的短 —— 多为新建的空壳表"
+                                   "被灌入上一代的段流。继续 redo 会触发不可捕获的"
+                                   "PANIC: invalid max offset number（R-P4-20）。")));
+                return;         /* 跳过本条，游标由调用方推进 */
+            }
+        }
     }
 
     /* 4) 派发原生 redo */
