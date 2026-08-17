@@ -1040,45 +1040,68 @@ CREATE OR REPLACE FUNCTION dtx_peek(
     p_coord_gsid bigint,
     p_dtxid bigint
 ) RETURNS TABLE(verdict integer, commit_ts bigint)
-LANGUAGE sql VOLATILE AS $fn$
+LANGUAGE plpgsql VOLATILE AS $fn$
+-- 改 plpgsql 的**唯一理由**见下面 R-P4-16：补读必须另起一条语句。
+DECLARE
+    v_is_leader boolean;
+    v_verdict   integer;
+    v_cts       bigint;
+BEGIN
     -- R-P4-12：应答前先把**自己**的 apply 积压排空。新当选的 leader 可能
     -- 正是尚未 apply 该决议的成员（决议在多数派上、选举合法），不追平就
     -- 读本地表 ⇒ 谁都问不到判决（实测 90s 不收敛）。drain 幂等、非 leader
     -- 或无该组时返回 -1，不影响下面的门控语义。
-    -- R-P4-13 绕行：本地行缺失时向组内其他成员只读拉取（决议在多数派上是
-    -- 确定事实；只读、不写推定中止、不改"决议一次性"语义）。拉到即幂等补
-    -- 进本地表，下次无需再远程问。
-    WITH drained AS (
-        SELECT partdist.pg_raft_group_drain_apply(p_coord_gsid) AS applied
-    ), gate AS (
-        SELECT EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
-                        WHERE s.group_id = p_coord_gsid AND s.state = 'leader') AS is_leader
-    ), local_row AS (
-        SELECT d.verdict::integer AS verdict, d.commit_ts::bigint AS commit_ts
-          FROM drained, gate, partdist.dtx_decision d
-         WHERE d.dtxid = p_dtxid AND gate.is_leader
-    ), peer_row AS (
-        -- R-P4-14：远程回退**不再要求被问节点自己是 leader**。纯增量改动：
-        -- 此前非 leader 一律返回 0 行，现在它会转问组内成员；能答上来的
-        -- 前提仍是"某成员本地有这条决议"，即决议已在多数派上落定。
-        -- 为何安全：决议是一次性的正向事实（写下就不再改），从谁那里读到
-        -- 都等价；返回 0 行的语义（无从判定）也没变，不产生推定中止。
-        -- 为何必要：清扫按 partition_map.primary_node 寻址，切主窗口内它
-        -- 与 raft leader 不同步，旧门控会让整条问询通道哑掉（Q3 实测）。
-        SELECT pd.verdict, d2.commit_ts::bigint AS commit_ts
-          FROM (SELECT partdist.pg_raft_group_peer_decision(
-                           p_coord_gsid, p_dtxid) AS verdict) pd
-          LEFT JOIN partdist.dtx_decision d2 ON d2.dtxid = p_dtxid
-         WHERE NOT EXISTS (SELECT 1 FROM local_row)
-           AND pd.verdict IN (1, 2)
-    )
-    SELECT verdict, commit_ts FROM local_row
-    UNION ALL
-    SELECT verdict, coalesce(commit_ts, 0) FROM peer_row
+    PERFORM partdist.pg_raft_group_drain_apply(p_coord_gsid);
+
+    SELECT EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
+                    WHERE s.group_id = p_coord_gsid AND s.state = 'leader')
+      INTO v_is_leader;
+
+    -- ① 本地答案：仍受 leader 门控（follower 有 apply 滞后会答错）。
+    IF v_is_leader THEN
+        SELECT d.verdict::integer, d.commit_ts::bigint
+          INTO v_verdict, v_cts
+          FROM partdist.dtx_decision d WHERE d.dtxid = p_dtxid;
+        IF FOUND THEN
+            verdict := v_verdict; commit_ts := v_cts;
+            RETURN NEXT; RETURN;
+        END IF;
+    END IF;
+
+    -- ② 本地无答案 ⇒ 转问组内成员（R-P4-13 绕行 + R-P4-14 去门控）。
+    -- 决议是一次性的正向事实（写下不再改），从谁那里读到都等价；本步只读，
+    -- 不写推定中止。拉到即幂等补进本地表，下次无需再远程问。
+    v_verdict := partdist.pg_raft_group_peer_decision(p_coord_gsid, p_dtxid);
+    IF v_verdict IS NULL OR v_verdict NOT IN (1, 2) THEN
+        RETURN;                 -- 无从判定：返回 0 行
+    END IF;
+
+    -- ★ R-P4-16（2026-08-17，修的是 R-P4-13 绕行自身的缺陷）：
+    -- 上一步已把决议幂等补进本地表，但**必须另起一条语句**再读才拿得到
+    -- commit_ts —— 首版把补读写成同一条 SQL 里的 LEFT JOIN，那个 JOIN 用的
+    -- 是语句开始时的快照，看不到函数刚插进去的行，于是答出
+    -- "verdict=1 而 commit_ts=0"。实测取证：5433 答 `1@0`，而组内两个成员
+    -- 都是 `1@22`。
+    SELECT d.commit_ts::bigint INTO v_cts
+      FROM partdist.dtx_decision d WHERE d.dtxid = p_dtxid;
+
+    -- ★ 守卫：COMMIT 判决必须带有效 commit_ts，否则宁可答"无从判定"让调用方
+    -- 重试，**绝不能把 cts=0 发出去**。参与方拿到 `1@0` 只有两种下场，实测
+    -- 两种都出现过：拒收 ⇒ 落 ABORTED 并注销登记（清扫再无东西可扫，Q3 必然
+    -- 60s 超时，取证见 st=3 sts=20 cts=0）；或收下 ⇒ 落一个时间戳错误的
+    -- COMMITTED，破坏 SI（M1 取证见 st=2 sts=4 cts=0）。
+    -- ABORT 判决与 commit_ts 无关，0 是正常值。
+    IF v_verdict = 1 AND coalesce(v_cts, 0) <= 0 THEN
+        RETURN;                 -- 答不全就不答
+    END IF;
+
+    verdict := v_verdict; commit_ts := coalesce(v_cts, 0);
+    RETURN NEXT;
+END
 $fn$;
 
 COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
-    '只读决议窥视（T4.5）：本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14），仍无则返回 0 行，绝不写推定中止。';
+    '只读决议窥视（T4.5）：本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14）并另起语句补读 commit_ts（R-P4-16）；COMMIT 判决缺有效 commit_ts 时宁可返回 0 行，绝不写推定中止、绝不答半个判决。';
 
 -- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
 -- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。

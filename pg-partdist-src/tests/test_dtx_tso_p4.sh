@@ -339,7 +339,22 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 OID_A=$(PSQLV $pport_a -Atc "SELECT 't47d_${gid_a}'::regclass::oid" </dev/null | tail -1)
 OID_B=$(PSQLV $pport_b -Atc "SELECT 't47d_${gid_b}'::regclass::oid" </dev/null | tail -1)
-for spec in "$pport_a:$OID_A" "$pport_b:$OID_B"; do
+# ★ 2026-08-17：辅助函数 + 打标 + TSO 源要配到**组内全部成员**，不只原始主。
+#   原先只配 $pport_a/$pport_b，隐含假定"主不会漂"。M4/M5 杀主后 leader 会
+#   落到 follower 上，那里既没有 pjoin/tso_c_start，也没打标 —— 夹具便无法
+#   在新主上做事（Q 腿实测 `function pjoin does not exist`）。
+#   打标必须一并配：QNODE 若未打标，COMMIT PREPARED 后行会立刻可见，Q3 不经
+#   清扫就"通过"，退化成一条不检验任何东西的断言。
+#   OID 逐节点解析 —— 各节点的 t47d_<gid> 是各自的表，OID 不同，不能共用。
+SETUP_SPECS=""
+for pair in "$gid_a:$pport_a $f1_a $f2_a" "$gid_b:$pport_b $f1_b $f2_b"; do
+  g=${pair%%:*}
+  for nd in ${pair#*:}; do
+    o=$(PSQLV $nd -Atc "SELECT 't47d_${g}'::regclass::oid" </dev/null 2>/dev/null | tail -1)
+    [[ "$o" =~ ^[0-9]+$ ]] && SETUP_SPECS="$SETUP_SPECS $nd:$o"
+  done
+done
+for spec in $SETUP_SPECS; do
   pp=${spec%%:*}; oid=${spec#*:}
   PSQL $pp -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.enable_ddl_propagation TO off;
@@ -661,11 +676,40 @@ check "S1：同一 start_ts 两次读一致（$snap1 = $snap2）" \
       "$([[ -n "$snap1" && "$snap1" == "$snap2" ]] && echo ok)" "ok"
 
 echo "========== [Q] 三态问询三分支 =========="
+# ★★ 2026-08-17 修复 Q 腿两处夹具缺陷（三次 Q3 假红的真正来源）★★
+#
+# 缺陷 1：落点写死 $QNODE（分片 A 的**原始**主）。Q 腿跑在 M4/M5 之后，
+#   那两腿会杀 leader 并触发切主，$QNODE 此时多半已是 follower。往
+#   follower 上 PREPARE 会被任期栅栏正确拒绝：
+#     ERROR: pg_raft: 分区 N(组 G)的本地写入被拒：本节点不是该分区组的 leader
+#   这是**产品的正确行为**，夹具却没跟随切主。
+#
+# 缺陷 2：上面那段 heredoc **没有 ON_ERROR_STOP**，而末尾恒有
+#   `SELECT 'prepared'`，于是无论 PREPARE 成没成功，`tail -1` 都取到
+#   "prepared" ⇒ "Q 前置：in-doubt 就位" **必然 PASS**。一个永远不会失败的
+#   前置检查，把"事务压根不存在"伪装成"事务已就位"，后面 Q1/Q2/Q3 全部
+#   建立在空气上 —— Q3 的"永不收敛"实为无物可收敛。
+#   （与 feedback_test_harness_silent_pass 同类：断言必须有能力失败。）
+#
+# 修法：① 现场重新解析 gid_a 组的当前 leader 作为落点；② 加
+#   ON_ERROR_STOP=1，让 PREPARE 失败直接暴露为前置失败。
+QNODE=""
+for t in $(seq 1 30); do
+  for cand in $pport_a $f1_a $f2_a; do
+    if [[ "$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]]; then
+      QNODE=$cand; break
+    fi
+  done
+  [[ -n "$QNODE" ]] && break
+  sleep 1
+done
+check "Q 前置：找到分片 A 当前 leader（:${QNODE:-无}）" "$([[ -n "$QNODE" ]] && echo ok)" "ok"
+[[ -z "$QNODE" ]] && QNODE=$QNODE      # 兜底，让后续断言以失败形式暴露
 # Q1：槽 start_ts > 读者快照 ⇒ 跳过（不可见、不阻塞）
 DTXQ=$(PSQL $COORD -Atc "SELECT ((9::bigint&255)<<55)|((777::bigint&4194303)<<33)|303" </dev/null)
 SQ=$(PSQL $COORD -Atc "SELECT tso_c_start()" </dev/null)
 GQ=$((SQ + 33000))
-pq=$(PSQL $pport_a -At </dev/null 2>&1 <<SQL
+pq=$(PSQL $QNODE -At -v ON_ERROR_STOP=1 </dev/null 2>&1 <<SQL
 BEGIN;
 SELECT pjoin(${GQ}::bigint, ${SQ}::bigint, ${gid_a}::bigint);
 SET citus.override_table_visibility TO false;
@@ -677,13 +721,32 @@ SQL
 )
 # 事务内取到的 xmin = 该行的**分片 xid**，Q3 取证靠它查分片 clog。
 QXID=$(echo "$pq" | grep -a '^QXID ' | tail -1 | cut -d' ' -f2)
-check "Q 前置：in-doubt 就位" "$(echo "$pq" | tail -1)" "prepared"
+# 双重判据：既要末行是 prepared，又要 pg_prepared_xacts 里真有这笔 —— 只认
+# 前者就是缺陷 2 的老路。
+qprep=$(PSQL $QNODE -Atc "SELECT count(*) FROM pg_prepared_xacts WHERE gid='citus_9_777_303_0'" </dev/null 2>/dev/null | tail -1)
+check "Q 前置：in-doubt 就位（@:$QNODE 实存=$qprep）" \
+      "$([[ "$(echo "$pq" | tail -1)" == "prepared" && "$qprep" == "1" ]] && echo ok)" "ok"
 # ★ 手工 prepared 必须补 note_coord（M3 腿有、Q 腿首版漏了）：清扫/问询
 #   靠 dtx_participant.coord_gsid 寻址协调组，缺它就无从问判决——表现为
 #   决议明明写了、Q3 却永不收敛（60s + 主动 drain 都救不回来）。
-PSQL $pport_a -q -c "SELECT partdist.dtx_note_coord(${DTXQ}, ${gid_a});" </dev/null >/dev/null 2>&1
+PSQL $QNODE -q -c "SELECT partdist.dtx_note_coord(${DTXQ}, ${gid_a});" </dev/null >/dev/null 2>&1
+# ★ 回滚溯源插桩（2026-08-17）：Q3 每次失败都是同一签名 —— PREPARE 后约
+#   0.7 秒该 prepared 事务就被人回滚，COMMIT PREPARED 报 "does not exist"。
+#   已排除 dtx_recover_prepared（30s 年龄门槛）与 Citus 2PC 恢复（已关闭）。
+#   剩余嫌疑需要知道"回滚发生前决议表里有什么"——本轮 decide_retry 还没跑，
+#   此刻若已有 DTXQ 的判决行，那就是跨轮残留（dtxid 每轮复用同一常量）。
+Q3TRACE="/tmp/q3_trace_$$.txt"
+{
+  echo "== T0 PREPARE 完成 + note_coord 之后（本轮尚未写判决）$(date '+%H:%M:%S.%3N') =="
+  echo "  prepared 是否在：$(PSQL $QNODE -Atc "SELECT count(*) FROM pg_prepared_xacts WHERE gid='citus_9_777_303_0'" </dev/null 2>&1 | tail -1)"
+  for cand in $pport_a $f1_a $f2_a; do
+    echo "  :$cand DTXQ 判决行=$(PSQL $cand -Atc "SELECT verdict||'@'||commit_ts FROM partdist.dtx_decision WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)" \
+         "全表行数=$(PSQL $cand -Atc "SELECT count(*) FROM partdist.dtx_decision" </dev/null 2>&1 | tail -1)" \
+         "raft=$(PSQL $cand -Atc "SELECT state||' '||last_log_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>&1 | tail -1)"
+  done
+} > "$Q3TRACE" 2>&1
 t0=$(date +%s)
-qv=$(PSQL $pport_a -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
+qv=$(PSQL $QNODE -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
 t1=$(date +%s)
 check "Q1/Q2：in-doubt 读者不阻塞（$((t1-t0))s）且不可见" \
       "$([[ "$qv" == "0" && $((t1-t0)) -le 5 ]] && echo ok)" "ok"
@@ -691,7 +754,13 @@ check "Q1/Q2：in-doubt 读者不阻塞（$((t1-t0))s）且不可见" \
 CTSQ=$(PSQL $COORD -Atc "SELECT partdist_tso_commit_ts()" </dev/null)
 rq=$(decide_retry $gid_a $DTXQ 1 $CTSQ $pport_a $f1_a $f2_a)
 check "Q3 前置：决议写入" "$rq" "1"
-PSQL $pport_a -q -c "COMMIT PREPARED 'citus_9_777_303_0';" </dev/null >/dev/null 2>&1
+{ echo "== T1 判决已写、COMMIT PREPARED 之前 $(date '+%H:%M:%S.%3N') =="
+  echo "  prepared 是否还在：$(PSQL $QNODE -Atc "SELECT count(*) FROM pg_prepared_xacts WHERE gid='citus_9_777_303_0'" </dev/null 2>&1 | tail -1)"
+  for cand in $pport_a $f1_a $f2_a; do
+    echo "  :$cand DTXQ 判决行=$(PSQL $cand -Atc "SELECT verdict||'@'||commit_ts FROM partdist.dtx_decision WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)"
+  done; } >> "$Q3TRACE" 2>&1
+cp_out=$(PSQL $QNODE -Atc "COMMIT PREPARED 'citus_9_777_303_0';" </dev/null 2>&1 | tail -1)
+echo "== T2 COMMIT PREPARED 返回：$cp_out ==" >> "$Q3TRACE" 2>&1
 # 取值用 PSQLV（PGOPTIONS 传可见性参数）——"SET …; SELECT …" 会把 SET 的
 # 回显混进输出，tail -1 取到 "SET" 而非计数（历轮踩过）。
 # Q 腿跑在 M4（杀过 leader）之后，组可能仍在追平：清扫的问询要落到能应答
@@ -702,8 +771,8 @@ for t in $(seq 1 60); do
   for cand in $pport_a $f1_a $f2_a; do
     PSQL $cand -q -c "SELECT partdist.pg_raft_group_drain_apply(${gid_a}::bigint);" </dev/null >/dev/null 2>&1
   done
-  PSQL $pport_a -q -c "SELECT partdist.dtx_pending_sweep();" </dev/null >/dev/null 2>&1
-  c=$(PSQLV $pport_a -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
+  PSQL $QNODE -q -c "SELECT partdist.dtx_pending_sweep();" </dev/null >/dev/null 2>&1
+  c=$(PSQLV $QNODE -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
   [[ "$c" == "1" ]] && { q3="ok:${t}s"; break; }
   sleep 1
 done
@@ -715,8 +784,8 @@ if [[ -z "$q3" ]]; then
   {
     echo "===== Q3 取证 dtxid=${DTXQ} gid_a=${gid_a} QXID=${QXID} CTSQ=${CTSQ} ====="
     echo "-- 参与登记（寻址靠它）--"
-    echo "  dtx_participant@:$pport_a coord_gsid=$(PSQL $pport_a -Atc "SELECT coalesce(coord_gsid::text,'NULL') FROM partdist.dtx_participant WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)"
-    echo "  dtx_pending_count@:$pport_a =$(PSQL $pport_a -Atc "SELECT partdist.dtx_pending_count()" </dev/null 2>&1 | tail -1)"
+    echo "  dtx_participant@:$QNODE coord_gsid=$(PSQL $QNODE -Atc "SELECT coalesce(coord_gsid::text,'NULL') FROM partdist.dtx_participant WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)"
+    echo "  dtx_pending_count@:$QNODE =$(PSQL $QNODE -Atc "SELECT partdist.dtx_pending_count()" </dev/null 2>&1 | tail -1)"
     echo "-- 逐成员：本地决议行 / dtx_peek 应答 / raft 状态 --"
     for cand in $pport_a $f1_a $f2_a; do
       echo "  :$cand 决议行=$(PSQL $cand -Atc "SELECT verdict||'@'||commit_ts FROM partdist.dtx_decision WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)" \
@@ -724,12 +793,14 @@ if [[ -z "$q3" ]]; then
            "raft=$(PSQL $cand -Atc "SELECT state||' '||last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>&1 | tail -1)"
     done
     echo "-- 分片 clog（判决是否已落账）--"
-    echo "  sclog_full(${OID_A}, ${QXID})@:$pport_a = $(PSQLV $pport_a -Atc "SELECT sclog_full(${OID_A}::oid, ${QXID}::bigint)" </dev/null 2>&1 | tail -1)"
+    oidq=$(PSQLV $QNODE -Atc "SELECT 't47d_${gid_a}'::regclass::oid" </dev/null 2>/dev/null | tail -1)
+    echo "  sclog_full(${oidq}, ${QXID})@:$QNODE = $(PSQLV $QNODE -Atc "SELECT sclog_full(${oidq}::oid, ${QXID}::bigint)" </dev/null 2>&1 | tail -1)"
     echo "-- 可见性判据：读者 start_ts 必须 > commit_ts --"
-    echo "  读者 tso_c_start()=$(PSQL $pport_a -Atc "SELECT tso_c_start()" </dev/null 2>&1 | tail -1)  CTSQ=${CTSQ}"
-    echo "  行可见性 count=$(PSQLV $pport_a -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>&1 | tail -1)"
+    echo "  读者 tso_c_start()=$(PSQL $QNODE -Atc "SELECT tso_c_start()" </dev/null 2>&1 | tail -1)  CTSQ=${CTSQ}"
+    echo "  行可见性 count=$(PSQLV $QNODE -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>&1 | tail -1)"
   } > "$Q3DUMP" 2>&1
-  echo "  [取证] Q3 未收敛 —— 现场已落盘：$Q3DUMP"
+  cat "$Q3TRACE" >> "$Q3DUMP" 2>/dev/null
+  echo "  [取证] Q3 未收敛 —— 现场已落盘：$Q3DUMP（含 T0/T1/T2 回滚溯源）"
 fi
 check "Q3：问询学到判决后可见（$q3）" "${q3%%:*}" "ok"
 
