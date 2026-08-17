@@ -376,9 +376,12 @@ DtxPendingCount(void)
 static int
 dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 {
-	char		sql[768];
-	char		host[NAMEDATALEN] = "";
-	int			port = 0;
+	char		sql[1024];
+#define DTX_INQ_MAX_CAND 8
+	char		hosts[DTX_INQ_MAX_CAND][NAMEDATALEN];
+	int			ports[DTX_INQ_MAX_CAND];
+	int			ncand = 0;
+	int			ci;
 	int			verdict = 0;
 	bool		spi_ok = false;
 
@@ -395,6 +398,20 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 	 */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return 0;
+	/*
+	 * ★ 2026-08-17（R-P4-14）：候选是**协调组全部成员**（primary +
+	 * secondary_nodes），不再只认 partition_map.primary_node。
+	 *
+	 * 原因：本函数按 partition_map 的"登记主"寻址，而 dtx_peek 内部按 raft
+	 * 的 state='leader' 门控 —— 两个"主"的概念不同步。协调组切主后，raft 侧
+	 * 立刻有了新 leader，partition_map 却要走"自选举→上报→group0→回落"才更新；
+	 * 窗口期内问询打到旧主：要么连不上（旧主正是被杀那个），要么连上了但它已
+	 * 不是 leader ⇒ dtx_peek 返回 0 行 ⇒ 判决永远学不到。实测表现为 Q3
+	 * "决议明明写了、60s + 主动 drain 都救不回来"。
+	 *
+	 * primary 仍排在最前（pri=0），命中率最高；失败才依次退到 secondary。
+	 * 全部返 0 时语义不变（保持未决），不引入推定中止。
+	 */
 	snprintf(sql, sizeof(sql),
 			 "SELECT g.gsid, n.hostname, n.port FROM ("
 			 "  SELECT x.gsid FROM ("
@@ -404,36 +421,51 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 			 "    UNION ALL SELECT 2, %lld WHERE %lld > 0"
 			 "  ) x ORDER BY x.pri LIMIT 1) g "
 			 "  JOIN partdist.partition_map p ON p.partition_id = g.gsid "
-			 "  JOIN partdist.node_map n ON n.node_id = p.primary_node",
-			 (long long) dtxid, (long long) coord_gsid, (long long) coord_gsid);
-	if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+			 "  JOIN LATERAL (SELECT 0 AS pri, p.primary_node AS nid "
+			 "                UNION ALL "
+			 "                SELECT 1, s.nid FROM unnest(p.secondary_nodes) AS s(nid)"
+			 "               ) c ON true "
+			 "  JOIN partdist.node_map n ON n.node_id = c.nid "
+			 " ORDER BY c.pri, n.node_id LIMIT %d",
+			 (long long) dtxid, (long long) coord_gsid, (long long) coord_gsid,
+			 DTX_INQ_MAX_CAND);
+	if (SPI_execute(sql, true, DTX_INQ_MAX_CAND) == SPI_OK_SELECT)
 	{
-		bool		isnull;
-		Datum		gd = SPI_getbinval(SPI_tuptable->vals[0],
-									   SPI_tuptable->tupdesc, 1, &isnull);
-		char	   *h = SPI_getvalue(SPI_tuptable->vals[0],
-									 SPI_tuptable->tupdesc, 2);
-		Datum		pd;
-		bool		pnull;
+		uint64		r;
 
-		if (!isnull && h != NULL)
+		for (r = 0; r < SPI_processed && ncand < DTX_INQ_MAX_CAND; r++)
 		{
-			coord_gsid = DatumGetInt64(gd);
-			strlcpy(host, h, sizeof(host));
-			pd = SPI_getbinval(SPI_tuptable->vals[0],
+			bool		isnull;
+			Datum		gd = SPI_getbinval(SPI_tuptable->vals[r],
+										   SPI_tuptable->tupdesc, 1, &isnull);
+			char	   *h = SPI_getvalue(SPI_tuptable->vals[r],
+										 SPI_tuptable->tupdesc, 2);
+			Datum		pd;
+			bool		pnull;
+
+			if (isnull || h == NULL)
+				continue;
+			pd = SPI_getbinval(SPI_tuptable->vals[r],
 							   SPI_tuptable->tupdesc, 3, &pnull);
-			if (!pnull)
-			{
-				port = DatumGetInt32(pd);
-				spi_ok = true;
-			}
+			if (pnull || DatumGetInt32(pd) <= 0)
+				continue;
+			coord_gsid = DatumGetInt64(gd);
+			strlcpy(hosts[ncand], h, NAMEDATALEN);
+			ports[ncand] = DatumGetInt32(pd);
+			ncand++;
+			spi_ok = true;
 		}
 	}
 	SPI_finish();
-	if (!spi_ok || port <= 0 || coord_gsid <= 0)
+	if (!spi_ok || ncand <= 0 || coord_gsid <= 0)
 		return 0;
 
-	/* 2) 只读 peek（leader 门控在函数里；0 行 = 非 leader 或无决议） */
+	/*
+	 * 2) 只读 peek，逐个候选试到学到判决为止（0 行 = 该节点无从应答：非
+	 * leader、或组内也没这条决议）。连不上就换下一个 —— 被杀的旧主正是
+	 * 最常见的第一候选。
+	 */
+	for (ci = 0; ci < ncand && verdict != 1 && verdict != 2; ci++)
 	{
 		char		conninfo[256];
 		PGconn	   *conn;
@@ -442,12 +474,12 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 		snprintf(conninfo, sizeof(conninfo),
 				 "host=%s port=%d dbname=postgres user=postgres "
 				 "connect_timeout=2 options='-c statement_timeout=2000'",
-				 host, port);
+				 hosts[ci], ports[ci]);
 		conn = PQconnectdb(conninfo);
 		if (PQstatus(conn) != CONNECTION_OK)
 		{
 			PQfinish(conn);
-			return 0;
+			continue;
 		}
 		snprintf(sql, sizeof(sql),
 				 "SELECT verdict, commit_ts FROM partdist.dtx_peek(%lld, %lld)",

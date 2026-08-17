@@ -1058,13 +1058,18 @@ LANGUAGE sql VOLATILE AS $fn$
           FROM drained, gate, partdist.dtx_decision d
          WHERE d.dtxid = p_dtxid AND gate.is_leader
     ), peer_row AS (
+        -- R-P4-14：远程回退**不再要求被问节点自己是 leader**。纯增量改动：
+        -- 此前非 leader 一律返回 0 行，现在它会转问组内成员；能答上来的
+        -- 前提仍是"某成员本地有这条决议"，即决议已在多数派上落定。
+        -- 为何安全：决议是一次性的正向事实（写下就不再改），从谁那里读到
+        -- 都等价；返回 0 行的语义（无从判定）也没变，不产生推定中止。
+        -- 为何必要：清扫按 partition_map.primary_node 寻址，切主窗口内它
+        -- 与 raft leader 不同步，旧门控会让整条问询通道哑掉（Q3 实测）。
         SELECT pd.verdict, d2.commit_ts::bigint AS commit_ts
-          FROM gate,
-               LATERAL (SELECT partdist.pg_raft_group_peer_decision(
-                                   p_coord_gsid, p_dtxid) AS verdict) pd
+          FROM (SELECT partdist.pg_raft_group_peer_decision(
+                           p_coord_gsid, p_dtxid) AS verdict) pd
           LEFT JOIN partdist.dtx_decision d2 ON d2.dtxid = p_dtxid
-         WHERE gate.is_leader
-           AND NOT EXISTS (SELECT 1 FROM local_row)
+         WHERE NOT EXISTS (SELECT 1 FROM local_row)
            AND pd.verdict IN (1, 2)
     )
     SELECT verdict, commit_ts FROM local_row
@@ -1073,7 +1078,7 @@ LANGUAGE sql VOLATILE AS $fn$
 $fn$;
 
 COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
-    '只读决议窥视（T4.5）：leader 门控（follower 有 apply 滞后会答错），无决议/非 leader 返回 0 行，绝不写推定中止。';
+    '只读决议窥视（T4.5）：本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14），仍无则返回 0 行，绝不写推定中止。';
 
 -- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
 -- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。

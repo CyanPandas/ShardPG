@@ -573,6 +573,40 @@ for t in $(seq 1 45); do
 done
 
 echo "========== [M5] master(TSO) 不可达 → 事务级 fail-closed =========="
+# ★ M5 取证（2026-08-17 加）：本腿曾观测到 before>after（"4 → 3"，已提交行
+#   变不可见）。怀疑 M4 的切主把 Citus 读路由指到了**回放未追平的副本**。
+#   下面在 before/after 两个时刻各拍一次"路由 + 各副本物理行数"快照，
+#   仅在 after<before 时落盘，不改断言、不影响计数。
+#   ★ 低扰动要求：探针**必须**比被观测的窗口快得多。首版是串行 16 次
+#   docker exec（~6s），等于在 M4 切主后凭空插入沉降时间，把要抓的竞态
+#   本身抹掉了（实测连续 4 轮不复现）。故各节点探测并行发起、统一 wait。
+m5_snapshot() {   # <标签>
+  local tag=$1 g p tmpd
+  tmpd=$(mktemp -d)
+  echo "### $tag  $(date '+%H:%M:%S.%3N')"
+  ( PSQL $COORD -Atc "SELECT 'CNT '||count(*) FROM t47d" </dev/null 2>/dev/null | tail -1 ) > "$tmpd/a" &
+  ( PSQL $COORD -Atc "SELECT 'PLACE '||s.shardid||' -> :'||n.nodeport
+                        FROM pg_dist_shard s
+                        JOIN pg_dist_placement p ON p.shardid=s.shardid
+                        JOIN pg_dist_node n ON n.groupid=p.groupid
+                       WHERE s.logicalrelid='t47d'::regclass
+                       ORDER BY s.shardid" </dev/null 2>/dev/null ) > "$tmpd/b" &
+  ( PSQL $COORD -Atc "SELECT 'PMAP '||partition_id||' primary='||primary_node||' term='||primary_term
+                        FROM partdist.partition_map
+                       WHERE partition_id IN (${gid_a}, ${gid_b})" </dev/null 2>/dev/null ) > "$tmpd/c" &
+  for g in "$gid_a:$pport_a $f1_a $f2_a" "$gid_b:$pport_b $f1_b $f2_b"; do
+    for p in ${g#*:}; do
+      ( echo "SHARD ${g%%:*} @:$p 物理行数=$(PSQLV $p -Atc "SELECT count(*) FROM t47d_${g%%:*}" </dev/null 2>/dev/null | tail -1)" \
+             "raft=$(PSQL $p -Atc "SELECT state||' '||last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${g%%:*}" </dev/null 2>/dev/null | tail -1)" \
+             "回放=$(PSQLV $p -Atc "SELECT armed||' applied='||applied FROM partdist.replay_status() WHERE shard='t47d_${g%%:*}'::regclass" </dev/null 2>/dev/null | tail -1)" ) > "$tmpd/s_${g%%:*}_$p" &
+    done
+  done
+  wait
+  cat "$tmpd"/* 2>/dev/null | sed 's/^/  /'
+  rm -rf "$tmpd"
+}
+M5DUMP="/tmp/m5_eviden_$$.txt"
+m5_before_snap=$(m5_snapshot "M5-before" 2>&1)
 before=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>/dev/null | tail -1)
 PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=59999 dbname=postgres connect_timeout=1';" </dev/null >/dev/null
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
@@ -584,6 +618,11 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 sleep 1
 after=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>/dev/null | tail -1)
+if [[ -n "$before" && -n "$after" && "$after" -lt "$before" ]]; then
+  { echo "===== M5 可见性倒退取证（before=$before after=$after）====="
+    echo "$m5_before_snap"; m5_snapshot "M5-after" 2>&1; } > "$M5DUMP" 2>&1
+  echo "  [取证] before>after —— 现场已落盘：$M5DUMP"
+fi
 check "M5：已提交事务可见性不受影响（$before → $after，只增不减）" \
       "$([[ -n "$before" && -n "$after" && "$after" -ge "$before" ]] && echo ok)" "ok"
 # ★ M5 制造过 TSO fail-closed，可能把 boot 防呆推进拒绝态 —— 立刻复位，
@@ -631,10 +670,13 @@ BEGIN;
 SELECT pjoin(${GQ}::bigint, ${SQ}::bigint, ${gid_a}::bigint);
 SET citus.override_table_visibility TO false;
 INSERT INTO t47d_${gid_a} VALUES (${KA[5]}, 'q');
+SELECT 'QXID '||xmin::text::bigint FROM t47d_${gid_a} WHERE id=${KA[5]};
 PREPARE TRANSACTION 'citus_9_777_303_0';
 SELECT 'prepared';
 SQL
 )
+# 事务内取到的 xmin = 该行的**分片 xid**，Q3 取证靠它查分片 clog。
+QXID=$(echo "$pq" | grep -a '^QXID ' | tail -1 | cut -d' ' -f2)
 check "Q 前置：in-doubt 就位" "$(echo "$pq" | tail -1)" "prepared"
 # ★ 手工 prepared 必须补 note_coord（M3 腿有、Q 腿首版漏了）：清扫/问询
 #   靠 dtx_participant.coord_gsid 寻址协调组，缺它就无从问判决——表现为
@@ -665,6 +707,30 @@ for t in $(seq 1 60); do
   [[ "$c" == "1" ]] && { q3="ok:${t}s"; break; }
   sleep 1
 done
+if [[ -z "$q3" ]]; then
+  # ★ Q3 取证（2026-08-17 加，R-P4-14 收窄后仍有残留失败）：60 秒学不到判决
+  #   时把"判决在哪、问询问到了什么、clog 落到哪一步、读者快照够不够新"
+  #   四件事一次性拍下来，不靠事后回溯（夹具下一轮就清场了）。
+  Q3DUMP="/tmp/q3_eviden_$$.txt"
+  {
+    echo "===== Q3 取证 dtxid=${DTXQ} gid_a=${gid_a} QXID=${QXID} CTSQ=${CTSQ} ====="
+    echo "-- 参与登记（寻址靠它）--"
+    echo "  dtx_participant@:$pport_a coord_gsid=$(PSQL $pport_a -Atc "SELECT coalesce(coord_gsid::text,'NULL') FROM partdist.dtx_participant WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)"
+    echo "  dtx_pending_count@:$pport_a =$(PSQL $pport_a -Atc "SELECT partdist.dtx_pending_count()" </dev/null 2>&1 | tail -1)"
+    echo "-- 逐成员：本地决议行 / dtx_peek 应答 / raft 状态 --"
+    for cand in $pport_a $f1_a $f2_a; do
+      echo "  :$cand 决议行=$(PSQL $cand -Atc "SELECT verdict||'@'||commit_ts FROM partdist.dtx_decision WHERE dtxid=${DTXQ}" </dev/null 2>&1 | tail -1)" \
+           "peek=$(PSQL $cand -Atc "SELECT verdict||'@'||commit_ts FROM partdist.dtx_peek(${gid_a}::bigint, ${DTXQ}::bigint)" </dev/null 2>&1 | tail -1)" \
+           "raft=$(PSQL $cand -Atc "SELECT state||' '||last_log_index||'/'||commit_index||'/'||last_applied FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>&1 | tail -1)"
+    done
+    echo "-- 分片 clog（判决是否已落账）--"
+    echo "  sclog_full(${OID_A}, ${QXID})@:$pport_a = $(PSQLV $pport_a -Atc "SELECT sclog_full(${OID_A}::oid, ${QXID}::bigint)" </dev/null 2>&1 | tail -1)"
+    echo "-- 可见性判据：读者 start_ts 必须 > commit_ts --"
+    echo "  读者 tso_c_start()=$(PSQL $pport_a -Atc "SELECT tso_c_start()" </dev/null 2>&1 | tail -1)  CTSQ=${CTSQ}"
+    echo "  行可见性 count=$(PSQLV $pport_a -Atc "SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>&1 | tail -1)"
+  } > "$Q3DUMP" 2>&1
+  echo "  [取证] Q3 未收敛 —— 现场已落盘：$Q3DUMP"
+fi
 check "Q3：问询学到判决后可见（$q3）" "${q3%%:*}" "ok"
 
 echo "========== [8] 零崩溃（除注入）+ 零丢弃 =========="
