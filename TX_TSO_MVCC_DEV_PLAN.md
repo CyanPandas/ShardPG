@@ -1690,7 +1690,18 @@ R-P4-18 的塌方**。⇒ 对根因的判断成立，"follower 不能配 tso_con
 - 净场残留 raft 组（清 3 剩 1）×1；
 - **回放工作进程 PANIC ×1**（见下条 R-P4-20）。
 
-##### ★ R-P4-20：回放 PANIC 复发，既有守卫挡不住（2026-08-17，**未修，待查**）
+##### ★ R-P4-20：回放 PANIC —— **已知缺陷（2026-08-18 用户裁定：记录在案，先推进 P4 出口清单）**
+
+> **【裁定】2026-08-18**：用户裁定**记为已知缺陷**，不阻塞 P4 出口清单。
+> **出错的位置（一句话）**：副本在崩溃恢复后接着重放数据时，**无法确认自己
+> 手里的表与要重放的数据流是不是同一代**，而整条链路没有任何机制去校验这件事。
+> **风险边界**：崩溃发生在**回放后台进程**，不破坏本轮事务语义（历次崩溃轮
+> 的功能断言全部通过）；进程会自动重启，但可能反复自噬（实测一轮内最多 8 次）。
+> **未闭的一步**：在持久化顺序正确、字节完好（CRC 16 轮零失败）、协议无漏洞的
+> 前提下，表与流究竟在哪个瞬间错开 —— 无答案，不编。
+> **复现难度**：最近约 48 轮一次未现（此前 10 轮 2 次），A/B 对照实验功效不足。
+> **进 P5 前必须重新评估**（见 P4 出口清单末条）。
+
 
 **现象**（worker4 `:5436`，2026-08-17 16:39:10）：
 ```
@@ -1820,16 +1831,179 @@ unlink 仍然存在**，守卫便会误放行。故校验应改为"locmap 记录
 此改动涉及代际标识的写入与持久化，**不宜再凭推断直接改**（本条已有一次
 判据选错的失败），需先确认 relfilenode 的可得性与延迟 unlink 的实际行为。
 
+##### ★ R-P4-23：`rebuild_shard_identity()` 的 DELETE 分支缺悬空过滤（2026-08-18，**已修**）
+
+**这是本轮回归反复无常的真因**，不是夹具问题，也不是清理脚本造成的。
+
+**缺陷**：
+```sql
+DELETE FROM shard_identity si
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_shard s
+    WHERE pg_catalog.to_regclass(
+              pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid = si.local_oid);
+```
+`shard_name()` 会对**每一行** `pg_dist_shard` 求值。只要有一行的 `logicalrelid`
+指向的逻辑表已被删（悬空行），它就抛
+`object_name does not reference a valid relation`，**整个
+`rebuild_shard_identity()` 报废**。
+
+**连锁**：身份重建报废 ⇒ `shard_identity` 建不出来 ⇒
+`local_partition_for_shard()` 返回空 ⇒ 下游取到空变量、SQL 退化成无参调用
+（实测报错表象是 `get_partition_flush_lsn()` "函数不存在"，实为参数为空）
+⇒ **所有依赖分片身份的套件成片失败**，且与它们自身无关。
+
+**为什么此前难以定位**：失败看起来随机且跨套件 —— 环境里只要存在**任何一行**
+悬空 `pg_dist_shard`，当轮所有相关套件就一起红；清掉后又全绿。我一度归因为
+"我的清理脚本清得过狠"，**该推断已收回**。
+
+**同一函数的 INSERT 分支早已修过这个坑**（注释原文："过滤必须**先于** JOIN 的
+shard_name 求值 —— v1 只加 WHERE，实测 planner 仍先求值 shard_name 而炸"），
+用的是 `WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_class)` + **`OFFSET 0`
+优化栅栏**。**DELETE 分支漏了同款防护。**
+
+**修法**：照 INSERT 分支原样补上栅栏（只加 WHERE 不够，planner 仍可能先求值）。
+已部署 9/9。
+
+**实证**：修复前后同环境对照 ——
+| 套件 | 修复前 | 修复后 |
+|---|---|---|
+| test_shard_pagecmp_p1 | 42/7 | **49/0** |
+| test_dtx_convergence_p4 | 34/11 | **45/0** |
+| 七套件合计 | 292/18 | **310/0** |
+两个套件**同时**回到满分，同源确认。
+
+##### ★ 测试体系的环境隔离缺陷（2026-08-18 记，供后续避坑）
+
+本轮为取一组可信数字反复失败多次，根因是**套件之间没有环境隔离**：每个套件都
+假定自己从某个"干净"状态起步，却都不自己建立那个状态，而依赖运行顺序。
+已抓到两个**互相冲突**的需求：`tso_si_p3` 要 TSO 配好且纪元纯净；
+`shard_xid_p1` 的负向用例要 TSO **没**配（有 ts 就触发不了守卫）。靠调顺序无解。
+
+**净场必须覆盖五层**（每一层都是一次失败换来的）：
+1. 宿主机测试进程 —— 批跑外壳未杀干净会继续遍历、与新跑并发；
+2. **容器内数据库会话** —— `docker exec` 派生的 psql 不随宿主机进程死，实测一个
+   `ANALYZE` 持锁挂了 3 小时堵死后续 DROP，而当时宿主机进程表与锁文件都显示"干净"；
+3. GUC（`tso_master`/`tso_conninfo`/`shard_relids`/`shard_safety_mode`）；
+4. TSO 纪元（计数器在共享内存，须重启协调者）；
+5. **各 worker 的本地残表 + 悬空元数据** —— 只查协调者的
+   `pg_dist_partition`/`pg_dist_shard` 会漏，实测九节点残留 47 张夹具表。
+
+**这也解释了历史"634/14 套件"基线为何难以复现**：它多半是在某个特定顺序下取得
+的，而顺序本身从未被记录。
+
 #### P4 出口清单（全部勾掉才进 P5）
 
-- [ ] 崩溃矩阵逐格全绿（里程碑门禁）
-- [ ] 跨分片写事务端到端（提交点=协调者组多数派落盘；ACK 在其后）
-- [ ] 跨分片读一致快照（start_ts 传播；三态问询三分支）
-- [ ] §9.2 四层门禁用例并入基线；禁用项/引用表裁定落档
-- [ ] MARKER/DTX ts 换源完成且双宇宙审计清零（R-P3-2 关闭）
-- [ ] 全量 634（14 套件，含换源重写断言）+ P4 新套件零新增 FAIL
-- [ ] 文档/补丁（0009）/pg-install 成对；pg_raft 变更与流控 #39 处置
-      按用户裁定落档
+**核验时间：2026-08-18。逐条证据见下方"出口核验记要"。**
+
+- [x] **崩溃矩阵逐格全绿（里程碑门禁）** —— **⚠️ 携带已知缺陷勾选**。
+      **【用户裁定 2026-08-18】允许携 R-P4-20 出口。**
+      口径说明：49 项功能断言稳定通过（近 30+ 轮几乎全 49/0），崩溃矩阵
+      M1–M5 / S1 / Q1–Q3 逐格均绿；唯一未闭项是 **R-P4-20**（回放后台进程
+      PANIC，不破坏事务语义，详见该条裁定块）。
+      **本条不是无条件全绿**，进 P5 前须按 R-P4-20 裁定块重新评估。
+- [x] **跨分片写事务端到端**（提交点=协调者组多数派落盘；ACK 在其后）
+      —— T4.5 套件 **45/0**（2026-08-18 复跑）。
+- [x] **跨分片读一致快照**（start_ts 传播；三态问询三分支）
+      —— T4.7 套件 `S1`/`Q1`/`Q2`/`Q3` 四条断言齐备且稳定通过。
+- [x] **§9.2 四层门禁用例并入基线；禁用项/引用表裁定落档**
+      —— T4.6 套件 **20/0**（2026-08-18 复跑），六组用例覆盖禁用项负向、
+      门控关闭放行、放行项正向、安全网（第 1 层）strict 报错、ANALYZE 分叉、
+      引用表现状核查（V3 裁定取证）。
+- [x] **MARKER/DTX ts 换源完成且双宇宙审计清零（R-P3-2 关闭）**
+      —— 换源于 T4.4 完成；**全量审计已做**（见记要），未发现任何跨宇宙比较点。
+- [x] **全量回归零新增 FAIL** —— **【用户裁定 2026-08-18】降格为"本环境
+      7 套件零新增 FAIL"。**
+      降格依据（核验中发现，此前未被记录）：**634/14 套件的基线是跨环境的**。
+      按 `CONTAINER` 变量逐个套件归属：
+      | 目标环境 | 套件数 | 套件 |
+      |---|---|---|
+      | `pg-citus-tx2`（**本环境**） | **7** | dtx_convergence_p4 / dtx_tso_p4 / shard_clog_p2 / shard_gating_p4 / shard_pagecmp_p1 / shard_xid_p1 / tso_si_p3 |
+      | `pg-citus-tx` | 4 | dtx_commit_marker_tx2 / dtx_replay_tx1 / fastpath_divergence_tx4 / promote_catchup_tx3 |
+      | `pg-citus-replay` | 6 | clog_hole_c4 / ddl_fileset_d1 / follower_replay_r1 / freeze_sync_d2 / lazy_replay_l1 / local_wal_conflict / txn_layer_r2 |
+      | `pg-partdist-raft4` | 1 | shard_identity_p0 |
+      | 更早的单节点环境 | 6 | bulk_insert_recovery / corrupt_segment_recovery / crash_recovery / demux_backlog_recovery / enospc_recovery / multi_table_isolation / segment_boundary_lsn / shard_auto_init |
+      而三套 9 节点环境**互斥**（同时只能起一套），故"全量 634"在不拆建环境的
+      前提下无法完整满足。
+      **一次误判留痕**：我最初直接跑了 tests/ 下全部 27 个套件，首个
+      `bulk_insert_recovery` 即报 `Timeout waiting for port 5432` —— 它指向
+      别的环境。**"跑全部"是错的做法**，按 `CONTAINER` 归属筛选才对。
+      **本环境 7 套件实测（2026-08-18 最终跑）：310/0 全绿**
+      | 套件 | 结果 |
+      |---|---|
+      | test_shard_clog_p2 | 64/0 |
+      | test_shard_pagecmp_p1 | 49/0 |
+      | test_shard_xid_p1 | 45/0 |
+      | test_tso_si_p3 | 38/0 |
+      | test_dtx_convergence_p4 | 45/0 |
+      | test_shard_gating_p4 | 20/0 |
+      | test_dtx_tso_p4（T4.7） | **49/0** |
+      | **合计** | **310 / FAIL=0** |
+- [x] **文档/补丁（0009）/pg-install 成对；pg_raft 变更与流控 #39 处置落档**
+      —— 补丁 `0009` 与 `pg-install/bin/postgres` 同在提交 `971da0f`，
+      08-13 之后**未再改动任何内核补丁**，两者无失配；pg_raft 解冻批次
+      #2–#5 与 #39 处置均已逐条落档。
+
+##### 出口核验记要（2026-08-18）
+
+**双宇宙审计（第 5 条）的做法与结论** —— 原文要求"P4 换源前全量重审计"，
+故按**产生端 + 消费端**两侧全查：
+- **产生端**：全仓扫描本地时钟取值点（`GetCurrentTimestamp` 等）。唯一会把
+  本地时钟当 ts 返回的是 `TsoMarkerCommitTs()`，且它以 `tso_configured()`
+  分流 —— 未配置走本地时钟（遗留宇宙），配置了全走 TSO；DTX 决议取号同样
+  "未配置返回 0（决议侧回退本地时钟，遗留宇宙不混）"。**两宇宙在产生端即
+  分离，不靠事后判断数值。** 其余命中点（租约过期、心跳、超时、tick）均为
+  本地时钟自比，不与逻辑值同场。
+- **消费端**：全仓扫描 ts 参与的比较。集中于 `shard_visibility.c` 的可见性
+  判据（`commit_ts < start_ts`）与 `enhanced_clog.c` 的取值（非比较）。
+  **未发现任何一处会让两个宇宙的值同场比较。**
+- **运行时兜底**：T4.5 套件含断言 `决议 cts=TSO 逻辑值（cts < 1e9）` ——
+  本地时钟值约 7×10¹⁷，一旦串线必然翻红。本次 **45/0**，未串。
+⇒ **R-P3-2 关闭。**
+
+
+---
+
+## P5 任务分解（2026-08-18 细化，设计 §6 + §7）
+
+**范围**：分片级 vacuum/GC 全章 + 回卷护栏。
+**骨架**：三个每分片变量 + 一条顺序铁律。
+- `clog_truncate_before` —— 实际截断点，**隐式 freeze 点**、回卷龄的基点；
+- `ShardVacuumXid` —— 两态恢复标记；
+- `VacuumTargetXid` —— 本次目标（由前缀扫描算出）。
+- **顺序铁律**：数据页、索引、堆全部清完，才许动 clog。
+
+**现状盘点（动手前实测）**：三变量与截断能力**尚未存在**（全仓无
+`clog_truncate_before` / `ShardVacuumXid` / `VacuumTargetXid`）；分片 clog 现有
+API 只到落账/读状态/认领/删表（`ShardClogSetRunning|SetVerdict|SetPrepared|
+ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
+`ShardClogClaimRange` 是 §6.6 无主 RUNNING 认领，P2 已完成。
+
+| 任务 | 内容 | 验收 |
+|---|---|---|
+| **T5.1** | 三变量与持久化：新增每分片 `clog_truncate_before`/`ShardVacuumXid`，走 CTRL 记录写进分片流 + checkpoint 收口 | 崩溃重启后两水位正确恢复；不变式 `clog_truncate_before ≤ ShardVacuumXid ≤ VacuumTargetXid` 恒成立 |
+| **T5.2** | 前缀扫描算 `VacuumTargetXid`：COMMITTED 且 `commit_ts < GlobalSafeTs` 放行、**ABORTED 也放行**、遇 RUNNING/PREPARED/`commit_ts ≥ GlobalSafeTs` 即停 | 含 ABORTED 的前缀能推进；RUNNING 阻挡时停在其前一条 |
+| **T5.3** | **页面三类动作（主体）**：① 删中止 xmin 的元组；② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段）；③ **xmax 消毒**（截断点以下的 ABORTED 与 lock-only xmax 清成 0） | §6.4 三类动作注入测试。每类对应一个正确性陷阱：①不做⇒截断后**幽灵行复活**；③不做⇒**活行被判死** |
+| **T5.4** | 截断 + 顺序铁律落地 | 注入"页未清完就截断"必须被拦 |
+| **T5.5** | 两态恢复：趟中崩溃整趟重来（幂等）；趟完未截断只补截断 | §6.5 两态恢复 |
+| **T5.6** | 回卷护栏两阶段：基点取 `clog_truncate_before`（非 `ShardVacuumXid` —— 后者在"趟完未截断"崩溃窗口跑在前面，算出的龄偏小、**方向不安全**）；阶段 1 到龄强制启动、**无视常规 vacuum 开关**；阶段 2 达 2³¹−边距时**该分片进只读**（分片粒度，不殃及节点/集群） | age 护栏触发。硬约束：超龄 RUNNING 可按策略强杀，**PREPARED 未决绝不允许单方中止**，只能走协调组决议 |
+| **T5.7** | 出口回归 | 本环境 7 套件 + P5 新套件零新增 FAIL |
+
+**可复用的既有设施（T5.1 动手前已勘察）**：
+- **CTRL 通道现成**：`PARTWAL_FLAG_CTRL` + `rmid=0xFF` 哨兵 + `info=opcode`，
+  已有 `FILESET_UPDATE(0x01)` / `FREEZE_UPDATE(0x02)`。
+  产生端 `PartWALAppendCtrl(partition_id, opcode, payload, len)`
+  （`include/partwal_sync.h:134`，用例见 `wal/shard_fileset.c:544`）；
+  应用端 `ApplyCtrlRecord`（`replay/shard_replay.c:~1240`）按 `hdr->info` 分派。
+  **按设计原文复用 `FREEZE_UPDATE` 通道换语义**，不新增 opcode。
+- **checkpoint 有向后兼容先例**：`ShardApplyCheckpoint` 现为版本 3，注释写明
+  "`nxidmap == 0` 时新算法与旧的逐字节等价，R1 时代的 checkpoint 继续有效"
+  —— 加水位字段照此办理，不必升版本破坏旧文件。
+- **复制部分很轻（§6.7）**：vacuum **只在 leader 执行**，页面修改本身走 parwal
+  流被 follower 逐字节回放，follower 不跑自己的 vacuum；"页在前、截断在后"由
+  **流序自动保证**，无需额外协议。
+
+**预判需要用户裁定的点**：T5.3（heapam 冻结路径）与 T5.6（发号拒绝）可能触及
+内核补丁与 pg_raft 解冻，到该步先问。
 
 ---
 

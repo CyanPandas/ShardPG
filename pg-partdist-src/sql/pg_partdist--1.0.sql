@@ -414,9 +414,23 @@ BEGIN
     GET DIAGNOSTICS n = ROW_COUNT;
 
     -- 清理已不在本节点的分片(表被删/迁走);to_regclass 不受分片隐藏影响。
+    --
+    -- ★ 2026-08-18：本条**漏了 INSERT 分支同款的悬空过滤**，实测因此报废。
+    -- 悬空的 pg_dist_shard 行（logicalrelid 指向的逻辑表已被删）会让
+    -- shard_name() 抛 "object_name does not reference a valid relation"，
+    -- 而它在 NOT EXISTS 子查询里对**每一行** pg_dist_shard 求值 ⇒ 整个
+    -- rebuild_shard_identity() 报废 ⇒ shard_identity 建不出来 ⇒
+    -- local_partition_for_shard() 返回空 ⇒ 下游连锁（实测 pagecmp_p1 7 条、
+    -- dtx_convergence_p4 11 条同源失败）。
+    -- 修法与 INSERT 分支一致：先用 OFFSET 0 优化栅栏把悬空行滤掉，再让
+    -- shard_name 求值。**只加 WHERE 不够** —— planner 仍可能先求值 shard_name
+    -- （INSERT 分支的 v1 就栽在这里，注释已记）。
     DELETE FROM shard_identity si
      WHERE NOT EXISTS (
-         SELECT 1 FROM pg_catalog.pg_dist_shard s
+         SELECT 1
+           FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
+                  WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
+                  OFFSET 0) s
           WHERE pg_catalog.to_regclass(
                     pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid = si.local_oid);
 
