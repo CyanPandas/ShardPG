@@ -30,6 +30,7 @@
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
 
+#include "utils/pg_crc.h"        /* R-P4-20：redo 前校验记录 CRC */
 #include "access/clog.h"            /* ExtendCLOG（§13 约束 4） */
 #include "access/commit_ts.h"       /* ExtendCommitTs */
 #include "access/heapam_xlog.h"
@@ -634,6 +635,83 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                                    "PANIC: invalid max offset number（R-P4-20）。")));
                 return;         /* 跳过本条，游标由调用方推进 */
             }
+        }
+    }
+
+    /*
+     * ★ R-P4-20 完整性校验（2026-08-18）
+     *
+     * 本模块此前把段文件里的字节直接当 XLogRecord 交给 redo：
+     * DecodeXLogRecord 只校验**结构**（块引用与各段长度是否自洽），
+     * 既不校验 CRC，也不校验记录主体数据 —— 而 xl_heap_insert.offnum
+     * 恰恰在主体数据里。PostgreSQL 自己的回放路径是校验 CRC 的，这里绕过了。
+     *
+     * 这道校验有两个作用：
+     *   ① 健壮性：外来字节进 redo 前先验完整性，本就该有（独立于本次崩溃）；
+     *   ② 判据：CRC 通过 ⇒ 记录是主副本真实写出来的 ⇒ 崩溃属"流与本地关系
+     *      不同代"；CRC 失败 ⇒ 字节损坏或读偏 ⇒ 属读取路径缺陷。
+     *      两者修法完全不同，这一位就能定案。
+     */
+    {
+        pg_crc32c   crc;
+
+        INIT_CRC32C(crc);
+        COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord,
+                    record->xl_tot_len - SizeOfXLogRecord);
+        COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
+        FIN_CRC32C(crc);
+
+        if (!EQ_CRC32C(record->xl_crc, crc))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_partdist replay [R-P4-20]: 记录 CRC 校验失败，跳过"
+                            "（shard %u plsn=%llu rmid=%u info=0x%02x tot_len=%u）",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            (unsigned) record->xl_rmid,
+                            (unsigned) (record->xl_info & ~XLR_INFO_MASK),
+                            (unsigned) record->xl_tot_len),
+                     errdetail("段流字节与其自带校验和不符：字节损坏或读取定位错误。"
+                               "继续 redo 会把损坏内容写进本地关系。")));
+            return;             /* 跳过本条，游标由调用方推进 */
+        }
+    }
+
+    /*
+     * ★ R-P4-20 精确前置陷阱（2026-08-17）
+     *
+     * PANIC 的判据（heapam.c heap_xlog_insert）是：
+     *     if (isinit) { XLogInitBufferForRedo(); PageInit(page,...,0); }
+     *     if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum) PANIC;
+     * isinit 时 PageInit 把页清空 ⇒ max offset = 0 ⇒ 只有 offnum >= 2 才炸。
+     * 而"带 INIT_PAGE 的 INSERT"按定义就是该页的**第一条**插入，offnum 应恒为
+     * FirstOffsetNumber(1)。offnum >= 2 意味着这条记录与它自称的 INIT 语义
+     * 自相矛盾 —— 要么流与本地关系不同代，要么记录被错误解码。
+     *
+     * 这里把 offnum 取出来打进日志（这是判定"不同代"还是"解码错"的唯一
+     * 判别量），并**跳过该条**以免不可捕获的 PANIC 把整节点带走。
+     * 注意：这是**遏制**，不是根因修复 —— 根因是"这种记录为何会出现"。
+     */
+    if (record->xl_rmid == RM_HEAP_ID &&
+        (record->xl_info & XLOG_HEAP_INIT_PAGE) != 0 &&
+        (record->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT)
+    {
+        xl_heap_insert *ins = (xl_heap_insert *) XLogRecGetData(ctx->reader);
+
+        if (ins->offnum != FirstOffsetNumber)
+        {
+            ereport(WARNING,
+                    (errmsg("pg_partdist replay [R-P4-20]: INIT_PAGE 的 INSERT 却带 "
+                            "offnum=%u（应为 1），跳过该记录"
+                            "（shard %u plsn=%llu 数据长度=%u）",
+                            (unsigned) ins->offnum,
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            (unsigned) XLogRecGetDataLen(ctx->reader)),
+                     errdetail("INIT_PAGE 表示该页由本条记录初始化，其插入位置必然是 1。"
+                               "offnum>=2 与之矛盾：流与本地关系不同代，或记录解码有误。"
+                               "继续 redo 会触发不可捕获的 PANIC: invalid max offset number。")));
+            return;             /* 跳过本条，游标由调用方推进 */
         }
     }
 
