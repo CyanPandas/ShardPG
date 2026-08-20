@@ -1982,7 +1982,7 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 | 任务 | 内容 | 验收 |
 |---|---|---|
 | **T5.1** ✅ | 三变量与持久化 —— **已完成（2026-08-18，验收 7/0）** | 见下方实施记要 |
-| **T5.2** | 前缀扫描算 `VacuumTargetXid`：COMMITTED 且 `commit_ts < GlobalSafeTs` 放行、**ABORTED 也放行**、遇 RUNNING/PREPARED/`commit_ts ≥ GlobalSafeTs` 即停 | 含 ABORTED 的前缀能推进；RUNNING 阻挡时停在其前一条 |
+| **T5.2** ✅ | 前缀扫描算 `VacuumTargetXid` —— **已完成（2026-08-18，验收 6/0）** | 见下方实施记要 |
 | **T5.3** | **页面三类动作（主体）**：① 删中止 xmin 的元组；② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段）；③ **xmax 消毒**（截断点以下的 ABORTED 与 lock-only xmax 清成 0） | §6.4 三类动作注入测试。每类对应一个正确性陷阱：①不做⇒截断后**幽灵行复活**；③不做⇒**活行被判死** |
 | **T5.4** | 截断 + 顺序铁律落地 | 注入"页未清完就截断"必须被拦 |
 | **T5.5** | 两态恢复：趟中崩溃整趟重来（幂等）；趟完未截断只补截断 | §6.5 两态恢复 |
@@ -2055,6 +2055,51 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 **未做的部分（留给后续任务）**：设计 §6.7 要求两水位作为 CTRL 记录写进分片流
 供 follower 同步。本任务只完成**本地持久化与恢复**；复制部分待 T5.4 截断落地时
 一并做（那时才有真实的水位推进事件可复制）。
+
+#### T5.2 实施记要（2026-08-18，验收 **6/0**）
+
+**实现**：`ShardVacuumComputeTarget(shard, from, safe_ts, ceiling, &stop_reason)`
+（`src/shard_clog.c`）。从 `clog_truncate_before` 起顺扫，返回可安全截断到的
+**前一条**；`InvalidTransactionId` = 一条都不能清。`stop_reason` 回填停因供
+验收与排障。
+
+**要害规则：ABORTED 一律放行。** 这是设计 §6.3 里最反直觉的一条 —— 若 ABORTED
+也挡，**一个中止事务就能永久钉死截断，直到回卷死亡**。它留下的垃圾由 §6.4 的
+页面三类动作清掉，不靠"挡住前缀"来保证。
+
+**停止条件**：RUNNING（未决）/ PREPARED（2PC 未决，**绝不单方推定**）/
+COMMITTED 但 `commit_ts >= GlobalSafeTs`（仍可能被活跃快照看到）。
+稀疏空洞读不出槽时按 RUNNING 处理 —— 空洞不代表"没有这个事务"，只代表判决
+没写下来（`shard_clog.h` 头注释的既有约定）。
+
+##### ★ 实现中发现的两处约束
+
+**其一：`partdist_global_safe_ts()` 只在 TSO master 上可用**（非 master 直接
+ERROR），而 vacuum 跑在**分片 leader（worker）**上，本地读不到。
+⇒ 新增 `TsoGetGlobalSafeTs()`（`src/tso_client.c`），走现成的 `tso_rpc` 通道
+（与 start_ts / commit_ts / 决议取号同一条路）。
+**取不到时返回 0 = 什么都不清**：GlobalSafeTs 偏小只会少清垃圾（安全方向），
+偏大才会误删活跃快照仍需要的版本，故不回退到任何本地估计值。
+
+**其二：`commit_ts = 0` 的 COMMITTED 槽会挡住前缀。**
+判据是 `commit_ts > 0 && commit_ts < safe_ts`，所以 P2 时代遗留、或 T4.4 换源
+前写下的 `commit_ts=0` 的已提交槽，会被判为"不放行"而永久阻挡截断。
+**这是已知边界，本任务不处理** —— 换源已在 T4.4 完成，新数据不再产生此形态；
+存量清理需要一次性迁移，留待 T5.7 出口前评估。
+
+##### T5.2 验收明细（6/0，safe_ts=1000）
+
+| # | 场景 | 期望 | 结果 |
+|---|---|---|---|
+| ① | 全 COMMITTED 且 ts 够旧 | 扫到上界，`scanned-to-ceiling` | PASS |
+| ② | **中间夹 ABORTED** | 仍推进，`scanned-to-ceiling` | PASS |
+| ③ | `commit_ts >= safe_ts` | 停在前一条，`commit-ts-too-new` | PASS |
+| ④ | RUNNING 阻挡 | 停在前一条，`running` | PASS |
+| ⑤ | PREPARED 阻挡 | 停在前一条，`prepared` | PASS |
+| ⑥ | `safe_ts = 0`（取不到） | 一条都不清，`no-safe-ts` | PASS |
+
+**新增的验收辅助**：`sclog_wts(oid, xid, status, ts)` —— 既有的
+`sclog_write()` 只写 status、`commit_ts` 恒 0，无法构造"带时间戳的已提交槽"。
 
 **预判需要用户裁定的点**：T5.3（heapam 冻结路径）与 T5.6（发号拒绝）可能触及
 内核补丁与 pg_raft 解冻，到该步先问。

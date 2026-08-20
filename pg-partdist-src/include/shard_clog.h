@@ -104,6 +104,19 @@ extern void ShardClogXactRedo(int nxids, const uint32 *pairs,
 							  uint64 commit_ts, bool committed);
 
 /* ---- DROP TABLE 生命周期（提交时点 GC）---- */
+/*
+ * T5.2（设计 §6.3）：前缀扫描算 VacuumTargetXid。
+ * 从 from 起顺扫至 ceiling（不含），返回可安全截断到的**前一条**；
+ * InvalidTransactionId = 一条都不能清。stop_reason 非 NULL 时回填停因，
+ * 供验收与排障（scanned-to-ceiling / no-safe-ts / hole-running /
+ * commit-ts-too-new / prepared / running）。
+ * **ABORTED 放行**是本规则要害：挡住它会让一个中止事务永久钉死截断。
+ */
+extern TransactionId ShardVacuumComputeTarget(Oid shard, TransactionId from,
+											  int64 safe_ts,
+											  TransactionId ceiling,
+											  const char **stop_reason);
+
 extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);
 extern void ShardClogAtCommit(void);	/* 执行挂起的删除 */

@@ -424,6 +424,25 @@ TsoGetStartTs(void)
 }
 
 /*
+ * T5.2：取 GlobalSafeTs（vacuum 前缀扫描的判据，设计 §6.2/§6.3）。
+ *
+ * 为什么必须走 RPC：`partdist_global_safe_ts()` 在 master 之外直接 ERROR，
+ * 而 vacuum 跑在**分片 leader（worker）**上 —— 本地读不到。
+ *
+ * 为什么"偏小是安全方向"：GlobalSafeTs 是"没有任何活跃快照会看到更早提交"
+ * 的下界。取到偏小的值 ⇒ 前缀扫描更早停下 ⇒ 少清一点垃圾，正确性不受损；
+ * 取到偏大才危险（会把仍被活跃快照需要的版本判为可回收）。故 RPC 失败时
+ * **返回 0 = 什么都别清**，而不是回退到某个本地估计值。
+ */
+int64
+TsoGetGlobalSafeTs(void)
+{
+	if (!tso_configured())
+		return 0;				/* 遗留模式：无 TSO 宇宙，不清 */
+	return tso_rpc("SELECT partdist_global_safe_ts()", "global_safe_ts");
+}
+
+/*
  * PRE_COMMIT 暂存 commit_ts（临界区外的最后落点，"尽晚取"）。
  * 已暂存或遗留模式则跳过。R-P3-1 第一道防线：这里 ERROR = 事务干净中止。
  */

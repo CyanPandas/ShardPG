@@ -15,6 +15,7 @@
 #include "shard_xid.h"
 
 #include "access/transam.h"
+#include "funcapi.h"			/* T5.2 SQL 包装：复合返回 */
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -483,6 +484,153 @@ partdist_shard_clog_write(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("status 只接受 0(RUNNING)/2(COMMITTED)/3(ABORTED)，"
 							"PREPARED 是 P4 的事")));
+	}
+	PG_RETURN_VOID();
+}
+
+/* ================= T5.2 前缀扫描：算 VacuumTargetXid（设计 §6.3）=================
+ *
+ * 从 clog_truncate_before 起顺扫本分片 clog，返回可安全截断到的**前一条**。
+ *
+ * 放行（可越过）：
+ *   · COMMITTED 且 commit_ts < GlobalSafeTs —— 没有活跃快照还需要它之前的版本；
+ *   · **ABORTED 一律放行** —— 这是本规则最反直觉、也最要紧的一条。若 ABORTED
+ *     也挡，**一个中止事务就能永久钉死截断，直到回卷死亡**；它留下的垃圾由
+ *     §6.4 的页面三类动作清掉，不需要靠挡住前缀来保证。
+ *
+ * 停止（VacuumTargetXid = 其前一条）：
+ *   · RUNNING —— 未决，之后的判决还没写；
+ *   · PREPARED —— 2PC 未决，**绝不允许单方推定**；
+ *   · COMMITTED 但 commit_ts >= GlobalSafeTs —— 仍可能被活跃快照看到。
+ *
+ * 可证性质（设计原文备查）：RUNNING 阻挡者之上不存在 commit_ts < GlobalSafeTs
+ * 的条目（start_ts 先于首写、首写序即落账序、TSO 单调，三段传递）。故前缀规则
+ * 在 RUNNING 阻挡下几乎无损，损失的只是阻挡点之上 ABORTED 事务的垃圾。
+ * "死元组清除与前缀截断解耦"记为后续优化，第一期不做。
+ *
+ * 返回 InvalidTransactionId 表示"一条都不能清"（含 safe_ts 取不到的情形）。
+ */
+TransactionId
+ShardVacuumComputeTarget(Oid shard, TransactionId from, int64 safe_ts,
+						 TransactionId ceiling, const char **stop_reason)
+{
+	TransactionId xid;
+	TransactionId last_ok = InvalidTransactionId;
+
+	if (stop_reason != NULL)
+		*stop_reason = "scanned-to-ceiling";
+
+	/*
+	 * safe_ts <= 0：取不到 GlobalSafeTs（未配置 TSO / RPC 失败）。**什么都不清**
+	 * —— 见 TsoGetGlobalSafeTs 的注释，偏小安全、取不到就别动。
+	 */
+	if (safe_ts <= 0)
+	{
+		if (stop_reason != NULL)
+			*stop_reason = "no-safe-ts";
+		return InvalidTransactionId;
+	}
+
+	if (!TransactionIdIsValid(from) || from < FIRST_SHARD_XID)
+		from = FIRST_SHARD_XID;
+
+	for (xid = from; xid < ceiling; xid++)
+	{
+		ShardClogSlot slot;
+
+		if (!ShardClogReadSlot(shard, xid, &slot))
+		{
+			/*
+			 * 读不出槽 = 稀疏空洞 = 全零 = TXN_RUNNING（见 shard_clog.h 头注释）。
+			 * 未决即停 —— 空洞不代表"没有这个事务"，只代表判决没写下来。
+			 */
+			if (stop_reason != NULL)
+				*stop_reason = "hole-running";
+			break;
+		}
+
+		if (slot.status == TXN_ABORTED)
+		{
+			last_ok = xid;		/* ★ ABORTED 放行（见上方说明） */
+			continue;
+		}
+		if (slot.status == TXN_COMMITTED)
+		{
+			if ((int64) slot.commit_ts > 0 && (int64) slot.commit_ts < safe_ts)
+			{
+				last_ok = xid;
+				continue;
+			}
+			if (stop_reason != NULL)
+				*stop_reason = "commit-ts-too-new";
+			break;
+		}
+		/* RUNNING / PREPARED */
+		if (stop_reason != NULL)
+			*stop_reason = (slot.status == TXN_PREPARED) ? "prepared" : "running";
+		break;
+	}
+
+	return last_ok;
+}
+
+/* ---- T5.2 SQL 包装：验收观测点 ---- */
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_target);
+Datum
+partdist_shard_vacuum_target(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	int64		safe_ts = PG_GETARG_INT64(1);
+	TransactionId ceiling = (TransactionId) PG_GETARG_INT64(2);
+	TransactionId tb,
+				vx,
+				target;
+	const char *reason = NULL;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	/* 起点 = 当前截断点（设计 §6.3：从 clog_truncate_before 起顺扫） */
+	ShardVacuumGetWatermarks(shard, &tb, &vx);
+	target = ShardVacuumComputeTarget(shard, tb, safe_ts, ceiling, &reason);
+
+	values[0] = Int64GetDatum((int64) target);
+	values[1] = CStringGetTextDatum(reason ? reason : "");
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* ---- T5.2 验收辅助：带 commit_ts 的落账（sclog_write 只写 status，ts 恒 0）---- */
+PG_FUNCTION_INFO_V1(partdist_shard_clog_write_ts);
+Datum
+partdist_shard_clog_write_ts(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	int32		status = PG_GETARG_INT32(2);
+	int64		cts = PG_GETARG_INT64(3);
+
+	switch ((TxnStatus) status)
+	{
+		case TXN_RUNNING:
+			ShardClogSetRunning(shard, sxid, cts);
+			break;
+		case TXN_PREPARED:
+			ShardClogSetPrepared(shard, sxid, cts, 0);
+			break;
+		case TXN_COMMITTED:
+			ShardClogSetVerdict(shard, sxid, true, cts);
+			break;
+		case TXN_ABORTED:
+			ShardClogSetVerdict(shard, sxid, false, cts);
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("status 只接受 0/1/2/3，收到 %d", status)));
 	}
 	PG_RETURN_VOID();
 }

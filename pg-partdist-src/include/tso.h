@@ -49,6 +49,9 @@ extern void TsoInjectStartTs(int64 ts);	/* 注入协调者下发的快照（登�
 extern int64 TsoCurrentGxid(void);		/* 0 = 未加入全局事务 */
 extern int64 TsoCurrentCoordGsid(void);	/* 0 = 未知 */
 
+/* T5.2：worker 侧取 GlobalSafeTs（经 RPC；失败返回 0 = 不清，安全方向） */
+extern int64 TsoGetGlobalSafeTs(void);
+
 /* ---- T3.5 GlobalSafeTs（心跳 bgworker + 栅栏） ---- */
 extern void TsoRegisterHeartbeatWorker(void);
 extern PGDLLEXPORT void TsoHeartbeatWorkerMain(Datum main_arg);
