@@ -2101,6 +2101,76 @@ ERROR），而 vacuum 跑在**分片 leader（worker）**上，本地读不到�
 **新增的验收辅助**：`sclog_wts(oid, xid, status, ts)` —— 既有的
 `sclog_write()` 只写 status、`commit_ts` 恒 0，无法构造"带时间戳的已提交槽"。
 
+#### T5.3 实现方案与补丁清单（2026-08-18 出，**待用户裁定后动手**）
+
+**规模判断：T5.3 与 T5.1/T5.2 不是一个量级。** 前两者是水位持久化与纯计算，
+本任务要**写页面**、**清索引**、**改元组头**，且必然动内核。
+
+##### 一、现状：判有、收无
+
+`0008-shard-vacuum-read-hook.patch` 已装在
+`heapam_visibility.c` 的 `HeapTupleSatisfiesVacuumHorizon`（判定入口），
+但它是 **T2.6 为 ANALYZE 装的"只判不收"钩子**，补丁注释原文写明
+"回收页面动作是 P5"。内核分叉点的注释更直接：
+
+> `remaining reclaim-side callers (prune skipped, VACUUM/CLUSTER/CREATE INDEX
+> intercepted) stay fenced off`
+
+即：回收侧的调用者当前**要么被跳过、要么被禁令拦住**。T5.3 就是把这道封锁
+**有控制地打开** —— 只对分片表、只在 vacuum 自己的通道里开。
+
+现有钩子能产出 LIVE / INSERT_IN_PROGRESS / DELETE_IN_PROGRESS /
+RECENTLY_DEAD / DEAD 五种裁决，且 `RECENTLY_DEAD` 被强制配上
+`ReadNextTransactionId()` 作 `dead_after`，**故意让所有调用者落进保守分支**
+（判而不收）。这一条在 T5.3 里必须改 —— 否则永远收不掉。
+
+##### 二、三类动作的落点与代价
+
+| 动作 | 内核落点 | 能否在扩展内做 | 说明 |
+|---|---|---|---|
+| **① 删中止 xmin 的元组** | `heap_page_prune` / `lazy_scan_prune` | ❌ 需内核 | 现有钩子已能判成 `HEAPTUPLE_DEAD`，但**执行删除**要走 prune 的行指针回收路径 |
+| **② 删死元组 + 索引两阶段** | `lazy_scan_heap` → `lazy_vacuum_all_indexes` → `lazy_vacuum_heap_rel` | ❌ 需内核 | 工作量最大。判据**看 xmax 不看 xmin**（设计 §6.4：没被删过的老行是活的，零页面动作） |
+| **③ xmax 消毒** | `heap_prepare_freeze_tuple` 的 xmax 处置 | ❌ 需内核 | 把截断点以下的 ABORTED 与 lock-only xmax 清成 `InvalidTransactionId` |
+
+**结论：三类动作全部需要内核补丁。** 扩展侧只能提供判据（哪些该删、
+截断点在哪、GlobalSafeTs 是多少），执行必须在内核。
+
+##### 三、补丁清单（建议）
+
+| 补丁 | 内容 | 风险 |
+|---|---|---|
+| **0010-shard-vacuum-reclaim-hook** | 在 `lazy_scan_prune` / `heap_page_prune` 加分片分叉：分片表的死元组判定改问扩展，并**允许回收**（解除 0008 的"永远保守分支"约束） | 中。触及 prune 主路径，误判即丢数据 |
+| **0011-shard-freeze-xmax** | `heap_prepare_freeze_tuple` 的 xmax 分支加分片处置：截断点以下的 ABORTED / lock-only xmax 清零 | 中。冻结路径，改错会让活行被判死 |
+| **0012-shard-vacuum-entry** | 放开 `VACUUM` 对分片表的禁令（当前被 §9.2 第 3 层拦），改为走分片专用通道 | 低。只是解禁 + 路由 |
+
+**为什么不能合成一个补丁**：三者的失败模式完全不同 —— ① 误判丢数据、
+③ 误判活行被判死、⑫ 只是入口。分开才能独立回退与独立验收。
+
+##### 四、必须先解决的前置问题
+
+1. **`RECENTLY_DEAD` 的 `dead_after` 造假**：现有钩子给它配
+   `ReadNextTransactionId()`，目的是把调用者钉在保守分支。T5.3 要收，就得让
+   它携带**真实的分片语义判据**。但 `dead_after` 是原生 xid 类型，分片 xid
+   与它不同宇宙 —— **这是本任务最硬的一处设计冲突，方案未定**。
+2. **索引清理的 TID 有效性**：索引两阶段依赖"收集死 TID → 清索引 → 回收行
+   指针"的顺序，中间不能有并发写入改变页面。分片表的写入走 parwal 复制，
+   vacuum 只在 leader 跑（§6.7），但 **leader 切换会打断这个顺序** —— 需要
+   与 T5.4 的"顺序铁律"一并设计。
+3. **follower 侧的一致性**：vacuum 的页面修改走 parwal 流被 follower 逐字节
+   回放（§6.7），意味着**三类动作产生的每一次页面写入都必须是可复制的**。
+   现有 R-P4-20（回放 PANIC）尚未闭，此处新增大量页面写入会放大它的暴露面。
+
+##### 五、我的建议
+
+**分三步走，而不是一次做完**：
+- **T5.3a**：③ xmax 消毒（补丁 0011）。最独立，不涉及行指针回收与索引，
+  失败模式单一（活行被判死，验收容易构造）。
+- **T5.3b**：① 删中止 xmin 的元组（补丁 0010 的一半）。涉及 prune 但不涉及索引。
+- **T5.3c**：② 死元组 + 索引两阶段（补丁 0010 的另一半 + 0012）。最大、最险，
+  且依赖前置问题 2/3 的结论。
+
+**前置问题 1（`dead_after` 的宇宙冲突）必须先有答案**，否则 T5.3b/c 无从下手。
+
 **预判需要用户裁定的点**：T5.3（heapam 冻结路径）与 T5.6（发号拒绝）可能触及
 内核补丁与 pg_raft 解冻，到该步先问。
 
