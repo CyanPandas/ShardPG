@@ -71,4 +71,17 @@ extern void ShardMvccEnsureWatermarkFile(Oid relid);
  * （P1_PRECHECK 结论 D：原生 clog 会误判分片 xid，重写/回收路径必须封死） */
 extern void ShardXidUtilityGuard(Node *parsetree);
 
+/*
+ * T5.1（设计 §6.1）：分片级 vacuum 两水位。与 alloc/claim 水位同住
+ * $PGDATA/pg_shard_xid/<oid>（16 字节格式，向后兼容读 8/4 字节旧格式）。
+ *   trunc_before —— clog 实际截断点 = 隐式 freeze 点 = 回卷龄基点（§7）；
+ *   vacuum_xid   —— 两态恢复标记：== trunc_before 表示无未完成的趟，
+ *                   > trunc_before 表示"页面趟已完成、截断待补"（§6.5）。
+ * 不变式 trunc_before <= vacuum_xid 在落盘出口统一强制。
+ */
+extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
+									 TransactionId *vacuum_xid);
+extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
+									 TransactionId vacuum_xid);
+
 #endif							/* SHARD_XID_H */

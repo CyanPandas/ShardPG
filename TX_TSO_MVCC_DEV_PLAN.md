@@ -1980,7 +1980,7 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 
 | 任务 | 内容 | 验收 |
 |---|---|---|
-| **T5.1** | 三变量与持久化：新增每分片 `clog_truncate_before`/`ShardVacuumXid`，走 CTRL 记录写进分片流 + checkpoint 收口 | 崩溃重启后两水位正确恢复；不变式 `clog_truncate_before ≤ ShardVacuumXid ≤ VacuumTargetXid` 恒成立 |
+| **T5.1** ✅ | 三变量与持久化 —— **已完成（2026-08-18，验收 7/0）** | 见下方实施记要 |
 | **T5.2** | 前缀扫描算 `VacuumTargetXid`：COMMITTED 且 `commit_ts < GlobalSafeTs` 放行、**ABORTED 也放行**、遇 RUNNING/PREPARED/`commit_ts ≥ GlobalSafeTs` 即停 | 含 ABORTED 的前缀能推进；RUNNING 阻挡时停在其前一条 |
 | **T5.3** | **页面三类动作（主体）**：① 删中止 xmin 的元组；② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段）；③ **xmax 消毒**（截断点以下的 ABORTED 与 lock-only xmax 清成 0） | §6.4 三类动作注入测试。每类对应一个正确性陷阱：①不做⇒截断后**幽灵行复活**；③不做⇒**活行被判死** |
 | **T5.4** | 截断 + 顺序铁律落地 | 注入"页未清完就截断"必须被拦 |
@@ -2001,6 +2001,59 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 - **复制部分很轻（§6.7）**：vacuum **只在 leader 执行**，页面修改本身走 parwal
   流被 follower 逐字节回放，follower 不跑自己的 vacuum；"页在前、截断在后"由
   **流序自动保证**，无需额外协议。
+
+#### T5.1 实施记要（2026-08-18，验收 **7/0**）
+
+**落点选择：扩展既有水位文件，而非另造设施。**
+两个水位并入 `$PGDATA/pg_shard_xid/<oid>`。理由是该文件**本就有格式演进先例**
+（T1.2 的 4 字节 → T2.4 的 8 字节，且兼容读旧格式），且 vacuum 水位与 xid 水位
+本就同源。格式扩为 16 字节：
+`{alloc_wm, claim_wm, clog_truncate_before, shard_vacuum_xid}`（uint32 小端），
+**向后兼容读 8/4 字节**，缺失字段取 0 —— 含义"从未截断、从未 vacuum"，
+**这是安全方向**（免查隐式冻结区为空，所有 xid 照常查 clog，不会把未决当已提交）。
+
+**不变式守在唯一出口**：`clog_truncate_before <= shard_vacuum_xid` 的检查放在
+`shard_xid_persist_watermark()`（落盘的唯一出口），违反即 ERROR 且状态不推进，
+不散在各调用点。
+
+**两水位必须进 shmem 槽位**：落盘函数是**整文件覆写**，任何一次发号/认领落盘
+若不带上它们就会抹成 0。四处既有调用点全部改为原样带回。
+
+**对外接口**：`ShardVacuumGetWatermarks/SetWatermarks` + SQL 包装
+`shard_vacuum_watermarks()` / `shard_vacuum_set_watermarks()`，9/9 部署。
+
+##### ★ 验收中发现并修复的两个真问题
+
+**其一：先改内存后落盘 —— 被拒绝的写照样可见。**
+`ShardVacuumSetWatermarks` 初版先更新槽位、再落盘。落盘处的不变式守卫 ERROR
+时，**槽位已被改脏**，而读接口优先读槽位 ⇒ 本该被拒的 `300/200` 从读接口里
+读得出来。根因：**ERROR 中止事务，但不回滚共享内存**。
+⇒ 改为**先落盘、成功了才更新槽位**。这类"内存先于持久化"的写法在 shmem 上
+一律是错的，已写进代码注释。
+
+**其二：水位文件损坏值被静默当作 xid 发出去。**
+测试中文件被写坏后，损坏值 `858814556` 被当作有效 alloc_wm 直接用于发号 ——
+**新插入行的 xmin 就是这个垃圾数**，且无声无息，一旦发出即污染该分片 xid 空间。
+（坏值是测试造成的，但"读取端零校验"是真实缺口。）
+⇒ 读取端加**合理性校验**：分片 xid 稠密连续分配，正常值远小于 2^30，
+超过 `SHARD_XID_SANITY_MAX` 即判损坏、ERROR 要求人工介入（fail-closed，
+宁可停也不发坏号）。
+
+##### T5.1 验收明细（7/0）
+
+| # | 断言 | 结果 |
+|---|---|---|
+| ① | 新分片初始两水位 0/0 | PASS |
+| ② | 写入 100/200 读回一致 | PASS |
+| ③ | 不变式拒绝 300>200 | PASS |
+| ④ | 被拒后水位未被污染 | PASS |
+| ⑤ | 相等水位合法（无未完成的趟） | PASS |
+| ⑥ | **immediate 崩溃重启后两水位保持**（核心） | PASS |
+| ⑦ | 8 字节旧格式兼容读取 0（安全方向） | PASS |
+
+**未做的部分（留给后续任务）**：设计 §6.7 要求两水位作为 CTRL 记录写进分片流
+供 follower 同步。本任务只完成**本地持久化与恢复**；复制部分待 T5.4 截断落地时
+一并做（那时才有真实的水位推进事件可复制）。
 
 **预判需要用户裁定的点**：T5.3（heapam 冻结路径）与 T5.6（发号拒绝）可能触及
 内核补丁与 pg_raft 解冻，到该步先问。

@@ -13,6 +13,7 @@
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
+#include "funcapi.h"			/* T5.1 SQL 包装：复合类型返回 */
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -57,12 +58,27 @@ static ShardRelidsCfg *shard_relids_cfg = NULL; /* 当前生效的解析结果 *
 
 /* ---- T1.2：共享内存发号器 ---- */
 
+/*
+ * T5.1：水位合理性上限。分片 xid 稠密连续分配，正常运行中远达不到 2^30；
+ * 取它作阈值既留足余量，又能拦住绝大多数损坏形态（含把 ASCII 文本当整数
+ * 读出来的情况 —— 实测 '\\x' 序列被读成 858814556，正落在该区间之上）。
+ */
+#define SHARD_XID_SANITY_MAX	((TransactionId) 0x40000000)
+
 typedef struct ShardXidSlot
 {
 	Oid			shard_relid;	/* InvalidOid = 空槽 */
 	TransactionId next_xid;		/* 下一个待发 */
 	TransactionId watermark;	/* 已持久化上界：所有已发号 < watermark */
 	TransactionId claim_wm;		/* T2.4 认领水位：< 它的历史号已全部认领过 */
+	/*
+	 * T5.1 vacuum 两水位（设计 §6.1）。放进槽位而不是每次读文件，是因为
+	 * shard_xid_persist_watermark() 是**整文件覆写** —— 任何一次发号/认领
+	 * 落盘若不带上它们，就会把它们抹成 0（免查区凭空消失，虽方向安全但
+	 * 等于白做一次 vacuum）。槽位是内存权威副本，建槽时从文件载入。
+	 */
+	TransactionId trunc_before;	/* clog 实际截断点 = 隐式 freeze 点 */
+	TransactionId vacuum_xid;	/* 两态恢复标记，>= trunc_before */
 } ShardXidSlot;
 
 /*
@@ -367,23 +383,45 @@ ShardXidLookupByOid(Oid reloid)
 
 /*
  * 水位文件：$PGDATA/pg_shard_xid/<oid>。
- * T2.4 起 8 字节小端 {uint32 alloc_wm, uint32 claim_wm}；兼容读 4 字节旧
- * 格式（缺 claim_wm 按 FIRST_SHARD_XID = 全量补认领，安全方向）。
+ *
+ * 格式演进（每次都保持**向后兼容读**，缺失字段一律取"安全方向"的值）：
+ *   T1.2  4 字节： {alloc_wm}
+ *   T2.4  8 字节： {alloc_wm, claim_wm}
+ *   T5.1 16 字节：{alloc_wm, claim_wm, clog_truncate_before, shard_vacuum_xid}
+ * 全部 uint32 小端。
+ *
  * 崩溃语义：alloc_wm 是"已授权发放的上界"，重启从它续发 —— 最多跳
  * SHARD_XID_BATCH 个号，绝不重发（DEV PLAN T1.2 的"跳号无害"裁定）；
  * claim_wm 之下的历史号已全部认领过（RUNNING 已改判 ABORTED）。
+ *
+ * T5.1 两个 vacuum 水位（设计 §6.1）：
+ *   clog_truncate_before —— 本分片 clog 实际截断到哪；**隐式 freeze 点**，
+ *                           也是回卷龄的基点（设计 §7 明确：基点必须是它而
+ *                           不是 shard_vacuum_xid，否则"趟完未截断"崩溃窗口
+ *                           里龄会被算小，方向不安全）；
+ *   shard_vacuum_xid     —— 两态恢复标记（设计 §6.5）：等于
+ *                           clog_truncate_before 表示"无未完成的趟"；大于它
+ *                           表示"页面趟已完成、截断尚未做"，重启只补截断。
+ * 缺失时两者均取 0 —— 含义是"从未截断、从未 vacuum"，**这是安全方向**：
+ * 免查隐式冻结区为空，所有 xid 都要正常查 clog，不会把未决当已提交。
  */
 static void
 shard_xid_read_wm_file(Oid shard, TransactionId *alloc_wm,
-					   TransactionId *claim_wm)
+					   TransactionId *claim_wm,
+					   TransactionId *trunc_before,
+					   TransactionId *vacuum_xid)
 {
 	char		path[MAXPGPATH];
 	int			fd;
-	uint32		v[2];
+	uint32		v[4];
 	int			r;
 
 	*alloc_wm = 0;
 	*claim_wm = 0;
+	if (trunc_before != NULL)
+		*trunc_before = 0;
+	if (vacuum_xid != NULL)
+		*vacuum_xid = 0;
 
 	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -399,6 +437,17 @@ shard_xid_read_wm_file(Oid shard, TransactionId *alloc_wm,
 	r = read(fd, v, sizeof(v));
 	if (r == (int) sizeof(v))
 	{
+		/* T5.1 起的 16 字节完整格式 */
+		*alloc_wm = (TransactionId) v[0];
+		*claim_wm = (TransactionId) v[1];
+		if (trunc_before != NULL)
+			*trunc_before = (TransactionId) v[2];
+		if (vacuum_xid != NULL)
+			*vacuum_xid = (TransactionId) v[3];
+	}
+	else if (r == (int) (2 * sizeof(uint32)))
+	{
+		/* T2.4 的 8 字节格式：两个 vacuum 水位缺席 ⇒ 取 0（从未截断） */
 		*alloc_wm = (TransactionId) v[0];
 		*claim_wm = (TransactionId) v[1];
 	}
@@ -417,19 +466,63 @@ shard_xid_read_wm_file(Oid shard, TransactionId *alloc_wm,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("无法关闭分片 xid 水位文件 \"%s\": %m", path)));
+
+	/*
+	 * ★ T5.1 加固：读回的水位做**合理性校验**，而不是照单全收。
+	 *
+	 * 实测暴露：文件字节损坏时（本轮是人为写坏），损坏值会被当作有效水位
+	 * 直接用于发号 —— 新行的 xmin 直接变成那个垃圾数（实测 858814556）。
+	 * 一旦发出去就污染了该分片的 xid 空间，且无声无息。
+	 *
+	 * 校验依据：分片 xid 是**稠密连续分配**的（设计 §5.2），alloc_wm 只可能
+	 * 由本节点一次次 +SHARD_XID_BATCH 推上去。真实值远小于 2^31；一个落在
+	 * 高位区间的值只可能来自损坏。这里不追求精确边界，只拦"显然不可能"的，
+	 * fail-closed：宁可报错要求人工介入，也不静默发出坏号。
+	 */
+	if (*alloc_wm >= SHARD_XID_SANITY_MAX || *claim_wm >= SHARD_XID_SANITY_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("分片 xid 水位文件 \"%s\" 的水位值不合理"
+						"（alloc_wm=%u claim_wm=%u，上限 %u）",
+						path, *alloc_wm, *claim_wm,
+						(uint32) SHARD_XID_SANITY_MAX),
+				 errdetail("分片 xid 稠密连续分配，正常值远小于该上限；"
+						   "此形态只可能来自文件损坏。"),
+				 errhint("继续使用会把损坏值当分片 xid 发出去，污染该分片的 "
+						 "xid 空间（实测新行 xmin 直接变成垃圾数）。")));
 }
 
 static void
 shard_xid_persist_watermark(Oid shard, TransactionId alloc_wm,
-							TransactionId claim_wm)
+							TransactionId claim_wm,
+							TransactionId trunc_before,
+							TransactionId vacuum_xid)
 {
 	char		tmppath[MAXPGPATH];
 	char		path[MAXPGPATH];
 	int			fd;
-	uint32		v[2];
+	uint32		v[4];
+
+	/*
+	 * T5.1 不变式（设计 §6.5）：clog_truncate_before <= shard_vacuum_xid。
+	 * 破坏它意味着"截断点跑到了 vacuum 进度前面" —— 免查区会覆盖尚未清理
+	 * 垃圾的 xid，中止事务的幽灵行会复活。故在**落盘这唯一出口**上守住，
+	 * 而不是散在各调用点（fail-closed：宁可 ERROR 也不写下坏水位）。
+	 */
+	if (TransactionIdIsValid(trunc_before) && TransactionIdIsValid(vacuum_xid) &&
+		trunc_before > vacuum_xid)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("分片 %u 的 vacuum 水位不变式被破坏："
+						"clog_truncate_before=%u > shard_vacuum_xid=%u",
+						shard, trunc_before, vacuum_xid),
+				 errdetail("截断点不得越过 vacuum 进度，否则免查隐式冻结区会"
+						   "覆盖尚未清理垃圾的 xid（设计 §6.4/§6.5）。")));
 
 	v[0] = (uint32) alloc_wm;
 	v[1] = (uint32) claim_wm;
+	v[2] = (uint32) trunc_before;
+	v[3] = (uint32) vacuum_xid;
 
 	if (MakePGDirectory(SHARD_XID_DIR) < 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -467,6 +560,116 @@ shard_xid_persist_watermark(Oid shard, TransactionId alloc_wm,
 	durable_rename(tmppath, path, ERROR);
 }
 
+/* ---- T5.1 SQL 包装：验收观测点 ---- */
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_watermarks);
+Datum
+partdist_shard_vacuum_watermarks(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId tb,
+				vx;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	ShardVacuumGetWatermarks(shard, &tb, &vx);
+	values[0] = TransactionIdGetDatum(tb);
+	values[1] = TransactionIdGetDatum(vx);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_set_watermarks);
+Datum
+partdist_shard_vacuum_set_watermarks(PG_FUNCTION_ARGS)
+{
+	ShardVacuumSetWatermarks(PG_GETARG_OID(0),
+							 (TransactionId) PG_GETARG_INT64(1),
+							 (TransactionId) PG_GETARG_INT64(2));
+	PG_RETURN_VOID();
+}
+
+/* T5.1 接口用到，定义在下方 */
+static ShardXidSlot *shard_xid_slot_attach(Oid shard, int *nclaimed);
+
+/*
+ * ================= T5.1 vacuum 两水位对外接口（设计 §6.1）=================
+ *
+ * 读：返回本分片的 {clog_truncate_before, shard_vacuum_xid}。槽位不存在时
+ *     按 0/0 返回（"从未截断、从未 vacuum"，安全方向），**不建槽** ——
+ *     建槽会顺带触发 T2.4 认领，读水位这种轻动作不该有那种副作用。
+ * 写：整体更新两水位并落盘。不变式由 shard_xid_persist_watermark 统一守，
+ *     此处不重复判断（单一出口，见该函数注释）。
+ */
+void
+ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
+						 TransactionId *vacuum_xid)
+{
+	int			i;
+
+	if (trunc_before != NULL)
+		*trunc_before = 0;
+	if (vacuum_xid != NULL)
+		*vacuum_xid = 0;
+
+	if (ShardXidCtl == NULL)
+		return;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+		{
+			if (trunc_before != NULL)
+				*trunc_before = ShardXidCtl->slots[i].trunc_before;
+			if (vacuum_xid != NULL)
+				*vacuum_xid = ShardXidCtl->slots[i].vacuum_xid;
+			break;
+		}
+	}
+	LWLockRelease(ShardXidCtl->lock);
+
+	/*
+	 * 槽位不存在 ⇒ 本次启动还没碰过该分片。回落读文件：vacuum 水位是
+	 * **跨重启的持久事实**，不能因为"这次还没建槽"就报 0（那会让回卷龄
+	 * 算出天文数字、误触阶段 2 拒发号）。
+	 */
+	if (trunc_before != NULL && *trunc_before == 0 &&
+		vacuum_xid != NULL && *vacuum_xid == 0)
+	{
+		TransactionId a,
+					c;
+
+		shard_xid_read_wm_file(shard, &a, &c, trunc_before, vacuum_xid);
+	}
+}
+
+void
+ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
+						 TransactionId vacuum_xid)
+{
+	ShardXidSlot *slot;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	slot = shard_xid_slot_attach(shard, NULL);
+
+	/*
+	 * ★ 顺序要害（2026-08-18 实测踩到）：**先落盘、成功了才更新槽位**。
+	 * 反过来写的话，不变式守卫在落盘处 ERROR 时槽位已被改脏 —— 而读接口
+	 * 优先从槽位取值，于是"被拒绝的写"照样从读接口里看得见（实测读到
+	 * 300/200 这个本该被拒的组合）。ERROR 会中止事务但**不会回滚 shmem**，
+	 * 这类"内存先于持久化"的写法在共享内存上一律是错的。
+	 */
+	shard_xid_persist_watermark(shard, slot->watermark, slot->claim_wm,
+								trunc_before, vacuum_xid);
+	slot->trunc_before = trunc_before;
+	slot->vacuum_xid = vacuum_xid;
+	LWLockRelease(ShardXidCtl->lock);
+}
+
 /*
  * 找到或建立分片槽位（须持 ShardXidCtl->lock 排它锁调用）。建槽时完成
  * T2.4 认领：认领上限 = 此刻文件里的 alloc_wm ——"冻结的启动恢复上限"，
@@ -480,6 +683,8 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	ShardXidSlot *free_slot = NULL;
 	TransactionId alloc_wm;
 	TransactionId claim_wm;
+	TransactionId slot_trunc_before;	/* T5.1：从文件载入，落盘时原样带回 */
+	TransactionId slot_vacuum_xid;
 	TransactionId ceiling;
 	int			i;
 
@@ -500,7 +705,8 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("分片 xid 槽位用尽（上限 %d）", SHARD_XID_MAX_SLOTS)));
 
-	shard_xid_read_wm_file(shard, &alloc_wm, &claim_wm);
+	shard_xid_read_wm_file(shard, &alloc_wm, &claim_wm,
+						   &slot_trunc_before, &slot_vacuum_xid);
 	ceiling = Max(alloc_wm, FIRST_SHARD_XID);
 	claim_wm = Max(claim_wm, FIRST_SHARD_XID);
 
@@ -525,7 +731,8 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 		 * 影子抬了上限时，写回 {0, ceiling} 会让下次重启退化（claim_wm >
 		 * alloc_wm 的畸形档），抬高只多跳号、方向安全。
 		 */
-		shard_xid_persist_watermark(shard, Max(alloc_wm, ceiling), ceiling);
+		shard_xid_persist_watermark(shard, Max(alloc_wm, ceiling), ceiling,
+									slot_trunc_before, slot_vacuum_xid);
 		if (nclaimed)
 			*nclaimed = n;
 	}
@@ -533,6 +740,9 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	free_slot->next_xid = ceiling;
 	free_slot->watermark = free_slot->next_xid;
 	free_slot->claim_wm = ceiling;
+	/* T5.1：两个 vacuum 水位随槽位常驻，供后续落盘原样带回（见结构体注释） */
+	free_slot->trunc_before = slot_trunc_before;
+	free_slot->vacuum_xid = slot_vacuum_xid;
 	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
 	free_slot->shard_relid = shard;
 	return free_slot;
@@ -570,7 +780,8 @@ shard_xid_allocate(Oid shard)
 		{
 			TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
 
-			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm);
+			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm,
+										slot->trunc_before, slot->vacuum_xid);
 			slot->watermark = new_wm;
 		}
 
@@ -933,7 +1144,7 @@ ShardMvccEnsureWatermarkFile(Oid relid)
 	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", relid);
 	if (stat(path, &st) == 0)
 		return;
-	shard_xid_persist_watermark(relid, 0, 0);
+	shard_xid_persist_watermark(relid, 0, 0, 0, 0);
 }
 
 /*

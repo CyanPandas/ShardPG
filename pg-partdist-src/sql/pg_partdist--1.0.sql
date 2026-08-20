@@ -510,6 +510,25 @@ COMMENT ON FUNCTION global_id_for_partition(OID) IS
 -- Raft control-plane boundary functions (consumed by pg_raft)
 -- ----------------------------------------------------------------
 
+-- T5.1（设计 §6.1）：分片级 vacuum 两水位的读写。观测/维护用。
+CREATE OR REPLACE FUNCTION shard_vacuum_watermarks(
+    p_shard OID,
+    OUT clog_truncate_before BIGINT,
+    OUT shard_vacuum_xid BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_watermarks';
+
+COMMENT ON FUNCTION shard_vacuum_watermarks(OID) IS
+    'T5.1：读本分片的 vacuum 两水位。clog_truncate_before = clog 实际截断点（隐式 freeze 点、回卷龄基点）；shard_vacuum_xid = 两态恢复标记（== 前者表示无未完成的趟，> 前者表示页面趟已完成、截断待补）。';
+
+CREATE OR REPLACE FUNCTION shard_vacuum_set_watermarks(
+    p_shard OID, p_trunc_before BIGINT, p_vacuum_xid BIGINT)
+RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_set_watermarks';
+
+COMMENT ON FUNCTION shard_vacuum_set_watermarks(OID, BIGINT, BIGINT) IS
+    'T5.1：写本分片的 vacuum 两水位并落盘。不变式 clog_truncate_before <= shard_vacuum_xid 在落盘出口强制，违反即 ERROR。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE
