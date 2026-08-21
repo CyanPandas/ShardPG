@@ -3137,6 +3137,7 @@ P4 出口时用户裁定携带该缺陷，并要求**进 P5 前重新评估**。
 | ③ | 阶段 1 的**自动启动器没有做** | 交付到"信号"为止；且"无视常规 vacuum 开关"这句今天是空的（分片 vacuum 根本没有开关） | T5.7 之后 / P6 |
 | ④ | **回卷本身没有实现**（全仓比较分片 xid 用的都是普通 `<`/`>=`，无模运算） | 不是疏漏而是分工：阶段 2 的停发线正是让线性假设成立的那道闸 | 独立一项 |
 | ⑤ | **U-P5-1**：follower 侧分片 clog 未由流重建；连带无分片发号水位 | 今天升主会"全表不可见 + 从 3 号重发号" | **P6**（设计阶段表把切主/恢复全链路整个划给 P6） |
+| ⑦ | **分片 vacuum 缺尾部截断**（不把文件尾部还给操作系统） | 空间，非正确性；V4 复评（§3.6）指出这是 VACUUM FULL 在 P5 之后唯一还能提供的东西，而它不需要 rewriteheap，复制面走现成的 `XLOG_SMGR_TRUNCATE` | 独立一项，推荐优先于"解禁 VACUUM FULL" |
 | ⑥ | 两处覆盖缺口：clog **整段删除**分支（段容量 1M xid，夹具够不到）；**真正停在页面循环中间**的崩溃（需要往生产路径加故障注入点，本次没加） | 覆盖度，非已知缺陷 | 后续压测 / 故障注入专项 |
 
 ##### 五、本轮回归自身的一处观察
@@ -3263,6 +3264,112 @@ UPDATE 就能造出这一格）。
 新的、更小的挂账：**LP_REDIRECT 未实现**，它与"解禁用户索引"是同一件事，
 不影响 TOAST。其余五项不变。
 
+### 3.6 V4 复评：CLUSTER / VACUUM FULL（2026-08-21，P5 出口后补做）
+
+设计 §10 与未决表 V4 都写明「第一期禁用，**P5 出口再评估 CLUSTER/VACUUM FULL**」。
+**T5.7 的出口清单漏了这一条**，此处补做。
+
+##### 一、先更正设计 §10 里那条禁用理由：它有一半已经过时
+
+§10 原文的理由是「走 rewriteheap 的 **freeze/裁决**会拿分片 xid 查原生 clog，
+且换 relfilenode 需 fileset 重绑（复制面）」。逐项核下来，**三个论点里有两个
+已经不成立**：
+
+| 论点 | 现状 |
+|---|---|
+| **裁决**会拿分片 xid 查原生 clog | **已不成立。** 补丁 0008（T2.6）把 `HeapTupleSatisfiesVacuumHorizon` 分叉给扩展，而 CLUSTER 的判活入口 `heapam_relation_copy_for_cluster`（`heapam_handler.c:848`）走的正是 `HeapTupleSatisfiesVacuum`。**实证**：本轮探针里 `ANALYZE` 对打标表成功返回，而 ANALYZE 的采样判活（`heapam_handler.c:1070`）用的是同一个入口 |
+| 换 relfilenode 需 fileset 重绑 | **已解决。** `ApplyCtrlRecord` 的注释就点名了这一类：「(role, ord) 集合不变、只是文件号变了 → VACUUM FULL / REINDEX / TRUNCATE / 重写类 ALTER……原地换表 + 把对应本地文件截 0，后续 FPI 自然填满。**全自动**」；`test_ddl_fileset_d1.sh` 第 [5] 段专验「VACUUM FULL：主堆/索引/TOAST 全部换文件号，应全自动」 |
+| **freeze**会拿分片 xid 查原生 clog | **仍然成立，而且比原文说得更重**（见下） |
+
+##### 二、真正的拦路虎：`rewrite_heap_tuple` 里那次 `heap_freeze_tuple`
+
+`rewriteheap.c:390`：每拷一条元组就顺手冻结一次 ——
+
+```c
+heap_freeze_tuple(new_tuple->t_data,
+                  state->rs_old_rel->rd_rel->relfrozenxid,
+                  state->rs_old_rel->rd_rel->relminmxid,
+                  state->rs_freeze_xid, state->rs_cutoff_multi);
+```
+
+`heap_freeze_tuple` 只是把四个**原生**水位塞进 `VacuumCutoffs` 再调
+`heap_prepare_freeze_tuple` —— 也就是 T5.3a 勘察过、并因此**决定不去分叉**的
+那个函数。
+
+**实测的数量关系（本环境探针）**：同一张打标表上
+`pg_class.relfrozenxid = 81848`（原生），而元组 `t_xmin = 3`（分片 xid）。
+
+于是失败形态取决于**两个互不相干的计数器碰巧谁大**：
+
+- **`分片xid < relfrozenxid`（新表的常态，如 3 < 81848）** ⇒
+  `heap_prepare_freeze_tuple` 第一道检查当场
+  `ereport(ERROR, "found xmin 3 from before relfrozenxid 81848")`。
+  **响亮的失败**，数据不坏 —— 但错误来自内核深处，信息完全误导。
+- **`分片xid > relfrozenxid`（长寿分片跑过 8 万笔以上事务后可达）** ⇒ 不报错，
+  转而按 `freeze_xmin = TransactionIdPrecedes(分片xid, FreezeLimit)` 判断，
+  极可能为真 ⇒ **给分片元组盖上 `HEAP_XMIN_FROZEN`**。
+  那条行从此"对一切快照可见"，与分片 clog 的联系被就地切断 ——
+  **中止事务的行复活，且无声无息。**
+
+⇒ **这才是禁用的真正理由**：不是"查原生 clog"，而是
+**两套 xid 空间在同一个比较里相遇，后果由巧合决定**。
+把它写清楚比原来那句笼统的话有用得多。
+
+##### 三、另外两处未审计的跨宇宙比较
+
+- **更新链解析**：`rewriteheap.c:487/584` 用
+  `TransactionIdPrecedes(HeapTupleHeaderGetXmin(...), state->rs_oldest_xmin)`
+  判"前一版本是不是 RECENTLY_DEAD"，据此维护 `rs_unresolved_tups`。
+  分片 xid 与 `rs_oldest_xmin`（原生）比较，链解析会错判 —— 未审计。
+- **cutoffs 的来源**：`cluster.c` 经 `vacuum_get_cutoffs()` 从**原生 procarray**
+  取 `OldestXmin`/`FreezeLimit`。分片表根本没有"原生活跃快照下界"这个概念，
+  入口参数本身就没有意义。
+
+（`logical_rewrite_heap_tuple` 的那几处比较不额外构成障碍 —— §10 已禁分片表
+逻辑解码。）
+
+##### 四、P5 改变了什么：需求侧塌了一大半
+
+V4 当初把复评挂到 P5 出口，是因为 P5 要交付 freeze/回收全章。现在交付了，
+**结论是往"更不需要"的方向走的**：
+
+| VACUUM FULL 能给的 | P5 之后还缺不缺 |
+|---|---|
+| 回收死元组占的空间 | **不缺** —— §6.4 三类动作已做（T5.3a/b/c） |
+| 回收索引项 | **不缺** —— 索引两阶段已做（T5.8） |
+| 回收 TOAST 空间 | **不缺** —— T5.8 实测 chunk 32→16 |
+| **把文件尾部还给操作系统** | **仍缺**（见下） |
+| CLUSTER 的按索引物理排序 | 仍缺，但第一期本就无此需求（分片表禁用户索引） |
+
+也就是说：**VACUUM FULL 的价值在 P5 之后收窄到"物理截断文件尾部"这一件事**，
+而那件事**根本不需要 rewriteheap**。
+
+##### 五、复评结论
+
+**维持禁用**（CLUSTER / VACUUM FULL 对分片打标表）。理由已从"要改的地方多"
+收紧为一条具体的：**`rewrite_heap_tuple` 内的 `heap_freeze_tuple` 会把分片 xid
+与原生 relfrozenxid/FreezeLimit 直接比较，后果由两个计数器的巧合决定，
+最坏是无声的幽灵行复活。** 要解禁就得给 rewriteheap 开分片分叉 ——
+而 T5.3a 已经论证过：`heap_prepare_freeze_tuple` 整个函数都活在原生宇宙里，
+给它开分叉等于重写它。
+
+**并给出替代路径（推荐，成本远低于解禁）**：给分片 vacuum 补一个
+**尾部截断**（对标 `lazy_truncate_heap`）—— 页面趟之后若尾部若干页已全空，
+取 `AccessExclusiveLock` 后 `RelationTruncate` 掉。它：
+
+- 不碰 rewriteheap，不涉及任何跨宇宙比较；
+- 复制面走现成的 `XLOG_SMGR_TRUNCATE`（补丁 0001v2 专为捕获它而加，
+  FRD §5.2/§5.3 已有先例）；
+- 恰好补上上表里唯一还缺的那一格。
+
+这条**没有做**，记为新的挂账项，与 P5 其余挂账并列。
+
+##### 六、V4 状态更新
+
+V4 的"P5 出口再评估"要求至此完成：**结论维持禁用**，理由已更正并具体化；
+§10 那条里"裁决会查原生 clog"与"fileset 重绑"两个论点标注为已过时/已解决。
+CIC 仍随索引专项（与 T5.8 记的 LP_REDIRECT 是同一件事）。
+
 ---
 
 ## 4 未决核实点跟踪表
@@ -3273,7 +3380,7 @@ UPDATE 就能造出这一格）。
 | V1 | 原生表 hint 位 vs pagecmp 既有处理（§4.5） | T1.0 | ✅ 已完成（P1_PRECHECK 结论 A） |
 | V2 | Citus 连接建立点枚举完备性（§9.2 ①） | P4 前 | ◐ 挂点运行时实证（T4.0 实验 2C：assign 每连接前置在 worker 驱动下生效）；完整枚举随 T4.1 逐路取证 |
 | V3 | 引用表使用现状与只读裁定（§9.2 ②） | P4 前 | ✅ 已裁定（T4.0：系统现役 0 引用表；第一期建表后只读） |
-| V4 | CIC/CLUSTER 分叉 vs 禁用裁定（§11） | P2 期间定 | ✅ 已裁定（2026-08-13 T2.6：第一期禁用，理由入设计 §10；P5 出口再评估 CLUSTER/VACUUM FULL，CIC 随索引专项） |
+| V4 | CIC/CLUSTER 分叉 vs 禁用裁定（§11） | P2 期间定 | ✅ 已裁定（2026-08-13 T2.6：第一期禁用）；**P5 出口复评已补做（2026-08-21，§3.6）：维持禁用**——理由收紧为"`rewrite_heap_tuple` 里的 `heap_freeze_tuple` 拿分片 xid 与原生 relfrozenxid/FreezeLimit 直接比较，后果由两个计数器的巧合决定，最坏是无声的幽灵行复活"；§10 原文另两个论点（裁决查原生 clog、fileset 重绑）已分别过时/已解决。替代路径：给分片 vacuum 补尾部截断（新挂账） |
 | V5 | Citus 13.1 worker 驱动 2PC 行为一致性（§9.1 实验一） | P4 前 | ✅ 已实测（T4.0 实验 2：语义逐项一致，连接并行度差异入 R-P4-1） |
 
 ---
