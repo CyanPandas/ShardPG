@@ -1983,8 +1983,8 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 |---|---|---|
 | **T5.1** ✅ | 三变量与持久化 —— **已完成（2026-08-18，验收 7/0）** | 见下方实施记要 |
 | **T5.2** ✅ | 前缀扫描算 `VacuumTargetXid` —— **已完成（2026-08-18，验收 6/0）** | 见下方实施记要 |
-| **T5.3a** ✅ | **③ xmax 消毒**：截断点以下的 ABORTED 与 lock-only xmax 清成 0 —— **已完成（2026-08-21，验收 33/0）** | 见下方实施记要 |
-| **T5.3b** | ① 删中止 xmin 的元组（不做⇒截断后**幽灵行复活**） | §6.4 ① 注入测试 |
+| **T5.3a** ✅ | **③ xmax 消毒**：截断点以下的 ABORTED 与 lock-only xmax 清成 0 —— **已完成（2026-08-21）** | 见下方实施记要 |
+| **T5.3b** ✅ | **① 删中止 xmin 的元组**（不做⇒截断后**幽灵行复活**）—— **已完成（2026-08-21）**；套件合计 **56/0** | 见下方实施记要 |
 | **T5.3c** | ② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段） | §6.4 ② 注入测试 |
 | **T5.4** | 截断 + 顺序铁律落地 | 注入"页未清完就截断"必须被拦 |
 | **T5.5** | 两态恢复：趟中崩溃整趟重来（幂等）；趟完未截断只补截断 | §6.5 两态恢复 |
@@ -2379,6 +2379,108 @@ clog"意味着推进必须由 T5.4 的截断路径在确认整趟做完之后统
 > 教训（与 §13 既有条目同类，此处记具体形态）：**改磁盘格式必须回跑一切直读
 > 该文件的断言。** 本例里格式变更与断言相隔两个任务，且失败信息
 > （"期望 4099 4099"）看上去像发号出了问题，与真因隔了一层。
+
+#### T5.3b 实施记要（2026-08-21，`test_shard_vacuum_p5.sh` 合计 **56/0**）
+
+**交付**：`ShardVacuumRemoveAbortedXmin()`（`src/shard_vacuum.c`）+ SQL 包装
+`partdist.shard_remove_aborted(regclass, bigint)`（9/9 部署）+ 套件 [8]–[13] 段。
+
+##### 为什么是"两条 WAL 记录"而不是一条
+
+原生对**无索引**表的回收本来就是两步（`vacuumlazy.c`：`nindexes == 0` 时
+`lazy_scan_prune` 之后立刻 `lazy_vacuum_heap_page`）：
+
+| 步 | 记录 | 动作 |
+|---|---|---|
+| ① | `XLOG_HEAP2_PRUNE` | LP_NORMAL ⇒ LP_DEAD（根元组）或 LP_UNUSED（已脱链的 heap-only 元组） |
+| ② | `XLOG_HEAP2_VACUUM` | LP_DEAD ⇒ LP_UNUSED + `PageTruncateLinePointerArray` |
+
+**这个分工是硬的，不是风格问题**：`heap_page_prune_execute()` 的 `nowunused`
+只接受 heap-only 元组（带存储的根元组的 TID 可能仍被索引引用），而
+`heap_xlog_vacuum` 的 redo 又要求目标行指针**已经是** LP_DEAD。想一步到位
+必然踩其中一边的不变式。照抄原生的两步，redo 侧一行不用改。
+
+页面变换全部交给内核的 `heap_page_prune_execute()`（**redo 侧调的是同一个
+函数**），本模块只负责"选哪些行"与组装记录 —— 延续 T5.3a 的"策略在扩展、
+页面变换与 WAL 用内核的"。
+
+##### 不碰 `pd_prune_xid` 与 `PD_PAGE_FULL`（比原生更紧）
+
+原生 `heap_page_prune` 在 leader 侧会更新这两个提示，而 `heap_xlog_prune` 的
+redo 明确不管（注释原文 "we don't worry about updating the page's prunability
+hints"）—— 即**原生自己就在这两个字段上主副本分叉**，靠 `heap_mask()` 掩掉。
+分片表已禁 on-access 剪枝（补丁 0005），这两个提示对我们毫无用处，因此干脆
+不动：与 redo 逐字一致。
+
+##### ★ "③ 必须先于 ①"是依赖，不是偏好（实测确认）
+
+中止事务里"插入后连更两次"会留下一条 HOT 链：根 → heap-only(自己也被 HOT
+更新) → heap-only。**中间那条**同时满足"死"与"仍挂在 HOT 链上"，而
+`heap_page_prune_execute` 不接受这种元组进 `nowunused`。
+解法不是特判，而是顺序：`HeapTupleHeaderIsHotUpdated()` 的定义里带
+`HEAP_XMAX_INVALID == 0` 前置条件，而那条元组的 xmax 必是同一个中止事务的
+号 —— **③ 一清，这个位就自动失效了**。
+
+实测（套件 [9]/[10] 段）：
+- 只跑 ①：删 4 条、**推迟 1 条**（链中那条），页上剩 3 个 LP_NORMAL；
+- 再跑 ③：消毒 2 条（活行 k1 的中止 xmax + 链中那条的 xmax）；
+- 再跑 ①：删 1 条、**零推迟**，页上剩 2 个 LP_NORMAL，两条活行内容完好。
+
+推迟不是失败，是如实计数：`tuples_deferred > 0` ⇒ 本趟不完整 ⇒ 不得据此截断
+（与 `pages_skipped` 同为 T5.4 门禁条件）。
+
+##### 三道 fail-closed 守卫
+
+- **带索引即 ERROR**。本函数走的是原生"无索引表"通路，不含索引两阶段
+  （T5.3c）；带索引的关系照做会把索引项留成悬空指针。P1 起分片打标表一律
+  无索引（`CREATE INDEX`/`REINDEX` 被 `ShardXidUtilityGuard` 拦着），所以正常
+  永不触发 —— 但它标出了 T5.3c 的缺口位置。
+- **`PD_ALL_VISIBLE` 即 ERROR**。分片表从未跑过 vacuum，这个位无从被置上；
+  真置上了说明有别的通路动过这张表，此时删元组还得同步清 vm 位。
+- **拿不到 cleanup lock 即跳过并计数**（`ConditionalLockBufferForCleanup`）。
+  回收行指针必须持 cleanup lock，否则并发扫描手里的 TID 会指向被复用的槽。
+  用条件版本是为了不阻塞在别人的 pin 上；跳过即本趟不完整。
+
+`snapshotConflictHorizon` 同 T5.3a 传 `Invalid`。这里的论证比 ③ 更需要说清：
+剪枝是**删元组**，正是 hot standby 冲突解决要防的事 —— 但被删的是**中止插入**
+的元组，**对任何快照、任何时刻都不可见**，本就不存在需要杀掉的读者；且分片
+副本走 pg_parwal 物理回放，不是 hot standby。
+
+##### T5.3b 验收明细（套件 [8]–[13]，合计 56/0）
+
+| 段 | 断言 | 结果 |
+|---|---|---|
+| [8] | 构造两活行 + 三种中止形态（中止插入根元组 / 中止更新的 heap-only 后继 / 中止事务内插入连更两次的整条链），7 个 LP_NORMAL、可见 2 行 | PASS ×4 |
+| [9] | **只跑 ①：删 4 推迟 1 跳页 0**；推迟那条仍在页上；可见行数不变 | PASS ×3 |
+| [10] | ③ 消毒 2 条；**再跑 ①：删 1 推迟 0**；页上只剩 2 个 LP_NORMAL、**0 个 LP_DEAD 残留**；两活行可见且内容完好；幂等第三趟零动作 | PASS ×7 |
+| [11] | pg_waldump 在同一趟里同时看到 `PRUNE` 与 `VACUUM` 两条内核标准记录 | PASS ×2 |
+| [12] | **immediate 崩溃重启后页面状态保持**；负向：带索引即拒；负向计数守卫 | PASS ×5 |
+| [13] | 清场 + 本轮无节点崩溃 | PASS ×2 |
+
+##### 验收脚本自身踩到的三个坑
+
+- **`xid` 类型没有大小比较运算符**：`max(GREATEST(t_xmin, t_xmax))` 直接报
+  "No function matches the given name and argument types"，且失败形态又是
+  **返回空串**。要先 `::text::bigint`。
+- **断言写在了错的那一趟上**：`VACUUM` 记录只在有**根元组**被回收（`ndead > 0`）
+  时才产生；第二趟 ① 删的是 heap-only 元组，只走 `nowunused`，压根没有
+  `VACUUM` 记录。把取证窗口移到第一趟（同时含根与 heap-only）才两条都有。
+- **`pg_waldump` 的记录类型在 `desc:` 里**，不是 `HEAP2/PRUNE` 这种形态；
+  grep 要按 `desc: PRUNE` / `desc: VACUUM`。
+
+##### T5.3b **未覆盖**的部分
+
+- **follower 回放未实测**（同 T5.3a）。本套件只验到"leader 的 WAL 里确有内核
+  标准 `PRUNE`/`VACUUM` 记录"。留 T5.4。
+- **幽灵行复活的端到端陷阱构造不出来**（同 T5.3a）：免查隐式冻结区的解释
+  规则全仓尚未实现，套件只能验到"元组物理上确实没了"这一层 —— 而这正是
+  §6.4 ① 要求的动作本身。
+- **多页与并发**：本套件的夹具只有一页，`pages_skipped` 分支（拿不到 cleanup
+  lock）没有被真正触发过，只验了它不误报。
+
+##### 回归
+
+`test_shard_clog_p2` 复跑 **64/0**（基线值），本次两处扩展未波及既有面。
 
 ---
 

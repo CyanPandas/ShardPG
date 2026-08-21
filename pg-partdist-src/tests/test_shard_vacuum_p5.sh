@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # [宿主机] P5 分片 vacuum 页面动作验收（TX_TSO_MVCC_DEV_PLAN.md §3.4 T5.3）。
 #
-# 本轮覆盖 T5.3a —— 设计 §6.4 ③ **xmax 消毒**：把截断点以下的 ABORTED 与
-# lock-only xmax 清成 InvalidTransactionId(0)。不做则截断后"中止了的删除"
-# 被免查隐式冻结区读成"早已提交的删除"，**活行被判死**。
+# 覆盖 T5.3a + T5.3b：
+#   [0]-[7] T5.3a —— §6.4 ③ **xmax 消毒**：把截断点以下的 ABORTED 与
+#           lock-only xmax 清成 InvalidTransactionId(0)。不做则截断后"中止了
+#           的删除"被免查隐式冻结区读成"早已提交的删除"，**活行被判死**。
+#   [8]-[13] T5.3b —— §6.4 ① **删中止 xmin 的元组**。不做则截断后该 xmin
+#           落进免查区被解释成"已提交全可见"，**中止事务的幽灵行复活**。
+#           同时验"③ 必须先于 ①"这条顺序依赖：中止事务"插入后又更新"留下的
+#           HOT 链，其 HEAP_HOT_UPDATED 位要靠 ③ 清 xmax 才失效。
 #
 # 判据边界（三条都要验，少一条就等于没验）：
 #   - ABORTED 且在截断点以下 ⇒ 清；
@@ -152,9 +157,83 @@ check "重启后 r1 的 xmax 仍为 0" "$(XMAX 1)" "0"
 check "重启后 r2 的 xmax 仍在"   "$(XMAX 2)" "$X2"
 check "重启后仍可见 3 行"        "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5a" </dev/null)" "3"
 
-echo "========== [7] 清场 =========="
+echo "========== [7] T5.3a 清场 =========="
 set_whitelist ""
-PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5a; DROP TABLE IF EXISTS p5plain; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int);" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5a; DROP TABLE IF EXISTS p5plain;" </dev/null >/dev/null
+check "T5.3a 清场完成" "$?" "0"
+
+# ================================================================
+#  T5.3b —— 设计 §6.4 ① 删中止 xmin 的元组
+#  不做则截断后该 xmin 落进免查隐式冻结区、被解释成"已提交全可见"，
+#  **中止事务的幽灵行复活**。
+# ================================================================
+NORMAL() { PSQL "$WPORT" -Atc "SELECT count(*) FROM heap_page_items(get_raw_page('p5b',0)) WHERE lp_flags=1" </dev/null; }
+LPDEAD() { PSQL "$WPORT" -Atc "SELECT count(*) FROM heap_page_items(get_raw_page('p5b',0)) WHERE lp_flags=3" </dev/null; }
+
+echo "========== [8] T5.3b 构造：两活行 + 三种中止形态 =========="
+PSQL "$WPORT" -q -c "DROP TABLE IF EXISTS p5b;" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; CREATE TABLE p5b(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OB=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5b'" </dev/null)
+set_whitelist "$OB"; check "p5b 白名单生效" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5b VALUES (1,'k1'),(2,'k2');
+BEGIN; INSERT INTO p5b VALUES (3,'g1'); ROLLBACK;                       -- 中止插入：根元组
+BEGIN; UPDATE p5b SET v='u1' WHERE id=1; ROLLBACK;                      -- 中止更新：根 xmax + heap-only 后继
+-- 中止事务内插入 + 连更两次：留下 根 → heap-only(自己也被 HOT 更新) → heap-only
+-- 中间那条是"死且仍挂在 HOT 链上"的唯一形态，正是顺序依赖的检验点
+BEGIN; INSERT INTO p5b VALUES (4,'g2'); UPDATE p5b SET v='g2b' WHERE id=4; UPDATE p5b SET v='g2c' WHERE id=4; ROLLBACK;
+SQL
+n0=$(NORMAL)
+check "构造后页上 7 个 LP_NORMAL" "$n0" "7"
+check "构造后可见 2 行"           "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5b" </dev/null)" "2"
+# 本轮截断点取"页上最大 xid + 1"，把全部中止号都划进范围
+# xid 类型没有大小比较运算符，GREATEST 直接用会报"No function matches"——先转 bigint
+TB=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5b',0)) WHERE lp_flags=1" </dev/null)
+check "截断点取到值" "$([[ -n "$TB" && "$TB" -gt 3 ]] && echo y)" "y"
+
+echo "========== [9] 顺序依赖：不先跑 ③，链上元组只能推迟 =========="
+# WAL 取证窗口取这一趟：它同时产生根元组（⇒LP_DEAD⇒VACUUM 记录）与已脱链的
+# heap-only 元组（⇒LP_UNUSED，只进 PRUNE 记录），两条记录一次看全。
+L0=$(PSQL "$WPORT" -Atc "SELECT pg_current_wal_lsn()" </dev/null)
+D1=$(PSQL "$WPORT" -Atc "SELECT tuples_removed||'/'||tuples_deferred||'/'||pages_skipped FROM partdist.shard_remove_aborted('p5b'::regclass, $TB::bigint)" </dev/null)
+PSQL "$WPORT" -Atc "SELECT pg_switch_wal()" </dev/null >/dev/null
+L1=$(PSQL "$WPORT" -Atc "SELECT pg_current_wal_lsn()" </dev/null)
+check "先跑①：删 4 条、推迟 1 条、无跳页" "$D1" "4/1/0"
+check "推迟的那条还在页上（3 个 LP_NORMAL）" "$(NORMAL)" "3"
+check "推迟期间可见行数不变" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5b" </dev/null)" "2"
+
+echo "========== [10] 先 ③ 后 ①：全部清干净 =========="
+S2=$(PSQL "$WPORT" -Atc "SELECT tuples_sanitized FROM partdist.shard_sanitize_xmax('p5b'::regclass, $TB::bigint)" </dev/null)
+check "③ 消毒 2 条（活行 k1 的中止 xmax + 链中元组的 xmax）" "$S2" "2"
+D2=$(PSQL "$WPORT" -Atc "SELECT tuples_removed||'/'||tuples_deferred||'/'||pages_skipped FROM partdist.shard_remove_aborted('p5b'::regclass, $TB::bigint)" </dev/null)
+check "再跑①：删 1 条、零推迟" "$D2" "1/0/0"
+check "页上只剩 2 个 LP_NORMAL" "$(NORMAL)" "2"
+check "页上无 LP_DEAD 残留"     "$(LPDEAD)" "0"
+check "两活行仍可见"            "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5b" </dev/null)" "2"
+check "活行内容未被误删"        "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5b" </dev/null)" "k1,k2"
+check "幂等：第三趟零动作"      "$(PSQL "$WPORT" -Atc "SELECT tuples_removed||'/'||tuples_deferred FROM partdist.shard_remove_aborted('p5b'::regclass, $TB::bigint)" </dev/null)" "0/0"
+
+echo "========== [11] WAL 取证：PRUNE + VACUUM 两条内核标准记录（取 [9] 那一趟）=========="
+WD=$(DEX /work/pg-install/bin/pg_waldump -p "$DATADIR/pg_wal" -s "$L0" -e "$L1" </dev/null 2>/dev/null)
+check "区间内有 PRUNE 记录"  "$(echo "$WD" | grep -c 'desc: PRUNE')"  "1"
+check "区间内有 VACUUM 记录" "$(echo "$WD" | grep -c 'desc: VACUUM')" "1"
+
+echo "========== [12] 崩溃持久性 + 负向 =========="
+crash_restart; check "immediate 崩溃后重启就绪" "$?" "0"
+check "重启后页上仍只 2 个 LP_NORMAL" "$(NORMAL)" "2"
+check "重启后两活行仍在"              "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5b" </dev/null)" "k1,k2"
+# 带索引即拒（索引两阶段是 T5.3c）。索引必须在打标之前建 —— 打标后 CREATE INDEX 被拦。
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5idx; CREATE TABLE p5idx(id int) WITH (autovacuum_enabled=off); CREATE INDEX p5idx_i ON p5idx(id);" </dev/null >/dev/null
+OI=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5idx'" </dev/null)
+set_whitelist "$OI"; check "p5idx 白名单生效" "$?" "0"
+neg "带索引即拒（索引两阶段属 T5.3c）" "需要索引两阶段" \
+    "SELECT tuples_removed FROM partdist.shard_remove_aborted('p5idx'::regclass, 100::bigint)"
+check "负向计数守卫（累计应跑 4 条）" "$NEG_RUN" "4"
+
+echo "========== [13] 清场 =========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int);" </dev/null >/dev/null
 check "清场完成" "$?" "0"
 
 health_check_no_crash

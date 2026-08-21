@@ -556,6 +556,26 @@ CREATE OR REPLACE FUNCTION shard_sanitize_xmax(
 COMMENT ON FUNCTION shard_sanitize_xmax(REGCLASS, BIGINT) IS
     'T5.3a：分片表 xmax 消毒（设计 §6.4 ③）。p_trunc_before = 本轮打算推进到的截断点（开区间上界，= ShardVacuumComputeTarget 结果 + 1）。截断点以下的 ABORTED / lock-only xmax 清成 0，COMMITTED 不动（留给动作②）；区间内仍未决即 ERROR。页面修改经内核 heap_freeze_execute_prepared 发 XLOG_HEAP2_FREEZE_PAGE，follower 逐字节回放。';
 
+-- T5.3b（设计 §6.4 ①）：删中止 xmin 的元组。不做则截断后该 xmin 落进免查
+-- 隐式冻结区、被解释成"已提交全可见"，**中止事务的幽灵行复活**。
+-- ★ 必须先跑 shard_sanitize_xmax（③）：中止事务"插入后又更新"留下的 HOT 链，
+--   其 HEAP_HOT_UPDATED 位要靠 ③ 清 xmax 才失效；③ 没跑过的那些元组会计进
+--   tuples_deferred 留到下一趟。
+-- ★ 只对无索引的分片表可用（索引两阶段是 T5.3c）；带索引即 ERROR。
+-- pages_skipped > 0 或 tuples_deferred > 0 ⇒ 本趟不完整，不得据此截断。
+CREATE OR REPLACE FUNCTION shard_remove_aborted(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_removed BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_remove_aborted';
+
+COMMENT ON FUNCTION shard_remove_aborted(REGCLASS, BIGINT) IS
+    'T5.3b：删中止 xmin 的元组（设计 §6.4 ①）。判据只看 xmin：clog ABORTED 且 xmin < p_trunc_before 即删。走原生无索引表通路——XLOG_HEAP2_PRUNE 置 LP_DEAD/LP_UNUSED，紧接 XLOG_HEAP2_VACUUM 置 LP_UNUSED 并截行指针数组，页面变换全交内核 heap_page_prune_execute。需先跑 shard_sanitize_xmax；带索引即 ERROR。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

@@ -23,12 +23,14 @@
 
 #include "utils/relcache.h"
 
-/* 一趟页面动作的计数（验收与排障用） */
+/* 一趟页面动作的计数（验收与排障用；各动作只填与自己相关的字段） */
 typedef struct ShardVacuumPageStats
 {
 	int64		pages_scanned;	/* 扫过的页数 */
 	int64		pages_dirtied;	/* 实际改写并写 WAL 的页数 */
-	int64		tuples_touched; /* 被消毒的元组数 */
+	int64		pages_skipped;	/* ①：拿不到 cleanup lock 而跳过的页数 */
+	int64		tuples_touched; /* ③ 消毒条数 / ① 移除条数 */
+	int64		tuples_deferred;	/* ①：死但仍挂在 HOT 链上，本趟不动 */
 } ShardVacuumPageStats;
 
 /*
@@ -56,5 +58,31 @@ typedef struct ShardVacuumPageStats
  */
 extern void ShardVacuumSanitizeXmax(Relation rel, TransactionId trunc_before,
 									ShardVacuumPageStats *stats);
+
+/*
+ * §6.4 ①：删中止 xmin 的元组。
+ *
+ * 不做的后果：截断之后该 xmin 落进免查隐式冻结区、被解释成"已提交、全可见"，
+ * **中止事务的幽灵行复活**。
+ *
+ * trunc_before 语义与 ③ 相同；未决条目的两分支守卫也相同。判据只看 xmin：
+ * clog ABORTED 且 `xmin < trunc_before` ⇒ 删；COMMITTED ⇒ 留。
+ *
+ * ★ 必须先跑 ③ 再跑 ①（顺序不是偏好，是依赖）：中止事务"插入后又更新"会留下
+ *   一条 HOT 链，链中元组既是死的、又还挂着 `HEAP_HOT_UPDATED`；而那个 bit 的
+ *   有效性以 `HEAP_XMAX_INVALID == 0` 为前提，正是 ③ 清 xmax 时一并解除的。
+ *   ③ 没跑过时这些元组会被计进 `tuples_deferred` 留到下一趟。
+ *
+ * ★ 只对**无索引**的分片表可用：本函数走的是原生"无索引表"通路
+ *   （prune 记录把行指针置 LP_DEAD，紧接一条 vacuum 记录置 LP_UNUSED），
+ *   不含索引两阶段（那是 T5.3c）。带索引的关系一律 ERROR，fail-closed。
+ *
+ * 调用者需持有 rel 的锁（建议 ShareUpdateExclusiveLock）。本函数逐页取
+ * **cleanup lock**（回收行指针的硬要求）；取不到则跳过该页并计入
+ * `pages_skipped` —— 跳过即本趟不完整，截断不得进行（T5.4 的门禁条件）。
+ */
+extern void ShardVacuumRemoveAbortedXmin(Relation rel,
+										 TransactionId trunc_before,
+										 ShardVacuumPageStats *stats);
 
 #endif							/* SHARD_VACUUM_H */
