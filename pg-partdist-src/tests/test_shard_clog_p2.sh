@@ -154,7 +154,9 @@ check "无主事务已被认领改判 ABORTED" "$(PSQL "$WPORT" -Atc "SELECT scl
 check "跳号洞一并改判（sxid=2000）" "$(PSQL "$WPORT" -Atc "SELECT sclog_read($OB::oid,2000::bigint)" </dev/null)" "3"
 check "认领上限之上未动（4099=洞）" "$(PSQL "$WPORT" -Atc "SELECT sclog_read($OB::oid,4099::bigint)" </dev/null)" "0"
 wmv=$(DEX od -An -tu4 "$DATADIR/pg_shard_xid/$OB" </dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
-check "水位文件 {4099,4099}" "$wmv" "4099 4099"
+# T5.1 起水位文件扩为 16 字节 {alloc_wm, claim_wm, clog_truncate_before,
+# shard_vacuum_xid}；后两者在没跑过 vacuum 的分片上恒为 0。
+check "水位文件 {4099,4099,0,0}" "$wmv" "4099 4099 0 0"
 check "认领幂等（显式触发=0）" "$(PSQL "$WPORT" -Atc "SELECT sclog_claim($OB::oid)" </dev/null)" "0"
 # R-P2-2 防误杀：新活事务不进认领范围
 PSQL "$WPORT" -q -c "BEGIN; INSERT INTO p2b VALUES (60,'live'),(61,'live'); SELECT pg_sleep(5); COMMIT;" </dev/null >/dev/null 2>&1 &

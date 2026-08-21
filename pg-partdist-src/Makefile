@@ -19,6 +19,7 @@ OBJS = \
 	src/raft_boundary.o \
 	src/shard_xid.o \
 	src/shard_clog.o \
+	src/shard_vacuum.o \
 	src/shard_visibility.o \
 	src/tso.o \
 	src/tso_client.o \

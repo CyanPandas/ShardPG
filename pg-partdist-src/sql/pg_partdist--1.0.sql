@@ -529,6 +529,33 @@ RETURNS void LANGUAGE c STRICT VOLATILE
 COMMENT ON FUNCTION shard_vacuum_set_watermarks(OID, BIGINT, BIGINT) IS
     'T5.1：写本分片的 vacuum 两水位并落盘。不变式 clog_truncate_before <= shard_vacuum_xid 在落盘出口强制，违反即 ERROR。';
 
+-- T5.2（设计 §6.3）：前缀扫描算 VacuumTargetXid。从本分片当前的
+-- clog_truncate_before 起顺扫至 p_ceiling（不含），返回可安全截断到的**前一条**；
+-- 0 = 一条都不能清。stop_reason 回填停因供排障。
+CREATE OR REPLACE FUNCTION shard_vacuum_target(
+    p_shard OID, p_safe_ts BIGINT, p_ceiling BIGINT,
+    OUT target_xid BIGINT,
+    OUT stop_reason TEXT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_target';
+
+COMMENT ON FUNCTION shard_vacuum_target(OID, BIGINT, BIGINT) IS
+    'T5.2：前缀扫描算 VacuumTargetXid（设计 §6.3）。COMMITTED 且 commit_ts < p_safe_ts 放行，**ABORTED 也放行**（挡住它会让一个中止事务永久钉死截断）；遇 RUNNING / PREPARED / 空洞 / commit_ts 太新即停。停因：scanned-to-ceiling / no-safe-ts / hole-running / commit-ts-too-new / prepared / running。';
+
+-- T5.3a（设计 §6.4 ③）：xmax 消毒。把 xmax < p_trunc_before 且 ABORTED 或
+-- lock-only 的 xmax 清成 0，其余原样。**只清不推进水位** —— 顺序铁律要求
+-- 页面全部清完才许动 clog，推进由 T5.4 的截断路径统一落。
+CREATE OR REPLACE FUNCTION shard_sanitize_xmax(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT tuples_sanitized BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_sanitize_xmax';
+
+COMMENT ON FUNCTION shard_sanitize_xmax(REGCLASS, BIGINT) IS
+    'T5.3a：分片表 xmax 消毒（设计 §6.4 ③）。p_trunc_before = 本轮打算推进到的截断点（开区间上界，= ShardVacuumComputeTarget 结果 + 1）。截断点以下的 ABORTED / lock-only xmax 清成 0，COMMITTED 不动（留给动作②）；区间内仍未决即 ERROR。页面修改经内核 heap_freeze_execute_prepared 发 XLOG_HEAP2_FREEZE_PAGE，follower 逐字节回放。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

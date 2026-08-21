@@ -1983,7 +1983,9 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 |---|---|---|
 | **T5.1** ✅ | 三变量与持久化 —— **已完成（2026-08-18，验收 7/0）** | 见下方实施记要 |
 | **T5.2** ✅ | 前缀扫描算 `VacuumTargetXid` —— **已完成（2026-08-18，验收 6/0）** | 见下方实施记要 |
-| **T5.3** | **页面三类动作（主体）**：① 删中止 xmin 的元组；② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段）；③ **xmax 消毒**（截断点以下的 ABORTED 与 lock-only xmax 清成 0） | §6.4 三类动作注入测试。每类对应一个正确性陷阱：①不做⇒截断后**幽灵行复活**；③不做⇒**活行被判死** |
+| **T5.3a** ✅ | **③ xmax 消毒**：截断点以下的 ABORTED 与 lock-only xmax 清成 0 —— **已完成（2026-08-21，验收 33/0）** | 见下方实施记要 |
+| **T5.3b** | ① 删中止 xmin 的元组（不做⇒截断后**幽灵行复活**） | §6.4 ① 注入测试 |
+| **T5.3c** | ② 删 `xmax` 已提交且 `commit_ts(xmax) < GlobalSafeTs` 的死元组（**判据看 xmax 不看 xmin**，含索引两阶段） | §6.4 ② 注入测试 |
 | **T5.4** | 截断 + 顺序铁律落地 | 注入"页未清完就截断"必须被拦 |
 | **T5.5** | 两态恢复：趟中崩溃整趟重来（幂等）；趟完未截断只补截断 | §6.5 两态恢复 |
 | **T5.6** | 回卷护栏两阶段：基点取 `clog_truncate_before`（非 `ShardVacuumXid` —— 后者在"趟完未截断"崩溃窗口跑在前面，算出的龄偏小、**方向不安全**）；阶段 1 到龄强制启动、**无视常规 vacuum 开关**；阶段 2 达 2³¹−边距时**该分片进只读**（分片粒度，不殃及节点/集群） | age 护栏触发。硬约束：超龄 RUNNING 可按策略强杀，**PREPARED 未决绝不允许单方中止**，只能走协调组决议 |
@@ -2222,6 +2224,9 @@ xmax 是**分片 xid**。两者数值空间独立、无可比性。直接把分�
 
 ##### 结论与建议
 
+> **【已裁定，2026-08-21】用户采纳解法 A。** T5.3b/c 按 A 推进：晋升判断
+> 由扩展在分片宇宙内做完再给终值，`dead_after` 不参与。
+
 **推荐解法 A**，理由：
 1. **冲突根源是"用原生水平线判分片元组"，A 是唯一从根上消除它的**——
    B 是给冲突打补丁、C 是把冲突扩散到三处、D 是绕开但要重写一切。
@@ -2252,6 +2257,128 @@ xmax 是**分片 xid**。两者数值空间独立、无可比性。直接把分�
 
 **预判需要用户裁定的点**：T5.3（heapam 冻结路径）与 T5.6（发号拒绝）可能触及
 内核补丁与 pg_raft 解冻，到该步先问。
+
+#### T5.3a 实施记要（2026-08-21，验收 **33/0**）
+
+**交付**：`ShardVacuumSanitizeXmax()`（新文件 `src/shard_vacuum.c` /
+`include/shard_vacuum.h`）+ SQL 包装 `partdist.shard_sanitize_xmax(regclass,
+bigint)`（9/9 部署）+ 验收套件 `tests/test_shard_vacuum_p5.sh`。
+
+##### ★ 与 T5.3 方案的一处修正：本任务**不需要内核补丁**
+
+T5.3 方案表里写"三类动作全部需要内核补丁"，动手勘察后**这一条对 ③ 不成立**，
+现予更正。理由分两半：
+
+- **策略侧确实不能用内核的**：`heap_prepare_freeze_tuple()` 从头到尾拿元组 xid
+  与 `VacuumCutoffs` 里的**原生** `relfrozenxid` / `OldestXmin` 比较，并按
+  `checkflags` 去查**原生** clog；分片元组的 xmin/xmax 是分片 xid，三处比较
+  全是异宇宙比较。更要命的是结尾的 `heap_tuple_should_freeze()` 会把分片 xid
+  喂进 `NoFreezePageRelfrozenXid` 跟踪器 —— **污染原生回卷账本**。给它开分叉
+  等于把整个函数改写。设计 §6.4 ③ 原文"即 `heap_prepare_freeze_tuple` 的
+  xmax 处置**换形态重现**"说的正是这件事。
+- **执行侧完全可以用内核的**：`heap_freeze_execute_prepared()` 是 `extern` 的
+  （`heapam.h:272`），只吃一组算好的 `HeapTupleFreeze` 计划，负责改页 + 发
+  内核原样的 `XLOG_HEAP2_FREEZE_PAGE`。
+
+⇒ **策略在扩展、WAL 由内核发。** 这样 follower 收到的是内核标准记录，
+`heap2_redo` 逐字节回放，**不新增任何记录格式** —— 恰好满足 §6.7 的硬要求，
+也避开了"自造记录格式"这条 R-P4-20 级别的风险路径。
+补丁清单里的 `0011-shard-freeze-xmax` 因此**取消**（编号不复用）。
+
+##### 判据（四分支，少一条就不成立）
+
+| xmax 形态 | 处置 | 不这么做的后果 |
+|---|---|---|
+| `>= trunc_before` | 不动 | clog 还查得到，动它是越权 |
+| lock-only | 清成 0 | 锁随事务结束释放，留着会被免查区读成"已提交的删除" |
+| clog **ABORTED** | 清成 0 | **本动作的正主**：截断后"中止了的删除"读成"早已提交的删除"，**活行被判死** |
+| clog **COMMITTED** | 不动 | 真删除，元组由动作 ② 回收；留着被读成"已提交的删除"恰好正确 |
+
+未决（RUNNING / PREPARED / 空洞）分两种，**区别对待是要点**：
+- 落在 `[当前截断点, trunc_before)` ⇒ **ERROR**。§6.3 的前缀扫描遇未决即停，
+  调用者不可能算出跨过未决条目的 target；到这里说明 `trunc_before` 给错了，
+  fail-closed 而不是"判不出来就不动"——后者会把本该报错的输入静默吞掉。
+- 落在当前截断点以下 ⇒ 不动。其 clog 已被上一轮截断，判不出来了；这是过去时的
+  既成事实（只可能来自上一轮违反顺序铁律），留着是唯一安全动作。
+
+`multixact xmax` 一律 ERROR：补丁 0006 对分片表强制 `HEAP_XMAX_INVALID` 简单
+路径（原生机器会拿分片 xid 误组 multixact，P1 实测过
+`new multixact has more than one updating member`），出现 multi 即上游破防，
+照常处置等于把分片 xid 当 multi 号解释。
+
+##### 两处必须与内核逐字一致的细节
+
+- 清 xmax 的 infomask 变换照抄 `heap_prepare_freeze_tuple` 的 `freeze_xmax`
+  分支：清 `HEAP_XMAX_BITS`、置 `HEAP_XMAX_INVALID`、清 `HEAP_HOT_UPDATED` /
+  `HEAP_KEYS_UPDATED`。（清 `HEAP_HOT_UPDATED` 曾疑心会断 HOT 链，查证后无碍：
+  `HeapTupleHeaderIsHotUpdated()` 本身就带 `HEAP_XMAX_INVALID == 0` 前置条件，
+  置了 INVALID 之后该位设不设都读作"未 HOT 更新"。）
+- `checkflags` 恒 0。那两项检查（`HEAP_FREEZE_CHECK_XMIN_COMMITTED` /
+  `_XMAX_ABORTED`）在 `heap_freeze_execute_prepared` 里查的是**原生** clog，
+  喂分片 xid 进去是纯粹的误判源。
+- `snapshotConflictHorizon` 传 `Invalid`：该值只在 hot standby 的
+  `ResolveRecoveryConflictWithSnapshot` 里用于杀查询，分片副本走 pg_parwal
+  物理回放（非 hot standby），且消毒只会让元组**更可见**，不存在需要杀的冲突。
+
+##### 顺序铁律的落地方式
+
+本函数**只清、绝不推进任何水位**。§6.4 末的"数据页、索引、堆全部清完，才许动
+clog"意味着推进必须由 T5.4 的截断路径在确认整趟做完之后统一落 —— 把推进埋在
+单个动作里，等于每个动作各自宣称"我这部分清完了"，铁律就无处强制。
+
+##### T5.3a 验收明细（33/0）
+
+| 段 | 断言 | 结果 |
+|---|---|---|
+| [0] | 节点就绪、扩展符号存在、pageinspect 就绪 | PASS ×3 |
+| [1] | 构造四形态：r1 ABORTED xmax / r2 COMMITTED xmax / r3 无 xmax / r4 ABORTED 但号更大；三条 clog 状态核对；发号递增；消毒前可见 3 行 | PASS ×10 |
+| [2] | 返回 `1/1/1`；**r1 xmax 清 0 且带 `HEAP_XMAX_INVALID`**；**r2 COMMITTED 不动**；**r4 截断点以上不动**；可见行数不变 | PASS ×6 |
+| [3] | pg_waldump 在区间内看到 `FREEZE_PAGE` —— 走的是内核标准记录 | PASS |
+| [4] | 幂等：第二趟 0 条 | PASS |
+| [5] | 负向 ×3：区间内仍未决即拒（且被拒后 xmax 未被污染）、`trunc_before` 后退即拒、非分片表即拒；负向计数守卫 | PASS ×5 |
+| [6] | **immediate 崩溃重启后消毒结果保持**（证明经 WAL 落盘，不是只改了内存） | PASS ×4 |
+| [7] | 清场 + 本轮无节点崩溃 | PASS ×2 |
+
+##### 验收脚本自身踩到的两个坑（记以备后用）
+
+- **`heap_page_items` 认行不能靠 `t_data::text LIKE '%r1%'`** —— `t_data` 是
+  bytea，文本形态是 `\x...` 十六进制，永远匹配不上，且失败形态是**返回空串**
+  （靠 `check()` 的空值守卫才没变成静默通过）。改按行指针 `lp` 定位：四行按
+  id 顺序一次插入、DELETE 不产生新版本，故 `lp1..lp4` 恒等于 `r1..r4`。
+- **`pg_waldump -e <pg_current_wal_lsn()>` 会把最后一条记录排除掉** ——
+  该函数返回的是**最后一条记录的末端**，消毒记录若正好是流水线末尾就落在
+  上界之外。实测同一脚本两次运行一过一挂。改为先 `pg_switch_wal()` 再取上界。
+
+##### T5.3a **未覆盖**的部分（不含糊其辞）
+
+- **follower 回放未实测**。§6.7 要求页面修改随 parwal 流被 follower 逐字节
+  回放；本套件只验到"leader 的 WAL 里确有内核标准 `FREEZE_PAGE` 记录"，
+  跨节点比对没做 —— 需要一张已登记 `partition_map` 的复制分片夹具，属 T5.4
+  规模。**留 T5.4 一并验**，届时 CTRL 水位复制本就需要同一套夹具。
+- **lock-only 分支未实测**。P1 起分片表禁行锁（补丁 0005），构造不出 lock-only
+  xmax；该分支是防御性的。
+- **免查隐式冻结区尚不存在**。`xid < clog_truncate_before ⇒ 已提交` 这条解释
+  规则**全仓未实现**（`shard_xid_state()` 现在一律查 clog）。因此 ③ 的
+  端到端陷阱（"不消毒 ⇒ 截断后活行被判死"）**目前构造不出来**，本套件只能
+  验到元组头这一层。解释规则属截断的配套，归 T5.4。
+
+##### 顺带查出并补齐的两处 P5 前序遗漏
+
+**其一：T5.2 的 SQL 包装从未进扩展安装脚本。**
+`partdist_shard_vacuum_target` 当时只在 9 个节点上**手工建了函数**，没写进
+`sql/pg_partdist--1.0.sql` —— 全新安装的节点上不存在它。本次一并补进。
+（`sclog_wts` 是验收辅助，按 `sclog_write` 的惯例留在测试脚本里，不进扩展。）
+
+**其二：T5.1 改水位文件格式时打翻了 `test_shard_clog_p2` 的一条断言，无人察觉。**
+该套件第 [3] 段用 `od -An -tu4` 直读 `pg_shard_xid/<oid>` 断言内容为
+`4099 4099`；T5.1 把文件从 8 字节扩到 16 字节后，实际输出成了
+`4099 4099 0 0`，这条断言自 T5.1 起一直是 FAIL —— **因为 T5.1/T5.2 都没有
+回跑既有套件**，直到本次 T5.3a 顺手做冒烟测试才暴露。
+基线 64/0 ⇒ 实测 63/1。断言期望已按新格式更正，复跑 **64/0** 恢复基线。
+
+> 教训（与 §13 既有条目同类，此处记具体形态）：**改磁盘格式必须回跑一切直读
+> 该文件的断言。** 本例里格式变更与断言相隔两个任务，且失败信息
+> （"期望 4099 4099"）看上去像发号出了问题，与真因隔了一层。
 
 ---
 
