@@ -125,4 +125,19 @@ extern bool ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 							 int64 *sanitized, int64 *removed_aborted,
 							 int64 *removed_dead);
 
+/*
+ * T5.5：两态恢复（设计 §6.5）。
+ *   tb == vx ⇒ 无未完成的趟，什么都不做（趟中崩溃落在这一格，整趟重来即可，
+ *              三类动作各自幂等）；
+ *   tb <  vx ⇒ 趟完未截断，**只补做截断**，绝不重跑页面趟。
+ * 幂等：连做两次，第二次必然回 NOTHING。
+ */
+typedef enum ShardVacuumRecoverAction
+{
+	SHARD_VACUUM_RECOVER_NOTHING = 0,
+	SHARD_VACUUM_RECOVER_TRUNCATE = 1
+} ShardVacuumRecoverAction;
+
+extern int	ShardVacuumRecover(Oid shard);
+
 #endif							/* SHARD_VACUUM_H */

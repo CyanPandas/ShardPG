@@ -15,6 +15,9 @@
 #   [19]-[23] T5.4 —— 截断 + **顺序铁律** + **免查隐式冻结区**。核心验收是
 #           "页未清完就截断必须被拦"；[21] 段用注入证明门禁拦的那件事确实是
 #           灾难：跳过清理直接推水位，幽灵行当场复活、活行当场被判死。
+#   [24]-[27] T5.5 —— **两态恢复**。状态一（趟不完整）用"同一 session 里开着
+#           游标 pin 住页面"确定性地造出来（顺带覆盖了 pages_skipped 分支）；
+#           状态二（趟完未截断）用 immediate 崩溃造出来，验恢复只补截断。
 #
 # 判据边界（三条都要验，少一条就等于没验）：
 #   - ABORTED 且在截断点以下 ⇒ 清；
@@ -418,9 +421,87 @@ check "重启后 p5e 水位仍 $TE/$TE" "$(WM "$OE")" "$TE/$TE"
 check "重启后 p5e 仍可见 2 行"    "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
 check "重启后 p5e 内容正确"       "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5e" </dev/null)" "live1,live2"
 
-echo "========== [23] 清场 =========="
+# ================================================================
+#  T5.5 —— 两态恢复（设计 §6.5）
+#  页面趟不按 xid 推进，所以 shard_vacuum_xid 只有两个有意义取值：
+#    tb == vx ⇒ 无未完成的趟（趟中崩溃落这一格，整趟重来即可，三类动作幂等）
+#    tb <  vx ⇒ 趟完未截断，只补做截断，绝不重跑页面趟
+# ================================================================
+echo "========== [24] 状态一：趟不完整（确定性注入 pages_skipped）=========="
 set_whitelist ""
-PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5h; CREATE TABLE p5h(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OH=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5h'" </dev/null)
+set_whitelist "$OH"; check "p5h 白名单生效" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5h VALUES (1,'a'),(2,'b'),(3,'c');
+DELETE FROM p5h WHERE id=3;
+BEGIN; INSERT INTO p5h VALUES (9,'ghost'); ROLLBACK;
+SQL
+TH=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5h',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OH::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TH-1))) g WHERE sclog_read($OH::oid, g::bigint)=2" </dev/null >/dev/null
+check "构造后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5h" </dev/null)" "2"
+# ★ 确定性地造出"趟不完整"：同一 session 里开着游标 FETCH 过一行，第 0 页就被
+#   本后端多钉了一个 pin，回收行指针要的 cleanup lock（要求 refcount==1）
+#   于是拿不到 —— ① 与 ② 跳过该页。这同时覆盖了 T5.3b/c 记要里
+#   "pages_skipped 分支从未被真正触发"那一条。
+# psql 会把 BEGIN/DECLARE/COMMIT 的命令标签也打到 stdout，tail -1 取到的是
+# "COMMIT" 而不是 sweep 的结果 —— 按结果的形状挑行。
+SK=$(PSQL "$WPORT" -At <<SQL 2>/dev/null | grep -E '^(true|false)/' | tail -1
+BEGIN;
+DECLARE c5h CURSOR FOR SELECT * FROM p5h;
+FETCH 1 FROM c5h;
+SELECT swept||'/'||pages_skipped FROM partdist.shard_vacuum_sweep('p5h'::regclass, $TH::bigint);
+COMMIT;
+SQL
+)
+check "★ 有页被 pin 住时 sweep 不完整（swept=false 且有跳页）" \
+      "$(echo "$SK" | grep -c '^false/[1-9]')" "1"
+check "★ 不完整的趟不落标记（水位仍 0/0）" "$(WM "$OH")" "0/0"
+neg "不完整的趟之后仍拒截断" "不许截断 clog" \
+    "SELECT partdist.shard_clog_truncate($OH::oid, $TH::bigint)"
+check "负向计数守卫（累计应跑 10 条）" "$NEG_RUN" "10"
+# 游标随事务结束释放 ⇒ 整趟重来即可（这正是状态一的恢复动作）
+SW2=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5h'::regclass, $TH::bigint)" </dev/null)
+check "整趟重来：干净收尾" "$SW2" "true/0/0"
+check "重来后标记落到 $TH" "$(WM "$OH")" "0/$TH"
+PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OH::oid, $TH::bigint)" </dev/null >/dev/null
+check "截断后水位 $TH/$TH" "$(WM "$OH")" "$TH/$TH"
+check "可见性正确（2 行）" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5h" </dev/null)" "2"
+
+echo "========== [25] 状态二：趟完未截断 + 崩溃 =========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5i; CREATE TABLE p5i(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OI2=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5i'" </dev/null)
+set_whitelist "$OI2"; check "p5i 白名单生效" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5i VALUES (1,'x'),(2,'y'),(3,'z');
+DELETE FROM p5i WHERE id=3;
+BEGIN; INSERT INTO p5i VALUES (9,'ghost'); ROLLBACK;
+BEGIN; DELETE FROM p5i WHERE id=1; ROLLBACK;
+SQL
+TI=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5i',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OI2::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TI-1))) g WHERE sclog_read($OI2::oid, g::bigint)=2" </dev/null >/dev/null
+SW3=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5i'::regclass, $TI::bigint)" </dev/null)
+check "sweep 干净收尾（未截断）" "$SW3" "true/0/0"
+check "★ 处于状态二：0/$TI（vx 跑在 tb 前面）" "$(WM "$OI2")" "0/$TI"
+crash_restart; check "immediate 崩溃后重启就绪" "$?" "0"
+check "★ 状态二跨崩溃保持（仍 0/$TI）" "$(WM "$OI2")" "0/$TI"
+check "★ 恢复只补做截断" "$(PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_recover($OI2::oid)" </dev/null)" "truncated"
+check "恢复后水位 $TI/$TI" "$(WM "$OI2")" "$TI/$TI"
+check "恢复后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5i" </dev/null)" "2"
+check "恢复后内容正确" "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5i" </dev/null)" "x,y"
+check "恢复幂等：再做一次是 nothing" "$(PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_recover($OI2::oid)" </dev/null)" "nothing"
+
+echo "========== [26] 状态一的恢复动作 = 整趟重来（幂等）=========="
+SW4=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||sanitized||'/'||removed_aborted||'/'||removed_dead FROM partdist.shard_vacuum_sweep('p5i'::regclass, $TI::bigint)" </dev/null)
+check "已清干净的表再跑整趟：零动作" "$SW4" "true/0/0/0"
+check "重跑不动水位" "$(WM "$OI2")" "$TI/$TI"
+check "重跑后仍可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5i" </dev/null)" "2"
+check "tb == vx 时恢复无事可做" "$(PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_recover($OI2::oid)" </dev/null)" "nothing"
+
+echo "========== [27] 清场 =========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5h; DROP TABLE IF EXISTS p5i; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
 check "清场完成" "$?" "0"
 
 health_check_no_crash

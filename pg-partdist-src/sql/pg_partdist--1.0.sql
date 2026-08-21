@@ -621,6 +621,18 @@ RETURNS INTEGER LANGUAGE c STRICT VOLATILE
 COMMENT ON FUNCTION shard_clog_truncate(OID, BIGINT) IS
     'T5.4：截断分片 clog 到 p_trunc_before（开区间上界；此后 xid < 该值进入免查隐式冻结区）。要求 p_trunc_before <= shard_vacuum_xid（顺序铁律：页没清完不许动 clog），否则 ERROR。先推水位后删文件——反过来一旦中途崩溃，clog 没了而水位还说要查 clog，已提交数据当场消失。按段整删，返回删掉的段文件数。';
 
+-- T5.5（设计 §6.5）：两态恢复。
+--   clog_truncate_before == shard_vacuum_xid ⇒ 无未完成的趟，返回 'nothing'
+--       （趟中崩溃落在这一格：整趟重来即可，三类动作各自幂等）；
+--   clog_truncate_before <  shard_vacuum_xid ⇒ 趟完未截断，**只补做截断**，
+--       返回 'truncated'，绝不重跑页面趟。
+CREATE OR REPLACE FUNCTION shard_vacuum_recover(p_shard OID)
+RETURNS TEXT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_recover';
+
+COMMENT ON FUNCTION shard_vacuum_recover(OID) IS
+    'T5.5：分片 vacuum 的两态恢复（设计 §6.5）。两个水位相等=无未完成的趟（什么都不做）；shard_vacuum_xid 跑在前面=趟完未截断（只补做截断）。幂等：连做两次第二次必回 nothing。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

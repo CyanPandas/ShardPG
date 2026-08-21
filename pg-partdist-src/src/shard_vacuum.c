@@ -36,6 +36,7 @@
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
+#include "access/xlog.h"			/* T5.5：落标记前刷 WAL */
 #include "access/xloginsert.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -647,6 +648,23 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 		return false;
 
 	/*
+	 * ★★ 落标记之前必须先把页面改动的 WAL 刷到盘上（T5.5 动手前查出的自身
+	 * 缺陷，2026-08-21）。
+	 *
+	 * 三类动作发的是普通 WAL 记录，只进 WAL 缓冲区；而
+	 * ShardVacuumSetWatermarks 走的是水位文件，**当场 fsync**。两者之间崩溃
+	 * 一次，结果是：标记说"页面已清到 trunc_before"，而那些页面改动随未刷的
+	 * WAL 一起没了 —— 恢复后 ShardClogTruncate 认这个标记、照常截断，
+	 * **中止事务的幽灵行当场复活**。这正是顺序铁律要防的那件事，却发生在
+	 * 铁律自己的实现里。
+	 *
+	 * 刷到"此刻的插入位置"即可覆盖本趟发出的全部记录（顺带多刷一点别的
+	 * 后端的，无害）。这条与"先推水位、后删文件"是同一族次序要求：
+	 * **任何一个'已经做完'的持久断言，都不能先于它所断言的那件事持久。**
+	 */
+	XLogFlush(GetXLogInsertRecPtr());
+
+	/*
 	 * 落"趟完"标记（设计 §6.5 两态之二："趟完、截断前"）。
 	 * 不变式 clog_truncate_before <= shard_vacuum_xid 由落盘出口统一守；
 	 * trunc_before 不许后退已在 shard_vacuum_begin 里拦过。
@@ -656,6 +674,48 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 		ShardVacuumSetWatermarks(shard, cur_tb, trunc_before);
 
 	return true;
+}
+
+/* ================================================================== */
+/* T5.5：两态恢复（设计 §6.5）                                         */
+/* ================================================================== */
+
+/*
+ * 页面趟不按 xid 推进（垃圾散布在任意页），所以 shard_vacuum_xid 只有两个
+ * 有意义的取值，恢复也只有两条路：
+ *
+ *   ① tb == vx  ——「没有未完成的趟」。趟中崩溃就落在这一格：整趟的页面动作
+ *      一条标记都没留下，下一轮**整趟重来**即可。重来是安全的，因为三类
+ *      动作各自幂等（已消毒的 xmax 是 0、已删的行指针不再是 LP_NORMAL，
+ *      再跑一遍全是空操作 —— 套件里逐条验过）。本函数对这一格**什么都不做**。
+ *
+ *   ② tb < vx   ——「趟完了、截断还没做」。页面动作已经全部完成并持久
+ *      （落标记前刷过 WAL，见 ShardVacuumSweep 里的 XLogFlush），
+ *      **只补做截断**，绝不重跑页面趟。
+ *
+ * 不变式 clog_truncate_before <= shard_vacuum_xid 由水位落盘出口统一守，
+ * 所以不存在第三种取值。
+ *
+ * 返回本次做了什么（见 ShardVacuumRecoverAction）。幂等：连做两次，
+ * 第二次必然回 NOTHING。
+ */
+int
+ShardVacuumRecover(Oid shard)
+{
+	TransactionId tb;
+	TransactionId vx;
+
+	ShardVacuumGetWatermarks(shard, &tb, &vx);
+
+	if (!TransactionIdIsValid(vx) || vx <= tb)
+		return SHARD_VACUUM_RECOVER_NOTHING;
+
+	ereport(DEBUG1,
+			(errmsg("pg_partdist: 分片 %u 处于「趟完未截断」态（%u < %u），补做截断",
+					shard, tb, vx)));
+
+	(void) ShardClogTruncate(shard, vx);
+	return SHARD_VACUUM_RECOVER_TRUNCATE;
 }
 
 /* ---- SQL 包装（T5.5 编排与验收的调用点）---- */
@@ -801,4 +861,15 @@ partdist_shard_vacuum_sweep(PG_FUNCTION_ARGS)
 	values[4] = Int64GetDatum(st.pages_skipped);
 	values[5] = Int64GetDatum(st.tuples_deferred);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_recover);
+Datum
+partdist_shard_vacuum_recover(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	int			act = ShardVacuumRecover(shard);
+
+	PG_RETURN_TEXT_P(cstring_to_text(
+		(act == SHARD_VACUUM_RECOVER_TRUNCATE) ? "truncated" : "nothing"));
 }
