@@ -576,6 +576,26 @@ CREATE OR REPLACE FUNCTION shard_remove_aborted(
 COMMENT ON FUNCTION shard_remove_aborted(REGCLASS, BIGINT) IS
     'T5.3b：删中止 xmin 的元组（设计 §6.4 ①）。判据只看 xmin：clog ABORTED 且 xmin < p_trunc_before 即删。走原生无索引表通路——XLOG_HEAP2_PRUNE 置 LP_DEAD/LP_UNUSED，紧接 XLOG_HEAP2_VACUUM 置 LP_UNUSED 并截行指针数组，页面变换全交内核 heap_page_prune_execute。需先跑 shard_sanitize_xmax；带索引即 ERROR。';
 
+-- T5.3c（设计 §6.4 ②）：删已提交删除的死元组。**判据看 xmax 不看 xmin** ——
+-- 没被删过的老行是活的，零页面动作。commit_ts < GlobalSafeTs 由 p_trunc_before
+-- 的构造保证（§6.3 只让满足该条件的 COMMITTED 过关）；反命题做成守卫：
+-- commit_ts=0 的已提交条目落在截断点以下即 ERROR。
+-- ★ 与 ① 不对称：本动作**不推迟**仍挂 HOT 链的 heap-only 元组——已提交的 xmax
+--   没有后续动作会清它的 HEAP_HOT_UPDATED，推迟就是永远推迟，会把截断钉死。
+-- ★ 索引两阶段尚未实现（带索引即 ERROR），见 DEV PLAN T5.3c 实施记要。
+CREATE OR REPLACE FUNCTION shard_remove_dead(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_removed BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_remove_dead';
+
+COMMENT ON FUNCTION shard_remove_dead(REGCLASS, BIGINT) IS
+    'T5.3c：删已提交删除的死元组（设计 §6.4 ②）。判据只看 xmax：clog COMMITTED 且 xmax < p_trunc_before 即删；xmax 为空/中止/lock-only 一律不动。与 shard_remove_aborted 共用同一条页面通路（PRUNE + VACUUM 两条内核记录），定义域互不相交。带索引即 ERROR（索引两阶段未实现）。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

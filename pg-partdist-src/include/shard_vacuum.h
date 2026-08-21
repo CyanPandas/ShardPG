@@ -85,4 +85,27 @@ extern void ShardVacuumRemoveAbortedXmin(Relation rel,
 										 TransactionId trunc_before,
 										 ShardVacuumPageStats *stats);
 
+/*
+ * §6.4 ②：删已提交删除的死元组。
+ *
+ * **判据看 xmax 不看 xmin**（设计 §6.4 ② 原文）：没被删过的老行是活的，
+ * 零页面动作 —— 无论它的 xmin 有多老。
+ *
+ * 判据：`xmax < trunc_before` 且 clog COMMITTED。设计原文还要求
+ * "commit_ts(xmax) < GlobalSafeTs"，该条件由 trunc_before 的构造保证
+ * （§6.3 只让 commit_ts < GlobalSafeTs 的 COMMITTED 过关，且 GlobalSafeTs
+ * 单调不减）；其反命题 —— commit_ts == 0 的 COMMITTED 落在截断点以下 ——
+ * 做成 fail-closed 守卫。
+ *
+ * ★ 与 ① 的一处刻意不对称：② **不推迟**仍挂在 HOT 链上的 heap-only 元组。
+ *   已提交的 xmax 没有任何后续动作会清它的 `HEAP_HOT_UPDATED`，一推迟就是
+ *   永远推迟，而"本趟不完整"又禁止截断 —— HOT 链会把截断永久钉死。无索引
+ *   的表页外没有任何东西引用行指针，逐条独立回收是安全的。
+ *
+ * 其余（无索引前提、cleanup lock、两条内核记录）与 ① 完全相同。
+ */
+extern void ShardVacuumRemoveDeadTuples(Relation rel,
+										TransactionId trunc_before,
+										ShardVacuumPageStats *stats);
+
 #endif							/* SHARD_VACUUM_H */

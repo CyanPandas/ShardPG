@@ -278,9 +278,90 @@ ShardVacuumSanitizeXmax(Relation rel, TransactionId trunc_before,
  * 它们掩掉。分片表已禁 on-access 剪枝（补丁 0005），这两个提示对我们毫无
  * 用处，因此干脆不动：与 redo 逐字一致，比原生还紧。
  */
-void
-ShardVacuumRemoveAbortedXmin(Relation rel, TransactionId trunc_before,
-							 ShardVacuumPageStats *stats)
+/* 两个删元组动作的判据差异全在这里 */
+typedef enum ShardVacuumPruneMode
+{
+	SVP_ABORTED_XMIN,			/* §6.4 ①：xmin 中止 */
+	SVP_DEAD_XMAX				/* §6.4 ②：xmax 已提交 */
+} ShardVacuumPruneMode;
+
+/*
+ * 判一条元组在本模式下是不是该删。两个模式的定义域天然不相交
+ * （xmin 中止的行不可能被谁删过 —— 看不见的行删不了），所以两趟互不干扰。
+ */
+static bool
+prune_tuple_is_dead(Oid shard, HeapTupleHeader tuple, ShardVacuumPruneMode mode,
+					TransactionId trunc_before, TransactionId cur_tb)
+{
+	if (mode == SVP_ABORTED_XMIN)
+	{
+		TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple);
+
+		/* 冻结/无效 xmin：不是分片 xid，不归本动作管 */
+		if (!TransactionIdIsNormal(xmin))
+			return false;
+		/* 截断点以上：clog 还查得到，本趟不动（设计 §6.4 趟范围） */
+		if (xmin >= trunc_before)
+			return false;
+
+		return shard_vacuum_status(shard, xmin, "xmin",
+								   trunc_before, cur_tb) == TXN_ABORTED;
+	}
+	else
+	{
+		TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple);
+		ShardClogSlot slot;
+
+		if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
+			!TransactionIdIsNormal(xmax))
+			return false;		/* 从没被删过 —— 设计 §6.4 ②："零页面动作" */
+
+		if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("分片 %u 的元组带 multixact xmax %u —— 分片表不应产生 multixact",
+							shard, xmax)));
+
+		/* lock-only 是锁不是删除；它归 ③ 消毒，不归本动作删 */
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+			return false;
+
+		if (xmax >= trunc_before)
+			return false;
+
+		if (shard_vacuum_status(shard, xmax, "xmax",
+								trunc_before, cur_tb) != TXN_COMMITTED)
+			return false;		/* 中止的删除 ⇒ 行是活的（③ 会消毒它的 xmax） */
+
+		/*
+		 * 设计 §6.4 ② 的判据原文是"xmax 已提交**且 commit_ts < GlobalSafeTs**"。
+		 * 这里不再取一次 GlobalSafeTs，而是靠 trunc_before 的构造来保证：
+		 * §6.3 的前缀扫描只让 `commit_ts > 0 && commit_ts < GlobalSafeTs` 的
+		 * COMMITTED 条目过关，所以**截断点以下的 COMMITTED 天然满足该条件**
+		 * （GlobalSafeTs 单调不减，当时成立则永远成立）。
+		 *
+		 * 这条推理只在 trunc_before 确实来自 ShardVacuumComputeTarget 时成立，
+		 * 因此把它的反命题做成守卫：commit_ts == 0 的 COMMITTED 槽是 T5.2 明确
+		 * 会**挡住前缀**的形态（P2 遗留数据），它出现在截断点以下就说明
+		 * trunc_before 是硬塞进来的 —— fail-closed，绝不按"已提交"删元组。
+		 */
+		if (!ShardClogReadSlot(shard, xmax, &slot) || (int64) slot.commit_ts <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("分片 %u 的 xmax %u 已提交但 commit_ts 为 0，却落在截断点 %u 以下",
+							shard, xmax, trunc_before),
+					 errdetail("§6.3 的前缀扫描会挡住 commit_ts=0 的已提交条目，"
+							   "它不可能出现在正确算出的截断点以下。"),
+					 errhint("trunc_before 应取 ShardVacuumComputeTarget() 的结果 + 1。")));
+
+		return true;
+	}
+}
+
+static void
+shard_vacuum_prune_pass(Relation rel, TransactionId trunc_before,
+						ShardVacuumPruneMode mode,
+						ShardVacuumPageStats *stats)
 {
 	Oid			shard;
 	TransactionId cur_tb;
@@ -366,38 +447,30 @@ ShardVacuumRemoveAbortedXmin(Relation rel, TransactionId trunc_before,
 		{
 			ItemId		itemid = PageGetItemId(page, off);
 			HeapTupleHeader tuple;
-			TransactionId xmin;
 
 			if (!ItemIdIsNormal(itemid))
 				continue;
 
 			tuple = (HeapTupleHeader) PageGetItem(page, itemid);
-			xmin = HeapTupleHeaderGetRawXmin(tuple);
 
-			/* 冻结/无效 xmin：不是分片 xid，不归本动作管 */
-			if (!TransactionIdIsNormal(xmin))
+			if (!prune_tuple_is_dead(shard, tuple, mode, trunc_before, cur_tb))
 				continue;
-
-			/* 截断点以上：clog 还查得到，本趟不动（设计 §6.4 趟范围） */
-			if (xmin >= trunc_before)
-				continue;
-
-			if (shard_vacuum_status(shard, xmin, "xmin",
-									trunc_before, cur_tb) != TXN_ABORTED)
-				continue;
-
-			/* —— 这条元组是中止插入，必须删 —— */
 
 			if (HeapTupleHeaderIsHeapOnly(tuple))
 			{
 				/*
-				 * 还挂在 HOT 链上（自己也被 HOT 更新过）就不能直接置
-				 * LP_UNUSED。这只可能出现在"③ 还没跑"的时候：HOT_UPDATED
-				 * 的有效性以 HEAP_XMAX_INVALID == 0 为前提，而这条元组的
-				 * xmax 必是同一个中止事务的号，③ 一清就解除了。
-				 * 留到下一趟，并如实计数——本趟不完整。
+				 * ① 的保守格：还挂在 HOT 链上（自己也被 HOT 更新过）就先不
+				 * 动。这只出现在"③ 还没跑"的时候 —— HOT_UPDATED 的有效性
+				 * 以 HEAP_XMAX_INVALID == 0 为前提，而这条元组的 xmax 必是
+				 * 同一个中止事务的号，③ 一清就解除了。留到下一趟，如实计数。
+				 *
+				 * ★ ② **不能**照此办理：committed 的 xmax 没有任何后续动作
+				 *   会去清它的 HOT_UPDATED 位，一推迟就是永远推迟，而
+				 *   "本趟不完整"又禁止截断 —— HOT 链会把截断永久钉死。
+				 *   ② 直接收：本表无索引（函数开头已强制），页外没有任何
+				 *   东西引用行指针，逐条独立回收是安全的。
 				 */
-				if (HeapTupleHeaderIsHotUpdated(tuple))
+				if (mode == SVP_ABORTED_XMIN && HeapTupleHeaderIsHotUpdated(tuple))
 				{
 					stats->tuples_deferred++;
 					continue;
@@ -492,6 +565,20 @@ ShardVacuumRemoveAbortedXmin(Relation rel, TransactionId trunc_before,
 	}
 }
 
+void
+ShardVacuumRemoveAbortedXmin(Relation rel, TransactionId trunc_before,
+							 ShardVacuumPageStats *stats)
+{
+	shard_vacuum_prune_pass(rel, trunc_before, SVP_ABORTED_XMIN, stats);
+}
+
+void
+ShardVacuumRemoveDeadTuples(Relation rel, TransactionId trunc_before,
+							ShardVacuumPageStats *stats)
+{
+	shard_vacuum_prune_pass(rel, trunc_before, SVP_DEAD_XMAX, stats);
+}
+
 /* ---- SQL 包装（T5.5 编排与验收的调用点）---- */
 PG_FUNCTION_INFO_V1(partdist_shard_sanitize_xmax);
 Datum
@@ -547,6 +634,41 @@ partdist_shard_remove_aborted(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		ShardVacuumRemoveAbortedXmin(rel, trunc_before, &st);
+	}
+	PG_FINALLY();
+	{
+		relation_close(rel, ShareUpdateExclusiveLock);
+	}
+	PG_END_TRY();
+
+	values[0] = Int64GetDatum(st.pages_scanned);
+	values[1] = Int64GetDatum(st.pages_dirtied);
+	values[2] = Int64GetDatum(st.pages_skipped);
+	values[3] = Int64GetDatum(st.tuples_touched);
+	values[4] = Int64GetDatum(st.tuples_deferred);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_remove_dead);
+Datum
+partdist_shard_remove_dead(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	Relation	rel;
+	ShardVacuumPageStats st;
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	rel = relation_open(relid, ShareUpdateExclusiveLock);
+	PG_TRY();
+	{
+		ShardVacuumRemoveDeadTuples(rel, trunc_before, &st);
 	}
 	PG_FINALLY();
 	{
