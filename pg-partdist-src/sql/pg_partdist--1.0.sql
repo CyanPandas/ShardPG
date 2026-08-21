@@ -596,6 +596,31 @@ CREATE OR REPLACE FUNCTION shard_remove_dead(
 COMMENT ON FUNCTION shard_remove_dead(REGCLASS, BIGINT) IS
     'T5.3c：删已提交删除的死元组（设计 §6.4 ②）。判据只看 xmax：clog COMMITTED 且 xmax < p_trunc_before 即删；xmax 为空/中止/lock-only 一律不动。与 shard_remove_aborted 共用同一条页面通路（PRUNE + VACUUM 两条内核记录），定义域互不相交。带索引即 ERROR（索引两阶段未实现）。';
 
+-- T5.4（设计 §6.4 顺序铁律）：一整趟页面动作 ③→①→②。
+-- **只有整趟干净**（pages_skipped=0 且 tuples_deferred=0）才落"趟完"标记
+-- shard_vacuum_xid = p_trunc_before —— 这是 shard_clog_truncate 唯一认的凭据。
+CREATE OR REPLACE FUNCTION shard_vacuum_sweep(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT swept BOOLEAN,
+    OUT sanitized BIGINT,
+    OUT removed_aborted BIGINT,
+    OUT removed_dead BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_sweep';
+
+COMMENT ON FUNCTION shard_vacuum_sweep(REGCLASS, BIGINT) IS
+    'T5.4：一整趟页面动作（③ xmax 消毒 → ① 删中止 xmin → ② 删已提交删除的死元组）。③ 必须最先——① 对"仍挂 HOT 链的 heap-only 元组"的推迟要靠 ③ 清 xmax 才解除。整趟干净才落 shard_vacuum_xid 标记，否则返回 swept=false 且不动水位，截断随之被拦。';
+
+-- T5.4：截断本分片 clog。门禁 = 顺序铁律；内部次序 = 先推水位后删文件。
+CREATE OR REPLACE FUNCTION shard_clog_truncate(p_shard OID, p_trunc_before BIGINT)
+RETURNS INTEGER LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_truncate';
+
+COMMENT ON FUNCTION shard_clog_truncate(OID, BIGINT) IS
+    'T5.4：截断分片 clog 到 p_trunc_before（开区间上界；此后 xid < 该值进入免查隐式冻结区）。要求 p_trunc_before <= shard_vacuum_xid（顺序铁律：页没清完不许动 clog），否则 ERROR。先推水位后删文件——反过来一旦中途崩溃，clog 没了而水位还说要查 clog，已提交数据当场消失。按段整删，返回删掉的段文件数。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

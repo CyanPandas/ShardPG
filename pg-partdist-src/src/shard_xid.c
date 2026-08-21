@@ -604,6 +604,48 @@ static ShardXidSlot *shard_xid_slot_attach(Oid shard, int *nclaimed);
  * 写：整体更新两水位并落盘。不变式由 shard_xid_persist_watermark 统一守，
  *     此处不重复判断（单一出口，见该函数注释）。
  */
+/*
+ * T5.4：本分片"下一个待发号"。vacuum 侧用它做 fail-closed 上界 ——
+ * 清理/截断到一个**从未发出过**的号是没有意义的输入，而它的后果很重：
+ * 整个已用 xid 空间落进免查区，此后每一行新写入的 xmin 都会被读成
+ * "早已提交、对一切快照可见"，中止事务的行也一并复活。
+ *
+ * 槽位不存在（本次启动没碰过该分片）时回落读水位文件，理由同
+ * ShardVacuumGetWatermarks：这是跨重启的持久事实。取不到返回 0，
+ * 调用方按"无从判断、不设限"处理（此时该分片本就没发过号）。
+ */
+TransactionId
+ShardXidNextToIssue(Oid shard)
+{
+	TransactionId next = 0;
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		return 0;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+		{
+			next = ShardXidCtl->slots[i].next_xid;
+			break;
+		}
+	}
+	LWLockRelease(ShardXidCtl->lock);
+
+	if (next == 0)
+	{
+		TransactionId a = 0,
+					c = 0;
+
+		shard_xid_read_wm_file(shard, &a, &c, NULL, NULL);
+		next = a;				/* 文件缺失时该函数已置 0 = 取不到 */
+	}
+
+	return next;
+}
+
 void
 ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 						 TransactionId *vacuum_xid)

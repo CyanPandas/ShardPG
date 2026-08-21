@@ -12,6 +12,9 @@
 #   [14]-[18] T5.3c —— §6.4 ② **删已提交删除的死元组**，判据**看 xmax 不看
 #           xmin**：没被删过的老行是活的、零页面动作，中止的删除更是一点
 #           不许碰。同时验 ② 与 ① 的刻意不对称（② 不推迟 HOT 链上的元组）。
+#   [19]-[23] T5.4 —— 截断 + **顺序铁律** + **免查隐式冻结区**。核心验收是
+#           "页未清完就截断必须被拦"；[21] 段用注入证明门禁拦的那件事确实是
+#           灾难：跳过清理直接推水位，幽灵行当场复活、活行当场被判死。
 #
 # 判据边界（三条都要验，少一条就等于没验）：
 #   - ABORTED 且在截断点以下 ⇒ 清；
@@ -316,9 +319,108 @@ crash_restart; check "immediate 崩溃后重启就绪" "$?" "0"
 check "重启后 p5c 页上仍 3 个 LP_NORMAL" "$(NORMAL p5c)" "3"
 check "重启后 p5c 三活行仍在" "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5c" </dev/null)" "b2,c,d3"
 
-echo "========== [18] 清场 =========="
+# ================================================================
+#  T5.4 —— 截断 + 顺序铁律 + 免查隐式冻结区
+#  截断与"免查区解释规则"是同一件事的两半：没有后者，截断就是纯粹的
+#  破坏动作（clog 没了、水位还说要查 ⇒ 读成空洞=RUNNING=已提交数据消失）。
+# ================================================================
+WM() { PSQL "$WPORT" -Atc "SELECT clog_truncate_before||'/'||shard_vacuum_xid FROM partdist.shard_vacuum_watermarks($1::oid)" </dev/null; }
+
+echo "========== [19] T5.4 构造 + 顺序铁律门禁 =========="
 set_whitelist ""
-PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5e; CREATE TABLE p5e(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OE=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5e'" </dev/null)
+set_whitelist "$OE"; check "p5e 白名单生效" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5e VALUES (1,'live1'),(2,'live2'),(3,'gone');
+DELETE FROM p5e WHERE id=3;                       -- 已提交删除 ⇒ ② 清
+BEGIN; INSERT INTO p5e VALUES (9,'ghost'); ROLLBACK;   -- 中止插入 ⇒ ① 清（不清则截断后复活）
+BEGIN; DELETE FROM p5e WHERE id=1; ROLLBACK;      -- 中止删除 ⇒ ③ 消毒（不消则截断后活行被判死）
+SQL
+TE=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5e',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OE::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TE-1))) g WHERE sclog_read($OE::oid, g::bigint)=2" </dev/null >/dev/null
+check "构造后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
+check "初始水位 0/0"    "$(WM "$OE")" "0/0"
+# ★★ 核心验收：页未清完就截断，必须被拦
+neg "★ 页未清完即拒截断" "不许截断 clog" \
+    "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
+check "被拦后水位仍 0/0" "$(WM "$OE")" "0/0"
+# 注入"趟标记落后于目标"：先只清到一半的号，再想截到全量
+HALF=$((TE-1))
+SW0=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||(sanitized+removed_aborted+removed_dead)||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5e'::regclass, $HALF::bigint)" </dev/null)
+N0=$(echo "$SW0" | cut -d/ -f2)
+check "半程 sweep 干净收尾" "$(echo "$SW0" | cut -d/ -f1,3,4)" "true/0/0"
+check "半程 sweep 后标记 = $HALF" "$(WM "$OE")" "0/$HALF"
+neg "★ 趟标记落后于目标即拒" "不许截断 clog" \
+    "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
+neg "trunc_before 超过下一个待发号即拒" "超过下一个待发号" \
+    "SELECT swept FROM partdist.shard_vacuum_sweep('p5e'::regclass, 999999::bigint)"
+check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
+
+echo "========== [20] 完整 sweep → 截断 → 免查区生效 =========="
+# 半程那趟已经把号更小的清掉了（这正是 sweep 该有的行为），所以这里对
+# **两趟总账**：全表恰好 1 条待消毒 + 1 条中止插入 + 1 条已提交删除 = 3。
+SW=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||(sanitized+removed_aborted+removed_dead)||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5e'::regclass, $TE::bigint)" </dev/null)
+N1=$(echo "$SW" | cut -d/ -f2)
+check "全程 sweep 干净收尾" "$(echo "$SW" | cut -d/ -f1,3,4)" "true/0/0"
+check "两趟总账：消毒1 + 删中止1 + 删死1 = 3 条" "$((N0+N1))" "3"
+check "趟完标记落到 $TE" "$(WM "$OE")" "0/$TE"
+NSEG=$(PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)" </dev/null)
+check "截断返回删段数 0（不足一整段，跨界那段留着）" "$NSEG" "0"
+check "截断后水位推进到 $TE/$TE" "$(WM "$OE")" "$TE/$TE"
+check "跨界段文件仍在" "$(DEX ls "$DATADIR/pg_shard_clog/$OE" </dev/null 2>/dev/null | wc -l)" "1"
+check "截断后仍可见 2 行"  "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
+check "截断后内容正确"     "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5e" </dev/null)" "live1,live2"
+check "页上只剩 2 个 LP_NORMAL" "$(NORMAL p5e)" "2"
+# 免查区确实在起作用：把某个已提交号的 clog 槽抹成 RUNNING，行照样可见
+PSQL "$WPORT" -Atc "SELECT sclog_write($OE::oid,3::bigint,0)" </dev/null >/dev/null
+check "clog 槽已被抹成 RUNNING(0)" "$(PSQL "$WPORT" -Atc "SELECT sclog_read($OE::oid,3::bigint)" </dev/null)" "0"
+check "★ 免查区生效：clog 说未决，行照样可见" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
+check "幂等：再截一次仍 $TE/$TE" \
+      "$(PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)" </dev/null >/dev/null; WM "$OE")" "$TE/$TE"
+
+echo "========== [21] ★ 两条正确性陷阱：跳过清理直接推水位 =========="
+# 用 shard_vacuum_set_watermarks 绕过门禁——注入测试的意义正在于证明
+# 门禁拦住的那件事确实是灾难。
+# 陷阱①：不删中止插入的行就截断 ⇒ 幽灵行复活
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5f; CREATE TABLE p5f(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OF=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5f'" </dev/null)
+set_whitelist "$OF"; check "p5f 白名单生效" "$?" "0"
+# ★ 必须用 heredoc 逐条送：psql -c 把整串当**一个**事务发，里面的 ROLLBACK
+#   会把前面那条 INSERT 一起回滚掉（实测：断言"注入前 1 行"读到 0）。
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5f VALUES (1,'real');
+BEGIN; INSERT INTO p5f VALUES (2,'ghost'); ROLLBACK;
+SQL
+check "注入前可见 1 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5f" </dev/null)" "1"
+TF=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5f',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_set_watermarks($OF::oid, $TF::bigint, $TF::bigint)" </dev/null >/dev/null
+check "★ 陷阱①：不清页直接截断 ⇒ 幽灵行复活（2 行）" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5f" </dev/null)" "2"
+# 陷阱③：不消毒中止的 xmax 就截断 ⇒ 活行被判死
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5g; CREATE TABLE p5g(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OG=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5g'" </dev/null)
+set_whitelist "$OG"; check "p5g 白名单生效" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5g VALUES (1,'alive');
+BEGIN; DELETE FROM p5g WHERE id=1; ROLLBACK;
+SQL
+check "注入前可见 1 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5g" </dev/null)" "1"
+TG=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5g',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_set_watermarks($OG::oid, $TG::bigint, $TG::bigint)" </dev/null >/dev/null
+check "★ 陷阱③：不消毒直接截断 ⇒ 活行被判死（0 行）" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5g" </dev/null)" "0"
+echo "  （以上两条是**注入**：门禁存在的理由。走正常 sweep→truncate 路径时 [20] 段已证明结果正确）"
+
+echo "========== [22] 截断的崩溃持久性 =========="
+crash_restart; check "immediate 崩溃后重启就绪" "$?" "0"
+check "重启后 p5e 水位仍 $TE/$TE" "$(WM "$OE")" "$TE/$TE"
+check "重启后 p5e 仍可见 2 行"    "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
+check "重启后 p5e 内容正确"       "$(PSQL "$WPORT" -Atc "SELECT string_agg(v,',' ORDER BY id) FROM p5e" </dev/null)" "live1,live2"
+
+echo "========== [23] 清场 =========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
 check "清场完成" "$?" "0"
 
 health_check_no_crash

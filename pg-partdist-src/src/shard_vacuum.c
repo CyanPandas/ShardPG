@@ -62,6 +62,7 @@ shard_vacuum_begin(Relation rel, TransactionId trunc_before,
 	Oid			shard = ShardXidLookupByOid(relid);
 	TransactionId cur_tb;
 	TransactionId cur_vx;
+	TransactionId next_xid;
 
 	if (!OidIsValid(shard))
 		ereport(ERROR,
@@ -83,6 +84,23 @@ shard_vacuum_begin(Relation rel, TransactionId trunc_before,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("分片 %u 的 trunc_before %u 小于当前截断点 %u",
 						shard, trunc_before, cur_tb)));
+
+	/*
+	 * ★ 上界 fail-closed：不许清理/截断到一个**从未发出过**的号。
+	 * 这条输入错误的后果很重 —— 整个已用 xid 空间落进免查区，此后每一行
+	 * 新写入的 xmin 都会被读成"早已提交、对一切快照可见"，中止事务的行也
+	 * 一并复活。正常来源（ShardVacuumComputeTarget 的结果 + 1）永远不会
+	 * 越界：它只在**已落账**的条目上前进，遇空洞即停。
+	 */
+	next_xid = ShardXidNextToIssue(shard);
+	if (next_xid > 0 && trunc_before > next_xid)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("分片 %u 的 trunc_before %u 超过下一个待发号 %u",
+						shard, trunc_before, next_xid),
+				 errdetail("清理到一个从未发出过的号会把整个已用 xid 空间推进"
+						   "免查隐式冻结区。"),
+				 errhint("trunc_before 应取 ShardVacuumComputeTarget() 的结果 + 1。")));
 
 	*shard_out = shard;
 	*cur_tb_out = cur_tb;
@@ -579,6 +597,67 @@ ShardVacuumRemoveDeadTuples(Relation rel, TransactionId trunc_before,
 	shard_vacuum_prune_pass(rel, trunc_before, SVP_DEAD_XMAX, stats);
 }
 
+/* ================================================================== */
+/* T5.4：一整趟页面动作 —— 顺序铁律的凭据来源                          */
+/* ================================================================== */
+
+bool
+ShardVacuumSweep(Relation rel, TransactionId trunc_before,
+				 ShardVacuumPageStats *stats,
+				 int64 *sanitized, int64 *removed_aborted,
+				 int64 *removed_dead)
+{
+	Oid			shard = ShardXidLookupByOid(RelationGetRelid(rel));
+	TransactionId cur_tb;
+	TransactionId cur_vx;
+	ShardVacuumPageStats one;
+
+	memset(stats, 0, sizeof(*stats));
+	*sanitized = *removed_aborted = *removed_dead = 0;
+
+	/* ③ 消毒 —— 必须最先：① 的推迟格要靠它清 xmax 才解除 */
+	ShardVacuumSanitizeXmax(rel, trunc_before, &one);
+	*sanitized = one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+
+	/* ① 删中止 xmin 的元组 */
+	ShardVacuumRemoveAbortedXmin(rel, trunc_before, &one);
+	*removed_aborted = one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+	stats->pages_skipped += one.pages_skipped;
+	stats->tuples_deferred += one.tuples_deferred;
+
+	/* ② 删已提交删除的死元组 */
+	ShardVacuumRemoveDeadTuples(rel, trunc_before, &one);
+	*removed_dead = one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+	stats->pages_skipped += one.pages_skipped;
+	stats->tuples_deferred += one.tuples_deferred;
+
+	stats->tuples_touched = *sanitized + *removed_aborted + *removed_dead;
+
+	/*
+	 * 不干净就不落标记。跳页（拿不到 cleanup lock）与推迟都意味着这一趟没有
+	 * 覆盖到全部页面/元组，此时落标记等于对 ShardClogTruncate 说谎。
+	 */
+	if (stats->pages_skipped > 0 || stats->tuples_deferred > 0)
+		return false;
+
+	/*
+	 * 落"趟完"标记（设计 §6.5 两态之二："趟完、截断前"）。
+	 * 不变式 clog_truncate_before <= shard_vacuum_xid 由落盘出口统一守；
+	 * trunc_before 不许后退已在 shard_vacuum_begin 里拦过。
+	 */
+	ShardVacuumGetWatermarks(shard, &cur_tb, &cur_vx);
+	if (trunc_before > cur_vx)
+		ShardVacuumSetWatermarks(shard, cur_tb, trunc_before);
+
+	return true;
+}
+
 /* ---- SQL 包装（T5.5 编排与验收的调用点）---- */
 PG_FUNCTION_INFO_V1(partdist_shard_sanitize_xmax);
 Datum
@@ -681,5 +760,45 @@ partdist_shard_remove_dead(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum(st.pages_skipped);
 	values[3] = Int64GetDatum(st.tuples_touched);
 	values[4] = Int64GetDatum(st.tuples_deferred);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_sweep);
+Datum
+partdist_shard_vacuum_sweep(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	Relation	rel;
+	ShardVacuumPageStats st;
+	int64		san = 0,
+				rab = 0,
+				rdead = 0;
+	bool		swept = false;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	rel = relation_open(relid, ShareUpdateExclusiveLock);
+	PG_TRY();
+	{
+		swept = ShardVacuumSweep(rel, trunc_before, &st, &san, &rab, &rdead);
+	}
+	PG_FINALLY();
+	{
+		relation_close(rel, ShareUpdateExclusiveLock);
+	}
+	PG_END_TRY();
+
+	values[0] = BoolGetDatum(swept);
+	values[1] = Int64GetDatum(san);
+	values[2] = Int64GetDatum(rab);
+	values[3] = Int64GetDatum(rdead);
+	values[4] = Int64GetDatum(st.pages_skipped);
+	values[5] = Int64GetDatum(st.tuples_deferred);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

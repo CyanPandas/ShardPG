@@ -156,6 +156,35 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	}
 
 	/*
+	 * ★ T5.4 免查隐式冻结区（设计 §6 "免查区"、§7 回卷龄基点）：
+	 * `sxid < clog_truncate_before` 一律解释为"已提交、且早于 GlobalSafeTs
+	 * 因而对一切快照可见"，**不查 clog** —— 它的 clog 已经（或即将）被截掉，
+	 * 再去查只会读到空洞=RUNNING=不可见，已提交数据当场消失。
+	 *
+	 * 这条解释规则与 ShardClogTruncate 是**同一件事的两半**，缺一不可：
+	 * 没有它，截断就是纯粹的破坏动作；没有截断，它永远不生效（水位恒 0）。
+	 *
+	 * commit_ts 给 0 —— 遗留语义正是"对一切快照可见"（§4.1 的
+	 * `my_ts > 0 && cts >= my_ts` 判据在 cts=0 时恒不成立），恰是这里要的。
+	 * 免查区里 ABORTED 与 COMMITTED 已经分不出来了，而这**不是缺陷**：
+	 * 设计 §6.4 的 ① 与 ③ 保证进入免查区之前，中止事务的元组已被删掉、
+	 * 中止的 xmax 已被消毒成 0 —— 没有任何元组还会问到那些号。
+	 *
+	 * 放在这里（活跃表与终局缓存之后、clog 之前）是为了不给热读路径加锁：
+	 * 免查区的 xid 既不可能在活跃表里（§6.3 前缀扫描遇 RUNNING 即停），
+	 * 也早已不在任何人的手里。已知边界：终局缓存是后端本地、不作废，
+	 * 截断前缓存下的 ABORTED 会在本后端内继续报 ABORTED —— 由上一段的
+	 * "没有元组还会问到那些号"覆盖。
+	 */
+	{
+		TransactionId frozen_before;
+
+		ShardVacuumGetWatermarks(shard, &frozen_before, NULL);
+		if (TransactionIdIsValid(frozen_before) && sxid < frozen_before)
+			return SXID_COMMITTED;	/* cts_out 已在函数开头置 0 */
+	}
+
+	/*
 	 * T2.4：咨询 clog 前确保认领已跑（读路径入口；发号路径在分配时已触发）。
 	 * 崩溃遗留的无主 RUNNING 在此改判 ABORTED，之后才读真相源。
 	 */

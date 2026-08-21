@@ -420,6 +420,70 @@ ShardClogAtAbort(void)
 	pending_drops_n = 0;
 }
 
+/* ================= T5.4：clog 截断（设计 §6.4 顺序铁律）================= */
+
+int
+ShardClogTruncate(Oid shard, TransactionId trunc_before)
+{
+	TransactionId cur_tb;
+	TransactionId vacuum_xid;
+	uint32		nfull;
+	uint32		segno;
+	int			removed = 0;
+
+	if (!TransactionIdIsValid(trunc_before) || trunc_before <= FIRST_SHARD_XID)
+		return 0;				/* 没什么可截的 */
+
+	ShardVacuumGetWatermarks(shard, &cur_tb, &vacuum_xid);
+
+	if (trunc_before < cur_tb)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("分片 %u 的截断点不许后退：目标 %u < 当前 %u",
+						shard, trunc_before, cur_tb)));
+
+	/*
+	 * ★ 顺序铁律的落地点（设计 §6.4 末）：页面动作没做完就不许动 clog。
+	 * shard_vacuum_xid 是"整趟页面动作已完成"的唯一凭据，只由
+	 * ShardVacuumSweep 在三类动作全部清完（无跳页、无推迟）后落下。
+	 */
+	if (trunc_before > vacuum_xid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("分片 %u 的页面尚未清到 %u（趟标记只到 %u），不许截断 clog",
+						shard, trunc_before, vacuum_xid),
+				 errdetail("设计 §6.4 顺序铁律：数据页、索引、堆全部清完，才许动 clog。"
+						   "此时截断会让中止事务的幽灵行复活、让活行被判死。"),
+				 errhint("先跑一趟完整的 partdist.shard_vacuum_sweep()。")));
+
+	/*
+	 * ★ 先推水位、后删文件。反过来一旦在中间崩溃，clog 没了而水位还说"要查
+	 * clog"，那些 xid 读成空洞=RUNNING=不可见，已提交数据当场消失。
+	 */
+	if (trunc_before > cur_tb)
+		ShardVacuumSetWatermarks(shard, trunc_before, vacuum_xid);
+
+	/* 只删完全落在 trunc_before 以下的整段；跨界那一段留着 */
+	nfull = trunc_before / SHARD_CLOG_XIDS_PER_SEGMENT;
+	for (segno = 0; segno < nfull; segno++)
+	{
+		char		path[MAXPGPATH];
+
+		ShardClogSegPath(path, MAXPGPATH, shard, segno);
+		if (unlink(path) == 0)
+			removed++;
+		else if (errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 删除分片 clog 段 \"%s\" 失败: %m", path)));
+	}
+
+	if (removed > 0)
+		ShardClogFsyncDir(shard);
+
+	return removed;
+}
+
 /* ================= 验收/运维用 SQL 包装 =================
  * T2.1 验收与 T2.8 套件直接 CREATE FUNCTION ... '$libdir/pg_partdist' 使用；
  * 正式并入扩展 SQL 文件随 T2.4 的显式函数一批做。
@@ -633,4 +697,14 @@ partdist_shard_clog_write_ts(PG_FUNCTION_ARGS)
 					 errmsg("status 只接受 0/1/2/3，收到 %d", status)));
 	}
 	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_clog_truncate);
+Datum
+partdist_shard_clog_truncate(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+
+	PG_RETURN_INT32(ShardClogTruncate(shard, trunc_before));
 }

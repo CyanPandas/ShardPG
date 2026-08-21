@@ -117,6 +117,27 @@ extern TransactionId ShardVacuumComputeTarget(Oid shard, TransactionId from,
 											  TransactionId ceiling,
 											  const char **stop_reason);
 
+/*
+ * T5.4（设计 §6.4 顺序铁律 + §6.7）：截断本分片 clog 到 trunc_before（开区间
+ * 上界，此后 `xid < trunc_before` 进入免查隐式冻结区）。
+ *
+ * ★ 门禁（"数据页、索引、堆全部清完，才许动 clog"的落地点）：要求
+ *   `trunc_before <= shard_vacuum_xid`。`shard_vacuum_xid` 只能由一趟**完整**
+ *   的页面动作（ShardVacuumSweep）落下 —— 页没清完就截断，等于让中止事务的
+ *   幽灵行复活、让活行被判死。不满足即 ERROR。
+ *
+ * ★ 次序（本步内部的次序，同样不能颠倒）：**先推水位、后删文件**。
+ *   反过来一旦在中间崩溃，clog 已经没了而水位还说"要查 clog"，那些 xid 读成
+ *   空洞=RUNNING=不可见 —— **已提交的数据当场消失**。先推水位则最坏只是留下
+ *   一堆没删掉的段文件，下一轮顺手清掉。
+ *
+ * 文件按段整删（段 = SHARD_CLOG_XIDS_PER_SEGMENT 个 xid），只删完全落在
+ * trunc_before 以下的段；跨界那一段留着，其中免查区部分不再有人问。
+ *
+ * 返回删掉的段文件数。幂等。
+ */
+extern int	ShardClogTruncate(Oid shard, TransactionId trunc_before);
+
 extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);
 extern void ShardClogAtCommit(void);	/* 执行挂起的删除 */
