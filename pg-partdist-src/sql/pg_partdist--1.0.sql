@@ -650,6 +650,15 @@ CREATE OR REPLACE FUNCTION shard_xid_age(
 COMMENT ON FUNCTION shard_xid_age(OID) IS
     'T5.6：分片 xid 龄与回卷护栏相位（设计 §7）。阈值由 pg_partdist.shard_vacuum_max_age（阶段1，默认 2e8）与 pg_partdist.shard_xid_stop_age（阶段2，默认 2^31-1e6）控制；阶段 2 触发后该分片拒发新号、进只读，护栏是分片粒度不殃及节点与集群。';
 
+-- U-P5-1：本分片下一个待发号。follower 上它由 MARKER 捎来的 leader 发号水位
+-- 落盘而来（升主后发号器取 Max(文件 alloc_wm, 影子) 起步，不会重号）。
+CREATE OR REPLACE FUNCTION shard_xid_next(p_shard OID)
+RETURNS BIGINT LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_next';
+
+COMMENT ON FUNCTION shard_xid_next(OID) IS
+    'U-P5-1：本分片下一个待发号（0 = 取不到）。所有已发号都小于它。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE

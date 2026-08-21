@@ -5,8 +5,10 @@
 #   T5.4b-1 —— vacuum 页面动作的跨节点回放（三份记要里挂了三次账的那一项）；
 #   T5.8   —— TOAST 关系（含它的 btree 索引）一并参与，于是索引两阶段发出的
 #              btree vacuum 记录也走这条回放通路；
-#   U-P5-1 —— [2b] 段：**分片 clog 由流重建**（设计 §5.3）。MARKER 现在带上
-#              本分区的分片 xid，follower 据此把 pg_shard_clog 也建起来；
+#   U-P5-1 —— [2b] 段：**分片 clog 由流重建**（设计 §5.3）+ **持久发号水位
+#              交接**。MARKER 现在带上本分区的分片 xid 与 leader 的发号水位，
+#              follower 据此把 pg_shard_clog 建起来、把发号水位落进自己的
+#              pg_shard_xid —— 升主后既看得见数据，也不会重号；
 #   T5.4b-2 —— 两个 vacuum 水位随 CTRL 记录（复用 FREEZE_UPDATE 通道换语义，
 #              不新增 opcode）到达 follower 并落进它自己的 pg_shard_xid/<oid>。
 #
@@ -233,6 +235,31 @@ for fp in $f1 $f2; do
   check "  （对照：follower :$fp 确实拿到了非空判决，不是全空洞）" \
         "$([[ "$fclog" =~ 2 ]] && echo ok)" "ok"
 done
+
+# ---- U-P5-1 之二：持久发号水位交接 ----
+# 光有 clog 判决还盖不住一格：事务的字节被别人的 group commit 顺带刷进了流、
+# 随后本后端**崩溃**（不是中止）—— 既无 COMMIT 也无 ABORT 标记，而元组已经到了
+# follower；新主对该号读到空洞，会把它重新发出去。带上 leader 的发号水位就没有
+# 这一格。
+# 判据是"follower 的水位 >= leader 的 next_xid"，而不是两边相等：leader 带的是
+# **已持久化**的水位（按批次向上取整，比 next_xid 宽），而中止且字节未入流的
+# 事务又会在 leader 上悄悄吃掉号 —— 两边本就不该相等。
+lead_next=$(PSQL $pport -Atc "SELECT partdist.shard_xid_next(${SOID}::oid)" </dev/null | tail -1)
+check "leader 已发过号（next_xid > 3）" "$([[ -n "$lead_next" && "$lead_next" -gt 3 ]] && echo ok)" "ok"
+for fp in $f1 $f2; do
+  foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+  fnext=$(PSQL "$fp" -Atc "SELECT partdist.shard_xid_next(${foid}::oid)" </dev/null | tail -1)
+  check "★ follower :$fp 接住了发号水位（$fnext >= $lead_next）" \
+        "$([[ -n "$fnext" && "$fnext" -ge "$lead_next" ]] && echo ok)" "ok"
+done
+# ★ "持久"二字要验：重启一个 follower，水位必须还在（否则升主就会从 3 号重发）
+f1data=$(PSQL $f1 -Atc "SHOW data_directory" </dev/null)
+DEX /work/pg-install/bin/pg_ctl -D "$f1data" -m fast restart -l "$f1data/restart_up51.log" </dev/null >/dev/null 2>&1
+up=""; for t in $(seq 1 45); do up=$(PSQL $f1 -Atc "SELECT 1" </dev/null 2>/dev/null); [[ "$up" == "1" ]] && break; sleep 1; done
+check "follower :$f1 重启就绪" "$up" "1"
+foid1=$(PSQL "$f1" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+check "★ 重启后发号水位仍在（这才叫持久）" \
+      "$([[ "$(PSQL "$f1" -Atc "SELECT partdist.shard_xid_next(${foid1}::oid)" </dev/null | tail -1)" -ge "$lead_next" ]] && echo ok)" "ok"
 
 F1MAIN=$(FPATH_MAIN $f1); F2MAIN=$(FPATH_MAIN $f2)
 md5_f1_pre=$(DEX md5sum "$F1MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)

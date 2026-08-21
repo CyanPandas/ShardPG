@@ -985,7 +985,7 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                         (unsigned long long) hdr->partition_lsn,
                         hdr->data_len)));
 
-    if (m->flags & ~PARTWAL_MARKER_HAS_SHARD_XID)
+    if (m->flags & ~PARTWAL_MARKER_KNOWN_FLAGS)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu MARKER 出现未知 flags "
                         "0x%08X —— 拒绝按旧语义蒙混过去", ctx->shard_oid,
@@ -993,17 +993,31 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 
     has_sx = (m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0;
 
-    if (hdr->data_len != (uint32) TxnMarkerPayloadSizeEx(m->nsubxacts, has_sx))
+    if (hdr->data_len != (uint32) TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu MARKER 载荷长度不符"
                         "（data_len=%u，nsubxacts=%u flags=0x%08X 需要 %zu）",
                         ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn,
                         hdr->data_len, m->nsubxacts, m->flags,
-                        TxnMarkerPayloadSizeEx(m->nsubxacts, has_sx))));
+                        TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))));
 
     if (has_sx)
         sxid = (TransactionId) *TxnMarkerShardXidPtr(m);
+
+    /*
+     * U-P5-1 之二：记下 leader 的发号水位，取 max 后随 apply checkpoint 落盘
+     * （复用 T5.4b-2 那条"worker 只暂存、由 replay_catchup 的调用方写"的通路）。
+     * 这里不当场落盘：每条 MARKER 一次 fsync 太重，而 follower 崩溃后从持久
+     * 游标重放会重新导出同一个值，语义安全。
+     */
+    if (m->flags & PARTWAL_MARKER_HAS_ALLOC_WM)
+    {
+        TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
+
+        if (wm > ctx->pending_alloc_wm)
+            ctx->pending_alloc_wm = wm;
+    }
 
     origin   = GxidNodeId(gxid);
     op       = hdr->info & XLOG_XACT_OPMASK;
@@ -1606,7 +1620,8 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
 {
     int i;
 
-    if (ctx->pending_freeze_n == 0 && !ctx->pending_vacuum_wm)
+    if (ctx->pending_freeze_n == 0 && !ctx->pending_vacuum_wm &&
+        ctx->pending_alloc_wm == 0)
         return;
 
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
@@ -1629,6 +1644,8 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
             s->vacuum_xid          = ctx->pending_vacuum_xid;
             s->vacuum_wm_valid     = true;
         }
+        if (ctx->pending_alloc_wm > s->alloc_wm)
+            s->alloc_wm = ctx->pending_alloc_wm;
         break;
     }
     LWLockRelease(ReplayCtl->lock);
@@ -1638,6 +1655,7 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
                  ctx->pending_vacuum_wm ? 1 : 0);
     ctx->pending_freeze_n = 0;
     ctx->pending_vacuum_wm = false;
+    ctx->pending_alloc_wm = 0;
 }
 
 void

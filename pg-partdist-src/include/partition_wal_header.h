@@ -212,6 +212,23 @@ PartWALRecordGxid(const PartWALRecord *rec)
  */
 #define PARTWAL_MARKER_HAS_SHARD_XID    UINT32_C(0x0001)
 
+/*
+ * U-P5-1 之二：再带上 leader 的**发号水位**（下一个待发号）。
+ *
+ * 为什么光有分片 xid 不够：升主后发号器要知道"在用 xid 的上界"。只靠 clog 里
+ * 的终局判决去跳号，覆盖不了这一格 —— 事务的字节被别人的 group commit 顺带
+ * 刷进了流、随后本后端**崩溃**（不是中止），于是既没有 COMMIT 也没有 ABORT
+ * 标记，而元组已经到了 follower；新主对该号读到空洞，会把它重新发出去，
+ * 新事务的判决就落到了那批孤儿元组上。带上水位就没有这一格。
+ *
+ * 单独占一个标志位而不是扩 0x0001 的尾块：0x0001 今天刚上线，容器里已经有
+ * 按 4 字节尾写下的段文件；改尾块尺寸会让那些流的长度校验当场 ERROR。
+ * 多一个位比多一次"为什么回放报长度不符"便宜。
+ */
+#define PARTWAL_MARKER_HAS_ALLOC_WM     UINT32_C(0x0002)
+#define PARTWAL_MARKER_KNOWN_FLAGS \
+    (PARTWAL_MARKER_HAS_SHARD_XID | PARTWAL_MARKER_HAS_ALLOC_WM)
+
 typedef struct TxnMarkerPayload
 {
     uint64      start_ts;       /* 事务启动时间戳（TSO 就位前取本地 TimestampTz）*/
@@ -225,12 +242,26 @@ typedef struct TxnMarkerPayload
 #define TxnMarkerPayloadSize(nsub) \
     (sizeof(TxnMarkerPayload) + (size_t) (nsub) * sizeof(TransactionId))
 
-#define TxnMarkerPayloadSizeEx(nsub, has_sx) \
-    (TxnMarkerPayloadSize(nsub) + ((has_sx) ? sizeof(uint32) : 0))
+/* 尾块按标志位逐个追加：[分片xid][发号水位] */
+#define TxnMarkerTailWords(flags) \
+    ((((flags) & PARTWAL_MARKER_HAS_SHARD_XID) ? 1 : 0) + \
+     (((flags) & PARTWAL_MARKER_HAS_ALLOC_WM)  ? 1 : 0))
 
-/* 分片 xid 的位置：紧跟在 subxacts[nsubxacts] 之后 */
-#define TxnMarkerShardXidPtr(m) \
+#define TxnMarkerPayloadSizeEx(nsub, flags) \
+    (TxnMarkerPayloadSize(nsub) + \
+     (size_t) TxnMarkerTailWords(flags) * sizeof(uint32))
+
+/* 尾块起点：紧跟在 subxacts[nsubxacts] 之后 */
+#define TxnMarkerTail(m) \
     ((uint32 *) ((char *) (m) + TxnMarkerPayloadSize(((const TxnMarkerPayload *) (m))->nsubxacts)))
+
+/* 分片 xid 恒在尾块首位（存在时） */
+#define TxnMarkerShardXidPtr(m)     (TxnMarkerTail(m))
+
+/* 发号水位跟在分片 xid 之后（两者都存在时） */
+#define TxnMarkerAllocWmPtr(m) \
+    (TxnMarkerTail(m) + \
+     ((((const TxnMarkerPayload *) (m))->flags & PARTWAL_MARKER_HAS_SHARD_XID) ? 1 : 0))
 
 
 #define TxnMarkerSubxacts(m) \

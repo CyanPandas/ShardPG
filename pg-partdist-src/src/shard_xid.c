@@ -637,6 +637,47 @@ static ShardXidSlot *shard_xid_slot_attach(Oid shard, int *nclaimed);
  * ShardVacuumGetWatermarks：这是跨重启的持久事实。取不到返回 0，
  * 调用方按"无从判断、不设限"处理（此时该分片本就没发过号）。
  */
+/*
+ * U-P5-1 之二：本分片**已持久化**的发号水位（所有已发号 < 它）。
+ *
+ * 与 ShardXidNextToIssue 的区别是刻意的：那个返回 next_xid（更紧的界，
+ * vacuum 的 fail-closed 上界要紧的），而这个返回 slot->watermark ——
+ * 发号器每次落盘按 SHARD_XID_BATCH 向上取整，于是它比 next_xid 大出至多
+ * 一个批次。**给 follower 要的正是更宽的那个**：它只能从"入了流的 MARKER"
+ * 学到水位，而中止且字节未入流的事务会在 leader 上悄悄吃掉号；宽一个批次
+ * 就把那段窗口盖住了。
+ */
+TransactionId
+ShardXidAllocWatermark(Oid shard)
+{
+	TransactionId wm = 0;
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		return 0;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+		{
+			wm = ShardXidCtl->slots[i].watermark;
+			break;
+		}
+	}
+	LWLockRelease(ShardXidCtl->lock);
+
+	if (wm == 0)
+	{
+		TransactionId a = 0,
+					c = 0;
+
+		shard_xid_read_wm_file(shard, &a, &c, NULL, NULL);
+		wm = a;
+	}
+	return wm;
+}
+
 TransactionId
 ShardXidNextToIssue(Oid shard)
 {
@@ -667,6 +708,42 @@ ShardXidNextToIssue(Oid shard)
 	}
 
 	return next;
+}
+
+/*
+ * U-P5-1 之二：把发号水位**只抬不降**地落进本分片的水位文件。
+ *
+ * follower 用它接住 leader 随 MARKER 捎来的水位 —— 升主后
+ * `shard_xid_slot_attach()` 取 `Max(文件 alloc_wm, 影子)` 起步，就不会把副本里
+ * 已有的号重新发一遍。
+ *
+ * 只抬不降：MARKER 是逐条到达的，乱序/重放都可能带来更小的值；而水位的语义
+ * 是"所有已发号 < 它"，退回去就等于允许重号。
+ *
+ * ★ 不动 claim_wm / 两个 vacuum 水位 —— 落盘是整文件覆写，它们必须原样带回
+ *   （T5.1 记要里那条"任何一次落盘不带上它们就会抹成 0"的教训）。
+ */
+void
+ShardXidRaiseAllocWatermark(Oid shard, TransactionId alloc_wm)
+{
+	ShardXidSlot *slot;
+
+	if (!TransactionIdIsNormal(alloc_wm) || ShardXidCtl == NULL)
+		return;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	slot = shard_xid_slot_attach(shard, NULL);
+
+	if (alloc_wm > slot->watermark)
+	{
+		/* 与 ShardVacuumSetWatermarks 同一条纪律：先落盘、成功了才改槽位 */
+		shard_xid_persist_watermark(shard, alloc_wm, slot->claim_wm,
+									slot->trunc_before, slot->vacuum_xid);
+		slot->watermark = alloc_wm;
+		if (slot->next_xid < alloc_wm)
+			slot->next_xid = alloc_wm;
+	}
+	LWLockRelease(ShardXidCtl->lock);
 }
 
 void
@@ -1744,4 +1821,12 @@ partdist_shard_xid_age(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) shard_vacuum_max_age);
 	values[3] = Int64GetDatum((int64) shard_xid_stop_age);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* ---- U-P5-1 观测点：本分片下一个待发号 ---- */
+PG_FUNCTION_INFO_V1(partdist_shard_xid_next);
+Datum
+partdist_shard_xid_next(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) ShardXidNextToIssue(PG_GETARG_OID(0)));
 }

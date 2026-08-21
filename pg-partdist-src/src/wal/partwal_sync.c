@@ -706,6 +706,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     char           *buf;
     TxnMarkerPayload *m;
     bool            has_shard_xid;
+    uint32          flags;
 
     /*
      * 已提交子事务清单。中止的子事务**不在**这个列表里 —— 于是它们的 gxid
@@ -722,8 +723,10 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
      * 字节与既有格式逐字节相同，R1/R2/TX1 时代的流与套件不受影响。
      */
     has_shard_xid = (ShardXidXactCount() > 0);
+    flags = has_shard_xid ? (PARTWAL_MARKER_HAS_SHARD_XID |
+                             PARTWAL_MARKER_HAS_ALLOC_WM) : 0;
 
-    *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, has_shard_xid);
+    *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, flags);
     buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
 
     m = (TxnMarkerPayload *) buf;
@@ -731,7 +734,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
                                   : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
-    m->flags     = has_shard_xid ? PARTWAL_MARKER_HAS_SHARD_XID : 0;
+    m->flags     = flags;
 
     if (nchildren > 0)
         memcpy(TxnMarkerSubxacts(m), children,
@@ -752,10 +755,20 @@ PartWALMarkerSetShardXid(char *payload, Oid partition_id)
 {
     TxnMarkerPayload *m = (TxnMarkerPayload *) payload;
 
-    if (payload == NULL || !(m->flags & PARTWAL_MARKER_HAS_SHARD_XID))
+    if (payload == NULL)
         return;
 
-    *TxnMarkerShardXidPtr(m) = (uint32) ShardXidMineForShard(partition_id);
+    if (m->flags & PARTWAL_MARKER_HAS_SHARD_XID)
+        *TxnMarkerShardXidPtr(m) = (uint32) ShardXidMineForShard(partition_id);
+
+    /*
+     * U-P5-1 之二：带**已持久化的**发号水位（而不是 next_xid）。
+     * 发号器落盘按批次向上取整，所以它比 next_xid 宽出至多一个批次 ——
+     * 而 follower 只能从"入了流的 MARKER"学到水位，中止且字节未入流的事务
+     * 会在 leader 上悄悄吃掉号，宽一个批次正好盖住那段窗口。
+     */
+    if (m->flags & PARTWAL_MARKER_HAS_ALLOC_WM)
+        *TxnMarkerAllocWmPtr(m) = (uint32) ShardXidAllocWatermark(partition_id);
 }
 
 static char *

@@ -191,6 +191,9 @@ typedef struct ShardReplayCtx
     TransactionId      pending_trunc_before;
     TransactionId      pending_vacuum_xid;
 
+    /* U-P5-1 之二：随 MARKER 捎来的 leader 发号水位（取 max，checkpoint 落盘）*/
+    TransactionId      pending_alloc_wm;
+
     /* 建 ctx 时槽位上的 locmap 代次；与槽位不符即须重建（见 ReplayShardSlot）*/
     uint64             locmap_gen;
 
@@ -311,6 +314,9 @@ typedef struct ReplayShardSlot
     bool               vacuum_wm_valid;
     TransactionId      vacuum_trunc_before;
     TransactionId      vacuum_xid;
+
+    /* U-P5-1 之二：leader 发号水位的交接位（0 = 无待落盘的值）*/
+    TransactionId      alloc_wm;
 } ReplayShardSlot;
 
 typedef struct ReplayCtlData

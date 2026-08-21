@@ -243,6 +243,7 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
     bool               have_wm = false;
     TransactionId      wm_tb = InvalidTransactionId;
     TransactionId      wm_vx = InvalidTransactionId;
+    TransactionId      alloc_wm = InvalidTransactionId;
     Relation           classRel;
     Oid                toastoid = InvalidOid;
     Relation           shell;
@@ -268,6 +269,11 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
             have_wm = true;
             s->vacuum_wm_valid = false;
         }
+        if (s->alloc_wm > 0)
+        {
+            alloc_wm = s->alloc_wm;
+            s->alloc_wm = 0;
+        }
         break;
     }
     LWLockRelease(ReplayCtl->lock);
@@ -283,6 +289,18 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
      *
      * 放在冻结账目之前处理：水位是可见性解释规则的输入，早一步到位没有坏处。
      */
+    /*
+     * U-P5-1 之二：先接住发号水位，再落 vacuum 两水位。次序无关正确性
+     * （两者互不依赖），但发号水位是"升主别重号"的那道保险，早一步到位没坏处。
+     */
+    if (alloc_wm > 0)
+    {
+        ShardXidRaiseAllocWatermark(shard_oid, alloc_wm);
+        ereport(DEBUG1,
+                (errmsg("pg_partdist replay: shard %u 发号水位已落盘（%u）",
+                        shard_oid, alloc_wm)));
+    }
+
     if (have_wm)
     {
         ShardVacuumSetWatermarks(shard_oid, wm_tb, wm_vx);

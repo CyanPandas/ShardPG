@@ -82,6 +82,12 @@ extern void ShardXidUtilityGuard(Node *parsetree);
  *                   > trunc_before 表示"页面趟已完成、截断待补"（§6.5）。
  * 不变式 trunc_before <= vacuum_xid 在落盘出口统一强制。
  */
+/* U-P5-1 之二：本分片已持久化的发号水位（比 next_xid 宽一个批次，给 follower 用） */
+extern TransactionId ShardXidAllocWatermark(Oid shard);
+
+/* U-P5-1 之二：只抬不降地落盘发号水位（follower 接住 leader 的水位用） */
+extern void ShardXidRaiseAllocWatermark(Oid shard, TransactionId alloc_wm);
+
 /* T5.4：本分片下一个待发号（vacuum 的 fail-closed 上界）。0 = 取不到 */
 extern TransactionId ShardXidNextToIssue(Oid shard);
 
