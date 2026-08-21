@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "shard_clog.h"
+#include "shard_fileset.h"	/* T5.4b-2：水位 CTRL 发射 */
 #include "shard_xid.h"
 
 #include "access/transam.h"
@@ -461,7 +462,16 @@ ShardClogTruncate(Oid shard, TransactionId trunc_before)
 	 * clog"，那些 xid 读成空洞=RUNNING=不可见，已提交数据当场消失。
 	 */
 	if (trunc_before > cur_tb)
+	{
 		ShardVacuumSetWatermarks(shard, trunc_before, vacuum_xid);
+
+		/*
+		 * §6.7：两个水位作为 CTRL 记录写进本分片流，follower 据此建立同一个
+		 * 免查区。放在推水位之后、删文件之前 —— 与"先推水位后删文件"同一个
+		 * 理由：先让语义到位，再回收空间。尽力而为，失败不影响本次截断。
+		 */
+		ShardVacuumEmitWatermarkCtrl(shard, trunc_before, vacuum_xid);
+	}
 
 	/* 只删完全落在 trunc_before 以下的整段；跨界那一段留着 */
 	nfull = trunc_before / SHARD_CLOG_XIDS_PER_SEGMENT;

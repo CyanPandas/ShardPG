@@ -1171,6 +1171,7 @@ ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
     const PartWALCtrlFreezeUpdate *upd;
     const PartWALFreezeEntry      *ents;
     uint32                         i;
+    bool                           has_wm;
 
     if (hdr->data_len < sizeof(PartWALCtrlFreezeUpdate))
         ereport(ERROR,
@@ -1180,14 +1181,29 @@ ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                         hdr->data_len)));
 
     upd = (const PartWALCtrlFreezeUpdate *) body;
+    has_wm = (upd->flags & PARTWAL_FREEZE_HAS_VACUUM_WM) != 0;
 
-    if (upd->nrels < 1 || upd->nrels > SHARD_FILESET_MAX_RELS ||
-        hdr->data_len != (uint32) PartWALCtrlFreezeUpdateSize(upd->nrels))
+    if (upd->flags & ~PARTWAL_FREEZE_HAS_VACUUM_WM)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FREEZE_UPDATE 出现"
+                        "未知 flags 0x%08X —— 拒绝按旧语义蒙混过去",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn, upd->flags)));
+
+    /*
+     * T5.4b-2：nrels 允许为 0，**但仅当带了 vacuum 水位块** —— 两本账各发
+     * 各的（vacuum 截断只带水位，D2 的冻结账目只带 rels），而两者皆空的
+     * 记录没有意义。
+     */
+    if (upd->nrels > SHARD_FILESET_MAX_RELS ||
+        (upd->nrels < 1 && !has_wm) ||
+        hdr->data_len != (uint32) PartWALCtrlFreezeUpdateSizeEx(upd->nrels, has_wm))
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu FREEZE_UPDATE 长度"
-                        "与 nrels 不符 (len=%u nrels=%u)", ctx->shard_oid,
+                        "与 nrels/flags 不符 (len=%u nrels=%u flags=0x%08X)",
+                        ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn,
-                        hdr->data_len, upd->nrels)));
+                        hdr->data_len, upd->nrels, upd->flags)));
 
     ents = PartWALCtrlFreezeRels(upd);
 
@@ -1201,9 +1217,25 @@ ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                             ents[i].role)));
 
     /* 全量覆盖：同一分区的后一条 FREEZE_UPDATE 天然作废前一条 */
-    memcpy(ctx->pending_freeze, ents,
-           (size_t) upd->nrels * sizeof(PartWALFreezeEntry));
-    ctx->pending_freeze_n = (int) upd->nrels;
+    if (upd->nrels > 0)
+    {
+        memcpy(ctx->pending_freeze, ents,
+               (size_t) upd->nrels * sizeof(PartWALFreezeEntry));
+        ctx->pending_freeze_n = (int) upd->nrels;
+    }
+
+    if (has_wm)
+    {
+        const PartWALFreezeVacuumWm *wm = PartWALCtrlFreezeVacuumWm(upd);
+
+        ctx->pending_trunc_before = (TransactionId) wm->clog_truncate_before;
+        ctx->pending_vacuum_xid   = (TransactionId) wm->shard_vacuum_xid;
+        ctx->pending_vacuum_wm    = true;
+
+        REPLAY_TRACE("TRACE freeze: shard %u 收到 vacuum 水位 %u/%u",
+                     ctx->shard_oid,
+                     ctx->pending_trunc_before, ctx->pending_vacuum_xid);
+    }
 
     return true;
 }
@@ -1521,7 +1553,7 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
 {
     int i;
 
-    if (ctx->pending_freeze_n == 0)
+    if (ctx->pending_freeze_n == 0 && !ctx->pending_vacuum_wm)
         return;
 
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
@@ -1532,16 +1564,27 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
         if (s->shard_oid != ctx->shard_oid)
             continue;
 
-        memcpy(s->freeze, ctx->pending_freeze,
-               (size_t) ctx->pending_freeze_n * sizeof(PartWALFreezeEntry));
-        s->freeze_n = ctx->pending_freeze_n;
+        if (ctx->pending_freeze_n > 0)
+        {
+            memcpy(s->freeze, ctx->pending_freeze,
+                   (size_t) ctx->pending_freeze_n * sizeof(PartWALFreezeEntry));
+            s->freeze_n = ctx->pending_freeze_n;
+        }
+        if (ctx->pending_vacuum_wm)
+        {
+            s->vacuum_trunc_before = ctx->pending_trunc_before;
+            s->vacuum_xid          = ctx->pending_vacuum_xid;
+            s->vacuum_wm_valid     = true;
+        }
         break;
     }
     LWLockRelease(ReplayCtl->lock);
 
-    REPLAY_TRACE("TRACE freeze: shard %u 发布 %d 条冻结账目待写入",
-                 ctx->shard_oid, ctx->pending_freeze_n);
+    REPLAY_TRACE("TRACE freeze: shard %u 发布 %d 条冻结账目 + vacuum 水位 %d",
+                 ctx->shard_oid, ctx->pending_freeze_n,
+                 ctx->pending_vacuum_wm ? 1 : 0);
     ctx->pending_freeze_n = 0;
+    ctx->pending_vacuum_wm = false;
 }
 
 void

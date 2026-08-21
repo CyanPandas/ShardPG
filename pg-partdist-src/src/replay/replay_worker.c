@@ -28,6 +28,7 @@
 #include "partition_wal.h"
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
+#include "shard_xid.h"                 /* T5.4b-2：vacuum 水位落盘 */
 
 #include "access/heapam.h"              /* heap_inplace_update */
 #include "access/relation.h"
@@ -239,6 +240,9 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
     PartWALFreezeEntry ents[SHARD_FILESET_MAX_RELS];
     int                n = 0;
     int                i;
+    bool               have_wm = false;
+    TransactionId      wm_tb = InvalidTransactionId;
+    TransactionId      wm_vx = InvalidTransactionId;
     Relation           classRel;
     Oid                toastoid = InvalidOid;
     Relation           shell;
@@ -249,14 +253,43 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
     {
         ReplayShardSlot *s = &ReplayCtl->slots[i];
 
-        if (s->shard_oid != shard_oid || s->freeze_n == 0)
+        if (s->shard_oid != shard_oid)
             continue;
-        n = s->freeze_n;
-        memcpy(ents, s->freeze, (size_t) n * sizeof(PartWALFreezeEntry));
-        s->freeze_n = 0;
+        if (s->freeze_n > 0)
+        {
+            n = s->freeze_n;
+            memcpy(ents, s->freeze, (size_t) n * sizeof(PartWALFreezeEntry));
+            s->freeze_n = 0;
+        }
+        if (s->vacuum_wm_valid)
+        {
+            wm_tb = s->vacuum_trunc_before;
+            wm_vx = s->vacuum_xid;
+            have_wm = true;
+            s->vacuum_wm_valid = false;
+        }
         break;
     }
     LWLockRelease(ReplayCtl->lock);
+
+    /*
+     * T5.4b-2（设计 §6.7）：把 leader 的分片 vacuum 两水位落进本节点的
+     * pg_shard_xid/<oid> —— 与 leader 同一个存储位，升主时 shard_xid 的
+     * 建槽路径原样读得到，不需要额外的交接协议。
+     *
+     * 搬 leader 的原值同样是**真话**（与 relfrozenxid 同款论证）：
+     * "xid < clog_truncate_before 的分片事务都已提交且早于 GlobalSafeTs"
+     * 这句话，在页面逐字节一致的副本上同样成立。
+     *
+     * 放在冻结账目之前处理：水位是可见性解释规则的输入，早一步到位没有坏处。
+     */
+    if (have_wm)
+    {
+        ShardVacuumSetWatermarks(shard_oid, wm_tb, wm_vx);
+        ereport(DEBUG1,
+                (errmsg("pg_partdist replay: shard %u vacuum 水位已落盘（%u/%u）",
+                        shard_oid, wm_tb, wm_vx)));
+    }
 
     if (n == 0)
         return;

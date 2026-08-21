@@ -497,6 +497,68 @@ FreezeEntriesEqual(const PartWALFreezeEntry *a, int na,
 }
 
 /*
+ * T5.4b-2（设计 §6.7）：把本分片的两个 vacuum 水位发进分区流。
+ *
+ * **尽力而为**，与冻结账目同一条纪律：发不出去绝不能把调用方的 vacuum 带下水。
+ * 失败的后果是 follower 的免查区落后于 leader —— 这是**安全方向**（follower
+ * 只会少信一点，不会多信），且水位发的是**绝对值**不是增量，下一轮截断自然
+ * 补上。
+ *
+ * 只对**本节点维护着 fileset 的分区**发射（`LoadShardFileSet` 探测）。这道
+ * 门同时挡掉两类情形：非复制的本地打标表（发了只会凭空造出 pg_parwal 目录），
+ * 以及 follower 侧（那里天然没有持久化 fileset）。
+ */
+void
+ShardVacuumEmitWatermarkCtrl(Oid shard_oid, TransactionId trunc_before,
+                             TransactionId vacuum_xid)
+{
+    ShardFileSet              probe;
+    PartWALCtrlFreezeUpdate  *payload;
+    PartWALFreezeVacuumWm    *wm;
+    uint32                    payload_len;
+    MemoryContext             oldcxt;
+
+    if (!IsTransactionState() || !OidIsValid(MyDatabaseId))
+        return;
+    if (!LoadShardFileSet(shard_oid, &probe))
+        return;                 /* 不是本节点维护的复制分区 */
+
+    payload_len = (uint32) PartWALCtrlFreezeUpdateSizeEx(0, true);
+    payload = palloc0(payload_len);
+    payload->nrels = 0;         /* 纯水位记录：不带冻结账目 */
+    payload->flags = PARTWAL_FREEZE_HAS_VACUUM_WM;
+    wm = PartWALCtrlFreezeVacuumWm(payload);
+    wm->clog_truncate_before = (uint32) trunc_before;
+    wm->shard_vacuum_xid     = (uint32) vacuum_xid;
+
+    oldcxt = CurrentMemoryContext;      /* 必须在 PG_TRY 之前存 */
+    PG_TRY();
+    {
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FREEZE_UPDATE,
+                          (const char *) payload, payload_len);
+        ereport(DEBUG1,
+                (errmsg("pg_partdist: shard %u vacuum 水位已发射（%u/%u）",
+                        shard_oid, trunc_before, vacuum_xid)));
+    }
+    PG_CATCH();
+    {
+        ErrorData *ed;
+
+        MemoryContextSwitchTo(oldcxt);
+        ed = CopyErrorData();
+        FlushErrorState();
+        ereport(WARNING,
+                (errmsg("pg_partdist: shard %u vacuum 水位发射失败（%s）——"
+                        "follower 免查区暂时落后，下一轮截断会补上",
+                        shard_oid, ed->message)));
+        FreeErrorData(ed);
+    }
+    PG_END_TRY();
+
+    pfree(payload);
+}
+
+/*
  * 单个 shard 的冻结账目检查 + 发射。调用方保证在事务上下文里。
  * 返回 true = 发了一条 CTRL。
  */
@@ -521,8 +583,8 @@ ShardFreezeEmitOne(Oid shard_oid)
 
     payload_len = (uint32) PartWALCtrlFreezeUpdateSize(n);
     payload = palloc0(payload_len);
-    payload->nrels    = (uint32) n;
-    payload->reserved = 0;
+    payload->nrels = (uint32) n;
+    payload->flags = 0;      /* D2 的冻结账目：不带 vacuum 水位块 */
     memcpy(PartWALCtrlFreezeRels(payload), cur,
            (size_t) n * sizeof(PartWALFreezeEntry));
 

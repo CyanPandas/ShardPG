@@ -182,6 +182,15 @@ typedef struct ShardReplayCtx
     int                pending_freeze_n;
     PartWALFreezeEntry pending_freeze[SHARD_FILESET_MAX_RELS];
 
+    /*
+     * T5.4b-2（设计 §6.7）：随 FREEZE_UPDATE 捎来的分片 vacuum 两水位。
+     * 与冻结账目同款处置——worker 里只暂存，落盘交给 replay_catchup 的调用方
+     * （写水位文件要开事务/取 shmem 锁，worker 不合适）。
+     */
+    bool               pending_vacuum_wm;
+    TransactionId      pending_trunc_before;
+    TransactionId      pending_vacuum_xid;
+
     /* 建 ctx 时槽位上的 locmap 代次；与槽位不符即须重建（见 ReplayShardSlot）*/
     uint64             locmap_gen;
 
@@ -297,6 +306,11 @@ typedef struct ReplayShardSlot
      */
     int                freeze_n;
     PartWALFreezeEntry freeze[SHARD_FILESET_MAX_RELS];
+
+    /* T5.4b-2：同上，分片 vacuum 两水位的交接位 */
+    bool               vacuum_wm_valid;
+    TransactionId      vacuum_trunc_before;
+    TransactionId      vacuum_xid;
 } ReplayShardSlot;
 
 typedef struct ReplayCtlData

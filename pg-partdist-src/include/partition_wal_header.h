@@ -310,15 +310,49 @@ typedef struct PartWALFreezeEntry
     uint32      relminmxid;     /* leader 的 pg_class.relminmxid   */
 } PartWALFreezeEntry;
 
+/*
+ * T5.4b-2（设计 §6.7）：分片 vacuum 的两个水位也走这条通道。
+ *
+ * **不新增 opcode，复用 FREEZE_UPDATE 换语义** —— 设计原文如此，而语义上也
+ * 恰好贴切：`clog_truncate_before` 就是分片 xid 宇宙里的**隐式 freeze 点**，
+ * 与 relfrozenxid 是同一类"leader 的冻结账目"。
+ *
+ * 兼容做法：把原来那个"显式补齐、恒为 0"的 reserved 字段改作 flags。
+ * 旧记录 flags == 0 ⇒ 没有尾块 ⇒ 长度校验与旧算法逐字节等价，
+ * R1/D2 时代写下的 FREEZE_UPDATE 继续有效。置位时在 rels[] 之后追加一个
+ * 8 字节的 PartWALFreezeVacuumWm。
+ *
+ * 两本账相互独立：vacuum 截断发的记录 nrels == 0（只带水位块），
+ * D2 的冻结账目发的记录 flags == 0（只带 rels）。因此 nrels 允许为 0，
+ * 但**仅当**水位块存在 —— 两者皆空的记录没有意义，仍旧拒收。
+ */
+#define PARTWAL_FREEZE_HAS_VACUUM_WM    UINT32_C(0x0001)
+
 typedef struct PartWALCtrlFreezeUpdate
 {
     uint32      nrels;
-    uint32      reserved;       /* 显式补齐，恒为 0 */
+    uint32      flags;          /* 原 reserved；旧记录恒 0 */
     /* PartWALFreezeEntry rels[nrels] 紧随其后 */
+    /* flags & PARTWAL_FREEZE_HAS_VACUUM_WM 时，其后再跟一个 PartWALFreezeVacuumWm */
 } PartWALCtrlFreezeUpdate;
+
+typedef struct PartWALFreezeVacuumWm
+{
+    uint32      clog_truncate_before;   /* 免查隐式冻结区上界（开区间） */
+    uint32      shard_vacuum_xid;       /* 两态恢复标记 */
+} PartWALFreezeVacuumWm;
 
 #define PartWALCtrlFreezeUpdateSize(n) \
     (sizeof(PartWALCtrlFreezeUpdate) + (size_t) (n) * sizeof(PartWALFreezeEntry))
+
+#define PartWALCtrlFreezeUpdateSizeEx(n, has_wm) \
+    (PartWALCtrlFreezeUpdateSize(n) + \
+     ((has_wm) ? sizeof(PartWALFreezeVacuumWm) : 0))
+
+/* 水位尾块的位置：紧跟在 rels[nrels] 之后 */
+#define PartWALCtrlFreezeVacuumWm(u) \
+    ((PartWALFreezeVacuumWm *) ((char *) (u) + \
+        PartWALCtrlFreezeUpdateSize(((const PartWALCtrlFreezeUpdate *) (u))->nrels)))
 
 #define PartWALCtrlFreezeRels(u) \
     ((PartWALFreezeEntry *) ((char *) (u) + sizeof(PartWALCtrlFreezeUpdate)))
@@ -327,5 +361,7 @@ StaticAssertDecl(sizeof(PartWALCtrlFreezeUpdate) == 8,
                  "PartWALCtrlFreezeUpdate 必须是 8 字节（CTRL 磁盘格式）");
 StaticAssertDecl(sizeof(PartWALFreezeEntry) == 12,
                  "PartWALFreezeEntry 必须是 12 字节且无填充洞");
+StaticAssertDecl(sizeof(PartWALFreezeVacuumWm) == 8,
+                 "PartWALFreezeVacuumWm 必须是 8 字节（CTRL 磁盘格式）");
 
 #endif /* PARTITION_WAL_HEADER_H */

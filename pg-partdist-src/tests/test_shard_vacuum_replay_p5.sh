@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # [宿主机] P5 vacuum 页面动作的**跨节点回放**验收（DEV PLAN §3.4 T5.4b）。
 #
-# ★ 这是 T5.3a/b/c 三份实施记要里连着挂了三次账的那一项。
+# 覆盖两件事：
+#   T5.4b-1 —— vacuum 页面动作的跨节点回放（三份记要里挂了三次账的那一项）；
+#   T5.4b-2 —— 两个 vacuum 水位随 CTRL 记录（复用 FREEZE_UPDATE 通道换语义，
+#              不新增 opcode）到达 follower 并落进它自己的 pg_shard_xid/<oid>。
+#
+# ★ T5.4b-1 的由来：
 #   §6.7 要求：vacuum 只在 leader 执行，它的页面修改本身走 pg_parwal 流被
 #   follower 逐字节回放。前面三个任务只验到"leader 的 WAL 里确有内核标准的
 #   FREEZE_PAGE / PRUNE / VACUUM 记录"，跨节点这一半一直没验。
@@ -153,6 +158,11 @@ wait_caught_up() {  # <fport> <期望plsn> <超时s>
   app=$(PSQL "$fp" -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}" </dev/null 2>/dev/null || echo 0)
   echo "$app"; return 1
 }
+FWM() {  # <fport> —— 该 follower 上本分片的 vacuum 两水位（不碰壳表，只读水位）
+  local fp=$1 foid
+  foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+  PSQL "$fp" -Atc "SELECT clog_truncate_before||'/'||shard_vacuum_xid FROM partdist.shard_vacuum_watermarks(${foid}::oid)" </dev/null | tail -1
+}
 FPATH_MAIN() {  # <fport> —— 该 follower 上主堆文件的绝对路径
   local fp=$1 fdata frel
   fdata=$(PSQL "$fp" -Atc "SHOW data_directory" </dev/null)
@@ -172,6 +182,9 @@ md5_f1_pre=$(DEX md5sum "$F1MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)
 md5_f2_pre=$(DEX md5sum "$F2MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)
 check "vacuum 前取到 follower1 主堆指纹" "$([[ -n "$md5_f1_pre" ]] && echo ok)" "ok"
 check "vacuum 前取到 follower2 主堆指纹" "$([[ -n "$md5_f2_pre" ]] && echo ok)" "ok"
+# ★ 水位复制的对照组：vacuum 之前两个 follower 都还没有免查区
+check "vacuum 前 follower1 水位 0/0" "$(FWM $f1)" "0/0"
+check "vacuum 前 follower2 水位 0/0" "$(FWM $f2)" "0/0"
 
 echo "================ [3] leader 侧 sweep + 截断 ================"
 TB=$(PSQL $pport -Atc "SET citus.override_table_visibility=false;
@@ -185,6 +198,8 @@ SW=$(PSQL $pport -Atc "SELECT swept||'/'||sanitized||'/'||removed_aborted||'/'||
 check "sweep：消毒1 删中止1 删死8 零跳页零推迟" "$SW" "true/1/1/8/0/0"
 NSEG=$(PSQL $pport -Atc "SELECT partdist.shard_clog_truncate(${SOID}::oid, ${TB}::bigint)" </dev/null | tail -1)
 check "截断成功（删段 0，不足一整段）" "$NSEG" "0"
+check "leader 水位推进到 ${TB}/${TB}" \
+      "$(PSQL $pport -Atc "SELECT clog_truncate_before||'/'||shard_vacuum_xid FROM partdist.shard_vacuum_watermarks(${SOID}::oid)" </dev/null | tail -1)" "${TB}/${TB}"
 check "vacuum 后 leader 仍可见 52 行" \
       "$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" </dev/null | tail -1)" "52"
 n_after=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM heap_page_items(get_raw_page('${shard_tbl}',0)) WHERE lp_flags=1" </dev/null | tail -1)
@@ -209,6 +224,10 @@ check "★ follower1 主堆文件确实变了（vacuum 记录真的到了）" \
       "$([[ -n "$md5_f1_post" && "$md5_f1_post" != "$md5_f1_pre" ]] && echo ok)" "ok"
 check "★ follower2 主堆文件确实变了" \
       "$([[ -n "$md5_f2_post" && "$md5_f2_post" != "$md5_f2_pre" ]] && echo ok)" "ok"
+# ★★ T5.4b-2：两个水位随 CTRL（复用 FREEZE_UPDATE 通道）到达 follower 并落盘。
+#    落点与 leader 同一个 pg_shard_xid/<oid>，升主时建槽路径原样读得到。
+check "★ follower1 收到并落盘 vacuum 水位 ${TB}/${TB}" "$(FWM $f1)" "${TB}/${TB}"
+check "★ follower2 收到并落盘 vacuum 水位 ${TB}/${TB}" "$(FWM $f2)" "${TB}/${TB}"
 
 echo "================ [5] 三方逐字节比对 ================"
 docker cp "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" "$CONTAINER":/tmp/pagecmp.py >/dev/null 2>&1
@@ -279,6 +298,11 @@ PSQL $pport -q -c "DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION
 PSQL $pport -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null
 PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 DEX rm -f "${PDATA}/pg_shard_xid/${SOID}" </dev/null
+for fp in $f1 $f2; do
+  fdata=$(PSQL "$fp" -Atc "SHOW data_directory" </dev/null)
+  foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+  [[ -n "$foid" && "$foid" != "0" ]] && DEX rm -f "${fdata}/pg_shard_xid/${foid}" </dev/null
+done
 check "清场完成" "$?" "0"
 health_check_no_crash
 

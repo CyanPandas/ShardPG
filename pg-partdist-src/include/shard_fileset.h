@@ -122,6 +122,17 @@ extern int  fileset_inline_max_blocks;
 extern void ShardFreezeMaybeEmitUpdates(void);
 
 /*
+ * T5.4b-2（设计 §6.7）：把本分片的两个 vacuum 水位作为 CTRL 记录发进分区流。
+ * 复用 FREEZE_UPDATE 通道换语义，不新增 opcode（clog_truncate_before 就是
+ * 分片 xid 宇宙里的隐式 freeze 点，与 relfrozenxid 同属"leader 的冻结账目"）。
+ * **尽力而为**：发不出去只会让 follower 的免查区落后（安全方向），且发的是
+ * 绝对值，下一轮截断自然补上；绝不把调用方的 vacuum 带下水。
+ */
+extern void ShardVacuumEmitWatermarkCtrl(Oid shard_oid,
+										 TransactionId trunc_before,
+										 TransactionId vacuum_xid);
+
+/*
  * ShardFreezeNoteUserActivity — "本 backend 执行了一条用户语句"。
  *
  * 由 ExecutorStart / ProcessUtility 两个钩子调用，是冻结发射器的**白名单**开关。
