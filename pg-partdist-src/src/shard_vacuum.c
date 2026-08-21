@@ -33,8 +33,10 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"			/* T5.8：索引两阶段 */
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
+#include "catalog/index.h"
 #include "access/htup_details.h"
 #include "access/xlog.h"			/* T5.5：落标记前刷 WAL */
 #include "access/xloginsert.h"
@@ -45,6 +47,8 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
+#include "storage/itemptr.h"
+#include "utils/memutils.h"		/* maintenance_work_mem */
 #include "utils/relcache.h"
 
 #include "shard_clog.h"
@@ -55,20 +59,21 @@
  * 两个页面动作的共同开场：认分片、拒绝无意义/后退的 trunc_before、取当前
  * 持久截断点。返回 false = 本趟无事可做（调用者直接返回）。
  */
+/*
+ * 给定分片 oid 的校验部分。
+ *
+ * 拆出这个变体是为了 **TOAST 关系**：它的元组同样被打分片 xid
+ * （`ShardXidRelidLookup` 对 RELKIND_TOASTVALUE 按 pg_toast_<owner> 解出属主），
+ * 但 `ShardXidLookupByOid(toast_oid)` 依赖后端本地的 toast_map 是否已被填过，
+ * 不可靠。所以处置 TOAST 时由调用方**直接把属主的分片 oid 传进来**。
+ */
 static bool
-shard_vacuum_begin(Relation rel, TransactionId trunc_before,
-				   Oid *shard_out, TransactionId *cur_tb_out)
+shard_vacuum_begin_for(Oid shard, TransactionId trunc_before,
+					   TransactionId *cur_tb_out)
 {
-	Oid			relid = RelationGetRelid(rel);
-	Oid			shard = ShardXidLookupByOid(relid);
 	TransactionId cur_tb;
 	TransactionId cur_vx;
 	TransactionId next_xid;
-
-	if (!OidIsValid(shard))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("关系 %u 不是分片打标表，无分片 vacuum 可做", relid)));
 
 	/* 一条都不清：InvalidTransactionId / 小于首个可用号，直接返回 */
 	if (!TransactionIdIsValid(trunc_before) || trunc_before <= FIRST_SHARD_XID)
@@ -103,9 +108,24 @@ shard_vacuum_begin(Relation rel, TransactionId trunc_before,
 						   "免查隐式冻结区。"),
 				 errhint("trunc_before 应取 ShardVacuumComputeTarget() 的结果 + 1。")));
 
-	*shard_out = shard;
 	*cur_tb_out = cur_tb;
 	return true;
+}
+
+static bool
+shard_vacuum_begin(Relation rel, TransactionId trunc_before,
+				   Oid *shard_out, TransactionId *cur_tb_out)
+{
+	Oid			relid = RelationGetRelid(rel);
+	Oid			shard = ShardXidLookupByOid(relid);
+
+	if (!OidIsValid(shard))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("关系 %u 不是分片打标表，无分片 vacuum 可做", relid)));
+
+	*shard_out = shard;
+	return shard_vacuum_begin_for(shard, trunc_before, cur_tb_out);
 }
 
 /*
@@ -142,6 +162,11 @@ shard_vacuum_status(Oid shard, TransactionId xid, const char *field,
  * 判一个元组要不要消毒 xmax；要则把清空计划写进 *frz（offset 由调用者填）。
  * cur_tb = 该分片**当前**的持久截断点，用于区分"判不出来"与"调用者给错"。
  */
+static void shard_vacuum_sanitize_pass(Relation rel, Oid shard,
+									   TransactionId cur_tb,
+									   TransactionId trunc_before,
+									   ShardVacuumPageStats *stats);
+
 static bool
 sanitize_plan_for_tuple(Oid shard, HeapTupleHeader tuple,
 						TransactionId trunc_before, TransactionId cur_tb,
@@ -195,19 +220,13 @@ sanitize_plan_for_tuple(Oid shard, HeapTupleHeader tuple,
 	return true;
 }
 
-void
-ShardVacuumSanitizeXmax(Relation rel, TransactionId trunc_before,
-						ShardVacuumPageStats *stats)
+static void
+shard_vacuum_sanitize_pass(Relation rel, Oid shard, TransactionId cur_tb,
+						   TransactionId trunc_before,
+						   ShardVacuumPageStats *stats)
 {
-	Oid			shard;
-	TransactionId cur_tb;
 	BlockNumber nblocks;
 	BlockNumber blkno;
-
-	memset(stats, 0, sizeof(*stats));
-
-	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
-		return;
 
 	nblocks = RelationGetNumberOfBlocks(rel);
 
@@ -377,36 +396,216 @@ prune_tuple_is_dead(Oid shard, HeapTupleHeader tuple, ShardVacuumPruneMode mode,
 	}
 }
 
-static void
-shard_vacuum_prune_pass(Relation rel, TransactionId trunc_before,
-						ShardVacuumPruneMode mode,
+void
+ShardVacuumSanitizeXmax(Relation rel, TransactionId trunc_before,
 						ShardVacuumPageStats *stats)
 {
 	Oid			shard;
 	TransactionId cur_tb;
-	BlockNumber nblocks;
-	BlockNumber blkno;
-	List	   *indexes;
-	bool		is_catalog;
 
 	memset(stats, 0, sizeof(*stats));
-
 	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
 		return;
+	shard_vacuum_sanitize_pass(rel, shard, cur_tb, trunc_before, stats);
+}
+
+/* ================================================================== */
+/* 索引两阶段（设计 §6.4 ②"含索引项清理，两阶段"，T5.8）              */
+/* ================================================================== */
+
+/*
+ * 死 TID 批。按扫描序收集，天然按 (blkno, offnum) 升序 —— 两个消费者都靠这个：
+ *   ① index_bulk_delete 的回调二分查找；
+ *   ② 第三阶段按块分组回收行指针。
+ */
+typedef struct ShardVacuumDeadItems
+{
+	int			max_items;
+	int			num_items;
+	ItemPointerData *items;
+} ShardVacuumDeadItems;
+
+static int
+shard_vacuum_tid_cmp(const void *a, const void *b)
+{
+	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
+}
+
+/* index_bulk_delete 的回调：TID 在死名单里就删掉这条索引项 */
+static bool
+shard_vacuum_tid_reaped(ItemPointer itemptr, void *state)
+{
+	ShardVacuumDeadItems *d = (ShardVacuumDeadItems *) state;
+
+	return bsearch(itemptr, d->items, (size_t) d->num_items,
+				   sizeof(ItemPointerData), shard_vacuum_tid_cmp) != NULL;
+}
+
+/*
+ * 第二阶段：逐个索引删掉指向死 TID 的索引项。
+ *
+ * 全部交给 index_bulk_delete / index_vacuum_cleanup —— 与原生 vacuum 走的是
+ * 同一对入口，索引侧的页面变更与 WAL 记录都由索引 AM 自己发，本模块不碰。
+ * 这与 ①③ 的路子一致：**策略在扩展，页面变换与 WAL 用内核的。**
+ */
+static void
+shard_vacuum_indexes(Relation rel, ShardVacuumDeadItems *dead)
+{
+	List	   *indexoidlist;
+	ListCell   *lc;
+
+	if (dead->num_items == 0)
+		return;
+
+	indexoidlist = RelationGetIndexList(rel);
+	foreach(lc, indexoidlist)
+	{
+		Relation	ind = index_open(lfirst_oid(lc), RowExclusiveLock);
+		IndexVacuumInfo ivinfo;
+		IndexBulkDeleteResult *istat;
+
+		memset(&ivinfo, 0, sizeof(ivinfo));
+		ivinfo.index = ind;
+		ivinfo.heaprel = rel;
+		ivinfo.analyze_only = false;
+		ivinfo.report_progress = false;
+		ivinfo.estimated_count = true;
+		ivinfo.message_level = DEBUG2;
+		ivinfo.num_heap_tuples = rel->rd_rel->reltuples;
+		ivinfo.strategy = NULL;
+
+		istat = index_bulk_delete(&ivinfo, NULL, shard_vacuum_tid_reaped, dead);
+		istat = index_vacuum_cleanup(&ivinfo, istat);
+		if (istat != NULL)
+			pfree(istat);
+
+		index_close(ind, RowExclusiveLock);
+	}
+	list_free(indexoidlist);
+}
+
+/*
+ * 第三阶段：把死 TID 的行指针 LP_DEAD ⇒ LP_UNUSED（XLOG_HEAP2_VACUUM）。
+ *
+ * 必须在第二阶段之后：反过来先回收行指针、后清索引，中间崩溃就会留下**指向
+ * 已被复用的行指针**的索引项 —— 索引扫到一条无关的新元组。这条次序正是设计
+ * §6.4 ② 写"两阶段（收集死 TID → 清索引 → 回收行指针）"的原因。
+ *
+ * 拿不到 cleanup lock 则跳过该页并计数：此时索引项已经删了、行指针还留作
+ * LP_DEAD —— **这是安全的中间态**（LP_DEAD 不被任何索引项指向，扫描也不会
+ * 返回它），下一趟扫描会把既有的 LP_DEAD 一并收进死名单再回收。
+ */
+static void
+shard_vacuum_heap_pass2(Relation rel, ShardVacuumDeadItems *dead,
+						ShardVacuumPageStats *stats)
+{
+	int			idx = 0;
+
+	while (idx < dead->num_items)
+	{
+		BlockNumber blkno = ItemPointerGetBlockNumber(&dead->items[idx]);
+		OffsetNumber unused[MaxHeapTuplesPerPage];
+		int			nunused = 0;
+		Buffer		buf;
+		Page		page;
+		Size		freespace;
+		int			i;
+
+		while (idx < dead->num_items &&
+			   ItemPointerGetBlockNumber(&dead->items[idx]) == blkno)
+			unused[nunused++] = ItemPointerGetOffsetNumber(&dead->items[idx++]);
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf = ReadBuffer(rel, blkno);
+		if (!ConditionalLockBufferForCleanup(buf))
+		{
+			ReleaseBuffer(buf);
+			stats->pages_skipped++;
+			continue;
+		}
+		page = BufferGetPage(buf);
+
+		START_CRIT_SECTION();
+
+		for (i = 0; i < nunused; i++)
+			ItemIdSetUnused(PageGetItemId(page, unused[i]));
+		PageTruncateLinePointerArray(page);
+		MarkBufferDirty(buf);
+
+		if (RelationNeedsWAL(rel))
+		{
+			xl_heap_vacuum xlrec;
+			XLogRecPtr	recptr;
+
+			xlrec.nunused = (uint16) nunused;
+
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
+			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+			XLogRegisterBufData(0, (char *) unused,
+								nunused * sizeof(OffsetNumber));
+
+			recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
+			PageSetLSN(page, recptr);
+		}
+
+		END_CRIT_SECTION();
+
+		freespace = PageGetHeapFreeSpace(page);
+		UnlockReleaseBuffer(buf);
+		RecordPageWithFreeSpace(rel, blkno, freespace);
+	}
+
+	dead->num_items = 0;		/* 本批结算完毕 */
+}
+
+/* 一批死 TID 的收尾：清索引 → 回收行指针 */
+static void
+shard_vacuum_flush_batch(Relation rel, ShardVacuumDeadItems *dead,
+						 ShardVacuumPageStats *stats)
+{
+	if (dead->num_items == 0)
+		return;
+	shard_vacuum_indexes(rel, dead);
+	shard_vacuum_heap_pass2(rel, dead, stats);
+}
+
+/* ================================================================== */
+/* 页面趟主体                                                          */
+/* ================================================================== */
+
+static void
+shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
+						TransactionId trunc_before, ShardVacuumPruneMode mode,
+						ShardVacuumPageStats *stats)
+{
+	BlockNumber nblocks;
+	BlockNumber blkno;
+	bool		is_catalog;
+	bool		has_index;
+	List	   *indexoidlist;
+	ShardVacuumDeadItems dead;
+
+	indexoidlist = RelationGetIndexList(rel);
+	has_index = (indexoidlist != NIL);
+	list_free(indexoidlist);
 
 	/*
-	 * 索引两阶段是 T5.3c。带索引的关系走到这里会把索引项留成悬空指针，
-	 * fail-closed。（P1 起分片打标表一律无索引：CREATE INDEX / REINDEX 都被
-	 * ShardXidUtilityGuard 拦着，所以这条正常永不触发。）
+	 * 死名单容量按 maintenance_work_mem 算（与原生同源）。装满就地结算一批
+	 * （清索引 + 回收行指针）再继续扫 —— 与原生 vacuum 的多趟一模一样。
 	 */
-	indexes = RelationGetIndexList(rel);
-	if (indexes != NIL)
+	dead.items = NULL;
+	dead.num_items = 0;
+	dead.max_items = 0;
+	if (has_index)
 	{
-		list_free(indexes);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("分片 %u 的关系带索引 —— 删元组需要索引两阶段（T5.3c，尚未实现）",
-						shard)));
+		long		n = (long) maintenance_work_mem * 1024L /
+			(long) sizeof(ItemPointerData);
+
+		dead.max_items = (int) Min(Max(n, 1024L), (long) (MaxAllocSize / sizeof(ItemPointerData)));
+		dead.items = (ItemPointerData *)
+			palloc(sizeof(ItemPointerData) * (Size) dead.max_items);
 	}
 
 	is_catalog = RelationIsAccessibleInLogicalDecoding(rel);
@@ -418,10 +617,13 @@ shard_vacuum_prune_pass(Relation rel, TransactionId trunc_before,
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
-		OffsetNumber nowdead[MaxHeapTuplesPerPage];
-		OffsetNumber nowunused[MaxHeapTuplesPerPage];
+		OffsetNumber newdead[MaxHeapTuplesPerPage];
+		OffsetNumber newunused[MaxHeapTuplesPerPage];
+		OffsetNumber alldead[MaxHeapTuplesPerPage];
 		int			ndead = 0;
 		int			nunused = 0;
+		int			nall = 0;
+		int			i;
 		Size		freespace;
 
 		CHECK_FOR_INTERRUPTS();
@@ -467,6 +669,17 @@ shard_vacuum_prune_pass(Relation rel, TransactionId trunc_before,
 			ItemId		itemid = PageGetItemId(page, off);
 			HeapTupleHeader tuple;
 
+			/*
+			 * 既有的 LP_DEAD：上一趟清完索引之前崩溃、或第三阶段跳过该页
+			 * 留下的中间态。**必须一并收走**，否则它们永远不再被扫描看见
+			 * （扫描只认 LP_NORMAL），行指针就此泄漏。
+			 */
+			if (ItemIdIsDead(itemid))
+			{
+				alldead[nall++] = off;
+				continue;
+			}
+
 			if (!ItemIdIsNormal(itemid))
 				continue;
 
@@ -484,103 +697,155 @@ shard_vacuum_prune_pass(Relation rel, TransactionId trunc_before,
 				 * 同一个中止事务的号，③ 一清就解除了。留到下一趟，如实计数。
 				 *
 				 * ★ ② **不能**照此办理：committed 的 xmax 没有任何后续动作
-				 *   会去清它的 HOT_UPDATED 位，一推迟就是永远推迟，而
+				 *   会去清它的 HEAP_HOT_UPDATED，一推迟就是永远推迟，而
 				 *   "本趟不完整"又禁止截断 —— HOT 链会把截断永久钉死。
-				 *   ② 直接收：本表无索引（函数开头已强制），页外没有任何
-				 *   东西引用行指针，逐条独立回收是安全的。
 				 */
 				if (mode == SVP_ABORTED_XMIN && HeapTupleHeaderIsHotUpdated(tuple))
 				{
 					stats->tuples_deferred++;
 					continue;
 				}
-				nowunused[nunused++] = off;
+				/* heap-only 元组没有索引项指向它，可以直接置 LP_UNUSED */
+				newunused[nunused++] = off;
 			}
 			else
-				nowdead[ndead++] = off;
+			{
+				/*
+				 * ★ 带索引的关系上，"死根元组 + 链上还有活的后继"必须做成
+				 * LP_REDIRECT（把根的行指针指向第一个活成员），否则索引项
+				 * 被删掉之后那条活行就再也扫不到了。**本实现不产生
+				 * LP_REDIRECT**，撞见即 fail-closed。
+				 *
+				 * 无索引的关系上不存在这个问题（页外没有任何东西引用行指针，
+				 * 顺序扫描逐个访问 LP_NORMAL，被摘掉根的 heap-only 元组照样
+				 * 读得到）—— 那条路 T5.3b/c 已验过。
+				 *
+				 * TOAST 关系也不存在：TOAST 元组只被 INSERT / DELETE，
+				 * 从不 UPDATE，天然没有 HOT 链。
+				 */
+				if (has_index && HeapTupleHeaderIsHotUpdated(tuple))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("分片 %u 第 %u 页第 %u 项是带 HOT 链的死根元组，"
+									"而该关系有索引", shard, blkno, off),
+							 errdetail("清掉它的索引项会让链上仍然活着的后继元组"
+									   "无法经索引访问；正确做法是把根做成 "
+									   "LP_REDIRECT —— 本实现尚未产生 LP_REDIRECT。"),
+							 errhint("分片打标表在 P1 起禁建索引；TOAST 关系不产生 "
+									 "HOT 链。撞见这条说明有第三种情形，须先补 "
+									 "LP_REDIRECT。")));
+
+				newdead[ndead++] = off;
+				alldead[nall++] = off;
+			}
 		}
 
-		if (ndead == 0 && nunused == 0)
+		if (ndead == 0 && nunused == 0 && nall == 0)
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
 
-		/* ---- 第一步：PRUNE 记录 ---- */
-		START_CRIT_SECTION();
-
-		heap_page_prune_execute(buf, NULL, 0, nowdead, ndead,
-								nowunused, nunused);
-		MarkBufferDirty(buf);
-
-		if (RelationNeedsWAL(rel))
-		{
-			xl_heap_prune xlrec;
-			XLogRecPtr	recptr;
-
-			/*
-			 * snapshotConflictHorizon 传 Invalid：它只服务 hot standby 的
-			 * 查询冲突解决，而(a) 分片副本走 pg_parwal 物理回放、不是 hot
-			 * standby；(b) 被删的是**中止插入**的元组，对任何快照、任何
-			 * 时刻都不可见，本就不存在需要杀掉的读者。
-			 */
-			xlrec.snapshotConflictHorizon = InvalidTransactionId;
-			xlrec.nredirected = 0;
-			xlrec.ndead = (uint16) ndead;
-			xlrec.isCatalogRel = is_catalog;
-
-			XLogBeginInsert();
-			XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
-			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-			if (ndead > 0)
-				XLogRegisterBufData(0, (char *) nowdead,
-									ndead * sizeof(OffsetNumber));
-			if (nunused > 0)
-				XLogRegisterBufData(0, (char *) nowunused,
-									nunused * sizeof(OffsetNumber));
-
-			recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_PRUNE);
-			PageSetLSN(page, recptr);
-		}
-
-		END_CRIT_SECTION();
-
-		/* ---- 第二步：LP_DEAD ⇒ LP_UNUSED（无索引，不需索引两阶段）---- */
-		if (ndead > 0)
+		/* ---- 第一阶段：PRUNE 记录 ---- */
+		if (ndead > 0 || nunused > 0)
 		{
 			START_CRIT_SECTION();
 
-			for (int i = 0; i < ndead; i++)
-				ItemIdSetUnused(PageGetItemId(page, nowdead[i]));
-			PageTruncateLinePointerArray(page);
+			heap_page_prune_execute(buf, NULL, 0, newdead, ndead,
+									newunused, nunused);
 			MarkBufferDirty(buf);
 
 			if (RelationNeedsWAL(rel))
 			{
-				xl_heap_vacuum xlrec;
+				xl_heap_prune xlrec;
 				XLogRecPtr	recptr;
 
-				xlrec.nunused = (uint16) ndead;
+				/*
+				 * snapshotConflictHorizon 传 Invalid：它只服务 hot standby 的
+				 * 查询冲突解决，而(a) 分片副本走 pg_parwal 物理回放、不是 hot
+				 * standby；(b) 被删的元组要么是**中止插入**（对任何快照任何
+				 * 时刻都不可见），要么是**已提交删除且 commit_ts <
+				 * GlobalSafeTs**（按 §6.2 的定义没有活跃快照还需要它）。
+				 */
+				xlrec.snapshotConflictHorizon = InvalidTransactionId;
+				xlrec.nredirected = 0;
+				xlrec.ndead = (uint16) ndead;
+				xlrec.isCatalogRel = is_catalog;
 
 				XLogBeginInsert();
-				XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
+				XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
 				XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-				XLogRegisterBufData(0, (char *) nowdead,
-									ndead * sizeof(OffsetNumber));
+				if (ndead > 0)
+					XLogRegisterBufData(0, (char *) newdead,
+										ndead * sizeof(OffsetNumber));
+				if (nunused > 0)
+					XLogRegisterBufData(0, (char *) newunused,
+										nunused * sizeof(OffsetNumber));
 
-				recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
+				recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_PRUNE);
 				PageSetLSN(page, recptr);
 			}
 
 			END_CRIT_SECTION();
+
+			stats->tuples_touched += ndead + nunused;
+		}
+
+		if (!has_index)
+		{
+			/* ---- 无索引：立刻 LP_DEAD ⇒ LP_UNUSED，不需要索引两阶段 ---- */
+			if (nall > 0)
+			{
+				START_CRIT_SECTION();
+
+				for (i = 0; i < nall; i++)
+					ItemIdSetUnused(PageGetItemId(page, alldead[i]));
+				PageTruncateLinePointerArray(page);
+				MarkBufferDirty(buf);
+
+				if (RelationNeedsWAL(rel))
+				{
+					xl_heap_vacuum xlrec;
+					XLogRecPtr	recptr;
+
+					xlrec.nunused = (uint16) nall;
+
+					XLogBeginInsert();
+					XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
+					XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+					XLogRegisterBufData(0, (char *) alldead,
+										nall * sizeof(OffsetNumber));
+
+					recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
+					PageSetLSN(page, recptr);
+				}
+
+				END_CRIT_SECTION();
+			}
 		}
 
 		stats->pages_dirtied++;
-		stats->tuples_touched += ndead + nunused;
-
 		freespace = PageGetHeapFreeSpace(page);
 		UnlockReleaseBuffer(buf);
 		RecordPageWithFreeSpace(rel, blkno, freespace);
+
+		if (has_index && nall > 0)
+		{
+			/* 死 TID 进批，等本批攒满或扫完再统一清索引、回收行指针 */
+			for (i = 0; i < nall; i++)
+			{
+				if (dead.num_items >= dead.max_items)
+					shard_vacuum_flush_batch(rel, &dead, stats);
+				ItemPointerSet(&dead.items[dead.num_items], blkno, alldead[i]);
+				dead.num_items++;
+			}
+		}
+	}
+
+	if (has_index)
+	{
+		shard_vacuum_flush_batch(rel, &dead, stats);
+		pfree(dead.items);
 	}
 }
 
@@ -588,19 +853,69 @@ void
 ShardVacuumRemoveAbortedXmin(Relation rel, TransactionId trunc_before,
 							 ShardVacuumPageStats *stats)
 {
-	shard_vacuum_prune_pass(rel, trunc_before, SVP_ABORTED_XMIN, stats);
+	Oid			shard;
+	TransactionId cur_tb;
+
+	memset(stats, 0, sizeof(*stats));
+	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
+		return;
+	shard_vacuum_prune_pass(rel, shard, cur_tb, trunc_before,
+							SVP_ABORTED_XMIN, stats);
 }
 
 void
 ShardVacuumRemoveDeadTuples(Relation rel, TransactionId trunc_before,
 							ShardVacuumPageStats *stats)
 {
-	shard_vacuum_prune_pass(rel, trunc_before, SVP_DEAD_XMAX, stats);
+	Oid			shard;
+	TransactionId cur_tb;
+
+	memset(stats, 0, sizeof(*stats));
+	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
+		return;
+	shard_vacuum_prune_pass(rel, shard, cur_tb, trunc_before,
+							SVP_DEAD_XMAX, stats);
 }
 
 /* ================================================================== */
 /* T5.4：一整趟页面动作 —— 顺序铁律的凭据来源                          */
 /* ================================================================== */
+
+/* 对一张关系（主堆或它的 TOAST）按 ③→①→② 跑一遍，计数累加进 stats */
+static void
+sweep_one_rel(Relation rel, Oid shard, TransactionId cur_tb,
+			  TransactionId trunc_before, ShardVacuumPageStats *stats,
+			  int64 *sanitized, int64 *removed_aborted, int64 *removed_dead)
+{
+	ShardVacuumPageStats one;
+
+	/* ③ 消毒 —— 必须最先：① 的推迟格要靠它清 xmax 才解除 */
+	memset(&one, 0, sizeof(one));
+	shard_vacuum_sanitize_pass(rel, shard, cur_tb, trunc_before, &one);
+	*sanitized += one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+
+	/* ① 删中止 xmin 的元组 */
+	memset(&one, 0, sizeof(one));
+	shard_vacuum_prune_pass(rel, shard, cur_tb, trunc_before,
+							SVP_ABORTED_XMIN, &one);
+	*removed_aborted += one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+	stats->pages_skipped += one.pages_skipped;
+	stats->tuples_deferred += one.tuples_deferred;
+
+	/* ② 删已提交删除的死元组 */
+	memset(&one, 0, sizeof(one));
+	shard_vacuum_prune_pass(rel, shard, cur_tb, trunc_before,
+							SVP_DEAD_XMAX, &one);
+	*removed_dead += one.tuples_touched;
+	stats->pages_scanned += one.pages_scanned;
+	stats->pages_dirtied += one.pages_dirtied;
+	stats->pages_skipped += one.pages_skipped;
+	stats->tuples_deferred += one.tuples_deferred;
+}
 
 bool
 ShardVacuumSweep(Relation rel, TransactionId trunc_before,
@@ -608,35 +923,46 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 				 int64 *sanitized, int64 *removed_aborted,
 				 int64 *removed_dead)
 {
-	Oid			shard = ShardXidLookupByOid(RelationGetRelid(rel));
+	Oid			shard;
 	TransactionId cur_tb;
 	TransactionId cur_vx;
-	ShardVacuumPageStats one;
 
 	memset(stats, 0, sizeof(*stats));
 	*sanitized = *removed_aborted = *removed_dead = 0;
 
-	/* ③ 消毒 —— 必须最先：① 的推迟格要靠它清 xmax 才解除 */
-	ShardVacuumSanitizeXmax(rel, trunc_before, &one);
-	*sanitized = one.tuples_touched;
-	stats->pages_scanned += one.pages_scanned;
-	stats->pages_dirtied += one.pages_dirtied;
+	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
+		return false;
 
-	/* ① 删中止 xmin 的元组 */
-	ShardVacuumRemoveAbortedXmin(rel, trunc_before, &one);
-	*removed_aborted = one.tuples_touched;
-	stats->pages_scanned += one.pages_scanned;
-	stats->pages_dirtied += one.pages_dirtied;
-	stats->pages_skipped += one.pages_skipped;
-	stats->tuples_deferred += one.tuples_deferred;
+	sweep_one_rel(rel, shard, cur_tb, trunc_before, stats,
+				  sanitized, removed_aborted, removed_dead);
 
-	/* ② 删已提交删除的死元组 */
-	ShardVacuumRemoveDeadTuples(rel, trunc_before, &one);
-	*removed_dead = one.tuples_touched;
-	stats->pages_scanned += one.pages_scanned;
-	stats->pages_dirtied += one.pages_dirtied;
-	stats->pages_skipped += one.pages_skipped;
-	stats->tuples_deferred += one.tuples_deferred;
+	/*
+	 * ★ TOAST 关系同属这个分片的 xid 宇宙，必须一起清（T5.8）。
+	 *
+	 * 依据：`ShardXidRelidLookup()` 对 RELKIND_TOASTVALUE 按 pg_toast_<owner>
+	 * 解出属主，属主在名单里就返回**属主的** shard oid —— 也就是说 TOAST
+	 * 元组一样被打分片 xid、一样会积累三类垃圾。而 TOAST 关系天生带一个
+	 * btree 索引，所以这一段正是索引两阶段的正主用例。
+	 *
+	 * 分片 oid 直接沿用属主的，不再 `ShardXidLookupByOid(toast_oid)` ——
+	 * 后者依赖后端本地的 toast_map 是否已被填过，不可靠。
+	 */
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		Relation	toastrel = table_open(rel->rd_rel->reltoastrelid,
+										  ShareUpdateExclusiveLock);
+
+		PG_TRY();
+		{
+			sweep_one_rel(toastrel, shard, cur_tb, trunc_before, stats,
+						  sanitized, removed_aborted, removed_dead);
+		}
+		PG_FINALLY();
+		{
+			table_close(toastrel, ShareUpdateExclusiveLock);
+		}
+		PG_END_TRY();
+	}
 
 	stats->tuples_touched = *sanitized + *removed_aborted + *removed_dead;
 

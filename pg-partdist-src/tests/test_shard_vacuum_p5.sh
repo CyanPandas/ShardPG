@@ -15,6 +15,9 @@
 #   [19]-[23] T5.4 —— 截断 + **顺序铁律** + **免查隐式冻结区**。核心验收是
 #           "页未清完就截断必须被拦"；[21] 段用注入证明门禁拦的那件事确实是
 #           灾难：跳过清理直接推水位，幽灵行当场复活、活行当场被判死。
+#   [16b]  T5.8 —— **索引两阶段**的正主用例：TOAST 关系（分片表的 TOAST 元组
+#           同样被打分片 xid，而 TOAST 天生带 btree 索引 —— 两阶段没做时它的
+#           空间永远不会被回收）。
 #   [24]-[27] T5.5 —— **两态恢复**。状态一（趟不完整）用"同一 session 里开着
 #           游标 pin 住页面"确定性地造出来（顺带覆盖了 pages_skipped 分支）；
 #           状态二（趟完未截断）用 immediate 崩溃造出来，验恢复只补截断。
@@ -244,9 +247,29 @@ set_whitelist ""
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5idx; CREATE TABLE p5idx(id int) WITH (autovacuum_enabled=off); CREATE INDEX p5idx_i ON p5idx(id);" </dev/null >/dev/null
 OI=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5idx'" </dev/null)
 set_whitelist "$OI"; check "p5idx 白名单生效" "$?" "0"
-neg "带索引即拒（索引两阶段属 T5.3c）" "需要索引两阶段" \
-    "SELECT tuples_removed FROM partdist.shard_remove_aborted('p5idx'::regclass, 100::bigint)"
-check "负向计数守卫（累计应跑 4 条）" "$NEG_RUN" "4"
+# ★ T5.8：带索引的关系走**索引两阶段**（收集死 TID → 清索引 → 回收行指针）。
+#   夹具只做 INSERT + 已提交 DELETE（不 UPDATE）——分片表上 UPDATE 会生成
+#   HOT 链，那一格由 [16] 段的负向单独验。
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5idx VALUES (1);
+INSERT INTO p5idx VALUES (2);
+INSERT INTO p5idx VALUES (3);
+INSERT INTO p5idx VALUES (4);
+DELETE FROM p5idx WHERE id IN (1,3);
+SQL
+TIX=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5idx',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OI::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TIX-1))) g WHERE sclog_read($OI::oid, g::bigint)=2" </dev/null >/dev/null
+IDX0=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM bt_page_items('p5idx_i',1)" </dev/null)
+check "清理前索引叶页有 4 条索引项" "$IDX0" "4"
+D5=$(PSQL "$WPORT" -Atc "SELECT tuples_removed||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_remove_dead('p5idx'::regclass, $TIX::bigint)" </dev/null)
+check "★ 带索引的关系删掉 2 条死元组" "$D5" "2/0/0"
+check "★ 索引项同步减到 2 条（两阶段的第二阶段真的跑了）" \
+      "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM bt_page_items('p5idx_i',1)" </dev/null)" "2"
+check "★ 堆上行指针已回收（只剩 2 个 LP_NORMAL，0 个 LP_DEAD）" \
+      "$(NORMAL p5idx)/$(LPDEAD p5idx)" "2/0"
+check "★ 索引扫描仍能取到活行" \
+      "$(PSQL "$WPORT" -Atc "SET enable_seqscan=off; SELECT string_agg(id::text,',' ORDER BY id) FROM p5idx WHERE id > 0" </dev/null | tail -1)" "2,4"
+check "负向计数守卫（累计应跑 3 条）" "$NEG_RUN" "3"
 
 # ================================================================
 #  T5.3c —— 设计 §6.4 ② 删已提交删除的死元组
@@ -316,10 +339,69 @@ check "该 xmax 已被改成 commit_ts=0 的 COMMITTED" \
 neg "commit_ts 为 0 即拒" "commit_ts 为 0" \
     "SELECT tuples_removed FROM partdist.shard_remove_dead('p5d'::regclass, $TD::bigint)"
 check "被拒后元组未被删" "$(NORMAL p5d)" "1"
+# ★ T5.8 的边界：带索引的关系上出现"死根元组 + 链上还有活的后继"时，正确做法
+#   是把根做成 LP_REDIRECT，而本实现不产生 LP_REDIRECT ⇒ fail-closed。
+#   分片表上一次已提交 UPDATE 就会造出这一格（索引列没变 ⇒ 走 HOT）。
 set_whitelist "$OI"; check "p5idx 重新打标" "$?" "0"
-neg "② 带索引即拒" "需要索引两阶段" \
-    "SELECT tuples_removed FROM partdist.shard_remove_dead('p5idx'::regclass, 100::bigint)"
-check "负向计数守卫（累计应跑 6 条）" "$NEG_RUN" "6"
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5hot; CREATE TABLE p5hot(id int, v text) WITH (autovacuum_enabled=off); CREATE INDEX p5hot_i ON p5hot(id);" </dev/null >/dev/null
+OHOT=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5hot'" </dev/null)
+set_whitelist "$OI,$OHOT"; check "p5hot 打标" "$?" "0"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5hot VALUES (1,'a');
+UPDATE p5hot SET v='b' WHERE id=1;
+SQL
+THOT=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5hot',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OHOT::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((THOT-1))) g WHERE sclog_read($OHOT::oid, g::bigint)=2" </dev/null >/dev/null
+neg "★ 带索引 + HOT 链的死根元组即拒（LP_REDIRECT 未实现）" "带 HOT 链的死根元组" \
+    "SELECT tuples_removed FROM partdist.shard_remove_dead('p5hot'::regclass, $THOT::bigint)"
+check "被拒后 p5hot 的行仍可见" "$(PSQL "$WPORT" -Atc "SELECT v FROM p5hot WHERE id=1" </dev/null)" "b"
+check "负向计数守卫（累计应跑 5 条）" "$NEG_RUN" "5"
+
+# ================================================================
+#  T5.8 的正主用例：**TOAST 关系**
+#  TOAST 元组同样被打分片 xid（ShardXidRelidLookup 按 pg_toast_<owner> 解出
+#  属主），同样会积累三类垃圾；而 TOAST 关系天生带一个 btree 索引 —— 索引
+#  两阶段没做的时候，分片表的 TOAST 空间**永远不会被回收**。
+#  TOAST 元组只被 INSERT/DELETE、从不 UPDATE，天然没有 HOT 链，
+#  所以它恰好落在"不需要 LP_REDIRECT"的那一格。
+# ================================================================
+echo "========== [16b] TOAST 关系的清理（索引两阶段的正主用例）=========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5t; CREATE TABLE p5t(id int, v text) WITH (autovacuum_enabled=off, toast.autovacuum_enabled=off);" </dev/null >/dev/null
+OT=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5t'" </dev/null)
+set_whitelist "$OT"; check "p5t 白名单生效" "$?" "0"
+# 值要大到进 TOAST，且不能太好压（拿 md5 拼出的十六进制串）
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q -c \
+  "INSERT INTO p5t SELECT g, (SELECT string_agg(md5((g*1000+i)::text),'') FROM generate_series(1,200) i) FROM generate_series(1,8) g;" </dev/null >/dev/null
+TREL=$(PSQL "$WPORT" -Atc "SELECT reltoastrelid::regclass::text FROM pg_class WHERE oid=$OT" </dev/null)
+TIDX="${TREL}_index"
+TOASTN() { PSQL "$WPORT" -Atc "SELECT count(*) FROM generate_series(0,(pg_relation_size('$1')/8192)::int-1) b, LATERAL heap_page_items(get_raw_page('$1',b)) i WHERE i.lp_flags=1" </dev/null; }
+tn0=$(TOASTN "$TREL")
+check "值确实进了 TOAST（chunk 数 > 8）" "$([[ -n "$tn0" && "$tn0" -gt 8 ]] && echo ok)" "ok"
+ti0=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM bt_page_items('$TIDX',1)" </dev/null)
+check "TOAST 索引项数 = chunk 数" "$ti0" "$tn0"
+PSQL "$WPORT" -q -c "DELETE FROM p5t WHERE id <= 4;" </dev/null >/dev/null
+check "删后可见 4 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5t" </dev/null)" "4"
+TT=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5t',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OT::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TT-1))) g WHERE sclog_read($OT::oid, g::bigint)=2" </dev/null >/dev/null
+# 清理前先把活行内容记下来，清完要逐字节对上（TOAST 取值走的正是那个索引）
+md5_before=$(PSQL "$WPORT" -Atc "SELECT md5(string_agg(v,'' ORDER BY id)) FROM p5t" </dev/null)
+SWT=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||removed_dead||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5t'::regclass, $TT::bigint)" </dev/null)
+check "sweep 干净收尾且删了主堆 4 条 + TOAST 一批" \
+      "$(echo "$SWT" | cut -d/ -f1,3,4)" "true/0/0"
+nrm=$(echo "$SWT" | cut -d/ -f2)
+check "★ 删掉的死元组数 > 4（主堆 4 条之外还有 TOAST 的 chunk）" \
+      "$([[ -n "$nrm" && "$nrm" -gt 4 ]] && echo ok)" "ok"
+tn1=$(TOASTN "$TREL")
+check "★ TOAST chunk 真的被回收了（$tn0 → $tn1）" \
+      "$([[ -n "$tn1" && "$tn1" -lt "$tn0" ]] && echo ok)" "ok"
+check "★ TOAST 索引项同步减少" \
+      "$([[ "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM bt_page_items('$TIDX',1)" </dev/null)" -eq "$tn1" ]] && echo ok)" "ok"
+check "★ 活行的 TOAST 值仍能完整取出（内容逐字节不变）" \
+      "$(PSQL "$WPORT" -Atc "SELECT md5(string_agg(v,'' ORDER BY id)) FROM p5t" </dev/null)" "$md5_before"
+check "清理后仍是 4 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5t" </dev/null)" "4"
+check "幂等：再 sweep 一次零动作" \
+      "$(PSQL "$WPORT" -Atc "SELECT removed_dead||'/'||removed_aborted FROM partdist.shard_vacuum_sweep('p5t'::regclass, $TT::bigint)" </dev/null)" "0/0"
 
 echo "========== [17] 崩溃持久性 =========="
 crash_restart; check "immediate 崩溃后重启就绪" "$?" "0"
@@ -362,7 +444,7 @@ neg "★ 趟标记落后于目标即拒" "不许截断 clog" \
     "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
 neg "trunc_before 超过下一个待发号即拒" "超过下一个待发号" \
     "SELECT swept FROM partdist.shard_vacuum_sweep('p5e'::regclass, 999999::bigint)"
-check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
+check "负向计数守卫（累计应跑 8 条）" "$NEG_RUN" "8"
 
 echo "========== [20] 完整 sweep → 截断 → 免查区生效 =========="
 # 半程那趟已经把号更小的清掉了（这正是 sweep 该有的行为），所以这里对
@@ -463,7 +545,7 @@ check "★ 有页被 pin 住时 sweep 不完整（swept=false 且有跳页）" \
 check "★ 不完整的趟不落标记（水位仍 0/0）" "$(WM "$OH")" "0/0"
 neg "不完整的趟之后仍拒截断" "不许截断 clog" \
     "SELECT partdist.shard_clog_truncate($OH::oid, $TH::bigint)"
-check "负向计数守卫（累计应跑 10 条）" "$NEG_RUN" "10"
+check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
 # 游标随事务结束释放 ⇒ 整趟重来即可（这正是状态一的恢复动作）
 SW2=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5h'::regclass, $TH::bigint)" </dev/null)
 check "整趟重来：干净收尾" "$SW2" "true/0/0"
@@ -606,14 +688,14 @@ PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OJ::oid, $TJ2::bigint)"
 check "★ 推进截断点后相位降回 0" "$(PHASE "$OJ")" "0"
 PSQL "$WPORT" -q -c "INSERT INTO p5j VALUES (999,'unlocked');" </dev/null >/dev/null
 check "★ 解锁后写入恢复" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j WHERE id=999" </dev/null)" "1"
-check "负向计数守卫（累计应跑 11 条）" "$NEG_RUN" "11"
+check "负向计数守卫（累计应跑 10 条）" "$NEG_RUN" "10"
 set_guc pg_partdist.shard_vacuum_max_age 200000000 >/dev/null
 set_guc pg_partdist.shard_xid_stop_age 2146483648 >/dev/null
 check "阈值已复位" "$(PSQL "$WPORT" -Atc "SELECT max_age||'/'||stop_age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)" "200000000/2146483648"
 
 echo "========== [30] 清场 =========="
 set_whitelist ""
-PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5h; DROP TABLE IF EXISTS p5i; DROP TABLE IF EXISTS p5j; DROP TABLE IF EXISTS p5k; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5h; DROP TABLE IF EXISTS p5i; DROP TABLE IF EXISTS p5j; DROP TABLE IF EXISTS p5k; DROP TABLE IF EXISTS p5idx; DROP TABLE IF EXISTS p5hot; DROP TABLE IF EXISTS p5t; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
 check "清场完成" "$?" "0"
 
 health_check_no_crash

@@ -3,6 +3,8 @@
 #
 # 覆盖两件事：
 #   T5.4b-1 —— vacuum 页面动作的跨节点回放（三份记要里挂了三次账的那一项）；
+#   T5.8   —— TOAST 关系（含它的 btree 索引）一并参与，于是索引两阶段发出的
+#              btree vacuum 记录也走这条回放通路；
 #   T5.4b-2 —— 两个 vacuum 水位随 CTRL 记录（复用 FREEZE_UPDATE 通道换语义，
 #              不新增 opcode）到达 follower 并落进它自己的 pg_shard_xid/<oid>。
 #
@@ -119,13 +121,19 @@ CREATE OR REPLACE FUNCTION sclog_wts(oid, bigint, int, bigint) RETURNS void
 SQL
 check "leader 测试函数就绪" "$?" "0"
 
-echo "================ [2] 工作负载：制造三类垃圾（全 leader 直写，值都不进 TOAST）================"
-# ★ 值一律小：TOAST 关系带索引，我们的删元组通路对带索引关系一律 ERROR
-#   （索引两阶段是 T5.3c 的缺口），本轮不把 TOAST 卷进来。
+echo "================ [2] 工作负载：制造三类垃圾（全 leader 直写，含 TOAST）================"
+# ★ T5.8 之后 TOAST 一并参与：每 10 行放一个进 TOAST 的大值（md5 拼的十六进制
+#   串，不好压）。TOAST 关系带 btree 索引，它的清理走的正是索引两阶段，
+#   于是这一轮连 btree 的 vacuum 记录也一起过回放通路。
 PSQL $pport -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
 SET citus.override_table_visibility=false;
-INSERT INTO ${shard_tbl} SELECT g, 'v'||g FROM generate_series(1, 60) g;
+INSERT INTO ${shard_tbl}
+SELECT g, CASE WHEN g % 10 = 0
+       THEN (SELECT string_agg(md5((g*1000+i)::text),'') FROM generate_series(1,200) i)
+       ELSE 'v'||g END
+FROM generate_series(1, 60) g;
 DELETE FROM ${shard_tbl} WHERE id % 7 = 0;
+DELETE FROM ${shard_tbl} WHERE id = 20;
 SQL
 PSQL $pport -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
 SET citus.override_table_visibility=false;
@@ -136,7 +144,14 @@ SET citus.override_table_visibility=false;
 BEGIN; DELETE FROM ${shard_tbl} WHERE id = 1; ROLLBACK;
 SQL
 vis=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" </dev/null | tail -1)
-check "leader 可见 52 行（60 插入 - 8 已提交删除）" "$vis" "52"
+check "leader 可见 51 行（60 插入 - 8 - 1 已提交删除）" "$vis" "51"
+TREL=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT reltoastrelid::regclass::text FROM pg_class WHERE oid=${SOID}" </dev/null | tail -1)
+TOASTN() { PSQL $pport -Atc "SET citus.override_table_visibility=false;
+  SELECT count(*) FROM generate_series(0,(pg_relation_size('$TREL')/8192)::int-1) b,
+    LATERAL heap_page_items(get_raw_page('$TREL',b)) i WHERE i.lp_flags=1" </dev/null | tail -1; }
+tn0=$(TOASTN)
+check "值确实进了 TOAST（chunk 数 > 5）" "$([[ -n "$tn0" && "$tn0" -gt 5 ]] && echo ok)" "ok"
+md5_before=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT md5(string_agg(v,'' ORDER BY id)) FROM ${shard_tbl}" </dev/null | tail -1)
 n_before=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM heap_page_items(get_raw_page('${shard_tbl}',0)) WHERE lp_flags=1" </dev/null | tail -1)
 check "vacuum 前第 0 页有 LP_NORMAL" "$([[ -n "$n_before" && "$n_before" -gt 10 ]] && echo ok)" "ok"
 
@@ -195,13 +210,19 @@ check "算出截断点" "$([[ -n "$TB" && "$TB" -gt 3 ]] && echo ok)" "ok"
 # 照 T5.2/T5.3c 的办法补真时间戳。
 PSQL $pport -Atc "SELECT sclog_wts(${SOID}::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TB-1))) g WHERE sclog_read(${SOID}::oid, g::bigint)=2" </dev/null >/dev/null
 SW=$(PSQL $pport -Atc "SELECT swept||'/'||sanitized||'/'||removed_aborted||'/'||removed_dead||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('${shard_tbl}'::regclass, ${TB}::bigint)" </dev/null | tail -1)
-check "sweep：消毒1 删中止1 删死8 零跳页零推迟" "$SW" "true/1/1/8/0/0"
+check "sweep 干净收尾（零跳页零推迟）" "$(echo "$SW" | cut -d/ -f1,5,6)" "true/0/0"
+check "★ 主堆 + TOAST 一起清：删死元组 > 9" \
+      "$([[ "$(echo "$SW" | cut -d/ -f4)" -gt 9 ]] && echo ok)" "ok"
+check "★ TOAST chunk 被回收（$tn0 → $(TOASTN)）" \
+      "$([[ "$(TOASTN)" -lt "$tn0" ]] && echo ok)" "ok"
+check "★ 活行的 TOAST 值仍能完整取出" \
+      "$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT md5(string_agg(v,'' ORDER BY id)) FROM ${shard_tbl}" </dev/null | tail -1)" "$md5_before"
 NSEG=$(PSQL $pport -Atc "SELECT partdist.shard_clog_truncate(${SOID}::oid, ${TB}::bigint)" </dev/null | tail -1)
 check "截断成功（删段 0，不足一整段）" "$NSEG" "0"
 check "leader 水位推进到 ${TB}/${TB}" \
       "$(PSQL $pport -Atc "SELECT clog_truncate_before||'/'||shard_vacuum_xid FROM partdist.shard_vacuum_watermarks(${SOID}::oid)" </dev/null | tail -1)" "${TB}/${TB}"
-check "vacuum 后 leader 仍可见 52 行" \
-      "$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" </dev/null | tail -1)" "52"
+check "vacuum 后 leader 仍可见 51 行" \
+      "$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" </dev/null | tail -1)" "51"
 n_after=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM heap_page_items(get_raw_page('${shard_tbl}',0)) WHERE lp_flags=1" </dev/null | tail -1)
 check "leader 第 0 页 LP_NORMAL 减少了" "$([[ -n "$n_after" && "$n_after" -lt "$n_before" ]] && echo ok)" "ok"
 
@@ -258,19 +279,17 @@ diff_one_follower() {  # <fport> <标签>
       [[ "$lex" == "y" && "$fex" == "y" ]] || continue
       kind=$(pagecmp_kind "$key" "$fork")
       same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "$lpath" "$fpath" </dev/null 2>/dev/null)
-      if [[ "$key" == "0.0" && -z "$fork" ]]; then
-        # ★ 主堆是本套件的正题：vacuum 的三条记录全落在它上面，必须逐字节相同
+      if [[ -z "$fork" ]]; then
+        # ★ T5.8 起三个 fileset 成员（主堆 / TOAST 堆 / TOAST 索引）都参与了
+        #   本轮 vacuum —— 主堆走 PRUNE+VACUUM，TOAST 堆同样，TOAST 索引走
+        #   index_bulk_delete 发的 btree 记录。三者一律要求逐字节相同。
         check "${tag} ${key}.main pagecmp(${kind}) 逐字节" "$same" "IDENTICAL_OUTSIDE_HOLE"
       else
-        # TOAST 堆与 TOAST 索引：本套件的值一律不进 TOAST（那条关系带索引，
-        # 而删元组通路对带索引关系一律 ERROR —— 索引两阶段是 T5.3c 的缺口），
-        # 所以它们**从未被写过**：空堆报 IDENTICAL_EMPTY、空 btree 元页两侧
-        # 各自本地创建故报 IDENTICAL_EXCEPT_PDLSN。两者都不是分歧，但也不能
-        # 松成"只要含 IDENTICAL 就算过"——列举允许值。
+        # vm fork 没有被本轮触碰过；空/未建都不是分歧，列举允许值
         case "$same" in
           IDENTICAL_OUTSIDE_HOLE|IDENTICAL_EMPTY|IDENTICAL_EXCEPT_PDLSN) same=OK ;;
         esac
-        check "${tag} ${key}${fork:-.main} pagecmp(${kind}) 无分歧（未参与本轮 vacuum）" "$same" "OK"
+        check "${tag} ${key}${fork} pagecmp(${kind}) 无分歧" "$same" "OK"
       fi
       ncmp=$((ncmp+1))
     done

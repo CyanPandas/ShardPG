@@ -13,8 +13,13 @@ DEX() { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" "$@"; }
 PS()  { local p=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$p" -U postgres -d postgres -X "$@"; }
 
 scrub() {   # 净场
-  # ① 宿主机：本脚本之外的测试进程（不杀自己）
-  pkill -f 'tests/test_.*\.sh' 2>/dev/null
+  # ① 宿主机：本脚本之外的测试进程。
+  #    ★ 模式必须锚定成"直接 bash 起来的套件脚本"。松成 'tests/test_.*\.sh'
+  #      会把**调用本脚本的那个外壳**一起打死 —— 它的命令行里往往也带着套件
+  #      路径（实测：`bash tests/test_x.sh; bash tests/run_p5_exit.sh` 这样的
+  #      一行命令，第一次 scrub 就把外壳杀了，退出码 144；runner 自己脱离父
+  #      进程继续跑完，于是"结果还在、外壳没了"，很容易被误读成跑挂了）。
+  pkill -f '^bash .*tests/test_[a-z0-9_]*\.sh$' 2>/dev/null
   # ② 容器内游离 psql 会话
   docker exec "$C" bash -lc "pkill -f 'bin/psql' 2>/dev/null; true" >/dev/null 2>&1
   # ③b raft 组：**必须做两轮**。按 5432→5440 顺序单轮复位时，尚未复位的节点会
