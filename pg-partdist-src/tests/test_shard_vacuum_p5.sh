@@ -18,6 +18,10 @@
 #   [24]-[27] T5.5 —— **两态恢复**。状态一（趟不完整）用"同一 session 里开着
 #           游标 pin 住页面"确定性地造出来（顺带覆盖了 pages_skipped 分支）；
 #           状态二（趟完未截断）用 immediate 崩溃造出来，验恢复只补截断。
+#   [27]-[30] T5.6 —— **回卷护栏两阶段**。阈值做成 GUC 才验得动；重点三条：
+#           龄的基点必须是 clog_truncate_before（状态二窗口里拿 vx 算会偏小）、
+#           阶段 2 是**分片粒度**（另一张龄小的分片表照写不误）、
+#           解锁靠推进截断点而不是靠调阈值。
 #
 # 判据边界（三条都要验，少一条就等于没验）：
 #   - ABORTED 且在截断点以下 ⇒ 清；
@@ -499,9 +503,117 @@ check "重跑不动水位" "$(WM "$OI2")" "$TI/$TI"
 check "重跑后仍可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5i" </dev/null)" "2"
 check "tb == vx 时恢复无事可做" "$(PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_recover($OI2::oid)" </dev/null)" "nothing"
 
-echo "========== [27] 清场 =========="
+# ================================================================
+#  T5.6 —— 分片级回卷护栏两阶段（设计 §7）
+#  龄 = next_xid − clog_truncate_before。★ 基点是 clog_truncate_before 而不是
+#  shard_vacuum_xid：歧义边界挂在免查区的解释规则上，而"趟完未截断"窗口里
+#  shard_vacuum_xid 跑在前面，拿它算龄会把紧迫度算小 —— 方向不安全。
+# ================================================================
+set_guc() {  # set_guc <名> <值>
+  PSQL "$WPORT" -q -c "ALTER SYSTEM SET $1 = $2;" </dev/null >/dev/null
+  PSQL "$WPORT" -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
+  local v="" i
+  for i in $(seq 1 10); do
+    v=$(PSQL "$WPORT" -Atc "SHOW $1" </dev/null); [[ "$v" == "$2" ]] && break; sleep 1
+  done
+  [[ "$v" == "$2" ]]
+}
+AGE()   { PSQL "$WPORT" -Atc "SELECT age FROM partdist.shard_xid_age($1::oid)" </dev/null; }
+PHASE() { PSQL "$WPORT" -Atc "SELECT phase FROM partdist.shard_xid_age($1::oid)" </dev/null; }
+
+echo "========== [27] 龄的定义与基点（★ 必须是 clog_truncate_before）=========="
 set_whitelist ""
-PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5h; DROP TABLE IF EXISTS p5i; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5j; CREATE TABLE p5j(id int, v text) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OJ=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5j'" </dev/null)
+set_whitelist "$OJ"; check "p5j 白名单生效" "$?" "0"
+check "默认阈值：阶段1=2e8 阶段2=2^31-1e6" \
+      "$(PSQL "$WPORT" -Atc "SELECT max_age||'/'||stop_age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)" "200000000/2146483648"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5j SELECT g,'v'||g FROM generate_series(1,20) g;
+DELETE FROM p5j WHERE id=1;
+BEGIN; INSERT INTO p5j VALUES (99,'ghost'); ROLLBACK;
+SQL
+NX=$(PSQL "$WPORT" -Atc "SELECT age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)
+check "未截断时龄 = next_xid（tb=0）" "$([[ -n "$NX" && "$NX" -gt 3 ]] && echo ok)" "ok"
+check "相位 0（远未到龄）" "$(PHASE "$OJ")" "0"
+TJ=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5j',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TJ-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT swept FROM partdist.shard_vacuum_sweep('p5j'::regclass, $TJ::bigint)" </dev/null >/dev/null
+check "现处于状态二（0/$TJ）" "$(WM "$OJ")" "0/$TJ"
+# ★★ 状态二正是"基点选错就出错"的窗口：拿 vx 算龄会算成 next-vx（偏小），
+#    拿 tb 算才是 next-0（偏大＝更紧迫）。断言龄没有因为 sweep 而变小。
+check "★ 状态二下龄未因 sweep 变小（基点是 tb 不是 vx）" "$(AGE "$OJ")" "$NX"
+PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OJ::oid, $TJ::bigint)" </dev/null >/dev/null
+AGE2=$(AGE "$OJ")
+check "截断推进后龄变小" "$([[ -n "$AGE2" && "$AGE2" -lt "$NX" ]] && echo ok)" "ok"
+# ★ 分片 xid 是**每事务一个**，不是每行一个 —— 20 行一条 INSERT 只领 1 个号。
+#   要把龄推上去必须开 20 个事务（heredoc 里每条语句各自提交）。
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
+INSERT INTO p5j VALUES (101,'a1');
+INSERT INTO p5j VALUES (102,'a2');
+INSERT INTO p5j VALUES (103,'a3');
+INSERT INTO p5j VALUES (104,'a4');
+INSERT INTO p5j VALUES (105,'a5');
+INSERT INTO p5j VALUES (106,'a6');
+INSERT INTO p5j VALUES (107,'a7');
+INSERT INTO p5j VALUES (108,'a8');
+INSERT INTO p5j VALUES (109,'a9');
+INSERT INTO p5j VALUES (110,'a10');
+INSERT INTO p5j VALUES (111,'a11');
+INSERT INTO p5j VALUES (112,'a12');
+INSERT INTO p5j VALUES (113,'a13');
+INSERT INTO p5j VALUES (114,'a14');
+INSERT INTO p5j VALUES (115,'a15');
+INSERT INTO p5j VALUES (116,'a16');
+INSERT INTO p5j VALUES (117,'a17');
+INSERT INTO p5j VALUES (118,'a18');
+INSERT INTO p5j VALUES (119,'a19');
+INSERT INTO p5j VALUES (120,'a20');
+SQL
+AGE3=$(AGE "$OJ")
+check "20 个事务后龄回到 20 以上" "$([[ -n "$AGE3" && "$AGE3" -ge 20 ]] && echo ok)" "ok"
+
+echo "========== [28] 阶段 1：到龄 WARNING =========="
+set_guc pg_partdist.shard_vacuum_max_age 2; check "阶段1阈值调到 2" "$?" "0"
+check "相位升为 1" "$(PHASE "$OJ")" "1"
+w=$(PSQL "$WPORT" -c "INSERT INTO p5j VALUES (777,'w')" </dev/null 2>&1 | grep -c "已达 shard_vacuum_max_age")
+check "★ 到龄时发号发 WARNING" "$w" "1"
+check "到龄不拦写入（阶段1只是提醒）" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j WHERE id=777" </dev/null)" "1"
+
+echo "========== [29] 阶段 2：拒发新号，该分片进只读 =========="
+set_guc pg_partdist.shard_xid_stop_age 10; check "阶段2停发线调到 10" "$?" "0"
+check "相位升为 2" "$(PHASE "$OJ")" "2"
+neg "★ 停发线以上拒发新号" "该分片进只读" "INSERT INTO p5j VALUES (888,'x')"
+check "★ 只读：读仍然可以" "$([[ "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j" </dev/null)" -gt 0 ]] && echo ok)" "ok"
+# ★ 护栏是分片粒度：另一张龄还小的分片表照写不误
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5k; CREATE TABLE p5k(id int) WITH (autovacuum_enabled=off);" </dev/null >/dev/null
+OK2=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='p5k'" </dev/null)
+set_whitelist "$OJ,$OK2"; check "p5j+p5k 同时打标" "$?" "0"
+PSQL "$WPORT" -q -c "INSERT INTO p5k VALUES (1);" </dev/null >/dev/null
+check "★ 分片粒度：另一张龄小的分片表照写不误" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5k" </dev/null)" "1"
+# p5k 是新表：next_xid 刚过保留号，龄很小 —— 在 max_age=2 之上（相位 1）
+# 但远在 stop_age=10 之下，所以照写不误。这正是"分片粒度"要说的事。
+check "p5k 未达停发线（相位 1 而非 2）" "$(PHASE "$OK2")" "1"
+# ★ 解锁路径：拒发只是止血，真正的解锁是推进截断点
+# ★ 停发状态下 vacuum 自身必须还能跑 —— 它不领分片 xid，否则就死锁了：
+#   要解锁得推进截断点，而推进截断点又被停发挡住。
+TJ2=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5j',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TJ2-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
+SWZ=$(PSQL "$WPORT" -Atc "SELECT swept FROM partdist.shard_vacuum_sweep('p5j'::regclass, $TJ2::bigint)" </dev/null)
+# 裸列输出布尔是 t（而 ||'/' 拼接走 boolean→text 输出函数、给的是 true）
+check "★ 停发状态下 vacuum 自身仍可运行（它不领分片 xid）" "$SWZ" "t"
+PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OJ::oid, $TJ2::bigint)" </dev/null >/dev/null
+check "★ 推进截断点后相位降回 0" "$(PHASE "$OJ")" "0"
+PSQL "$WPORT" -q -c "INSERT INTO p5j VALUES (999,'unlocked');" </dev/null >/dev/null
+check "★ 解锁后写入恢复" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j WHERE id=999" </dev/null)" "1"
+check "负向计数守卫（累计应跑 11 条）" "$NEG_RUN" "11"
+set_guc pg_partdist.shard_vacuum_max_age 200000000 >/dev/null
+set_guc pg_partdist.shard_xid_stop_age 2146483648 >/dev/null
+check "阈值已复位" "$(PSQL "$WPORT" -Atc "SELECT max_age||'/'||stop_age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)" "200000000/2146483648"
+
+echo "========== [30] 清场 =========="
+set_whitelist ""
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5b; DROP TABLE IF EXISTS p5c; DROP TABLE IF EXISTS p5d; DROP TABLE IF EXISTS p5e; DROP TABLE IF EXISTS p5f; DROP TABLE IF EXISTS p5g; DROP TABLE IF EXISTS p5h; DROP TABLE IF EXISTS p5i; DROP TABLE IF EXISTS p5j; DROP TABLE IF EXISTS p5k; DROP TABLE IF EXISTS p5idx; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null
 check "清场完成" "$?" "0"
 
 health_check_no_crash

@@ -41,6 +41,10 @@
  */
 #define SHARD_XID_HARD_LIMIT	((TransactionId) 0xFFFF0000)
 
+/* T5.6：回卷护栏两阶段的阈值（设计 §7），GUC 可调 —— 验收要把它们调小 */
+static int	shard_vacuum_max_age = 200000000;
+static int	shard_xid_stop_age = 2146483648;
+
 /* ---- T1.1：GUC 白名单 ---- */
 
 /*
@@ -59,11 +63,30 @@ static ShardRelidsCfg *shard_relids_cfg = NULL; /* 当前生效的解析结果 *
 /* ---- T1.2：共享内存发号器 ---- */
 
 /*
- * T5.1：水位合理性上限。分片 xid 稠密连续分配，正常运行中远达不到 2^30；
- * 取它作阈值既留足余量，又能拦住绝大多数损坏形态（含把 ASCII 文本当整数
- * 读出来的情况 —— 实测 '\\x' 序列被读成 858814556，正落在该区间之上）。
+ * 水位合理性上限。
+ *
+ * ★【2026-08-21 T5.6 更正，两处】
+ *
+ * 其一：**原注释里的举证是错的**。它说"实测 '\\x' 序列被读成 858814556，
+ * 正落在该区间之上"—— 而 858814556 < 2^30 = 1073741824，这道守卫**拦不住
+ * 它自己引用的那个值**。绝对阈值天生分不清"损坏值 8.6 亿"和"真跑了 8.6 亿
+ * 笔事务的分片"，这是它的固有局限，不是参数没调好。
+ *
+ * 其二：**原来的 2^30 会抢在回卷护栏前面触发**。设计 §7 的阶段 2 停发线是
+ * 2^31 − 边距；一个正常运转到那个量级的分片，重启读水位时会先撞上 2^30 的
+ * "文件损坏"报错 —— 一条完全误导的错误信息。阈值因此上抬到 2^31，让
+ * **T5.6 的分片级停发护栏先说话**（它给的信息才是对的：该分片进只读、
+ * 去解决前缀阻挡者）。
+ *
+ * 保留这道检查的意义收窄为：越过停发线还能读到的水位，要么文件损坏、
+ * 要么护栏本身失效 —— 两种都必须 fail-closed。
+ *
+ * 顺带记下一条**不能加**的检查：`vacuum_xid <= alloc_wm` 看着是个真不变式
+ * （不可能清理到从未发出过的号），但 T5.4b-2 起 **follower 侧的水位文件正是
+ * alloc_wm=0 而 trunc_before/vacuum_xid 非 0**（水位由 CTRL 复制过来、发号
+ * 从未在本节点发生），加上去会把每个 follower 判成损坏。
  */
-#define SHARD_XID_SANITY_MAX	((TransactionId) 0x40000000)
+#define SHARD_XID_SANITY_MAX	((TransactionId) 0x80000000)
 
 typedef struct ShardXidSlot
 {
@@ -795,6 +818,80 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
  * 且分配频率是"每事务每分片"而不是每元组 —— T1.3 的映射缓存住了）。
  * 任何 ERROR 都发生在槽位状态推进之前，fail-closed。
  */
+/* ================= T5.6：分片级回卷护栏两阶段（设计 §7）================= */
+
+/*
+ * 分片 xid 龄。
+ *
+ * ★ 基点必须是 clog_truncate_before，**不是** shard_vacuum_xid（设计 §7 原文）：
+ *   歧义边界挂在免查隐式冻结区的解释规则上，而那条规则读的正是
+ *   clog_truncate_before；「趟完未截断」的窗口里 shard_vacuum_xid 跑在前面，
+ *   拿它算龄会把紧迫度算**小** —— 方向不安全。平时两者相等。
+ */
+static TransactionId
+shard_xid_age_locked(const ShardXidSlot *slot)
+{
+	if (slot->next_xid <= slot->trunc_before)
+		return 0;
+	return slot->next_xid - slot->trunc_before;
+}
+
+/* 阶段 1 的 WARNING 每个后端每分片只发一次（持续状态，逐次发号刷屏无意义） */
+static Oid	warned_shards[SHARD_XID_MAX_SLOTS];
+static int	warned_shards_n = 0;
+
+static bool
+shard_xid_warn_once(Oid shard)
+{
+	int			i;
+
+	for (i = 0; i < warned_shards_n; i++)
+		if (warned_shards[i] == shard)
+			return false;
+	if (warned_shards_n < SHARD_XID_MAX_SLOTS)
+		warned_shards[warned_shards_n++] = shard;
+	return true;
+}
+
+/*
+ * 发号前的两阶段护栏。须持 ShardXidCtl->lock 调用。
+ *
+ * 阶段 2 走 ERROR：**该分片进只读**，护栏是分片粒度，不殃及节点与集群
+ * （这正是分片级 clog 相对原生全局 clog 的好处）。
+ *
+ * 实话两条（设计 §7 原文，写进错误信息里，因为这是操作者当场要知道的）：
+ *   - 拒发只是止血，**解锁必须解决前缀阻挡者** —— 超龄 RUNNING 事务按策略
+ *     强杀，而 **PREPARED 未决绝不允许单方中止**，只能走协调组决议；
+ *   - GlobalSafeTs 被钉死会间接钉死 vacuum，告警体系须把「最老快照的龄」
+ *     一并纳入监控。
+ */
+static void
+shard_xid_wraparound_gate(Oid shard, const ShardXidSlot *slot)
+{
+	TransactionId age = shard_xid_age_locked(slot);
+
+	if (age >= (TransactionId) shard_xid_stop_age)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("分片 %u 的 xid 龄 %u 达到停发线 %d，该分片进只读",
+						shard, age, shard_xid_stop_age),
+				 errdetail("龄 = next_xid(%u) - clog_truncate_before(%u)。"
+						   "护栏是分片粒度，本节点与集群的其它分片不受影响。",
+						   slot->next_xid, slot->trunc_before),
+				 errhint("拒发只是止血：解锁必须让 clog 截断点推进 —— 先用 "
+						 "partdist.shard_vacuum_target() 查前缀阻挡者。"
+						 "超龄 RUNNING 可按策略强杀；PREPARED 未决绝不允许"
+						 "单方中止，只能走协调组决议。")));
+
+	if (age >= (TransactionId) shard_vacuum_max_age && shard_xid_warn_once(shard))
+		ereport(WARNING,
+				(errmsg("分片 %u 的 xid 龄 %u 已达 shard_vacuum_max_age %d",
+						shard, age, shard_vacuum_max_age),
+				 errdetail("停发线是 %d。", shard_xid_stop_age),
+				 errhint("尽快跑 partdist.shard_vacuum_sweep() + "
+						 "partdist.shard_clog_truncate() 推进截断点。")));
+}
+
 static TransactionId
 shard_xid_allocate(Oid shard)
 {
@@ -809,6 +906,8 @@ shard_xid_allocate(Oid shard)
 	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
 
 	slot = shard_xid_slot_attach(shard, NULL);
+
+	shard_xid_wraparound_gate(shard, slot);
 
 	for (;;)
 	{
@@ -1077,6 +1176,29 @@ ShardXidDefineGUCs(void)
 		check_shard_relids,
 		assign_shard_relids,
 		NULL);
+
+	/* ---- T5.6：分片级回卷护栏两阶段（设计 §7）---- */
+	DefineCustomIntVariable(
+		"pg_partdist.shard_vacuum_max_age",
+		"阶段 1：分片 xid 龄达到此值即到龄，须尽快跑分片 vacuum。",
+		"分片版的 autovacuum_freeze_max_age。龄 = next_xid - clog_truncate_before。"
+		"到龄本身只发 WARNING —— 自动启动器尚未实现（见 DEV PLAN T5.6 记要）。",
+		&shard_vacuum_max_age,
+		200000000,
+		1, INT_MAX,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.shard_xid_stop_age",
+		"阶段 2：分片 xid 龄达到此值即拒发新号，该分片进只读。",
+		"分片版的 xidStopLimit。默认 2^31 − 10^6（设计 §7）。护栏是分片粒度，"
+		"不殃及节点与集群。拒发只是止血 —— 解锁必须解决前缀阻挡者。",
+		&shard_xid_stop_age,
+		2146483648,
+		1, INT_MAX,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
 }
 
 void
@@ -1585,4 +1707,34 @@ partdist_set_shard_mvcc(PG_FUNCTION_ARGS)
 	ShardMvccSetAdd(relid);
 
 	PG_RETURN_VOID();
+}
+
+/* ---- T5.6 观测点：分片 xid 龄与护栏相位 ---- */
+PG_FUNCTION_INFO_V1(partdist_shard_xid_age);
+Datum
+partdist_shard_xid_age(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId next = ShardXidNextToIssue(shard);
+	TransactionId tb;
+	TransactionId age;
+	int			phase;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	ShardVacuumGetWatermarks(shard, &tb, NULL);
+	age = (next <= tb) ? 0 : next - tb;
+	phase = (age >= (TransactionId) shard_xid_stop_age) ? 2
+		: (age >= (TransactionId) shard_vacuum_max_age) ? 1 : 0;
+
+	values[0] = Int64GetDatum((int64) age);
+	values[1] = Int32GetDatum(phase);
+	values[2] = Int64GetDatum((int64) shard_vacuum_max_age);
+	values[3] = Int64GetDatum((int64) shard_xid_stop_age);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

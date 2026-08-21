@@ -633,6 +633,23 @@ RETURNS TEXT LANGUAGE c STRICT VOLATILE
 COMMENT ON FUNCTION shard_vacuum_recover(OID) IS
     'T5.5：分片 vacuum 的两态恢复（设计 §6.5）。两个水位相等=无未完成的趟（什么都不做）；shard_vacuum_xid 跑在前面=趟完未截断（只补做截断）。幂等：连做两次第二次必回 nothing。';
 
+-- T5.6（设计 §7）：分片级回卷护栏的观测点。
+-- 龄 = next_xid - clog_truncate_before。★ 基点是 clog_truncate_before 而**不是**
+-- shard_vacuum_xid：歧义边界挂在免查区的解释规则上，而"趟完未截断"窗口里
+-- shard_vacuum_xid 跑在前面，拿它算龄会把紧迫度算小，方向不安全。
+-- phase 0=正常 / 1=到龄（须尽快 vacuum）/ 2=已停发（该分片进只读）。
+CREATE OR REPLACE FUNCTION shard_xid_age(
+    p_shard OID,
+    OUT age BIGINT,
+    OUT phase INTEGER,
+    OUT max_age BIGINT,
+    OUT stop_age BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_age';
+
+COMMENT ON FUNCTION shard_xid_age(OID) IS
+    'T5.6：分片 xid 龄与回卷护栏相位（设计 §7）。阈值由 pg_partdist.shard_vacuum_max_age（阶段1，默认 2e8）与 pg_partdist.shard_xid_stop_age（阶段2，默认 2^31-1e6）控制；阶段 2 触发后该分片拒发新号、进只读，护栏是分片粒度不殃及节点与集群。';
+
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
     LANGUAGE c STRICT STABLE
