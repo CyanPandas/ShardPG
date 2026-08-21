@@ -1987,7 +1987,8 @@ ReadStatus|ReadSlot|ClaimRange|RememberDrop`），**没有截断**。
 | **T5.3b** ✅ | **① 删中止 xmin 的元组**（不做⇒截断后**幽灵行复活**）—— **已完成（2026-08-21）** | 见下方实施记要 |
 | **T5.3c** ⚠️ | **② 删 `xmax` 已提交的死元组**（**判据看 xmax 不看 xmin**）—— **无索引通路已完成（2026-08-21）**，套件合计 **83/0**；**索引两阶段未做**（P1 禁索引，当前不可达也不可测，缺口见记要） | 见下方实施记要 |
 | **T5.4a** ✅ | **截断 + 顺序铁律 + 免查隐式冻结区** —— **已完成（2026-08-21）**，套件合计 **115/0** | 见下方实施记要 |
-| **T5.4b** | §6.7 两水位的 CTRL 记录复制 + follower 跨节点回放实测（需复制分片夹具） | 三次记要重复挂账的那一项 |
+| **T5.4b-1** ✅ | **follower 跨节点回放实测** —— **已完成（2026-08-21）**，新套件 `test_shard_vacuum_replay_p5.sh` **43/0**；三次记要重复挂账的那一项就此关闭 | 见下方实施记要 |
+| **T5.4b-2** | §6.7 两水位的 CTRL 记录复制（复用 `FREEZE_UPDATE` 通道） | 切主后新主的截断点与老主一致 |
 | **T5.5** | 两态恢复：趟中崩溃整趟重来（幂等）；趟完未截断只补截断 | §6.5 两态恢复 |
 | **T5.6** | 回卷护栏两阶段：基点取 `clog_truncate_before`（非 `ShardVacuumXid` —— 后者在"趟完未截断"崩溃窗口跑在前面，算出的龄偏小、**方向不安全**）；阶段 1 到龄强制启动、**无视常规 vacuum 开关**；阶段 2 达 2³¹−边距时**该分片进只读**（分片粒度，不殃及节点/集群） | age 护栏触发。硬约束：超龄 RUNNING 可按策略强杀，**PREPARED 未决绝不允许单方中止**，只能走协调组决议 |
 | **T5.7** | 出口回归 | 本环境 7 套件 + P5 新套件零新增 FAIL |
@@ -2699,6 +2700,79 @@ T5.3a/b/c 的记要里连着三次写"端到端陷阱构造不出来，因为免
 `test_shard_clog_p2` 复跑 **64/0**（基线值）。这一轮特别值得跑它：免查区
 解释规则加在 `shard_xid_state()` 这条**热读路径**上，而该套件的可见性断言
 最密集。
+
+#### T5.4b-1 实施记要（2026-08-21，新套件 `test_shard_vacuum_replay_p5.sh` **43/0**）
+
+**这是 T5.3a / T5.3b / T5.3c 三份记要里连着挂了三次账的那一项。** §6.7 要求
+vacuum 只在 leader 执行、其页面修改随 pg_parwal 流被 follower 逐字节回放；
+前面三个任务只验到"leader 的 WAL 里确有内核标准的 `FREEZE_PAGE` / `PRUNE` /
+`VACUUM` 记录"，跨节点这一半一直没验。
+
+**夹具**照抄 `test_shard_pagecmp_p1.sh` 阶段 2 的配方（1 分片分布表 + raft 组
++ 两个 follower 壳表 + locmap + 白名单打标），把工作负载换成"制造三类垃圾 →
+`shard_vacuum_sweep` → `shard_clog_truncate`"。
+
+##### ★ 一条防假通过的断言：follower 的文件必须真的变了
+
+**只比对"leader == follower"是不够的** —— 若 vacuum 记录压根没进流，两边都
+停在 vacuum 之前的状态，比对照样报 IDENTICAL。所以先取 vacuum 前后 follower
+主堆文件的 md5，**断言它变了**，再做逐字节比对。
+
+##### 结果
+
+| 断言 | 结果 |
+|---|---|
+| sweep 在复制分片上：消毒 1、删中止 1、删死 8、零跳页零推迟 | PASS |
+| vacuum 产生了新的 parwal 记录（plsn 从 71 推进到 75） | PASS |
+| 两个 follower 都追平 | PASS |
+| **★ 两个 follower 的主堆文件确实变了** | PASS |
+| **★ 主堆 leader vs follower1 / follower2 逐字节 `IDENTICAL_OUTSIDE_HOLE`** | PASS |
+| leader 侧 vacuum 后仍可见 52 行、页上 LP_NORMAL 减少 | PASS |
+
+⇒ **`FREEZE_PAGE` / `PRUNE` / `VACUUM` 三条记录跨节点回放逐字节一致**，
+T5.3a/b/c 的"策略在扩展、页面变换与 WAL 由内核发"这条路线到此闭环。
+连跑 2 轮 43/0。
+
+##### ★ 途中查明的一件事：分片表的 TOAST 空间**永远回收不了**，且与索引两阶段是同一个缺口
+
+写夹具时才意识到需要确认：分片表的 TOAST 元组带的是**分片 xid 还是原生 xid**。
+查明是**分片 xid** —— `ShardXidRelidLookup()` 对 `RELKIND_TOASTVALUE` 按
+`pg_toast_<owner>` 命名解出属主，属主在白名单里就返回属主的 shard oid，
+所以 TOAST 元组同样被打标。于是：
+
+- TOAST 关系里同样会积累三类垃圾（`heap_delete` 会顺带给 TOAST 元组盖 xmax）；
+- 而 TOAST 关系**天生带一个 btree 索引**，撞上 T5.3c 那道"带索引即 ERROR"；
+- ⇒ **分片表的 TOAST 空间在当前实现下永远不会被回收。**
+
+不构成正确性问题（TOAST 读走 `SnapshotToast`，`HeapTupleSatisfiesToast` 根本
+不查 clog、不分叉，0006 已论证过），但是实打实的**空间泄漏**。
+
+**这条把 T5.3c 的索引两阶段缺口从"理论上够不到"变成"实际拦住了一件必须做的
+事"** —— 之前的判断是"P1 禁索引 ⇒ 索引两阶段不可达也不可测"，现在多了一个
+可达且必须的用例：TOAST。P5 出口前的那个问题因此更尖锐了：要么补上索引两阶段
+（TOAST 用得上，且它的索引是内核自建、不受 `CREATE INDEX` 禁令影响），
+要么明确接受"分片表 TOAST 空间不回收"。**本套件为规避它，工作负载的值一律
+不进 TOAST。**
+
+##### 验收脚本踩到的三个坑
+
+- **`partition_lsn` 是分区流内的逻辑位置（记录序），不是字节 LSN。** 本夹具
+  的写入量下实测只有 70 上下，照抄 pagecmp 的 `> 100` 会误报"取不到值"。
+- **空 TOAST 关系的比对结果不是 `IDENTICAL_OUTSIDE_HOLE`**：空堆报
+  `IDENTICAL_EMPTY`、空 btree 元页两侧各自本地创建故报
+  `IDENTICAL_EXCEPT_PDLSN`。两者都不是分歧，但**没有松成"含 IDENTICAL 就算
+  过"**，而是按 role 分开：主堆（本套件的正题）必须严格逐字节，未参与本轮
+  vacuum 的 TOAST 关系列举允许值。
+- **`wait_caught_up` 收到空 target 时，`-ge ""` 是语法错误，断言会变成假通过。**
+  加了空值 fail-fast（这正是上一条 plsn 取值失败暴露出来的连带风险）。
+
+##### 未覆盖
+
+- **CTRL 水位复制仍未做**（T5.4b-2）：follower 侧目前**没有**
+  `clog_truncate_before`，免查区只在 leader 上生效。切主后新主从自己的水位
+  文件读（本地持久，T5.1 已验），但它与老主的水位是否一致**尚无协议保证**。
+- 本套件不做切主，也不做崩溃注入 —— 只验"正常路径下 vacuum 记录跨节点逐字节
+  一致"这一件事。
 
 ---
 
