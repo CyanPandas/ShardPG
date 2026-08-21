@@ -195,17 +195,43 @@ PartWALRecordGxid(const PartWALRecord *rec)
  * data_len == sizeof(TxnMarkerPayload) + nsubxacts * sizeof(TransactionId)
  *          == 24 + 4 * nsubxacts
  */
+/*
+ * U-P5-1（设计 §5.3）：标记额外携带**本分区的分片 xid**，好让 follower 把
+ * 分片 clog 也由流重建 —— 设计原文「落账顺序锁定在分片流的 plsn 序上 ⇒
+ * 每个副本重放同一个流得到同一本账」。在此之前 follower 只写增强型 clog
+ * （按 gxid 索引），`pg_shard_clog/<oid>` 在它上面根本不存在，于是升主后
+ * 每个分片 xid 都读成空洞＝RUNNING＝不可见。
+ *
+ * 兼容做法与 FREEZE_UPDATE 同款：把原来那个「显式补齐、恒为 0」的
+ * `reserved` 改作 `flags`。**不含分片写的事务不置位**，载荷字节与既有格式
+ * 逐字节相同（R1/R2/TX1 时代的流继续有效）。
+ *
+ * 只带**一个** xid 而不是 (shard, xid) 对列表：MARKER 是**逐分区**追加的，
+ * 而一个分区就是一个分片 —— follower 用自己的本地分片 oid（ctx->shard_oid）
+ * 落账即可，不需要跨节点翻译 leader 的 oid。0 = 本分区没有分片写。
+ */
+#define PARTWAL_MARKER_HAS_SHARD_XID    UINT32_C(0x0001)
+
 typedef struct TxnMarkerPayload
 {
     uint64      start_ts;       /* 事务启动时间戳（TSO 就位前取本地 TimestampTz）*/
     uint64      commit_ts;      /* 提交时间戳；ABORT 标记中为 0                  */
     uint32      nsubxacts;      /* 已提交子事务数；无 SAVEPOINT 时为 0           */
-    uint32      reserved;       /* 显式补齐，恒为 0                              */
+    uint32      flags;          /* 原 reserved；旧记录恒 0                       */
     /* TransactionId subxacts[nsubxacts] 紧随其后（leader 侧本地 xid） */
+    /* flags & PARTWAL_MARKER_HAS_SHARD_XID 时，其后再跟一个 uint32 分片 xid */
 } TxnMarkerPayload;
 
 #define TxnMarkerPayloadSize(nsub) \
     (sizeof(TxnMarkerPayload) + (size_t) (nsub) * sizeof(TransactionId))
+
+#define TxnMarkerPayloadSizeEx(nsub, has_sx) \
+    (TxnMarkerPayloadSize(nsub) + ((has_sx) ? sizeof(uint32) : 0))
+
+/* 分片 xid 的位置：紧跟在 subxacts[nsubxacts] 之后 */
+#define TxnMarkerShardXidPtr(m) \
+    ((uint32 *) ((char *) (m) + TxnMarkerPayloadSize(((const TxnMarkerPayload *) (m))->nsubxacts)))
+
 
 #define TxnMarkerSubxacts(m) \
     ((TransactionId *) ((char *) (m) + sizeof(TxnMarkerPayload)))

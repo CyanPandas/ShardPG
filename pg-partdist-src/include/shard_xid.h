@@ -53,6 +53,9 @@ extern Oid	ShardXidRelidLookup(Relation relation);
 extern Oid	ShardXidLookupByOid(Oid reloid);
 
 /* 本事务在该分片已领的 xid；未领返回 InvalidTransactionId（自见性判定用） */
+/* U-P5-1：本事务已绑定的分片数（0 = 没碰过分片打标表） */
+extern int	ShardXidXactCount(void);
+
 extern TransactionId ShardXidMineForShard(Oid shard);
 
 /* T2.4：确保该分片本次启动已完成无主 RUNNING 认领（槽位存在=已认领）。

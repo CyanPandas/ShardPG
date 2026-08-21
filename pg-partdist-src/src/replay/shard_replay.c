@@ -29,6 +29,8 @@
 #include "partition_wal_header.h"
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
+#include "shard_clog.h"	/* U-P5-1：分片 clog 由流重建 */
+#include "shard_xid.h"
 
 #include "utils/pg_crc.h"        /* R-P4-20：redo 前校验记录 CRC */
 #include "access/clog.h"            /* ExtendCLOG（§13 约束 4） */
@@ -965,6 +967,8 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
     uint16               origin;
     uint8                op;
     uint32               i;
+    bool                 has_sx = false;
+    TransactionId        sxid = InvalidTransactionId;
 
     if (hdr->version < PARTWAL_RECORD_VERSION_3)
         ereport(ERROR,
@@ -974,15 +978,32 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                         (unsigned long long) hdr->partition_lsn,
                         hdr->version)));
 
-    if (hdr->data_len < sizeof(TxnMarkerPayload) ||
-        hdr->data_len != (uint32) TxnMarkerPayloadSize(m->nsubxacts))
+    if (hdr->data_len < sizeof(TxnMarkerPayload))
         ereport(ERROR,
-                (errmsg("shard replay: shard %u @plsn %llu MARKER 载荷长度不符"
-                        "（data_len=%u，nsubxacts=%u 需要 %zu）",
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 载荷过短 (%u)",
                         ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn,
-                        hdr->data_len, m->nsubxacts,
-                        TxnMarkerPayloadSize(m->nsubxacts))));
+                        hdr->data_len)));
+
+    if (m->flags & ~PARTWAL_MARKER_HAS_SHARD_XID)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 出现未知 flags "
+                        "0x%08X —— 拒绝按旧语义蒙混过去", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn, m->flags)));
+
+    has_sx = (m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0;
+
+    if (hdr->data_len != (uint32) TxnMarkerPayloadSizeEx(m->nsubxacts, has_sx))
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu MARKER 载荷长度不符"
+                        "（data_len=%u，nsubxacts=%u flags=0x%08X 需要 %zu）",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len, m->nsubxacts, m->flags,
+                        TxnMarkerPayloadSizeEx(m->nsubxacts, has_sx))));
+
+    if (has_sx)
+        sxid = (TransactionId) *TxnMarkerShardXidPtr(m);
 
     origin   = GxidNodeId(gxid);
     op       = hdr->info & XLOG_XACT_OPMASK;
@@ -1026,6 +1047,38 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
      * （§8.4 推进协议第 2 步）。重放同一条 MARKER 会算出同样的槽内容，
      * 幂等，崩溃恢复正是靠这一点。
      */
+    /*
+     * ★ U-P5-1（设计 §5.3）：分片 clog 也由流重建。
+     *
+     * 在此之前 follower 只写增强型 clog（按 gxid 索引），
+     * `pg_shard_clog/<oid>` 在它上面根本不存在 —— 升主之后每个分片 xid 都
+     * 读成空洞＝RUNNING＝不可见，整张表看不见。设计 §5.3 要的正是
+     * 「每个副本重放同一个流得到同一本账」。
+     *
+     * 分片 oid 用**本地的** ctx->shard_oid：MARKER 逐分区追加，一个分区就是
+     * 一个分片，载荷里只带 xid 不带 oid，因此不需要跨节点翻译。
+     *
+     * 顺带推进影子发号水位（ShardXidRedoAdvance）：升主后发号器建槽时取
+     * `Max(文件 alloc_wm, 影子)`，这一步让新主不至于从 3 号重发。
+     * **注意这只是本次启动内的内存影子**，跨重启的持久交接仍是缺口
+     * （见 DEV PLAN U-P5-1 记要"未做的一半"）。
+     */
+    if (TransactionIdIsNormal(sxid))
+    {
+        ShardXidRedoAdvance(ctx->shard_oid, sxid);
+
+        if (op == XLOG_XACT_COMMIT)
+            ShardClogSetVerdict(ctx->shard_oid, sxid, true, (int64) m->commit_ts);
+        else if (op == XLOG_XACT_ABORT)
+            ShardClogSetVerdict(ctx->shard_oid, sxid, false, 0);
+        else                    /* XLOG_XACT_PREPARE */
+            ShardClogSetPrepared(ctx->shard_oid, sxid, (int64) m->start_ts,
+                                 (int64) gxid);
+
+        REPLAY_TRACE("TRACE marker: shard clog 落账 shard=%u sxid=%u op=0x%02X",
+                     ctx->shard_oid, sxid, op);
+    }
+
     if (op == XLOG_XACT_COMMIT)
     {
         EnhancedClogWriteStatus(gxid, m->start_ts, m->commit_ts, TXN_COMMITTED);

@@ -40,6 +40,7 @@
 #include "partition_wal_writer.h"
 #include "demux_worker.h"
 #include "shard_fileset.h"
+#include "shard_xid.h"		/* U-P5-1：MARKER 携带分片 xid */
 
 #include "access/heapam_xlog.h"
 #include "access/rmgr.h"
@@ -704,6 +705,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     int             nchildren;
     char           *buf;
     TxnMarkerPayload *m;
+    bool            has_shard_xid;
 
     /*
      * 已提交子事务清单。中止的子事务**不在**这个列表里 —— 于是它们的 gxid
@@ -714,21 +716,46 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     if (nchildren < 0)
         nchildren = 0;
 
-    *out_len = (uint32) TxnMarkerPayloadSize(nchildren);
-    buf = palloc0(*out_len);        /* palloc0：reserved 与尾部必须是确定字节 */
+    /*
+     * U-P5-1：本事务碰过分片打标表就带上分片 xid 尾（值留 0 占位，由
+     * PartWALMarkerSetShardXid 逐分区回填）。**没碰过就不置位** —— 载荷
+     * 字节与既有格式逐字节相同，R1/R2/TX1 时代的流与套件不受影响。
+     */
+    has_shard_xid = (ShardXidXactCount() > 0);
+
+    *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, has_shard_xid);
+    buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
 
     m = (TxnMarkerPayload *) buf;
     m->start_ts  = (uint64) GetCurrentTransactionStartTimestamp();
     m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
                                   : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
-    m->reserved  = 0;
+    m->flags     = has_shard_xid ? PARTWAL_MARKER_HAS_SHARD_XID : 0;
 
     if (nchildren > 0)
         memcpy(TxnMarkerSubxacts(m), children,
                (size_t) nchildren * sizeof(TransactionId));
 
     return buf;
+}
+
+/*
+ * U-P5-1：把某个分区对应的分片 xid 回填进已组装好的载荷。
+ *
+ * 纯内存写、不 palloc、不取锁 —— 因此可以在 PartWALCtl->lock 之下、逐分区
+ * 的循环里调用（载荷本身必须在加锁前组装，见 PartWALBuildMarkerPayload 上方
+ * 的注释）。本分区没有分片写时写 0，follower 见 0 即跳过。
+ */
+static void
+PartWALMarkerSetShardXid(char *payload, Oid partition_id)
+{
+    TxnMarkerPayload *m = (TxnMarkerPayload *) payload;
+
+    if (payload == NULL || !(m->flags & PARTWAL_MARKER_HAS_SHARD_XID))
+        return;
+
+    *TxnMarkerShardXidPtr(m) = (uint32) ShardXidMineForShard(partition_id);
 }
 
 static char *
@@ -783,6 +810,13 @@ PartWALAppendMarkerFor(Oid partition_id, TransactionId xid, uint8 op,
                        const char *payload, uint32 payload_len)
 {
     PartitionWALWriter *w;
+
+    /*
+     * U-P5-1：2PC 的 PREPARE/COMMIT/ABORT 标记同样带上本分区的分片 xid。
+     * 本函数逐分区调用，回填在这里做最自然。载荷由调用方 palloc，
+     * 回填是就地写 —— 与单机路径同一条纪律。
+     */
+    PartWALMarkerSetShardXid((char *) payload, partition_id);
 
     if (!TransactionIdIsValid(xid))
         return;                 /* 无 xid 可标记：无账可记 */
@@ -1282,6 +1316,7 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
                     ereport(ERROR,
                             (errmsg("pg_partdist: 无法为分区 %u 打开 writer "
                                     "写提交标记", partwal_my_touched[t])));
+                PartWALMarkerSetShardXid(marker_payload, partwal_my_touched[t]);
                 PartWALAppendTxnMarker(w, marker_lsn, my_xid, true,
                                        marker_payload, marker_len);
                 DestroyPartitionWALWriter(w);   /* flush + fsync */
@@ -1395,6 +1430,7 @@ PartWALAbort(void)
                                              InvalidRelFileNumber);
                 if (w == NULL)
                     continue;
+                PartWALMarkerSetShardXid(payload, partwal_my_touched[t]);
                 PartWALAppendTxnMarker(w, my_max, my_xid, false,
                                        payload, payload_len);
                 DestroyPartitionWALWriter(w);   /* flush + fsync */

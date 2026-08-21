@@ -3370,13 +3370,106 @@ V4 的"P5 出口再评估"要求至此完成：**结论维持禁用**，理由�
 §10 那条里"裁决会查原生 clog"与"fileset 重绑"两个论点标注为已过时/已解决。
 CIC 仍随索引专项（与 T5.8 记的 LP_REDIRECT 是同一件事）。
 
+### 3.7 U-P5-1：分片 clog 由流重建（2026-08-21，P6 前置）
+
+设计 §5.3 明写「落账顺序锁定在分片流的 plsn 序上 ⇒ **每个副本重放同一个流得到
+同一本账**（确定性、副本一致）」。T5.4b-2 途中查明实测不是这样：follower 回放
+`TXN_MARKER` 时写的是**增强型 clog（按 gxid 索引）**，而 `pg_shard_clog/<oid>`
+在它上面**根本不存在**。后果是升主后每个分片 xid 都读成空洞＝RUNNING＝不可见，
+**整张表看不见**。本任务补上这一半。
+
+##### 记录格式：MARKER 带上本分区的分片 xid
+
+沿用 FREEZE_UPDATE 那套兼容做法：把 `TxnMarkerPayload` 里「显式补齐、恒为 0」的
+`reserved` 改作 `flags`，置 `PARTWAL_MARKER_HAS_SHARD_XID` 时在 `subxacts[]` 之后
+追加一个 `uint32` 分片 xid。
+
+两处刻意的选择：
+
+- **只带一个 xid，不带 (shard, xid) 对列表。** MARKER 是**逐分区**追加的，
+  而一个分区就是一个分片 —— follower 用自己的本地分片 oid（`ctx->shard_oid`）
+  落账即可，**不需要跨节点翻译 leader 的 oid**。这一条把整件事从"要建一张
+  跨节点 oid 映射表"缩成"多带 4 个字节"。
+- **不含分片写的事务不置位。** `ShardXidXactCount() == 0` 时载荷与既有格式
+  **逐字节相同** —— R1/R2/TX1 时代的流与套件不受影响。
+
+载荷仍在取 `PartWALCtl->lock` **之前**组装（既有纪律：`xactGetCommittedChildren`
+/ palloc 不能在 LWLock 下做），逐分区的那个值由
+`PartWALMarkerSetShardXid()` 在循环里**就地回填** —— 纯内存写、不 palloc、
+不取锁。2PC 的 `PartWALAppendMarkerFor()` 本就逐分区调用，回填放在函数入口。
+
+##### 应用端
+
+`ApplyMarkerRecord()` 解析出 xid 后：COMMIT ⇒ `ShardClogSetVerdict(..., true,
+commit_ts)`；ABORT ⇒ `..., false, 0`；PREPARE ⇒ `ShardClogSetPrepared(...)`。
+顺带 `ShardXidRedoAdvance()` 推进本次启动内的影子发号水位。
+
+##### ★ 实测撞出的一件事：中止事务不一定有账
+
+第一版断言写的是"follower 与 leader 的 clog 逐条相等"，实测
+`2,2,2,3,3,...` vs `2,2,2,0,0,...` —— **COMMITTED 全到了，两条 ABORTED 没到**。
+
+查明**不是缺陷，是 `PartWALAbort` 的既有设计**：中止事务若其 DATA 字节尚未入流，
+parwal 会丢弃本后端的槽位、也不写 ABORT 标记（"中止字节只进原生 WAL 不进分区
+流"，`test_shard_pagecmp_p1` 的注释即此）。而这是**自洽的**：那些元组同样没进流，
+副本上没有任何东西引用那些号。
+
+⇒ 断言据此改成按语义写，而不是放宽：**COMMITTED 判决必须逐条到位**（少一条就是
+升主后"已提交数据看不见"），而**允许且仅允许一种差异**：leader=ABORTED(3) 而
+follower=空洞(0)。另配一条对照断言"follower 确实拿到了非空判决，不是全空洞"。
+
+##### 升主时的发号安全：既有守卫兜住了大部分
+
+follower 的水位文件里 `alloc_wm` 仍是 0（影子只在内存里），所以升主后发号器
+从 3 号起走。**这在 (A) 做完之后基本是安全的**，靠的是 T2.5 那道「终局槽跳过
+守卫」：`shard_xid_allocate` 逐个查 clog，只有读到 `TXN_RUNNING` 才接受该号，
+于是 COMMITTED / ABORTED / PREPARED 的号全被跳过。而"中止且字节未入流"留下的
+空洞可以放心复用 —— 副本上本就没有引用那些号的元组。
+
+**残留的那一格（归 P6）**：事务的字节被别人的 group commit 顺带刷进了流，
+随后本后端**崩溃**（不是中止）—— 既没有 COMMIT 也没有 ABORT 标记，而元组已经
+到了 follower。此时新主的 clog 对该号是空洞，可能重新发出去。设计 §6.6 给了
+答案（「新主追平后流里没有该事务的提交标记 ⇒ 从未提交过 ⇒ 改 ABORTED 安全」），
+但那需要知道"在用 xid 的上界"——也就是**持久的发号水位交接**，正是 P6 的活。
+另有"老主重入后本地那批未入流的字节如何处置"，同属 P6 的 rebaseline 话题。
+
+##### 验收
+
+跨节点套件新增 [2b] 段（升为 **59/0**，连跑 2 轮）：
+
+| 断言 | 结果 |
+|---|---|
+| leader 分片 clog 有 COMMITTED / 有 ABORTED 判决（夹具有鉴别力） | PASS ×2 |
+| **★ 两个 follower 的分片 clog 由流重建，COMMITTED 逐条到位** | PASS ×2 |
+| 对照：follower 拿到的不是全空洞 | PASS ×2 |
+
+##### 回归
+
+**出口串行一遍全绿：7 基线 310/0 + P5 新套件 239/0 = 549/0。**
+其中 `shard_pagecmp_p1` **49/0** 与 `dtx_tso_p4` **49/0** 最值得看 ——
+两者都既打分片标、又做字节级比对，正是 MARKER 格式改动的正面靶子。
+
+**另跑两套最直接消费 MARKER 的 replay 时代套件**（它们的 `CONTAINER` 默认指向
+`pg-citus-replay-container`，此处用覆盖跑，属尽力而为）：
+
+- `test_txn_layer_r2` **50/1** —— 唯一的红是 **R-P4-22**「本轮无 Raft 提案被
+  丢弃」（流控计数器，2026-08-18 已记录在案的既有观测），50 条功能断言全过。
+- `test_follower_replay_r1` **46/4** —— 4 条全是 `_vm` fork 存在性
+  （leader 有、follower 没有）。**与本次改动可证无关**：R1 的夹具**从不设
+  `pg_partdist.shard_relids`**，于是 `ShardXidXactCount()` 恒 0 ⇒ MARKER 标志位
+  永不置位 ⇒ 载荷逐字节不变；follower 侧的分片 clog 落账也被
+  `TransactionIdIsNormal(sxid)` 挡在门外。R1 的内容断言（follower 壳表 142 行
+  与 leader 一致）照常通过。
+  **但也不下"本来就红"的结论**：R1 属 replay 环境，而三套 9 节点环境互斥，
+  在本环境跑它本身就是越界取样。记为待在 replay 环境复核的一项。
+
 ---
 
 ## 4 未决核实点跟踪表
 
 | 编号 | 内容 | 归属 | 状态 |
 |---|---|---|---|
-| U-P5-1 | **follower 侧的分片 clog 未由流重建**（设计 §5.3 要求“每个副本重放同一个流得到同一本账”，实测 follower 只写 gclog）；连带 follower 也没有分片 xid 发号水位 ⇒ 今天升主会“全表不可见 + 从 3 号重发号” | P6（切主/恢复全链路） | 2026-08-21 T5.4b-2 途中查明，未修 |
+| U-P5-1 | **follower 侧的分片 clog 未由流重建** | P6（切主/恢复全链路） | **◐ 主体已做（2026-08-21，§3.7）**：MARKER 携带本分区分片 xid，follower 据此重建 `pg_shard_clog`（跨节点套件 [2b] 段验证，COMMITTED 逐条到位）。**残留归 P6**：持久的发号水位交接 —— 用于覆盖"字节被 group commit 刷进流后本后端崩溃"那一格（§6.6 的切主认领需要"在用 xid 的上界"），以及老主重入的 rebaseline |
 | V1 | 原生表 hint 位 vs pagecmp 既有处理（§4.5） | T1.0 | ✅ 已完成（P1_PRECHECK 结论 A） |
 | V2 | Citus 连接建立点枚举完备性（§9.2 ①） | P4 前 | ◐ 挂点运行时实证（T4.0 实验 2C：assign 每连接前置在 worker 驱动下生效）；完整枚举随 T4.1 逐路取证 |
 | V3 | 引用表使用现状与只读裁定（§9.2 ②） | P4 前 | ✅ 已裁定（T4.0：系统现役 0 引用表；第一期建表后只读） |

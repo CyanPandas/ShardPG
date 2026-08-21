@@ -1057,6 +1057,13 @@ shard_xid_for_current_xact(Oid shard)
 	return sxid;
 }
 
+/* U-P5-1：本事务是否碰过任何分片打标表（决定 MARKER 要不要带分片 xid 尾） */
+int
+ShardXidXactCount(void)
+{
+	return xact_map_n;
+}
+
 TransactionId
 ShardXidMineForShard(Oid shard)
 {

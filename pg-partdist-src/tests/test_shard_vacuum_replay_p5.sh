@@ -5,6 +5,8 @@
 #   T5.4b-1 —— vacuum 页面动作的跨节点回放（三份记要里挂了三次账的那一项）；
 #   T5.8   —— TOAST 关系（含它的 btree 索引）一并参与，于是索引两阶段发出的
 #              btree vacuum 记录也走这条回放通路；
+#   U-P5-1 —— [2b] 段：**分片 clog 由流重建**（设计 §5.3）。MARKER 现在带上
+#              本分区的分片 xid，follower 据此把 pg_shard_clog 也建起来；
 #   T5.4b-2 —— 两个 vacuum 水位随 CTRL 记录（复用 FREEZE_UPDATE 通道换语义，
 #              不新增 opcode）到达 follower 并落进它自己的 pg_shard_xid/<oid>。
 #
@@ -120,6 +122,14 @@ CREATE OR REPLACE FUNCTION sclog_wts(oid, bigint, int, bigint) RETURNS void
   AS '$libdir/pg_partdist','partdist_shard_clog_write_ts' LANGUAGE C STRICT;
 SQL
 check "leader 测试函数就绪" "$?" "0"
+for fp in $f1 $f2; do
+  PSQL $fp -v ON_ERROR_STOP=1 -q <<'SQL'
+SET citus.enable_ddl_propagation TO off;
+CREATE OR REPLACE FUNCTION sclog_read(oid, bigint) RETURNS int
+  AS '$libdir/pg_partdist','partdist_shard_clog_read' LANGUAGE C STRICT;
+SQL
+done
+check "follower 测试函数就绪" "$?" "0"
 
 echo "================ [2] 工作负载：制造三类垃圾（全 leader 直写，含 TOAST）================"
 # ★ T5.8 之后 TOAST 一并参与：每 10 行放一个进 TOAST 的大值（md5 拼的十六进制
@@ -192,6 +202,38 @@ a2=$(wait_caught_up $f2 "$lead_plsn1" 180)
 check "follower2 追平工作负载" "$([[ -n "$a2" && "$a2" -ge "$lead_plsn1" ]] && echo ok)" "ok"
 PSQL $pport -q -c "CHECKPOINT;" </dev/null >/dev/null
 sleep 4
+
+echo "================ [2b] U-P5-1：分片 clog 由流重建 ================"
+# 设计 §5.3：「落账顺序锁定在分片流的 plsn 序上 ⇒ 每个副本重放同一个流得到
+# 同一本账」。在此之前 follower 只写增强型 clog（按 gxid 索引），
+# pg_shard_clog/<oid> 在它上面根本不存在 —— 升主后每个分片 xid 都读成
+# 空洞=RUNNING=不可见，整张表看不见。
+SCLOG() { PSQL "$1" -Atc "SELECT string_agg(sclog_read($2::oid, g::bigint)::text, ',' ORDER BY g) FROM generate_series(3,15) g" </dev/null | tail -1; }
+lead_clog=$(SCLOG $pport $SOID)
+check "leader 分片 clog 有 COMMITTED 判决" "$([[ "$lead_clog" =~ 2 ]] && echo ok)" "ok"
+check "leader 分片 clog 有 ABORTED 判决" "$([[ "$lead_clog" =~ 3 ]] && echo ok)" "ok"
+# ★ 判据不是"逐条相等"，而是按 PartWALAbort 的既有设计来：
+#   中止事务若其 DATA 字节**尚未入流**，parwal 会丢弃本后端的槽位、也不写 ABORT
+#   标记（"中止字节只进原生 WAL 不进分区流"，pagecmp_p1 的注释即此）。于是
+#   follower 在这些位置是空洞。这是**自洽的**：那些元组同样没进流，副本上没有
+#   任何东西引用那些号。
+#   所以允许且仅允许一种差异：leader=ABORTED(3) 而 follower=空洞(0)。
+#   COMMITTED 判决必须逐条到位 —— 少一条就是升主后"已提交数据看不见"。
+cmp_clog() {  # cmp_clog <leader串> <follower串> → 打印不合规的位数
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    n=split(a,x,","); split(b,y,","); bad=0;
+    for(i=1;i<=n;i++) if (x[i]!=y[i] && !(x[i]=="3" && y[i]=="0")) bad++;
+    print bad }'
+}
+for fp in $f1 $f2; do
+  foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+  fclog=$(SCLOG $fp $foid)
+  check "★ follower :$fp 的分片 clog 由流重建（COMMITTED 逐条到位）" \
+        "$(cmp_clog "$lead_clog" "$fclog")" "0"
+  check "  （对照：follower :$fp 确实拿到了非空判决，不是全空洞）" \
+        "$([[ "$fclog" =~ 2 ]] && echo ok)" "ok"
+done
+
 F1MAIN=$(FPATH_MAIN $f1); F2MAIN=$(FPATH_MAIN $f2)
 md5_f1_pre=$(DEX md5sum "$F1MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)
 md5_f2_pre=$(DEX md5sum "$F2MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)
@@ -314,6 +356,12 @@ for p in $COORD $pport $f1 $f2; do
   PSQL $p -q -c "DELETE FROM partdist.partition_map WHERE partition_id=${gid};" </dev/null >/dev/null 2>&1
 done
 PSQL $pport -q -c "DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null 2>&1
+for fp in $f1 $f2; do
+  PSQL $fp -q -c "SET citus.enable_ddl_propagation=off; DROP FUNCTION IF EXISTS sclog_read(oid,bigint);" </dev/null >/dev/null 2>&1
+  fdata2=$(PSQL "$fp" -Atc "SHOW data_directory" </dev/null)
+  foid2=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
+  [[ -n "$foid2" && "$foid2" != "0" ]] && DEX rm -rf "${fdata2}/pg_shard_clog/${foid2}" </dev/null
+done
 PSQL $pport -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null
 PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 DEX rm -f "${PDATA}/pg_shard_xid/${SOID}" </dev/null
