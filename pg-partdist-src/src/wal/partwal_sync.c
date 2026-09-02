@@ -957,12 +957,13 @@ PartWALSyncListPartitions(Oid *out, int max)
  *
  * 调用方必须**不持有** PartWALCtl->lock（本函数自己取）。
  */
-void
+uint64
 PartWALAppendCtrl(Oid partition_id, uint8 opcode,
                   const char *payload, uint32 payload_len)
 {
     XLogRecPtr    ctrl_lsn = GetXLogInsertRecPtr();
     TransactionId my_xid   = GetCurrentTransactionIdIfAny();
+    uint64        assigned_plsn = 0;
 
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
     PG_TRY();
@@ -981,6 +982,8 @@ PartWALAppendCtrl(Oid partition_id, uint8 opcode,
                             payload, payload_len,
                             MakeGlobalXid(PartDistLocalNodeId(), my_xid),
                             PARTWAL_FLAG_CTRL);
+        /* 编号在 writer 里，销毁前取走（T6.1：基线要拿它当 base_part_lsn） */
+        assigned_plsn = w->last_partition_lsn;
         DestroyPartitionWALWriter(w);       /* flush + fsync */
     }
     PG_CATCH();
@@ -999,6 +1002,8 @@ PartWALAppendCtrl(Oid partition_id, uint8 opcode,
      * "本 backend 无插入"分支直接返回，控制记录就只落本地、永远进不了 Raft。
      */
     PartWALReplicateTouched();
+
+    return assigned_plsn;
 }
 
 /*

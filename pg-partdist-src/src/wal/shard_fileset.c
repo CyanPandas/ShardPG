@@ -308,6 +308,112 @@ EmitFilesetUpdate(Oid shard_oid, const ShardFileSet *old_fs,
 }
 
 /* ================================================================== */
+/* T6.1（P6）：全量物理基线                                            */
+/* ================================================================== */
+
+/*
+ * ShardBaselineEmit — 把一个 shard 的**全部字节**重新灌进它自己的分区流，
+ * 并返回这次基线的起点 partition_lsn。
+ *
+ * ★ 它解决的是设计 §13 约束 2 后半句一直没实装的那件事：
+ *   「副本必须由 leader shard 物理拷贝初始化（**拷贝时记下 partition_lsn
+ *     静止点**，增量从该游标重放追齐）」。
+ *   此前 locmap 只配对了"哪个文件对哪个文件"，从不配对"从哪个游标开始"，
+ *   于是缺省游标 0 等于沉默地断言"本地文件 == leader 在流起点时的文件" ——
+ *   这个断言从来没人建立过，也从来没人校验过（R-P4-20 的第一半）。
+ *
+ * ★ 为什么不做"文件拷贝 + 带外传输"，而是走流：
+ *   项目里已经有一条把文件字节送到 follower 的成熟通路 —— §12 的 DDL 变更
+ *   用 log_newpage_range() 把新文件整页灌成 FPI，捕获钩子收进分区流，
+ *   follower 当普通 DATA 记录重放。**全量基线与它逐字一致，差别只在
+ *   "截断哪些成员"**（DDL 只截换了文件号的，基线截全部）。走同一条路的好处：
+ *     - 没有传输问题（跨机、权限、断点续传统统不存在）；
+ *     - follower 侧**一行新的导入逻辑都不需要**，FPI 重放本来就会；
+ *     - 与 Raft 复制、崩溃恢复、幂等去重全部天然兼容。
+ *
+ * ★ 为什么不需要独占锁（与 pg_basebackup 同理）：
+ *   设某页在扫描中途被改。若改动发生在该页 FPI **之前**，FPI 里已经含它；
+ *   若发生在**之后**，那条增量记录的 partition_lsn 大于 FPI 的，重放时
+ *   "先 FPI 后增量"，结果一样正确。扫描期间新扩的块也一样 —— 它们的创建
+ *   记录排在基线之后。故 AccessShareLock（FileSetLogRelationPages 已取）足够。
+ *
+ * ★ 顺序铁律：CTRL 必须**先于**那批 FPI 进流。follower 要先按 CTRL 换完表、
+ *   截完文件，后面的 FPI 才有地方落。这一条与 §12 的 EmitFilesetUpdate 相同，
+ *   那里的注释写着"顺序不能反"。
+ *
+ * 返回值 = 这条 CTRL 的 partition_lsn。把它交给 follower 当 base_part_lsn：
+ * 从它开始重放，之前的记录一律不看，也不需要看。
+ */
+uint64
+ShardBaselineEmit(Oid shard_oid)
+{
+    ShardFileSet    fs;
+    Oid             relids[SHARD_FILESET_MAX_RELS];
+    PartWALCtrlFilesetUpdate *payload;
+    uint32          payload_len;
+    uint64          total_blocks = 0;
+    uint64          base_plsn;
+    int             nrels;
+    int             i;
+
+    nrels = BuildShardFileSetEx(shard_oid, &fs, relids);
+    if (nrels < 0)
+        ereport(ERROR,
+                (errmsg("pg_partdist: shard %u 不存在，无法发射物理基线",
+                        shard_oid)));
+    if (nrels == 0)
+        ereport(ERROR,
+                (errmsg("pg_partdist: shard %u 的 fileset 为空，无法发射物理基线",
+                        shard_oid)));
+
+    /* 先量一次总块数：超限就**明确报错**，不静默降级 */
+    for (i = 0; i < nrels; i++)
+        total_blocks += FileSetLogRelationPages(relids[i], false);
+
+    if (total_blocks > (uint64) fileset_inline_max_blocks)
+        ereport(ERROR,
+                (errmsg("pg_partdist: shard %u 的物理基线涉及 %llu 个块，"
+                        "超过 pg_partdist.fileset_inline_max_blocks = %d",
+                        shard_oid, (unsigned long long) total_blocks,
+                        fileset_inline_max_blocks),
+                 errdetail("基线是**显式**操作，这里不做静默降级 —— 一次灌太多块"
+                           "会把 Raft 日志环顶爆（§13 约束 13），后果是永久分叉。"),
+                 errhint("确认该 shard 的体量后调高 "
+                         "pg_partdist.fileset_inline_max_blocks 再重试。")));
+
+    /*
+     * 注册必须在 log_newpage_range 之前 —— 捕获钩子的判据是"文件号命中反向
+     * 哈希"，没登记的话下面那批 FPI 一条都进不了流，而且是**静默**丢弃。
+     * （这正是 §12 之前 DDL 造成副本静默分歧的机制，此处照抄那条纪律。）
+     */
+    RegisterShardFileSet(&fs);
+
+    payload_len = (uint32) PartWALCtrlFilesetUpdateSize(nrels);
+    payload = palloc0(payload_len);
+    payload->nrels    = (uint32) nrels;
+    payload->flags    = PARTWAL_FSUPD_FULL_BASELINE;
+    payload->reserved = 0;
+    memcpy(PartWALCtrlFilesetRels(payload), fs.rels,
+           (size_t) nrels * sizeof(ShardFileSetRel));
+
+    base_plsn = PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FILESET_UPDATE,
+                                  (const char *) payload, payload_len);
+    pfree(payload);
+
+    /* CTRL 已在流里，现在灌全部内容 —— 顺序不能反 */
+    for (i = 0; i < nrels; i++)
+        (void) FileSetLogRelationPages(relids[i], true);
+
+    ereport(LOG,
+            (errmsg("pg_partdist: shard %u 物理基线已发射（%d 个成员，%llu 块，"
+                    "base_part_lsn=%llu）",
+                    shard_oid, nrels, (unsigned long long) total_blocks,
+                    (unsigned long long) base_plsn)));
+
+    return base_plsn;
+}
+
+/* ================================================================== */
 /* §13 约束 5：把 leader 的冻结账目同步给副本（D2）                     */
 /* ================================================================== */
 

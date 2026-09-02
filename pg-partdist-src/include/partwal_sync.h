@@ -130,9 +130,13 @@ extern bool  PartWALFreezeCheckDue(int interval_ms);
 /*
  * 给一个分区追加一条 CTRL 控制记录并就地复制（FRD §7.7/§12）。
  * opcode 落在头部的 info 字段（PARTWAL_CTRL_*）。
+ *
+ * 返回本条 CTRL 被分配到的 partition_lsn。T6.1 的全量基线要拿它当
+ * `base_part_lsn` 交给 follower —— "从这一条开始重放，之前的一律不看"。
+ * 不需要这个值的调用方忽略返回值即可。
  */
-extern void  PartWALAppendCtrl(Oid partition_id, uint8 opcode,
-                               const char *payload, uint32 payload_len);
+extern uint64 PartWALAppendCtrl(Oid partition_id, uint8 opcode,
+                                const char *payload, uint32 payload_len);
 
 /* ------------------------------------------------------------------ */
 /* Per-backend WAL content capture (for full-body pg_parwal records)   */

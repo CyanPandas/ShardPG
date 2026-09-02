@@ -965,6 +965,29 @@ CREATE OR REPLACE FUNCTION register_shard_fileset(
 COMMENT ON FUNCTION register_shard_fileset(REGCLASS) IS
     'Leader 侧：把 shard 的全部物理文件（主堆/索引/TOAST 堆及其索引）注册进捕获反向映射并持久化，索引与 TOAST 的 WAL 记录随主堆进入同一 parwal 流。';
 
+-- ------------------------------------------------------------------
+-- T6.1（P6）：全量物理基线
+-- ------------------------------------------------------------------
+--
+-- 把该 shard 的**全部字节**重新灌进它自己的分区流（整页 FPI，走的是 §12
+-- DDL 变更那条成熟通路），返回这次基线的起点 partition_lsn。
+--
+-- 用法：在 **leader** 上对分片表调用，把返回值交给 follower 当
+-- base_part_lsn —— 从这一条开始重放，之前的记录一律不看。
+--
+-- 实装的是设计 §13 约束 2 后半句（"拷贝时记下 partition_lsn 静止点"）。
+-- 此前只有前半句：locmap 只配对"哪个文件对哪个文件"，从不配对"从哪个游标
+-- 开始"，缺省游标 0 等于沉默地断言"本地文件 == leader 在流起点时的文件"。
+DROP FUNCTION IF EXISTS shard_baseline_emit(REGCLASS);
+
+CREATE OR REPLACE FUNCTION shard_baseline_emit(p_shard REGCLASS)
+    RETURNS BIGINT
+    LANGUAGE c STRICT
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_emit';
+
+COMMENT ON FUNCTION shard_baseline_emit(REGCLASS) IS
+    '发射该 shard 的全量物理基线（整页 FPI 进本分区流），返回基线起点 partition_lsn。三个消费者：副本初始配对、快路径分叉修复、永久分叉修复。只在 leader 上调用；块数超过 pg_partdist.fileset_inline_max_blocks 时显式报错而不静默降级。';
+
 -- fileset 导出：follower 侧 replay_set_locmap 的输入。
 CREATE OR REPLACE FUNCTION shard_fileset(
     p_shard REGCLASS,

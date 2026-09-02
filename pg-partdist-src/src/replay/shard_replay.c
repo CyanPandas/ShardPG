@@ -1377,6 +1377,32 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 
     rels = PartWALCtrlFilesetRels(upd);
 
+    /*
+     * ★ T6.1：未知标志位一律 ERROR，绝不静默忽略。
+     *
+     * 此前这里对 flags 只查 NEEDS_REBASELINE 一位，别的位视而不见 —— 那等于
+     * 允许"新版 leader 发了新语义、旧版 follower 当没看见照常重放"，是最难查
+     * 的一类分歧。MARKER 的标志位扩展当初就立了这条规矩，CTRL 这边补上。
+     */
+    if ((upd->flags & ~PARTWAL_FSUPD_KNOWN_FLAGS) != 0)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FILESET_UPDATE "
+                        "含未知标志位 0x%04X（已知 0x%04X）",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        (unsigned) upd->flags,
+                        (unsigned) PARTWAL_FSUPD_KNOWN_FLAGS),
+                 errdetail("leader 版本比本副本新 —— 拒绝按旧语义重放。")));
+
+    /* 两位语义相反（内容没来 vs 内容全来了），同时置位是协议错误 */
+    if ((upd->flags & PARTWAL_FSUPD_NEEDS_REBASELINE) != 0 &&
+        (upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FILESET_UPDATE "
+                        "同时置位 NEEDS_REBASELINE 与 FULL_BASELINE",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn)));
+
     if ((upd->flags & PARTWAL_FSUPD_NEEDS_REBASELINE) != 0)
         return ReplayFenceStruct(ctx,
                                  "leader 的 fileset 变更超过 "
@@ -1428,13 +1454,36 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      * 先截断：leader 文件号变了的成员，本地文件清空等 FPI 重建。
      * 文件号没变的（哈希里查得到）内容仍然有效，一个字节都不要动。
      */
-    for (i = 0; i < upd->nrels; i++)
     {
-        bool found;
+        bool full_baseline = ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0);
 
-        (void) hash_search(ctx->loc_map, &rels[i].loc, HASH_FIND, &found);
-        if (!found)
-            ReplayTruncateLocalRel(&lm.pairs[i].local_loc);
+        for (i = 0; i < upd->nrels; i++)
+        {
+            bool found;
+
+            /*
+             * ★ T6.1 全量基线：**每一个**成员都截成 0 块，不管它的 leader
+             * 文件号变没变。这正是基线与 DDL 变更的唯一区别 —— DDL 只需要
+             * 重建换了号的那几个（没换号的历史记录早已在流里、内容仍然有效），
+             * 而基线的语义是"忘掉之前的一切，后面这批 FPI 就是全部真相"。
+             *
+             * 不截干净的后果很具体：本地文件比 leader 长时，尾部那些**基线
+             * 不覆盖**的块会原样留下来，成为副本里一段谁也不会再碰的幽灵数据
+             * （FRD §13 里"副本文件长于 leader，运行期不 PANIC，只有逐页 diff
+             * 能发现"说的就是这种）。
+             */
+            (void) hash_search(ctx->loc_map, &rels[i].loc, HASH_FIND, &found);
+            if (full_baseline || !found)
+                ReplayTruncateLocalRel(&lm.pairs[i].local_loc);
+        }
+
+        if (full_baseline)
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: shard %u @plsn %llu 收到全量"
+                            "物理基线，已截断全部 %u 个本地文件，等待 FPI 重建",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            upd->nrels)));
     }
 
     /* 换表：整张 loc_map 重建（新旧文件号在同一临界区换完，§12） */

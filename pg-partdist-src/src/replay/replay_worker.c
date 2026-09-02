@@ -1058,6 +1058,7 @@ ReplayWorkerMain(Datum arg)
 /* ================================================================== */
 
 PG_FUNCTION_INFO_V1(pg_partdist_register_shard_fileset);
+PG_FUNCTION_INFO_V1(pg_partdist_shard_baseline_emit);
 PG_FUNCTION_INFO_V1(pg_partdist_shard_fileset);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_set_locmap);
 PG_FUNCTION_INFO_V1(pg_partdist_replay_locmap);
@@ -1273,6 +1274,30 @@ pg_partdist_register_shard_fileset(PG_FUNCTION_ARGS)
 
     RegisterShardFileSet(&fs);
     PG_RETURN_INT32(n);
+}
+
+/*
+ * shard_baseline_emit(regclass) → bigint
+ *
+ * T6.1（P6）：把该 shard 的全部字节重新灌进自己的分区流，返回这次基线的
+ * 起点 partition_lsn。把返回值交给 follower 当 `base_part_lsn` —— 从这一条
+ * 开始重放，之前的记录一律不看，也不需要看。
+ *
+ * 三个消费者共用它（P6_PRECHECK 结论六）：
+ *   ① 副本**初始配对**（§13 约束 2：拷贝时记下 partition_lsn 静止点）；
+ *   ② **快路径分叉**修复（§9.5：promote_prepare 返回 −1 之后的下一步）；
+ *   ③ **永久分叉**修复（§13 约束 13：Raft 环顶爆丢提案之后的唯一出路）。
+ * 此前这三条路都断在同一处 —— "重做物理基线"是终点，而那个工具不存在。
+ */
+Datum
+pg_partdist_shard_baseline_emit(PG_FUNCTION_ARGS)
+{
+    Oid     relid = PG_GETARG_OID(0);
+    uint64  base_plsn;
+
+    base_plsn = ShardBaselineEmit(relid);
+
+    PG_RETURN_INT64((int64) base_plsn);
 }
 
 /*

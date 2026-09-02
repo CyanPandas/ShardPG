@@ -317,6 +317,25 @@ typedef struct PartWALCtrlFilesetUpdate
 
 #define PARTWAL_FSUPD_NEEDS_REBASELINE  UINT16_C(0x0001)
 
+/*
+ * T6.1（P6）：**全量物理基线**。
+ *
+ * 语义：本条 CTRL 之后紧跟着的是该 shard **全部成员、全部 fork 的完整 FPI**，
+ * 而不是"只有变了的那几个成员"。follower 收到它时必须把 fileset 里**每一个**
+ * 本地文件截成 0 块，再让后面那批 FPI 把内容重建出来。
+ *
+ * 为什么复用 FILESET_UPDATE 而不新开 opcode：这条记录要做的事
+ * （宣告 fileset + 截断 + 等 FPI 灌内容）与 DDL 变更**逐字一致**，差别只在
+ * "截断哪些成员"。新开 opcode 等于把同一段 follower 逻辑抄第二遍。
+ *
+ * 与 NEEDS_REBASELINE 的关系：那一位是"内容**没**随流来，你得自己想办法"；
+ * 这一位是"内容**全部**随流来了"。两位互斥，同时置位即协议错误。
+ */
+#define PARTWAL_FSUPD_FULL_BASELINE     UINT16_C(0x0002)
+
+#define PARTWAL_FSUPD_KNOWN_FLAGS \
+    (PARTWAL_FSUPD_NEEDS_REBASELINE | PARTWAL_FSUPD_FULL_BASELINE)
+
 #define PartWALCtrlFilesetUpdateSize(n) \
     (sizeof(PartWALCtrlFilesetUpdate) + (size_t) (n) * sizeof(ShardFileSetRel))
 
