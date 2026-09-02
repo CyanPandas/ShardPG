@@ -103,8 +103,11 @@ ShardReplayReadLocMap(Oid shard_oid, ReplayLocMapFile *lm, const char **reason)
     if (lm->version != REPLAY_LOCMAP_VERSION)
     {
         if (reason != NULL)
-            *reason = "locmap 版本不符（v1 无 role/ord，无法就地升级）——"
-                      "请重跑 replay_set_locmap() 重建";
+            *reason = "locmap 版本不符（v1 无 role/ord，v2 无 base_part_lsn，"
+                      "都无法就地升级）—— 请重跑 replay_set_locmap() 重建。"
+                      "★ 旧版配对没有起效游标，等于沉默假设"
+                      "「本地文件 == leader 在流起点时的文件」，"
+                      "本版拒绝按这个假设认领（T6.2）";
         return false;
     }
     if (lm->shard_oid != shard_oid ||
@@ -180,6 +183,7 @@ ShardReplayLoadLocMap(ShardReplayCtx *ctx)
                                HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
     ctx->nlocal = 0;
+    ctx->base_part_lsn = lm.base_part_lsn;   /* T6.2：本配对的起效游标 */
     for (i = 0; i < lm.npairs; i++)
     {
         LocMapEntry *e;
@@ -1428,6 +1432,20 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
     lm.shard_oid = ctx->shard_oid;
     lm.npairs    = 0;
 
+    /*
+     * ★ T6.2：起效游标必须跟着走，不能被这次换表抹成 0。
+     *
+     * 普通 fileset 变更沿用原值；**全量基线**则把它推进到本条 CTRL 自己的
+     * 编号 —— 基线之后，"本配对自哪个游标起有效"的答案就是这一条。这样
+     * 崩在基线中途（CTRL 已应用、FPI 还没灌完、checkpoint 也没落）时，
+     * 重启会从这条 CTRL 重来：再截一次、再灌一遍，幂等且正确；若还停在旧
+     * base，就要多走一大段无谓的重放。
+     */
+    lm.base_part_lsn =
+        ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0)
+            ? hdr->partition_lsn
+            : ctx->base_part_lsn;
+
     for (i = 0; i < upd->nrels; i++)
     {
         RelFileLocator local;
@@ -1520,6 +1538,7 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 
     /* 持久化 + 刷新槽位（豁免钩子的数据源）*/
     ShardReplayWriteLocMap(&lm);
+    ctx->base_part_lsn = lm.base_part_lsn;      /* T6.2：与文件保持一致 */
     ReplaySlotRefreshLocs(ctx->shard_oid);
 
     ereport(LOG,

@@ -923,10 +923,42 @@ ReplayWorkerMain(Datum arg)
 
                 ShardReplayInitXidMap(ctx);
 
+                /*
+                 * ★ T6.2：无 apply_checkpoint 时，游标取 **locmap 的起效游标**
+                 * 而不再是 0。
+                 *
+                 * ShardReplayLoadLocMap 刚把它读进 ctx->base_part_lsn；配对时
+                 * 若声明 base=0，那句"从流起点开始"已在 replay_set_locmap 里
+                 * 核对过本地关系为空。旧格式 locmap（v1/v2 无此字段）在读取阶段
+                 * 就被拒了，压根到不了这里 —— 那正是"无基线不再默认从 0，而是
+                 * 拒绝认领"的落点。
+                 */
+                ctx->durable_part_lsn = ctx->base_part_lsn;
+                ctx->applied_part_lsn = ctx->base_part_lsn;
+
                 if (ReadApplyCheckpoint(ctx->shard_oid, &chk, &xments))
                 {
-                    ctx->durable_part_lsn  = chk.durable_part_lsn;
-                    ctx->applied_part_lsn  = chk.durable_part_lsn;
+                    /*
+                     * checkpoint 比基线新才用它。反过来（游标落在基线之前）
+                     * 说明这份 checkpoint 属于**上一代**配对 —— 基线之后
+                     * 那批 FPI 会把文件整体重建，从旧游标起跑等于拿新文件
+                     * 去对旧记录，正是 R-P4-20 的形状。取二者较大值即可，
+                     * 无需额外的代际标识。
+                     */
+                    if (chk.durable_part_lsn >= ctx->base_part_lsn)
+                    {
+                        ctx->durable_part_lsn  = chk.durable_part_lsn;
+                        ctx->applied_part_lsn  = chk.durable_part_lsn;
+                    }
+                    else
+                        ereport(LOG,
+                                (errmsg("pg_partdist replay: shard %u 的 "
+                                        "apply_checkpoint 游标 %llu 早于配对"
+                                        "起效游标 %llu —— 按起效游标起跑",
+                                        ctx->shard_oid,
+                                        (unsigned long long) chk.durable_part_lsn,
+                                        (unsigned long long) ctx->base_part_lsn)));
+
                     ctx->max_orig_lsn      = chk.max_orig_lsn;
                     ctx->max_replayed_fxid =
                         FullTransactionIdFromU64(chk.max_replayed_fxid);
@@ -958,11 +990,17 @@ ReplayWorkerMain(Datum arg)
                 s->applied = ctx->applied_part_lsn;
                 LWLockRelease(ReplayCtl->lock);
 
+                /*
+                 * 认领日志带上 base —— R-P4-20 的排查里，"游标从几起"是
+                 * 唯一能事后回溯的现场，而当时没人知道那个游标该是几。
+                 */
                 ereport(LOG,
                         (errmsg("pg_partdist replay: 认领 shard %u，"
-                                "游标从 %llu 起（惰性：待触发）",
+                                "游标从 %llu 起（配对起效游标 %llu；"
+                                "惰性：待触发）",
                                 ctx->shard_oid,
-                                (unsigned long long) ctx->applied_part_lsn)));
+                                (unsigned long long) ctx->applied_part_lsn,
+                                (unsigned long long) ctx->base_part_lsn)));
 
             }
 
@@ -1385,10 +1423,26 @@ pg_partdist_replay_locmap(PG_FUNCTION_ARGS)
 
 /*
  * replay_set_locmap(local regclass, roles int[], ords int[],
- *                   spcs oid[], dbs oid[], relnums oid[]) → int
+ *                   spcs oid[], dbs oid[], relnums oid[],
+ *                   base_part_lsn bigint DEFAULT 0) → int
  *
  * follower 侧：按 (role, ord) 把 leader fileset 与本地 shell 表的
  * fileset 配对，持久化 locmap，并把本地文件号登记进豁免槽位。
+ *
+ * ★ T6.2：第 7 个参数是**本配对的起效游标**（设计 §13 约束 2 的后半句）。
+ *
+ *   base_part_lsn > 0 —— 由 `partdist.shard_baseline_emit()`（T6.1）返回，
+ *                        自那条全量基线 CTRL 起重放。
+ *   base_part_lsn = 0 —— 显式声明"这条流从关系的出生点开始"。这是一句
+ *                        **断言**，不是缺省值：本函数会核对**本地关系确为空**
+ *                        （主堆 0 块），不为空即 ERROR。
+ *
+ * 为什么要核对：此前 locmap 只回答"哪个文件对哪个文件"，认领时无 checkpoint
+ * 就从 0 起 —— 那等于沉默假设「本地文件 == leader 在流起点时的文件」，而这句
+ * 话从没人建立、也从没人校验。R-P4-20 的第一半正是它：假设不成立时，早期记录
+ * 灌到内容对不上的文件上，页面太短即不可捕获的 PANIC。核对不能证明假设为真
+ * （leader 那半边这里看不到），但能**当场否掉一眼假的那一类**，且把这句话从
+ * 隐含变成写进文件的显式声明。
  */
 Datum
 pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
@@ -1399,6 +1453,7 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
     ArrayType *spcs_a   = PG_GETARG_ARRAYTYPE_P(3);
     ArrayType *dbs_a    = PG_GETARG_ARRAYTYPE_P(4);
     ArrayType *rels_a   = PG_GETARG_ARRAYTYPE_P(5);
+    int64      base_plsn = PG_ARGISNULL(6) ? 0 : PG_GETARG_INT64(6);
 
     Datum     *roles, *ords, *spcs, *dbs, *rels;
     int        n1, n2, n3, n4, n5;
@@ -1417,9 +1472,44 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errmsg("replay_set_locmap: 数组长度不一致或超限")));
 
+    if (base_plsn < 0)
+        ereport(ERROR,
+                (errmsg("replay_set_locmap: base_part_lsn 不能为负（%lld）",
+                        (long long) base_plsn)));
+
     if (BuildShardFileSet(local_relid, &local_fs) < 1)
         ereport(ERROR,
                 (errmsg("replay_set_locmap: 本地关系 %u 不存在", local_relid)));
+
+    /*
+     * ★ T6.2：base_part_lsn == 0 是"从关系出生点开始"这句**断言**，不是缺省值。
+     * 能当场核对的那一半在这里核对：本地关系必须是空的。
+     */
+    if (base_plsn == 0)
+    {
+        Relation    rel = try_relation_open(local_relid, AccessShareLock);
+        BlockNumber nblocks = 0;
+
+        if (rel != NULL)
+        {
+            if (smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM))
+                nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+            relation_close(rel, AccessShareLock);
+        }
+
+        if (nblocks > 0)
+            ereport(ERROR,
+                    (errmsg("replay_set_locmap: base_part_lsn=0 声明"
+                            "\"从流起点开始\"，但本地关系 %u 已有 %u 个块",
+                            local_relid, (unsigned) nblocks),
+                     errdetail("从 0 重放只在\"本地文件 == leader 在流起点时的"
+                               "文件\"时成立；本地非空即当场否掉这个断言。"
+                               "继续下去会把早期记录灌到内容对不上的文件上，"
+                               "页面太短即触发不可捕获的 PANIC（R-P4-20）。"),
+                     errhint("在 leader 上调 partdist.shard_baseline_emit() "
+                             "取得基线游标，把返回值作为 base_part_lsn 传入；"
+                             "或先把本地关系清空再配对。")));
+    }
 
     /* 按 (role, ord) 配对（FRD §7.1："关系角色 + 索引定义序"） */
     memset(&lm, 0, sizeof(lm));
@@ -1427,6 +1517,7 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
     lm.version   = REPLAY_LOCMAP_VERSION;
     lm.shard_oid = local_relid;
     lm.npairs    = 0;
+    lm.base_part_lsn = (uint64) base_plsn;
 
     for (i = 0; i < n1; i++)
     {

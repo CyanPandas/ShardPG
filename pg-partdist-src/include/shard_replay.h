@@ -54,14 +54,32 @@ StaticAssertDecl(sizeof(LocMapEntry) == 28,
                  "LocMapEntry 必须是 28 字节且无填充洞（随 locmap 直写磁盘）");
 
 #define REPLAY_LOCMAP_MAGIC     UINT32_C(0x4C4D4150)    /* "LMAP" */
-#define REPLAY_LOCMAP_VERSION   UINT32_C(2)             /* v2：加 role/ord */
+#define REPLAY_LOCMAP_VERSION   UINT32_C(3)             /* v3：加 base_part_lsn */
 #define REPLAY_LOCMAP_FILENAME  "locmap"
 
 /*
  * v1（R1/L1/R2 时代）没有 version 字段、每对 24 字节，整文件 780 字节；
- * v2 是 912 字节。两者长度不同，read() 的返回长度就是可靠的判别器 ——
- * 装载失败时提示重跑 replay_set_locmap()，不做原地升级：v1 文件里没有
- * role/ord，凭空补不出来（那正是 v2 存在的理由）。
+ * v2 是 912 字节；v3 是 920。三者长度两两不同，read() 的返回长度就是可靠的
+ * 判别器 —— 装载失败时提示重跑 replay_set_locmap()，不做原地升级：v1 文件里
+ * 没有 role/ord，v2 文件里没有 base_part_lsn，凭空都补不出来（那正是新版本
+ * 存在的理由）。
+ *
+ * ★ v3 新增 base_part_lsn（T6.2）：**本配对自哪个 partition_lsn 起有效**。
+ *
+ * 设计 §13 约束 2 要求"副本必须由 leader shard 物理拷贝初始化（拷贝时记下
+ * partition_lsn 静止点，增量从该游标重放追齐）"。此前只实装了前半句：locmap
+ * 只回答"哪个文件对哪个文件"，从不回答"从哪个游标开始"，而缺省游标 0 是一句
+ * **没人建立、也没人校验**的断言 ——「本地文件 == leader 在流起点时的文件」。
+ * R-P4-20 的第一半就是它：断言不成立时，从 0 重放会把早期记录灌到一个内容
+ * 对不上的文件上，页面太短即不可捕获的 PANIC。
+ *
+ * v3 把这句断言**写进文件**：
+ *   base_part_lsn == 0 —— 显式声明"这条流从关系的出生点开始"。
+ *                          `replay_set_locmap` 会**核对本地关系确为空**，
+ *                          断言至少不是一眼假的。
+ *   base_part_lsn >  0 —— 由 `partdist.shard_baseline_emit()`（T6.1）给出，
+ *                          自那条全量基线 CTRL 起重放。
+ * 无 apply_checkpoint 时，认领游标取 base_part_lsn 而不再是 0。
  */
 typedef struct ReplayLocMapFile
 {
@@ -69,6 +87,7 @@ typedef struct ReplayLocMapFile
     uint32          version;        /* REPLAY_LOCMAP_VERSION */
     Oid             shard_oid;      /* 本地 shard（分区）OID = 目录名 */
     int32           npairs;
+    uint64          base_part_lsn;  /* v3：本配对自哪个游标起有效（见上） */
     LocMapEntry     pairs[SHARD_FILESET_MAX_RELS];
 } ReplayLocMapFile;
 
@@ -150,6 +169,9 @@ typedef struct ShardReplayCtx
                                             * 的比较会失效，而路由表里的
                                             * watermark 本就是 FullTransactionId,
                                             * 两处类型必须一致（§7.1 注）     */
+    uint64             base_part_lsn;      /* T6.2：本配对起效游标（locmap
+                                            * v3）。无 apply_checkpoint 时
+                                            * 认领从它起，而不再是 0        */
     uint64             applied_part_lsn;   /* 已应用游标（内存值）            */
     uint64             durable_part_lsn;   /* 已持久化游标                    */
     XLogRecPtr         max_orig_lsn;       /* 已应用的最大 leader end LSN     */

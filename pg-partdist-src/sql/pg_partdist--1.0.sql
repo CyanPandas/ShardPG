@@ -1004,18 +1004,31 @@ COMMENT ON FUNCTION shard_fileset(REGCLASS) IS
 
 -- follower 侧：按 (role, ord) 把 leader fileset 与本地 shell 表配对成 loc_map，
 -- 持久化到 pg_parwal/<oid>/locmap，并登记补丁 0002 的刷脏豁免。
+--
+-- ★ T6.2 新增第 7 参 p_base_part_lsn —— **本配对的起效游标**，实装设计
+--   §13 约束 2 的后半句（"拷贝时记下 partition_lsn 静止点"）。
+--     >0 = 由 partdist.shard_baseline_emit() 给出，自那条全量基线起重放；
+--      0 = 显式声明"这条流从关系的出生点开始"。这是**断言**不是缺省值，
+--          函数会核对本地关系确为空，不为空即报错。
+--
+-- ★ 必须先 DROP 旧的 6 参签名再建 7 参版本：只 CREATE OR REPLACE 会留下一个
+--   **重载**，而那个 6 参声明仍指向同一个 C 符号 —— 它会去读并不存在的第 7 个
+--   参数。带 DEFAULT 的 7 参版本对既有 6 参调用点完全兼容。
+DROP FUNCTION IF EXISTS replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]);
+
 CREATE OR REPLACE FUNCTION replay_set_locmap(
     p_local_shard REGCLASS,
     p_roles INTEGER[],
     p_ords INTEGER[],
     p_spcs OID[],
     p_dbs OID[],
-    p_relnums OID[]
+    p_relnums OID[],
+    p_base_part_lsn BIGINT DEFAULT 0
 ) RETURNS INTEGER LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_replay_set_locmap';
 
-COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]) IS
-    'Follower 侧：建立 leader→本地 文件号映射（loc_map）。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。';
+COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[], BIGINT) IS
+    'Follower 侧：建立 leader→本地 文件号映射（loc_map）+ 本配对的起效游标。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。p_base_part_lsn>0 取自 shard_baseline_emit()；=0 是"从流起点开始"的断言，函数会核对本地关系为空。';
 
 -- follower 侧当前生效的 loc_map。leader 一次 VACUUM FULL/REINDEX/TRUNCATE
 -- 就会经 CTRL:FILESET_UPDATE 把 leader_relnum 整体换掉（FRD §12），
