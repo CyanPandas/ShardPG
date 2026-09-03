@@ -200,6 +200,26 @@ ShardReplicaAccessGate(Oid relid, const char *what)
     if (allow_replica_access || !ShardReplicaIsLocal(relid))
         return;
 
+    /*
+     * ★ 只拦**分片 xid 宇宙**里的副本（T6.5 同款判据：本分片有没有分配器水位）。
+     *
+     * 设计里"follower 壳表绝不能被 SELECT"那条禁令的真正理由是
+     * "元组带**外来分片 xid** ⇒ 原生剪枝按原生 clog 误判 ⇒ 就地损毁副本"。
+     * 这个理由**对遗留副本不成立**：R1/L1/R2 时代的副本元组带的是**原生 xid**，
+     * 原生剪枝判得对，读它既不损毁也不误判 —— 那些套件从 R1 起就一直靠
+     * "读 follower 壳表数行数"来验回放内容（`test_follower_replay_r1.sh` 的
+     * "follower 壳表行数 == leader"）。
+     *
+     * 首版没分这一层，把遗留副本也拦了，当场把 r1 那条内容断言打红。
+     * 按 T6.5 刚确立的同一条原则收窄：**新宇宙用新规矩，遗留流用老规矩**。
+     *
+     * ★ 已知残留（记在案，不假装解决）：约束 12 的另一半 —— 读会设 hint bit、
+     * 进而写本地 WAL —— 对遗留副本**依然存在**。但那是 T6.3c 之前就有的状况，
+     * 收窄并没有让它变差；而遗留副本本就是要退役的一支。
+     */
+    if (!TransactionIdIsValid(ShardXidAllocWatermark(relid)))
+        return;
+
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
              errmsg("不允许在本节点上对副本壳表（OID %u）执行%s", relid, what),

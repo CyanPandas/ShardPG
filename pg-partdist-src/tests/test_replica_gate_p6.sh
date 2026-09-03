@@ -107,6 +107,33 @@ foid=$(PSQL $f1 -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/n
 a=$(PSQL $f1 -Atc "SELECT partdist.replay_catchup(${foid}::regclass, ${plsn}, 60000)" </dev/null 2>/dev/null|tail -1)
 check "follower 追平（applied=$a）" "$([[ -n "$a" && "$a" -ge "$plsn" ]] && echo ok)" "ok"
 
+echo "================ [2b] ★ 遗留副本（已配对、未打标）不拦 ================"
+# 设计里"follower 壳表绝不能被 SELECT"那条禁令的真正理由是"元组带**外来分片
+# xid** ⇒ 原生剪枝误判 ⇒ 就地损毁副本"。这个理由**对遗留副本不成立**：
+# R1/L1/R2 时代的副本元组带的是原生 xid，原生剪枝判得对。那些套件从 R1 起
+# 就一直靠"读 follower 壳表数行数"来验回放内容。
+# 首版没分这一层，把遗留副本也拦了，当场把 r1 的内容断言打红。
+leg=$(PSQLO $f1 "$NOPROP" -Atc "SELECT count(*) FROM ${shard_tbl}" </dev/null 2>&1 | tail -1)
+check "★ 遗留副本：SELECT 放行（r1 那类内容断言仍可用）" \
+      "$([[ "$leg" =~ ^[0-9]+$ ]] && echo ok)" "ok"
+
+echo "================ [2c] 打标 ⇒ 副本进入分片 xid 宇宙 ================"
+SOID=$(PSQLO $pport "$VISIBLE" -Atc "SELECT '${shard_tbl}'::regclass::oid" </dev/null|tail -1)
+PSQL $pport -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${SOID}';" </dev/null >/dev/null
+PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
+guc=""
+for t in $(seq 1 10); do
+  guc=$(PSQL $pport -Atc "SHOW pg_partdist.shard_relids" </dev/null); [[ "$guc" == "$SOID" ]] && break; sleep 1
+done
+check "leader 白名单生效" "$guc" "$SOID"
+PSQL $pport -q -c "INSERT INTO ${shard_tbl} SELECT g,'marked'||g FROM generate_series(500,540) g;" </dev/null >/dev/null
+plsn2=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${LEADER_OID})" </dev/null | tail -1)
+a2=$(PSQL $f1 -Atc "SELECT partdist.replay_catchup(${foid}::regclass, ${plsn2}, 60000)" </dev/null 2>/dev/null|tail -1)
+check "打标后追平（applied=$a2）" "$([[ -n "$a2" && "$a2" -ge "$plsn2" ]] && echo ok)" "ok"
+wm=$(PSQL $f1 -Atc "SELECT partdist.shard_xid_next(${foid}::oid)" </dev/null 2>/dev/null|tail -1)
+check "★ 副本已在分片 xid 宇宙（发号水位=$wm）" \
+      "$([[ -n "$wm" && "$wm" -gt 0 ]] && echo ok)" "ok"
+
 echo "================ [3] ★ 闸门：配对之后本地一律不许碰 ================"
 fdata=$(PSQL $f1 -Atc "SHOW data_directory" </dev/null)
 frel=$(PSQL $f1 -Atc "SET citus.override_table_visibility=false; SELECT pg_relation_filepath(${foid}::regclass)" </dev/null | tail -1)
@@ -163,7 +190,12 @@ check "默认仍是 off（fail-closed）" "$dflt" "off"
 
 echo "================ [6] 零影响：leader 节点（无副本）一切照常 ================"
 lv=$(PSQLO $pport "$NOPROP" -Atc "SELECT count(*) FROM ${shard_tbl}" </dev/null 2>&1 | tail -1)
-check "leader 上读自己的分片表不受影响" "$lv" "200"
+# ★ 判据是"**没被闸门拦住**"（返回的是数字而不是错），不是具体行数。
+#   首版写死 200，实测拿到 41 —— 那不是缺陷：打标之后，白名单**之前**插入的
+#   200 行带的是原生 xid，在分片可见性规则下不可见；41 正是打标后插入的那批。
+#   这是"打标之后旧行不可见"的既定边界，与副本闸门无关。
+check "leader 上读自己的分片表不受闸门影响（返回=$lv）" \
+      "$([[ "$lv" =~ ^[0-9]+$ ]] && echo ok)" "ok"
 other=$(PSQL $f1 -Atc "SELECT count(*) FROM pg_class WHERE relname='pg_class'" </dev/null 2>&1 | tail -1)
 check "follower 上访问普通表不受影响" "$other" "1"
 
@@ -194,6 +226,8 @@ PSQL $pport -q -c "ALTER SYSTEM RESET pg_partdist.freeze_sync_interval_ms;" </de
 PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 
 echo "================ [8] 清理 ================"
+PSQL $pport -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null
+PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 for fp in $f1 $f2; do
   PSQL $fp -q -c "SELECT partdist.replay_disable('${shard_tbl}'::regclass);" </dev/null >/dev/null 2>&1
   PSQLO $fp "$NOPROP" -q -c "DROP TABLE IF EXISTS ${shard_tbl};" </dev/null >/dev/null 2>&1

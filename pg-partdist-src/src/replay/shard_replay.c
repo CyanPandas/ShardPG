@@ -1075,15 +1075,59 @@ ShardReplayRestoreXidMap(ShardReplayCtx *ctx, const XidMapEntry *ents,
 }
 
 /*
- * ShardReplayAdvanceWatermark — 把本地 nextXid 拉到回放水位之上。
+ * ShardReplayAdvanceWatermark — 把本地 nextXid 拉到回放水位之上（**仅遗留流**）。
+ *
+ * ★ T6.5（设计 §5.5）：这条规则的适用面已经收窄。
+ *
+ * FRD §7.5 的原规则是"follower 回放推进**原生 nextXid** 越过流内一切 xid"，
+ * 理由是 R1/R2 时代副本元组身上带的就是 **leader 的原生 xid** —— 本地若把
+ * 同一个号再发一次，两笔互不相干的事务会共用一个查账键。
+ *
+ * TX-TSO-MVCC 之后这个理由**在打标分片上不再成立**：元组 xmin/xmax 里写的是
+ * **分片 xid**（活在每分片独立的宇宙里），本地原生 nextXid 发到哪儿与它们
+ * 毫无关系。真正需要"永不重号"的是**分片分配器**，而它的水位已经由
+ * U-P5-1 之二经 MARKER 交接过来（ShardXidRaiseAllocWatermark）。
+ *
+ * 于是设计 §5.5 把规则改成"推进本分片分配器"，并点明一个副产品：
+ * **#40（§13 约束 4）的原生 clog 逐页补齐不再被回放触发** —— 那段
+ * ExtendCLOG/ExtendCommitTs/ExtendSUBTRANS 的补页开销，连同它自己的风险，
+ * 在新宇宙里整个消失。
+ *
+ * ★ 判据用"本分片有没有分配器水位"，而不是新加一个标志位：
+ *   ShardXidAllocWatermark(shard) > 0 ⇔ 这条流的 MARKER 带过分片 xid
+ *   ⇔ 它已在分片 xid 宇宙里。这份状态**本来就持久化**在
+ *   pg_shard_xid/<oid> 里，认领时（还没应用任何记录）就能读到，
+ *   不必改 apply_checkpoint 的格式，也不必在 ctx 里维护会话内标志。
+ *
+ * 遗留流（未打标的副本，R1/L1/R2 时代那些套件）判据为假，原样走老路 ——
+ * 它们的元组确实带原生 xid，那条规则对它们仍然必需。
  */
+static bool
+shard_replay_stream_is_shard_universe(Oid shard_oid)
+{
+    return TransactionIdIsValid(ShardXidAllocWatermark(shard_oid));
+}
+
 void
 ShardReplayAdvanceWatermark(ShardReplayCtx *ctx)
 {
     TransactionId xid = XidFromFullTransactionId(ctx->max_replayed_fxid);
 
-    if (TransactionIdIsNormal(xid))
-        PartDistAdvanceNextXidPastXid(xid);
+    if (!TransactionIdIsNormal(xid))
+        return;
+
+    if (shard_replay_stream_is_shard_universe(ctx->shard_oid))
+    {
+        /*
+         * 新宇宙：不碰原生 nextXid。分片分配器那一侧由 MARKER 交接的
+         * alloc 水位负责（U-P5-1 之二），此处什么都不用做。
+         */
+        REPLAY_TRACE("TRACE xid: shard %u 在分片 xid 宇宙，跳过原生 nextXid 推进",
+                     ctx->shard_oid);
+        return;
+    }
+
+    PartDistAdvanceNextXidPastXid(xid);
 }
 
 /*
@@ -1965,13 +2009,30 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
     REPLAY_TRACE("TRACE ckpt: flush done, writing cursor");
 
     /*
-     * 在写游标之前把本批回放引入的 xid 拉齐到本地 nextXid（§7.5）。
-     * 顺序不能反：checkpoint 一旦落盘就宣告"该游标之前的效果都已持久化"，
-     * 而 nextXid 落后于回放水位本身就是一种未完成的效果。
+     * 在写游标之前把本批回放引入的 xid 拉齐到本地 nextXid（§7.5）——
+     * **仅遗留流**。顺序不能反：checkpoint 一旦落盘就宣告"该游标之前的效果
+     * 都已持久化"，而 nextXid 落后于回放水位本身就是一种未完成的效果。
+     *
+     * ★ T6.5：打标分片走新宇宙，元组里是分片 xid，本地原生 nextXid 与它们
+     * 无关；需要"永不重号"的分片分配器由 MARKER 交接的 alloc 水位负责。
+     * 判据与 ShardReplayAdvanceWatermark 处相同，理由见那里的长注释。
      */
     if (TransactionIdIsNormal(XidFromFullTransactionId(ctx->max_replayed_fxid)))
-        PartDistAdvanceNextXidPastXid(
-            XidFromFullTransactionId(ctx->max_replayed_fxid));
+    {
+        if (shard_replay_stream_is_shard_universe(ctx->shard_oid))
+            /*
+             * 这条 trace 必须打在**这里**，不能只打在 ShardReplayAdvanceWatermark
+             * 里：那个函数只在**认领时**调一次，而分片一旦认领就不会再走它 ——
+             * 于是"新宇宙走了跳过分支"这件事在整个稳定运行期**没有任何痕迹**
+             * （实测套件因此始终数到 0）。checkpoint 路径每批都会经过，
+             * 把痕迹留在这里才对得上"它一直在生效"。
+             */
+            REPLAY_TRACE("TRACE xid: shard %u 在分片 xid 宇宙，跳过原生 nextXid 推进",
+                         ctx->shard_oid);
+        else
+            PartDistAdvanceNextXidPastXid(
+                XidFromFullTransactionId(ctx->max_replayed_fxid));
+    }
 
     /*
      * 冻结账目发布到槽位（§13 约束 5）。放在写游标之前，是为了让"游标之前
