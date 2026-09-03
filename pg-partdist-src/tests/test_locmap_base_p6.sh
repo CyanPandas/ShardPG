@@ -152,10 +152,18 @@ check "f1 追平到 $plsn_now（applied=$a1）" "$([[ -n "$a1" && "$a1" -ge "$pl
 check "f2 追平到 $plsn_now（applied=$a2）" "$([[ -n "$a2" && "$a2" -ge "$plsn_now" ]] && echo ok)" "ok"
 
 f1data=$(PSQL $f1 -Atc "SHOW data_directory" </dev/null)
-f1oid=$(PSQL $f1 -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null|tail -1)
-# ★ 必须按**本分片的 oid** 过滤：pg.log 跨轮追加，`tail -1` 会拿到上一轮别的
-#   分片的陈旧认领行（首版就被这么骗过一次，看到"游标从 0 起"以为守卫没生效）
-claim=$(DEX bash -c "grep -a '认领 shard ${f1oid}，' '${f1data}/pg.log' 2>/dev/null | tail -1" </dev/null)
+# ★ 过滤键用 **base** 而不是 shard oid：
+#   - pg.log 跨轮追加，不过滤会拿到上一轮别的分片的陈旧认领行（首版被骗过一次，
+#     看到"游标从 0 起"以为守卫没生效）；
+#   - 但按 oid 过滤要多取一次 local_partition_for_shard，多一个可能取空的环节
+#     （实测在连跑里空过一次，功能其实是对的，是断言不稳）。
+#   base 每轮都是新数字、由 leader 给出，既唯一又不依赖 follower 侧任何查询。
+claim=""
+for _t in $(seq 1 10); do
+  claim=$(DEX bash -c "grep -a '认领 shard .*游标从 ${base} 起' '${f1data}/pg.log' 2>/dev/null | tail -1" </dev/null)
+  [[ -n "$claim" ]] && break
+  sleep 1
+done
 echo "  f1 认领日志：${claim##*: }"
 check "★ f1 认领游标从 base=$base 起（不是 0）" \
       "$([[ "$claim" == *"游标从 ${base} 起"* ]] && echo ok)" "ok"

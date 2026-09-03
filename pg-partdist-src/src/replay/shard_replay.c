@@ -472,6 +472,236 @@ ApplySmgrRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 /* DATA 记录应用（FRD §7.4）                                           */
 /* ================================================================== */
 
+/* ================================================================== */
+/* T6.3a：offnum 前置检查 —— 把不可捕获的 PANIC 降级为该 shard 停摆      */
+/* ================================================================== */
+
+/*
+ * 内核在三处以 `elog(PANIC, "invalid max offset number")` 收口
+ * （heapam.c 的 heap_xlog_insert / heap_xlog_multi_insert / heap_xlog_update），
+ * 判据都是同一条：
+ *
+ *     if (PageGetMaxOffsetNumber(page) + 1 < offnum) elog(PANIC, ...);
+ *
+ * 即**页存在、块号在界内、但页太短**（缺目标 offnum 之前的行指针）。
+ *
+ * ★ 现有的三道守卫够不着这一格：R-P4-8 的两道查的是"关系是否存在"
+ *   （`smgrexists`），块号边界那道查的是"块号是否在界内"。加上块号那道之后的
+ *   10 轮验证里，它的 WARNING **一次都没触发**，而 PANIC 照常复发 —— 那条
+ *   注释就是这么写的。
+ *
+ * ★ PANIC 不可捕获：回放本体的 PG_TRY 拦不住，postmaster 会**整节点重置**，
+ *   随后再选举、再认领、再 PANIC，反复自噬（实测单轮 16–18 次）。所以这道
+ *   检查的价值不在"修好了什么"，而在**把节点级灾难降格成单个 shard 停摆**：
+ *   ERROR 走外层 PG_TRY，槽位置 REPLAY_FAILED，别的 shard 照常。
+ *
+ * ★ 它取代了此前那个只覆盖"带 INIT_PAGE 的 INSERT"的特例陷阱 —— 那是本检查
+ *   的一个子集（INIT_PAGE ⇒ 页被 PageInit 清空 ⇒ 有效 maxoff = 0）。
+ *
+ * ★ 诊断随检查一起打，而不是挂在"游标从 0 起"上。R-P4-20 的取证点当初写成
+ *   `if (ctx->applied_part_lsn == 0)`，而实测 30 次 PANIC 里**最后 7 次的游标
+ *   是 10 和 11** —— 那个精心埋的取证点一次都没为它们打过，这正是几何形状
+ *   两周没被记下来的原因。挂在跳闸点上，就永远打得到。
+ */
+
+/*
+ * 取该块在 redo 之前的有效 max offset 与页面 LSN；
+ * 返回 false = 无需检查（带整页镜像 / 块不存在 / 越界）。
+ */
+static bool
+shard_replay_page_maxoff(const DecodedBkpBlock *blk, OffsetNumber *maxoff_out,
+						 XLogRecPtr *pagelsn_out)
+{
+	SMgrRelation smgr = smgropen(blk->rlocator, InvalidBackendId);
+	BlockNumber  nblocks;
+	Buffer       buf;
+	Page         page;
+
+	/* 带整页镜像：内核走 RestoreBlockImage，压根不做 offnum 判据 */
+	if (blk->has_image)
+		return false;
+
+	/* WILL_INIT / INIT_PAGE：页会被 PageInit 清空 ⇒ 有效 maxoff = 0 */
+	if ((blk->flags & BKPBLOCK_WILL_INIT) != 0)
+	{
+		*maxoff_out  = 0;
+		*pagelsn_out = InvalidXLogRecPtr;	/* 页会被清空，LSN 闸门不适用 */
+		return true;
+	}
+
+	if (!smgrexists(smgr, blk->forknum))
+		return false;
+	nblocks = smgrnblocks(smgr, blk->forknum);
+	if (blk->blkno >= nblocks)
+		return false;			/* 越界那道守卫已经处置过 */
+
+	/*
+	 * ★ 必须走缓冲区而不是 smgrread：页面很可能正脏在共享缓冲区里、盘上那份
+	 * 还是旧的（更短）。从盘上读会**误报**。这次查找随后被 redo 自己命中，
+	 * 代价只是一次哈希命中加一把共享锁。
+	 */
+	buf = ReadBufferWithoutRelcache(blk->rlocator, blk->forknum, blk->blkno,
+									RBM_NORMAL, NULL, true);
+	if (!BufferIsValid(buf))
+		return false;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	*maxoff_out  = PageIsNew(page) ? 0 : PageGetMaxOffsetNumber(page);
+	*pagelsn_out = PageIsNew(page) ? InvalidXLogRecPtr : PageGetLSN(page);
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/*
+ * 返回 true = 可以派发 redo；false = 已经拦下（调用方跳过本条记录）。
+ */
+static bool
+ShardReplayOffnumPrecheck(ShardReplayCtx *ctx, XLogReaderState *reader,
+						  const XLogRecord *rec, const PartWALRecord *hdr)
+{
+	DecodedXLogRecord *dec = reader->record;
+	uint8         info = rec->xl_info & ~XLR_INFO_MASK;
+	uint8         op   = info & XLOG_HEAP_OPMASK;
+	OffsetNumber  want = InvalidOffsetNumber;   /* 记录想落的最大 offnum */
+	int           blkid = 0;
+	const char   *what = NULL;
+	OffsetNumber  maxoff;
+	XLogRecPtr    pagelsn = InvalidXLogRecPtr;
+
+	if (rec->xl_rmid == RM_HEAP_ID && op == XLOG_HEAP_INSERT)
+	{
+		want  = ((xl_heap_insert *) XLogRecGetData(reader))->offnum;
+		what  = "INSERT";
+	}
+	else if (rec->xl_rmid == RM_HEAP_ID &&
+			 (op == XLOG_HEAP_UPDATE || op == XLOG_HEAP_HOT_UPDATE))
+	{
+		/* 新元组恒在 block 0（heap_xlog_update 的 newaction 分支） */
+		want  = ((xl_heap_update *) XLogRecGetData(reader))->new_offnum;
+		what  = "UPDATE(new)";
+	}
+	else if (rec->xl_rmid == RM_HEAP2_ID && op == XLOG_HEAP2_MULTI_INSERT)
+	{
+		xl_heap_multi_insert *m =
+			(xl_heap_multi_insert *) XLogRecGetData(reader);
+		bool isinit = ((info & XLOG_HEAP_INIT_PAGE) != 0);
+		int  i;
+
+		/*
+		 * ★★ 取**第一个**偏移，不是最大的那个。
+		 *
+		 * 内核的判据在**循环内**，而每次 PageAddItem 都会把 maxoff 加一：
+		 *     for (i = 0; i < ntuples; i++) {
+		 *         offnum = isinit ? FirstOffsetNumber + i : offsets[i];
+		 *         if (PageGetMaxOffsetNumber(page) + 1 < offnum) PANIC;
+		 *         PageAddItem(...);            ← maxoff 随之增长
+		 *     }
+		 * 所以约束是"**第一个**装得下"，后面的随页面一起长。
+		 *
+		 * 首版取最大值与初始 maxoff 比，注释还写着"最大者过了其余都过" ——
+		 * 推理正好反了。实测代价：一条 10 元组的 MULTI_INSERT（offsets
+		 * 121..130、页内 maxoff=120）被误判，而它在内核里完全合法。更糟的是
+		 * 它一被拦下，后续引用 121+ 的 UPDATE 就真的找不到行指针，于是级联出
+		 * 两百多条"误报"——**整串假象都源自这一个 off-by-max**。
+		 */
+		want = isinit ? (OffsetNumber) FirstOffsetNumber : m->offsets[0];
+		i = 0;					/* 上面已取首个偏移，循环留给将来扩展 */
+		(void) i;
+		what = "MULTI_INSERT";
+	}
+	else
+		return true;			/* 其余记录类型不走这三处判据 */
+
+	if (dec == NULL || blkid > dec->max_block_id ||
+		!dec->blocks[blkid].in_use)
+		return true;
+
+	if (!shard_replay_page_maxoff(&dec->blocks[blkid], &maxoff, &pagelsn))
+		return true;			/* 无需检查 */
+
+	/*
+	 * ★★ 内核自己的那道闸门必须照抄，否则会**大面积误报**。
+	 *
+	 * XLogReadBufferForRedoExtended 的非 FPI 分支先判
+	 *     if (lsn <= PageGetLSN(page)) return BLK_DONE;
+	 * 页面已经到达或越过这条记录时 redo 直接跳过，**压根到不了 offnum 判据**。
+	 * 而"越过"完全可能伴随 maxoff 变小 —— 后来的 prune/vacuum 把行指针数组
+	 * 截短了，页面 LSN 却更新。此时页短是**正常状态**，不是分歧。
+	 *
+	 * 首版漏了这一条，在 pagecmp_p1 里一轮打出 **89 条误报**（清一色
+	 * HOT_UPDATE），跳过合法记录之后页面残缺，下一条记录撞上另一处判据
+	 * `elog(PANIC, "invalid lp")` —— **遏制层自己制造了它要防的那类崩溃**。
+	 * 判据必须与内核逐字一致，包括它的前置分支。
+	 */
+	if (!XLogRecPtrIsInvalid(pagelsn) && hdr->orig_lsn <= pagelsn)
+		return true;			/* redo 会 BLK_DONE 跳过，不会触发判据 */
+
+	if ((uint32) maxoff + 1 >= (uint32) want)
+		return true;			/* 正常：够得着 */
+
+	/*
+	 * 跳闸。这里把**全部几何形状**一次打全 —— 事后回溯只有这一次机会
+	 * （夹具下一轮就清场，日志又会被轮转）。
+	 */
+	/*
+	 * ★ 动作是**停摆**而不是跳过。
+	 *
+	 * 首版写成"跳过本条、游标照推"，这是错的：数据记录一旦被跳过，页面就此
+	 * 残缺，下一条依赖它的记录立刻撞上另一处判据 elog(PANIC, "invalid lp")
+	 * —— **遏制层自己制造了它要防的那类崩溃**（实测一轮 89 次跳过之后，
+	 * worker2/worker3 各崩两次）。
+	 *
+	 * ERROR 由外层 PG_TRY 接住 ⇒ 槽位置 REPLAY_FAILED、**游标不推进**，
+	 * 运维据 errhint 重做物理基线后可从原位继续，别的 shard 不受影响。
+	 * 这才是任务卡上"该 shard 停摆"的意思。
+	 */
+	/*
+	 * ★ 取证必须先以 WARNING 单独发一条，不能只挂在 ERROR 的 errdetail 上。
+	 *
+	 * 这条 ERROR 会被外层 PG_TRY 接住，而 PG_CATCH 只取 ed->message 重发一条
+	 * WARNING —— **errdetail / errhint 连同整个几何形状一起被吞掉**，日志里
+	 * 只剩一句"追平失败: 页太短"。实测就是这样：套件里"几何形状完整"与
+	 * "提示指向 shard_baseline_emit"两条断言取不到值。
+	 *
+	 * 而"看得清"正是这道遏制层的四个目标之一（造得出/拦得住/看得清/修得好），
+	 * R-P4-20 拖了两周没定案，缺的就是现场。所以先记全，再停摆。
+	 */
+	ereport(WARNING,
+			(errmsg("pg_partdist replay [R-P4-20]: 页太短，停止该分片回放"
+					"（shard %u plsn=%llu %s offnum=%u 但页内 maxoff=%u）",
+					ctx->shard_oid,
+					(unsigned long long) hdr->partition_lsn,
+					what, (unsigned) want, (unsigned) maxoff),
+			 errdetail("几何：rmid=%u info=0x%02X blk=%u/%u relNumber=%u "
+					   "fork=%d image=%d will_init=%d 游标=%llu 基线=%llu "
+					   "记录LSN=%X/%X 页LSN=%X/%X。"
+					   "内核会在此处 elog(PANIC, \"invalid max offset number\") "
+					   "——不可捕获，后果是整节点重置并反复自噬（R-P4-20）。",
+					   (unsigned) rec->xl_rmid, (unsigned) info,
+					   (unsigned) blkid, (unsigned) dec->blocks[blkid].blkno,
+					   (unsigned) dec->blocks[blkid].rlocator.relNumber,
+					   (int) dec->blocks[blkid].forknum,
+					   dec->blocks[blkid].has_image ? 1 : 0,
+					   (dec->blocks[blkid].flags & BKPBLOCK_WILL_INIT) ? 1 : 0,
+					   (unsigned long long) ctx->applied_part_lsn,
+					   (unsigned long long) ctx->base_part_lsn,
+					   LSN_FORMAT_ARGS(hdr->orig_lsn),
+					   LSN_FORMAT_ARGS(pagelsn)),
+			 errhint("本副本与该流不同代。在 leader 上调 "
+					 "partdist.shard_baseline_emit() 重做物理基线，"
+					 "并以返回值作为 base_part_lsn 重跑 replay_set_locmap()。")));
+
+	/* 现场已落盘，现在停摆：ERROR 走外层 PG_TRY ⇒ FAILED + 游标不推进 */
+	ereport(ERROR,
+			(errmsg("pg_partdist replay [R-P4-20]: 页太短，停止该分片回放"
+					"（shard %u plsn=%llu %s offnum=%u 但页内 maxoff=%u）",
+					ctx->shard_oid,
+					(unsigned long long) hdr->partition_lsn,
+					what, (unsigned) want, (unsigned) maxoff)));
+	return false;				/* 到不了这里：上面是 ERROR */
+}
+
 static void
 ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 {
@@ -597,28 +827,16 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
          * 本地不存在的块"本身也该拦，不是因为它修好了什么。
          */
         /*
-         * ★ R-P4-20 诊断（2026-08-17）：PANIC 恒在认领后 1ms 内发生，事后
-         * 无从回溯（夹具下一轮就清场）。这里把 redo 之前的几何形状记下来，
-         * 用于分辨两个假说：
-         *   (a) 段流与堆不同代（堆新、段旧）；
-         *   (b) 游标丢失 + 段截断 —— 重放起点落在堆内容之后，形成空洞。
-         * 只在"游标从 0 起"这一出事形态下打，不污染正常日志。
-         * PANIC 的判据是 PageGetMaxOffsetNumber(page)+1 < offnum，靠块数与
-         * 页 LSN 分不出来，但"堆是不是空的"能直接否掉 (a)：空表 redo 会
-         * BLK_NOTFOUND 跳过而非 PANIC。
+         * ★ R-P4-20 诊断已于 T6.3a 迁走（2026-09-02）。
+         *
+         * 原先它挂在 `if (ctx->applied_part_lsn == 0)` 上，理由是"只在出事形态
+         * 下打，不污染正常日志"。实测把 30 次 PANIC 与前一行认领日志逐条配对
+         * 之后发现：**最后 7 次的游标是 10 和 11，不是 0** —— 这个精心埋的
+         * 取证点一次都没为它们打过，几何形状因此两周无从回溯。
+         *
+         * 现在诊断挂在 ShardReplayOffnumPrecheck 的**跳闸点**上：只在真要出事
+         * 时打，且无论游标是几都打得到。既不污染日志，也不会再漏。
          */
-        if (ctx->applied_part_lsn == 0)
-            ereport(LOG,
-                    (errmsg("pg_partdist replay [R-P4-20 诊断]: shard %u plsn=%llu "
-                            "rmid=%u info=0x%02x blk=%u/%u 块数=%u image=%d init=%d",
-                            ctx->shard_oid,
-                            (unsigned long long) hdr->partition_lsn,
-                            (unsigned) record->xl_rmid,
-                            (unsigned) (record->xl_info & ~XLR_INFO_MASK),
-                            (unsigned) id, (unsigned) blk->blkno,
-                            (unsigned) smgrnblocks(smgr, blk->forknum),
-                            blk->has_image ? 1 : 0,
-                            (blk->flags & BKPBLOCK_WILL_INIT) ? 1 : 0)));
 
         if (!blk->has_image && (blk->flags & BKPBLOCK_WILL_INIT) == 0)
         {
@@ -684,42 +902,15 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
     }
 
     /*
-     * ★ R-P4-20 精确前置陷阱（2026-08-17）
+     * ★ T6.3a：offnum 前置检查（2026-09-02）
      *
-     * PANIC 的判据（heapam.c heap_xlog_insert）是：
-     *     if (isinit) { XLogInitBufferForRedo(); PageInit(page,...,0); }
-     *     if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum) PANIC;
-     * isinit 时 PageInit 把页清空 ⇒ max offset = 0 ⇒ 只有 offnum >= 2 才炸。
-     * 而"带 INIT_PAGE 的 INSERT"按定义就是该页的**第一条**插入，offnum 应恒为
-     * FirstOffsetNumber(1)。offnum >= 2 意味着这条记录与它自称的 INIT 语义
-     * 自相矛盾 —— 要么流与本地关系不同代，要么记录被错误解码。
-     *
-     * 这里把 offnum 取出来打进日志（这是判定"不同代"还是"解码错"的唯一
-     * 判别量），并**跳过该条**以免不可捕获的 PANIC 把整节点带走。
-     * 注意：这是**遏制**，不是根因修复 —— 根因是"这种记录为何会出现"。
+     * 取代了此前那个只覆盖"带 INIT_PAGE 的 INSERT"的特例陷阱 —— 那是本检查的
+     * 一个子集。现在 INSERT / UPDATE / MULTI_INSERT 三类一并查，判据与内核
+     * 完全一致（maxoff + 1 < offnum），跳闸即 WARNING + 跳过本条，
+     * **绝不让内核 elog(PANIC) 把整节点带走**。
      */
-    if (record->xl_rmid == RM_HEAP_ID &&
-        (record->xl_info & XLOG_HEAP_INIT_PAGE) != 0 &&
-        (record->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT)
-    {
-        xl_heap_insert *ins = (xl_heap_insert *) XLogRecGetData(ctx->reader);
-
-        if (ins->offnum != FirstOffsetNumber)
-        {
-            ereport(WARNING,
-                    (errmsg("pg_partdist replay [R-P4-20]: INIT_PAGE 的 INSERT 却带 "
-                            "offnum=%u（应为 1），跳过该记录"
-                            "（shard %u plsn=%llu 数据长度=%u）",
-                            (unsigned) ins->offnum,
-                            ctx->shard_oid,
-                            (unsigned long long) hdr->partition_lsn,
-                            (unsigned) XLogRecGetDataLen(ctx->reader)),
-                     errdetail("INIT_PAGE 表示该页由本条记录初始化，其插入位置必然是 1。"
-                               "offnum>=2 与之矛盾：流与本地关系不同代，或记录解码有误。"
-                               "继续 redo 会触发不可捕获的 PANIC: invalid max offset number。")));
-            return;             /* 跳过本条，游标由调用方推进 */
-        }
-    }
+    if (!ShardReplayOffnumPrecheck(ctx, ctx->reader, record, hdr))
+        return;                 /* 跳过本条，游标由调用方推进 */
 
     /* 4) 派发原生 redo */
     GetRmgr(record->xl_rmid).rm_redo(ctx->reader);
