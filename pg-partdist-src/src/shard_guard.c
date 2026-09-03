@@ -32,6 +32,7 @@
 
 #include "shard_guard.h"
 #include "shard_xid.h"
+#include "shard_replay.h"	/* T6.3c：副本壳表闸门 */
 
 #include "catalog/pg_proc.h"
 #include "nodes/nodeFuncs.h"
@@ -125,8 +126,28 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 {
 	ListCell   *lc;
 
-	if (pstmt == NULL || !ShardGatingActive())
-		return;					/* 无打标表：零成本返回 */
+	if (pstmt == NULL)
+		return;
+
+	/*
+	 * ★ T6.3c：先查**副本壳表**，再查打标表禁用项。
+	 *
+	 * 两者的门控条件不同，不能共用 ShardGatingActive()：副本壳表所在的
+	 * follower 节点**从不设** pg_partdist.shard_relids，白名单恒空，
+	 * 于是那道快门一开就把副本这一支也挡在外面 —— 这正是此前"设计文档反复
+	 * 强调不许 SELECT、代码里却没人拦"的直接原因。
+	 * 副本这一支自己的快门是 ReplayCtl->nreplicas == 0（见 ShardReplicaIsLocal）。
+	 */
+	foreach(lc, pstmt->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte != NULL && rte->rtekind == RTE_RELATION)
+			ShardReplicaAccessGate(rte->relid, "查询");
+	}
+
+	if (!ShardGatingActive())
+		return;					/* 无打标表：下面的禁用项检查零成本返回 */
 
 	/* ① 顶层 Result 的 targetlist（`SELECT f(...)` 的落点） */
 	if (pstmt->planTree != NULL && IsA(pstmt->planTree, Result))

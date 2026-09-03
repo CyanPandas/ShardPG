@@ -157,6 +157,64 @@ ReplayShmemInit(void)
 /* 补丁 0002 豁免钩子（在**每个**会刷 shared buffer 的进程里跑）       */
 /* ================================================================== */
 
+bool allow_replica_access = false;   /* GUC：见 shard_replay.h 的说明 */
+
+/*
+ * ShardReplicaIsLocal — 本节点上这个 relid 是不是副本壳表（T6.3c）。
+ * 判据：槽位里有它、且已配对出本地文件号（nlocs > 0）。
+ */
+bool
+ShardReplicaIsLocal(Oid relid)
+{
+    int  i;
+    bool hit = false;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL || ReplayCtl->nreplicas == 0)
+        return false;           /* 无副本：零成本快速返回 */
+
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+        if (s->shard_oid == relid && s->nlocs > 0)
+        {
+            hit = true;
+            break;
+        }
+    }
+    LWLockRelease(ReplayCtl->lock);
+    return hit;
+}
+
+/*
+ * ShardReplicaAccessGate — 副本壳表的本地访问一律拒绝（除非显式放行）。
+ *
+ * 为什么是 fail-closed 而不是 WARNING：这两类后果都**不可逆**——
+ * on-access 剪枝按原生 clog 清掉分片元组是**就地损毁**，写本地 WAL 则把
+ * 约束 12 的洞重新打开（R-P4-20 的病灶）。发现之后再回滚已经晚了。
+ */
+void
+ShardReplicaAccessGate(Oid relid, const char *what)
+{
+    if (allow_replica_access || !ShardReplicaIsLocal(relid))
+        return;
+
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("不允许在本节点上对副本壳表（OID %u）执行%s", relid, what),
+             errdetail("这张表是别的节点那份分片的物理副本，内容由 pg_parwal "
+                       "流逐字节回放而来，元组带的是**外来的分片 xid**。"
+                       "本地访问有两重不可逆后果：on-access 剪枝会按原生 clog "
+                       "把它们当垃圾清掉（就地损毁副本）；而任何写本地 WAL 的"
+                       "动作都会把 §13 约束 12 的洞重新打开——本地崩溃恢复的"
+                       "无条件 FPI 会拿旧镜像盖掉回放好的页（R-P4-20 的病灶）。"),
+             errhint("要看副本内容请在**文件级**比对（见 tests/pagecmp.py），"
+                     "或升主后再读。确需就地取证时由超级用户显式打开 "
+                     "pg_partdist.allow_replica_access —— 那意味着你接受"
+                     "上述后果。")));
+}
+
 bool
 PartDistFlushExemptHook(const RelFileLocator *rlocator)
 {

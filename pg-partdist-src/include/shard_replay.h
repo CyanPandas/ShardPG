@@ -356,6 +356,38 @@ extern void ReplayShmemInit(void);
 /* 补丁 0002 的钩子实现：relNumber 命中副本豁免哈希 → 跳过 XLogFlush */
 extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
 
+/* ------------------------------------------------------------------ */
+/* T6.3c（P6）：副本壳表的本地访问闸门                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * ShardReplicaIsLocal — 本节点上这个 relid 是不是一张**副本壳表**
+ * （已配对 locmap、槽位里有本地文件号）。
+ *
+ * ★ 它补的是设计 §13 约束 12 的根治方向：「让副本文件永不被本地 WAL 触碰」。
+ *
+ * 此前这条只是**纪律**：设计文档反复写"follower 壳表绝不能被 SELECT"
+ * （无白名单 ⇒ on-access 剪枝会按原生 clog 清掉分片元组，就地损毁副本），
+ * 验收脚本的注释里也写着"本脚本只用文件级比对触碰 follower"。
+ * 但**代码里没有任何东西拦着** —— 副本壳表在本节点上是一张完全普通的表：
+ * 它不在 `pg_partdist.shard_relids` 白名单里（follower 侧从不设），于是
+ * `ShardXidUtilityGuard` 与 `ShardAccessGate` 这两道现成的闸门对它统统不生效。
+ *
+ * 一次误操作的 SELECT / VACUUM / ANALYZE 就能：① 触发剪枝损毁副本；
+ * ② 往**本地 WAL** 写进针对副本文件的记录 —— 而后者正是 R-P4-20 的病灶
+ * （本地崩溃恢复的无条件 FPI 会拿它盖掉回放好的页）。
+ *
+ * 判据零成本：`ReplayCtl->nreplicas == 0` 时立即返回 false（无副本的节点、
+ * 以及 438 基线路径完全不受影响）。
+ */
+extern bool ShardReplicaIsLocal(Oid relid);
+
+/* GUC：显式放行副本壳表的本地访问（默认 off；运维取证时才开） */
+extern bool allow_replica_access;
+
+/* 副本壳表的本地访问闸门（fail-closed）；what 用于错误文案 */
+extern void ShardReplicaAccessGate(Oid relid, const char *what);
+
 /*
  * 从 locmap 文件重新灌一遍槽位的本地文件号。CTRL:FILESET_UPDATE 换表之后
  * 必须调用 —— 豁免钩子认的是槽位里那份 locs[]，不刷新的话新文件号的脏页

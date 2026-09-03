@@ -9,6 +9,7 @@
  */
 #include "pg_partdist.h"
 #include "shard_xid.h"
+#include "shard_replay.h"	/* T6.3c：副本壳表闸门 */
 #include "shard_clog.h"
 #include "dtx_pending.h"
 #include "tso.h"
@@ -1644,6 +1645,86 @@ shard_xid_guard_range_var(ShardRelidsCfg *cfg, RangeVar *rv, const char *cmd)
 }
 
 /*
+ * T6.3c：副本壳表的维护命令闸门。判据是"本地是副本"，与白名单无关。
+ * 只拦会**动文件字节**或**触发回收判定**的那几类；DROP 不拦（清理要用）。
+ */
+static void
+shard_replica_guard_rv(RangeVar *rv, const char *what)
+{
+	Oid relid;
+
+	if (rv == NULL)
+		return;
+	relid = RangeVarGetRelid(rv, NoLock, true /* missing_ok */);
+	ShardReplicaAccessGate(relid, what);
+}
+
+static void
+shard_replica_utility_guard(Node *parsetree)
+{
+	if (ReplayCtl == NULL || ReplayCtl->nreplicas == 0)
+		return;					/* 无副本：零成本返回 */
+
+	if (IsA(parsetree, VacuumStmt))
+	{
+		VacuumStmt *stmt = (VacuumStmt *) parsetree;
+		ListCell   *lc;
+		const char *what = stmt->is_vacuumcmd ? "VACUUM" : "ANALYZE";
+
+		/*
+		 * ★ 整库形态只拦 VACUUM，**不拦 ANALYZE**。
+		 *
+		 * 与打标表那一支的处置逐条对齐：那边同样"白名单非空时不许整库 VACUUM"，
+		 * 而 ANALYZE 早在 T2.6 就已解禁（读侧走补丁 0008 分叉，只判不收）。
+		 * 整库 ANALYZE 是节点级的日常操作，因为存在一份副本就让它全库失败，
+		 * 是那种"最后一定会被运维关掉"的守卫 —— 首版这么写，当场把
+		 * shard_clog_p2 的"整库 ANALYZE 放行"打红。
+		 */
+		if (stmt->rels == NIL)
+		{
+			if (stmt->is_vacuumcmd)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("本节点持有副本壳表时不允许整库 VACUUM"),
+						 errdetail("副本元组带外来分片 xid，原生回收路径会误判；"
+								   "且回收动作写本地 WAL，会重新打开 §13 约束 12 的洞。"),
+						 errhint("请点名不含副本壳表的目标表。")));
+			return;				/* 整库 ANALYZE 放行 */
+		}
+
+		foreach(lc, stmt->rels)
+		{
+			VacuumRelation *vrel = lfirst_node(VacuumRelation, lc);
+
+			if (OidIsValid(vrel->oid))
+				ShardReplicaAccessGate(vrel->oid, what);
+			shard_replica_guard_rv(vrel->relation, what);
+		}
+	}
+	else if (IsA(parsetree, ClusterStmt))
+		shard_replica_guard_rv(((ClusterStmt *) parsetree)->relation, "CLUSTER");
+	/*
+	 * ★ CREATE INDEX / REINDEX **不拦** —— 它们是 §12 写明的修复路径的一部分。
+	 *
+	 * 结构栅栏立起来之后，文档给运维的指令原文是"请在本地 shell 表上做等价
+	 * 结构变更后重跑 replay_set_locmap()" —— 那个"等价结构变更"就是在副本壳表
+	 * 上 CREATE INDEX。把它拦掉等于**把文档写明的唯一修复路径堵死**
+	 * （首版这么写，当场把 ddl_fileset_d1 从 78/0 打到 65/11）。
+	 *
+	 * 安全性论证：这一步之后紧跟着的是 CTRL:FILESET_UPDATE 与那批 FPI，
+	 * 新索引文件的内容**会被流整体重建**，本地建索引时读堆判活的那点结果
+	 * 一个字节都不会留下。
+	 */
+	else if (IsA(parsetree, TruncateStmt))
+	{
+		ListCell *lc;
+
+		foreach(lc, ((TruncateStmt *) parsetree)->relations)
+			shard_replica_guard_rv((RangeVar *) lfirst(lc), "TRUNCATE");
+	}
+}
+
+/*
  * VACUUM/ANALYZE/CLUSTER 拦截。白名单为空时零成本直接返回，438 基线不受
  * 影响。整库 VACUUM 在白名单非空时一律拒绝 —— 无法逐表甄别，fail-closed
  * （P1 白名单只出现在专用验收集群，代价可接受）。
@@ -1653,7 +1734,21 @@ ShardXidUtilityGuard(Node *parsetree)
 {
 	ShardRelidsCfg *cfg = shard_relids_cfg;
 
-	if (!shard_gating_active(cfg) || parsetree == NULL)
+	if (parsetree == NULL)
+		return;
+
+	/*
+	 * ★ T6.3c：副本壳表这一支的门控条件与打标表**不同**，必须先查。
+	 *
+	 * follower 节点从不设 pg_partdist.shard_relids，白名单恒空 ⇒
+	 * shard_gating_active() 恒假 ⇒ 下面整段对副本壳表统统不生效。
+	 * 而副本壳表恰恰是最不能被 VACUUM / ANALYZE / CLUSTER 碰的东西：
+	 * 它的元组带外来分片 xid，原生回收路径会把活元组当垃圾清掉，
+	 * 且这些动作都写**本地 WAL**（§13 约束 12 的洞）。
+	 */
+	shard_replica_utility_guard(parsetree);
+
+	if (!shard_gating_active(cfg))
 		return;
 
 	if (IsA(parsetree, VacuumStmt))

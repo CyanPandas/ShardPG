@@ -418,6 +418,27 @@ _PG_init(void)
     if (!process_shared_preload_libraries_in_progress)
         return;
 
+    /*
+     * T6.3c：副本壳表的本地访问闸门的逃生口。
+     *
+     * 默认 off = 拒绝一切本地访问。开它意味着**接受两条不可逆后果**：
+     * on-access 剪枝按原生 clog 清掉分片元组（就地损毁副本），以及写本地 WAL
+     * 重新打开 §13 约束 12 的洞。所以放在 PGC_SUSET 且默认关闭 —— 有口子是
+     * 因为取证偶尔真的需要，不是因为它安全。
+     */
+    DefineCustomBoolVariable(
+        "pg_partdist.allow_replica_access",
+        "允许在本节点上直接访问副本壳表（默认 off，fail-closed）。",
+        "副本内容由 pg_parwal 流回放而来、元组带外来分片 xid；本地访问会触发"
+        "原生剪枝就地损毁副本，并把 §13 约束 12 的洞重新打开（R-P4-20 的病灶）。"
+        "取证请优先走文件级比对（tests/pagecmp.py）。",
+        &allow_replica_access,
+        false,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL
+    );
+
     DefineCustomBoolVariable(
         "pg_partdist.debug_segv_backtrace",
         "崩溃（SIGSEGV/SIGBUS/SIGILL）时把栈回溯打进服务器日志。",
