@@ -3584,7 +3584,7 @@ ABORTED」）—— 而认领需要"在用 xid 的上界"，正是本次交付�
 | **T6.3c** ✅ | **副本壳表隔离于本地 WAL**（约束 12 + 约束 5 **合并立项**）—— **已完成（2026-09-03）**，新套件 `test_replica_gate_p6.sh` **33/0** | 否 | 见下方实施记要 |
 | **T6.4** | **§6.6 第三支：切主认领**（流内无提交标记 ⇒ ABORTED）+ 关闭 U-P5-1 残留格 | **是** | 升主后无主 RUNNING 全部落定；水位残留窗口被认领兜住 |
 | **T6.5** ✅ | **§5.5 水位新语义**：回放推进**分片分配器**而非原生 nextXid —— **已完成（2026-09-03）**，新套件 `test_xid_watermark_p6.sh` **17/0** | 否 | 见下方实施记要 |
-| **T6.6** | **§10 负向用例并入门禁**（补齐两项零覆盖，其余逐条核实为真断言） | 否 | 新套件 `test_negative_p6.sh`，每条限制一条负向断言 |
+| **T6.6** ✅ | **§10 负向用例并入门禁**（十条逐条核实：九条早有守卫，`synchronous_commit=off` **零覆盖**已补，逻辑解码**装错层**已前移到入口）—— **已完成（2026-09-04）**，新套件 `test_negative_p6.sh` **27/0**；顺带查出并修复 **R-P6-8**（禁用清单整层可绕） | 否 | 见下方实施记要 |
 | **T6.7** ✅ | **全量门禁归一** —— **已完成（2026-09-04）**，`run_p6_exit.sh` 一次跑完 **26 套 1136/14**，逐套可读；口径按证据裁定 | 否 | 见下方实施记要 |
 | **T6.8** | **P6 出口回归 + 文档终检** | 否 | 全量零 FAIL；三份设计文档与代码逐条对齐 |
 | **T6.9** | **解冻批次 #6 闸门**（T6.3b / T6.4 在闸门后） | — | 用户批准后方可动 pg-raft |
@@ -4171,6 +4171,45 @@ REINDEX / 整库 VACUUM）+ **拦下之后副本主堆 md5 未变**（证明闸�
 
 ---
 
+#### T6.6 §10 负向用例并入门禁（2026-09-04，27/0）
+
+**做法**：把 §10 的每一条限制都写成一条**负向断言**（禁的必须真报错），
+再逐条回查代码确认那道禁令**确实存在且在对的层**。逐条核实的结果：
+十条里九条早有守卫（SERIALIZABLE / FOR SHARE / FOR UPDATE / CLUSTER /
+VACUUM FULL / VACUUM / CREATE INDEX / 整库 VACUUM / 未 join 的 PREPARE），
+**只有一条是零覆盖**，另一条**装错了层**：
+
+1. **`synchronous_commit = off` 写分片表：此前完全没有守卫**（本次补上）。
+   理由写进了报错本身：提交点语义只允许断言**已持久的事实**，异步提交把
+   "已提交"提前到 WAL 落盘之前，分片 clog 的判决就可能比 WAL 更早可见 ——
+   崩溃后判决在、数据不在。实装在 `shard_xid_for_current_xact` 的写路径，
+   放行 `on` / `local` / `remote_write`（三条各一条正向断言，防"全禁"式假通过）。
+
+2. **逻辑解码：禁令装在可见性层，够不着** —— 见 R-P6-7。溢出发生在解码阶段，
+   补丁 0006 挂在 `HeapTupleSatisfiesHistoricMVCC` 的守卫根本执行不到。
+   本次**前移到入口**（禁用函数表）。
+
+**过程中的两次自我更正，都值得留痕**：
+
+- **不要写"能把节点弄成起不来"的测试**。首版为了"真做掉逻辑解码这一条"，
+  给 worker1 临时开 `wal_level=logical` → 建槽 → 解码 → 收尾调回。结果解码
+  撞出 R-P6-7 的 abort，**崩溃留下了那个槽**，而收尾已经把 wal_level 调回
+  `replica`，于是节点再也起不来（`FATAL: slot exists, but wal_level < logical`），
+  只能人工"调回 logical → 起库 → 丢槽 → 再调回来"。禁令前移到入口之后，
+  这段操作整个不必存在，已删除。
+
+- **一条测不过的断言，先怀疑被测对象**。删掉 wal_level 操作后那两条仍然
+  FAIL，返回的是原生的 `logical decoding requires wal_level >= logical`
+  而不是我们的禁令 —— 第一反应是"断言写法问题：原生检查先跳闸"。换一个
+  **非解码类**的禁用函数做判别（`SELECT * FROM citus_rebalance_start()`），
+  才看出是**整层失灵**：禁用清单只拦得住 `SELECT f(...)`，FROM 形式一路放行。
+  这就是 **R-P6-8**，一个从 T4.6 潜伏至今、把 §9.2 第 3 层整体架空的缺陷。
+
+**结果**：`test_negative_p6.sh` 27 PASS / 0 FAIL，含 4 条 R-P6-8 绕法回归
+（FROM 形式 / 子查询 / CTE / 阴性对照）与 1 条"本轮无节点崩溃"哨兵。
+
+---
+
 #### ★ P6 是最后一期：不做的事也必须有裁定
 
 P6 之后没有下一期可以推。因此**下列每一条都必须在 P6 出口前拿到明确去向**
@@ -4377,6 +4416,54 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
     尚不知是"VM 记录整类漏捕获"还是"leader 侧以不产生 WAL 的路径建了 VM fork"。
     **处置**：P6 出口前必须定性 —— 它要么是覆盖缺口，要么是真的漏捕获，
     而后者按约束 1 的口径应当 fail-fast 而不是静默。
+16. **R-P6-7 逻辑解码打标记录 ⇒ 栈溢出、后端 abort、整节点重置**
+    （2026-09-04，T6.6 实测，**已前移禁令遏制，根因未修**）：
+    在有打标表的节点上 `pg_logical_slot_get_changes()` 实测：
+    ```
+    LOG:  starting logical decoding for slot "t66slot"
+    *** stack smashing detected ***: terminated
+    server process (PID …) was terminated by signal 6: Aborted
+    ```
+    **机制**（高置信推断，未逐字节验证）：补丁 0005 在 insert/update/multi_insert
+    的**主数据末尾追加 4 字节分片 xid 尾缀**，而逻辑解码走的是**原生解析器**，
+    它按记录长度反算元组长度时会把那 4 字节算进去 ⇒ 拷贝越界 ⇒ 栈保护器 abort。
+    **严重性**：一次普通 SQL 调用能让后端崩溃、进而 postmaster **整节点重置**；
+    且这不限于解码分片表本身 —— 解码器会解析流里**所有**记录。
+    **§10 的禁令实装在错的层**：补丁 0006 把守卫放在可见性层
+    （`HeapTupleSatisfiesHistoricMVCC`），而溢出发生在解码阶段，到不了那里。
+    **本次处置**：把禁令**前移到入口** —— 白名单非空时
+    `pg_create_logical_replication_slot` / `pg_logical_slot_*_changes` 一律拒绝
+    （`shard_guard.c` 的禁用函数表）。这是遏制，不是修复：在解码器学会那个尾缀
+    之前，唯一能保证的是**不触碰腐坏路径**。
+    **未闭**：根因（尾缀与原生解析器的长度约定冲突）仍在；若将来要支持逻辑解码，
+    必须让解码侧认得 `XLH_INSERT_SHARD_XID` / `XLH_UPDATE_SHARD_XID` 标志位。
+17. **R-P6-8 §9.2 第 3 层禁用清单整层可绕：`SELECT * FROM f(...)`**
+    （2026-09-04，T6.6 顺带查出，**已修**）：
+    禁用清单从 T4.6 起就只拦得住 `SELECT f(...)` 这一种写法；换成
+    **FROM 形式**一律放行。实测 `SELECT * FROM citus_rebalance_start()`
+    绕过禁令、一路跑进 Citus 重平衡器（最后因无关原因才报错）；
+    `SELECT * FROM pg_logical_slot_get_changes(...)` 同理直达 R-P6-7 的腐坏路径。
+    **根因**（已在仓库源码坐实，非推断）：首版靠扫 `pstmt->rtable` 里
+    `RTE_FUNCTION` 的 `rte->functions` 取 funcexpr，而 `PlannedStmt` 的 rtable
+    是 setrefs.c 造的**扁平副本**，`add_rte_to_flat_rtable()` 明写
+    `newrte->functions = NIL;`（`postgres-src/src/backend/optimizer/plan/setrefs.c:554`），
+    执行器改从 `FunctionScan` **计划节点**的 `functions` 字段取。
+    于是那个循环是**死代码**，从来没命中过一次。
+    **发现路径值得记**：它是被 T6.6 的两条断言"意外"钉出来的 —— 当时以为是
+    断言写法问题（先撞上原生 `wal_level >= logical` 检查），换个非解码类禁用
+    函数做判别才发现是整层失灵。**一条测不过的断言，先怀疑被测对象**。
+    **修复**：`ShardGuardCheckPlan` 改为**遍历计划树**
+    （`shard_guard_walk_plan`）：每个节点只取 targetlist / qual 交给
+    `expression_tree_walker`（节点本身绝不交出去，否则撞
+    `unrecognized node type` —— 见 T4.6 首版栽过的坑），
+    `FunctionScan` 额外取其 `functions`，并递归
+    lefttree/righttree/Append/MergeAppend/BitmapAnd/BitmapOr/SubqueryScan/CustomScan
+    与 `pstmt->subplans`（覆盖 CTE 与 initPlan）。
+    **覆盖边界（如实记）**：连接节点专属的 joinqual、索引 quals 未覆盖 ——
+    禁用项都是顶层 UDF 调用，不会长在那些位置。
+    **验证**：`test_negative_p6.sh` 新增 4 条 —— FROM 形式、子查询套一层、
+    CTE 三种绕法各一条，外加一条**阴性对照**（`generate_series` 必须仍放行，
+    防"全禁"式假通过）。27/0。
 
 ---
 

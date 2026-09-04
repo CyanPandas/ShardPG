@@ -37,6 +37,7 @@
 #include "catalog/pg_proc.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"	/* T6.6：FunctionScan / Append 等计划节点 */
 #include "nodes/primnodes.h"
 #include "utils/lsyscache.h"
 
@@ -54,6 +55,29 @@ static const char *const shard_banned_funcs[] = {
 	"undistribute_table",
 	"citus_schema_undistribute",
 	"alter_distributed_table",
+	/*
+	 * ★ T6.6：逻辑解码入口。§10 早就写着"分片表逻辑解码：禁"，补丁 0006 也
+	 * 确实实装了一道守卫 —— 但它挂在**可见性层**
+	 * （HeapTupleSatisfiesHistoricMVCC），而实测崩溃发生在**解码阶段**，
+	 * 根本到不了那里：
+	 *     LOG:  starting logical decoding for slot "t66slot"
+	 *     *** stack smashing detected ***: terminated
+	 *     server process ... was terminated by signal 6: Aborted
+	 *
+	 * 机制：补丁 0005 在 insert/update/multi_insert 的**主数据末尾追加 4 字节
+	 * 分片 xid 尾缀**，而逻辑解码走的是**原生解析器**，它按记录长度反算元组
+	 * 长度时会多算那 4 字节 ⇒ 拷贝越界 ⇒ 栈保护器 abort。后端崩溃会让
+	 * postmaster **整节点重置**，也就是说一次普通的 SQL 调用能打掉整个节点。
+	 *
+	 * 所以禁令必须**前移到入口**：白名单非空时，连槽都不许建、更不许解码。
+	 * 在解码器学会那个尾缀之前，这是唯一能保证"不触碰腐坏路径"的位置。
+	 * 已登记 R-P6-7。
+	 */
+	"pg_create_logical_replication_slot",
+	"pg_logical_slot_get_changes",
+	"pg_logical_slot_peek_changes",
+	"pg_logical_slot_get_binary_changes",
+	"pg_logical_slot_peek_binary_changes",
 	NULL
 };
 
@@ -104,6 +128,63 @@ shard_guard_expr_walker(Node *node, void *context)
 }
 
 /*
+ * 计划树遍历：只取节点的**表达式字段**，节点本身不交给 expression_tree_walker
+ * （交出去会撞 `unrecognized node type`，见下方 ShardGuardCheckPlan 的注释）。
+ */
+static void
+shard_guard_walk_plan(Plan *plan)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+
+	/* 表达式字段：targetlist 覆盖 `SELECT f(...)`，qual 覆盖 `WHERE f(...)` */
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (te != NULL && IsA(te, TargetEntry) && te->expr != NULL)
+			(void) shard_guard_expr_walker((Node *) te->expr, NULL);
+	}
+	(void) shard_guard_expr_walker((Node *) plan->qual, NULL);
+
+	/* ★ `SELECT * FROM f(...)`：funcexpr 在**计划节点**里，不在 rtable 里 */
+	if (IsA(plan, FunctionScan))
+	{
+		foreach(lc, ((FunctionScan *) plan)->functions)
+		{
+			RangeTblFunction *rtf = (RangeTblFunction *) lfirst(lc);
+
+			if (rtf != NULL && rtf->funcexpr != NULL)
+				(void) shard_guard_expr_walker(rtf->funcexpr, NULL);
+		}
+	}
+
+	/* 子节点 */
+	shard_guard_walk_plan(plan->lefttree);
+	shard_guard_walk_plan(plan->righttree);
+
+	if (IsA(plan, Append))
+		foreach(lc, ((Append *) plan)->appendplans)
+			shard_guard_walk_plan((Plan *) lfirst(lc));
+	else if (IsA(plan, MergeAppend))
+		foreach(lc, ((MergeAppend *) plan)->mergeplans)
+			shard_guard_walk_plan((Plan *) lfirst(lc));
+	else if (IsA(plan, BitmapAnd))
+		foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+			shard_guard_walk_plan((Plan *) lfirst(lc));
+	else if (IsA(plan, BitmapOr))
+		foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+			shard_guard_walk_plan((Plan *) lfirst(lc));
+	else if (IsA(plan, SubqueryScan))
+		shard_guard_walk_plan(((SubqueryScan *) plan)->subplan);
+	else if (IsA(plan, CustomScan))
+		foreach(lc, ((CustomScan *) plan)->custom_plans)
+			shard_guard_walk_plan((Plan *) lfirst(lc));
+}
+
+/*
  * ShardGuardCheckPlan — ExecutorStart 挂点调用。
  *
  * ★ 遍历方式（2026-08-14 首版栽过的坑）：**不能**把 plan 树（planTree->
@@ -112,14 +193,22 @@ shard_guard_expr_walker(Node *node, void *context)
  * 抛错，于是门控一开、**每条 SQL 都炸**（实测两个 worker 连 `SELECT 1`
  * 都起不来）。
  *
- * 正解：用 planner 已经算好的 `pstmt->invalItems`? 不 —— 最稳的是扫
- * `pstmt->planTree` 的**表达式字段**时走 plan 专用的 walker
- * （planstate_tree_walker 是执行期的、这里也不合适）。本方案取更简单可靠
- * 的路子：禁用项都是**顶层 UDF 调用**（`SELECT citus_xxx(...)`），planner
- * 会把它放进 Result 节点的 targetlist，其元素是 TargetEntry→FuncExpr；
- * 直接按 Result 节点取、且只对 TargetEntry 的 expr 递归，避开一切 plan
- * 节点类型。非 Result 顶层（如 FROM 里的函数扫描）由 rtable 的 functions
- * 字段覆盖。
+ * 正解（T6.6 修正）：**遍历计划树**，只把每个节点的**表达式字段**
+ * （targetlist / qual）交给 expression_tree_walker，节点本身绝不交出去。
+ *
+ * ★★ 首版为什么漏：首版靠两处取表达式 —— 顶层 Result 的 targetlist，
+ * 外加 `pstmt->rtable` 里 RTE_FUNCTION 的 `rte->functions`。后者是**死代码**：
+ * PlannedStmt 的 rtable 是 setrefs.c 造的扁平副本，
+ * `add_rte_to_flat_rtable()` 明写着 `newrte->functions = NIL;`
+ * （本仓库 postgres-src/src/backend/optimizer/plan/setrefs.c:554），
+ * 执行器改从 FunctionScan **计划节点**的 functions 字段取。于是循环永远
+ * 空转，`SELECT * FROM f(...)` 这一整类调用从 T4.6 起就绕得过禁用清单 ——
+ * 实测 `SELECT * FROM citus_rebalance_start()` 一路跑进了 Citus 重平衡器。
+ * 已登记 R-P6-8。
+ *
+ * 覆盖边界（如实记）：targetlist、qual、FunctionScan.functions、以及
+ * pstmt->subplans。连接节点专属的 joinqual / 索引 quals 未覆盖 —— 禁用项
+ * 都是顶层 UDF 调用，不会长在那些位置；真要长在那儿属另一类问题。
  */
 void
 ShardGuardCheckPlan(PlannedStmt *pstmt)
@@ -149,32 +238,9 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 	if (!ShardGatingActive())
 		return;					/* 无打标表：下面的禁用项检查零成本返回 */
 
-	/* ① 顶层 Result 的 targetlist（`SELECT f(...)` 的落点） */
-	if (pstmt->planTree != NULL && IsA(pstmt->planTree, Result))
-	{
-		foreach(lc, pstmt->planTree->targetlist)
-		{
-			TargetEntry *te = (TargetEntry *) lfirst(lc);
+	shard_guard_walk_plan(pstmt->planTree);
 
-			if (te != NULL && IsA(te, TargetEntry) && te->expr != NULL)
-				(void) shard_guard_expr_walker((Node *) te->expr, NULL);
-		}
-	}
-
-	/* ② RTE_FUNCTION 的函数表达式（`SELECT * FROM f(...)`） */
-	foreach(lc, pstmt->rtable)
-	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
-		ListCell   *lc2;
-
-		if (rte == NULL || rte->rtekind != RTE_FUNCTION)
-			continue;
-		foreach(lc2, rte->functions)
-		{
-			RangeTblFunction *rtf = (RangeTblFunction *) lfirst(lc2);
-
-			if (rtf != NULL && rtf->funcexpr != NULL)
-				(void) shard_guard_expr_walker(rtf->funcexpr, NULL);
-		}
-	}
+	/* CTE / 子查询：initPlan、SubPlan 都指向这里，走一遍即全覆盖 */
+	foreach(lc, pstmt->subplans)
+		shard_guard_walk_plan((Plan *) lfirst(lc));
 }

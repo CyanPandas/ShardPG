@@ -1099,6 +1099,38 @@ shard_xid_for_current_xact(Oid shard)
 	ShardAccessGate(shard, "写入");
 
 	/*
+	 * ★ T6.6：异步提交禁令（设计 §10 的"分片表异步提交"一行）。
+	 *
+	 * 这一条此前**只写在文档里，代码一个字都没拦** —— §10 逐条核实时才发现，
+	 * 它是那张限制表里唯一的空档（SERIALIZABLE 在 shard_visibility.c、行锁与
+	 * COPY FREEZE/推测插入在补丁 0005、逻辑解码在补丁 0006、维护命令与 Citus
+	 * 运维项在 ShardXidUtilityGuard/shard_guard.c，都实装了）。
+	 *
+	 * 为什么必须拦：本方案的可见性与提交点语义**只许断言已持久的事实**
+	 * （§4.5）。synchronous_commit=off 下，事务向客户端报成功时提交记录**尚未
+	 * 落盘**，于是：
+	 *   - 单分片快路径的 `[A] → quorum → [B]` 时序失去意义（[B] 根本没发生），
+	 *   - 2PC 的多数派提交点也建立在"本地已持久"这个前提上，
+	 *   - 崩溃之后 clog 判决与页面元组会不一致 —— 而这正是 §9.5 那类
+	 *     "旧 leader 与自己的组分叉"的成因。
+	 * 后果不可见、不报错、只在崩溃时显形，所以必须 fail-closed 在写入那一刻。
+	 *
+	 * 只拦 OFF：local/remote_write/remote_flush/remote_apply 都保证本地已 flush，
+	 * 前提成立。
+	 */
+	if (synchronous_commit == SYNCHRONOUS_COMMIT_OFF)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("分片打标表（OID %u）不支持异步提交"
+						"（synchronous_commit = off）", shard),
+				 errdetail("本方案的可见性与提交点语义只许断言**已持久**的事实："
+						   "异步提交下事务报成功时提交记录尚未落盘，单分片快路径的"
+						   " [A]<[B] 时序与 2PC 的多数派提交点都会失去前提，"
+						   "崩溃后判决与页面元组不一致（§10 / §4.5）。"),
+				 errhint("把 synchronous_commit 设为 on / local / remote_* "
+						 "之一再写分片表。")));
+
+	/*
 	 * 子事务全面禁写（DEV PLAN T1.3）：整个事务只有一个分片 xid，SAVEPOINT
 	 * 局部回滚无法表达 —— 已领过号的复用也不行，所以嵌套检查放在查表之前。
 	 */
