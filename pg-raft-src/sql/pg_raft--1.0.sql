@@ -494,6 +494,24 @@ BEGIN
         END IF;
     END IF;
 
+    -- ★★ T6.3b（解冻批次 #6）：推进本地 WAL 插入位点，越过 max_orig_lsn。
+    --
+    -- 必须排在追平**之后**（max_orig_lsn 这时才是终值），也必须排在下面任何
+    -- 本地写**之前**。不做的后果不是性能问题而是丢数据：物理回放出来的页
+    -- 带的是 leader 坐标的 LSN，升主后这些页改由本地 XLogInsert 保护；本地
+    -- 插入位点若还低于页面现有 LSN，新记录的 LSN 就小于页 LSN，本地崩溃恢复
+    -- 时 `lsn <= PageGetLSN(page)` 会把新记录当成"页面已经更新过"直接跳过。
+    --
+    -- 尽力而为：位点没推成不该把一个已追平的副本挡在升主之外（那等于用一次
+    -- 可用性事故换一个可以重试的动作），但要留下 WARNING —— 这条日志是事后
+    -- 判断"该节点升主时位点到底推没推"的唯一证词。
+    BEGIN
+        PERFORM partdist.advance_wal_past_shard(loid::regclass);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主推进 WAL 插入位点 shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+
     -- 追平之后才闭合 in-doubt：判决要按已回放到位的流来求，顺序不能反。
     -- 尽力而为 —— 闭合失败不该把一个已经追平的副本挡在升主之外，
     -- 恢复守护（dtx_recover_prepared）随后仍会周期性重试。
@@ -504,12 +522,30 @@ BEGIN
                       loid, p_group_id, SQLERRM;
     END;
 
+    -- ★★ T6.4（解冻批次 #6）：§6.6 第三支，切主认领。
+    --
+    -- 顺序要害：**必须排在 dtx_close_indoubt 之后**。认领的判据是"流里没有
+    -- 提交标记 ⇒ 从未提交过 ⇒ 改 ABORTED"，而未决的 2PC 分片 xid 在
+    -- follower 上是 TXN_PREPARED（回放的 XLOG_XACT_PREPARE 分支写的），
+    -- 认领本身不动 PREPARED；先闭合是为了让**有决议的**先落成终局，
+    -- 剩下的才交给认领兜底。反过来做，语义上仍不会误伤（PREPARED 受保护），
+    -- 但会把本可立刻定案的事务多晾一轮。
+    --
+    -- 同样尽力而为：认领失败不挡升主，但留 WARNING。未认领的后果是那些
+    -- 无主 RUNNING 继续挂着（未决即不可见，方向安全），下轮仍有机会。
+    BEGIN
+        PERFORM partdist.shard_claim_on_promote(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主认领无主 RUNNING shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+
     RETURN 1;
 END
 $promo$;
 
 COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
-    '升主前置：先查快路径分叉，再确认"无槽位"不是"带陈旧数据的旧主回归"（R-P4-15），然后把本节点该分片的物理回放追平到 Raft 已提交位点，最后闭合 in-doubt 分布式事务。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=分叉或收到了却回放不了（永不放行，须重做物理基线）。';
+    '升主前置：先查快路径分叉，再确认"无槽位"不是"带陈旧数据的旧主回归"（R-P4-15），然后把本节点该分片的物理回放追平到 Raft 已提交位点；追平后依次推进本地 WAL 插入位点越过 max_orig_lsn（T6.3b，不做则升主后写入会在一次本地崩溃后被 lsn<=PageGetLSN 跳过而消失）、闭合 in-doubt 分布式事务、认领无主 RUNNING 改判 ABORTED（T6.4，§6.6 第三支）。后三步均尽力而为、失败只 WARNING 不挡升主。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=分叉或收到了却回放不了（永不放行，须重做物理基线）。';
 
 -- ------------------------------------------------------------------
 -- 快路径分叉检测（DTX_2PC_DESIGN.md §9.5，第 6 步 b）

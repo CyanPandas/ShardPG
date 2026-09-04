@@ -1060,6 +1060,72 @@ ShardXidRedoAdvance(Oid shard, TransactionId sxid)
  * T2.4：确保某分片本次启动已完成无主 RUNNING 认领（可见性读路径入口）。
  * 槽位存在即已认领（不变式），快路径共享锁一次扫描。返回本次改判条数。
  */
+/*
+ * ShardXidClaimOnPromote —— §6.6 第三支：**切主认领**（T6.4）。
+ *
+ * 判据是设计原文那句，干净且可证：
+ *
+ *   > 新主追平后流里没有该事务的提交标记 ⇒ 从未提交过 ⇒ 改 ABORTED 安全。
+ *   > 依据：提交的必要条件是提交标记已多数派入流（[A]<[B] + 多数派先于本地
+ *   > 提交），raft 选举保证新主拥有全部多数派条目。
+ *
+ * **与 T2.4 那一支的区别，正是本函数存在的理由**：ShardXidEnsureClaimed() 只在
+ * "槽位不存在"时认领（挂槽即认领，见上面的不变式）。而升主的 follower 上槽位
+ * **一定已经存在** —— 回放推进分片分配器水位时就把它挂上了（T6.5）。于是那条
+ * 路径直接 return 0，一条都不认领。切主必须有自己的入口，强制对
+ * [claim_wm, watermark) 再扫一遍。
+ *
+ * **上界为什么取 watermark 而不是 next_xid**：watermark 是**持久发号水位**
+ * （P5 交付），按批次向上取整，比 next_xid 宽出至多一个批次。follower 只能从
+ * "入了流的 MARKER"学到号，而 leader 上中止且字节未入流的事务会悄悄吃掉号 ——
+ * 宽的那个正好把这段窗口盖住。这就是"水位是认领的输入、认领是水位的兜底"
+ * （U-P5-1 残留格的配套关系）：两件事必须同期做完，单做任一件都留口子。
+ *
+ * **PREPARED 一根汗毛都不动**：ShardClogClaimRange 只改 RUNNING（含空洞槽），
+ * 这是 §6.6 第二支。未决的 2PC 分片 xid 在 follower 上由回放
+ * （shard_replay.c 的 XLOG_XACT_PREPARE 分支）写成 TXN_PREPARED，因此不会被
+ * 本函数误判成中止 —— 否则一笔后来被判 COMMIT 的分布式事务会在这一分片上丢掉。
+ * 调用方仍应把 dtx_close_indoubt() 排在本函数**之前**，让有决议的先落终局。
+ *
+ * 返回本次改判的条数。
+ */
+int
+ShardXidClaimOnPromote(Oid shard)
+{
+	ShardXidSlot *slot;
+	TransactionId from;
+	TransactionId to;
+	int			n = 0;
+
+	if (ShardXidCtl == NULL)
+		return 0;				/* shmem 未起（防御） */
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+
+	/* 槽位不在就按老路挂（挂槽本身即认领一次），在就强制再扫一遍 */
+	slot = shard_xid_slot_attach(shard, &n);
+
+	from = slot->claim_wm;
+	to = slot->watermark;
+
+	if (from < to)
+	{
+		n += ShardClogClaimRange(shard, from, to);
+
+		/*
+		 * 顺序同 ShardXidSetVacuumWatermarks 的要害注释：**先落盘、成功了才
+		 * 更新槽位**。ERROR 会中止事务但不会回滚 shmem，反过来写就会让
+		 * "被拒绝的写"照样从读接口里看得见。
+		 */
+		shard_xid_persist_watermark(shard, slot->watermark, to,
+									slot->trunc_before, slot->vacuum_xid);
+		slot->claim_wm = to;
+	}
+
+	LWLockRelease(ShardXidCtl->lock);
+	return n;
+}
+
 int
 ShardXidEnsureClaimed(Oid shard)
 {

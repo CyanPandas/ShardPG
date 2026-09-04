@@ -1,0 +1,206 @@
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 03d26e24d2..e8e3d969df 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -522,6 +522,20 @@ typedef struct XLogCtlData
+ 	 */
+ 	RecoveryState SharedRecoveryState;
+ 
++	/*
++	 * pg_partdist 补丁 0010（升主推进本地 WAL 插入位点）。
++	 *
++	 * 物理回放出来的副本页携带的是 **leader 坐标**的 LSN；该分片一旦升主，
++	 * 页面改由本地 XLogInsert 保护。若本地插入位点低于页面现有 LSN，新记录的
++	 * LSN 就小于页 LSN，本地崩溃恢复时 `lsn <= PageGetLSN(page)` 会**错误跳过
++	 * 新记录** ⇒ 数据丢失。所以升主时要把本地插入位点跳过 max_orig_lsn。
++	 *
++	 * 这里只存"待跳到哪"，真正的跳跃在 CreateCheckPoint 持有全部插入锁的那段
++	 * 临界区里做 —— 见 XLogAdvancePendingInsertPosition() 的注释，那是本设计
++	 * 唯一能做到"零窗口"的位置。Protected by info_lck.
++	 */
++	XLogRecPtr	pendingAdvanceTo;
++
+ 	/*
+ 	 * InstallXLogFileSegmentActive indicates whether the checkpointer should
+ 	 * arrange for future segments by recycling and/or PreallocXlogFiles().
+@@ -694,6 +708,7 @@ static char *GetXLogBuffer(XLogRecPtr ptr, TimeLineID tli);
+ static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
+ static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
+ static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
++static bool XLogAdvancePendingInsertPosition(void);	/* 补丁 0010 */
+ 
+ static void WALInsertLockAcquire(void);
+ static void WALInsertLockAcquireExclusive(void);
+@@ -1768,6 +1783,131 @@ XLogRecPtrToBytePos(XLogRecPtr ptr)
+ 	return result;
+ }
+ 
++/*
++ * XLogRequestInsertPositionAdvance —— 请求把本地 WAL 插入位点推进到 target 之后。
++ *
++ * pg_partdist 补丁 0010（FRD §11 步骤 4）。语义类似 `pg_resetwal -l`，但在线执行。
++ *
++ * **为什么不能就地跳完就返回**：跳跃之后、下一个检查点之前，pg_control 里的
++ * redo 位点仍指着旧段。此刻若崩溃，恢复从旧 redo 往前走，读到旧段末尾就断了
++ * ——新段里那些已经 fsync 的记录（包括已提交事务）**一条都读不到**，等于丢数据。
++ * 所以跳跃必须与"写出一条检查点记录"原子发生。
++ *
++ * 做法：把目标记在共享内存里，然后请一次**强制且立即**的检查点。真正的跳跃在
++ * CreateCheckPoint 持有全部插入锁的那段临界区里完成，紧接着算出的
++ * checkPoint.redo 就落在新段内 —— 期间没有任何后端能插入记录。窗口为零。
++ */
++void
++XLogRequestInsertPositionAdvance(XLogRecPtr target)
++{
++	if (XLogRecPtrIsInvalid(target))
++		return;
++
++	if (RecoveryInProgress())
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("恢复过程中不能推进 WAL 插入位点")));
++
++	SpinLockAcquire(&XLogCtl->info_lck);
++	if (XLogCtl->pendingAdvanceTo < target)
++		XLogCtl->pendingAdvanceTo = target;
++	SpinLockRelease(&XLogCtl->info_lck);
++
++	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
++}
++
++/*
++ * XLogAdvancePendingInsertPosition —— 真正把插入位点搬到新段起点。
++ *
++ * **只允许由 CreateCheckPoint 在持有全部插入锁时调用**，且必须排在"空闲跳过
++ * 检查"之后：跳过的那条路径不写检查点记录，若在它之前消费掉待跳目标，就正好
++ * 制造出上面那个"跳了却没有检查点"的丢数据窗口。
++ *
++ * 返回 true 表示位点确实动了，调用方需要重算 curInsert。
++ */
++static bool
++XLogAdvancePendingInsertPosition(void)
++{
++	XLogRecPtr	target;
++	XLogRecPtr	curEnd;
++	XLogRecPtr	newptr;
++	XLogSegNo	segno;
++	XLogwrtRqst WriteRqst;
++	int			i;
++
++	SpinLockAcquire(&XLogCtl->info_lck);
++	target = XLogCtl->pendingAdvanceTo;
++	XLogCtl->pendingAdvanceTo = InvalidXLogRecPtr;
++	SpinLockRelease(&XLogCtl->info_lck);
++
++	if (XLogRecPtrIsInvalid(target))
++		return false;
++
++	/* 持有全部插入锁 ⇒ 没有在途插入，这两个字段此刻是静止的 */
++	curEnd = XLogBytePosToEndRecPtr(XLogCtl->Insert.CurrBytePos);
++	if (curEnd > target)
++	{
++		ereport(LOG,
++				(errmsg("pg_partdist: 本地 WAL 插入位点 %X/%X 已越过目标 %X/%X，无需推进",
++						LSN_FORMAT_ARGS(curEnd), LSN_FORMAT_ARGS(target))));
++		return false;
++	}
++
++	/*
++	 * 落点取"目标所在段的**下一段**起点"：既保证严格大于 target，又落在段边界
++	 * 上——段边界是唯一能干净起头的位置（第一页带长页头，AdvanceXLInsertBuffer
++	 * 会照常初始化它）。
++	 */
++	XLByteToSeg(target, segno, wal_segment_size);
++	segno++;
++	XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, newptr);
++
++	/*
++	 * 先把现存 WAL 全部写出并 fsync：位点一跳，这些缓冲页就再没人写了，
++	 * 不先落盘就是真丢。持插入锁再取 WALWriteLock 是既有加锁序
++	 * （AdvanceXLInsertBuffer 正是这么做的），不会与谁反序。
++	 */
++	WriteRqst.Write = curEnd;
++	WriteRqst.Flush = curEnd;
++	LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
++	XLogWrite(WriteRqst, XLogCtl->InsertTimeLineID, false);
++	LWLockRelease(WALWriteLock);
++
++	/*
++	 * 搬位点。范本是 StartupXLOG 收尾处那段。
++	 *
++	 * ★ PrevBytePos 取**旧的 curEnd**，不是 newptr。跳跃后的第一条记录会被崩溃
++	 * 恢复以"随机访问"方式读到（recovery 从 checkPoint.redo 起读），
++	 * xlogreader.c 的 ValidXLogRecordHeader 对随机访问校验的是
++	 * `xl_prev < RecPtr`。若把 PrevBytePos 也设成 newptr，xl_prev 就等于记录
++	 * 自身地址，该校验判负 ⇒ "record with incorrect prev-link"，恢复就停在这。
++	 */
++	SpinLockAcquire(&XLogCtl->Insert.insertpos_lck);
++	XLogCtl->Insert.PrevBytePos = XLogRecPtrToBytePos(curEnd);
++	XLogCtl->Insert.CurrBytePos = XLogRecPtrToBytePos(newptr);
++	SpinLockRelease(&XLogCtl->Insert.insertpos_lck);
++
++	/* 缓冲区整体作废：跳过的那段页永不初始化，也绝不该被写出去 */
++	for (i = 0; i <= XLogCtl->XLogCacheBlck; i++)
++		XLogCtl->xlblocks[i] = InvalidXLogRecPtr;
++	XLogCtl->InitializedUpTo = newptr;
++
++	XLogCtl->LogwrtResult.Write = newptr;
++	XLogCtl->LogwrtResult.Flush = newptr;
++	LogwrtResult = XLogCtl->LogwrtResult;
++	XLogCtl->LogwrtRqst.Write = newptr;
++	XLogCtl->LogwrtRqst.Flush = newptr;
++
++	ereport(LOG,
++			(errmsg("pg_partdist: 本地 WAL 插入位点自 %X/%X 推进到 %X/%X（越过 leader 坐标 %X/%X）",
++					LSN_FORMAT_ARGS(curEnd), LSN_FORMAT_ARGS(newptr),
++					LSN_FORMAT_ARGS(target)),
++			 errdetail("跳过的 WAL 段号成为永久空洞：本地崩溃恢复不受影响（检查点 redo 已落在新段内），"
++					   "但原生归档/PITR 在此处断链，须以本次升主为界重取基础备份。")));
++
++	return true;
++}
++
+ /*
+  * Initialize XLOG buffers, writing out old buffers if they still contain
+  * unwritten data, upto the page containing 'upto'. Or if 'opportunistic' is
+@@ -4636,6 +4776,7 @@ XLOGShmemInit(void)
+ 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_CRASH;
+ 	XLogCtl->InstallXLogFileSegmentActive = false;
+ 	XLogCtl->WalWriterSleeping = false;
++	XLogCtl->pendingAdvanceTo = InvalidXLogRecPtr;	/* 补丁 0010 */
+ 
+ 	SpinLockInit(&XLogCtl->Insert.insertpos_lck);
+ 	SpinLockInit(&XLogCtl->info_lck);
+@@ -6584,6 +6725,19 @@ CreateCheckPoint(int flags)
+ 		}
+ 	}
+ 
++	/*
++	 * ★ pg_partdist 补丁 0010：升主推进本地 WAL 插入位点（FRD §11 步骤 4）。
++	 *
++	 * 位置是本设计的关键，不能挪：
++	 *   - 必须在**空闲跳过检查之后** —— 那条路径直接 return，不写检查点记录；
++	 *     在它之前跳，就制造出"跳了却没有检查点"的丢数据窗口。
++	 *   - 必须在**持有全部插入锁期间** —— 跳完紧接着算 checkPoint.redo，
++	 *     redo 直接落在新段内，期间没有后端能插入。窗口为零。
++	 * 位点动过就要重算 curInsert，否则 redo 还指着旧段。
++	 */
++	if (XLogAdvancePendingInsertPosition())
++		curInsert = XLogBytePosToRecPtr(Insert->CurrBytePos);
++
+ 	/*
+ 	 * An end-of-recovery checkpoint is created before anyone is allowed to
+ 	 * write WAL. To allow us to write the checkpoint record, temporarily
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index 6fd5b3dfa6..faa4fc2a8e 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -199,6 +199,8 @@ extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
+ 								   int num_fpi,
+ 								   bool topxid_included);
+ extern void XLogFlush(XLogRecPtr record);
++/* pg_partdist 补丁 0010：在线推进本地 WAL 插入位点（升主，FRD §11 步骤 4） */
++extern void XLogRequestInsertPositionAdvance(XLogRecPtr target);
+ extern bool XLogBackgroundFlush(void);
+ extern bool XLogNeedsFlush(XLogRecPtr record);
+ extern int	XLogFileInit(XLogSegNo logsegno, TimeLineID logtli);

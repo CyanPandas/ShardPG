@@ -61,6 +61,8 @@ extern TransactionId ShardXidMineForShard(Oid shard);
 /* T2.4：确保该分片本次启动已完成无主 RUNNING 认领（槽位存在=已认领）。
  * 发号路径自动触发；可见性读路径在咨询 clog 前调用。返回本次改判条数。 */
 extern int	ShardXidEnsureClaimed(Oid shard);
+/* T6.4：§6.6 第三支，切主认领（强制重扫 [claim_wm, watermark)） */
+extern int	ShardXidClaimOnPromote(Oid shard);
 
 /* T2.5：恢复期影子推进（0007 redo 钩子逐对喂入，startup 进程调用） */
 extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);

@@ -718,3 +718,62 @@ partdist_shard_clog_truncate(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(ShardClogTruncate(shard, trunc_before));
 }
+
+PG_FUNCTION_INFO_V1(partdist_shard_claim_on_promote);
+
+/*
+ * shard_claim_on_promote(shard oid) → int
+ *
+ * T6.4 / §6.6 第三支的 SQL 入口。升主路径（pg_raft_promote_prepare）在追平并
+ * 闭合 in-doubt 之后调用；验收也用它单独驱动认领。返回改判条数。
+ */
+Datum
+partdist_shard_claim_on_promote(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+
+	PG_RETURN_INT32((int32) ShardXidClaimOnPromote(shard));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_clog_set_prepared);
+
+/*
+ * 验收探针：直接把某分片 xid 写成 TXN_PREPARED。
+ *
+ * 不去放宽 partdist_shard_clog_write() 的 status 白名单 —— 那道"PREPARED 是
+ * P4 的事"的守卫是故意的，为了一条测试把它松掉，等于用验收去磨产品的棱角。
+ * T6.4 需要 PREPARED 只是为了做**阴性对照**（认领必须不动它，§6.6 第二支），
+ * 单开一个探针最小且不影响任何产品路径。
+ */
+Datum
+partdist_shard_clog_set_prepared(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+
+	ShardClogSetPrepared(shard, sxid, 1, 1);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_xid_raise_watermark);
+
+/*
+ * 验收探针：直接抬高本分片的发号水位（等价于回放消费一条更高水位的 MARKER）。
+ *
+ * 为什么用探针而不是"真烧一整批号"：水位按 SHARD_XID_BATCH(4096) 成批推进，
+ * 挂槽那一刻 claim_wm 与 watermark 相等，缺口要等 leader 烧掉**整整 4096 笔
+ * 事务**才张开。实测在本环境跑 4200 笔自动提交事务要 31 秒（还只是普通表，
+ * 分片表叠上 raft 复制到分钟级），而这段代价换不来任何新覆盖 ——
+ * "真 MARKER 路径确实会抬水位"已由 T6.5 的 test_xid_watermark_p6.sh 证过
+ * （17/0，含"水位确实在动"的正向断言）。本探针只把同一份状态确定性地摆好，
+ * 让 T6.4 能专心验它自己的那件事：给定缺口，认领改判谁、不动谁。
+ */
+Datum
+partdist_shard_xid_raise_watermark(PG_FUNCTION_ARGS)
+{
+	Oid			shard = PG_GETARG_OID(0);
+	TransactionId wm = (TransactionId) PG_GETARG_INT64(1);
+
+	ShardXidRaiseAllocWatermark(shard, wm);
+	PG_RETURN_VOID();
+}

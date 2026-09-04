@@ -1848,3 +1848,72 @@ pg_partdist_replay_catchup(PG_FUNCTION_ARGS)
 
     PG_RETURN_INT64((int64) ShardReplayCatchUp(relid, bound, timeout_ms));
 }
+
+PG_FUNCTION_INFO_V1(pg_partdist_advance_wal_past_shard);
+
+/*
+ * advance_wal_past_shard(shard regclass) → pg_lsn
+ *
+ * T6.3b / FRD §11 步骤 4：升主时把**本地** WAL 插入位点推进到该分片
+ * `max_orig_lsn`（已应用的最大 leader 坐标 end LSN）之后。
+ *
+ * **为什么非做不可**：物理回放出来的副本页带的是 leader 坐标的 LSN。分片一旦
+ * 升主，这些页改由本地 XLogInsert 保护；若本地插入位点还低于页面现有 LSN，
+ * 新记录的 LSN 就小于页 LSN，本地崩溃恢复时 `lsn <= PageGetLSN(page)` 那道
+ * 闸门会**把新记录当成"页面已经更新过"直接跳过** —— 升主后写进去的数据在一次
+ * 崩溃后凭空消失。位点越过之后，"页面 LSN 单调递增"这条不变式才重新成立。
+ *
+ * 返回推进后的插入位点；本节点没有该分片的回放游标时返回 NULL（无事可做，
+ * 不是错误：一直是本组 leader 的节点走的就是这条路）。
+ */
+Datum
+pg_partdist_advance_wal_past_shard(PG_FUNCTION_ARGS)
+{
+    Oid              relid = PG_GETARG_OID(0);
+    ShardApplyCheckpoint chk;
+
+    if (!ReadApplyCheckpoint(relid, &chk, NULL))
+        PG_RETURN_NULL();
+
+    if (XLogRecPtrIsInvalid(chk.max_orig_lsn))
+        PG_RETURN_NULL();
+
+    /*
+     * 内核补丁 0010。它内部会请一次强制且立即的检查点，跳跃就发生在那次
+     * 检查点持有全部插入锁的临界区里 —— 跳完紧接着算出的 redo 落在新段内，
+     * 「跳了却没有检查点」的丢数据窗口因此为零。
+     */
+    XLogRequestInsertPositionAdvance(chk.max_orig_lsn);
+
+    PG_RETURN_LSN(GetXLogInsertRecPtr());
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_advance_wal_to);
+
+/*
+ * advance_wal_to(target pg_lsn) → pg_lsn
+ *
+ * FRD §11 步骤 4 点名的原语，内核补丁 0010 的直接入口。
+ * advance_wal_past_shard() 只是"target 取该分片 max_orig_lsn"的薄封装。
+ *
+ * 单独暴露它的理由有二：① 运维取证/兜底时需要能手工推进；② 这是**唯一**能把
+ * 位点跳跃与回放夹具解耦、单独验收内核补丁的手段——否则每验一次都要先搭一整套
+ * leader/follower。
+ *
+ * 限超级用户：跳过的 WAL 段号是永久空洞，原生归档/PITR 会在此断链。
+ */
+Datum
+pg_partdist_advance_wal_to(PG_FUNCTION_ARGS)
+{
+    XLogRecPtr  target = PG_GETARG_LSN(0);
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("advance_wal_to() 限超级用户"),
+                 errdetail("跳过的 WAL 段号成为永久空洞，原生归档/PITR 在此断链。")));
+
+    XLogRequestInsertPositionAdvance(target);
+
+    PG_RETURN_LSN(GetXLogInsertRecPtr());
+}

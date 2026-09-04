@@ -1100,6 +1100,36 @@ CREATE OR REPLACE FUNCTION replay_catchup(
 COMMENT ON FUNCTION replay_catchup(REGCLASS, BIGINT, INTEGER) IS
     '惰性回放触发入口：把该副本追平到 p_upto（NULL=本地全部字节；升主时传 Raft commit_index），同步等待完成，返回追平后的 applied_part_lsn。';
 
+-- ------------------------------------------------------------------
+-- T6.3b：升主推进本地 WAL 插入位点（FRD §11 步骤 4，内核补丁 0010）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION advance_wal_past_shard(
+    p_local_shard REGCLASS
+) RETURNS PG_LSN LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_advance_wal_past_shard';
+
+CREATE OR REPLACE FUNCTION advance_wal_to(
+    p_target PG_LSN
+) RETURNS PG_LSN LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_advance_wal_to';
+
+COMMENT ON FUNCTION advance_wal_to(PG_LSN) IS
+    'FRD §11 步骤 4 的原语（内核补丁 0010）：把本地 WAL 插入位点在线推进到 p_target 之后的段边界。跳跃发生在一次强制检查点持有全部插入锁的临界区内，因此不存在"跳了却没有检查点"的丢数据窗口。跳过的 WAL 段号成为永久空洞：本地崩溃恢复不受影响，原生归档/PITR 在此断链。限超级用户。';
+
+-- ------------------------------------------------------------------
+-- T6.4：§6.6 第三支，切主认领
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION shard_claim_on_promote(
+    p_shard OID
+) RETURNS INTEGER LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_claim_on_promote';
+
+COMMENT ON FUNCTION shard_claim_on_promote(OID) IS
+    '升主收尾：把该分片 [claim_wm, watermark) 区间内仍是 RUNNING（含空洞）的分片 xid 一律改判 ABORTED——新主追平后流里没有提交标记即从未提交过。PREPARED 不动（§6.6 第二支），调用方须先 dtx_close_indoubt。与 T2.4 的挂槽认领不同：升主的 follower 上槽位一定已存在（回放推水位时就挂了），那条路径一条都不认领，所以切主必须有自己的入口。返回改判条数。';
+
+COMMENT ON FUNCTION advance_wal_past_shard(REGCLASS) IS
+    '升主前置：把本地 WAL 插入位点推进到该分片 max_orig_lsn（已应用的最大 leader 坐标 LSN）之后。不做的后果是升主后写入的数据在一次本地崩溃后消失——新记录 LSN 小于页面携带的 leader LSN，恢复时被 lsn <= PageGetLSN 当作"已更新过"跳过。返回推进后的插入位点；本节点没有该分片回放游标时返回 NULL。';
+
 -- ==================================================================
 -- 增强型 CLOG（pg_gclog）核账入口（R2-d）
 -- ==================================================================

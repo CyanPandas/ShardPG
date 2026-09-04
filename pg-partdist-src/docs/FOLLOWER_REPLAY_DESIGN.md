@@ -1051,8 +1051,9 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
    > `[A] → quorum → [B]` 时序,存在"组内已提交、leader 本地 `[B]` 前崩溃"的窗口
    > ⇒ 旧 leader 与自己的组分叉。**旧 leader 归队时对检测到状态分叉的分片必须强制
    > 重做物理基线**(§8.5 的 fail-safe 路径),不能直接按游标追平。
-4. **推进本地 WAL 插入位点**越过 `max_orig_lsn`(内核补丁 0003,
-   `pg_partdist_advance_wal_to(XLogRecPtr)`:语义类似 pg_resetwal 的 `-l` 但在线执行
+4. **推进本地 WAL 插入位点**越过 `max_orig_lsn`(**内核补丁 0010**,
+   `partdist.advance_wal_to(pg_lsn)` / `partdist.advance_wal_past_shard(regclass)`:
+   语义类似 pg_resetwal 的 `-l` 但在线执行
    ——持有全部 WALInsertLock,把 insert 位置跳到目标 LSN 所在段起点并切段)。
    必要性:提升后该 shard 页面开始由本地 `XLogInsert` 保护;若本地位点低于页 LSN,
    新记录 LSN 小于页面现有 LSN,本地崩溃恢复时 `lsn <= PageGetLSN` 会**错误跳过
@@ -1067,6 +1068,24 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
    > (b) `max_wal_size` / `wal_keep_size` 的账目按 LSN 距离计算,一次大跳跃会让
    > checkpoint 触发逻辑瞬间失真;(c) 已有的物理备库(如果该节点自身还带 standby)
    > 会在位点跳跃处断流,须重建。R4 立项时必须先出这三项的处置结论。
+   >
+   > **★ 已出结论(2026-09-04,T6.3b,解冻批次 #6)** —— 详见
+   > `patches/README.md` 的"0010 的运维裁定"一节:
+   > (a) **接受并写成运维规程**:每次升主后以该时刻为界重取基础备份。理由是
+   > 本方案的高可用不建立在原生归档上(§10 已裁定"分片表原生流复制热备读:
+   > 本来就不用"),而正确性上没有第二条路 —— 位点不推进,升主后写入的数据会在
+   > 一次本地崩溃后被 `lsn <= PageGetLSN` 静默跳过。用**可恢复的运维代价**换
+   > **不可恢复的数据损失**。
+   > (b) **无需额外处置**:跳跃本身以一次强制检查点收尾(零窗口设计的副产品),
+   > 账目在同一刻即被重置,失真窗口长度为零。
+   > (c) **不支持**在参与 raft 分区组的节点上挂原生物理备库,与 (a) 同源。
+   >
+   > **实装要点(与本条原文的差异)**:跳跃不是"就地跳完返回",而是被塞进
+   > `CreateCheckPoint` 持有全部插入锁的临界区。就地跳完会留下一个窗口:
+   > pg_control 的 redo 还指着旧段,此刻崩溃则新段里已 fsync 的记录(含已提交
+   > 事务)一条都读不回来。塞进检查点临界区后,跳完紧接着算出的 `checkPoint.redo`
+   > 就落在新段内,窗口为零。验收:`test_promote_p6.sh` 的 [2d] 直接 kill -9
+   > 取证 —— 恢复日志 `redo starts at` 落在新段、500 行一行不少、无 prev-link 断链。
 5. **路由切换**:`PartDistRoutePromote(shard_oid, W = max_replayed_fxid)`——
    角色置 `SHARD_PROMOTED`、登记水位,同一临界区原子生效。此后写路由切到本节点,
    `wal_insert_hook` 开始为其捕获新流,`partition_lsn` 从 Raft log index 继续。
