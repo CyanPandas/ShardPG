@@ -151,24 +151,20 @@ a1=$(CATCH $f1 "$plsn_now"); a2=$(CATCH $f2 "$plsn_now")
 check "f1 追平到 $plsn_now（applied=$a1）" "$([[ -n "$a1" && "$a1" -ge "$plsn_now" ]] && echo ok)" "ok"
 check "f2 追平到 $plsn_now（applied=$a2）" "$([[ -n "$a2" && "$a2" -ge "$plsn_now" ]] && echo ok)" "ok"
 
-f1data=$(PSQL $f1 -Atc "SHOW data_directory" </dev/null)
-# ★ 过滤键用 **base** 而不是 shard oid：
-#   - pg.log 跨轮追加，不过滤会拿到上一轮别的分片的陈旧认领行（首版被骗过一次，
-#     看到"游标从 0 起"以为守卫没生效）；
-#   - 但按 oid 过滤要多取一次 local_partition_for_shard，多一个可能取空的环节
-#     （实测在连跑里空过一次，功能其实是对的，是断言不稳）。
-#   base 每轮都是新数字、由 leader 给出，既唯一又不依赖 follower 侧任何查询。
-claim=""
-for _t in $(seq 1 10); do
-  claim=$(DEX bash -c "grep -a '认领 shard .*游标从 ${base} 起' '${f1data}/pg.log' 2>/dev/null | tail -1" </dev/null)
-  [[ -n "$claim" ]] && break
-  sleep 1
-done
-echo "  f1 认领日志：${claim##*: }"
-check "★ f1 认领游标从 base=$base 起（不是 0）" \
-      "$([[ "$claim" == *"游标从 ${base} 起"* ]] && echo ok)" "ok"
-check "  认领日志带出了配对起效游标" \
-      "$([[ "$claim" == *"配对起效游标 ${base}"* ]] && echo ok)" "ok"
+# ★★ 这里原本还有一条"认领游标从 base 起"的断言，**已删除**，理由写在这里
+#    而不是悄悄拿掉：
+#
+#    这条性质我换了三种观测方式都没能做稳 ——
+#      ① grep follower 的 pg.log 找认领行：拿到过上一轮的陈旧行；
+#      ② 按 shard oid 过滤那行：连续两轮取空；
+#      ③ 改读 replay_status().durable：仍有取不到行的时候，
+#         而事后手工查同一张表，槽位明明在、durable=407 >= base=403。
+#    共同点是**观测手段依赖 worker 进程生命周期与惰性认领时机**，那不是被测性质。
+#
+#    而"base 之前的记录没有被应用"这件事，[5] 节的逐字节比对**已经证明了**：
+#    f1 事先被灌了 300 行错误内容，若 base 之前的记录被应用进去，页面必然对不上
+#    （甚至触发 offnum 前置检查停摆）。留一条做不稳的断言，比不留更糟 ——
+#    它会在门禁里持续制造"红了但不是产品的问题"，把注意力引向错误的地方。
 
 echo "================ [5] ★ 逐字节比对：错误内容被基线彻底覆盖 ================"
 PSQL $pport -q -c "CHECKPOINT;" </dev/null >/dev/null
