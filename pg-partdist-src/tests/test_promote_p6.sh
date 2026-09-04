@@ -155,7 +155,12 @@ check "★★ 插入位点已越过 max_orig_lsn" \
 #   只断言 insert_lsn 变大的话，"跳了却没有检查点"那种丢数据实现照样满分。
 check "★★ 检查点 redo 也已越过 max_orig_lsn（零窗口的判据）" \
       "$(PSQL $f1 -Atc "SELECT '${F_REDO1}'::pg_lsn > '${MAXORIG}'::pg_lsn" </dev/null)" "t"
-check "  返回值就是推进后的插入位点" "$RET" "$F_INS1"
+# ★ 不能断言"返回值 == 随后查到的插入位点"：两次查询之间集群还在写 WAL
+#   （raft 心跳等），单跑时空闲恰好相等，进了批次就必红（实测 T6.8 出口门禁
+#   4/1C00CF08 vs 4/1C00D050）。**判据要写成对时序不敏感的形式**：
+#   返回值必须落在跳跃后那个新段内，且不大于随后读到的位点（单调）。
+check "  返回值落在新段内且单调不超过随后读数" \
+      "$(PSQL $f1 -Atc "SELECT ('${RET}'::pg_lsn <= '${F_INS1}'::pg_lsn) AND ('${RET}'::pg_lsn > '${MAXORIG}'::pg_lsn)" </dev/null)" "t"
 
 echo "================ [2b] 幂等：再调一次不该再跳 ================"
 RET2=$(PSQL $f1 -Atc "SELECT partdist.advance_wal_past_shard(${foid}::regclass)" </dev/null|tail -1)
@@ -305,6 +310,16 @@ PSQL $f1 -q -c "DROP TABLE IF EXISTS t63b_dur" </dev/null >/dev/null 2>&1
 PSQL $pport -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids" </dev/null >/dev/null 2>&1
 PSQL $pport -q -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1
 PSQL $COORD -q -c "DROP TABLE IF EXISTS t63b" </dev/null >/dev/null 2>&1
+# ★ partition_map 与 pg_shard_xid 也要清。首版漏了这两样（既有套件都做，
+#   见 test_shard_pagecmp_p1.sh 的收尾），实测把出口门禁的 shard_identity_p0
+#   打成 8/2 —— 它比对"登记了几个分片 vs 实际存在几个"，孤儿登记行直接判红。
+#   pg_shard_xid 槽位更狠：只增不减且有 64 硬上限，跨过之后该节点**所有**打标
+#   验收都在登记那步死，报错与被测内容毫无关系（R-P6-4）。
+for p in $COORD $pport $f1 $f2; do
+  PSQL $p -q -c "DELETE FROM partdist.partition_map WHERE partition_id=${gid};" </dev/null >/dev/null 2>&1
+done
+PDATA=$(PSQL $pport -Atc "SHOW data_directory" </dev/null 2>/dev/null)
+[[ -n "${PDATA:-}" && -n "${SOID:-}" ]] && DEX rm -f "${PDATA}/pg_shard_xid/${SOID}" </dev/null 2>/dev/null
 check "清理完成" "ok" "ok"
 health_check_no_crash && { echo "  PASS  本轮无节点崩溃（signal 11/6 或 PANIC）"; PASS=$((PASS+1)); } \
                      || { echo "  FAIL  本轮有节点崩溃"; FAIL=$((FAIL+1)); }

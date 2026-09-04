@@ -35,6 +35,7 @@ C="${CONTAINER:-pg-citus-tx2-container}"
 T="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT_DIR:-/tmp/p6_exit_$(date +%Y%m%d-%H%M%S)}"
 PORTS="$(seq 5432 5440)"
+COORD_PORT=5432
 mkdir -p "$OUT"
 
 DEX() { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" "$@"; }
@@ -60,6 +61,8 @@ SUITES=(
   "offnum_guard_p6        900  P6"
   "replica_gate_p6        900  P6"
   "xid_watermark_p6       900  P6"
+  "negative_p6            900  P6"
+  "promote_p6            1200  P6"
   # ── replay 时代（CONTAINER 覆盖到 tx2）
   "follower_replay_r1    1800  R1"
   "txn_layer_r2          1800  R2"
@@ -129,6 +132,12 @@ rotate_logs() {
     for d in coordinator worker1 worker2 worker3 worker4 worker5 worker6 worker7 worker8; do
       /work/pg-install/bin/pg_ctl -D /work/pg-cluster-data/$d -m fast stop -w -t 30 >/dev/null 2>&1
     done' >/dev/null 2>&1
+  # ★★ 纪元复位必须夹在"全停"与"拉起"之间。
+  #   boot_blocked 是 **postmaster 启动时** stat 一次写进共享内存的；只删文件
+  #   不重启，当前实例照样拒发号。而这里刚好是全批唯一一次"所有节点都停着"的
+  #   时刻，删完再拉起，整批就以一个干净纪元起跑。
+  docker exec -i -u postgres "$C" bash -lc \
+    'rm -f /work/pg-cluster-data/coordinator/pg_tso_boot' >/dev/null 2>&1
   docker exec -i -u postgres "$C" bash -lc "
     n=0
     for f in /work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log; do
@@ -211,9 +220,81 @@ ensure_nodes_up() {
   return 0
 }
 
+# ── ⑧ TSO 纪元按需复位（T6.8 补）──────────────────────────────
+#
+# ★★ 这是 T6.7 只做了一半的一件事。原来的 pre_suite 只给 tso_si_p3 复位纪元，
+#   可**所有要分片 xid 的套件**都吃这个前置：shard_xid_p1 / shard_clog_p2 /
+#   shard_gating_p4 / dtx_* / shard_vacuum_* / 全部 P6 套件。T6.7 那轮能过，
+#   是因为起跑时协调者恰好还没服务过、标记不在 —— 又是一次"顺序依赖冒充前置"，
+#   正是那段注释自己批评过的东西。
+#
+# 实测代价（2026-09-04 T6.8 首轮）：协调者在 T6.3b 重编 PG 时被重启过，
+# shard_xid_p1 当场 **18/27**，27 条红全是同一句
+#   `TSO 检测到上个纪元的 boot 标记（pg_tso_boot），拒绝发号`
+# —— 与被测内容毫无关系。
+#
+# ★ 判据不能用 partdist_tso_status()：它在 pg_partdist--1.0.sql 里**声明了，
+#   但本集群的扩展从没重建过，库里根本没有这个函数**（T6.8 审计出的
+#   "声明 vs 实装"差集之一）。
+#
+# 也不能只看"标记文件在不在"：`boot_blocked` 是 postmaster **启动那一刻**
+# stat 一次的结果。正常服务过的实例自己也会写下标记，此时文件在、却没被拦。
+#
+# 精确且零依赖的判据：**标记的 mtime 早于协调者的 postmaster 启动时刻**
+# ⇔ 标记在启动时就已存在 ⇔ boot_blocked。只在真被拦时才动手，
+# 不给每套件白搭一次协调者重启。
+tso_epoch_reset_if_blocked() {
+  local cdata i mtime started
+  cdata=$(PS 5432 -Atc "SHOW data_directory" </dev/null 2>/dev/null)
+  [[ -n "$cdata" ]] || return 0
+  mtime=$(DEX stat -c %Y "$cdata/pg_tso_boot" </dev/null 2>/dev/null)
+  [[ -n "$mtime" ]] || return 0            # 标记不在：本来就是干净纪元
+  started=$(PS 5432 -Atc "SELECT floor(extract(epoch FROM pg_postmaster_start_time()))::bigint" </dev/null 2>/dev/null)
+  [[ "$started" =~ ^[0-9]+$ ]] || return 0
+  [[ "$mtime" -lt "$started" ]] || return 0 # 标记是本实例自己写的：没被拦
+  DEX rm -f "$cdata/pg_tso_boot" </dev/null 2>/dev/null
+  DEX /work/pg-install/bin/pg_ctl -D "$cdata" -m fast -l "$cdata/pg.log" \
+      restart -w -t 40 </dev/null >/dev/null 2>&1
+  for i in $(seq 1 30); do
+    [[ "$(PS 5432 -Atc 'SELECT 1' </dev/null 2>/dev/null)" == "1" ]] && break
+    sleep 1
+  done
+  echo "  [净场] TSO 纪元被拦，已删标记并重启协调者（换新纪元）"
+}
+
+# ── ⑨ 孤儿 Citus prepared 事务（T6.8 补，实证）──────────────────
+#
+# ★★ 被中断的一批会留下 `citus_*` 的 2PC 未决事务，而 §9.2 **已经关掉了
+#   Citus 原生 2PC 恢复** —— 于是没有任何人会来清它们，那个 worker 上的 DDL
+#   从此永久阻塞。
+#
+# 实测（2026-09-04 T6.8）：worker1 上留了 4 个 `citus_0_*`，
+# `shard_identity_p0` 建引用表那一步直接挂满 600s 超时（0/0 早退）。
+# 现场指纹很好认：`pg_blocking_pids()` 返回 **0** —— 等的是一个**没有后端**
+# 的事务，也就是 prepared 事务。清掉之后同一套件立刻回到基线 10/0。
+#
+# 只回滚 `citus_%`：那是 Citus 内部 DDL 的 2PC，协调者没提交就等于没发生
+# （本次核对过协调者 `pg_dist_shard` 里确实没有对应表）。
+# **本方案自己的 DTX（gid 前缀不同）一概不碰** —— 它的判决在 raft 里，
+# 只能由恢复守护按决议闭合，验收脚本无权替它做主。
+purge_orphan_prepared() {
+  local p n total=0 g
+  for p in $PORTS; do
+    n=$(PS "$p" -Atc "SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'citus\\_%'" </dev/null 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || continue
+    for g in $(PS "$p" -Atc "SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'citus\\_%'" </dev/null 2>/dev/null); do
+      PS "$p" -q -c "ROLLBACK PREPARED '$g'" </dev/null >/dev/null 2>&1 && total=$((total+1))
+    done
+  done
+  [[ "$total" -gt 0 ]] && echo "  [净场] 回滚孤儿 Citus 2PC $total 笔（Citus 原生恢复已关，没人会清）"
+  return 0
+}
+
 scrub() {
   local p round
   ensure_nodes_up
+  tso_epoch_reset_if_blocked
+  purge_orphan_prepared
   for p in $PORTS; do
     PS "$p" -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;
                    ALTER SYSTEM RESET pg_partdist.tso_conninfo;
@@ -248,7 +329,19 @@ purge_leftovers() {
         | grep -oE 'dropped [0-9]+' | grep -oE '[0-9]+')
     total=$((total + ${n:-0}))
   done
-  echo "  [净场] 清理夹具残表 $total 张"
+  # ★ 分布式表 / 引用表 **从 worker 上 DROP 不掉**，必须走协调者。
+  #   实测残留 `p5repl`（P5 期的引用表）在 8 个 worker 上各留一张，
+  #   上面那圈 worker 侧 DROP 一张也清不掉，"清理后残表"永远停在 8。
+  local c
+  c=$(PS "$COORD_PORT" -Atc "DO \$do\$ DECLARE r record; k int := 0; BEGIN
+      FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace ns ON ns.oid=c.relnamespace
+                WHERE ns.nspname='public' AND c.relkind='r'
+                  AND (c.relname ~ '^t[0-9]{2}[a-z]' OR c.relname ~ '^p[0-9]') LOOP
+        BEGIN EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.relname); k := k + 1;
+        EXCEPTION WHEN OTHERS THEN NULL; END;
+      END LOOP; RAISE NOTICE 'dropped %', k; END \$do\$;" </dev/null 2>&1 \
+      | grep -oE 'dropped [0-9]+' | grep -oE '[0-9]+')
+  echo "  [净场] 清理夹具残表 $total 张（worker 侧）+ ${c:-0} 张（协调者侧，分布式/引用表）"
 }
 
 leftovers() {
@@ -293,6 +386,17 @@ prepare_env() {
 #   归一之后必须显式化，否则"换个顺序就红"这种事会一直发生。
 pre_suite() {
   case "$1" in
+    shard_xid_p1)
+      # ★★ 这套 P1 期的负向断言（"严格模式读/写被拦截"）**只在遗留模式下成立**。
+      #   ShardAccessGate 的 strict 分支判据是 `TsoGetStartTs() == 0` —— T3.6 已把
+      #   strict 从"一切拦截"收紧为"无 ts 读 / 无 gxid 写才拦"，TSO 一配置就自动
+      #   取号、strict 全放行。所以 tso_conninfo 非空时这几条必红，且连带
+      #   "负向用例未破坏数据"也红（那条 INSERT 真的写进去了）。
+      #   T6.7 那轮能过，只是因为跑到它时 worker1 的 tso_conninfo 恰好是空的
+      #   —— 又一次"顺序依赖冒充前置"（实测 T6.8 首轮 41/4，四条红同源）。
+      PS "${WPORT:-5433}" -q -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo;" </dev/null >/dev/null 2>&1
+      PS "${WPORT:-5433}" -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
+      ;;
     tso_si_p3)
       # TSO 计数器在共享内存 + boot 防呆标记：纪元必须干净，否则整套取号全红。
       # run_p5_exit.sh 靠"把它垫底 + 前面重启协调者"绕过，那是顺序依赖，不是前置。

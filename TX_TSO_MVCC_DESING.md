@@ -402,6 +402,34 @@ clog 行以 RUNNING 落账后、事务未到提交/中止时崩溃 ⇒ 该行永
   依据：提交的必要条件是提交标记已多数派入流（[A]<[B] + 多数派先于本地提交），
   raft 选举保证新主拥有全部多数派条目。
 
+> **实装（T6.4，2026-09-04，解冻批次 #6）**：三支各自的落点如下。
+>
+> | 分支 | 入口 | 触发点 |
+> |---|---|---|
+> | 普通事务（崩溃恢复） | `ShardXidEnsureClaimed()` → `shard_xid_slot_attach()` | 挂槽即认领，范围 `[claim_wm, ceiling)` |
+> | PREPARED | —— | `ShardClogClaimRange()` **只改 RUNNING**，非终局的 PREPARED 天然被跳过 |
+> | 切主 | `ShardXidClaimOnPromote()` → `partdist.shard_claim_on_promote(oid)` | `pg_raft_promote_prepare` 里，追平 + `dtx_close_indoubt` 之后 |
+>
+> **切主必须是独立入口**，不能复用第一支：`ShardXidEnsureClaimed()` 只在
+> **槽位不存在**时认领，而升主的 follower 上槽位一定已经存在 —— 回放推进分片
+> 分配器水位时就把它挂上了（§5.5 / T6.5）。复用的话那条路径直接 `return 0`，
+> 一条都不认领。
+>
+> **区间上界取发号水位 `watermark` 而不是 `next_xid`**：watermark 按批次
+> （`SHARD_XID_BATCH` = 4096）向上取整，比 next_xid 宽出至多一个批次。follower
+> 只能从"入了流的 MARKER"学到号，而 leader 上**中止且字节未入流**的事务会悄悄
+> 吃掉号 —— 宽的那个正好把这段窗口盖住。这就是 U-P5-1 那句
+> "**水位是认领的输入，认领是水位的兜底**"落成代码的样子：两件事必须同期做完，
+> 单做任一件都留口子。
+>
+> **顺序**：`dtx_close_indoubt()` 排在认领之前。认领本身不动 PREPARED（未决的
+> 2PC 分片 xid 在 follower 上由回放的 `XLOG_XACT_PREPARE` 分支写成
+> `TXN_PREPARED`），所以反过来做语义上也不会误伤；先闭合只是让**有决议的**先
+> 落终局，剩下的才交给认领兜底。
+>
+> 验收 `test_promote_p6.sh` 39/0，含一条**判别断言**（先证明第一支返回 0、
+> 够不着）与三条阴性对照（PREPARED / COMMITTED 不动）。
+
 ### 6.7 复制与持久化落地
 
 - vacuum **只在 leader 执行**；其页面修改本身就是页面变更，走 pg_parwal 流被

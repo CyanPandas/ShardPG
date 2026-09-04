@@ -306,6 +306,14 @@ typedef struct ReplayShardSlot
     bool    armed;          /* 允许被触发；false = 连触发都不受理 */
 
     /*
+     * T6.8：本节点已就该分片升主 ⇒ **它不再是别人的副本**，T6.3c 那道
+     * 「不许查询副本壳表」的闸门必须放行（闸门自己的 HINT 就写着"或升主后再读"）。
+     * 由 ShardXidClaimOnPromote() 在升主收尾处置位；不持久化 —— 重启后节点
+     * 若仍是 leader，升主路径会再跑一遍并重新置位，期间保持 fail-closed。
+     */
+    bool    promoted;
+
+    /*
      * locmap 代次：每次 replay_set_locmap() 重建配对就 +1。worker 拿它和
      * ctx 里那份比对，不同就重建 ctx —— 否则运维在结构栅栏之后补完结构、
      * 重跑了 replay_set_locmap()，worker 仍抱着内存里那张旧 loc_map，
@@ -381,6 +389,8 @@ extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
  * 以及 438 基线路径完全不受影响）。
  */
 extern bool ShardReplicaIsLocal(Oid relid);
+/* T6.8：升主收尾解除副本身份（闸门出口） */
+extern void ShardReplicaMarkPromoted(Oid relid);
 
 /* GUC：显式放行副本壳表的本地访问（默认 off；运维取证时才开） */
 extern bool allow_replica_access;

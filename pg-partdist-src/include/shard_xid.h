@@ -70,6 +70,8 @@ extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);
 /* T2.7：partition_map 驱动门控——运行时集合登记 + 水位文件预创建
  * （pg_shard_xid/ 目录 = 启动登记表，ShardXidShmemInit 扫描重建集合） */
 extern void ShardMvccSetAdd(Oid relid);
+/* R-P6-9：DROP 提交时把 OID 摘掉，否则 OID 复用会误伤无关表 */
+extern void ShardMvccSetRemove(Oid relid);
 extern void ShardMvccEnsureWatermarkFile(Oid relid);
 
 /* P1 数据保护拦截：VACUUM/ANALYZE/CLUSTER 点名白名单表一律 ERROR

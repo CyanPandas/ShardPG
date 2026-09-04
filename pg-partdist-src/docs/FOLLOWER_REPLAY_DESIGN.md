@@ -706,7 +706,7 @@ ShardReplayMarkerRecord(ShardReplayCtx *ctx, PartWALRecord *h, TxnMarkerPayload 
 
 ### 7.9 阶段五:回放收尾(升主场景)
 
-见 §11(依赖补丁 0003 与路由表,R4 阶段实现)。
+见 §11(依赖**内核补丁 0010** 与路由表;0010 已于 2026-09-04 T6.3b 实装,0003 号位按 patches/README.md 作废不复用)。
 
 ---
 
@@ -752,8 +752,9 @@ extern bool (*buffer_flush_lsn_exempt_hook)(const RelFileLocator *rlocator);
 先行条件在写页之前已满足。
 
 > 注意豁免的生命周期:升主后,旧页面在被本地 WAL 重新保护(首次修改产生 FPI)之前
-> 仍携带 leader 坐标 LSN。补丁 0003 把本地插入位点推过 `max_orig_lsn`(§11)后,
-> `XLogFlush(页LSN)` 自然可满足,豁免可随角色切换收敛为仅 FOLLOWER 角色生效。
+> 仍携带 leader 坐标 LSN。**内核补丁 0010**(T6.3b,原文写的 0003 号位已作废)
+> 把本地插入位点推过 `max_orig_lsn`(§11)后,`XLogFlush(页LSN)` 自然可满足,
+> 豁免可随角色切换收敛为仅 FOLLOWER 角色生效。
 
 ### 8.4 应用游标与崩溃恢复
 
@@ -1227,6 +1228,24 @@ worker 抱着旧表还是撞同一道栅栏。
    漏登记在 follower 侧以"未知 relfilelocator" PANIC 暴露(fail-fast,不静默漏)。
 2. **同源物理基线**:副本必须由 leader shard 物理拷贝初始化(拷贝时记下
    partition_lsn 静止点,增量从该游标重放追齐)。
+
+   > **★ 已闭合(2026-09-02,T6.1 + T6.2)**。此前**两半都没实装**:locmap 只把
+   > 文件配成对,既没有"物理拷贝"这个动作,也从没记过那个静止点游标 ——
+   > 于是认领时默认从 0 起重放,拿一份新流去砸一份来路不明的旧文件,
+   > 这正是 R-P4-20 那串 PANIC 的土壤。
+   >
+   > 两半分别由两件事补上:
+   > - **发基线**(T6.1):`partdist.shard_baseline_emit(regclass)` 把该分片
+   >   fileset 的全部成员以 `log_newpage_range` 整页打进分区流,follower 侧
+   >   `ApplyFilesetUpdate` 见到 `PARTWAL_FSUPD_FULL_BASELINE` 标志就**先截断
+   >   全部成员再重灌**。走的是既有 FPI 内联通道,不引入新传输面;超过
+   >   `fileset_inline_max_blocks` 时**显式 ERROR 而不是静默降级**。
+   >   验收 `test_shard_baseline_p6.sh` 43/0。
+   > - **记游标**(T6.2):locmap 升到 v3,多一个 `base_part_lsn` 字段
+   >   (v1 780B / v2 912B / v3 920B,长度即版本判别式);
+   >   `replay_set_locmap()` 增第 7 参 `p_base_part_lsn`。
+   >   **无基线不再默认从 0,而是拒绝认领** —— 空表配 `base=0` 是唯一合法的
+   >   例外,函数里有断言。验收 `test_locmap_base_p6.sh` 23/0。
 3. **恢复上下文完备性**:`InRecovery = true` 覆盖已核实断言;落地时审计 redo 路径
    其余 `InRecovery` / `reachedConsistency` 分支(`log_invalid_page` 在非恢复进程中
    reachedConsistency=false,会记入进程内 invalid_page_tab 而不立即 PANIC——
@@ -1260,6 +1279,16 @@ worker 抱着旧表还是撞同一道栅栏。
    这个**目录字段**没人更新)。本地 `datfrozenxid` 计算须排除副本壳表,或经控制记录
    同步 leader 的 relfrozenxid;同时 nextXid 被最活跃 leader 拉齐后,本地普通表的
    age() 相应增大,须确认 autovacuum 对本地表正常 freeze。R2 验收项。
+
+   > **★ 已闭合(D2 实装,2026-09-03 T6.3c 前置核查时才发现"早就闭合、文档没
+   > 回填")**:leader 侧 `ShardFreezeMaybeEmitUpdates` 按间隔发 CTRL
+   > `FREEZE_UPDATE`,follower 侧 `replay_worker.c` 用 `heap_inplace_update`
+   > **真的写进了 pg_class** 的 `relfrozenxid` / `relminmxid`。套件实测两侧值
+   > 相等、副本壳表离强制回卷阈值 **0%**。
+   >
+   > 这条闭合把下面约束 12 那句"`autovacuum_enabled=off` 挡不住 anti-wraparound"
+   > 的**前提**也一并推翻了:副本 relfrozenxid 有人维护、age 不再无界增长,
+   > 强制回卷就不会被触发。**T6.3c 因此收缩成小得多的一件事**(见约束 12)。
 
    > **⚠ 约束 4 的 `autovacuum_enabled = off` 挡不住这条(R2-e 核实)。**
    > 内核 `autovacuum.c:3196` 原文:
@@ -1470,10 +1499,34 @@ worker 抱着旧表还是撞同一道栅栏。
     **不变式**:*副本文件在开始回放之前,写过它们的本地 WAL 必须已被 checkpoint
     甩到 redo 点之后;开始回放之后,不得再有任何本地 WAL 记录写它们。*
 
-    **仍未根治**(与约束 5 联动):`autovacuum_enabled = off` 挡不住
-    anti-wraparound vacuum,它一旦扫到副本壳表就会写本地 WAL,把这个洞重新打开。
-    彻底的办法只有让副本文件永不被本地 WAL 触碰,而那需要先解决约束 5 的
-    relfrozenxid 处置。**两条约束应当合并立项,不要各修各的。**
+    ~~**仍未根治**(与约束 5 联动):`autovacuum_enabled = off` 挡不住
+    anti-wraparound vacuum……**两条约束应当合并立项,不要各修各的。**~~
+
+    > **★ 已按"合并立项"处置完毕(2026-09-02 ~ 09-04,T6.3a/b/c)**。三层:
+    >
+    > - **T6.3c 跟随侧 —— 让副本文件永不被本地 WAL 触碰**(与约束 5 合并立项,
+    >   `test_replica_gate_p6.sh` 33/0)。前置核查先推翻了上面那句话的前提
+    >   (约束 5 已闭合,见上)。真正的缺口是另一件事,而且可证:两道既有闸门
+    >   `ShardXidUtilityGuard` / `ShardAccessGate` 的判据都是白名单
+    >   `pg_partdist.shard_relids`,而 **follower 侧从不设白名单** ——
+    >   "副本壳表在本节点上是一张完全普通的表"。设计反复写"绝不能 SELECT",
+    >   代码里却没有任何东西拦着。处置:`ShardReplicaIsLocal()` 按回放槽位判定
+    >   (快门是 `nreplicas == 0`),计划期与维护命令两支各设闸门,且**门控条件
+    >   必须与打标表分开** —— 共用 `shard_gating_active()` 的话,白名单恒空的
+    >   follower 上那道快门一开就把副本这一支也挡在外面,这正是"写了也不会被
+    >   执行到"的成因。逃生口 `pg_partdist.allow_replica_access`(PGC_SUSET,默认 off)。
+    > - **T6.3a 遏制层 —— 把不可捕获的 PANIC 降级为"该 shard 停摆"**
+    >   (`test_offnum_guard_p6.sh` 25/0)。redo 前做 offnum 前置检查,页太短就
+    >   带全几何 WARNING + ERROR 停在该分片,**不推进游标**;节点不死、其余分片
+    >   照跑,提示直指 `shard_baseline_emit` 这条能修好的路。
+    > - **T6.3b 升主侧 —— 推进本地 WAL 插入位点**(内核补丁 0010,
+    >   见 §11 步骤 4,`test_promote_p6.sh` 39/0)。分片升主之后页面改由本地
+    >   `XLogInsert` 保护,位点必须越过 `max_orig_lsn`,否则"页面 LSN 单调递增"
+    >   这条不变式不成立。
+    >
+    > **残留(记在案,不假装解决)**:读会设 hint bit,那仍是对副本文件的本地写。
+    > T6.3c 把"读"整条路堵死之后这条残留没有触发面,但它不等于被消除 ——
+    > 一旦将来放开副本读(R3),必须重新处置。
 
 13. **★★ Raft 日志环顶爆 ⇒ leader 的物理截断在 follower 上永久缺失**
     (2026-08-05 实测,未修,记为 pg_raft 侧待办)。
@@ -1731,7 +1784,7 @@ pg_raft 侧新增:`pg_raft.propose_wait_ms`(§13 约束 13,默认 10000,`PGC_SIG
 | D1 DDL/fileset 控制通道 | CTRL 记录格式 + `PartWALAppendCtrl`;locmap v2(加 `role`/`ord`);leader 侧 `ProcessUtility_hook` 检测 → PRE_COMMIT 发射 `FILESET_UPDATE` + `log_newpage_range` 灌新文件;follower 侧换表/截断 与 `REPLAY_NEEDS_STRUCT` 结构栅栏(§12) | `VACUUM FULL`/`REINDEX`/`TRUNCATE` 全自动追平且页面比对仍一致;`CREATE INDEX` 停在栅栏(游标不推进、locmap 未换),补齐本地结构 + 重跑 `replay_set_locmap()` 后原地继续;未同步结构的另一 follower 必须仍停住 | R1 |
 | D2 冻结账目同步 | `CTRL:FREEZE_UPDATE`;leader 侧时间驱动检测(autovacuum 不走 ProcessUtility)+ 持久化基线 diff + **尽力而为**发射;follower 侧 worker 发布到槽位、`replay_catchup` 调用方写 `pg_class`(§13 约束 5) | follower 壳表的 `relfrozenxid` 由建表初值变为 leader 的值、`age()` 有界;leader 再次 VACUUM 后能重新同步;账目未变时不重复发射 | D1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
-| R4 提升 | 补丁 0003(**含 §11 的归档/`max_wal_size`/级联备库三项处置结论**);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
+| R4 提升 | **内核补丁 0010**(2026-09-04 T6.3b 已实装;§11 的归档/`max_wal_size`/级联备库三项处置结论也已出,见 patches/README.md「0010 的运维裁定」);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
 
 > **★ "逐页字节级一致"必须排除页内空闲空洞(R1 实测修正)。** v3 稿写的
 > "逐页 diff 一致(含 LSN 域)"**不可达**,原因不在回放而在 FPI 机制本身:

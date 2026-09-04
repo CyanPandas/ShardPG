@@ -796,17 +796,39 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
         if (!blk->in_use)
             continue;
         smgr = smgropen(blk->rlocator, InvalidBackendId);
-        if (!smgrexists(smgr, blk->forknum))
+
+        /*
+         * ★★ 判据是 **MAIN_FORKNUM**，不是 blk->forknum（R-P6-6，2026-09-04 修）。
+         *
+         * 这道守卫本来要拦的是「认领之后表被 DROP」—— 那时继续 redo 会撞不可
+         * 捕获的 PANIC（R-P4-8）。但首版把判据下在 **fork 粒度**上，于是连
+         * 「这个次级 fork 还没建出来、而这条记录本就该把它建出来」也一并拦了。
+         *
+         * 实测后果（follower_replay_r1 与 lazy_replay_l1 各 4 条、共 8 条稳定
+         * 复现的红）：follower 的壳表由 `CREATE TABLE (LIKE ...)` 建出来，
+         * **从来没有 `_vm` fork**；于是每条 visibility map 记录都命中这里被跳过，
+         * fork 也就永远建不出来 —— **跳过 ⇒ 不存在 ⇒ 继续跳过**，自我维持的空洞。
+         *
+         * 对照原生：`heap_xlog_visible` 走 `CreateFakeRelcacheEntry` +
+         * `visibilitymap_pin` → `vm_readbuf` → `vm_extend` → `smgrcreate`，
+         * redo 本来就会把缺失的 VM fork 建出来。我们抢在它前面返回了。
+         *
+         * 收窄到主 fork 之后：表真被 DROP 时主 fork 一样不存在，R-P4-8 的保护
+         * 原样成立；次级 fork（_vm / _fsm）缺失时放行，交给内核 redo 自己建。
+         */
+        if (!smgrexists(smgr, MAIN_FORKNUM))
         {
             ereport(WARNING,
-                    (errmsg("pg_partdist replay: 目标文件已不存在，跳过该记录"
+                    (errmsg("pg_partdist replay: 目标关系已不存在，跳过该记录"
                             "（shard %u，plsn=%llu，relNumber=%u fork=%d）",
                             ctx->shard_oid,
                             (unsigned long long) hdr->partition_lsn,
                             (unsigned) blk->rlocator.relNumber,
                             (int) blk->forknum),
                      errdetail("表多半在认领之后被 DROP；继续 redo 会触发"
-                               "不可捕获的 PANIC（R-P4-8）。")));
+                               "不可捕获的 PANIC（R-P4-8）。判据取主 fork —— "
+                               "次级 fork（_vm/_fsm）缺失是正常的，由 redo 自建"
+                               "（R-P6-6）。")));
             return;             /* 跳过本条，游标由调用方推进 */
         }
 

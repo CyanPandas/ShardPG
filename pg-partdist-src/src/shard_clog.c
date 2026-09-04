@@ -411,6 +411,17 @@ ShardClogAtCommit(void)
 			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("pg_partdist: 水位文件 \"%s\" 删除失败: %m", path)));
+
+		/*
+		 * R-P6-9：共享内存里的打标登记也要摘掉。此前只清文件不清登记，
+		 * 而这个函数上方那句"DROP TABLE 会连同水位/clog 文件一并清理"正是
+		 * `partdist_set_shard_mvcc(..., false)` 拒绝撤销时给出的理由 ——
+		 * 承诺与实现对不上。留着的后果不是多占一个槽位，而是 **OID 复用后
+		 * 误伤无关表**：新表被判成分片打标表，若它是分布式表，DROP 走 2PC
+		 * 就撞上 §10 的 PRE_PREPARE 禁令删不掉。实测表现为夹具残表逐轮累积
+		 * （122→244→366），症状伪装成"回放写多了"。
+		 */
+		ShardMvccSetRemove(pending_drops[i]);
 	}
 	pending_drops_n = 0;
 }

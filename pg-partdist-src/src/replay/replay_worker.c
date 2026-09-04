@@ -179,7 +179,15 @@ ShardReplicaIsLocal(Oid relid)
 
         if (s->shard_oid == relid && s->nlocs > 0)
         {
-            hit = true;
+            /*
+             * ★ T6.8：已升主的分片不再是副本。
+             *
+             * 闸门原本只认"有配好 locmap 的回放槽位"，而升主并不会把槽位撤掉 ——
+             * 于是新主自己的分片被当成别人的副本一直拦着，`promote_catchup_tx3`
+             * 的「新主壳表读到切主前写入的全部 40 行」当场判红。这与闸门自己
+             * 给出的 HINT（"或升主后再读"）直接矛盾：**禁令有入口没出口**。
+             */
+            hit = !s->promoted;
             break;
         }
     }
@@ -194,6 +202,37 @@ ShardReplicaIsLocal(Oid relid)
  * on-access 剪枝按原生 clog 清掉分片元组是**就地损毁**，写本地 WAL 则把
  * 约束 12 的洞重新打开（R-P4-20 的病灶）。发现之后再回滚已经晚了。
  */
+/*
+ * ShardReplicaMarkPromoted —— 升主收尾解除副本身份（T6.8）。
+ *
+ * **为什么置位点在这里而不是 pg_raft 里新加一次调用**：解冻批次 #6 批准的范围
+ * 是 `pg_raft_promote_prepare` 里的**两处**新增调用（T6.3b/T6.4），再加第三处
+ * 就越界了。而 T6.4 的 `ShardXidClaimOnPromote()` 恰好就是升主收尾的汇合点 ——
+ * 它只会被升主路径（和验收）调到，语义上正是"本节点已完成对该分片的接管"。
+ *
+ * **为什么此刻置位是安全的**：`data_group_promote_prepare()` 在
+ * `raft_consensus.c` 里的调用点前面就是 `if (state != RAFT_LEADER) return;`
+ * —— 跑到这里时**选举已经赢下**，本节点就是该分片的 raft leader，
+ * 剩下的只是把路由登记出去。此时它已不是任何人的副本。
+ */
+void
+ShardReplicaMarkPromoted(Oid relid)
+{
+    int i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            ReplayCtl->slots[i].promoted = true;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+}
+
 void
 ShardReplicaAccessGate(Oid relid, const char *what)
 {

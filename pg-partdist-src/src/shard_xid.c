@@ -1123,6 +1123,15 @@ ShardXidClaimOnPromote(Oid shard)
 	}
 
 	LWLockRelease(ShardXidCtl->lock);
+
+	/*
+	 * ★ T6.8：升主收尾顺带解除副本身份，让 T6.3c 那道闸门放行本节点对该分片的
+	 * 查询 —— 闸门的 HINT 原文就写着"或升主后再读"，此前却**有入口没出口**。
+	 * 放在锁外调用：它自己要取 ReplayCtl->lock，嵌在 ShardXidCtl->lock 里
+	 * 会引入一个新的加锁序。
+	 */
+	ShardReplicaMarkPromoted(shard);
+
 	return n;
 }
 
@@ -1475,6 +1484,43 @@ ShardMvccSetAdd(Oid relid)
 	/* 先写槽位再抬 mvcc_n——无锁快门读侧永远看不到未初始化的槽 */
 	ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n] = relid;
 	ShardXidCtl->mvcc_n++;
+	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
+ * ShardMvccSetRemove —— 把 OID 从共享内存的打标登记集合里摘掉（R-P6-9）。
+ *
+ * 集合本身是**故意只进不出**的（`partdist_set_shard_mvcc(..., false)` 明确
+ * 拒绝撤销），那条禁令针对的是"运行中的表想退出打标语义"。但 **DROP 是另一
+ * 回事**：那张表已经不存在了，登记再留着只会误伤后来者 —— 提示原文写的就是
+ * 「DROP TABLE 会连同水位/clog 文件一并清理」，而此前**只清了文件、没清这个
+ * 集合**，承诺与实现对不上。
+ *
+ * 后果实测过（R-P6-9）：OID 一被复用，一张毫不相干的新表就被
+ * shard_oid_is_mvcc() 判成分片打标表；它若是分布式表，DROP 走 2PC 就撞上
+ * §10 的 PRE_PREPARE 禁令而删不掉，夹具残表逐轮累积（122→244→366），
+ * 症状伪装成"回放写多了"。
+ *
+ * 只在 DROP 提交时点调用（ShardClogAtCommit），与文件 GC 同一处。
+ */
+void
+ShardMvccSetRemove(Oid relid)
+{
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		return;					/* shmem 未起：没什么可摘 */
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < ShardXidCtl->mvcc_n; i++)
+		if (ShardXidCtl->mvcc_set[i] == relid)
+		{
+			/* 末位填洞再降计数：读侧持锁遍历，顺序对它不可见 */
+			ShardXidCtl->mvcc_set[i] =
+				ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n - 1];
+			ShardXidCtl->mvcc_n--;
+			break;
+		}
 	LWLockRelease(ShardXidCtl->lock);
 }
 
