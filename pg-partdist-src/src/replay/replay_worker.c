@@ -540,9 +540,6 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
     if (ReplayCtl == NULL)
         ereport(ERROR, (errmsg("replay_catchup: 回放共享内存未初始化")));
 
-    if (bound == 0)
-        bound = GetLastWrittenPartitionLSN(shard_oid);
-
     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
     s = ReplaySlotFindLocked(shard_oid, false);
     if (s == NULL || s->nlocs == 0)
@@ -558,6 +555,46 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
         ereport(ERROR,
                 (errmsg("replay_catchup: shard %u 未 armed（replay_enable）",
                         shard_oid)));
+    }
+
+    /*
+     * ★★ bound == 0 的"追到本地已落盘的全部字节"是**测试模式**，由
+     * pg_partdist.replay_trust_local_segments 门控（T6.8-2 修）。
+     *
+     * 首版把这个回退写成**无条件**的，而那个 GUC **定义了却没有一行代码读它**
+     * —— 12 个验收套件在开它，开与不开毫无分别。于是"本地段内容即回放上界"
+     * 这条本该只在测试里成立的捷径，在生产路径上同样敞着：任何传 NULL 的调用
+     * 都会把 leader 已写但**尚未达多数派**的字节一并放进副本。
+     *
+     * 惰性回放的核心不变式是「绝不碰未提交条目」，它靠的是**调用方给对上界**
+     * （升主路径传 get_follower_applied_part_lsn，该列只在 raft apply 里按
+     * [idx, commit_index] 推进，天然不超过 commit_index）。既然是靠约定，
+     * 就必须有一道 fail-closed 的门把"没给上界"这种情况拦住，而不是悄悄替它
+     * 选一个最宽的。
+     *
+     * 排在 armed 检查**之后**：那两道更早的错更具体（没配 locmap / 没 arm），
+     * 先报它们对使用者更有用；且 lazy_replay_l1 有一条断言正是按"未 armed"
+     * 的文案取证的。
+     */
+    if (bound == 0)
+    {
+        if (!replay_trust_local_segments)
+        {
+            LWLockRelease(ReplayCtl->lock);
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("replay_catchup: shard %u 必须显式给出回放上界",
+                            shard_oid),
+                     errdetail("不给上界就等于「放到本地段末尾」，会把 leader 已写"
+                               "但尚未达多数派的字节也回放进副本 —— 惰性回放的"
+                               "核心不变式（绝不碰未提交条目）由调用方给对上界来"
+                               "保证，这里不替它选。"),
+                     errhint("升主路径传该组的 raft 已提交位点"
+                             "（partdist.get_follower_applied_part_lsn）；"
+                             "确需「追到本地全部字节」请显式打开"
+                             "pg_partdist.replay_trust_local_segments。")));
+        }
+        bound = GetLastWrittenPartitionLSN(shard_oid);
     }
 
     /* 已经到位：直接返回，不惊动 worker */

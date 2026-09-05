@@ -4436,6 +4436,75 @@ VACUUM FULL / VACUUM / CREATE INDEX / 整库 VACUUM / 未 join 的 PREPARE），
 
 ---
 
+#### T6.8-2 回放上界：把"绕行"收回来（2026-09-04，23/0）
+
+用户的问题问得准：**"是不是 raft 和日志回放哪里还没放开，而是绕行呢"**。
+查下来一半不成立、一半成立，两半都记。
+
+##### 先否掉一个我自己的怀疑
+
+`get_follower_applied_part_lsn()` 的文件头注释写着 "Local follower replay
+progress"，看名字像"本地进度"，我一度以为升主路径那句"上界取 Raft 已提交位点"
+是空话。**不成立**：`applied_part_lsn` 只在 raft apply 路径里推进，而且是按
+`[idx, commit_index]` 这一连续段**合并**推进的（`raft_consensus.c:2103`），
+天然不超过 commit_index。所以生产升主路径的上界是对的。
+
+##### 但确实有两处在绕行，且互相掩护
+
+1. **`replay_trust_local_segments` 是死配置**。定义在 `replay_worker.c:108`，
+   描述写着"测试模式：本地段内容即回放上界"，**12 个验收套件在开它**，
+   而**没有一行代码读它**。它本该门控的回退
+   （`bound == 0` ⇒ `GetLastWrittenPartitionLSN()`）当时是**无条件**的 ——
+   也就是说"追到本地段末尾"这条本该只在测试里成立的捷径，在生产路径上同样敞着。
+
+2. **核心不变式一条断言都没有**。全部 8 处验收传给 `replay_catchup` 的上界
+   都是 `get_partition_flush_lsn` —— 那是 **leader 侧已刷盘的字节**，不是
+   follower 的已提交游标。于是"绝不碰未提交条目"这句话，在 1191 条通过的断言里
+   **一条都没测**。第 1 条让守卫失效，第 2 条让失效没人发现。
+
+##### 处置
+
+- **让 GUC 真的生效**：`bound == 0` 时，`replay_trust_local_segments = off`
+  （默认）**报错**而不是替调用方选一个最宽的上界。排在 locmap / armed 两道检查
+  **之后** —— 那两个错更具体，且 `lazy_replay_l1` 有一条断言正按"未 armed"的
+  文案取证。改动面核过：rendezvous 钩子只发布无人消费，验收里唯一传单参数的
+  那处本就期待报错，`promote_prepare` 只在 `bound > app` 时才调（bound 必 > 0）。
+- **新套件 `test_replay_bound_p6.sh` 23/0**，两件都钉住。
+
+##### 几何怎么造：**不去制造"未达多数派"**
+
+第一反应是拆掉 follower 的 raft 组让 leader 凑不齐多数派（`txn_layer_r2` §9 就
+这么干）。**这条路是错的**：组一 reset，follower 连字节都收不到，"上界之外还有
+字节"这个前提本身就没了，断言会变成空的。
+
+等价且确定的形态：让字节**已经躺在 follower 本地段里**（raft 已复制并提交），
+却给一个更小的上界。要验的性质完全相同 —— **回放会不会跑到本地段末尾去**。
+
+实测：`P1=21`、`P2=43`，以 P1 为上界追平后 `applied=21`，**没有**越界；
+数据层佐证此刻副本与 leader **不**一致（第二批确实没进去）；
+换上界为 P2 立刻到 43 且逐字节一致 —— 这条**判别**不能省，否则第一条可能是
+因为"本地段里根本没数据"而通过的假通过。
+
+##### 还有两处没收回来，属 R4 正题（记在案，不假装解决）
+
+- **raft → 回放的角色交接是桩**：`partwal_notify_primary_switch()` 整个函数体
+  只有一句 `ereport(LOG)`；`raft_boundary.c:21` 自己写着
+  "Placeholder until the real role-switch / replay handover lands:
+  **follower replay is design-only in shardpg-3.0**"。真正的升主动作挂在
+  `pg_raft_promote_prepare`（上报**之前**），而不是 `OP_PARTITION_PRIMARY`
+  apply 之后的正规交接；FRD §11 步骤 5 的 `PartDistRoutePromote`（角色置
+  `SHARD_PROMOTED` + 路由切换）仍未实现 —— T6.8 加的 `promoted` 位是它的
+  **局部替身**，只解决了"闸门放行"，没解决"路由改指向"。
+- **副本的建立全靠手工**：`register_shard_fileset` / `replay_set_locmap` /
+  `replay_enable` 在 `pg-partdist-src/src` 与 `pg-raft-src/src` 里**没有任何
+  调用方**，只有验收脚本在调。没有"给分片 X 建一个副本"的自动路径 ——
+  这也是 R-P4-15 那种"旧主带着陈旧数据回归"只能靠**拒绝升主**兜底、
+  而不是重建副本的原因。
+
+两条都要动 pg_raft 的 apply 路径或新立供给面，属冻结面外，须新批次。
+
+---
+
 #### ★ P6 是最后一期：不做的事也必须有裁定
 
 P6 之后没有下一期可以推。因此**下列每一条都必须在 P6 出口前拿到明确去向**

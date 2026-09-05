@@ -63,6 +63,7 @@ SUITES=(
   "xid_watermark_p6       900  P6"
   "negative_p6            900  P6"
   "promote_p6            1200  P6"
+  "replay_bound_p6        900  P6"
   # ── replay 时代（CONTAINER 覆盖到 tx2）
   "follower_replay_r1    1800  R1"
   "txn_layer_r2          1800  R2"
@@ -296,9 +297,14 @@ scrub() {
   tso_epoch_reset_if_blocked
   purge_orphan_prepared
   for p in $PORTS; do
+    # ★ replay_trust_local_segments 也要复位（T6.8-2）：它现在**真的有效力**了
+    #   —— 开着就允许 replay_catchup 不给上界、直接追到本地段末尾。
+    #   12 个套件在自己开头把它设 on 且从不还原，不在这里复位的话，
+    #   后面套件的 fail-closed 守卫会被前面那套悄悄遮掉。需要它的套件自己开。
     PS "$p" -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;
                    ALTER SYSTEM RESET pg_partdist.tso_conninfo;
                    ALTER SYSTEM RESET pg_partdist.allow_replica_access;
+                   ALTER SYSTEM RESET pg_partdist.replay_trust_local_segments;
                    ALTER SYSTEM RESET pg_partdist.replay_debug_trace;" </dev/null >/dev/null 2>&1
     PS "$p" -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
   done
