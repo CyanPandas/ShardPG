@@ -336,6 +336,14 @@ else
 fi
 
 echo "========== [9] 中止路径：ABORT 标记 =========="
+# ★★ 本节**故意**拆掉多数派 —— 那必然让 quorum_drops +1，而收尾那句
+#   "本轮无 Raft 提案被丢弃" 就此**结构上永远不可能过**：它在断言本节自己刚
+#   造出来的东西。这条红被当成 R-P4-22 挂了很久，其实测错了对象。
+#   丢弃计数的含义在 8/3 之后也变了 —— 增量点的注释写着"leader 侧不再截断
+#   parwal，字节留作孤儿、同 plsn 重新 propose，多数派恢复后自然收敛，
+#   丢弃不再直接等于无痕分叉"，它是**复制健康度**的观测口。
+#   做法同"故意 kill -9 之后重开崩溃窗口"：本节收尾处重取基线，让收尾那句回去
+#   测**非预期**的丢弃。
 # 拆掉两个 follower 的组 → leader 凑不齐多数派 → 复制挂钩 ERROR → 事务中止。
 # 此时 DATA 记录已落盘（[A] 在挂钩之前），必须补一条 ABORT 标记。
 for fp in $f1 $f2; do
@@ -393,7 +401,11 @@ done
 
 echo ""
 health_check_no_crash
-health_check_no_drops
+# ★ 额度 2：本套件 [9] **故意**拆掉多数派来验 ABORT 标记，那必然产生
+#   1~2 次 quorum_drop（实测两者都出现过）。不给额度这条断言永远红 ——
+#   它在断言本套件自己造出来的东西，被当成 R-P4-22 挂了很久。
+#   额度之外多一次仍然红，非预期的丢弃照样抓得住。
+health_check_no_drops 2
 health_check_worker_pool
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "R2 事务层验收：全部通过"; else echo "R2 事务层验收：存在 FAIL"; fi

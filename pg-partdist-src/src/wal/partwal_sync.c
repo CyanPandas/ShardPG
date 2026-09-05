@@ -1029,7 +1029,34 @@ PartWALReplicateTouched(void)
         return;
 
     for (i = 0; i < partwal_my_ntouched; i++)
-        fn(partwal_my_touched[i]);
+    {
+        Oid part = partwal_my_touched[i];
+
+        /*
+         * ★★ §13 约束 13 的"检测"（批次 #8）。
+         *
+         * 复制挂钩一失败，本事务就会中止 —— 提交路径是 fail-closed 的。
+         * **但那挡不住分叉**：`lazy_truncate_heap()` 的物理截断在 leader 上
+         * 已经做掉且**不随事务回滚**（内核在 AccessExclusiveLock 下截空页），
+         * 于是 leader 短了、follower 没短，那条 XLOG_SMGR_TRUNCATE 再也不会
+         * 重发。原文把它定性成「永久分叉，既无检测也无修复路径」。
+         *
+         * 修复路径现在有了（shard_baseline_emit / provision_shard_replica），
+         * 这里补上**检测**：就地打一个**非事务性**标记。写表是不行的 ——
+         * 事务马上要中止，标记会跟着回滚，等于没记。
+         */
+        PG_TRY();
+        {
+            fn(part);
+        }
+        PG_CATCH();
+        {
+            ShardMarkDiverged(part, "复制挂钩失败：本事务已中止，但 leader 侧的"
+                              "物理截断不随回滚撤销，副本可能已分叉（§13 约束 13）");
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+    }
 }
 
 void

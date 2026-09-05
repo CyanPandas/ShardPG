@@ -1562,6 +1562,35 @@ worker 抱着旧表还是撞同一道栅栏。
     leader `155648` / follower `614400`,而索引、TOAST 索引、主堆都对得上,
     极像"某个特定关系的回放漏了"。
 
+    > **★ 检测已补上（2026-09-04，批次 #8）；"既无检测也无修复路径"这句
+    > 两半都不再成立。**
+    >
+    > **先纠正一处对机制的误读**（我自己先误判过一次）：复制挂钩失败时事务
+    > **确实**中止了 —— `replicate_group_upto()` 对任何一条未达多数派即
+    > `ereport(ERROR)`，三个生产调用点全走它，`pg_raft_data_propose()` 那个
+    > 返回 0 的 SQL 入口只有测试脚本在用。**提交路径处处 fail-closed。**
+    > 所以危险**不是**"提案被静默丢弃后照常提交"，而是本条原文点明的那一件：
+    > `lazy_truncate_heap()` 的物理截断**不随事务回滚**，fail-closed 挡不住它。
+    >
+    > **修复路径**：早已存在 —— T6.1 的 `shard_baseline_emit()`（FULL_BASELINE
+    > 让 follower 先截断全部成员再重灌）与批次 #7 的
+    > `provision_shard_replica()`。原文写这句时它们还没有。
+    >
+    > **检测**（本次补）：复制挂钩一失败就**就地**给该分片打一个
+    > **非事务性**标记 `pg_parwal/<oid>/diverged`（写表不行 —— 出事的事务马上
+    > 要回滚，标记会跟着没掉）。落点在 `PartWALReplicateTouched()` 的
+    > PG_CATCH 里，属 pg-partdist，**不必碰 pg_raft**。
+    > 查询 `partdist.shard_divergence(oid)`（返回时刻+原因，无标记返回 NULL）；
+    > `shard_baseline_emit` / `provision_shard_replica` 成功后**自动清标** ——
+    > 重做基线就是修复动作本身，不必运维再手工清一次。
+    >
+    > 验收 `test_divergence_mark_p8.sh` **19/0**，其中最要紧的一条是
+    > 「标记活过了那个中止的事务」—— 那是这件事的全部意义。
+    >
+    > **仍未做**：自动化。标记只是把"分叉了"变成看得见、修得好，**没有**
+    > 自动触发重做基线 —— 在提交路径上放大成一次全量 FPI 洪水，代价与风险
+    > 都要单独评估。运维动作：见到标记就在该分片的 leader 上重做基线。
+
     相关但不同的一个坑:中止的那个事务在分区流里留下了读不出来的空洞
     (`partwal_read_record 返回空行`),复制挂钩是区间式的
     (`[last_data_plsn+1, flush_lsn]`),踩到洞就整段失败。pg_raft 的

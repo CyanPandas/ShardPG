@@ -159,4 +159,9 @@ extern void ShardFreezeNoteUserActivity(void);
 /* GUC：两次冻结账目检查的最小间隔（毫秒）；0 = 每个事务都查（测试用） */
 extern int  freeze_sync_interval_ms;
 
+/* §13 约束 13 的"检测"：分叉标记（非事务性，落 pg_parwal/<oid>/diverged） */
+extern void  ShardMarkDiverged(Oid shard_oid, const char *reason);
+extern char *ShardDivergedReason(Oid shard_oid);
+extern void  ShardClearDiverged(Oid shard_oid);
+
 #endif /* SHARD_FILESET_H */

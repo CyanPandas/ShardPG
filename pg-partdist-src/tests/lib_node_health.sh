@@ -144,7 +144,24 @@ health_check_worker_pool() {
 #
 # 节点重启会把 shmem 计数清零，所以差值只认"涨"（负数按 0 计）——重启丢掉的
 # 计数由 health_check_no_crash 那侧兜住（重启本身就是崩溃）。
+# health_check_no_drops [允许额度]
+#
+# ★ 额度这个参数是必要的，不是放水：有的用例**故意**制造多数派缺失
+#   （txn_layer_r2 §9 就是拆掉两个 follower 的组来验 ABORT 标记）。那必然让
+#   quorum_drops 增加，于是同一套件末尾那句"本轮无 Raft 提案被丢弃"
+#   **结构上永远不可能过** —— 它在断言本套件自己刚造出来的东西。
+#   这条红被当成 R-P4-22 挂了很久，其实**测错了对象**。
+#
+#   为什么不是把基线挪到故意窗口之后：那一段之后套件已经没有写入了，
+#   断言会被掏成一句空话 —— 零个检查的静默通过是最糟的失败模式。
+#   保留全程覆盖 + 给出额度，既容得下故意的那一两次，又照样能抓住
+#   **非预期**的丢弃（多一次就红）。
+#
+#   丢弃计数的含义也要看清：增量点的注释写着"8/3 起 leader 侧不再截断 parwal，
+#   字节留作孤儿、同 plsn 重新 propose，多数派恢复后自然收敛，**丢弃不再直接
+#   等于无痕分叉**"。它是**复制健康度**的观测口，不是分叉指示灯。
 health_check_no_drops() {
+  local allow=${1:-0}
   local total=0 missing=0 detail="" p base cur delta
   local cur_snap
   cur_snap=$(_health_drops_snapshot)
@@ -163,7 +180,12 @@ health_check_no_drops() {
     echo "  跳过  丢弃检查（partdist.pg_raft_group_flow_stats 不存在，flow-stats 版本之前的环境）"
     return
   fi
-  check "本轮无 Raft 提案被丢弃（ring_full_drops + quorum_drops）" "$total" "0"
+  if [[ "$allow" -gt 0 ]]; then
+    check "Raft 提案丢弃数未超出本用例的故意额度（${total} <= ${allow}）" \
+          "$([[ "$total" -le "$allow" ]] && echo ok)" "ok"
+  else
+    check "本轮无 Raft 提案被丢弃（ring_full_drops + quorum_drops）" "$total" "0"
+  fi
   if [[ "$total" != "0" ]]; then
     echo "        增量按节点：${detail}"
     echo "        ↑ 数据组丢提案 = leader 已 durable 的物理变更没送到 follower，"

@@ -410,6 +410,14 @@ ShardBaselineEmit(Oid shard_oid)
                     shard_oid, nrels, (unsigned long long) total_blocks,
                     (unsigned long long) base_plsn)));
 
+    /*
+     * ★ 批次 #8：基线发完就把分叉标记清掉 —— 重做物理基线**就是**§13 约束 13
+     * 的修复动作（FULL_BASELINE 会让 follower 先截断全部成员再重灌），
+     * 没有必要再让运维手工去清一次。清标只发生在这里和 provision（它也发基线），
+     * 手工入口 shard_clear_divergence() 是给"确认过没事"的取证场景留的。
+     */
+    ShardClearDiverged(shard_oid);
+
     return base_plsn;
 }
 
@@ -1501,4 +1509,134 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
 
     ret = cstring_to_text(summary);
     PG_RETURN_TEXT_P(ret);
+}
+
+/* ================================================================== */
+/* 分叉标记（§13 约束 13 的"检测"那一半，批次 #8）                    */
+/* ================================================================== */
+
+#define SHARD_DIVERGED_FILENAME "diverged"
+
+/*
+ * §13 约束 13 的机制，读原文才看清它比"提案被静默丢弃"微妙得多：
+ *
+ *   复制挂钩失败时事务**确实**中止了（replicate_group_upto 对任何一条未达
+ *   多数派即 ERROR，三个生产调用点全走它，所以提交路径处处 fail-closed）。
+ *   问题在于 `lazy_truncate_heap()` 的物理截断**在 leader 上已经做掉，且不随
+ *   事务回滚** —— 内核在 AccessExclusiveLock 下截空页，认定安全。
+ *   于是 leader 短了、follower 没短，那条 XLOG_SMGR_TRUNCATE 再也不会重发。
+ *
+ * 原文把它定性成「永久分叉，**既无检测也无修复路径**」。**修复路径这句已经
+ * 不成立了**：T6.1 的 shard_baseline_emit 与批次 #7 的 provision_shard_replica
+ * 正是重做物理基线。缺的只是**检测** —— 本节补的就是它。
+ *
+ * 标记必须是**非事务性**的：出事的那个事务马上就要中止，写进表里会一起回滚，
+ * 等于没记。所以落成 pg_parwal/<oid>/diverged 这个文件，与水位/fileset 同侧。
+ */
+static void
+shard_diverged_path(char *path, size_t len, Oid shard_oid)
+{
+    snprintf(path, len, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_DIVERGED_FILENAME);
+}
+
+void
+ShardMarkDiverged(Oid shard_oid, const char *reason)
+{
+    char    path[MAXPGPATH];
+    char    buf[512];
+    int     fd;
+    int     n;
+
+    if (!OidIsValid(shard_oid))
+        return;
+
+    shard_diverged_path(path, MAXPGPATH, shard_oid);
+    n = snprintf(buf, sizeof(buf), "%s|%s\n",
+                 timestamptz_to_str(GetCurrentTimestamp()),
+                 reason ? reason : "(无)");
+
+    fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+    {
+        /* 目录可能还没建（分片从没写过流）—— 记不下就只告警，不再添乱 */
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 无法写分叉标记 \"%s\": %m", path)));
+        return;
+    }
+    if (write(fd, buf, n) != n || pg_fsync(fd) != 0)
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 分叉标记 \"%s\" 落盘不完整: %m", path)));
+    CloseTransientFile(fd);
+}
+
+/* 返回标记内容（palloc），没有标记返回 NULL */
+char *
+ShardDivergedReason(Oid shard_oid)
+{
+    char    path[MAXPGPATH];
+    char    buf[512];
+    int     fd;
+    int     n;
+
+    if (!OidIsValid(shard_oid))
+        return NULL;
+
+    shard_diverged_path(path, MAXPGPATH, shard_oid);
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return NULL;
+    n = read(fd, buf, sizeof(buf) - 1);
+    CloseTransientFile(fd);
+    if (n <= 0)
+        return NULL;
+    buf[n] = '\0';
+    if (buf[n - 1] == '\n')
+        buf[n - 1] = '\0';
+    return pstrdup(buf);
+}
+
+void
+ShardClearDiverged(Oid shard_oid)
+{
+    char    path[MAXPGPATH];
+
+    if (!OidIsValid(shard_oid))
+        return;
+    shard_diverged_path(path, MAXPGPATH, shard_oid);
+    if (unlink(path) != 0 && errno != ENOENT)
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 分叉标记 \"%s\" 删除失败: %m", path)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_divergence);
+Datum
+partdist_shard_divergence(PG_FUNCTION_ARGS)
+{
+    Oid     shard = PG_GETARG_OID(0);
+    char   *r = ShardDivergedReason(shard);
+
+    if (r == NULL)
+        PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(cstring_to_text(r));
+}
+
+PG_FUNCTION_INFO_V1(partdist_shard_clear_divergence);
+Datum
+partdist_shard_clear_divergence(PG_FUNCTION_ARGS)
+{
+    Oid     shard = PG_GETARG_OID(0);
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("shard_clear_divergence() 限超级用户"),
+                 errdetail("清标记不等于修好了分叉：真正的修复是重做物理基线"
+                           "（shard_baseline_emit / provision_shard_replica），"
+                           "它们成功后会自己清。")));
+    ShardClearDiverged(shard);
+    PG_RETURN_VOID();
 }

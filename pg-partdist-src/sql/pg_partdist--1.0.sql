@@ -1125,6 +1125,20 @@ CREATE OR REPLACE FUNCTION shard_xid_raise_watermark(
 COMMENT ON FUNCTION shard_xid_raise_watermark(OID, BIGINT) IS
     '把本分片的发号水位抬到 p_watermark（只升不降）。供给副本时由 leader 把自己的水位带过去：纯靠物理基线建出来的副本，元组里带的是分片 xid，却没有任何 MARKER 教它水位——水位为 0 会让 T6.3c 的读闸门把它误当成遗留副本放行，也会让 T6.4 的切主认领区间为空。';
 
+CREATE OR REPLACE FUNCTION shard_divergence(p_shard OID)
+    RETURNS TEXT LANGUAGE c STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_divergence';
+
+COMMENT ON FUNCTION shard_divergence(OID) IS
+    '§13 约束 13 的检测面：该分片有没有被标记为「副本可能已分叉」，返回标记时刻与原因，无标记返回 NULL。标记由复制挂钩失败时就地写下（非事务性——出事的事务马上要中止，写表会一起回滚）。修复是重做物理基线：shard_baseline_emit / provision_shard_replica 成功后会自己清。';
+
+CREATE OR REPLACE FUNCTION shard_clear_divergence(p_shard OID)
+    RETURNS void LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clear_divergence';
+
+COMMENT ON FUNCTION shard_clear_divergence(OID) IS
+    '手工清除分叉标记（限超级用户）。清标不等于修好了——真正的修复是重做物理基线，那两个入口成功后会自己清。本函数只给"取证后确认无事"的场景留。';
+
 -- ------------------------------------------------------------------
 -- 批次 #7：副本供给（在 leader 上调用，向目标节点推）
 -- ------------------------------------------------------------------
