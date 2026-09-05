@@ -1087,9 +1087,26 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
    > 事务)一条都读不回来。塞进检查点临界区后,跳完紧接着算出的 `checkPoint.redo`
    > 就落在新段内,窗口为零。验收:`test_promote_p6.sh` 的 [2d] 直接 kill -9
    > 取证 —— 恢复日志 `redo starts at` 落在新段、500 行一行不少、无 prev-link 断链。
-5. **路由切换**:`PartDistRoutePromote(shard_oid, W = max_replayed_fxid)`——
+5. **路由切换**（★ 数据面部分已于 2026-09-04 批次 #7 实装，见下方注）:
+   `PartDistRoutePromote(shard_oid, W = max_replayed_fxid)`——
    角色置 `SHARD_PROMOTED`、登记水位,同一临界区原子生效。此后写路由切到本节点,
    `wal_insert_hook` 开始为其捕获新流,`partition_lsn` 从 Raft log index 继续。
+> **★ 批次 #7 实装（2026-09-04）**:步骤 5 的**数据面角色交接**已落在
+> `partdist.partwal_notify_primary_switch()`（`raft_boundary.c`）——它由 group0
+> 的 apply 调用，而 group0 的 apply 在**每个成员节点**上都跑,所以每个节点都能
+> 就地判断自己的新角色。升主方向:解除 T6.3c 的副本读闸门 + 撤下回放槽位的
+> `armed`;降级方向:收回"已升主"身份、闸门重新合上(fail-closed)。
+> **不**自动重新 arm——降级归队能不能直接按游标追平,取决于有没有快路径分叉
+> (§9.5),那个判断不属于交接。
+> **仍未实装**:路由层本身(`PartDistRoutePromote` 的角色枚举与写路由切换)、
+> 以及 `wal_insert_hook` 为新主开始捕获新流这一支。
+> 验收 `test_handover_provision_p7.sh` 27/0,其中"切主前读被拦、切主后放行"
+> 这条**差分**证明放行确实是交接干的。
+>
+> **另**:此函数此前整个函数体只有一句 `ereport(LOG)`,本文件 §13 之外的
+> `raft_boundary.c` 头注释里那句「follower replay is design-only in
+> shardpg-3.0」已随之作废。
+
 6. 旧 leader 恢复后作为 follower 归队:对齐 `durable_part_lsn`,未 committed 的尾部
    按 Raft 截断——凭 §8.4 顺序保证(committed 才 apply 才刷盘),被截断记录的效果
    不可能已持久化。

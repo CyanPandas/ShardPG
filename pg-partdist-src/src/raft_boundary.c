@@ -17,9 +17,11 @@
  *
  *   partwal_notify_primary_switch(partition_id, old, new, switch_orig_lsn)
  *       Called after a Raft OP_PARTITION_PRIMARY entry is applied.
- *       Placeholder until the real role-switch / replay handover lands:
- *       follower replay is design-only in shardpg-3.0
- *       (docs/FOLLOWER_REPLAY_DESIGN.md), so this only logs the event.
+ *       ★ 2026-09-04（批次 #7）：**不再是 placeholder**。此前它整个函数体只有
+ *       一句 ereport(LOG)，注释写着「follower replay is design-only」——
+ *       也就是 raft 把主权翻过来之后数据面什么都没做。现在它做 FRD §11 步骤 5
+ *       的数据面角色交接：升主解除副本读闸门并撤下回放 armed，降级收回身份
+ *       （fail-closed）。仍未实装的是路由层本身。
  */
 #include "postgres.h"
 
@@ -32,6 +34,7 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"		/* GetConfigOption：读 pg_raft.node_id */
 #include "utils/pg_lsn.h"
 
 #include <fcntl.h>
@@ -46,6 +49,7 @@
 #include "partition_wal_writer.h"
 #include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 #include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
+#include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
 
 PG_FUNCTION_INFO_V1(pg_partdist_get_partition_flush_lsn);
@@ -98,6 +102,77 @@ pg_partdist_get_follower_applied_part_lsn(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(applied_lsn);
 }
 
+/*
+ * raft_local_node_id —— 本节点的 **raft** 编号。
+ *
+ * ★ 不能拿 PartDistLocalNodeId() 顶替：那是 Citus 的 groupid（本集群 worker1=1），
+ * 而 partition_map.primary_node 用的是 pg_raft.node_id（本集群 worker1=2）。
+ * 两套编号差 1，混用会让"我是不是新主"整个判反。
+ * 读的是另一个扩展的 GUC，属只读耦合，不触碰 pg_raft 的代码。
+ */
+static int
+raft_local_node_id(void)
+{
+	const char *v = GetConfigOption("pg_raft.node_id", true, false);
+
+	return (v != NULL) ? atoi(v) : -1;
+}
+
+/* 全局 shardid → 本节点该分片的本地 OID；本节点不承载则 InvalidOid */
+static Oid
+local_oid_for_shard(Oid global_shard_id)
+{
+	StringInfoData sql;
+	int			ret;
+	bool		isnull;
+	Oid			loid = InvalidOid;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return InvalidOid;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT local_oid FROM partdist.shard_identity "
+					 "WHERE global_shard_id = %u", global_shard_id);
+	ret = SPI_execute(sql.data, true, 1);
+	pfree(sql.data);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+								1, &isnull);
+
+		if (!isnull)
+			loid = DatumGetObjectId(d);
+	}
+	SPI_finish();
+	return loid;
+}
+
+/*
+ * partwal_notify_primary_switch —— **数据面的角色交接**（FRD §11 步骤 5）。
+ *
+ * ★★ 这个函数此前整个函数体只有一句 ereport(LOG)，文件头注释白纸黑字写着
+ * 「Placeholder until the real role-switch / replay handover lands」。
+ * 也就是说 raft 把主权翻过来之后，**数据面什么都没做** —— 真正的升主动作
+ * （追平 / 推 WAL 位点 / 认领）被挂在 pg_raft_promote_prepare 里，那是**上报
+ * 之前**的路，不是交接。降级方向更是完全没人管。
+ *
+ * 现在把它做实。它由 group0 的 apply 调用，而 group0 的 apply 在**每个成员
+ * 节点**上都跑，所以每个节点都能就地判断自己的新角色 —— 这正是交接该发生的
+ * 地方，也是 promote_prepare 那条路根本够不着的（它只在**当选者**上跑）。
+ *
+ * 两个方向：
+ *   - 升主：本节点成为该分片的主 ⇒ 它不再是任何人的副本，解除 T6.3c 那道
+ *     读闸门；同时**撤掉回放槽位的 armed**，否则一次误触发的 replay_catchup
+ *     会拿别人的流盖掉自己的表。
+ *   - 降级：本节点交出主权 ⇒ **立刻收回"已升主"身份**，读闸门重新合上。
+ *     方向是 fail-closed 的：交出去之后本地这份数据随时可能过期，宁可拦住。
+ *
+ * ★ 不在这里自动重新 arm 回放。降级归队要不要直接按游标追平，取决于有没有
+ * 发生过快路径分叉（DTX_2PC_DESIGN.md §9.5：分叉的旧 leader 必须重做物理基线
+ * 才能重新参选）。那个判断不属于交接，硬塞进来就是拿正确性换省事。
+ */
 Datum
 pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 {
@@ -105,6 +180,8 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 	int32		old_primary_node = PG_GETARG_INT32(1);
 	int32		new_primary_node = PG_GETARG_INT32(2);
 	XLogRecPtr	switch_orig_lsn = PG_GETARG_LSN(3);
+	int			me = raft_local_node_id();
+	Oid			loid;
 
 	ereport(LOG,
 			(errmsg("pg_partdist: primary switch notified for partition %u: %d -> %d at %X/%X",
@@ -112,6 +189,40 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 					old_primary_node,
 					new_primary_node,
 					LSN_FORMAT_ARGS(switch_orig_lsn))));
+
+	if (me <= 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_partdist: 取不到本节点的 raft 编号（pg_raft.node_id），"
+						"分片 %u 的角色交接被跳过", partition_id),
+				 errdetail("交接靠比对 primary_node 与本节点编号来判方向，"
+						   "拿不到编号就无从判断 —— 宁可不做，也不猜。")));
+		PG_RETURN_VOID();
+	}
+
+	loid = local_oid_for_shard(partition_id);
+	if (!OidIsValid(loid))
+		PG_RETURN_VOID();		/* 本节点不承载该分片：与我无关 */
+
+	if (new_primary_node == me)
+	{
+		ShardReplicaSetPromoted(loid, true);
+		ShardReplaySetArmed(loid, false);
+		ereport(LOG,
+				(errmsg("pg_partdist: 分片 %u（本地 OID %u）已接管为主，"
+						"解除副本读闸门并撤下回放 armed",
+						partition_id, loid)));
+	}
+	else if (old_primary_node == me)
+	{
+		ShardReplicaSetPromoted(loid, false);
+		ereport(LOG,
+				(errmsg("pg_partdist: 分片 %u（本地 OID %u）主权已交给节点 %d，"
+						"本节点收回「已升主」身份，读闸门重新合上",
+						partition_id, loid, new_primary_node)),
+				errdetail("本地这份数据自此可能落后于新主；要重新作为副本参与，"
+						  "须先判定有无快路径分叉（§9.5），必要时重做物理基线。"));
+	}
 
 	PG_RETURN_VOID();
 }

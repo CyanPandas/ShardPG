@@ -389,8 +389,9 @@ extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
  * 以及 438 基线路径完全不受影响）。
  */
 extern bool ShardReplicaIsLocal(Oid relid);
-/* T6.8：升主收尾解除副本身份（闸门出口） */
-extern void ShardReplicaMarkPromoted(Oid relid);
+/* 批次 #7：raft 角色交接时置/撤"已升主"身份（闸门出口） */
+extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
+extern void ShardReplaySetArmed(Oid relid, bool armed);
 
 /* GUC：显式放行副本壳表的本地访问（默认 off；运维取证时才开） */
 extern bool allow_replica_access;

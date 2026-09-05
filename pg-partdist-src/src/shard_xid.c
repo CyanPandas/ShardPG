@@ -1125,13 +1125,17 @@ ShardXidClaimOnPromote(Oid shard)
 	LWLockRelease(ShardXidCtl->lock);
 
 	/*
-	 * ★ T6.8：升主收尾顺带解除副本身份，让 T6.3c 那道闸门放行本节点对该分片的
-	 * 查询 —— 闸门的 HINT 原文就写着"或升主后再读"，此前却**有入口没出口**。
-	 * 放在锁外调用：它自己要取 ReplayCtl->lock，嵌在 ShardXidCtl->lock 里
-	 * 会引入一个新的加锁序。
+	 * ★ 批次 #7：解除副本身份的动作**已经从这里搬走**。
+	 *
+	 * T6.8 时它临时放在这里，是因为当时解冻批次 #6 只批准了
+	 * pg_raft_promote_prepare 里的两处调用，加不了第三处 —— 那是个**局部替身**，
+	 * 而且时机偏早：promote_prepare 跑在**上报之前**，此刻路由还没翻过来。
+	 *
+	 * 正规位置是 FRD §11 步骤 5 说的"路由切换"那一刻，即 group0 apply 了
+	 * OP_PARTITION_PRIMARY 之后 —— 现在实装在
+	 * partdist.partwal_notify_primary_switch()（raft_boundary.c）。
+	 * 那里还能顺带处理**降级**方向，这是本函数根本够不着的。
 	 */
-	ShardReplicaMarkPromoted(shard);
-
 	return n;
 }
 

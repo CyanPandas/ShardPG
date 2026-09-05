@@ -64,6 +64,7 @@ SUITES=(
   "negative_p6            900  P6"
   "promote_p6            1200  P6"
   "replay_bound_p6        900  P6"
+  "handover_provision_p7 1500  P7"
   # ── replay 时代（CONTAINER 覆盖到 tx2）
   "follower_replay_r1    1800  R1"
   "txn_layer_r2          1800  R2"

@@ -216,7 +216,7 @@ ShardReplicaIsLocal(Oid relid)
  * 剩下的只是把路由登记出去。此时它已不是任何人的副本。
  */
 void
-ShardReplicaMarkPromoted(Oid relid)
+ShardReplicaSetPromoted(Oid relid, bool promoted)
 {
     int i;
 
@@ -227,7 +227,32 @@ ShardReplicaMarkPromoted(Oid relid)
     for (i = 0; i < REPLAY_MAX_SHARDS; i++)
         if (ReplayCtl->slots[i].shard_oid == relid)
         {
-            ReplayCtl->slots[i].promoted = true;
+            ReplayCtl->slots[i].promoted = promoted;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+}
+
+/*
+ * ShardReplaySetArmed —— 置/撤该分片回放槽位的 armed 位（批次 #7）。
+ *
+ * 升主之后必须撤掉：本节点已经是这个分片的主，槽位再留着 armed，一次误触发的
+ * replay_catchup 就会拿别人的流去盖自己的表。撤 armed 而不是拆槽位 ——
+ * 槽位还留着 locmap，降级归队时不必从头再配一遍。
+ */
+void
+ShardReplaySetArmed(Oid relid, bool armed)
+{
+    int i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            ReplayCtl->slots[i].armed = armed;
             break;
         }
     LWLockRelease(ReplayCtl->lock);

@@ -1135,3 +1135,370 @@ SmgrRecordGetLocator(const char *record_data, uint32 record_len,
 
     return false;
 }
+
+/* ================================================================== */
+/* 副本供给（解冻批次 #7）                                            */
+/* ================================================================== */
+
+#include "libpq-fe.h"
+#include "executor/spi.h"
+#include "lib/stringinfo.h"
+#include "utils/builtins.h"
+
+/* 取一列文本，取不到返回 NULL（palloc 在调用方的上下文里） */
+static char *
+prov_query_text(const char *sql)
+{
+    char *out = NULL;
+
+    /*
+     * ★ read_only 必须是 false：这些查询里带 `SET citus.override_table_visibility`
+     * （不设它就看不见分片表，Citus 把分片表从 pg_class 扫描里藏了），
+     * 而只读 SPI **不允许 SET**，会当场报错。首版写成 true，症状是
+     * "CONTEXT: SQL statement \"SET citus.override_table_visibility=false; ...\""
+     * —— 报错指着的是被拒的那条 SET，不是查询本身。
+     */
+    if (SPI_execute(sql, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        if (!isnull)
+            out = TextDatumGetCString(d);
+    }
+    return out;
+}
+
+PG_FUNCTION_INFO_V1(partdist_provision_shard_replica);
+
+/*
+ * provision_shard_replica(global_shard_id bigint, target_node int) → text
+ *
+ * ★★ 解冻批次 #7：把「给分片 X 在节点 N 上建一个副本」从**纯手工**变成一个入口。
+ *
+ * 此前 register_shard_fileset / replay_set_locmap / replay_enable 在
+ * pg-partdist-src/src 与 pg-raft-src/src 里**没有任何调用方** —— 只有验收脚本
+ * 在调，每套件都要自己抄一遍那四十行样板。后果不只是麻烦：
+ *   - 副本**只能靠人建**，raft 把某个节点登记成 secondary 也不会真的有副本；
+ *   - R-P4-15 那种「旧主带着陈旧数据回归」只能靠**拒绝升主**兜底，
+ *     而不是「重建副本让它归队」—— 因为根本没有重建这个动作。
+ *
+ * **本函数跑在 leader 上，向目标节点推**。选推不选拉，是因为 leader 手里已经
+ * 有全部素材（fileset 就在本地），拉的话目标节点还得反过来读 leader 的目录。
+ *
+ * 步骤（顺序是要害）：
+ *   ① 本地登记 fileset —— 成员集合以此刻为准；
+ *   ② **先发物理基线**（ShardBaselineEmit），拿到它的 partition_lsn 作 base；
+ *   ③ 再去目标节点建壳表 + 按 base 配 locmap + arm。
+ * 反过来做（先配 locmap 再发基线）会让目标从 base=0 起追，正是 §13 约束 2
+ * 「拷贝时记下静止点」没做时的老毛病 —— R-P4-20 那串 PANIC 的土壤。
+ *
+ * 壳表用 `LIKE <分布表>` 建：分布表在每个节点上都有 Citus 的空壳，而分片表
+ * 只在放置节点上有，拿不到定义。
+ */
+Datum
+partdist_provision_shard_replica(PG_FUNCTION_ARGS)
+{
+    int64           gsid = PG_GETARG_INT64(0);
+    int32           target = PG_GETARG_INT32(1);
+    StringInfoData  q;
+    StringInfoData  remote;
+    char           *shard_tbl = NULL;
+    char           *logical = NULL;
+    char           *host = NULL;
+    char           *portstr = NULL;
+    char           *roles = NULL, *ords = NULL, *spcs = NULL, *dbs = NULL, *rels = NULL;
+    uint64          lead_wm = 0;
+    Oid             loid = InvalidOid;
+    uint64          base;
+    char            conninfo[256];
+    PGconn         *conn;
+    PGresult       *res;
+    text           *ret;
+    MemoryContext   caller_cxt = CurrentMemoryContext;
+    char           *remote_sql = NULL;
+    char           *summary = NULL;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("provision_shard_replica() 限超级用户")));
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("provision_shard_replica: SPI_connect 失败")));
+
+    initStringInfo(&q);
+
+    /* ① 本节点必须**就是**这个分片的主，否则无从推送 */
+    appendStringInfo(&q,
+                     "SELECT local_oid::text FROM partdist.shard_identity "
+                     "WHERE global_shard_id = %lld", (long long) gsid);
+    { char *t = prov_query_text(q.data); if (t) loid = (Oid) strtoul(t, NULL, 10); }
+    if (!OidIsValid(loid))
+    {
+        SPI_finish();
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("provision_shard_replica: 本节点没有分片 %lld", (long long) gsid),
+                 errhint("本函数须在该分片的 leader 上调用。")));
+    }
+
+    /*
+     * ★ 「本地有这个分片」不等于「本节点是它的主」—— 副本上也有。
+     *
+     * 不拦的话，副本上调用会一路走到基线发射，被 pg_raft 的写栅栏拒掉
+     * （"本节点不是该分区组的 leader"），报错指向 raft、看不出是**调错了节点**。
+     * 判据取控制面的登记（partition_map.primary_node）与本节点的 raft 编号：
+     * 编号是 pg_raft.node_id，**不是** Citus 的 groupid，两者差 1。
+     */
+    {
+        char       *gstate;
+        char       *prim;
+
+        /*
+         * ★ 判据取**本节点此刻的 raft 组状态**，与写栅栏查的是同一件事
+         * （raft_consensus.c：`state != RAFT_LEADER` 即拒本地写）。
+         *
+         * 首版拿 partition_map.primary_node 比对本节点编号 —— 那是**控制面的
+         * 登记**，它落后于选举：实测第一次调用时组已选出主、登记却还是"未登记"，
+         * 于是自己把自己拦了。登记只留作报错时的旁证。
+         */
+        resetStringInfo(&q);
+        appendStringInfo(&q,
+                         "SELECT state FROM partdist.pg_raft_group_status() "
+                         "WHERE group_id = %lld", (long long) gsid);
+        gstate = prov_query_text(q.data);
+
+        if (gstate == NULL || strcmp(gstate, "leader") != 0)
+        {
+            char        sbuf[64];
+            char        pbuf[64];
+
+            snprintf(sbuf, sizeof(sbuf), "%s", gstate ? gstate : "无该组");
+            resetStringInfo(&q);
+            appendStringInfo(&q,
+                             "SELECT primary_node::text FROM partdist.partition_map "
+                             "WHERE partition_id = %lld", (long long) gsid);
+            prim = prov_query_text(q.data);
+            snprintf(pbuf, sizeof(pbuf), "%s", prim ? prim : "未登记");
+            SPI_finish();
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("provision_shard_replica: 本节点不是分片 %lld 的主"
+                            "（本节点该组状态=%s，控制面登记的主=%s）",
+                            (long long) gsid, sbuf, pbuf),
+                     errdetail("供给要在 leader 上发起：它要先发一次物理基线，"
+                               "而基线走 raft 写路径，副本上会被写栅栏拒掉。"),
+                     errhint("到该分片的主节点上调用；组还没选出主时先等它收敛。")));
+        }
+    }
+
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SELECT hostname||':'||port FROM partdist.node_map "
+                     "WHERE node_id = %d", target);
+    host = prov_query_text(q.data);
+    if (host == NULL)
+    {
+        SPI_finish();
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("provision_shard_replica: node_map 里没有节点 %d", target)));
+    }
+    portstr = strchr(host, ':');
+    if (portstr != NULL)
+        *portstr++ = '\0';
+
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SET citus.override_table_visibility=false; "
+                     "SELECT %u::regclass::text", loid);
+    shard_tbl = prov_query_text(q.data);
+
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SELECT logicalrelid::text FROM pg_dist_shard "
+                     "WHERE shardid = %lld", (long long) gsid);
+    logical = prov_query_text(q.data);
+    if (shard_tbl == NULL || logical == NULL)
+    {
+        SPI_finish();
+        ereport(ERROR,
+                (errmsg("provision_shard_replica: 解析不出分片 %lld 的表名"
+                        "（分片表=%s 分布表=%s）", (long long) gsid,
+                        shard_tbl ? shard_tbl : "?", logical ? logical : "?")));
+    }
+
+    /* ② 登记 fileset（成员集以此刻为准） */
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SET citus.override_table_visibility=false; "
+                     "SELECT partdist.register_shard_fileset(%u::regclass)::text", loid);
+    (void) prov_query_text(q.data);
+
+    /*
+     * ★★ 阶段①：**先**去目标节点把壳表和身份建出来，之后才能发基线。
+     *
+     * 顺序是实测钉死的，不是偏好。目标节点没有壳表时，`shard_identity` 里就没有
+     * 这个分片的本地 OID，raft 的字节**归不了档**，于是它 ack 不了 —— 三成员组里
+     * 只有 leader 能 ack，基线提案卡在 1/3：
+     *     WARNING: 组 N propose plsn=1 失败(state=2 last_log_index=0 ...)
+     *     ERROR:   分区 X(组 N) record 1 未达多数派
+     * 报错指着"未达多数派"，看着像 raft 有毛病，其实是**目标还没准备好收**。
+     * 各验收脚本的手工配方里，壳表也一直是在建组之前建的 —— 那条隐含前提
+     * 从没写下来过，本函数把它变成显式的两段。
+     */
+    /* 阶段①的远程语句：只建壳表 + 重建身份，让目标先能收字节 */
+    initStringInfo(&remote);
+    appendStringInfo(&remote,
+                     "SET citus.enable_ddl_propagation=off; "
+                     "CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL); "
+                     "ALTER TABLE %s SET (autovacuum_enabled=off, toast.autovacuum_enabled=off); "
+                     "SELECT partdist.rebuild_shard_identity();",
+                     shard_tbl, logical, shard_tbl);
+    snprintf(conninfo, sizeof(conninfo),
+             "host=%s port=%s dbname=postgres user=postgres "
+             "connect_timeout=5 options='-c statement_timeout=60000'",
+             host, portstr ? portstr : "5432");
+
+    /*
+     * ★ SPI_connect() 把 CurrentMemoryContext 切到 SPI 的过程上下文，
+     * SPI_finish() 会把它整个释放 —— 上面所有 TextDatumGetCString / StringInfo
+     * 的内存都在那里。首版在 SPI_finish 之后还用 shard_tbl / rels 拼返回值，
+     * 那是**读已释放内存**。要跨过 SPI_finish 的串必须先搬到调用方上下文。
+     */
+    remote_sql = MemoryContextStrdup(caller_cxt, remote.data);
+    shard_tbl  = MemoryContextStrdup(caller_cxt, shard_tbl);
+    SPI_finish();
+
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        char errbuf[256];
+
+        strlcpy(errbuf, PQerrorMessage(conn), sizeof(errbuf));
+        PQfinish(conn);
+        ereport(ERROR,
+                (errcode(ERRCODE_CONNECTION_FAILURE),
+                 errmsg("provision_shard_replica: 连不上目标节点 %d (%s): %s",
+                        target, conninfo, errbuf)));
+    }
+    res = PQexec(conn, remote_sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK &&
+        PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        char errbuf[512];
+
+        strlcpy(errbuf, PQerrorMessage(conn), sizeof(errbuf));
+        PQclear(res);
+        PQfinish(conn);
+        ereport(ERROR,
+                (errmsg("provision_shard_replica: 目标节点 %d 建壳表失败: %s",
+                        target, errbuf)));
+    }
+    PQclear(res);
+
+    /* ── 阶段②：目标已能收字节，这才发基线；base 取基线那一刻的 plsn ── */
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        PQfinish(conn);
+        ereport(ERROR, (errmsg("provision_shard_replica: SPI_connect 失败(阶段②)")));
+    }
+    initStringInfo(&q);
+    appendStringInfo(&q,
+                     "SET citus.override_table_visibility=false; "
+                     "SELECT partdist.shard_baseline_emit(%u::regclass)::text", loid);
+    { char *t = prov_query_text(q.data); base = t ? strtoull(t, NULL, 10) : 0; }
+
+    /* 成员清单在基线之后读：成员集与基线同源 */
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SET citus.override_table_visibility=false; "
+                     "SELECT string_agg(role::text,',' ORDER BY role,ord), "
+                     "       string_agg(ord::text,',' ORDER BY role,ord), "
+                     "       string_agg(spc::text,',' ORDER BY role,ord), "
+                     "       string_agg(db::text,',' ORDER BY role,ord), "
+                     "       string_agg(relnum::text,',' ORDER BY role,ord) "
+                     "  FROM partdist.shard_fileset(%u::regclass)", loid);
+    if (SPI_execute(q.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool isnull;
+        roles = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+        ords  = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+        spcs  = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull));
+        dbs   = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull));
+        rels  = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull));
+    }
+    if (roles == NULL)
+    {
+        SPI_finish();
+        PQfinish(conn);
+        ereport(ERROR, (errmsg("provision_shard_replica: 分片 %lld 的 fileset 为空",
+                               (long long) gsid)));
+    }
+
+    /*
+     * ★★ 把 leader 的**分片发号水位**一并带过去。
+     *
+     * 纯靠物理基线建出来的副本，元组里带的是**分片 xid**（页镜像原样拷过来的），
+     * 可它没收过任何 MARKER，本地水位是 0。两处会因此判错：
+     *   - T6.3c 的读闸门判据是 `ShardXidAllocWatermark > 0`（"在不在分片 xid
+     *     宇宙里"），水位 0 就被当成**遗留副本**放行 —— 而遗留副本之所以能读，
+     *     前提正是"元组带原生 xid"，在这里根本不成立；
+     *   - T6.4 的切主认领扫 [claim_wm, watermark)，水位 0 ⇒ 区间为空 ⇒
+     *     一条无主 RUNNING 都认领不到。
+     * 实测就是前者：供给完之后读副本壳表**没有被拦**。
+     */
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "SELECT partdist.shard_xid_next(%u::oid)::text", loid);
+    { char *t = prov_query_text(q.data); lead_wm = t ? strtoull(t, NULL, 10) : 0; }
+
+    /*
+     * ★ 必须 initStringInfo 而不是 resetStringInfo：`remote` 是在**阶段①的
+     * SPI 上下文**里 init 的，第一次 SPI_finish() 已经把那块内存整个释放。
+     * reset 之后往里 append 就是写已释放内存 —— 实测症状是远程 SQL 被拦腰
+     * 拼错：`ARRAY[5517348,SET citus.enab...`，报回来的却是目标节点的
+     * "syntax error at or near citus"，看着像 SQL 拼串写错了，其实是内存问题。
+     * 这是同一个上下文陷阱在本函数里的第二次，第一次是 SPI_finish 之后还用
+     * shard_tbl / rels 拼返回值。
+     */
+    initStringInfo(&remote);
+    appendStringInfo(&remote,
+                     "SET citus.enable_ddl_propagation=off; "
+                     "SELECT partdist.replay_set_locmap('%s', ARRAY[%s], ARRAY[%s], "
+                     "ARRAY[%s]::oid[], ARRAY[%s]::oid[], ARRAY[%s]::oid[], %llu::bigint); "
+                     "SELECT partdist.replay_enable('%s'); "
+                     "SELECT partdist.shard_xid_raise_watermark('%s'::regclass::oid, %llu);",
+                     shard_tbl, roles, ords, spcs, dbs, rels,
+                     (unsigned long long) base, shard_tbl,
+                     shard_tbl, (unsigned long long) lead_wm);
+    resetStringInfo(&q);
+    appendStringInfo(&q,
+                     "shard=%lld target_node=%d table=%s base=%llu xid_wm=%llu members=%s",
+                     (long long) gsid, target, shard_tbl,
+                     (unsigned long long) base, (unsigned long long) lead_wm, rels);
+    remote_sql = MemoryContextStrdup(caller_cxt, remote.data);
+    summary    = MemoryContextStrdup(caller_cxt, q.data);
+    SPI_finish();
+
+    res = PQexec(conn, remote_sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK &&
+        PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        char errbuf[512];
+
+        strlcpy(errbuf, PQerrorMessage(conn), sizeof(errbuf));
+        PQclear(res);
+        PQfinish(conn);
+        ereport(ERROR,
+                (errmsg("provision_shard_replica: 目标节点 %d 配 locmap/arm 失败: %s",
+                        target, errbuf)));
+    }
+    PQclear(res);
+    PQfinish(conn);
+
+    ret = cstring_to_text(summary);
+    PG_RETURN_TEXT_P(ret);
+}

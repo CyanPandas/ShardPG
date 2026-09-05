@@ -1116,6 +1116,27 @@ CREATE OR REPLACE FUNCTION advance_wal_to(
 COMMENT ON FUNCTION advance_wal_to(PG_LSN) IS
     'FRD §11 步骤 4 的原语（内核补丁 0010）：把本地 WAL 插入位点在线推进到 p_target 之后的段边界。跳跃发生在一次强制检查点持有全部插入锁的临界区内，因此不存在"跳了却没有检查点"的丢数据窗口。跳过的 WAL 段号成为永久空洞：本地崩溃恢复不受影响，原生归档/PITR 在此断链。限超级用户。';
 
+CREATE OR REPLACE FUNCTION shard_xid_raise_watermark(
+    p_shard OID,
+    p_watermark BIGINT
+) RETURNS void LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_raise_watermark';
+
+COMMENT ON FUNCTION shard_xid_raise_watermark(OID, BIGINT) IS
+    '把本分片的发号水位抬到 p_watermark（只升不降）。供给副本时由 leader 把自己的水位带过去：纯靠物理基线建出来的副本，元组里带的是分片 xid，却没有任何 MARKER 教它水位——水位为 0 会让 T6.3c 的读闸门把它误当成遗留副本放行，也会让 T6.4 的切主认领区间为空。';
+
+-- ------------------------------------------------------------------
+-- 批次 #7：副本供给（在 leader 上调用，向目标节点推）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION provision_shard_replica(
+    p_global_shard_id BIGINT,
+    p_target_node     INTEGER
+) RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_provision_shard_replica';
+
+COMMENT ON FUNCTION provision_shard_replica(BIGINT, INTEGER) IS
+    '把「给分片 X 在节点 N 上建一个副本」做成一个入口：本地登记 fileset → 发物理基线（§13 约束 2 的静止点）→ 到目标节点建壳表、按该基线的 partition_lsn 配 locmap、arm 回放。此前 register_shard_fileset/replay_set_locmap/replay_enable 在产品代码里没有任何调用方，副本只能靠人手建。须在该分片的 leader 上、由超级用户调用。';
+
 -- ------------------------------------------------------------------
 -- T6.4：§6.6 第三支，切主认领
 -- ------------------------------------------------------------------

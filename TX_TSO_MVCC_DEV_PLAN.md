@@ -4505,6 +4505,100 @@ progress"，看名字像"本地进度"，我一度以为升主路径那句"上�
 
 ---
 
+#### 批次 #7：角色交接落地 + 副本供给入口（2026-09-04，27/0）
+
+承接"是不是绕行"那次追查的第 3、4 条。两条都补上了，**而且都不用改 pg_raft**。
+
+##### 第 3 条：raft → 回放的角色交接（原来只有一句 ereport(LOG)）
+
+`partwal_notify_primary_switch()` 此前整个函数体只有一句日志，文件头写着
+「Placeholder until the real role-switch / replay handover lands」。
+也就是说 raft 把主权翻过来之后，**数据面什么都没做**。
+
+★ 动手前的关键发现：**这件事根本不需要碰冻结面**。桥接函数
+`raft_notify_primary_switch()` 已经把 `(partition_id, old, new, switch_orig_lsn)`
+全传进来了，而 `partwal_notify_primary_switch` 本身就在 pg-partdist。
+更要紧的是它由 **group0 的 apply** 调用，而 group0 的 apply 在**每个成员节点**
+上都跑 —— 每个节点都能就地判断自己的新角色。`pg_raft_promote_prepare` 那条路
+只在**当选者**上跑，天生够不着降级方向。
+
+实装两个方向：
+- **升主**：解除 T6.3c 的读闸门 + **撤下回放槽位的 armed**（新主不再是副本，
+  留着 armed 就等着一次误触发的 catchup 拿别人的流盖自己的表）。
+- **降级**：立刻收回"已升主"身份，读闸门重新合上。方向是 fail-closed 的 ——
+  交出去之后本地这份随时可能过期，宁可拦住。
+- **不**自动重新 arm：降级归队能不能直接按游标追平，取决于有没有快路径分叉
+  （§9.5：分叉的旧 leader 必须重做物理基线）。那个判断不属于交接。
+
+同时把 T6.8 临时放在 `ShardXidClaimOnPromote` 里的置位**搬走**了 ——
+那是当时受批次 #6 范围所限的局部替身，且时机偏早（promote_prepare 跑在**上报
+之前**，路由还没翻）。现在回到 FRD §11 步骤 5 说的位置。
+
+★ 编号是个坑：`partition_map.primary_node` 用的是 **pg_raft.node_id**
+（本集群 worker1=2），**不是** `PartDistLocalNodeId()` 的 Citus groupid
+（worker1=1）。两套差 1，混用会把"我是不是新主"整个判反。
+
+##### 第 4 条：`provision_shard_replica(shard, target_node)`
+
+此前 `register_shard_fileset` / `replay_set_locmap` / `replay_enable` 在产品代码里
+**没有任何调用方**，只有验收脚本在调。选 **leader 推**不选拉：素材都在 leader 手里。
+
+**顺序是实测钉死的，分两次远程往返**：
+1. 本地登记 fileset；
+2. **先**去目标节点建壳表 + `rebuild_shard_identity`；
+3. **再**发物理基线，拿它的 partition_lsn 作 base；
+4. 推 locmap(base) + `replay_enable` + **把 leader 的分片发号水位一并带过去**。
+
+②必须在③之前 —— 目标没有壳表就没有本地 OID，raft 的字节**归不了档**、它 ack
+不了，三成员组里只有 leader 能 ack，基线提案卡在 1/3：
+`ERROR: 分区 X(组 N) record 1 未达多数派`。报错指着"未达多数派"，看着像 raft
+有毛病，其实是**目标还没准备好收**。各验收脚本的手工配方里壳表一直建在建组
+之前，那条隐含前提从没写下来过。
+
+④里带水位也是实测逼出来的：**纯靠物理基线建出来的副本，元组里带的是分片 xid，
+却没收过任何 MARKER**，本地水位是 0。于是 T6.3c 的读闸门（判据
+`ShardXidAllocWatermark > 0`）把它当成**遗留副本**放行 —— 而遗留副本能读的前提
+正是"元组带原生 xid"，在这里根本不成立；T6.4 的认领区间也会是空的。
+
+##### 自己踩的三个坑，都记下来
+
+1. **SPI 只读执行不许 SET**。`prov_query_text` 首版用 `SPI_execute(..., true, 1)`，
+   而查询里带 `SET citus.override_table_visibility`（不设就看不见分片表）。
+   报错是 `CONTEXT: SQL statement "SET citus.override_table_visibility=false; ..."`
+   —— 指着被拒的那条 SET，不是查询本身。
+2. **SPI 内存上下文，同一个坑踩了两次**。`SPI_connect()` 把
+   CurrentMemoryContext 切到 SPI 过程上下文，`SPI_finish()` 整个释放。
+   第一次是 SPI_finish 之后还用 `shard_tbl`/`rels` 拼返回值；第二次是
+   `remote` 这个 StringInfo 在阶段①的上下文里 init、阶段②却 `resetStringInfo`
+   往里写 —— 症状是远程 SQL 被拦腰拼错
+   （`ARRAY[5517348,SET citus.enab...`），而报回来的是目标节点的
+   "syntax error at or near citus"，看着像 SQL 拼串写错了。
+   **跨 SPI_finish 的串必须先 MemoryContextStrdup 到调用方上下文。**
+3. **判据要对齐真正把关的那道门**。我给供给加的"必须在 leader 上调"首版按
+   `partition_map.primary_node` 判，可**控制面登记落后于选举** —— 第一次调用时
+   组已选出主、登记还是"未登记"，自己把自己拦了。改成查
+   `pg_raft_group_status()` 的组状态，与写栅栏查的是同一件事。
+
+##### 验收：`test_handover_provision_p7.sh` 27/0
+
+最有力的两条：
+- **不手工建任何东西**，只调一次 `provision_shard_replica`，追平后副本与 leader
+  **逐字节一致**（供给前先断言目标上壳表**不存在**，否则这条一致性可能本来就有）；
+- 切主**之前**读新主壳表必须被闸门拦、**之后**必须放行 —— 这条**差分**证明放行
+  是**交接**干的，而不是别处顺手做掉的。
+外加三条阴性对照：在副本上调、在根本没有该分片的节点上调、交接日志按本轮唯一的
+GID 定位（不用行号基线 —— 新主是谁要到切主后才知道，在 f1 上取的行号对 f2 是
+错位的，首版因此漏判）。
+
+##### 夹具必须让 placement 主抢跑（记下来，免得下次又当成产品缺陷）
+
+组主**必须**落在 placement 主上：数据只在它那儿，而供给要先发基线、基线要求
+发起者是组 leader。三个成员同时建组是场竞选竞态，实测连续两轮选到了没有数据的
+节点，整套连锁全红。pg_raft 没有"指定竞选/转移主权"的入口，只能让 placement 主
+先建组、等一拍再建到 follower 上，仍选不到就复位重来。
+
+---
+
 #### ★ P6 是最后一期：不做的事也必须有裁定
 
 P6 之后没有下一期可以推。因此**下列每一条都必须在 P6 出口前拿到明确去向**
@@ -4858,6 +4952,21 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
     （协调者没提交就等于没发生，本次核对过 `pg_dist_shard` 里确无对应表）；
     **本方案自己的 DTX 一概不碰** —— 它的判决在 raft 里，只能由恢复守护按决议
     闭合，验收脚本无权替它做主。
+
+23. **R-P7-1 从未被供给的组成员照样能当选，R-P4-15 挡不住**
+    （2026-09-04，批次 #7 实测，**未修，已定性**）：
+    R-P4-15 拦的是「收到了分区 WAL 却没有回放槽位」—— 判据是
+    `get_follower_applied_part_lsn(loid) > 0`。可**从来没被供给过**的成员连字节
+    都收不到（没有壳表 ⇒ shard_identity 里没有本地 OID ⇒ 字节归不了档），
+    那个值恒为 0，守卫的 `IF coalesce(bound,0) > 0` 判否，**直接放行**。
+    实测：三成员组里只供给了一个 follower，杀掉 leader 之后选中的是**没有任何
+    数据**的那个陪跑节点，新主上连表都不存在。
+    **性质**：这不是"读到旧数据"，是"读到空表" —— 比 R-P4-15 拦的那一格更糟。
+    **暂行纪律**：**成员集应当跟着真实副本走 —— 先供给，再进组**；
+    `provision_shard_replica()` 让这条纪律第一次成为可执行的动作。
+    **未闭**：真修法是升主前置再加一道「本节点有没有这个分片的物理副本」的判据
+    （壳表存在 + locmap 已配对），而不是只看收没收到字节。属 pg_raft 面，
+    须新批次。
 
 22. **R-P6-13 门禁仍有跨套件干扰：同一二进制上"批次红、单跑绿"**
     （2026-09-04，T6.8 实测，**未修，已量化**）：
