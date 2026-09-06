@@ -164,6 +164,18 @@ neg2=$(PSQL 5436 -Atc "SELECT partdist.provision_shard_replica(${GID}::bigint, $
 check "★ 根本没有该分片的节点调用 ⇒ ERROR" \
       "$([[ "$neg2" == *"本节点没有分片"* ]] && echo rejected)" "rejected"
 
+echo "================ [2b] ★★ R-P7-1：没有副本的成员不许当选 ================"
+# R-P4-15 拦的是"收到了分区 WAL 却没有回放槽位"，判据 applied_part_lsn > 0。
+# **从未被供给**的成员连字节都收不到（没壳表 ⇒ 没本地 OID ⇒ 字节归不了档），
+# 那个值恒为 0，守卫判否**直接放行** —— 空节点当选，新主上连表都没有。
+# 这比 R-P4-15 拦的那一格更糟：它是"读到旧数据"，这是"读到空表"。
+nohost=5436
+[[ "$nohost" == "$PA" || "$nohost" == "$f1" || "$nohost" == "$f2" ]] && nohost=5437
+hasit=$(PSQL $nohost -Atc "SELECT coalesce(partdist.local_partition_for_shard(${GID})::text,'none')" </dev/null|tail -1)
+check "阴性前提：:$nohost 确实没有该分片" "$hasit" "none"
+rc7=$(PSQL $nohost -Atc "SELECT partdist.pg_raft_promote_prepare(${GID}, 2000)" </dev/null 2>&1|tail -1)
+check "★★ 没有副本的成员升主前置返回 -1（永不放行）" "$rc7" "-1"
+
 echo "================ [3] ★★ raft → 回放的真角色交接 ================"
 # ★ 差分的前半：切主**之前**，新主候选上的壳表必须被闸门拦住。
 before=$(PSQL $f1 -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${TBL}" </dev/null 2>&1 | tr '\n' ' ')
@@ -196,8 +208,14 @@ done
 check "★★ 切主后：读壳表**放行**（交接解除了副本身份）" \
       "$([[ "$after" =~ ^[0-9]+$ ]] && echo allowed)" "allowed"
 check "★★ 新主读到切主前写入的全部 40 行" "$after" "40"
-narm=$(PSQL $NEWPORT -Atc "SELECT armed FROM partdist.replay_status() WHERE shard=$(PSQL $NEWPORT -Atc "SELECT partdist.local_partition_for_shard(${GID})" </dev/null|tail -1)" </dev/null 2>/dev/null|tail -1)
-check "★ 交接撤下了回放 armed（新主不再是副本，防误触发盖表）" "$narm" "f"
+# ★ 验的是**真防护**：对已升主的分片触发回放必须被拒。
+#   首版断言的是 armed='f'（交接把它撤掉）—— 那个做法为了防护去改别人依赖的
+#   状态，实测把 txn_layer_r2 的"崩溃后重新追平"打红了。防护下到动作处之后，
+#   armed 归属不变，而断言反而更强：它测的是"盖不进去"，不是"某个位是 0"。
+noid=$(PSQL $NEWPORT -Atc "SELECT partdist.local_partition_for_shard(${GID})" </dev/null|tail -1)
+rej=$(PSQL $NEWPORT -Atc "SELECT partdist.replay_catchup(${noid}::regclass, 1, 5000)" </dev/null 2>&1 | tr '\n' ' ')
+check "★★ 对已升主的分片触发回放被拒（拿别人的流盖自己的表进不来）" \
+      "$([[ "$rej" == *"已升主，不再回放别人的流"* ]] && echo rejected)" "rejected"
 newdir="worker$((NEWPORT - 5432))"
 # ★ 不用行号基线：新主是谁要到切主后才知道，在 f1 上取的行号对 f2 是错位的
 #   （首版因此漏判）。本轮的 GID 全局唯一，直接按它定位即可。

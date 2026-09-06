@@ -174,6 +174,19 @@ reap_xid_slots() {
   echo "  [净场] 回收陈旧分配器槽位 $total 个（上限 64，跨过即该节点所有打标验收在登记那步死）"
 }
 
+# ── ⑪ 扩展函数面对齐（R-P6-12）──────────────────────────────────
+#
+# ★ 扩展 SQL 只在 CREATE EXTENSION 时执行一次，之后新增的声明不会自动补到
+#   已有的库上。tx2 是增量搭起来的环境，实测**声明 86 个、库里少 10 个**。
+#   后果不是少几个函数，而是**任何"SQL 里声明了就一定能调"的假设都会翻车** ——
+#   T6.8 的门禁判据一开始就拿 partdist_tso_status() 当判据，而库里根本没有它。
+#   每轮起跑前重放一遍 C 函数声明（CREATE OR REPLACE，幂等）。
+refresh_extension_funcs() {
+  local out
+  out=$(CONTAINER="$C" bash "$T/../scripts/refresh_extension_sql.sh" 2>&1 | tail -1)
+  echo "  [净场] 扩展函数面对齐：${out#  }"
+}
+
 # ── ⑤⑥ 残表 + raft 复位 + GUC ──────────────────────────────────
 # ★★ 每套件之前把 9 个节点都拉起来。
 #
@@ -293,6 +306,44 @@ purge_orphan_prepared() {
   return 0
 }
 
+# ── ⑩ 等到 raft 拓扑收敛（R-P6-13）──────────────────────────────
+#
+# ★★ 净场层原来只做"复位 + 拉起"，**没有"等到组稳定"这一步**。后果是
+#   R-P6-13：同一份二进制上"批次红、单跑绿" —— follower_replay_r1 30/18 与
+#   36/12 对 58/0、offnum_guard_p6 16/9 对 25/0、locmap_base_p6 22/1 对 23/0。
+#   现场提示反复是「分区主副本可能已切换」与 local_partition_for_shard() 取空，
+#   指向**分区组主权在批次里持续抖动**。
+#
+# **危险是双向的**：它既会把好的判成红（上面三例），也可能把该红的盖成绿 ——
+# 后者更糟，因为没人会去查一条通过的断言。
+#
+# 稳定的定义取两条可直接观测的：
+#   (a) 每个节点上**只剩 group 0** —— 上一套的数据组残留是主权抖动的直接来源；
+#   (b) group 0 的 leader 在各节点上**一致且非零** —— 控制面自己没在选举中。
+# 等不到就只告警不阻塞：宁可带着告警跑，也好过静默地把抖动算进结果。
+wait_groups_settled() {
+  local t p ngroups leaders uniq_leaders ok
+  for t in $(seq 1 30); do
+    ok=1
+    for p in $PORTS; do
+      ngroups=$(PS "$p" -Atc "SELECT count(*) FROM partdist.pg_raft_group_status()" </dev/null 2>/dev/null)
+      [[ "$ngroups" == "1" ]] || { ok=0; break; }
+    done
+    if [[ "$ok" == "1" ]]; then
+      leaders=$(for p in $PORTS; do
+                  PS "$p" -Atc "SELECT coalesce(leader_node_id,0) FROM partdist.pg_raft_get_cluster_status()" </dev/null 2>/dev/null
+                done | sort -u | tr '\n' ' ')
+      uniq_leaders=$(printf '%s' "$leaders" | wc -w)
+      if [[ "$uniq_leaders" == "1" && "$leaders" != "0 " ]]; then
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  echo "  [净场] ⚠ raft 拓扑 60s 未收敛（残留数据组或 group0 主未定），本套结果按 R-P6-13 存疑"
+  return 0
+}
+
 scrub() {
   local p round
   ensure_nodes_up
@@ -319,6 +370,7 @@ scrub() {
     done
     sleep 2
   done
+  wait_groups_settled
 }
 
 # ★ 真的清，不只是数 —— 头注释里承诺了 ⑤，只数不清就是文不对题。
@@ -423,6 +475,7 @@ wait_idle
 rotate_logs
 prepare_env
 reap_xid_slots
+refresh_extension_funcs
 echo "  [净场] 起跑前残表：$(leftovers)"
 purge_leftovers
 echo "  [净场] 清理后残表：$(leftovers)"

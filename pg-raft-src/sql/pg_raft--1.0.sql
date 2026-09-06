@@ -412,7 +412,27 @@ BEGIN
     -- 而"检测到分叉"绝不能放行 —— 放行等于让一个已知与组分叉的副本当上主库。
     loid := partdist.local_partition_for_shard(p_group_id);
     IF loid IS NULL OR loid = 0 THEN
-        RETURN 1;               -- 本节点没有该分片，无事可做
+        -- ★★ R-P7-1（批次 #9）：这里原本无条件 RETURN 1，注释写"本节点没有该
+        -- 分片，无事可做"。**那个假设是错的**：本函数的入参就是**这个组自己的**
+        -- 分片，拿不到本地 OID 只有一个含义 —— **本节点根本没有这个分片的副本**。
+        -- 放行等于把一个**没有任何数据**的节点选成主。
+        --
+        -- 它比 R-P4-15 拦的那一格更糟：R-P4-15 是"读到旧数据"，这是"读到空表"。
+        -- 而 R-P4-15 的判据（get_follower_applied_part_lsn > 0）恰恰挡不住它 ——
+        -- 从没被供给过的成员连字节都收不到（没有壳表 ⇒ shard_identity 里没有
+        -- 本地 OID ⇒ 字节归不了档），那个值恒为 0，守卫判否直接放行。
+        -- 实测：三成员组只供给了一个 follower，杀掉 leader 后选中的正是那个
+        -- 从未被供给的陪跑节点，新主上连表都不存在。
+        --
+        -- 返回 -1（永不放行）而不是 0（重试）：没有副本不会自己长出来，重试只是
+        -- 空转到 deadline 再被兜底放行 —— 缺陷原样回来，只是晚了一分钟。
+        -- 正解是先供给（partdist.provision_shard_replica）再让它参选。
+        -- 可用性：只排除这一个节点，同组其余**有副本**的成员照常可当选。
+        RAISE WARNING 'pg_raft: 分片 (组 %) 拒绝升主：本节点没有该分片的本地副本 '
+                      '（shard_identity 里查不到本地 OID）。从未被供给的成员当选 '
+                      '= 新主上连表都没有。请先 partdist.provision_shard_replica() '
+                      '把副本建起来再参选。', p_group_id;
+        RETURN -1;
     END IF;
 
     -- ★ 第 6 步 b（§9.5）：快路径分叉的归队规则。
@@ -519,6 +539,19 @@ BEGIN
         PERFORM partdist.dtx_close_indoubt(loid::oid);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg_raft: 升主闭合 in-doubt shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+
+    -- ★ 批次 #9：升主顺带修一次分叉标记。
+    --
+    -- 分叉标记是复制挂钩失败时就地写下的（§13 约束 13 的检测面，批次 #8），
+    -- 修复动作是重做物理基线。此刻是个安全的自动触发点：追平刚做完、本节点
+    -- 是组 leader（基线要走 raft 写路径）、且还没对外服务。
+    -- 尽力而为：修不动不挡升主（多数派可能还没回来），标记留着下次再修。
+    BEGIN
+        PERFORM partdist.repair_diverged_shards();
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
                       loid, p_group_id, SQLERRM;
     END;
 

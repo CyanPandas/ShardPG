@@ -164,4 +164,8 @@ extern void  ShardMarkDiverged(Oid shard_oid, const char *reason);
 extern char *ShardDivergedReason(Oid shard_oid);
 extern void  ShardClearDiverged(Oid shard_oid);
 
+/* 批次 #9："本节点已是该分片的主"的持久记号（重启后闸门要认得） */
+extern void  ShardPromotedMarkWrite(Oid shard_oid, bool promoted);
+extern bool  ShardPromotedMarkRead(Oid shard_oid);
+
 #endif /* SHARD_FILESET_H */

@@ -207,10 +207,9 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 	if (new_primary_node == me)
 	{
 		ShardReplicaSetPromoted(loid, true);
-		ShardReplaySetArmed(loid, false);
 		ereport(LOG,
 				(errmsg("pg_partdist: 分片 %u（本地 OID %u）已接管为主，"
-						"解除副本读闸门并撤下回放 armed",
+						"解除副本读闸门；此后拒绝对它触发回放",
 						partition_id, loid)));
 	}
 	else if (old_primary_node == me)

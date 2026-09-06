@@ -1132,6 +1132,13 @@ CREATE OR REPLACE FUNCTION shard_divergence(p_shard OID)
 COMMENT ON FUNCTION shard_divergence(OID) IS
     '§13 约束 13 的检测面：该分片有没有被标记为「副本可能已分叉」，返回标记时刻与原因，无标记返回 NULL。标记由复制挂钩失败时就地写下（非事务性——出事的事务马上要中止，写表会一起回滚）。修复是重做物理基线：shard_baseline_emit / provision_shard_replica 成功后会自己清。';
 
+CREATE OR REPLACE FUNCTION repair_diverged_shards()
+    RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';
+
+COMMENT ON FUNCTION repair_diverged_shards() IS
+    '把「见到分叉标记就重做基线」从逐个分片手工变成一次调用：扫 pg_parwal 下所有带标记的分片，对本节点能发基线的那些重发（基线成功自动清标），发不出去的（多半不是组 leader / 多数派没恢复）保留标记并计入 skipped。限超级用户。升主路径也会顺带跑一次。';
+
 CREATE OR REPLACE FUNCTION shard_clear_divergence(p_shard OID)
     RETURNS void LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_shard_clear_divergence';

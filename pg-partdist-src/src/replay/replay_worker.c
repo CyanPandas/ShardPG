@@ -231,6 +231,13 @@ ShardReplicaSetPromoted(Oid relid, bool promoted)
             break;
         }
     LWLockRelease(ReplayCtl->lock);
+
+    /*
+     * ★ 批次 #9：同步落盘。只放共享内存的话，一次重启就把"我已经是主了"这件事
+     * 忘掉，而交接不会再触发一次（主权没再变） —— 注册在案的主会被自己的副本
+     * 闸门永久拦住（dtx_tso_p4 的 M5/S1 就是这么红的）。
+     */
+    ShardPromotedMarkWrite(relid, promoted);
 }
 
 /*
@@ -516,6 +523,12 @@ ReplaySlotLoadLocsLocked(ReplayShardSlot *s)
     if (!ShardReplayReadLocMap(s->shard_oid, &lm, NULL))
         return;
 
+    /*
+     * ★ 批次 #9：槽位（重）载入时把持久记号读回来。槽位是重启后重建的，
+     * 不读盘就等于把升主这件事忘了。
+     */
+    s->promoted = ShardPromotedMarkRead(s->shard_oid);
+
     s->nlocs = 0;
     for (i = 0; i < lm.npairs; i++)
     {
@@ -580,6 +593,28 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
         ereport(ERROR,
                 (errmsg("replay_catchup: shard %u 未 armed（replay_enable）",
                         shard_oid)));
+    }
+
+    /*
+     * ★★ 已升主的分片不许再回放别人的流（批次 #9 改法）。
+     *
+     * 批次 #7 是靠**在交接时撤 armed** 来防这件事的 —— 那个做法错在
+     * **为了防护去改别人依赖的状态**：armed 是各验收/运维自己管的位，
+     * 交接把它抹掉，崩溃恢复后想继续追平的流程就断了
+     * （实测 txn_layer_r2 的"崩溃后重新追平"当场红：未 armed）。
+     * 防护应当下在**动作**上：谁来触发回放，就在这里拦谁。
+     * 这样 armed 的归属不变，而"拿别人的流盖自己的表"照样进不来。
+     */
+    if (s->promoted)
+    {
+        LWLockRelease(ReplayCtl->lock);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("replay_catchup: shard %u 已升主，不再回放别人的流",
+                        shard_oid),
+                 errdetail("本节点已是该分片的主（角色交接已置位）。继续回放会拿"
+                           "别人的分区流盖掉自己的表。"),
+                 errhint("确需把它退回副本，先重做物理基线并重新配对 locmap。")));
     }
 
     /*

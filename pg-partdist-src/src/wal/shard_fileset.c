@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "shard_fileset.h"
@@ -1516,6 +1517,7 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
 /* ================================================================== */
 
 #define SHARD_DIVERGED_FILENAME "diverged"
+#define SHARD_PROMOTED_FILENAME "promoted"
 
 /*
  * §13 约束 13 的机制，读原文才看清它比"提案被静默丢弃"微妙得多：
@@ -1639,4 +1641,162 @@ partdist_shard_clear_divergence(PG_FUNCTION_ARGS)
                            "它们成功后会自己清。")));
     ShardClearDiverged(shard);
     PG_RETURN_VOID();
+}
+
+
+/*
+ * ShardPromotedMark* —— "本节点已是该分片的主"这件事的**持久**记号（批次 #9）。
+ *
+ * ★ 批次 #7 把它只放在共享内存的槽位里，注释还写着"不持久化：重启后节点若仍是
+ * leader，升主路径会再跑一遍并重新置位"。**那句话是错的** —— 重启之后没有任何
+ * 东西会重跑交接（交接由 group0 apply 触发，而主权没再变过就不会再 apply 一次）。
+ * 于是一个**注册在案的主**在重启后被自己的副本闸门永久拦住。
+ *
+ * 实测代价：dtx_tso_p4 的 M5/S1 两条长期报"实际取不到值"，把 stderr 捞出来才
+ * 看见是「不允许在本节点上对副本壳表执行查询」—— 协调器的分布式读被路由到那个
+ * 节点，撞在自己的闸门上。这条红在 T6.7 基线里就有，一直没人查到底。
+ */
+static void
+shard_promoted_path(char *path, size_t len, Oid shard_oid)
+{
+    snprintf(path, len, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_PROMOTED_FILENAME);
+}
+
+void
+ShardPromotedMarkWrite(Oid shard_oid, bool promoted)
+{
+    char    path[MAXPGPATH];
+    int     fd;
+
+    if (!OidIsValid(shard_oid))
+        return;
+    shard_promoted_path(path, MAXPGPATH, shard_oid);
+
+    if (!promoted)
+    {
+        if (unlink(path) != 0 && errno != ENOENT)
+            ereport(WARNING,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: 升主记号 \"%s\" 删除失败: %m", path)));
+        return;
+    }
+
+    fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+    {
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 无法写升主记号 \"%s\": %m", path)));
+        return;
+    }
+    if (write(fd, "1\n", 2) != 2)
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 升主记号 \"%s\" 写入不完整: %m", path)));
+    (void) pg_fsync(fd);
+    CloseTransientFile(fd);
+}
+
+bool
+ShardPromotedMarkRead(Oid shard_oid)
+{
+    char        path[MAXPGPATH];
+    struct stat st;
+
+    if (!OidIsValid(shard_oid))
+        return false;
+    shard_promoted_path(path, MAXPGPATH, shard_oid);
+    return (stat(path, &st) == 0);
+}
+
+PG_FUNCTION_INFO_V1(partdist_repair_diverged_shards);
+
+/*
+ * repair_diverged_shards() → text
+ *
+ * 批次 #9：把「见到分叉标记就去重做基线」从**逐个分片手工**变成一次调用。
+ *
+ * 扫 pg_parwal/ 下所有带 diverged 标记的分片，对**本节点是组 leader** 的那些
+ * 重发物理基线（基线成功会自己清标）。不是 leader 的跳过并说明 —— 基线要走
+ * raft 写路径，副本上发不出去。
+ *
+ * ★ 为什么不做成"自动触发"：唯一能保证 quorum 已恢复的时刻是下一次复制成功，
+ * 而那在**提交路径**上；在那里放大成一次全量 FPI 洪水，代价与风险都要单独评估。
+ * 现在的形态是：检测自动、修复一条命令、升主路径顺带跑一次。
+ */
+Datum
+partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
+{
+    char            dirpath[MAXPGPATH];
+    DIR            *d;
+    struct dirent  *de;
+    StringInfoData  out;
+    int             nrepaired = 0, nskipped = 0, nstale = 0;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("repair_diverged_shards() 限超级用户")));
+
+    initStringInfo(&out);
+    snprintf(dirpath, MAXPGPATH, "%s/%s", DataDir, PARTITION_WAL_DIR);
+    d = AllocateDir(dirpath);
+    if (d == NULL)
+        PG_RETURN_TEXT_P(cstring_to_text("repaired=0 skipped=0 stale_cleaned=0（没有 pg_parwal 目录）"));
+
+    while ((de = ReadDir(d, dirpath)) != NULL)
+    {
+        Oid     shard;
+        char   *reason;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        shard = (Oid) strtoul(de->d_name, NULL, 10);
+        reason = ShardDivergedReason(shard);
+        if (reason == NULL)
+            continue;
+
+        /*
+         * ★ 表已经不在了 ⇒ 标记是孤儿，直接清掉。
+         *   不清的话它会**永远**堆在报告里：实测一次调用就 skipped=7，
+         *   全是早先夹具留下的、表早已 DROP 的分片。一个越用越吵的报告
+         *   等于没有报告 —— 真出事的那一条会被淹掉。
+         */
+        if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(shard)))
+        {
+            ShardClearDiverged(shard);
+            nstale++;
+            continue;
+        }
+
+        /*
+         * 只对本节点是组 leader 的分片动手。判据与写栅栏同源 —— 副本上发基线
+         * 一定被拒，硬试只会把一个可读的报告变成一串 ERROR。
+         */
+        PG_TRY();
+        {
+            (void) ShardBaselineEmit(shard);   /* 成功即清标 */
+            nrepaired++;
+            appendStringInfo(&out, " repaired:%u", shard);
+        }
+        PG_CATCH();
+        {
+            /* 发不出去（多半不是 leader / 多数派没恢复）：留标记，报出来 */
+            FlushErrorState();
+            nskipped++;
+            appendStringInfo(&out, " skipped:%u", shard);
+        }
+        PG_END_TRY();
+    }
+    FreeDir(d);
+
+    {
+        StringInfoData s2;
+
+        initStringInfo(&s2);
+        appendStringInfo(&s2, "repaired=%d skipped=%d stale_cleaned=%d%s",
+                         nrepaired, nskipped, nstale, out.data);
+        PG_RETURN_TEXT_P(cstring_to_text(s2.data));
+    }
 }

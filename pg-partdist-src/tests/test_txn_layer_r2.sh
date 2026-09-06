@@ -124,23 +124,53 @@ check "leader 本地分区 oid 解析成功" "$([[ -n "$loid" && "$loid" != "0" 
 
 flush_lsn() { PSQL "$1" -Atc "SELECT partdist.get_partition_flush_lsn($2)"; }
 
+# ★★ 找**本事务的 MARKER**，不能假设它就是流的尾记录。
+#
+#   冻结账目发射器（D2）按间隔往同一条流里插 CTRL 记录（rmid=255 / flags=4），
+#   它随时可能追加在提交标记之后。首版直接读 flush_lsn 那一条，于是在长批次里
+#   撞上发射器就整段连锁全红（实测 43/8：尾记录读成 flags=4，后面取 gxid、
+#   查 gclog、核 commit_ts 全部落空）。**这不是抖动，是假设本身错了** ——
+#   单跑能过只是因为没撞上。
+#   改成从 upto 向前找第一条 flags=2（MARKER），最多回溯 20 条。
+marker_plsn() {   # $1=partition_oid  $2=upto
+  PSQL $pport -Atc "
+    SELECT g FROM generate_series(${2}, GREATEST(${2}-20,1), -1) g,
+         LATERAL partdist.partwal_read_record(${1}::oid, g) r
+     WHERE r.flags = 2 LIMIT 1" </dev/null 2>/dev/null | tail -1
+}
+
 echo "========== [4] 简单提交：尾部 COMMIT MARKER =========="
 before=$(flush_lsn $pport $loid)
 PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO r2_txn VALUES (1,'a'),(2,'b');"
 after=$(flush_lsn $pport $loid)
 check "提交产生了新记录（${before} → ${after}）" "$([[ "$after" -gt "$before" ]] && echo ok)" "ok"
 
+mplsn=$(marker_plsn $loid $after)
 row=$(PSQL $pport -Atc "
   SELECT flags||'|'||rmid||'|'||info||'|'||length(data)||'|'||${NSUB}
-  FROM partdist.partwal_read_record(${loid}::oid, ${after})")
-check "尾记录是 COMMIT MARKER（flags=2 rmid=1 info=0 len=24 nsub=0）" "$row" "2|1|0|24|0"
+  FROM partdist.partwal_read_record(${loid}::oid, ${mplsn:-$after})")
+check "本事务的 COMMIT MARKER 就位（flags=2 rmid=1 info=0 len=24 nsub=0）" "$row" "2|1|0|24|0"
 
-gx=$(PSQL $pport -Atc "SELECT gxid FROM partdist.partwal_read_record(${loid}::oid, ${after})")
+# ★ gxid 要从 **MARKER** 那条取，不是从尾记录取 —— 尾巴上可能是冻结发射器
+#   插进来的 CTRL（gxid=0），拿它去比对一比一个不中。
+gx=$(PSQL $pport -Atc "SELECT gxid FROM partdist.partwal_read_record(${loid}::oid, ${mplsn:-$after})")
+# ★ 期望条数也不能用 (after-before-1) 硬算：那等于假设区间里每一条都是本事务的
+#   DATA，而 CTRL 记录随时会掺进来（实测 7 条 = 1 CTRL + 1 MARKER + 5 DATA，
+#   硬算出 6 就必红）。断言原本要说的是"**所有** DATA 的 gxid 都与 MARKER 一致"，
+#   那就按这句写：分母取区间内 DATA 的实际条数。
+mend=${mplsn:-$after}
+ndata_all=$(PSQL $pport -Atc "
+  SELECT count(*) FROM generate_series($((before+1)), $((mend-1))) g,
+       LATERAL partdist.partwal_read_record(${loid}::oid, g) r
+  WHERE r.flags=1")
 ndata=$(PSQL $pport -Atc "
-  SELECT count(*) FROM generate_series($((before+1)), $((after-1))) g,
+  SELECT count(*) FROM generate_series($((before+1)), $((mend-1))) g,
        LATERAL partdist.partwal_read_record(${loid}::oid, g) r
   WHERE r.flags=1 AND r.gxid=${gx}")
-check "MARKER 的 gxid 与全部 $((after-1-before)) 条 DATA 记录一致" "$ndata" "$((after-1-before))"
+# ★ 计数守卫：区间里一条 DATA 都没有的话，上面那条是 0==0 的**静默通过**。
+check "  区间内确实有 DATA 记录可比（${ndata_all} 条）" \
+      "$([[ -n "$ndata_all" && "$ndata_all" -ge 1 ]] && echo ok)" "ok"
+check "MARKER 的 gxid 与全部 ${ndata_all} 条 DATA 记录一致" "$ndata" "$ndata_all"
 
 # gxid 的节点号取自 pg_dist_local_group.groupid（不是端口推出来的 raft node id，
 # 两者是不同的编号空间）
@@ -160,11 +190,12 @@ COMMIT;
 SQL
 after=$(flush_lsn $pport $loid)
 
+mplsn2=$(marker_plsn $loid $after)
 mk=$(PSQL $pport -Atc "
   SELECT flags||'|'||info||'|'||${NSUB}||'|'||length(data)
-  FROM partdist.partwal_read_record(${loid}::oid, ${after})")
+  FROM partdist.partwal_read_record(${loid}::oid, ${mplsn2:-$after})")
 nsub=$(echo "$mk" | cut -d'|' -f3); len=$(echo "$mk" | cut -d'|' -f4)
-check "SAVEPOINT 事务尾部仍是 COMMIT MARKER" "$(echo "$mk" | cut -d'|' -f1,2)" "2|0"
+check "SAVEPOINT 事务的 COMMIT MARKER 就位" "$(echo "$mk" | cut -d'|' -f1,2)" "2|0"
 check "nsubxacts > 0（确实记下了子事务，nsub=${nsub}）" "$([[ -n "$nsub" && "$nsub" -gt 0 ]] && echo ok)" "ok"
 check "载荷长度 = 24 + 4*nsubxacts" "$len" "$((24 + 4*${nsub:-0}))"
 

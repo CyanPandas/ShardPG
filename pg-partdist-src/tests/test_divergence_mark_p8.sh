@@ -124,10 +124,19 @@ for round in 1 2 3; do
   sleep 2
 done
 check "  组已恢复（基线也要走 raft 写路径）" "$st2" "leader"
-be=$(PSQL $PA -Atc "SET citus.override_table_visibility=false; SELECT partdist.shard_baseline_emit(${SOID}::regclass)" </dev/null 2>&1|tail -1)
-check "★ 基线发射成功（base=${be}）" "$([[ "$be" =~ ^[0-9]+$ ]] && echo ok)" "ok"
+# ★★ 用**一条命令**修：repair_diverged_shards() 扫全部带标记的分片、逐个重发
+#   基线。这把"见到标记就逐个分片手工重做"变成一次调用（批次 #9）。
+rp=$(PSQL $PA -Atc "SELECT partdist.repair_diverged_shards()" </dev/null 2>&1|tail -1)
+echo "  repair_diverged_shards ⇒ ${rp}"
+check "★★ 一条命令修复（报告里 repaired>=1）" \
+      "$([[ "$rp" == repaired=* && "$rp" != repaired=0* ]] && echo ok)" "ok"
+check "  报告点名了被修的分片" "$([[ "$rp" == *"repaired:${SOID}"* ]] && echo ok)" "ok"
 d3=$(PSQL $PA -Atc "SELECT coalesce(partdist.shard_divergence(${SOID}::oid),'CLEAN')" </dev/null|tail -1)
 check "★★ 修复动作把标记清掉了（不必运维手工清）" "$d3" "CLEAN"
+# 阴性对照：没有标记时再修一次，应当 repaired=0（不做无谓的基线洪水）
+rp2=$(PSQL $PA -Atc "SELECT partdist.repair_diverged_shards()" </dev/null 2>&1|tail -1)
+check "★ 无标记时不做多余的基线（repaired=0）" \
+      "$([[ "$rp2" == repaired=0* ]] && echo ok)" "ok"
 
 echo "================ [5] 阴性对照 ================"
 # 清标不等于修好 —— 报错文案必须把这句说出来

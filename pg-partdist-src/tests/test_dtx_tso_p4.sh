@@ -658,7 +658,11 @@ m5_snapshot() {   # <标签>
 }
 M5DUMP="/tmp/m5_eviden_$$.txt"
 m5_before_snap=$(m5_snapshot "M5-before" 2>&1)
-before=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>/dev/null | tail -1)
+# ★ 不再吞 stderr：这条断言长期报"实际取不到值"，而原因被 2>/dev/null 埋了
+#   ——"取不到值"本身不是结论，得先知道是为什么取不到。
+before_raw=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>&1 | tr '\n' ' ')
+before=$(printf '%s' "$before_raw" | grep -oE '^[0-9]+' | head -1)
+[[ -z "$before" ]] && echo "  [取证] M5 前置读失败：${before_raw}"
 PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=59999 dbname=postgres connect_timeout=1';" </dev/null >/dev/null
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 sleep 1
@@ -668,7 +672,9 @@ check "M5：TSO 不可达时事务被拒（fail-closed）" \
 PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres';" </dev/null >/dev/null
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 sleep 1
-after=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>/dev/null | tail -1)
+after_raw=$(PSQL $COORD -Atc "SELECT count(*) FROM t47d" </dev/null 2>&1 | tr '\n' ' ')
+after=$(printf '%s' "$after_raw" | grep -oE '^[0-9]+' | head -1)
+[[ -z "$after" ]] && echo "  [取证] M5 后置读失败：${after_raw}"
 if [[ -n "$before" && -n "$after" && "$after" -lt "$before" ]]; then
   { echo "===== M5 可见性倒退取证（before=$before after=$after）====="
     echo "$m5_before_snap"; m5_snapshot "M5-after" 2>&1; } > "$M5DUMP" 2>&1
@@ -691,7 +697,17 @@ check "M5 后：TSO 取号恢复（$tso_ok）" "$([[ "$tso_ok" =~ ^[0-9]+$ ]] &&
 echo "========== [S1] 跨分片 SI 一致快照 =========="
 gx=$(PSQL $COORD -Atc "SELECT gxid_next()" </dev/null)
 Ssnap=$(PSQL $COORD -Atc "SELECT tso_c_start()" </dev/null)
-snap1=$(PSQL $COORD -At </dev/null 2>/dev/null <<SQL | grep -E '^[0-9]+$' | tail -1
+s1raw=$(PSQL $COORD -At </dev/null 2>&1 <<SQL | tr '\n' ' '
+BEGIN;
+SET LOCAL citus.propagate_set_commands = 'local';
+SET LOCAL pg_partdist.join_info = '${gx},${Ssnap},${gid_a}';
+SELECT count(*) FROM t47d;
+COMMIT;
+SQL
+)
+snap1=$(printf '%s' "$s1raw" | grep -oE '[0-9]+' | tail -1)
+[[ -z "$snap1" ]] && echo "  [取证] S1 首读失败（gx=${gx} Ssnap=${Ssnap} gid_a=${gid_a}）：${s1raw}"
+snap1_unused=$(PSQL $COORD -At </dev/null 2>/dev/null <<SQL | grep -E '^[0-9]+$' | tail -1
 BEGIN;
 SET LOCAL citus.propagate_set_commands = 'local';
 SET LOCAL pg_partdist.join_info = '${gx},${Ssnap},${gid_a}';
