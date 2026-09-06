@@ -49,6 +49,7 @@
 #include "partition_wal_writer.h"
 #include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 #include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
+#include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
 
@@ -206,7 +207,13 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 
 	if (new_primary_node == me)
 	{
-		ShardReplicaSetPromoted(loid, true);
+		/*
+		 * ★ 批次 #10：走 FRD §11 步骤 5 点名的入口 —— 它除了置角色，还把本地
+		 * fileset 登记进捕获反向哈希。不做这一步，新主对外服务的**第一条写**
+		 * 要等 EnsurePartWALRegistered 惰性登记才进流；在交接点显式做掉，
+		 * 那个窗口就没了。
+		 */
+		PartDistRoutePromote(loid);
 		ereport(LOG,
 				(errmsg("pg_partdist: 分片 %u（本地 OID %u）已接管为主，"
 						"解除副本读闸门；此后拒绝对它触发回放",

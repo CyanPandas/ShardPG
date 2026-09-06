@@ -19,6 +19,8 @@
 #include "shard_fileset.h"
 #include "partition_wal.h"
 #include "partwal_sync.h"
+#include "shard_xid.h"	/* 批次 #10：路由层角色切换 */
+#include "shard_replay.h"	/* 批次 #10：路由层角色切换 */
 
 #include "access/relation.h"
 #include "access/table.h"
@@ -1799,4 +1801,82 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
                          nrepaired, nskipped, nstale, out.data);
         PG_RETURN_TEXT_P(cstring_to_text(s2.data));
     }
+}
+
+/* ================================================================== */
+/* 路由层：升主的角色切换（FRD §11 步骤 5）                            */
+/* ================================================================== */
+
+PG_FUNCTION_INFO_V1(partdist_route_status);
+
+/*
+ * PartDistRoutePromote —— FRD §11 步骤 5 点名的入口（R4，批次 #10）。
+ *
+ * 原文：「角色置 SHARD_PROMOTED、登记水位，同一临界区原子生效。此后写路由切到
+ * 本节点，`wal_insert_hook` 开始为其捕获新流」。它在 FRD 里只有签名、没有实现。
+ *
+ * 落地时把三件事写在一处：
+ *   ① **角色** —— 置持久 promoted 记号（解除 T6.3c 的副本读闸门，并让
+ *      replay_catchup 拒绝再拿别人的流盖自己的表）；
+ *   ② **捕获** —— 把本地 fileset 登记进反向哈希，`wal_insert_hook` 才认得
+ *      新主的写入、把它们送进分区流；
+ *   ③ **水位** —— 分配器水位由 T6.5 的回放路径维护，这里只做观测面暴露，
+ *      不重复置位（重复置位会与回放争写，且没有新信息）。
+ *
+ * ★ 关于②：`EnsurePartWALRegistered` 本来就会在新主**第一次 DML** 时惰性登记
+ *   （`InitPartitionWALAndRegister`）。这里提前做一次是**把窗口关掉**：
+ *   惰性登记发生在语句执行期，而 fileset 遍历要 catalog、要事务态；
+ *   在交接点显式做掉，新主对外服务的第一条写就一定被捕获。
+ *
+ * ★ 关于"同一临界区原子生效"：**没有做到，如实记**。角色走 ReplayCtl->lock、
+ *   捕获走 PartWALCtl->lock，两把锁跨不到一起，硬凑要新引一把全局锁。
+ *   实际需要的性质是"**两件事都在对外服务之前完成**" —— 交接点在
+ *   OP_PARTITION_PRIMARY apply 里，而路由登记（pg_dist_placement）在同一
+ *   apply 的后半段，这个顺序已经保证了它。
+ */
+void
+PartDistRoutePromote(Oid shard_oid)
+{
+    ShardFileSet fs;
+
+    if (!OidIsValid(shard_oid))
+        return;
+
+    /* ① 角色 */
+    ShardReplicaSetPromoted(shard_oid, true);
+
+    /* ② 捕获 */
+    if (BuildShardFileSet(shard_oid, &fs) > 0)
+        RegisterShardFileSet(&fs);
+}
+
+/*
+ * route_status(shard oid) → text
+ *
+ * 观测面：这个分片在**本节点**上现在是什么角色、写入会不会被捕获、分配器水位
+ * 到哪了。此前这三件事分散在 replay_status() / 文件系统 / shard_xid_next()，
+ * 想回答"新主到底接管好了没有"要拼三处 —— 交接出问题时最需要的恰恰是这一句。
+ */
+Datum
+partdist_route_status(PG_FUNCTION_ARGS)
+{
+    Oid             shard = PG_GETARG_OID(0);
+    StringInfoData  s;
+    ShardFileSet    fs;
+    bool            captured = false;
+    int             nrel;
+
+    initStringInfo(&s);
+
+    nrel = BuildShardFileSet(shard, &fs);
+    if (nrel > 0)
+        captured = PartWALSyncIsRegistered(fs.rels[0].loc.relNumber);
+
+    appendStringInfo(&s, "role=%s captured=%s members=%d xid_watermark=%u",
+                     ShardPromotedMarkRead(shard) ? "promoted" : "replica_or_plain",
+                     captured ? "yes" : "no",
+                     nrel > 0 ? nrel : 0,
+                     (unsigned) ShardXidAllocWatermark(shard));
+
+    PG_RETURN_TEXT_P(cstring_to_text(s.data));
 }

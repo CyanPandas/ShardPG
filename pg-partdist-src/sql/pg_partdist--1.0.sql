@@ -1132,6 +1132,13 @@ CREATE OR REPLACE FUNCTION shard_divergence(p_shard OID)
 COMMENT ON FUNCTION shard_divergence(OID) IS
     '§13 约束 13 的检测面：该分片有没有被标记为「副本可能已分叉」，返回标记时刻与原因，无标记返回 NULL。标记由复制挂钩失败时就地写下（非事务性——出事的事务马上要中止，写表会一起回滚）。修复是重做物理基线：shard_baseline_emit / provision_shard_replica 成功后会自己清。';
 
+CREATE OR REPLACE FUNCTION route_status(p_shard OID)
+    RETURNS TEXT LANGUAGE c STABLE
+    AS 'MODULE_PATHNAME', 'partdist_route_status';
+
+COMMENT ON FUNCTION route_status(OID) IS
+    'FRD §11 步骤 5 的观测面：该分片在**本节点**上的角色（promoted / replica_or_plain）、写入会不会被 wal_insert_hook 捕获、fileset 成员数、分配器水位。此前这三件事分散在 replay_status() / 文件系统 / shard_xid_next()，交接出问题时最需要的恰恰是这一句。';
+
 CREATE OR REPLACE FUNCTION repair_diverged_shards()
     RETURNS TEXT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';

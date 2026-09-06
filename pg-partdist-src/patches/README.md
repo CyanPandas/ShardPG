@@ -32,6 +32,32 @@
 > 3 号位空缺：`0003` 曾用于一版被放弃的尝试，编号保留不复用，避免与历史记录混淆。
 > 0010 是"3 号位那件事"的重做，按 README 纪律另起编号。
 
+## ★★ 构建纪律：改内核补丁后必须整树 `make clean` 重编
+
+**增量 make 的头文件依赖在本项目里不可靠**，而症状是**运行期栈踩踏**，
+离改动点极远。
+
+实证（2026-09-06，R-P6-7 定案）：补丁 0007 给 `xl_xact_parsed_commit` /
+`_abort` 加了三个字段，结构变大。整树里**1218 个 .o 编于 `xact.h` 改动之前** ——
+`decode.o` 是 6 月 1 日、`xact.h` 是 8 月 13 日。于是 `xact_decode()` 在栈上按
+**旧的小结构**分配 `parsed`，而 `ParseCommitRecord` 头一句
+`memset(parsed, 0, sizeof(*parsed))` 按**新的大结构**清零，打穿调用方栈帧：
+
+```
+*** stack smashing detected ***: terminated
+#7  __stack_chk_fail ()
+#8  xact_decode ()
+#9  LogicalDecodingProcessRecord ()
+```
+
+这个崩溃被当成"逻辑解码与分片 xid 尾缀的设计冲突"记了很久（R-P6-7），
+**推断错了两处**：尾缀走主数据而元组解码取块数据，且崩溃根本不在 heap 解码。
+`make clean` 整树重编后，同一份数据、同一条解码正常返回，陈旧 .o 归零。
+
+**规矩**：任何补丁只要**动了共享结构体或头文件**，就必须
+`make clean && make -j && make install`，然后把 `bin/postgres` 同步回仓库。
+省这一步的代价不是编译慢，是一个**离现场极远的运行期崩溃**。
+
 ## 0010 的运维裁定（FRD §11 步骤 4 点名"落地前须定方案"的三项）
 
 FRD 原文把运维面标成空白并要求立项前出结论。三项逐条：

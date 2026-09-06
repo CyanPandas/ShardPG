@@ -594,7 +594,7 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 |---|---|---|
 | 分片表 SERIALIZABLE | 禁 | SSI 按原生 xid；本方案语义即 SI |
 | 分片表 SELECT FOR SHARE（多锁者） | 禁 | MultiXact 实例级 |
-| 分片表逻辑解码 | 禁 | 解码按原生 xid 组事务。**实装位置（T6.6 修正）**：禁令在**入口**——`pg_create_logical_replication_slot` / `pg_logical_slot_{get,peek}_{,binary_}changes` 进禁用函数表，白名单非空时连槽都不许建。此前守卫挂在可见性层（`HeapTupleSatisfiesHistoricMVCC`），够不着：实测崩溃发生在**解码阶段**（`*** stack smashing detected ***` → SIGABRT → 整节点重置，R-P6-7），根因是补丁 0005 的 4 字节分片 xid 尾缀与原生解析器的长度约定冲突，**未修，仅遏制** |
+| 分片表逻辑解码 | 禁 | 解码按原生 xid 组事务。**实装位置（T6.6 修正）**：禁令在**入口**——`pg_create_logical_replication_slot` / `pg_logical_slot_{get,peek}_{,binary_}changes` 进禁用函数表，白名单非空时连槽都不许建。此前守卫挂在可见性层（`HeapTupleSatisfiesHistoricMVCC`），够不着。**★ 禁令的理由已于 2026-09-06 更正回本行原文**：曾把它写成"遏制一个会打掉整节点的崩溃"（R-P6-7），而栈回溯查明那个崩溃是**构建产物的 ABI 撕裂**（补丁 0007 给 `xl_xact_parsed_commit` 加了字段，而 1218 个 .o 编于头文件改动之前，`decode.o` 按旧结构在栈上分配、`ParseCommitRecord` 按新结构 memset），clean rebuild 后即消失——**不是任何补丁的设计缺陷**。禁令仍然成立，但成立的理由是本行开头那句：解码按原生 xid 组事务，对分片表就是错的分组。**已知洞**：禁令挂在 ExecutorStart，只覆盖 SQL 调用，walsender 的 START_REPLICATION 绕得过去（R-P6-14） |
 | 分片表原生流复制热备读 | 本来就不用 | 本项目用自己的回放 |
 | 分片表异步提交（synchronous_commit=off） | 禁 | 可见性/提交点语义只许断言已持久事实（§4.5）；[A]<[B] 与多数派提交点均以同步提交为前提。**实装位置**：`shard_xid_for_current_xact` 写路径（T6.6 补——此前本行只有文档、**代码零守卫**）；`on`/`local`/`remote_write` 放行 |
 | CIC / CLUSTER / VACUUM FULL | **禁（V4 已裁定，2026-08-13）**；P5 freeze/回收全章落地后再评估 CLUSTER/VACUUM FULL，CIC 随索引专项 | CIC 的多快照阶段与 validate 等待全按原生 xid 机制，且 P 期分片表本就禁索引；CLUSTER/VACUUM FULL 走 rewriteheap 的 freeze/裁决会拿分片 xid 查原生 clog，且换 relfilenode 需 fileset 重绑（复制面）。ANALYZE 已于 T2.6 解禁（补丁 0008 读侧分叉，只判不收） |

@@ -178,15 +178,33 @@ wait $BGR 2>/dev/null
 check "对方回滚不误报（本方成功）" "$out" "ok"
 
 echo "========== [5] T3.5 GlobalSafeTs =========="
-PSQL "$WPORT" -At > "$TMPD/sa.txt" 2>&1 <<'BGSQL' &
+# ★★ 后台 psql 必须**行缓冲**，否则这条断言测不出东西。
+#   psql 的 stdout 重定向到文件时是块缓冲的：`SELECT tso_c_start()` 那一行要等
+#   进程退出（这里是 5 秒 pg_sleep 之后）才落盘，而下面在第 2 秒就去读 ——
+#   读到空是常态，偶尔抢到才过。实测判红的形态是 `期望=''`（两个空串比较，
+#   连"不相等"都算不上）。
+#   `stdbuf -oL` 一个词就够，语义完全不动；再加轮询把固定 sleep 换掉。
+#
+#   ★ 试过换数据源（改读 partdist_tso_status() 里的 node<id>=<ts>）——**不等价**：
+#   实测那里的最小值是 1（陈旧登记），而 global_safe_ts 是 423，两者不是同一个
+#   口径。要验的是"safe 跟住**当前这笔活跃事务**的 start_ts"，就得用它自己的号。
+DEX stdbuf -oL /work/pg-install/bin/psql -h /tmp -p "$WPORT" -U postgres -d postgres -X -At \
+  > "$TMPD/sa.txt" 2>&1 <<'BGSQL' &
 BEGIN;
 SELECT tso_c_start();
 SELECT pg_sleep(5);
 COMMIT;
 BGSQL
 BGS=$!
-sleep 2
-TSA=$(grep -E '^[0-9]+$' "$TMPD/sa.txt" | head -1)
+TSA=""
+for _t in $(seq 1 30); do
+  TSA=$(grep -E '^[0-9]+$' "$TMPD/sa.txt" 2>/dev/null | head -1)
+  [[ -n "$TSA" ]] && break
+  sleep 0.2
+done
+# ★ 计数守卫：取不到号时，下面那条会退化成两个空串相等的静默通过
+check "  能读到后台事务的 start_ts（否则下一条是空比空）" \
+      "$([[ "$TSA" =~ ^[0-9]+$ ]] && echo ok)" "ok"
 SAFE1=$(PSQL "$CPORT" -Atc "SELECT partdist_global_safe_ts()" </dev/null)
 check "safe == 最老活跃 start_ts（$TSA）" "$SAFE1" "$TSA"
 wait $BGS 2>/dev/null

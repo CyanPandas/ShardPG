@@ -223,6 +223,33 @@ hs=$(DEX bash -c "grep -c '分片 ${GID}（本地 OID' /work/pg-cluster-data/${n
 check "★★ 交接在**正规位置**留了痕（notify 钩子真的干活了，不再只是 placeholder）" \
       "$([[ "${hs:-0}" -ge 1 ]] && echo ok)" "ok"
 
+echo "================ [3b] ★★ R4：新主的写入必须进流并复制出去 ================"
+# FRD §11 步骤 5 的后半句：「此后写路由切到本节点，wal_insert_hook 开始为其
+# 捕获新流」。这句话唯一有意义的判据不是"角色位是不是 promoted"，而是
+# **新主写一行，分区流真的长出记录、且另一个副本追得到**。
+# 不进流 = 副本静默落后，比读到旧数据更隐蔽。
+rs=$(PSQL $NEWPORT -Atc "SELECT partdist.route_status(${noid}::oid)" </dev/null 2>&1|tail -1)
+echo "  route_status ⇒ ${rs}"
+check "★ 新主角色是 promoted" "$([[ "$rs" == *"role=promoted"* ]] && echo ok)" "ok"
+check "★★ 新主的写入会被捕获（captured=yes）" \
+      "$([[ "$rs" == *"captured=yes"* ]] && echo ok)" "ok"
+lsn_b=$(PSQL $NEWPORT -Atc "SELECT partdist.get_partition_flush_lsn(${noid})" </dev/null|tail -1)
+PSQL $NEWPORT -q -c "SET citus.override_table_visibility=false; INSERT INTO ${TBL} VALUES (777,'after-promote');" </dev/null >/dev/null 2>&1
+lsn_a=$(PSQL $NEWPORT -Atc "SELECT partdist.get_partition_flush_lsn(${noid})" </dev/null|tail -1)
+echo "  新主写入前后分区流位点：${lsn_b} → ${lsn_a}"
+check "★★ 新主写一行 ⇒ 分区流确实长出记录（不进流=副本静默落后）" \
+      "$([[ -n "$lsn_a" && -n "$lsn_b" && "$lsn_a" -gt "$lsn_b" ]] && echo ok)" "ok"
+# 另一个还活着的副本要能追到这条新记录 —— 证明它真的复制出去了，不只是本地落盘
+other=$f2; [[ "$NEWPORT" == "$f2" ]] && other=$f1
+ooid=$(PSQL $other -Atc "SELECT partdist.local_partition_for_shard(${GID})" </dev/null|tail -1)
+orecv=""
+for t in $(seq 1 30); do
+  orecv=$(PSQL $other -Atc "SELECT partdist.get_follower_applied_part_lsn(${ooid})" </dev/null 2>/dev/null|tail -1)
+  [[ -n "$orecv" && "$orecv" -ge "$lsn_a" ]] && break; sleep 2
+done
+check "★★ 另一个副本收到了新主的这条记录（${orecv}/${lsn_a}）" \
+      "$([[ -n "$orecv" && "$orecv" -ge "$lsn_a" ]] && echo ok)" "ok"
+
 echo "================ [4] 清理 ================"
 PGCTL "$leader_dir" -w -t 60 start >/dev/null 2>&1
 for t in $(seq 1 40); do [[ "$(PSQL $PA -Atc 'SELECT 1' </dev/null 2>/dev/null)" == "1" ]] && break; sleep 2; done

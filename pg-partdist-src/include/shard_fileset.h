@@ -168,4 +168,7 @@ extern void  ShardClearDiverged(Oid shard_oid);
 extern void  ShardPromotedMarkWrite(Oid shard_oid, bool promoted);
 extern bool  ShardPromotedMarkRead(Oid shard_oid);
 
+/* FRD §11 步骤 5：升主的角色切换（角色 + 捕获登记） */
+extern void  PartDistRoutePromote(Oid shard_oid);
+
 #endif /* SHARD_FILESET_H */
