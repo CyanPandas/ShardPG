@@ -1096,6 +1096,7 @@ ShardXidClaimOnPromote(Oid shard)
 	TransactionId from;
 	TransactionId to;
 	int			n = 0;
+	int			i;
 
 	if (ShardXidCtl == NULL)
 		return 0;				/* shmem 未起（防御） */
@@ -1104,6 +1105,31 @@ ShardXidClaimOnPromote(Oid shard)
 
 	/* 槽位不在就按老路挂（挂槽本身即认领一次），在就强制再扫一遍 */
 	slot = shard_xid_slot_attach(shard, &n);
+
+	/*
+	 * ★ 2026-09-06：新主的发号起点 = Max(MARKER 交接来的 next_xid, 影子)。
+	 *
+	 * 槽位多半在追平期就已由 ShardXidRaiseAllocWatermark 挂上（值 = 旧主最后一条
+	 * 入流 MARKER 时的 next_xid），slot_attach 因此不会再看影子。而影子里还有
+	 * 回放期从 DATA 记录见到的分片 xid（ShardReplayNoteDataShardXid）——那是
+	 * "字节入了流、却没有提交标记"的号，正是不能重发的那一类。这里补上取 Max。
+	 */
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->shadow[i].shard_relid != shard)
+			continue;
+		if (ShardXidCtl->shadow[i].next_hint > slot->watermark)
+		{
+			TransactionId hint = ShardXidCtl->shadow[i].next_hint;
+
+			shard_xid_persist_watermark(shard, hint, slot->claim_wm,
+										slot->trunc_before, slot->vacuum_xid);
+			slot->watermark = hint;
+			if (slot->next_xid < hint)
+				slot->next_xid = hint;
+		}
+		break;
+	}
 
 	from = slot->claim_wm;
 	to = slot->watermark;

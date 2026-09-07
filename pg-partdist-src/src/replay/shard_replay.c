@@ -702,6 +702,76 @@ ShardReplayOffnumPrecheck(ShardReplayCtx *ctx, XLogReaderState *reader,
 	return false;				/* 到不了这里：上面是 ERROR */
 }
 
+/*
+ * ShardReplayNoteDataShardXid — 从一条已解码的 heap DATA 记录里取出它盖到
+ * 元组上的分片 xid，推进本分片的影子发号水位（ShardXidRedoAdvance）。
+ *
+ * 取法与内核补丁 0005 的 redo 侧一致：
+ *   - INSERT / MULTI_INSERT / UPDATE(HOT_UPDATE)：flags 带 XLH_*_SHARD_XID 时，
+ *     主数据**末尾 4 字节**就是分片 xid（shard_xid_from_maindata）；
+ *   - DELETE / LOCK：xmax 字段走既有记录体、零格式变更，没有标志位可辨 ——
+ *     只在本分片已确认在分片 xid 宇宙里（发号水位 > 0，与 T6.5 同一判据）时
+ *     才把它当分片 xid；遗留宇宙的流一律不喂，免得把原生 xid 灌进影子。
+ * 影子只是"见过的最大号 + 1"，多喂一条不会少发号，漏喂才会重发 —— 所以
+ * 宁可多认。
+ */
+static void
+ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
+                            const DecodedXLogRecord *decoded)
+{
+    uint8           info = record->xl_info & ~XLR_INFO_MASK;
+    uint8           op   = info & XLOG_HEAP_OPMASK;
+    const char     *main = decoded->main_data;
+    Size            len  = decoded->main_data_len;
+    TransactionId   sxid = InvalidTransactionId;
+
+    if (main == NULL || len == 0)
+        return;
+
+    if (record->xl_rmid == RM_HEAP_ID)
+    {
+        switch (op)
+        {
+            case XLOG_HEAP_INSERT:
+                if (len >= SizeOfHeapInsert + sizeof(TransactionId) &&
+                    (((const xl_heap_insert *) main)->flags & XLH_INSERT_SHARD_XID))
+                    memcpy(&sxid, main + len - sizeof(TransactionId), sizeof(TransactionId));
+                break;
+            case XLOG_HEAP_UPDATE:
+            case XLOG_HEAP_HOT_UPDATE:
+                if (len >= SizeOfHeapUpdate + sizeof(TransactionId) &&
+                    (((const xl_heap_update *) main)->flags & XLH_UPDATE_SHARD_XID))
+                    memcpy(&sxid, main + len - sizeof(TransactionId), sizeof(TransactionId));
+                break;
+            case XLOG_HEAP_DELETE:
+                if (len >= SizeOfHeapDelete &&
+                    TransactionIdIsValid(ShardXidAllocWatermark(ctx->shard_oid)))
+                    sxid = ((const xl_heap_delete *) main)->xmax;
+                break;
+            case XLOG_HEAP_LOCK:
+                if (len >= SizeOfHeapLock &&
+                    TransactionIdIsValid(ShardXidAllocWatermark(ctx->shard_oid)))
+                    sxid = ((const xl_heap_lock *) main)->xmax;
+                break;
+            default:
+                break;
+        }
+    }
+    else if (record->xl_rmid == RM_HEAP2_ID && op == XLOG_HEAP2_MULTI_INSERT)
+    {
+        if (len >= SizeOfHeapMultiInsert + sizeof(TransactionId) &&
+            (((const xl_heap_multi_insert *) main)->flags & XLH_INSERT_SHARD_XID))
+            memcpy(&sxid, main + len - sizeof(TransactionId), sizeof(TransactionId));
+    }
+
+    if (TransactionIdIsNormal(sxid))
+    {
+        ShardXidRedoAdvance(ctx->shard_oid, sxid);
+        REPLAY_TRACE("TRACE xid: shard %u DATA 记录带分片 xid %u，影子水位推进",
+                     ctx->shard_oid, sxid);
+    }
+}
+
 static void
 ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 {
@@ -752,6 +822,19 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                         ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn,
                         errormsg ? errormsg : "(no message)")));
+
+    /*
+     * 1b) ★ 2026-09-06：把 DATA 记录里的**分片 xid** 喂给影子水位。
+     *
+     * MARKER 现在交接的是 leader 的真实 next_xid（不再是宽一个批次的持久化
+     * 水位，见 partwal_sync.c PartWALMarkerSetShardXid）。于是"字节入了流、
+     * 却没有提交标记"的号必须由 DATA 记录自己作证：group commit 让 peer 把本
+     * 事务的记录先刷进流、本事务随后中止，这种元组带着分片 xid 躺在副本页面上；
+     * 升主后若把同一个号再发给一笔提交的事务，那些幽灵元组会复活。
+     * 影子只记"见过的最大分片 xid + 1"，升主时与 MARKER 交接来的值取 Max
+     * （ShardXidClaimOnPromote），两者合起来覆盖一切入过流的号。
+     */
+    ShardReplayNoteDataShardXid(ctx, record, decoded);
 
     /* 2) 文件号重映射：leader → 本地（唯一改写点） */
     for (id = 0; id <= decoded->max_block_id; id++)

@@ -762,13 +762,26 @@ PartWALMarkerSetShardXid(char *payload, Oid partition_id)
         *TxnMarkerShardXidPtr(m) = (uint32) ShardXidMineForShard(partition_id);
 
     /*
-     * U-P5-1 之二：带**已持久化的**发号水位（而不是 next_xid）。
-     * 发号器落盘按批次向上取整，所以它比 next_xid 宽出至多一个批次 ——
-     * 而 follower 只能从"入了流的 MARKER"学到水位，中止且字节未入流的事务
-     * 会在 leader 上悄悄吃掉号，宽一个批次正好盖住那段窗口。
+     * U-P5-1 之二：带 leader **此刻真实的 next_xid**（下一个待发号）。
+     *
+     * ★ 2026-09-06 改：此前带的是按批次（SHARD_XID_BATCH=4096）向上取整的
+     * **已持久化水位**，理由是"中止且字节未入流的事务会在 leader 上悄悄吃掉号，
+     * 宽一个批次正好盖住"。实测代价是切主后新主从 4099 起发号，而旧主明明只发到
+     * 9 —— 每个分片自己的号被白白跳过一整批。
+     *
+     * 那段"窗口"其实不需要靠跳号来盖：
+     *   - 字节**入了流**的号，follower 都看得见（MARKER 带分片 xid；DATA 记录的
+     *     分片 xid 由回放侧喂进影子水位，见 shard_replay.c ShardReplayNoteDataShardXid），
+     *     升主时影子与本值取 Max，绝不重发；
+     *   - 字节**没入流**的号，旧主一旦降级/重做基线，那些元组就不存在于本分片的
+     *     宇宙里，新主重发它们没有任何东西会引用旧值。
+     * 于是新主从 next_xid 继续，切主收尾的认领区间 [claim_wm, next_xid) 只把
+     * "发出去了、流里却没有提交标记"的号（如被 ROLLBACK 的那笔）改判 ABORTED。
+     *
+     * leader 自己的批次水位（崩溃恢复起点）不受影响，仍由发号路径按批次落盘。
      */
     if (m->flags & PARTWAL_MARKER_HAS_ALLOC_WM)
-        *TxnMarkerAllocWmPtr(m) = (uint32) ShardXidAllocWatermark(partition_id);
+        *TxnMarkerAllocWmPtr(m) = (uint32) ShardXidNextToIssue(partition_id);
 }
 
 static char *

@@ -4857,6 +4857,55 @@ postgres < 查询文件" -ex run -ex bt`（注意 `run < file` 会把参数清�
 
 ---
 
+#### 批次 #11：切主后的发号起点 = 旧主真实的 next_xid（2026-09-07）
+
+用户在多分片演示的切主一幕上点出：旧主发到 10，新主却从 **4099** 起发。4099 不是
+原生 xid，是 MARKER 交接过来的**按批次向上取整的持久化水位**（T6.4 记要里明写
+"上界取 watermark 而不是 next_xid ... 宽一个批次正好盖住中止且未入流的号"）。
+用户的判断是对的：每个分片自己维护一个 xid 宇宙，**主换了号不该断、不该跳**。
+
+##### 为什么可以缩到真实 next_xid 而不丢安全性
+
+"宽一个批次"要盖的是"leader 发了号、字节却没入流"的事务。分两种：
+- 字节**入了流**却没有提交标记（group commit 下 peer 替它刷盘、随后它中止）：
+  这些元组带着分片 xid 躺在副本页面上，**绝不能重发**。以前靠宽水位盖住；现在由
+  回放侧把 DATA 记录里的分片 xid 喂进影子水位（`ShardReplayNoteDataShardXid`），
+  升主认领时与交接值取 Max。取法与内核补丁 0005 的 redo 侧一致：INSERT /
+  MULTI_INSERT / UPDATE 看主数据末尾 4 字节（有 `XLH_*_SHARD_XID` 标志），
+  DELETE / LOCK 走 xmax 字段、只在本分片已确认在分片 xid 宇宙时才认。
+- 字节**没入流**：旧主一旦降级、重做基线，那些元组不存在于本分片宇宙里，任何
+  东西都不会引用旧值，重发无害。
+
+于是三处改动（都在 pg-partdist，不碰 pg_raft）：
+1. `partwal_sync.c` `PartWALMarkerSetShardXid`：MARKER 带 `ShardXidNextToIssue()`
+   而不是 `ShardXidAllocWatermark()`；
+2. `shard_replay.c` `ApplyDataRecord`：解码后喂影子水位；
+3. `shard_xid.c` `ShardXidClaimOnPromote`：槽位多半在追平期就已挂上（值 = 最后一条
+   入流 MARKER 时的 next_xid），`slot_attach` 不会再看影子，这里补上取 Max 后再认领。
+leader 自己的批次水位（本机崩溃恢复起点）不受影响。
+
+##### 实测（多分片演示整套重跑，`shardpg-demo/DEMO_WINDOWS_POWERSHELL.md`）
+
+杀主前旧主"下个号 = 10"（3–9 用掉，9 是被 ROLLBACK 的）；两个惰性从节点水位 6
+（只追平到第 7 步）。切主 13s，新主追平后 `shard_xid_next = 10`、
+`route_status ⇒ xid_watermark=10`，首行分片 xid = **10**；`sclog_full`：3/8 判决保留，
+**9 = ABORTED（认领）**，10/11/4099 空槽。切主后跨分片 2PC 在新主上正常。
+
+##### 顺带查出、本批**未修**的四条（记入台账待裁）
+
+- 2PC 阶段 3 的 COMMIT 标记用 `PartWALBuildMarkerPayload()` 组装，而 `COMMIT
+  PREPARED` 跑在没碰过分片表的事务里，`ShardXidXactCount()==0` ⇒ 24 字节旧格式不带
+  分片 xid ⇒ 副本的分片 clog 对每笔 2PC 事务永远停在 PREPARED；决议被 FORGET 回收后
+  `dtx_close_indoubt` 四级落空 ⇒ **切主后 2PC 提交的行在新主上永久不可见**（实测）。
+- 升主不发 `FILESET_UPDATE`：新主的流带它自己的 relfilenumber，其余副本 locmap 仍对着
+  旧主 ⇒ `replay_catchup` 报"未知 relfilelocator"，须从新主重新供给（演示 11b）。
+- `shard_baseline_emit` 不搬分片 clog：在已有数据之后才供给的副本，对基线之前提交的
+  号没有判决，升主即丢行。演示因此必须"先供给、后写数据"。
+- MARKER 的 `start_ts` 是墙钟（`GetCurrentTransactionStartTimestamp()`），副本 PREPARED
+  槽的 sts 是 8.4e14 —— R-P3-2 "双 ts 宇宙串线"成真。
+
+---
+
 #### ★ P6 是最后一期：不做的事也必须有裁定
 
 P6 之后没有下一期可以推。因此**下列每一条都必须在 P6 出口前拿到明确去向**
