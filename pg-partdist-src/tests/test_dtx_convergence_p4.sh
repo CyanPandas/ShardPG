@@ -6,7 +6,12 @@
 #   [6] 无决议：读者不阻塞不可见；补决议后收敛可见（cts=TSO 值）
 #   [7] kill -9 崩溃：持久日志+2PC 段双通道重建登记，决议后仍收敛（矩阵行 1 机制）
 set -u
-cd "$(dirname "$0")"
+TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+	# ★ T7.1 期修：① 原为硬编码 /home/zhanhao/shardpg-tx2-work 绝对路径，换工作区/
+	# 全新 clone 会静默跑到另一份工作区的脚本；② 必须在 `cd` **之前**取绝对路径 ——
+	# cd 之后 $0 仍是相对路径，再 dirname 就指到新 cwd 下的同名子目录，
+	# source 不到 lib_node_health.sh ⇒ 健康断言整层被静默跳过（本期实测踩过）。
+cd "$TESTS_DIR"
 CONTAINER="${CONTAINER:-pg-citus-tx2-container}"
 COORD=5432
 PASS=0; FAIL=0
@@ -34,7 +39,6 @@ if ! flock -n 9; then
 fi
 echo "  [lock] 独占锁已获取 (pid $$)"
 
-TESTS_DIR="/home/zhanhao/shardpg-tx2-work/pg-partdist-src/tests"
 source "$TESTS_DIR/lib_node_health.sh"
 health_mark_start
 
@@ -354,7 +358,12 @@ for t in $(seq 1 60); do
   sleep 1
 done
 check "自动清扫在 ${t}s 内收敛两参与者" "$conv" "ok"
-autolog=$(docker exec -u postgres "$CONTAINER" bash -c "grep -h '未决 2PC 清扫收敛' /work/pg-cluster-data/*/startup.log | wc -l" </dev/null)
+# ★ T7.1 期修：日志布局有两种，只查一种会假红。
+#   setup-raft.sh 建的环境把日志写在 <datadir>/startup.log；
+#   reproduce-env.sh 建的环境（pg-test / 全新复现）写在 <datadir>.log。
+#   心跳工作者的清扫留痕落在**节点主日志**里，本环境正是后者 ——
+#   只 grep */startup.log 时恒为 0，表现为一条与产品无关的红。
+autolog=$(docker exec -u postgres "$CONTAINER" bash -c "cat /work/pg-cluster-data/*/startup.log /work/pg-cluster-data/*.log 2>/dev/null | grep -c '未决 2PC 清扫收敛'" </dev/null)
 check "工作者清扫日志留痕（≥1，实际 $autolog）" "$([[ -n "$autolog" && "$autolog" -ge 1 ]] && echo ok)" "ok"
 
 echo "========== [5] ABORT 决议学习（清扫写 ABORTED）=========="

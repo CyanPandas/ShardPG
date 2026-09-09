@@ -260,6 +260,31 @@ extern void  PartWALAppendMarkerFor(Oid partition_id, TransactionId xid,
                                     uint8 op,
                                     const char *payload, uint32 payload_len);
 
+/*
+ * ★ T7.1（R-P6-15）：判决标记的显式版本。
+ *
+ * 上面两个函数都从**当前事务**取值：载荷的 flags 由 `ShardXidXactCount() > 0`
+ * 决定、分片 xid 由 `ShardXidMineForShard()` 取、时间戳由 TSO 客户端取。
+ * 这套取法对"写分片的那笔事务自己发标记"成立，对**判决落账时补发标记**不成立
+ * ——那时跑在另一个事务里（COMMIT PREPARED 的语句、清扫工作者、恢复守护），
+ * 三个来源全是空的，组装出来的就是不带分片 xid 的 24 字节旧格式，
+ * 回放侧 `ShardClogSetVerdict` 因此被跳过（R-P6-15：切主后 2PC 提交的行永久不可见）。
+ *
+ * 于是这一对函数把三个值全部**显式传入**：
+ *   PartWALBuildVerdictMarker   —— start_ts / commit_ts 由调用方给（决议的权威值）
+ *   PartWALAppendMarkerForShardXid —— 分片 xid 由调用方给（未决登记里的 pairs）
+ *
+ * 载荷恒带 HAS_SHARD_XID | HAS_ALLOC_WM 两个尾巴；alloc_wm 仍在追加时按分区
+ * 现取（`ShardXidNextToIssue`，与事务无关，任何语境下都成立）。
+ */
+extern char *PartWALBuildVerdictMarker(int64 start_ts, int64 commit_ts,
+                                       uint32 *out_len);
+extern void  PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid,
+                                            uint8 op,
+                                            const char *payload,
+                                            uint32 payload_len,
+                                            TransactionId shard_xid);
+
 /* ------------------------------------------------------------------ */
 /* WAL range scan (used by DemuxCrashRecovery)                         */
 /* ------------------------------------------------------------------ */

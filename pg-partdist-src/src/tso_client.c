@@ -350,6 +350,23 @@ tso_rpc_once(const char *sql)
 }
 
 static int64
+/*
+ * ★ T7.5（R-P6-20）：本文件发出去的每一条 RPC 都必须写**全限定名**
+ * `partdist.partdist_tso_*`。
+ *
+ * 现场（2026-09-09 在 pg-test 环境实测复现）：这些 C 函数由扩展装进
+ * `partdist` 模式（`pg_partdist.control` 的 `schema = partdist`），而本文件
+ * 此前发的是裸函数名；TSO 服务端连接用的是默认 `search_path = "$user", public`
+ * ⇒ 取号、心跳、commit_ts、safe_ts **全部** `function partdist_tso_start_ts
+ * (integer, bigint) does not exist` ⇒ 取号 fail-closed ⇒ **全簇分片写不进去**：
+ *
+ *     ERROR:  function partdist_tso_start_ts(integer, bigint) does not exist
+ *     ERROR:  TSO 不可达或拒绝服务（取 start_ts 失败）
+ *
+ * 此前之所以"能跑"，是因为 P4 期各验收套件都在 `public` 里现建了同名垫片；
+ * 演示环境则靠 `ALTER DATABASE postgres SET search_path TO ..., partdist` 绕过。
+ * 两者都不是产品形态 —— 干净装出来的集群第一笔分片写就会撞上。
+ */
 tso_rpc(const char *sql, const char *what)
 {
 	int64		ts = tso_rpc_once(sql);
@@ -413,7 +430,7 @@ TsoGetStartTs(void)
 
 	/* 字面量显式转型：0 会被解析成 int4 撞不上 (int, bigint) 签名 */
 	snprintf(sql, sizeof(sql),
-			 "SELECT partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
+			 "SELECT partdist.partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 (int) PartDistLocalNodeId(), oldest);
 	cur_start_ts = tso_rpc(sql, "start_ts");
 	if (TsoClientCtl->node_id < 0)
@@ -439,7 +456,7 @@ TsoGetGlobalSafeTs(void)
 {
 	if (!tso_configured())
 		return 0;				/* 遗留模式：无 TSO 宇宙，不清 */
-	return tso_rpc("SELECT partdist_global_safe_ts()", "global_safe_ts");
+	return tso_rpc("SELECT partdist.partdist_global_safe_ts()", "global_safe_ts");
 }
 
 /*
@@ -451,7 +468,7 @@ TsoStashCommitTs(void)
 {
 	if (cur_commit_ts != 0 || !tso_configured())
 		return;
-	cur_commit_ts = tso_rpc("SELECT partdist_tso_commit_ts()", "commit_ts");
+	cur_commit_ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "commit_ts");
 }
 
 /* 收集钩子/落账读取暂存（临界区内安全：纯内存读） */
@@ -499,7 +516,7 @@ PartDistTsoDtxDecisionTs(void)
 
 	if (!tso_configured())
 		return 0;
-	ts = tso_rpc("SELECT partdist_tso_commit_ts()", "dtx_decision_ts");
+	ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "dtx_decision_ts");
 	cur_commit_ts = ts;
 	return ts;
 }
@@ -553,7 +570,7 @@ TsoHeartbeatOnce(void)
 	}
 
 	snprintf(sql, sizeof(sql),
-			 "SELECT partdist_tso_heartbeat(%d, CAST(" INT64_FORMAT " AS bigint))",
+			 "SELECT partdist.partdist_tso_heartbeat(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 node, oldest);
 	lease = tso_rpc_once(sql);
 	if (lease < 0)

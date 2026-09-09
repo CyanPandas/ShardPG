@@ -1033,6 +1033,52 @@ leader 本地事务却中止**，leader 与自己的组分叉。
 
 ### 9.6 ~~【机制已落地，接线未做】~~ **【已接线，2026-09-09 复核】** 升主序列要加一步"清 in-doubt"（2026-08-04 机制先行）
 
+> **★★ 2026-09-09 T7.1 修复（R-P6-15）：终局标记改由「判决落账那一刻」补发。**
+>
+> 缺陷：阶段 3 的终局标记原本在 `COMMIT PREPARED` 的钩子里发
+> （`dtx_participant.c` `PartDistDtxOnFinishPrepared`），载荷走
+> `PartWALBuildMarkerPayload()` —— 而该函数按 `ShardXidXactCount() > 0` 决定
+> 带不带分片 xid 尾，`COMMIT PREPARED` 跑在**另一个没碰过分片表的事务**里，
+> 计数恒 0 ⇒ 24 字节旧格式 ⇒ 回放侧 `TransactionIdIsNormal(sxid)` 为假、
+> `ShardClogSetVerdict` 被跳过 ⇒ **副本的分片 clog 对每笔跨分片事务永远停在
+> PREPARED**；决议被 FORGET 回收、`pg_dist_transaction` 也 GC 之后，
+> `dtx_close_indoubt` 四级全落空 ⇒ **切主后已提交的行在新主上永久不可见**。
+>
+> **为什么不是"在 COMMIT PREPARED 处把分片 xid 补上"**：那里还缺第二个权威值 ——
+> 判决的 `commit_ts`。该钩子跑在决议之后，但本节点未必已收到决议广播，就地
+> `TsoMarkerCommitTs()` 取到的是个**新号**，比决议的 commit_ts 晚。用它落副本的
+> 分片 clog，会让同一行在 leader 与 follower 上对同一快照可见性不同 ——
+> 把"永久不可见"换成"偶发不一致"，不是修复。
+>
+> **落点**：`dtx_pending.c` 的 `dtx_replicate_verdict()`，紧跟在
+> `dtx_pending_apply_verdict()` 写本地分片 clog 之后。那一刻两个值都是权威的：
+> 分片 xid 来自未决登记的 pairs（PREPARE 时与 2PC 状态段一起 fsync，
+> "prepared 存在 ⇒ 登记必在"），commit_ts 就是正在写进本地 clog 的那一个。
+> **leader 写什么，副本就收到什么，由构造保证一致。** 三条调用路径
+> （广播接收 `dtx_apply_decision`、清扫工作者、恢复守护）都是普通 backend，
+> 可以安全地开 writer、取 PartWALCtl 锁、发提案。
+>
+> 新接口：`PartWALBuildVerdictMarker(start_ts, commit_ts)` +
+> `PartWALAppendMarkerForShardXid(..., shard_xid)`（`partwal_sync.h`）——
+> 三个值全部显式传入，一个都不从当前事务取。
+>
+> **失败一律不上抛**：本地分片 clog 已落账（正确性底线），复制是尽力而为。
+> 最典型的失败是本节点已不是该分片的主（切主后由恢复守护补判决，R-P4-9 的
+> 场景）——写栅栏会拒，这正是它该拒的。
+>
+> **验收**：`tests/test_dtx_verdict_marker_p7.sh` **34/0**（2026-09-09，pg-test 环境）。
+> 决定性取证：leader 段流里判决标记 **len=32**（修复前 24）、flags 含
+> `HAS_SHARD_XID|HAS_ALLOC_WM`、尾部分片 xid == 该行 xmin；副本回放后
+> `sclog_full` 从 `st=1(PREPARED)` 变为 **`st=2 cts=13`**，与 leader 的 `cts=13`
+> 逐字节相同。
+>
+> **★ 落地时踩到的第二个坑（值得记）**：`PartWALAppendMarkerForShardXid` 只把字节
+> 写进**本地段**并 fsync，送进 Raft 是 `PartWALFlush` 干的，而它只遍历本事务
+> **触达过**的分区（`partwal_my_touched`）。少调一句 `PartWALNoteTouchedPartition()`
+> 的现象极具迷惑性：leader 段流里有这条 32 字节标记、**副本段流里没有**
+> （实测 leader 8 条 / follower 7 条），副本 clog 因此仍停在 PREPARED ——
+> 与没修之前一模一样，但原因完全不同。`dtx_participant.c` 的阶段 3 也是成对写的。
+>
 > **★ 2026-09-09 回填**：标题里的"接线未做"已过时。`pg_raft--1.0.sql:539`
 > 的升主路径里有 `PERFORM partdist.dtx_close_indoubt(loid::oid);`，且顺序正确
 > ——排在 `shard_claim_on_promote` **之前**（:560 的注释写明了顺序要害：认领的

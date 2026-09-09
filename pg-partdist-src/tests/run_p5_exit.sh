@@ -6,7 +6,8 @@
 # 且在它之前复位 TSO 纪元（重启协调者）。
 set -u
 C=pg-citus-tx2-container
-T=/home/zhanhao/shardpg-tx2-work/pg-partdist-src/tests
+T="$(cd "$(dirname "$0")" && pwd)"	# ★ T7.1 期修：原为硬编码 shardpg-tx2-work 绝对路径，
+								# 换分支/换工作区（或全新 clone）时会静默跑到**另一份**工作区的脚本
 OUT="$1"; mkdir -p "$OUT"
 PORTS="5432 5433 5434 5435 5436 5437 5438 5439 5440"
 DEX() { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" "$@"; }

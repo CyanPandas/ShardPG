@@ -37,7 +37,7 @@
 
 | ID | 缺陷 | 09-09 复核 | 影响 |
 |---|---|---|---|
-| **R-P6-15** | **2PC 阶段 3 的 COMMIT 标记不带分片 xid**：`dtx_participant.c:467` 在 `COMMIT PREPARED` 里调 `PartWALBuildMarkerPayload()`，而该函数按 `ShardXidXactCount() > 0` 决定带不带分片 xid 尾（`partwal_sync.c:723-727`）——`COMMIT PREPARED` 跑在另一个没碰过分片表的事务里，计数恒 0 ⇒ 24 字节旧格式 | **未修**（代码原样） | 副本分片 clog 对每笔跨分片事务**永远停在 PREPARED**；决议被 FORGET 回收后 `dtx_close_indoubt` 四级全落空 ⇒ **切主后 2PC 提交的行在新主上永久不可见**（09-06 实跑取证） |
+| **R-P6-15** | **2PC 阶段 3 的 COMMIT 标记不带分片 xid**：`dtx_participant.c:467` 在 `COMMIT PREPARED` 里调 `PartWALBuildMarkerPayload()`，而该函数按 `ShardXidXactCount() > 0` 决定带不带分片 xid 尾（`partwal_sync.c:723-727`）——`COMMIT PREPARED` 跑在另一个没碰过分片表的事务里，计数恒 0 ⇒ 24 字节旧格式 | **✅ 已修（2026-09-09，T7.1）**：判决标记改由判决落账那一刻补发（`dtx_pending.c` `dtx_replicate_verdict()`）。验收 `test_dtx_verdict_marker_p7.sh` **34/0**，决定性取证：副本 `st=2 cts=13` 与 leader 的 `cts=13` 逐字节相同（修复前恒为 st=1） | 副本分片 clog 对每笔跨分片事务**永远停在 PREPARED**；决议被 FORGET 回收后 `dtx_close_indoubt` 四级全落空 ⇒ **切主后 2PC 提交的行在新主上永久不可见**（09-06 实跑取证） |
 | **R-P6-17** | **物理基线不搬分片 clog**：`shard_fileset.c` 全文零处引用 `pg_shard_clog`/`ShardClog`，`shard_baseline_emit` 只灌页面 + 抬发号水位 | **未修**（grep 零命中） | 在已有数据之后才供给的副本，对基线之前提交的分片 xid **没有判决**；升主后那些行是 RUNNING ⇒ 被 `shard_claim_on_promote` 改判 ABORTED ⇒ **丢行** |
 | **R-P6-16** | **升主不发 `FILESET_UPDATE`**：`PartDistRoutePromote()`（`shard_fileset.c:1838`）只做"角色 + 捕获"两件事，不广播新主的 relfilenumber | **未修**（函数体 12 行，无 CTRL 发射） | 其余副本 locmap 仍对着旧主文件号 ⇒ `replay_catchup` 报"未知 relfilelocator" ⇒ **切主一次，该分片其余副本全部失去再次当选资格**，直到从新主重新供给 |
 | **R-P6-21** | **供给/升主不携带"打标身份"**：`shard_fileset.c`/`raft_boundary.c` 均无 `ShardMvccSetAdd`；`mvcc_set` 只由 `partdist_set_shard_mvcc()` 或重启扫目录装载 | **未修**（grep 零命中） | 升主后的新主若未事先手工加白名单又未重启，**写入不打标、读走原生路径** —— `handover_provision_p7` [3b] 与 `promote_catchup_tx3` [4] 都是在这个状态下通过的，**通过的原因是错的** |
@@ -47,7 +47,7 @@
 | ID | 缺陷 | 09-09 复核 | 影响 |
 |---|---|---|---|
 | **R-P6-19** | 回放 worker **泄漏目录描述符**：`exceeded maxAllocatedDescs (328)`，某条 `AllocateDir` 路径缺 `FreeDir` | 未修（六个文件里 `AllocateDir`/`FreeDir` 计数配平，说明泄漏在**异常提前返回**路径上，需逐条走查） | 该节点此后**所有回放失败**，直到 worker 重启 |
-| **R-P6-20** | TSO 客户端 RPC 用裸函数名：`tso_client.c:416/442/454/502/556` 发 `SELECT partdist_tso_start_ts(...)`，而函数装在 `partdist` 模式 | **未修**（5 处原样） | 协调者默认 `search_path` 不含 `partdist` ⇒ 取号/心跳/commit_ts/safe_ts 全部 `function does not exist` ⇒ **全簇分片写 fail-closed**。演示环境靠 `ALTER DATABASE ... SET search_path` 绕过 |
+| **R-P6-20** | TSO 客户端 RPC 用裸函数名：`tso_client.c` 5 处发 `SELECT partdist_tso_start_ts(...)`，而函数装在 `partdist` 模式 | **✅ 已修（2026-09-09，T7.5）**：5 处改全限定名。修前在 pg-test 环境实测复现（`function partdist_tso_start_ts(integer, bigint) does not exist` → `TSO 不可达或拒绝服务`）；修后默认 `search_path` 下取号 1→2→3→4 单调，日志零 `does not exist` | 协调者默认 `search_path` 不含 `partdist` ⇒ 取号/心跳/commit_ts/safe_ts 全部 `function does not exist` ⇒ **全簇分片写 fail-closed**。演示环境靠 `ALTER DATABASE ... SET search_path` 绕过 |
 | **R-P6-4** | 分配器 shmem 槽位 `SHARD_XID_MAX_SLOTS = 64`/节点，**无产品侧回收**：`shard_xid.c` 零处释放路径 | 未修（`include/shard_xid.h:30`；grep 释放零命中） | 建删 64 个分片后该节点**再也建不了分片**；门禁靠"移走水位文件 + 重启"规避（`run_p6_exit.sh:165-170` 直接 `mv`） |
 | **P7-D1** | **leader `DROP TABLE` ⇒ 副本侧静默**：`shard_fileset.c:929-933` 明写"属后续工作；这里保持沉默" | 未修 | 壳表 + 回放槽位 + `pg_parwal/<oid>` **永不回收**（回收判据是"OID 不在本地 `pg_class`"，而壳表是本地真表） |
 

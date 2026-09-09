@@ -16,7 +16,12 @@
 #   [Q1/Q2/Q3] 三态问询三分支：start_ts>S 跳过 / 无登记跳过 / 问询学到判决
 set -u
 
-cd "$(dirname "$0")"
+TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+	# ★ T7.1 期修：① 原为硬编码 /home/zhanhao/shardpg-tx2-work 绝对路径，换工作区/
+	# 全新 clone 会静默跑到另一份工作区的脚本；② 必须在 `cd` **之前**取绝对路径 ——
+	# cd 之后 $0 仍是相对路径，再 dirname 就指到新 cwd 下的同名子目录，
+	# source 不到 lib_node_health.sh ⇒ 健康断言整层被静默跳过（本期实测踩过）。
+cd "$TESTS_DIR"
 CONTAINER="${CONTAINER:-pg-citus-tx2-container}"
 COORD=5432
 PASS=0; FAIL=0
@@ -44,7 +49,6 @@ if ! flock -n 9; then
 fi
 echo "  [lock] 独占锁已获取 (pid $$)"
 
-TESTS_DIR="/home/zhanhao/shardpg-tx2-work/pg-partdist-src/tests"
 source "$TESTS_DIR/lib_node_health.sh"
 health_mark_start
 

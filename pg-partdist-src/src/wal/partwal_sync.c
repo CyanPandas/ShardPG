@@ -744,6 +744,45 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
 }
 
 /*
+ * PartWALBuildVerdictMarker —— T7.1（R-P6-15）：判决落账时补发的终局标记。
+ *
+ * 与 PartWALBuildMarkerPayload 的差别只有一处但要害：**三个值全部显式传入，
+ * 一个都不从当前事务取**。
+ *
+ * 为什么必须这样：判决落账（`dtx_pending_apply_verdict`）跑在广播接收、
+ * 清扫工作者或恢复守护的事务里，那个事务**没碰过任何分片表** ——
+ *   · `ShardXidXactCount()` = 0 ⇒ 旧函数不置 HAS_SHARD_XID ⇒ 24 字节旧格式
+ *     ⇒ 回放侧 `sxid` 非法 ⇒ `ShardClogSetVerdict` 被跳过（R-P6-15 的机制）；
+ *   · `TsoMarkerCommitTs()` 会**新取一个号**，而不是决议的 commit_ts ——
+ *     那会让 follower 的分片 clog 记上一个比 leader 晚的提交时间戳，
+ *     升主后同一行在两侧对同一快照可见性不同（本可以避免的 SI 分歧）。
+ *
+ * 所以 start_ts / commit_ts 由调用方从未决登记与决议里给，
+ * 分片 xid 由 PartWALAppendMarkerForShardXid 逐分区给。
+ * 子事务清单恒空：整棵提交树已由第一段的 PREPARE 标记（带 parent_xid）落成
+ * TXN_PREPARED，读路径把子事务解析到顶层判决上。
+ */
+char *
+PartWALBuildVerdictMarker(int64 start_ts, int64 commit_ts, uint32 *out_len)
+{
+    char             *buf;
+    TxnMarkerPayload *m;
+    uint32            flags = PARTWAL_MARKER_HAS_SHARD_XID |
+                              PARTWAL_MARKER_HAS_ALLOC_WM;
+
+    *out_len = (uint32) TxnMarkerPayloadSizeEx(0, flags);
+    buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
+
+    m = (TxnMarkerPayload *) buf;
+    m->start_ts  = (uint64) start_ts;
+    m->commit_ts = (uint64) commit_ts;
+    m->nsubxacts = 0;
+    m->flags     = flags;
+
+    return buf;
+}
+
+/*
  * U-P5-1：把某个分区对应的分片 xid 回填进已组装好的载荷。
  *
  * 纯内存写、不 palloc、不取锁 —— 因此可以在 PartWALCtl->lock 之下、逐分区
@@ -751,15 +790,26 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
  * 的注释）。本分区没有分片写时写 0，follower 见 0 即跳过。
  */
 static void
-PartWALMarkerSetShardXid(char *payload, Oid partition_id)
+PartWALMarkerSetShardXid(char *payload, Oid partition_id,
+                         TransactionId explicit_sxid)
 {
     TxnMarkerPayload *m = (TxnMarkerPayload *) payload;
 
     if (payload == NULL)
         return;
 
+    /*
+     * ★ T7.1（R-P6-15）：分片 xid 有两个来源。
+     *   · 隐式（explicit_sxid = InvalidTransactionId）：本事务自己写的分片，
+     *     从 xact_map 取 —— 单机路径与 2PC 的 PREPARE 标记走这条；
+     *   · 显式：判决落账时补发标记，此刻跑在**另一个事务**里，xact_map 是空的，
+     *     值只能由调用方从未决登记的 pairs 里给。
+     */
     if (m->flags & PARTWAL_MARKER_HAS_SHARD_XID)
-        *TxnMarkerShardXidPtr(m) = (uint32) ShardXidMineForShard(partition_id);
+        *TxnMarkerShardXidPtr(m) =
+            (uint32) (TransactionIdIsValid(explicit_sxid)
+                      ? explicit_sxid
+                      : ShardXidMineForShard(partition_id));
 
     /*
      * U-P5-1 之二：带 leader **此刻真实的 next_xid**（下一个待发号）。
@@ -835,6 +885,19 @@ void
 PartWALAppendMarkerFor(Oid partition_id, TransactionId xid, uint8 op,
                        const char *payload, uint32 payload_len)
 {
+    PartWALAppendMarkerForShardXid(partition_id, xid, op, payload, payload_len,
+                                   InvalidTransactionId);
+}
+
+/*
+ * T7.1（R-P6-15）：同上，但分片 xid 由调用方显式给出。
+ * 判决落账补发标记时用这一支 —— 见 partwal_sync.h 的说明。
+ */
+void
+PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid, uint8 op,
+                               const char *payload, uint32 payload_len,
+                               TransactionId shard_xid)
+{
     PartitionWALWriter *w;
 
     /*
@@ -842,7 +905,7 @@ PartWALAppendMarkerFor(Oid partition_id, TransactionId xid, uint8 op,
      * 本函数逐分区调用，回填在这里做最自然。载荷由调用方 palloc，
      * 回填是就地写 —— 与单机路径同一条纪律。
      */
-    PartWALMarkerSetShardXid((char *) payload, partition_id);
+    PartWALMarkerSetShardXid((char *) payload, partition_id, shard_xid);
 
     if (!TransactionIdIsValid(xid))
         return;                 /* 无 xid 可标记：无账可记 */
@@ -1374,7 +1437,8 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
                     ereport(ERROR,
                             (errmsg("pg_partdist: 无法为分区 %u 打开 writer "
                                     "写提交标记", partwal_my_touched[t])));
-                PartWALMarkerSetShardXid(marker_payload, partwal_my_touched[t]);
+                PartWALMarkerSetShardXid(marker_payload, partwal_my_touched[t],
+                                         InvalidTransactionId);
                 PartWALAppendTxnMarker(w, marker_lsn, my_xid, true,
                                        marker_payload, marker_len);
                 DestroyPartitionWALWriter(w);   /* flush + fsync */
@@ -1488,7 +1552,8 @@ PartWALAbort(void)
                                              InvalidRelFileNumber);
                 if (w == NULL)
                     continue;
-                PartWALMarkerSetShardXid(payload, partwal_my_touched[t]);
+                PartWALMarkerSetShardXid(payload, partwal_my_touched[t],
+                                         InvalidTransactionId);
                 PartWALAppendTxnMarker(w, my_max, my_xid, false,
                                        payload, payload_len);
                 DestroyPartitionWALWriter(w);   /* flush + fsync */

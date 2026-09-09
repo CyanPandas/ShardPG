@@ -7995,8 +7995,16 @@ dtx_master_pre_record_commit(void)
     int             i, j;
     int             verdict = 0;
     int64           dtx_cts = 0;
+    int             probe_rows = 0;     /* T7.1：探针命中的 pg_dist_transaction 行数 */
 
-    elog(LOG, "pg_raft: [R11] 挂钩已进入 raft=%d dtx2pc=%d",
+    /*
+     * ★ T7.1 期改（2026-09-09）：这条原本是无条件 LOG，每个库的每次提交都打一行
+     * （协调者日志里几千行"挂钩已进入"），而它**只说进来了、不说为什么走掉** ——
+     * 决议没做时从日志上完全看不出卡在哪一步。降到 DEBUG1，改由下面的探针结果
+     * 行承担诊断（与 §13 约束 13 那条"三个 return false 在日志上看不出区别"
+     * 同一教训）。
+     */
+    elog(DEBUG1, "pg_raft: [R11] 挂钩已进入 raft=%d dtx2pc=%d",
          pg_raft_raft_enabled ? 1 : 0, pg_raft_dtx_2pc_enabled ? 1 : 0);
     if (!pg_raft_raft_enabled || !pg_raft_dtx_2pc_enabled)
         return;
@@ -8045,8 +8053,10 @@ dtx_master_pre_record_commit(void)
         "    ON n.groupid = t.groupid AND n.noderole = 'primary' "
         " WHERE t.xmin = pg_catalog.pg_current_xact_id()::xid");
 
+    probe_rows = -1;
     if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
     {
+        probe_rows = (int) SPI_processed;
         for (i = 0; i < (int) SPI_processed; i++)
         {
             char *gid = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
@@ -8076,6 +8086,21 @@ dtx_master_pre_record_commit(void)
     }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
+
+    /*
+     * ★ T7.1 期加（2026-09-09）：探针结果留痕。
+     * `probe_rows == 0/-1` = 本事务没往 pg_dist_transaction 写行 ⇒ 不是 2PC 驱动者，
+     * 这是绝大多数提交的正常去向，DEBUG1 即可；
+     * 探针**有行却仍然 dtxid=0 或 nnodes=0** 则是真异常（gid 形态不认识、
+     * 或 pg_dist_node 里找不到对应 primary），必须 LOG 出来 ——
+     * 否则表现就是"2PC 事务提交成功但决议永远不出现、行永久不可见"，
+     * 而日志上一片安静（2026-09-09 在 pg-test 环境实测踩过一整轮）。
+     */
+    if (probe_rows > 0)
+        elog(LOG, "pg_raft: [R11] 2PC 探针命中 %d 行：dtxid=" INT64_FORMAT " nnodes=%d",
+             probe_rows, dtxid, nnodes);
+    else
+        elog(DEBUG1, "pg_raft: [R11] 2PC 探针无行（本事务不是 2PC 驱动者）");
 
     if (dtxid == 0 || nnodes == 0)
         return;                     /* 不是跨节点的 Citus 2PC 事务 */

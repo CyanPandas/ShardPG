@@ -4955,7 +4955,38 @@ raft plan §0.2（11 行逐行复核）、DEV PLAN"不做的事"表 + P6 出口�
 `P6_PENDING_DECISIONS.md` 附录里。其中**三条是 ★★★**（切主/供给后已提交数据不可见
 或丢失），且**都在 pg-partdist 侧、不需要解冻 raft**。
 
-**跑了什么测试**：本批次不改代码，只跑了环境验收 `reproduce-env.sh verify`
+##### T7.1 / T7.5 验收（2026-09-09）
+
+- **`test_dtx_verdict_marker_p7.sh` 34/0**（新套件）。决定性取证：leader 段流里
+  判决标记 **len=32**（修复前 24）、flags = `HAS_SHARD_XID|HAS_ALLOC_WM`、
+  尾部分片 xid == 该行 xmin；副本回放后 `sclog_full` 由 `st=1(PREPARED)`
+  变为 **`st=2 cts=13`**，与 leader 的 `cts=13` 逐字节相同。
+- **`test_dtx_convergence_p4.sh`**（已有套件，用作判别器）：35 PASS / 1 FAIL，
+  唯一的红是 `工作者清扫日志留痕` —— 脚本假设日志在 `<datadir>/startup.log`，
+  而 reproduce-env 建的环境写在 `<datadir>.log`，**与产品无关**，已修脚本。
+- T7.5 单独实测：默认 `search_path` 下 worker 取号 1→2→3→4 单调，日志零
+  `does not exist`。
+
+##### 这一轮暴露出来的环境/夹具规律（后续套件都要照着写）
+
+1. **重启 coordinator 后必须删 `pg_tso_boot`**，否则 TSO 拒绝发号（设计 §2.4 防呆），
+   症状是后面每一步莫名其妙地空/红。
+2. **`ALTER SYSTEM` 必须自己占一条 `-c`**，与别的语句写在一起会因隐式事务块失败，
+   于是"以为清干净了"的白名单其实还在。
+3. **净场必须重启全节点**：shmem 里的打标集/分配器槽位只增不减（R-P6-9/R-P6-4），
+   不重启就带着上一轮的状态跑。
+4. **建组顺序**：placement 节点先建组并当选 → follower 入组 → 等 follower 就绪 →
+   **再等 `partition_map` 登记**（决议路径读它找现任 leader，读不到就 fail-closed）。
+5. **两个分片都要完整建站**（身份 + 壳表 + locmap + 组），否则写集只剩 1 个组，
+   撞 §3.4 快路径 ⇒ 决议根本不产生。
+6. **分片 clog 的键是本节点的 oid**：同一张分片表在不同节点 oid 不同
+   （实测 leader 25914 / follower 17778），拿 leader 的 oid 查副本读到空账。
+7. **`replay_catchup` 必须给上界**，不给直接报错（惰性回放的核心不变式）。
+8. **分区主会自治漂移**：本宿主机 2 核跑 9 节点，30 秒内实测到主从 :5433 漂到
+   :5435（`partition_map` 与 `pg_dist_placement` 都正确跟随 —— 路由层是好的）。
+   夹具要么按当前 placement 取节点，要么容忍并重试。
+
+**跑了什么测试**：文档回填部分不改代码，只跑了环境验收 `reproduce-env.sh verify`
 （V1–V6，PASS=25 FAIL=0）确认新场地可用。**产品回归一套没跑，也不该跑** ——
 全量要留到 P7 批次 1–3 改完之后跑，现在跑出来的数字改完就作废（用户已裁定暂缓）。
 
@@ -4972,6 +5003,51 @@ raft plan §0.2（11 行逐行复核）、DEV PLAN"不做的事"表 + P6 出口�
 
 同时立下两条新纪律（已并入 §0.0 第 6、7 条）：**改完就回填文档**、
 **接口必须真的可用，不许假声明**。
+
+---
+
+#### 批次 #13：P7 批次 1 开工 —— T7.1（R-P6-15）+ 搭车修 T7.5（R-P6-20）（2026-09-09）
+
+**T7.5（R-P6-20）先修，因为它是 T7.1 验收的硬阻塞。** 头一次在 pg-test 这套
+**干净**集群上跑打标写入，第一笔就撞上：
+
+```
+ERROR:  function partdist_tso_start_ts(integer, bigint) does not exist
+ERROR:  TSO 不可达或拒绝服务（取 start_ts 失败）
+```
+
+`tso_client.c` 5 处发的是裸函数名，而扩展把 C 函数装进 `partdist` 模式
+（`schema = partdist`），TSO 连接用默认 `search_path = "$user", public`。
+此前"能跑"全靠 P4 期各套件在 `public` 里现建的同名垫片、以及演示环境的
+`ALTER DATABASE ... SET search_path`。**这正是"假可用"的第二种形态**（§0.0 第 7 条）。
+改成全限定名后实测：默认 search_path 下取号 **1→2→3→4** 单调，日志零 `does not exist`。
+
+**T7.1（R-P6-15）**：终局标记改由**判决落账那一刻**补发（`dtx_pending.c` 新增
+`dtx_replicate_verdict()`，紧跟 `dtx_pending_apply_verdict()` 写本地分片 clog 之后），
+新接口 `PartWALBuildVerdictMarker()` + `PartWALAppendMarkerForShardXid()`
+（`partwal_sync.h`）把 start_ts / commit_ts / 分片 xid **三个值全部显式传入**。
+机制与"为什么不在 COMMIT PREPARED 处补"的论证已回填 `DTX_2PC_DESIGN.md` §9.6。
+
+##### 顺带修掉的两处工程债
+
+- `run_p5_exit.sh` / `test_dtx_convergence_p4.sh` / `test_dtx_tso_p4.sh` 里
+  **硬编码 `/home/zhanhao/shardpg-tx2-work/...` 绝对路径**：换工作区或全新 clone 时
+  会静默跑到**另一份**工作区的脚本。改成 `$(cd "$(dirname "$0")" && pwd)`。
+- 新套件第一版自己踩了同一类坑：`cd "$(dirname "$0")"` 之后 `$0` 仍是相对路径，
+  再 `dirname` 就指到新 cwd 下的同名子目录，`lib_node_health.sh` source 不到
+  （于是健康断言整层静默跳过）。改为先取绝对路径再 cd。
+
+##### 新套件写错两次，两次都是"用例的错"，如实留痕
+
+1. **没走 join 传播协议**：打标分片的 Citus 路由写必须在同一事务里
+   `SET LOCAL pg_partdist.join_info='gxid,start_ts,coord_gsid'`（配
+   `citus.propagate_set_commands=local`），否则撞 T4.3 禁令
+   "未加入全局事务的分片写不允许 PREPARE TRANSACTION"。
+2. **把"提交成功"和"行可见"写成一条断言**：打标分片的行**不是提交即可见** ——
+   判决走协调组决议的异步广播/清扫收敛，落进分片 clog 之前读者按 §4.2 三态处置
+   一律判不可见。第一版红在"实际=0 期望=2"，那是用例的错，不是缺陷。
+   改为：先断言 COMMIT 语句成功，再轮询（带 `dtx_pending_sweep()`）等收敛后
+   断言可见性。
 
 ---
 

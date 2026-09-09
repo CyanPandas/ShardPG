@@ -65,6 +65,32 @@ docker rm -f pg-test-container && rm -rf /home/zhanhao/pg_test
 # 工作区另删：rm -rf /home/zhanhao/shardpg-test-work
 ```
 
+## 4.1 两条实测出来的操作纪律（2026-09-09，T7.1 期踩出来）
+
+**① 重启 coordinator 之后必须删 TSO boot 标记，否则全簇停发号。**
+设计 §2.4 的防呆：TSO 首次服务时落 `$PGDATA/pg_tso_boot`，重启后检测到"曾服务过"
+即拒绝发号（把"静默重发号 = 数据损坏"变成"响亮停摆"）。测试集群里每次
+`pg_ctl restart` 完 coordinator 都会撞上，症状是后面每一步莫名其妙地空/红：
+
+```
+ERROR:  TSO 检测到上个纪元的 boot 标记（pg_tso_boot），拒绝发号
+```
+
+处置（**仅限可重建的测试集群**；生产语义是整簇重建）：
+
+```bash
+docker exec -i -u postgres pg-test-container bash -c \
+  'rm -f /work/pg-cluster-data/coordinator/pg_tso_boot && \
+   /work/pg-install/bin/pg_ctl restart -D /work/pg-cluster-data/coordinator \
+     -l /work/pg-cluster-data/coordinator.log -w -t 60'
+```
+
+**② `ALTER SYSTEM` 必须自己占一条 `-c`。**
+写成 `-c "ALTER SYSTEM RESET ...; SELECT pg_reload_conf();"` 会被 psql 当成隐式
+事务块 ⇒ `ERROR: ALTER SYSTEM cannot run inside a transaction block` ⇒ **白名单
+根本没撤掉**，而调用方通常把输出丢进 `/dev/null`，于是下一轮验收在"以为清干净了"
+的污染现场上跑，红得毫无道理（本期实测浪费了两轮）。
+
 ## 5. 当前在这块场地上做什么
 
 **批次 #12 起：P6 缺陷收口（P7）。** 盘点见

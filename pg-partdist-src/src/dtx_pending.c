@@ -9,6 +9,9 @@
 
 #include "dtx_pending.h"
 #include "shard_clog.h"
+#include "gxid.h"					/* T7.1：从 gxid 还原本地 xid */
+#include "partwal_sync.h"			/* T7.1：判决标记补发 */
+#include "partition_wal_header.h"	/* T7.1：XLOG_XACT_* / MARKER 载荷 */
 
 #include "access/htup_details.h"
 #include "executor/spi.h"
@@ -499,6 +502,121 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 }
 
 /* 学到判决：整笔（本节点全部 pairs）幂等落分片 clog + 注销 */
+/*
+ * dtx_replicate_verdict —— T7.1（R-P6-15）：把刚落进本地分片 clog 的判决
+ * 补一条 MARKER 进分区流，让副本得到同一本账。
+ *
+ * ★ 为什么补在这里，而不是在 COMMIT PREPARED 那一步。
+ *
+ * 缺陷现场（R-P6-15，2026-09-06 多分片演示实测）：阶段 3 的终局标记由
+ * `dtx_participant.c` 在 `COMMIT PREPARED` 的钩子里发，载荷走
+ * `PartWALBuildMarkerPayload()` 组装 —— 而那个函数按 `ShardXidXactCount() > 0`
+ * 决定带不带分片 xid 尾，`COMMIT PREPARED` 跑在**另一个没碰过分片表的事务**里，
+ * 计数恒 0 ⇒ 24 字节旧格式 ⇒ 回放侧 `sxid` 非法、`ShardClogSetVerdict` 被跳过
+ * （`shard_replay.c` 的 `TransactionIdIsNormal(sxid)` 分支）⇒ **副本的分片 clog
+ * 对每笔跨分片事务永远停在 PREPARED**；等协调组的 DECISION 被 FORGET 回收、
+ * `pg_dist_transaction` 也 GC 掉之后，`dtx_close_indoubt` 四级全落空 ⇒
+ * 切主后那些**已经提交成功的行在新主上永久不可见**。
+ *
+ * 那为什么不是在 COMMIT PREPARED 处把分片 xid 补上就好？因为那里还缺**第二个
+ * 权威值**：判决的 `commit_ts`。COMMIT PREPARED 的钩子跑在决议之后，但本节点
+ * 未必已经收到决议广播；就地 `TsoMarkerCommitTs()` 取到的是一个**新号**，
+ * 比决议的 commit_ts 晚。用它落副本的分片 clog，会让同一行在 leader 与
+ * follower 上对同一快照可见性不同 —— 把"永久不可见"换成"偶发不一致"，
+ * 不是修复。
+ *
+ * 判决落账这一刻则两个值都是权威的：分片 xid 来自未决登记的 pairs（PREPARE 时
+ * 与 2PC 状态段一起 fsync，"prepared 存在 ⇒ 登记必在"），commit_ts 就是本函数
+ * 正在往本地分片 clog 里写的那一个。**leader 写什么，副本就收到什么**，
+ * 由构造保证一致。三条调用路径（广播接收 `dtx_apply_decision`、清扫工作者、
+ * 恢复守护）都是普通 backend，可以安全地开 writer、取 PartWALCtl 锁、发提案。
+ *
+ * ★ 失败一律不上抛。本地分片 clog 已经落账（调用方在本函数之前做的），那是
+ * 正确性的底线；复制是尽力而为，与 §3.3 阶段 3 "随下一次 flush 复制" 同一口径。
+ * 最典型的失败是**本节点已不是该分片的主**（切主后由恢复守护补判决，R-P4-9 的
+ * 场景）——写栅栏会拒，这正是它该拒的：陈旧主不得再往流里写。
+ */
+static void
+dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
+{
+	TransactionId	xid;
+	char		   *payload = NULL;
+	uint32			payload_len = 0;
+	uint8			op;
+	int				i;
+	bool			appended = false;
+
+	if (ent->nxids <= 0 || (verdict != 1 && verdict != 2))
+		return;
+
+	/* 被标记的是那笔 prepared 事务的本地 xid，不是当前语句的 */
+	xid = GxidLocalXid(ent->gxid);
+	if (!TransactionIdIsValid(xid))
+		return;
+
+	op = (verdict == 1) ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT;
+
+	PG_TRY();
+	{
+		payload = PartWALBuildVerdictMarker(ent->start_ts,
+											verdict == 1 ? cts : 0,
+											&payload_len);
+
+		for (i = 0; i < ent->nxids; i++)
+		{
+			Oid				shard = (Oid) ent->pairs[2 * i];
+			TransactionId	sxid = (TransactionId) ent->pairs[2 * i + 1];
+
+			if (!OidIsValid(shard) || !TransactionIdIsNormal(sxid))
+				continue;
+
+			PartWALAppendMarkerForShardXid(shard, xid, op,
+										   payload, payload_len, sxid);
+
+			/*
+			 * ★ 必须登记"触达"，否则下面的 flush 不会提议这条记录。
+			 * `PartWALAppendMarkerForShardXid` 只把字节写进**本地段**并 fsync；
+			 * 送进 Raft 是 `PartWALFlush` 干的，而它只遍历本事务触达过的分区
+			 * （`partwal_my_touched`）。漏了这一步的现象很具体：leader 的段流
+			 * 里有这条 32 字节判决标记，**副本的段流里没有**（实测 leader 7 条 /
+			 * follower 6 条），副本的分片 clog 因此停在 PREPARED ——
+			 * 与没修之前一模一样，但原因完全不同。
+			 * `dtx_participant.c` 的阶段 3 也是这么配对写的。
+			 */
+			PartWALNoteTouchedPartition(shard);
+			appended = true;
+		}
+
+		/*
+		 * 尽力复制一轮。不 flush 的话标记只躺在本地段里，副本要等下一笔
+		 * 写入才顺带收到 —— 而"下一笔写入"可能永远不来（尤其是切主前的
+		 * 最后一笔事务，恰恰是最需要它的那笔）。
+		 */
+		if (appended)
+			PartWALFlush(InvalidXLogRecPtr, false);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(TopMemoryContext);
+		ed = CopyErrorData();
+		FlushErrorState();
+
+		ereport(WARNING,
+				(errmsg("pg_partdist: 判决标记未能复制给副本（gxid=%lld）：%s",
+						(long long) ent->gxid, ed->message),
+				 errdetail("本地分片 clog 判决已落账，正确性不受影响；"
+						   "副本要等下一次供给或重做基线才拿到这笔判决。"),
+				 errhint("本节点若已不是该分片的主，这是写栅栏的正常拒绝。")));
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+
+	if (payload != NULL)
+		pfree(payload);
+}
+
 static void
 dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
@@ -508,6 +626,10 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		ShardClogSetVerdict((Oid) ent->pairs[2 * i],
 							(TransactionId) ent->pairs[2 * i + 1],
 							verdict == 1, verdict == 1 ? cts : 0);
+
+	/* ★ T7.1（R-P6-15）：本节点刚落的这本账，要复制给副本 */
+	dtx_replicate_verdict(ent, verdict, cts);
+
 	DtxPendingFinalized(ent->gxid);
 }
 

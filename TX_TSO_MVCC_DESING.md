@@ -164,6 +164,24 @@ start_ts)，**然后**才返回新号。一次 RPC，原子，无竞态窗口。
 3. **范围边界**：本裁定只豁免 **TSO 自身**的故障。§6.2 GlobalSafeTs 的双通道/租约/
    栅栏针对的是 **worker 失联**（vacuum 正确性依赖），不在豁免之列，仍属 v1。
 
+> **★ 2026-09-09 T7.5 修复（R-P6-20）：TSO 客户端的 RPC 必须写全限定名。**
+>
+> `tso_client.c` 此前发的是**裸函数名**（`SELECT partdist_tso_start_ts(...)` 等
+> 5 处），而这些 C 函数由扩展装进 `partdist` 模式（`pg_partdist.control` 的
+> `schema = partdist`）。TSO 连接用默认 `search_path = "$user", public`
+> ⇒ 取号 / 心跳 / commit_ts / safe_ts **全部**报
+> `function partdist_tso_start_ts(integer, bigint) does not exist`
+> ⇒ 取号 fail-closed ⇒ **全簇分片写不进去**。
+>
+> 此前之所以"能跑"：P4 期各验收套件都在 `public` 里现建了同名垫片；演示环境靠
+> `ALTER DATABASE postgres SET search_path TO ..., partdist` 绕过。两者都不是产品
+> 形态 —— 干净装出来的集群第一笔分片写就会撞上（2026-09-09 在 pg-test 环境实测
+> 复现，见节点日志 15:50:08 那三行）。
+>
+> 修后实测（默认 `search_path` 下、未加任何垫片）：worker 连续取号
+> **1 → 2 → 3 → 4**，服务端直取 5，单调递增，日志零 `does not exist`。
+> 演示文档里那条 `ALTER DATABASE ... SET search_path` 的绕法可以撤掉。
+
 **后续版本的 HA 方向（论证留档，届时立项裁定）**：绑 group0 leader——水位推进写进
 group0 raft 日志（多数派持久，切主后新 leader 从状态机续发）、持租约发号（新 leader
 等旧租约过期，堵被分区旧 leader 的双发号）、接管后冻结 GlobalSafeTs 一个租约周期再
