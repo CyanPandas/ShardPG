@@ -1009,8 +1009,8 @@ extern void PartDistRouteRegister(Oid shard_oid,
                                   ShardRole role);
 extern void PartDistRouteUpdateFileset(Oid shard_oid,
                                        const ShardFileSet *new_fileset);
-extern void PartDistRoutePromote(Oid shard_oid, FullTransactionId watermark);
-extern void PartDistRouteDrop(Oid shard_oid);
+extern void PartDistRoutePromote(Oid shard_oid);   /* ★ 2026-09-09 回填：实装签名无 watermark 形参 */
+extern void PartDistRouteDrop(Oid shard_oid);   /* ★ 未实装：leader DROP 的副本侧回收缺 opcode，见 P7 计划 P7-D1 */
 
 /* xid_map(回放侧写,查询侧读) */
 extern void ShardXidMapInsert(ShardReplayCtx *ctx, TransactionId xid,
@@ -1098,8 +1098,27 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
 > `armed`;降级方向:收回"已升主"身份、闸门重新合上(fail-closed)。
 > **不**自动重新 arm——降级归队能不能直接按游标追平,取决于有没有快路径分叉
 > (§9.5),那个判断不属于交接。
-> **仍未实装**:路由层本身(`PartDistRoutePromote` 的角色枚举与写路由切换)、
-> 以及 `wal_insert_hook` 为新主开始捕获新流这一支。
+> **★ 2026-09-09 回填:上面这句"仍未实装"已过时。** 批次 #10(2026-09-06)
+> 把路由层本身落了地——`PartDistRoutePromote()`(`shard_fileset.c:1838`)在一处
+> 做两件事:① `ShardReplicaSetPromoted()` 置持久 promoted 记号(解除 T6.3c 的副本
+> 读闸门、让 `replay_catchup` 拒绝再拿别人的流盖自己的表);② `BuildShardFileSet`
+> + `RegisterShardFileSet` 把本地 fileset 登记进反向哈希,`wal_insert_hook` 由此
+> 认得新主的写入。观测面 `partdist.route_status(oid)` 同批次落地。验收
+> `handover_provision_p7` 33/0。
+>
+> **水位为什么没进签名**:FRD 原文的 `W = max_replayed_fxid` 由 T6.5 的回放路径
+> 维护(`ShardReplayNoteDataShardXid` + `ShardXidClaimOnPromote`),这里重复置位
+> 只会与回放争写且没有新信息,故实装签名收成 `PartDistRoutePromote(Oid)`。
+>
+> **"同一临界区原子生效"没有做到,如实记**:角色走 `ReplayCtl->lock`、捕获走
+> `PartWALCtl->lock`,两把锁跨不到一起。实际需要的性质是"两件事都在对外服务
+> 之前完成",由 `OP_PARTITION_PRIMARY` apply 里的顺序(路由登记在后半段)保证。
+>
+> **★ 仍缺的一支(R-P6-16,未修)**:升主**不广播 `FILESET_UPDATE`**。新主写入
+> 带的是它自己的 relfilenumber,其余副本的 locmap 仍对着旧主文件号 ⇒
+> `replay_catchup` 报"未知 relfilelocator ... (fileset 漏登记)" ⇒ **该分片其余
+> 副本切主一次后全部失去再次当选资格**,直到从新主重新供给。修法与验收见
+> `P7_REMEDIATION_PLAN.md` T7.3。
 > 验收 `test_handover_provision_p7.sh` 27/0,其中"切主前读被拦、切主后放行"
 > 这条**差分**证明放行确实是交接干的。
 >
@@ -1605,18 +1624,34 @@ worker 抱着旧表还是撞同一道栅栏。
     VACUUM 灌环的窗口上,把环顶爆。已改为节点级共享水位
     (`PartWALFreezeCheckDue`,`PartWALCtlData.freeze_last_check`)。
 
-    > **★★ 状态(2026-08-05 终):下述 pg_raft 侧修法曾全部实装并逐项验证,
-    > 后按用户决定(Raft/2PC 模块冻结,回退到稳定版本)整体回退。**
-    > 当前代码 = 稳定版 + `data_propose_one` 的 isnull 修复(已提交)。
-    > 完整补丁存档:`pg_raft_flowcontrol_39.patch`(工作区外备份
-    > `/home/zhanhao/pg_raft_flowcontrol_39.patch.bak`,661 行,含背压、
-    > #39 认领归还、批量游标推进、`flow_stats` 观测、2PC 门禁半成品)。
-    > 下文保留为**已验证的设计记录**,供将来重新立项时直接取用;文中
-    > "已落地/已修"均指回退前的验证状态,不指当前代码。
-    > 测试侧的 `health_check_no_drops` 保留:`flow_stats` 不存在时显式打
-    > "跳过",流控将来落地即自动生效。
+    > **★★ 状态(2026-09-09 回填,推翻下面那段 08-05 的措辞):这些修法现在都在
+    > 代码里。** 08-05 曾因 Raft/2PC 模块冻结整条回退,但 T4.4 已按
+    > 用户裁定 (b) 重放 #39(`1c22a31` + `455c935`)。09-09 实测确认:
+    > `wait_for_log_room` 4 处、`apply_owner_pid` 11 处、`flow_stats`/
+    > `ring_full_drops` 13 处,全部命中 `pg-raft-src/src/raft_consensus.c`。
+    > **下文的"已落地/已修"从此指当前代码,不再是"回退前的验证状态"。**
+    >
+    > 未变的部分:环容量 `RAFT_LOG_CAPACITY` 仍是 128、**未提容**,
+    > 多数派不足导致的 `quorum_drops` 仍是通向同一后果的另一条路(见本节末段);
+    > 分叉的**检测**(`diverged` 标记)与**一键修复**(`repair_diverged_shards`)
+    > 已由批次 #8/#9 补上,但没有自动修复。
+    >
+    > <details><summary>08-05 原始措辞(保留留痕)</summary>
+    >
+    > 下述 pg_raft 侧修法曾全部实装并逐项验证,后按用户决定(Raft/2PC 模块冻结,
+    > 回退到稳定版本)整体回退。当前代码 = 稳定版 + `data_propose_one` 的
+    > isnull 修复(已提交)。
+    >
+    > </details>
+    > 当年那次回退的完整补丁存档仍在:`pg_raft_flowcontrol_39.patch`(工作区外
+    > 备份 `/home/zhanhao/pg_raft_flowcontrol_39.patch.bak`,661 行)——**现已无用**,
+    > 内容(背压、#39 认领归还、批量游标推进、`flow_stats` 观测)都已在库。
+    > 下文是**当前代码的设计记录**(2026-09-09 复核后改判,见上方状态注)。
+    > 测试侧的 `health_check_no_drops` 现在**真正生效**(`flow_stats` 已存在,
+    > 不再走"跳过"分支):每套件收尾断言本轮 `ring_full_drops + quorum_drops`
+    > 增量为 0 —— **全 PASS + 有丢弃 = 运气,不是通过。**
 
-    **已落地的修法(2026-08-05,pg_raft 侧,已回退——见上)**:
+    **已落地的修法(2026-08-05 首次实装,T4.4 重放后至今在库,2026-09-09 复核)**:
 
     - **背压取代拒绝**(`wait_for_log_room`)。环满时不再直接丢提案,而是循环
       `group_apply_pending` + 睡 1ms,直到有空位或超过
@@ -1830,7 +1865,25 @@ pg_raft 侧新增:`pg_raft.propose_wait_ms`(§13 约束 13,默认 10000,`PGC_SIG
 | D1 DDL/fileset 控制通道 | CTRL 记录格式 + `PartWALAppendCtrl`;locmap v2(加 `role`/`ord`);leader 侧 `ProcessUtility_hook` 检测 → PRE_COMMIT 发射 `FILESET_UPDATE` + `log_newpage_range` 灌新文件;follower 侧换表/截断 与 `REPLAY_NEEDS_STRUCT` 结构栅栏(§12) | `VACUUM FULL`/`REINDEX`/`TRUNCATE` 全自动追平且页面比对仍一致;`CREATE INDEX` 停在栅栏(游标不推进、locmap 未换),补齐本地结构 + 重跑 `replay_set_locmap()` 后原地继续;未同步结构的另一 follower 必须仍停住 | R1 |
 | D2 冻结账目同步 | `CTRL:FREEZE_UPDATE`;leader 侧时间驱动检测(autovacuum 不走 ProcessUtility)+ 持久化基线 diff + **尽力而为**发射;follower 侧 worker 发布到槽位、`replay_catchup` 调用方写 `pg_class`(§13 约束 5) | follower 壳表的 `relfrozenxid` 由建表初值变为 leader 的值、`age()` 有界;leader 再次 VACUUM 后能重新同步;账目未变时不重复发射 | D1 |
 | R3 可见性接口 | 路由表 + xid_map 迁 dshash 共享化;`PartDistResolveGxid`/`HeapTupleSatisfiesGlobalMVCC` 实装(**另行立项,MVCC 文档定稿后启动**) | 两个 leader 的 shard 副本同居一 follower,交叉提交/回滚可见性正确 | R2 + **全局 MVCC 文档定稿** |
-| R4 提升 | **内核补丁 0010**(2026-09-04 T6.3b 已实装;§11 的归档/`max_wal_size`/级联备库三项处置结论也已出,见 patches/README.md「0010 的运维裁定」);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | **R3(硬阻断,见下)** |
+| R4 提升 | **内核补丁 0010**(2026-09-04 T6.3b 已实装;§11 的归档/`max_wal_size`/级联备库三项处置结论也已出,见 patches/README.md「0010 的运维裁定」);§11 六步收尾;旧 leader 归队 | 杀 leader → follower 提升 → 继续读写 → 旧 leader 归队追平,全程数据一致;升主后重启,W 从 checkpoint 恢复,判定不漂移 | ~~R3(硬阻断)~~ **★ 已解除,见下方 09-09 回填** |
+
+> **★ 2026-09-09 回填:「R4 硬阻断于 R3」对新宇宙(打标分片)已不成立,R3 建议裁掉。**
+>
+> R3 的四个符号(`PartDistResolveGxid` / `HeapTupleSatisfiesGlobalMVCC` /
+> `ShardRouteEntry` / xid_map 共享化)**从未实装** —— 09-09 复核:全仓只剩
+> `shard_xidmap.h:9` 一条注释提到它们。但 R4 已经跑通了:
+>
+> - TX-TSO-MVCC 落地后,**打标分片走的是分片级 xid + 分片 clog + TSO 快照**
+>   (DESIGN §4/§5),可见性不再需要 R3 那套 gxid 解析路径;
+> - promoted 分片可读已由 `promote_catchup_tx3`、`handover_provision_p7` 实证。
+>
+> ⇒ **R3 的必要性只剩"遗留宇宙"**(R1/R2/L1 时代、未打标的分片副本):它们升主后
+> 不可读,且读会设 hint bit 写本地 WAL(§13 约束 12 残留)。建议裁定
+> **「遗留副本退役」而不是继续把 R3 挂着**——见 `P7_REMEDIATION_PLAN.md`。
+>
+> **注意这不是"R4 已完工"**:R4 自身仍缺升主广播 `FILESET_UPDATE`(R-P6-16)、
+> 供给/升主不带打标身份(R-P6-21)、基线不带分片 clog(R-P6-17),三条都会让
+> "切主后数据可见"这个命题失败,见 P7 计划批次 1。
 
 > **★ "逐页字节级一致"必须排除页内空闲空洞(R1 实测修正)。** v3 稿写的
 > "逐页 diff 一致(含 LSN 域)"**不可达**,原因不在回放而在 FPI 机制本身:

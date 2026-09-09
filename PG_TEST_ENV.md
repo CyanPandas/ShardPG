@@ -65,7 +65,15 @@ docker rm -f pg-test-container && rm -rf /home/zhanhao/pg_test
 # 工作区另删：rm -rf /home/zhanhao/shardpg-test-work
 ```
 
-## 5. 建环境时的验收结果
+## 5. 当前在这块场地上做什么
+
+**批次 #12 起：P6 缺陷收口（P7）。** 盘点见
+`pg-partdist-src/docs/P6_EXIT_AUDIT.md`，计划见
+`pg-partdist-src/docs/P7_REMEDIATION_PLAN.md`（6 个批次 + 6 条待裁 + 出口标准）。
+第一批四条都是"切主/供给后已提交数据不可见或丢失"级别，且都在 pg-partdist 侧、
+不需要解冻 pg_raft。
+
+## 6. 建环境时的验收结果
 
 见本文件末尾「验收记录」一节。
 

@@ -9,7 +9,17 @@
 > **代码基线**：`shardpg-TX2` @ `7ff2656`（2026-08-11 自 shardpg-TX 尖端分出）。
 > 文中引用的现有代码事实均在该基线上复核过。
 >
-> **状态**：方案定稿（2026-08-12 评审对话逐条敲定）。**未实施，未动任何代码。**
+> **状态（2026-09-09 回填）**：方案定稿于 2026-08-12；**P1–P6 六期已全部实施**，
+> 代码在 `pg-partdist-src`（分片 xid/clog、TSO、可见性、vacuum、回放接线）与
+> 内核补丁 0005–0010。头部此前一直挂着"未实施，未动任何代码"——那是定稿当天的
+> 措辞，**已陈旧一个月以上**，本次改正。
+>
+> **但 P6 没有结项**：出口清单 12 条 ✅5 / ◐4 / ❌3，未闭合的缺陷 21 条（其中 4 条
+> 是"已提交数据在切主/供给后不可见或丢失"级别）。盘点见
+> `pg-partdist-src/docs/P6_EXIT_AUDIT.md`，收口计划见
+> `pg-partdist-src/docs/P7_REMEDIATION_PLAN.md`。**在批次 1 四条修完之前，
+> 本方案不具备生产可用性。**
+>
 > 带【待定】标注的条目集中在 §11。
 
 ---
@@ -52,6 +62,13 @@
 2. **TSO 发号**：start_ts / commit_ts 的唯一来源，单调递增；发号与最老快照登记在
    同一 RPC 内原子完成（§2.3）。
 3. **GlobalSafeTs**：维护各协调者节点上报的最老快照时间，计算全局安全水位（§6.2）。
+
+> **★ 2026-09-09 回填：第 1 条的"Proxy"已被 Citus MX 取代，不再是本方案的组件。**
+> §9.1 于 2026-08-12 敲定语句转发载体为 Citus MX，P4 的 T4.2「Proxy 粘性路由并入」
+> 落地后，会话→协调者的粘性由 MX 的路由与 2PC 会话保证，**独立 Proxy 守护组件
+> 正式从方案中裁掉**（DEV PLAN §3.8「不做的事」原文即写"若 P6 仍无消费方应考虑
+> 从方案中裁掉"）。master 今天的实际职责只剩第 2、3 两条 —— TSO 发号与
+> GlobalSafeTs，且两者都是**单点无 HA**（§2.4 v1 裁定）。
 
 ### 1.2 协调者（是分片，不是节点）
 
@@ -603,10 +620,14 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 | 分片表原生流复制热备读 | 本来就不用 | 本项目用自己的回放 |
 | 分片表异步提交（synchronous_commit=off） | 禁 | 可见性/提交点语义只许断言已持久事实（§4.5）；[A]<[B] 与多数派提交点均以同步提交为前提。**实装位置**：`shard_xid_for_current_xact` 写路径（T6.6 补——此前本行只有文档、**代码零守卫**）；`on`/`local`/`remote_write` 放行 |
 | CIC / CLUSTER / VACUUM FULL | **禁（V4 已裁定，2026-08-13）**；P5 freeze/回收全章落地后再评估 CLUSTER/VACUUM FULL，CIC 随索引专项 | CIC 的多快照阶段与 validate 等待全按原生 xid 机制，且 P 期分片表本就禁索引；CLUSTER/VACUUM FULL 走 rewriteheap 的 freeze/裁决会拿分片 xid 查原生 clog，且换 relfilenode 需 fileset 重绑（复制面）。ANALYZE 已于 T2.6 解禁（补丁 0008 读侧分叉，只判不收） |
-| Citus rebalancer / move_shard_placement / undistribute_table / alter_distributed_table | 禁 | 原生快照读分片表 = 静默错读；与 raft 管理的放置冲突；搬分片 = 后续 raft 成员变更专项（§9.2）。**实装位置**：`ShardGuardCheckPlan` **遍历计划树**取 FunctionScan/targetlist/qual（T6.6 修正——首版扫 `pstmt->rtable` 的 `rte->functions` 是死代码，setrefs.c 已把它清成 NIL，于是 `SELECT * FROM f(...)` 整类写法一直绕得过去，R-P6-8） |
+| Citus rebalancer / move_shard_placement / undistribute_table / alter_distributed_table | 禁 | 原生快照读分片表 = 静默错读；与 raft 管理的放置冲突；搬分片 = 后续 raft 成员变更专项（§9.2）。**实装位置**：`ShardGuardCheckPlan` **遍历计划树**取 FunctionScan/targetlist/qual（T6.6 修正——首版扫 `pstmt->rtable` 的 `rte->functions` 是死代码，setrefs.c 已把它清成 NIL，于是 `SELECT * FROM f(...)` 整类写法一直绕得过去，R-P6-8）。**★ 2026-09-09 复核：清单漏了 8 个同类 UDF**（`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method`），其中 `citus_drain_node` 内部直接调 C 函数、不经 ExecutorStart，**加名字也挡不住**。见 P7 计划 T7.9 |
 | 含分片写的 PREPARE TRANSACTION | P1 禁（PRE_PREPARE 拦截，且拦截先于 PartWAL 刷流——回调 LIFO 序，见 DEV PLAN T1.9 记要） | 后端映射/临时提交表无法跨会话延续 prepared 事务；若字节先进流再中止，还会打断在途复制、让 leader plsn 跑到多数派前头（T1.9 实测） |
-| 分片打标表的 Citus 路由写（coordinator 经手的 INSERT/UPDATE/DELETE/COPY） | P1 禁——验收与使用一律 leader 直写 | 本分支 Citus 分布式写一律 2PC（PREPARE TRANSACTION，DTX 链路即建于其上）→ 撞上一条禁令，事务在 PREPARE 点中止（T1.9 实测两轮）；2PC × 打标的接线 = P4 正题（决议搬迁 + MX） |
-| 引用表运行期写入 | 建表后只读【需核实现状】 | 无分片写集 ⇒ 无协调者分片；Citus 原生 2PC 恢复已关（§9.2） |
+| 分片打标表的 Citus 路由写（coordinator 经手的 INSERT/UPDATE/DELETE/COPY） | **P1 禁；P4 之后解禁——★ 2026-09-09 回填**：MX 接线（§9.1）+ 决议搬迁（DTX-2PC）落地后，Citus 驱动的 2PC 写是**正路**，tx1/tx2/tx4 三套验收全部走这条路。本行原文只对 P1–P3 成立 | 本分支 Citus 分布式写一律 2PC（PREPARE TRANSACTION，DTX 链路即建于其上）→ 撞上一条禁令，事务在 PREPARE 点中止（T1.9 实测两轮）；2PC × 打标的接线 = P4 正题（决议搬迁 + MX） |
+| 引用表运行期写入 | 建表后只读——**★ 2026-09-09 复核：代码零守卫、测试零断言**（`shard_guard.c` 全文无引用表判据），本行目前只是**纸面约定**，拦不住 | 无分片写集 ⇒ 无协调者分片；Citus 原生 2PC 恢复已关（§9.2）。去向见 `P7_REMEDIATION_PLAN.md` T7.10（拦 / 接受，待裁） |
+| 分片表的**子事务写**（SAVEPOINT / plpgsql `EXCEPTION` 块内写打标表） | 禁（ERROR）——**★ 2026-09-09 补行** | §5.4 承诺的 per-shard 子 xid + parent 链**未实现**（`shard_xid.c:1213-1220` 直接拒写，`shard_clog.h:51` 的 `parent_xid` 恒 0）。此前 §10 无此行，而代码一直在拦 |
+| 打标后 `CREATE INDEX`；`LP_REDIRECT` | 禁 / 撞见即 ERROR——**★ 2026-09-09 补行** | 索引须在打标前建（T5.8 两阶段）；行指针重定向不产生，撞见即报错（`shard_vacuum.c:715-736`）。二者同属「解禁用户索引」专项，v1 不做 |
+| 分片 xid **回卷** | 未实现——**★ 2026-09-09 补行，降级为已知边界** | 分片 xid 是线性计数器，全仓普通 `<`/`>=` 比较、无模运算；靠 §7 阶段 2 的停发线（2^31 − 边距）让线性假设成立。**到线即停写**，不是回绕 |
+| 物理基线（供给副本 / 修复分叉）**上限 1 GB** | 超出显式 ERROR——**★ 2026-09-09 补行** | `fileset_inline_max_blocks = 131072`（`shard_fileset.c:158, 268-275`），无流式基线 ⇒ **大于 1 GB 的分片既不能供给副本、也不能修复分叉**。见 P7 计划 P7-R3 |
 
 ---
 

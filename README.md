@@ -1,5 +1,38 @@
 # pg_partdist
 
+> ## ★ 先读这里（2026-09-09 回填）
+>
+> **本文以下的正文是 `shardpg-2.0` 时代的文档：三节点、只讲"分区级 WAL 拆分"。
+> 它描述的是本项目最早的一层，早已不是全貌。** 当前分支的实际形态是：
+>
+> | | 现状 |
+> |---|---|
+> | **集群** | 1 coordinator + 8 worker（9 节点，端口 5432–5440），单机容器内 |
+> | **能力层** | 分区级 WAL（本文） → 物理回放 R1/L1 + DDL/冻结控制通道 D1/D2 → Raft 多分区组 + 自治切主 → DTX-2PC 决议进数据组 → **TX-TSO-MVCC**（TSO 全局时间戳 + 分片级 xid/clog + SI 可见性 + 分片 vacuum/GC） |
+> | **内核依赖** | **10 个补丁是硬依赖**，`pg-install/` 是"已打补丁并编译好"的整棵树，随仓库提交。改补丁后必须同步回仓库，见 `pg-partdist-src/patches/README.md` |
+> | **成熟度** | **P1–P6 六期已实施，但 P6 未结项**：21 条未闭合缺陷，其中 4 条是"已提交数据在切主/供给后不可见或丢失"级别。**不具备生产可用性** |
+>
+> ### 文档地图（按"想知道什么"找）
+>
+> | 想知道 | 看 |
+> |---|---|
+> | 事务/可见性/GC 的方案定稿 | `TX_TSO_MVCC_DESING.md`（§10 是第一期功能限制，**上生产前必读**） |
+> | 怎么做的、什么顺序、验收数字 | `TX_TSO_MVCC_DEV_PLAN.md`（§5 是风险登记簿） |
+> | 物理回放（follower 怎么追平、切主怎么交接） | `pg-partdist-src/docs/FOLLOWER_REPLAY_DESIGN.md` |
+> | 分布式提交（2PC 决议怎么进数据组） | `pg-partdist-src/docs/DTX_2PC_DESIGN.md` |
+> | Raft 模块的缺口与冻结范围 | `pg-raft-src/docs/raft_module_revision_plan.md` §0.2 |
+> | **现在有哪些缺陷、接下来怎么补** | **`pg-partdist-src/docs/P6_EXIT_AUDIT.md`（盘点）+ `P7_REMEDIATION_PLAN.md`（计划）** |
+> | 怎么把环境原样建起来 | `pg-raft-src/reproduce-env.sh`（`up` / `verify` / `test` / `destroy`）；本分支的场地说明见 `PG_TEST_ENV.md` |
+>
+> ### 门禁入口
+>
+> ```bash
+> # 31 套全量（最坏 9.5h，跑前先腾内存和磁盘）
+> CONTAINER=pg-test-container bash pg-partdist-src/tests/run_p6_exit.sh
+> # 单套件
+> CONTAINER=pg-test-container bash pg-partdist-src/tests/test_<name>.sh
+> ```
+
 PostgreSQL 16 + Citus 13.1.0 的分区级 WAL 拆分扩展。
 
 `pg_partdist` 通过 Hook 机制自动拦截 Citus 分布式表的 INSERT 操作，在每个 Worker 节点上生成**分区级 WAL 日志**（`pg_parwal/`），并由后台 Demux Worker 将记录拆分落盘到对应的分区段文件，整个过程对业务层完全透明。
