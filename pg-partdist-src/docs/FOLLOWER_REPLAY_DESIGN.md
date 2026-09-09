@@ -1114,11 +1114,29 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
 > `PartWALCtl->lock`,两把锁跨不到一起。实际需要的性质是"两件事都在对外服务
 > 之前完成",由 `OP_PARTITION_PRIMARY` apply 里的顺序(路由登记在后半段)保证。
 >
-> **★ 仍缺的一支(R-P6-16,未修)**:升主**不广播 `FILESET_UPDATE`**。新主写入
-> 带的是它自己的 relfilenumber,其余副本的 locmap 仍对着旧主文件号 ⇒
-> `replay_catchup` 报"未知 relfilelocator ... (fileset 漏登记)" ⇒ **该分片其余
-> 副本切主一次后全部失去再次当选资格**,直到从新主重新供给。修法与验收见
-> `P7_REMEDIATION_PLAN.md` T7.3。
+> **★★ 2026-09-09 T7.3/T7.4 补齐了交接的另外三件事**（原本只有角色 + 捕获）:
+>
+> ③ **文件号交接**(R-P6-16):`PartDistEmitFilesetHandover()` 广播一条带
+>    `PARTWAL_FSUPD_PRIMARY_HANDOVER` 的 `FILESET_UPDATE`。该标志位是新增的,
+>    与另外两位**互斥**且语义相反 —— `NEEDS_REBASELINE`/`FULL_BASELINE` 说
+>    "内容要重来",它说"**内容一个字节都没变,只换号**"。
+>    ★ follower 侧因此必须**跳过截断**:原路径的前提是"leader 文件号变了 ⇒
+>    本地内容作废,等 FPI 重建",而交接时号变是因为**换了主**,副本手上的文件
+>    是它自己回放出来的、与新主同源,且交接 CTRL 后面**没有 FPI**。照截就是
+>    把副本清空后等一批永远不会来的记录 —— 那不是修复,是更坏的缺陷。
+>    `base_part_lsn` 同理不动。
+>
+> ④ **打标身份**(R-P6-21):判定一张表是否分片打标只看本节点白名单/shmem 集合,
+>    而该集合只由 `partdist_set_shard_mvcc()` 或**重启扫目录**装载,副本从不设 ——
+>    于是新主若既没人工加白名单又没重启,**写入不打标、读走原生路径**。
+>    现按持久证据继承:`pg_shard_clog/<oid>` 存在 ⇔ 这个分片的流里带过分片 xid
+>    ⇔ 它是打标分片,于是补 `ShardMvccEnsureWatermarkFile()` + `ShardMvccSetAdd()`。
+>
+> **验收**:`tests/test_promote_handover_p7.sh` **35/0**（2026-09-09）——
+> 杀主 6s 内新主当选、`partition_map` 与 `pg_dist_placement` 跟随;新主流里出现
+> `PRIMARY_HANDOVER` 的 CTRL(plsn=9);**新主写入带分片 xid(xmin=4)**;
+> **另一副本回放新主的流成功(applied=12)** —— 修复前这一格恒报"未知
+> relfilelocator",正是批次 #10 的 p7 [3b] 只断言"收到"没断言"放得了"而漏掉的。
 > 验收 `test_handover_provision_p7.sh` 27/0,其中"切主前读被拦、切主后放行"
 > 这条**差分**证明放行确实是交接干的。
 >

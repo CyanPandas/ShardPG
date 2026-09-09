@@ -333,8 +333,30 @@ typedef struct PartWALCtrlFilesetUpdate
  */
 #define PARTWAL_FSUPD_FULL_BASELINE     UINT16_C(0x0002)
 
+/*
+ * T7.3（R-P6-16，2026-09-09）：**主权交接**的文件号重绑。
+ *
+ * 语义：分区换主了。新主的写入此后带的是**它自己的** relfilenumber，而其余副本
+ * 的 locmap 仍然对着旧主的号 —— 不重绑就报「未知 relfilelocator（fileset 漏
+ * 登记）」，该副本从此放不了新主的流，也就**失去再次当选的资格**，直到从新主
+ * 重新供给。这正是 R-P6-16。
+ *
+ * 与另外两位的**本质区别：内容一个字节都没变**。副本手上的文件是它自己回放出来
+ * 的、与新主同源；要换的只是"leader 侧文件号 → 本地文件号"这张映射。所以
+ * follower 收到这一位时：
+ *   · **绝不截断**任何本地文件（DDL/基线那两条路径都截，这里截了就是把副本
+ *     的数据清空后等一批永远不会来的 FPI）；
+ *   · 不推进 base_part_lsn（配对的起效游标没有变化）；
+ *   · 只按 (role, ord) 重建 locmap 的配对。
+ *
+ * 与 NEEDS_REBASELINE / FULL_BASELINE 三者互斥：那两位说的是"内容要重来"，
+ * 这一位说的是"内容不动、只换号"。
+ */
+#define PARTWAL_FSUPD_PRIMARY_HANDOVER  UINT16_C(0x0004)
+
 #define PARTWAL_FSUPD_KNOWN_FLAGS \
-    (PARTWAL_FSUPD_NEEDS_REBASELINE | PARTWAL_FSUPD_FULL_BASELINE)
+    (PARTWAL_FSUPD_NEEDS_REBASELINE | PARTWAL_FSUPD_FULL_BASELINE | \
+     PARTWAL_FSUPD_PRIMARY_HANDOVER)
 
 #define PartWALCtrlFilesetUpdateSize(n) \
     (sizeof(PartWALCtrlFilesetUpdate) + (size_t) (n) * sizeof(ShardFileSetRel))

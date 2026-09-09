@@ -138,6 +138,9 @@ extern TransactionId ShardVacuumComputeTarget(Oid shard, TransactionId from,
  */
 extern int	ShardClogTruncate(Oid shard, TransactionId trunc_before);
 
+/* T7.4（R-P6-21）：本节点是否有该分片的 clog 目录 = 它是不是打标分片的持久证据 */
+extern bool ShardClogDirExists(Oid shard);
+
 extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);
 extern void ShardClogAtCommit(void);	/* 执行挂起的删除 */

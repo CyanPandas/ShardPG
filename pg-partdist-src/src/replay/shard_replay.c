@@ -1747,6 +1747,19 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                         ctx->shard_oid,
                         (unsigned long long) hdr->partition_lsn)));
 
+    /*
+     * T7.3（R-P6-16）：主权交接位与另外两位互斥 —— 那两位说"内容要重来"，
+     * 这一位说"内容不动、只换号"。同时置位是协议错误，宁可停也不能猜。
+     */
+    if ((upd->flags & PARTWAL_FSUPD_PRIMARY_HANDOVER) != 0 &&
+        (upd->flags & (PARTWAL_FSUPD_NEEDS_REBASELINE |
+                       PARTWAL_FSUPD_FULL_BASELINE)) != 0)
+        ereport(ERROR,
+                (errmsg("shard replay: shard %u @plsn %llu FILESET_UPDATE "
+                        "的 PRIMARY_HANDOVER 与重做基线类标志互斥",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn)));
+
     if ((upd->flags & PARTWAL_FSUPD_NEEDS_REBASELINE) != 0)
         return ReplayFenceStruct(ctx,
                                  "leader 的 fileset 变更超过 "
@@ -1781,6 +1794,7 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      * 重启会从这条 CTRL 重来：再截一次、再灌一遍，幂等且正确；若还停在旧
      * base，就要多走一大段无谓的重放。
      */
+    /* T7.3：主权交接不改起效游标 —— 配对换的是文件号，不是"从哪起有效" */
     lm.base_part_lsn =
         ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0)
             ? hdr->partition_lsn
@@ -1814,8 +1828,18 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      */
     {
         bool full_baseline = ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0);
+        bool handover     = ((upd->flags & PARTWAL_FSUPD_PRIMARY_HANDOVER) != 0);
 
-        for (i = 0; i < upd->nrels; i++)
+        /*
+         * ★ T7.3（R-P6-16）：主权交接**一个字节都不截**。
+         *
+         * 下面这段截断的前提是"leader 文件号变了 ⇒ 本地内容作废，等 FPI 重建"。
+         * 交接时前提不成立：号变了是因为**换了主**，副本手上的文件是它自己
+         * 回放出来的、与新主同源，内容完全有效；而且交接的 CTRL 后面**没有
+         * FPI**。照截就是把副本清空后等一批永远不会来的记录 —— 那不是修复，
+         * 是把 R-P6-16 换成一个更坏的缺陷。
+         */
+        for (i = 0; !handover && i < upd->nrels; i++)
         {
             bool found;
 

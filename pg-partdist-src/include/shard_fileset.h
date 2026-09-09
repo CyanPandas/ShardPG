@@ -171,4 +171,11 @@ extern bool  ShardPromotedMarkRead(Oid shard_oid);
 /* FRD §11 步骤 5：升主的角色切换（角色 + 捕获登记） */
 extern void  PartDistRoutePromote(Oid shard_oid);
 
+/*
+ * T7.3（R-P6-16）：升主后把本节点的 fileset 广播出去，让其余副本把 locmap
+ * 重绑到新主的文件号上（`PARTWAL_FSUPD_PRIMARY_HANDOVER`：只重绑、不截断、
+ * 不发 FPI）。由 PartDistRoutePromote 调用；失败只 WARNING。
+ */
+extern void  PartDistEmitFilesetHandover(Oid shard_oid);
+
 #endif /* SHARD_FILESET_H */

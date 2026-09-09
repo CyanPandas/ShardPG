@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "shard_clog.h"		/* T7.4：打标身份的持久证据 */
 #include "shard_fileset.h"
 #include "partition_wal.h"
 #include "partwal_sync.h"
@@ -234,6 +235,72 @@ FileSetLogRelationPages(Oid relid, bool do_log)
 
     relation_close(rel, AccessShareLock);
     return total;
+}
+
+/*
+ * EmitFilesetHandover —— T7.3（R-P6-16）：升主时把**本节点的 fileset** 广播出去，
+ * 让其余副本把 locmap 重绑到新主的文件号上。
+ *
+ * 与 EmitFilesetUpdate 的三处差别，每一处都是必须的：
+ *   ① **不发任何 FPI**：内容没变，副本手上的文件是它自己回放出来的、与新主同源；
+ *   ② 置 `PARTWAL_FSUPD_PRIMARY_HANDOVER`，让 follower 走"只重绑、不截断"分支；
+ *   ③ 不比较新旧 fileset —— 交接时"变了的成员"就是全部成员，比较没有意义。
+ *
+ * 仍然要做的一件事与 DDL 路径相同：**先把本地 fileset 登记进反向哈希**
+ * （`RegisterShardFileSet`），否则新主自己后续的写入进不了流。
+ * `PartDistRoutePromote` 已经做过一次，这里靠它幂等。
+ *
+ * 失败不上抛：交接的其余部分（角色、捕获、打标身份）已经完成，广播失败只是让
+ * 其余副本晚一点才能跟上（运维动作 = 从新主重新供给）。把 ERROR 抛出去会让
+ * 整个 OP_PARTITION_PRIMARY 的 apply 失败，那才是真的坏。
+ */
+void
+PartDistEmitFilesetHandover(Oid shard_oid)
+{
+    ShardFileSet             fs;
+    PartWALCtrlFilesetUpdate *payload;
+    uint32                   payload_len;
+
+    if (!OidIsValid(shard_oid))
+        return;
+    if (BuildShardFileSet(shard_oid, &fs) < 1)
+        return;
+
+    RegisterShardFileSet(&fs);
+
+    payload_len = (uint32) PartWALCtrlFilesetUpdateSize(fs.nrels);
+    payload = palloc0(payload_len);
+    payload->nrels    = (uint32) fs.nrels;
+    payload->flags    = PARTWAL_FSUPD_PRIMARY_HANDOVER;
+    payload->reserved = 0;
+    memcpy(PartWALCtrlFilesetRels(payload), fs.rels,
+           (size_t) fs.nrels * sizeof(ShardFileSetRel));
+
+    PG_TRY();
+    {
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FILESET_UPDATE,
+                          (const char *) payload, payload_len);
+        elog(LOG, "pg_partdist: 分片 %u 升主后广播 fileset 交接（%d 个成员）",
+             shard_oid, fs.nrels);
+    }
+    PG_CATCH();
+    {
+        ErrorData *ed;
+
+        MemoryContextSwitchTo(TopMemoryContext);
+        ed = CopyErrorData();
+        FlushErrorState();
+        ereport(WARNING,
+                (errmsg("pg_partdist: 分片 %u 的 fileset 交接广播失败：%s",
+                        shard_oid, ed->message),
+                 errdetail("其余副本的 locmap 仍指向旧主的文件号，"
+                           "它们放不了新主的流，也就暂时失去当选资格。"),
+                 errhint("运维动作：从新主重新供给这些副本。")));
+        FreeErrorData(ed);
+    }
+    PG_END_TRY();
+
+    pfree(payload);
 }
 
 static void
@@ -1848,6 +1915,46 @@ PartDistRoutePromote(Oid shard_oid)
     /* ② 捕获 */
     if (BuildShardFileSet(shard_oid, &fs) > 0)
         RegisterShardFileSet(&fs);
+
+    /*
+     * ③ **打标身份**（T7.4 / R-P6-21，2026-09-09 补）。
+     *
+     * 缺陷现场：判定一张表是否分片打标只看本节点的白名单 GUC 或 shmem 集合
+     * （`shard_oid_is_mvcc`），而该集合只由 `partdist_set_shard_mvcc()` 或
+     * **重启时扫 `pg_shard_xid/` 目录**装载。副本从来不设白名单，
+     * `provision_shard_replica` / 本函数也都不加 —— 于是**升主后的新主若既没有
+     * 人工加白名单、又没重启，写入就不打标、读走原生路径**。
+     * `handover_provision_p7` [3b] 与 `promote_catchup_tx3` [4] 都是在这个状态下
+     * 通过的：通过的原因是错的。演示文档 6c 因此要求"给组内全部成员配白名单"。
+     *
+     * 判据用**持久证据**而不是猜：`pg_shard_clog/<oid>` 目录只由回放路径在收到
+     * 带分片 xid 的 MARKER 时创建，所以它存在 ⇔ 这个分片的流里带过分片 xid
+     * ⇔ 它是打标分片。补两件事，与 `partdist_set_shard_mvcc()` 的 ②③ 步同源：
+     *   · `ShardMvccEnsureWatermarkFile()` —— 预创建水位文件，它同时**就是**
+     *     启动装载的登记表，于是这次交接跨重启也不会丢；
+     *   · `ShardMvccSetAdd()` —— 本次进程内立即生效，不必等重启。
+     *
+     * 不做的事：不碰 `partition_map.shard_mvcc` 真相列。那是控制面的事，
+     * 由 group0 复制；这里只负责"本节点认得出自己手上这张表是打标表"。
+     */
+    if (ShardClogDirExists(shard_oid))
+    {
+        ShardMvccEnsureWatermarkFile(shard_oid);
+        ShardMvccSetAdd(shard_oid);
+        elog(LOG, "pg_partdist: 分片 %u 升主时继承打标身份（pg_shard_clog 存在）",
+             shard_oid);
+    }
+
+    /*
+     * ④ **文件号交接**（T7.3 / R-P6-16，2026-09-09 补）。
+     *
+     * 新主此后写进流里的记录带的是它自己的 relfilenumber，而其余副本的 locmap
+     * 还对着旧主的号 —— 不广播就报「未知 relfilelocator ... (fileset 漏登记)」，
+     * 那些副本从此放不了新主的流、也失去再次当选资格（R-P4-15 拦升主的那一格），
+     * 直到有人从新主重新供给它们。批次 #10 的 p7 [3b] 只断言了副本**收到**新主的
+     * 记录，没断言**放得了**，所以这条缺陷当时没被测出来。
+     */
+    PartDistEmitFilesetHandover(shard_oid);
 }
 
 /*

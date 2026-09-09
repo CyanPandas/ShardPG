@@ -41,6 +41,24 @@ ShardClogDirPath(char *path, size_t pathlen, Oid shard)
 	snprintf(path, pathlen, "%s/%s/%u", DataDir, SHARD_CLOG_DIR, shard);
 }
 
+/*
+ * ShardClogDirExists —— 本节点有没有这个分片的分片 clog 目录。
+ *
+ * T7.4（R-P6-21）用它当"这张表是分片打标表"的**持久证据**：副本侧的
+ * `pg_shard_clog/<oid>` 只由回放路径在收到带分片 xid 的 MARKER 时创建
+ * （`shard_replay.c` 的 `ShardClogSetVerdict`/`SetPrepared` 分支），
+ * 所以目录存在 ⇔ 这个分片的流里带过分片 xid ⇔ 它是打标分片。
+ */
+bool
+ShardClogDirExists(Oid shard)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	ShardClogDirPath(path, sizeof(path), shard);
+	return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+}
+
 /* EEXIST 是常态 —— 多后端并发建同一个目录 */
 static void
 ShardClogEnsureDir(Oid shard)
