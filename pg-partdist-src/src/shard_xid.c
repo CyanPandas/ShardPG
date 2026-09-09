@@ -1518,6 +1518,44 @@ ShardMvccSetAdd(Oid relid)
 }
 
 /*
+ * ShardXidSlotRelease —— T7.7（R-P6-4）：DROP 提交时把分配器槽位（连同影子）
+ * 还回去。
+ *
+ * 缺陷：`SHARD_XID_MAX_SLOTS = 64`/节点是**定长 shmem**，而此前全仓**没有任何
+ * 释放路径**（grep 零命中）——建删 64 张打标表之后，该节点再也建不出第 65 张，
+ * 报「分片 xid 槽位用尽」。门禁一直靠"移走水位文件 + 重启"绕过去
+ * （`run_p6_exit.sh` 直接 `mv`），也就是说这条缺陷在验收里是被**隐藏**的。
+ *
+ * 判据与 `ShardMvccSetRemove()` 完全同源：都挂在 DROP 的提交时点
+ * （`ShardClogAtCommit`），回滚不执行——失败方向是"槽位没还"，只是浪费一格，
+ * 语义安全；反向（表还在、槽位被抢走）才会让发号从头开始，那是数据损坏。
+ *
+ * 影子（`shadow[]`）一并清：它记的是"本次启动窗口里见过的最大分片 xid"，
+ * 表都没了，留着只会在 OID 复用时把新表的起点顶到一个莫名其妙的高位。
+ */
+void
+ShardXidSlotRelease(Oid relid)
+{
+	int			i;
+
+	if (ShardXidCtl == NULL || !OidIsValid(relid))
+		return;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		if (ShardXidCtl->slots[i].shard_relid == relid)
+		{
+			memset(&ShardXidCtl->slots[i], 0, sizeof(ShardXidSlot));
+			ShardXidCtl->slots[i].shard_relid = InvalidOid;
+		}
+		if (ShardXidCtl->shadow[i].shard_relid == relid)
+			memset(&ShardXidCtl->shadow[i], 0, sizeof(ShardXidShadow));
+	}
+	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
  * ShardMvccSetRemove —— 把 OID 从共享内存的打标登记集合里摘掉（R-P6-9）。
  *
  * 集合本身是**故意只进不出**的（`partdist_set_shard_mvcc(..., false)` 明确

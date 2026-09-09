@@ -290,6 +290,58 @@ typedef struct TxnMarkerPayload
 #define PARTWAL_CTRL_FREEZE_UPDATE   UINT8_C(0x02)
 
 /*
+ * T7.2（R-P6-17，2026-09-09）：**分片 clog 随物理基线一起搬**。
+ *
+ * 缺陷：`shard_baseline_emit` 只灌页面 + 抬发号水位，不搬 `pg_shard_clog/<oid>`；
+ * 而基线游标之前的 MARKER 不再回放 ⇒ 在**已有数据之后**才供给的副本，对基线
+ * 之前提交的每一个分片 xid 都**没有判决** ⇒ 那些行读成 RUNNING（不可见），
+ * 该副本一旦升主，`shard_claim_on_promote` 还会把它们改判 ABORTED ⇒ **丢行**。
+ * 此前只能靠"先供给、后写数据"的运维纪律绕过去。
+ *
+ * 载荷：一段**连续**的分片 clog 槽（每槽 32 字节，与 ShardClogSlot 逐字节同构）。
+ * 基线发射方按块切（见 SHARD_CLOG_BASELINE_CHUNK），follower 收到就原样写进
+ * 自己的 `pg_shard_clog/<本地 oid>` —— 键是分片 xid，与 oid 无关，所以不需要
+ * 任何翻译。幂等：同一块重放两次写的是同样的字节。
+ *
+ * 顺序：必须排在 FULL_BASELINE 的 CTRL **之后**（follower 先换表再落账），
+ * 与那批 FPI 谁先谁后都不影响正确性（clog 与页面互不引用）。
+ */
+#define PARTWAL_CTRL_SHARD_CLOG      UINT8_C(0x03)
+
+/*
+ * T7.8（P7-D1，2026-09-09）：**leader DROP 了这个分片**。
+ *
+ * 缺陷：leader 侧 DROP TABLE 之后，副本一侧**完全静默** —— 壳表、回放槽位、
+ * `pg_parwal/<oid>` 目录全都留着，永不回收。回收判据是"OID 不在本地 pg_class"，
+ * 而副本的壳表恰恰是本地真表，判据天然不成立（`shard_fileset.c` 原注释：
+ * "副本侧的处置需要另一个 opcode，属后续工作；这里保持沉默"）。
+ *
+ * 语义：收到即"本分片到此为止"。follower 的处置是**停流 + 摘槽位**，
+ * 但**不删壳表也不删目录** —— 删表是 DDL，副本上没人授权它做；而且运维可能
+ * 正想留着那份数据做取证。摘掉槽位与 armed 之后，那张壳表就是一张普通本地表，
+ * `DROP TABLE` 由运维决定什么时候执行（回收动作因此是**可审计**的）。
+ *
+ * 载荷为空（分片 oid 已在记录头里）。幂等：重复应用就是重复停流。
+ */
+#define PARTWAL_CTRL_SHARD_DROP      UINT8_C(0x04)
+
+typedef struct PartWALCtrlShardClog
+{
+    uint32      first_sxid;     /* 本块第一个分片 xid                        */
+    uint32      nslots;         /* 本块槽数                                  */
+    /* 其后紧跟 nslots 个 32 字节槽（与 ShardClogSlot 同构） */
+} PartWALCtrlShardClog;
+
+#define PARTWAL_SHARD_CLOG_SLOT_BYTES  32
+
+#define PartWALCtrlShardClogSize(n) \
+    (sizeof(PartWALCtrlShardClog) + \
+     (size_t) (n) * PARTWAL_SHARD_CLOG_SLOT_BYTES)
+
+#define PartWALCtrlShardClogSlots(p) \
+    ((char *) (p) + sizeof(PartWALCtrlShardClog))
+
+/*
  * FILESET_UPDATE 载荷：leader 侧 fileset 变更后的**全量**新描述。
  *
  * 为什么是全量而不是增量：follower 侧的应用必须幂等（崩溃后从游标重放会

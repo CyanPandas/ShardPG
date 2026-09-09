@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include "shard_clog.h"
+#include "partition_wal_header.h"	/* T7.2：基线 clog CTRL 载荷 */
+#include "partwal_sync.h"			/* T7.2：PartWALAppendCtrl */
 #include "shard_fileset.h"	/* T5.4b-2：水位 CTRL 发射 */
 #include "shard_xid.h"
 
@@ -215,6 +217,103 @@ ShardClogSetPrepared(Oid shard, TransactionId sxid, int64 start_ts, int64 gxid)
 	slot.start_ts = (uint64) start_ts;
 	slot.global_xid = (uint64) gxid;
 	ShardClogWriteSlot(shard, sxid, &slot, true);
+}
+
+/*
+ * ShardClogEmitBaseline —— T7.2（R-P6-17）：把本分片 clog 里 [FirstNormal, upto)
+ * 的槽切块塞进分区流，让副本拿到基线**之前**那些事务的判决。
+ *
+ * 为什么必须搬：基线只灌页面 + 抬发号水位，而基线游标之前的 MARKER 不再回放。
+ * 于是"先有数据、后供给"的副本对基线前提交的每个分片 xid 都没有判决，那些行
+ * 读成 RUNNING（不可见）；它一旦升主，`shard_claim_on_promote` 还会把这些
+ * RUNNING 改判 ABORTED —— **已经提交的行就此消失**。此前只能靠"先供给、后写
+ * 数据"的运维纪律绕过去，而那条纪律没有任何东西强制。
+ *
+ * 只搬**有内容**的槽块：全零块（= 全是 RUNNING 空洞）不发，省流量也省回放。
+ * 幂等：同一块重放两次写同样的字节。
+ *
+ * 返回发出的块数。
+ */
+int
+ShardClogEmitBaseline(Oid shard, TransactionId upto)
+{
+	TransactionId	x;
+	int				nblocks = 0;
+	char		   *buf;
+	uint32			buflen;
+	PartWALCtrlShardClog *hdr;
+	char		   *slots;
+
+	if (!TransactionIdIsNormal(upto))
+		return 0;
+
+	buflen = (uint32) PartWALCtrlShardClogSize(SHARD_CLOG_BASELINE_CHUNK);
+	buf = palloc0(buflen);
+	hdr = (PartWALCtrlShardClog *) buf;
+	slots = PartWALCtrlShardClogSlots(buf);
+
+	for (x = FirstNormalTransactionId; x < upto; x += SHARD_CLOG_BASELINE_CHUNK)
+	{
+		uint32	n = (uint32) Min((uint64) SHARD_CLOG_BASELINE_CHUNK,
+								 (uint64) (upto - x));
+		uint32	i;
+		bool	any = false;
+
+		memset(slots, 0, (size_t) SHARD_CLOG_BASELINE_CHUNK * sizeof(ShardClogSlot));
+		for (i = 0; i < n; i++)
+		{
+			ShardClogSlot slot;
+
+			if (ShardClogReadSlot(shard, x + i, &slot) && slot.status != 0)
+			{
+				memcpy(slots + (size_t) i * sizeof(ShardClogSlot),
+					   &slot, sizeof(ShardClogSlot));
+				any = true;
+			}
+		}
+		if (!any)
+			continue;			/* 整块都是空洞：不值得占一条记录 */
+
+		hdr->first_sxid = (uint32) x;
+		hdr->nslots     = n;
+		PartWALAppendCtrl(shard, PARTWAL_CTRL_SHARD_CLOG, buf,
+						  (uint32) PartWALCtrlShardClogSize(n));
+		nblocks++;
+	}
+
+	pfree(buf);
+	if (nblocks > 0)
+		ereport(LOG,
+				(errmsg("pg_partdist: shard %u 的分片 clog 随基线发射 %d 块"
+						"（上界 sxid=%u）", shard, nblocks, upto)));
+	return nblocks;
+}
+
+/*
+ * ShardClogApplyBaselineChunk —— follower 侧：把一块槽原样写进本地分片 clog。
+ * 键是分片 xid，与 oid 无关，所以不需要任何翻译。幂等。
+ */
+void
+ShardClogApplyBaselineChunk(Oid shard, TransactionId first_sxid,
+							const char *slots, uint32 nslots)
+{
+	uint32		i;
+
+	for (i = 0; i < nslots; i++)
+	{
+		ShardClogSlot slot;
+
+		memcpy(&slot, slots + (size_t) i * sizeof(ShardClogSlot), sizeof(slot));
+		if (slot.status == 0)
+			continue;			/* 空洞照旧是空洞，不写 */
+		/*
+		 * 最后一个槽 durable=true：段内前面的槽在同一次 fsync 里一起落盘
+		 * （与 ShardClogClaimRange 的"段收尾一次 fsync"同一条纪律）。
+		 * 判决字节必须持久 —— 丢了就是槽回到 RUNNING，认领会把它改判 ABORTED。
+		 */
+		ShardClogWriteSlot(shard, first_sxid + i, &slot,
+						   (i + 1 == nslots));
+	}
 }
 
 bool
@@ -440,6 +539,14 @@ ShardClogAtCommit(void)
 		 * （122→244→366），症状伪装成"回放写多了"。
 		 */
 		ShardMvccSetRemove(pending_drops[i]);
+
+		/*
+		 * T7.7（R-P6-4）：分配器槽位也要还。`SHARD_XID_MAX_SLOTS = 64` 是定长
+		 * shmem，此前全仓没有任何释放路径 —— 建删 64 张打标表后该节点再也建不出
+		 * 第 65 张。门禁一直靠"移走水位文件 + 重启"绕过去，等于把这条缺陷藏在
+		 * 净场脚本里。判据与上面那句同源：都在 DROP 的提交时点，回滚不执行。
+		 */
+		ShardXidSlotRelease(pending_drops[i]);
 	}
 	pending_drops_n = 0;
 }

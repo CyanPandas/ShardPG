@@ -1694,6 +1694,53 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
     if (hdr->info == PARTWAL_CTRL_FREEZE_UPDATE)
         return ApplyFreezeRecord(ctx, hdr, body);
 
+    /*
+     * ★ T7.2（R-P6-17）：分片 clog 块。键是分片 xid，与 oid 无关，原样落进
+     * 本地 `pg_shard_clog/<ctx->shard_oid>` 即可，不需要任何翻译。幂等。
+     */
+    if (hdr->info == PARTWAL_CTRL_SHARD_CLOG)
+    {
+        const PartWALCtrlShardClog *cc = (const PartWALCtrlShardClog *) body;
+
+        if (hdr->data_len < sizeof(PartWALCtrlShardClog) ||
+            hdr->data_len != (uint32) PartWALCtrlShardClogSize(cc->nslots))
+            ereport(ERROR,
+                    (errmsg("shard replay: shard %u @plsn %llu SHARD_CLOG 载荷"
+                            "长度不符（data_len=%u nslots=%u）",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            hdr->data_len, cc->nslots)));
+
+        ShardClogApplyBaselineChunk(ctx->shard_oid,
+                                    (TransactionId) cc->first_sxid,
+                                    PartWALCtrlShardClogSlots(cc),
+                                    cc->nslots);
+        REPLAY_TRACE("TRACE ctrl: shard clog 落账 first=%u n=%u",
+                     cc->first_sxid, cc->nslots);
+        return true;            /* 落账完成，游标照常推进 */
+    }
+
+    /*
+     * ★ T7.8（P7-D1）：leader 把这个分片 DROP 了。
+     *
+     * 处置是**停流 + 摘槽位**，不删壳表也不删目录：删表是 DDL，副本上没人授权
+     * 它做；而且运维可能正想留着那份数据做取证。摘掉 armed/槽位之后，那张壳表
+     * 就是一张普通本地表，什么时候 `DROP TABLE` 由运维决定 —— 回收动作因此是
+     * **可审计**的，而不是回放线程背着人删数据。
+     *
+     * 幂等：重复应用就是重复停流。
+     */
+    if (hdr->info == PARTWAL_CTRL_SHARD_DROP)
+    {
+        ereport(LOG,
+                (errmsg("pg_partdist replay: shard %u 收到 leader 的 DROP 通知，"
+                        "停止回放并摘除槽位", ctx->shard_oid),
+                 errdetail("本地壳表与 pg_parwal 目录保留，等待运维回收 —— "
+                           "回放侧不代替 DDL 做删除。")));
+        ShardReplaySetArmed(ctx->shard_oid, false);
+        return true;
+    }
+
     if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu 未知 CTRL opcode "
@@ -2234,9 +2281,14 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
 {
     ParwalIndex idx;
     int         pos = 0;
-    char       *body = NULL;
+    /*
+     * ★ T7.6：跨 PG_TRY/PG_FINALLY 且在 TRY 里被修改、在 TRY 外被读的局部量
+     * 必须 volatile —— 否则编译器可能把它留在寄存器里，longjmp 回来读到的是
+     * 陈旧值（这类 bug 只在开优化的构建上出现，最难查的一类）。
+     */
+    char       *volatile body = NULL;
     uint32      body_cap = 0;
-    int         cur_fd = -1;
+    volatile int cur_fd = -1;
     int         cur_file = -1;
     char        dirpath[MAXPGPATH];
 
@@ -2262,6 +2314,25 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
 
     REPLAY_TRACE("TRACE Run: 索引 %d 条 (files=%d)", idx.nents, idx.nfiles);
 
+    /*
+     * ★ T7.6（R-P6-19）：回放主循环必须包在 PG_FINALLY 里，否则 ERROR 会带走
+     * 打开的段文件描述符。
+     *
+     * 为什么"事务结束会自动回收"这条兜底在这里**不成立**：调用方
+     * （`replay_worker.c` 的追平循环）用 `PG_TRY/PG_CATCH` **接住 ERROR 并在
+     * 同一个事务里继续**（"追平失败不能拖垮 worker"，见那里的注释），
+     * 于是 `AtEOXact_Files()` 永远轮不到执行。每失败一次漏一个 fd，
+     * 攒到 `max_safe_fds` 就报
+     *     exceeded maxAllocatedDescs (328) while trying to open directory
+     *     ".../pg_parwal/<oid>"
+     * 此后该节点**所有**回放都失败，直到 worker 重启 —— 而这条错误看上去
+     * 像是"打开目录失败"，与真正的泄漏点（读段文件）隔着几百次调用。
+     *
+     * 用 PG_FINALLY 而不是在 PG_CATCH 里补一句：这里没有要吞掉的错误，
+     * 只是要保证收尾。
+     */
+    PG_TRY();
+    {
     while (ctx->applied_part_lsn < bound)
     {
         uint64          expected = ctx->applied_part_lsn + 1;
@@ -2398,8 +2469,15 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
             ShardReplayDoCheckpoint(ctx);
     }
 
-    if (cur_fd >= 0)
-        CloseTransientFile(cur_fd);
+    }
+    PG_FINALLY();
+    {
+        if (cur_fd >= 0)
+            CloseTransientFile(cur_fd);
+        cur_fd = -1;
+    }
+    PG_END_TRY();
+
     if (body != NULL)
         pfree(body);
     pfree(idx.ents);

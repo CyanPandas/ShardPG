@@ -474,6 +474,21 @@ ShardBaselineEmit(Oid shard_oid)
     for (i = 0; i < nrels; i++)
         (void) FileSetLogRelationPages(relids[i], true);
 
+    /*
+     * ★ T7.2（R-P6-17）：页面之外，**分片 clog 也要搬**。
+     *
+     * 只灌页面的后果很具体：基线游标之前的 MARKER 不再回放，于是"先有数据、
+     * 后供给"的副本对基线前提交的每个分片 xid 都没有判决 —— 那些行读成 RUNNING
+     * （不可见）；它一旦升主，`shard_claim_on_promote` 还会把这些 RUNNING 改判
+     * ABORTED，**已经提交的行就此消失**。此前只能靠"先供给、后写数据"的运维
+     * 纪律绕过去，而那条纪律没有任何东西强制。
+     *
+     * 上界取本分片**下一个待发的号**：小于它的号才可能已经落过账。
+     * 非打标分片（没有 clog 目录）返回 0 块，行为与从前逐字一致。
+     */
+    if (ShardClogDirExists(shard_oid))
+        (void) ShardClogEmitBaseline(shard_oid, ShardXidNextToIssue(shard_oid));
+
     ereport(LOG,
             (errmsg("pg_partdist: shard %u 物理基线已发射（%d 个成员，%llu 块，"
                     "base_part_lsn=%llu）",
@@ -994,11 +1009,42 @@ ShardFilesetMaybeEmitUpdates(void)
             continue;
 
         /*
-         * 表被 DROP 掉了。副本侧的处置（停流 / 删副本）需要另一个 opcode，
-         * 属后续工作；这里保持沉默而不是发一条半吊子的 FILESET_UPDATE。
+         * ★ T7.8（P7-D1，2026-09-09）：表被 DROP 掉了 —— 发 `SHARD_DROP`。
+         *
+         * 此处**原本是沉默的**（原注释："副本侧的处置需要另一个 opcode，属
+         * 后续工作"）。沉默的代价：副本的壳表、回放槽位、`pg_parwal/<oid>`
+         * 目录永不回收；而回收判据是"OID 不在本地 pg_class"，副本的壳表恰恰
+         * 是本地真表，这条判据对副本天然不成立。
+         *
+         * 发射失败不上抛：DROP 本身是本地 DDL，已经在提交路上，不能因为
+         * 通知不到副本就把它带崩。副本收不到只是回退到从前的行为（残留）。
          */
         if (BuildShardFileSetEx(parts[p], &new_fs, new_relids) < 1)
+        {
+            PG_TRY();
+            {
+                PartWALAppendCtrl(parts[p], PARTWAL_CTRL_SHARD_DROP, NULL, 0);
+                PartWALNoteTouchedPartition(parts[p]);
+                elog(LOG, "pg_partdist: 分片 %u 已 DROP，已通知副本停流",
+                     parts[p]);
+            }
+            PG_CATCH();
+            {
+                ErrorData *ed;
+
+                MemoryContextSwitchTo(TopMemoryContext);
+                ed = CopyErrorData();
+                FlushErrorState();
+                ereport(WARNING,
+                        (errmsg("pg_partdist: 分片 %u 的 DROP 通知未能发出：%s",
+                                parts[p], ed->message),
+                         errdetail("副本侧的壳表/槽位/目录将保持残留，"
+                                   "需要运维手工回收。")));
+                FreeErrorData(ed);
+            }
+            PG_END_TRY();
             continue;
+        }
 
         if (FileSetEquals(&old_fs, &new_fs))
             continue;

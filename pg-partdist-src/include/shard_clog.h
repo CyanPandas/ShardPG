@@ -141,6 +141,17 @@ extern int	ShardClogTruncate(Oid shard, TransactionId trunc_before);
 /* T7.4（R-P6-21）：本节点是否有该分片的 clog 目录 = 它是不是打标分片的持久证据 */
 extern bool ShardClogDirExists(Oid shard);
 
+/*
+ * T7.2（R-P6-17）：分片 clog 随物理基线一起搬。
+ * 发射方按 SHARD_CLOG_BASELINE_CHUNK 个槽切块，只发有内容的块；
+ * follower 收到 PARTWAL_CTRL_SHARD_CLOG 原样落盘（键是分片 xid，与 oid 无关）。
+ */
+#define SHARD_CLOG_BASELINE_CHUNK	256		/* 256 × 32B = 8KB/块 */
+
+extern int	ShardClogEmitBaseline(Oid shard, TransactionId upto);
+extern void ShardClogApplyBaselineChunk(Oid shard, TransactionId first_sxid,
+										const char *slots, uint32 nslots);
+
 extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);
 extern void ShardClogAtCommit(void);	/* 执行挂起的删除 */

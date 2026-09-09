@@ -72,6 +72,9 @@ extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);
 extern void ShardMvccSetAdd(Oid relid);
 /* R-P6-9：DROP 提交时把 OID 摘掉，否则 OID 复用会误伤无关表 */
 extern void ShardMvccSetRemove(Oid relid);
+
+/* T7.7（R-P6-4）：DROP 提交时归还分配器槽位与影子。与 ShardMvccSetRemove 同源。 */
+extern void ShardXidSlotRelease(Oid relid);
 extern void ShardMvccEnsureWatermarkFile(Oid relid);
 
 /* P1 数据保护拦截：VACUUM/ANALYZE/CLUSTER 点名白名单表一律 ERROR
