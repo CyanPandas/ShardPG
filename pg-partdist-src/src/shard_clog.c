@@ -258,6 +258,27 @@ ShardClogEmitBaseline(Oid shard, TransactionId upto)
 								 (uint64) (upto - x));
 		uint32	i;
 		bool	any = false;
+		int		probe;
+
+		/*
+		 * ★ 整段跳过：一段是 100 万个 xid，段文件不存在就等于这 100 万个号
+		 * 全是空洞（= RUNNING = 无判决），一个都不用读、一块都不用发。
+		 * 没有这一步的话，扫描代价随**分片 xid 空间**线性增长而不是随
+		 * **实际判决数**增长 —— 本环境实测：反复重启把水位推到 16389 之后，
+		 * 一次基线要扫 1.6 万个号、发 65 块，而真正有判决的只有个位数。
+		 */
+		probe = ShardClogOpenSegFile(shard, x / SHARD_CLOG_XIDS_PER_SEGMENT,
+									 false);
+		if (probe < 0)
+		{
+			uint32 seg_end = ((x / SHARD_CLOG_XIDS_PER_SEGMENT) + 1)
+							 * SHARD_CLOG_XIDS_PER_SEGMENT;
+
+			/* 减去循环自增的一步，跳到下一段的段首 */
+			x = seg_end - SHARD_CLOG_BASELINE_CHUNK;
+			continue;
+		}
+		CloseTransientFile(probe);
 
 		memset(slots, 0, (size_t) SHARD_CLOG_BASELINE_CHUNK * sizeof(ShardClogSlot));
 		for (i = 0; i < n; i++)

@@ -364,6 +364,28 @@ partdist_process_utility(PlannedStmt *pstmt,
     if (pstmt->utilityStmt != NULL &&
         UtilityMayChangeRelfilenode(pstmt->utilityStmt))
         ShardFilesetNoteMaybeChanged();
+
+    /*
+     * ★ T7.8（P7-D1）：`COMMIT PREPARED` **执行完之后**补一遍 DROP 通知。
+     *
+     * 为什么非要单挂一处（2026-09-10 实测定位）：fileset 发射器只挂在
+     * `XACT_EVENT_PRE_COMMIT` 上，而 **Citus 的 DDL 在 worker 上一律走 2PC**
+     * —— 那笔事务触发的是 `XACT_EVENT_PRE_PREPARE`，发射器一次都不会跑。
+     * 于是"DROP 掉一张分布表"的通知漏发；日志里只见到给**残留旧 fileset**
+     * 补发的通知（那是后来某笔本地事务顺手发的），当轮刚删的分片反而没有 ——
+     * 看起来像"通知没实装"，其实是挂错了时机。
+     *
+     * 为什么不挂在 PRE_PREPARE：那时提交还没成定局，事务仍可能
+     * ROLLBACK PREPARED；副本一旦按通知停了流，回滚之后就再也追不上 ——
+     * 这正是 §12 把 fileset 发射放在 PRE_COMMIT（而不是 DDL 执行完就发）的理由。
+     * 放在 COMMIT PREPARED 之后则没有这个窗口：表是真的没了。
+     *
+     * 只补 DROP，不补 fileset 变更：后者要与那批 FPI 保持"CTRL 先、内容后"的
+     * 顺序，必须留在提交之前；DROP 没有内容要灌，事后发反而更安全。
+     */
+    if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, TransactionStmt) &&
+        ((TransactionStmt *) pstmt->utilityStmt)->kind == TRANS_STMT_COMMIT_PREPARED)
+        ShardFilesetEmitDropNotices();
 }
 
 /* ---- SIGSEGV 诊断 ---- */

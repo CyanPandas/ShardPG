@@ -303,6 +303,117 @@ PartDistEmitFilesetHandover(Oid shard_oid)
     pfree(payload);
 }
 
+/*
+ * EmitShardDropNotice —— T7.8（P7-D1）：告诉副本"这个分片没了"。
+ *
+ * 失败不上抛：DROP 本身是本地 DDL，已经在提交路上，不能因为通知不到副本就把它
+ * 带崩；副本收不到只是回退到从前的行为（残留）。
+ */
+static void
+EmitShardDropNotice(Oid shard_oid)
+{
+    PG_TRY();
+    {
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_SHARD_DROP, NULL, 0);
+        PartWALNoteTouchedPartition(shard_oid);
+        elog(LOG, "pg_partdist: 分片 %u 已 DROP，已通知副本停流", shard_oid);
+    }
+    PG_CATCH();
+    {
+        ErrorData *ed;
+
+        MemoryContextSwitchTo(TopMemoryContext);
+        ed = CopyErrorData();
+        FlushErrorState();
+        ereport(WARNING,
+                (errmsg("pg_partdist: 分片 %u 的 DROP 通知未能发出：%s",
+                        shard_oid, ed->message),
+                 errdetail("副本侧的壳表/槽位/目录将保持残留，需要运维手工回收。")));
+        FreeErrorData(ed);
+    }
+    PG_END_TRY();
+}
+
+/*
+ * ShardFilesetEmitDropNotices —— T7.8：**COMMIT PREPARED 之后**的 DROP 扫一遍。
+ *
+ * ★ 为什么非要有这一支（2026-09-10 实测定位）：
+ *   fileset 发射器只挂在 `XACT_EVENT_PRE_COMMIT` 上，而 **Citus 的 DDL 在 worker
+ *   上一律走 2PC** —— PostgreSQL 那时触发的是 `XACT_EVENT_PRE_PREPARE`，
+ *   于是"DROP 掉一张分布表"的那笔事务里，发射器**一次都没跑**。
+ *   现象：日志里只见到给**残留旧 fileset** 补发的通知（那是后来某笔本地事务顺手
+ *   发的），当轮刚删的分片反而没有 —— 看起来像"通知没实装"，其实是挂错了时机。
+ *
+ * ★ 为什么不是简单地也挂到 PRE_PREPARE 上：那时**提交还没成定局**，
+ *   事务仍可能 ROLLBACK PREPARED。副本一旦按通知停了流，回滚之后就再也追不上 ——
+ *   这正是 D1 当初把 fileset 发射放在 PRE_COMMIT（而不是 DDL 执行完就发）的理由，
+ *   §12 的注释里写着。放到 `XACT_EVENT_COMMIT_PREPARED` 则没有这个问题：
+ *   那一刻表是真的没了。
+ *
+ * ★ 只处理 DROP，不处理 fileset 变更：后者要与那批 FPI 保持"CTRL 先、内容后"的
+ *   顺序，必须留在提交之前；DROP 没有内容要灌，事后发反而更安全。
+ *
+ * 代价：每次 COMMIT PREPARED 多一次分区清单遍历 + 每个分区一次 syscache 命中判定。
+ * 分区清单是本节点实际维护的那几十个，不是全库扫描。
+ */
+void
+ShardFilesetEmitDropNotices(void)
+{
+    static TimestampTz last_scan = 0;
+    TimestampTz         now;
+    char                dirpath[MAXPGPATH];
+    DIR                *dir;
+    struct dirent      *de;
+
+    if (!IsTransactionState() || !OidIsValid(MyDatabaseId))
+        return;
+
+    /*
+     * ★ 必须扫**目录**，不能扫 shmem 反向哈希（`PartWALSyncListPartitions`）。
+     *   第一版就是那么写的，结果只对**残留的旧 OID** 发出通知，当轮刚删的分片
+     *   反而没有 —— 因为表一 DROP，它在反向哈希里的条目就没了，事后扫描根本
+     *   看不见它。持久化的 fileset 文件（`pg_parwal/<oid>/fileset`）才是"这个
+     *   分片曾经归本节点维护"的持久证据，DROP 不会把它带走。
+     *
+     * 频率守卫：COMMIT PREPARED 不是冷路径，1 秒一次足够（DROP 通知晚一秒到达
+     * 副本没有任何后果 —— 它只是让副本停流，不涉及数据正确性）。
+     *   与 ShardFreezeMaybeEmitUpdates 的时间间隔守卫同一条纪律。
+     */
+    now = GetCurrentTimestamp();
+    if (last_scan != 0 &&
+        !TimestampDifferenceExceeds(last_scan, now, 1000))
+        return;
+    last_scan = now;
+
+    snprintf(dirpath, MAXPGPATH, "%s/%s", DataDir, PARTITION_WAL_DIR);
+    dir = AllocateDir(dirpath);
+    if (dir == NULL)
+        return;
+
+    while ((de = ReadDir(dir, dirpath)) != NULL)
+    {
+        Oid           shard_oid;
+        char         *endptr;
+        ShardFileSet  old_fs;
+        ShardFileSet  new_fs;
+        Oid           new_relids[SHARD_FILESET_MAX_RELS];
+
+        if (de->d_name[0] == '.')
+            continue;
+        shard_oid = (Oid) strtoul(de->d_name, &endptr, 10);
+        if (*endptr != '\0' || shard_oid == InvalidOid)
+            continue;
+
+        if (!LoadShardFileSet(shard_oid, &old_fs))
+            continue;           /* 没登记过 fileset：不归本节点维护 */
+        if (BuildShardFileSetEx(shard_oid, &new_fs, new_relids) >= 1)
+            continue;           /* 表还在，不是 DROP */
+
+        EmitShardDropNotice(shard_oid);
+    }
+    FreeDir(dir);
+}
+
 static void
 EmitFilesetUpdate(Oid shard_oid, const ShardFileSet *old_fs,
                   const ShardFileSet *new_fs, const Oid *new_relids)
@@ -1021,28 +1132,7 @@ ShardFilesetMaybeEmitUpdates(void)
          */
         if (BuildShardFileSetEx(parts[p], &new_fs, new_relids) < 1)
         {
-            PG_TRY();
-            {
-                PartWALAppendCtrl(parts[p], PARTWAL_CTRL_SHARD_DROP, NULL, 0);
-                PartWALNoteTouchedPartition(parts[p]);
-                elog(LOG, "pg_partdist: 分片 %u 已 DROP，已通知副本停流",
-                     parts[p]);
-            }
-            PG_CATCH();
-            {
-                ErrorData *ed;
-
-                MemoryContextSwitchTo(TopMemoryContext);
-                ed = CopyErrorData();
-                FlushErrorState();
-                ereport(WARNING,
-                        (errmsg("pg_partdist: 分片 %u 的 DROP 通知未能发出：%s",
-                                parts[p], ed->message),
-                         errdetail("副本侧的壳表/槽位/目录将保持残留，"
-                                   "需要运维手工回收。")));
-                FreeErrorData(ed);
-            }
-            PG_END_TRY();
+            EmitShardDropNotice(parts[p]);
             continue;
         }
 
