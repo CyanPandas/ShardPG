@@ -388,6 +388,26 @@ tso_rpc(const char *sql, const char *what)
  * 取本事务的分片快照 start_ts（懒取 + 事务内缓存）。
  * 遗留模式（未配置）返回 0。
  */
+/*
+ * TsoPeekStartTs —— T7.11（R-P6-18）：**只看不取**的 start_ts。
+ *
+ * 为什么必须另开一个：`TsoGetStartTs()` 在 TSO 已配置而本事务还没取号时会**发起
+ * 一次 RPC 取号**。MARKER 组装路径对**每一条**标记都要读 start_ts，用它等于给
+ * 每笔没碰过分片表的普通事务凭空加一次 TSO 往返 —— 既是性能问题，也是语义错误
+ * （那种事务本来就不该在 TSO 的时间轴上占号）。
+ *
+ * 返回 0 = 本事务没有 TSO start_ts（普通事务 / 遗留模式），调用方据此回退。
+ */
+int64
+TsoPeekStartTs(void)
+{
+	return cur_start_ts;
+}
+
+/*
+ * 取本事务的分片快照 start_ts（懒取 + 事务内缓存）。
+ * 遗留模式（未配置）返回 0。
+ */
 int64
 TsoGetStartTs(void)
 {

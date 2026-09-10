@@ -730,7 +730,26 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
 
     m = (TxnMarkerPayload *) buf;
-    m->start_ts  = (uint64) GetCurrentTransactionStartTimestamp();
+    /*
+     * ★ T7.11（R-P6-18）：start_ts 优先取 **TSO 的**，取不到才退回本地墙钟。
+     *
+     * 缺陷：这里一直无条件用 `GetCurrentTransactionStartTimestamp()`，回放侧原样
+     * 写进分片 clog 的 PREPARED 槽（`ShardClogSetPrepared(..., m->start_ts)`），
+     * 于是副本上 `sts = 842001420732582`（微秒墙钟）而 leader 的 TSO 是个小整数
+     * —— R-P3-2「双 ts 宇宙串线」成真：升主后 §4.2 三态处置的第一支拿它与 TSO
+     * 快照比，**恒为"跳过"**，那一支等于没有。
+     *
+     * 用 `TsoPeekStartTs()`（只看不取）而不是 `TsoGetStartTs()`：后者会给没取过号
+     * 的事务凭空发起一次 RPC —— 每条 MARKER 一次往返，且那种事务本就不该占号。
+     * 返回 0 时保持原样：普通事务/遗留模式的载荷字节与从前逐字节相同。
+     */
+    {
+        int64 sts = TsoPeekStartTs();
+
+        m->start_ts = (sts > 0)
+            ? (uint64) sts
+            : (uint64) GetCurrentTransactionStartTimestamp();
+    }
     m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
                                   : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;

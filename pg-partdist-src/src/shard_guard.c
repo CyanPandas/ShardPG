@@ -39,6 +39,14 @@
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"	/* T6.6：FunctionScan / Append 等计划节点 */
 #include "nodes/primnodes.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace_d.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"		/* R-P6-22：读 pg_raft.raft_enabled */
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
 /*
@@ -47,7 +55,21 @@
  * 同名多签名（citus_move_shard_placement 有 4 参与 6 参两版）一并覆盖 ——
  * 按名字匹配天然如此，正是不硬编 OID 的又一好处。
  */
-static const char *const shard_banned_funcs[] = {
+/*
+ * ★ R-P6-22 / T7.9（2026-09-10）：清单拆成两张，判据不同。
+ *
+ * **集群级**（下表）：Citus 的运维/搬运类 UDF。它们该禁的理由是"本集群的分片放置
+ * 由 raft 管、数据由物理回放同步"，与**本节点有没有打标表**毫无关系 ——
+ * 而它们恰恰只在**协调者**上调用，协调者上既没有打标表、也没人给它设白名单。
+ * 旧代码把这一层压在 `ShardGatingActive()`（本节点有打标表）之下，于是
+ * **生产形态下这一整层是熄火的**：`negative_p6` 之所以全绿，是因为夹具用一个
+ * worker 上的表 OID 给协调者开了闸门（`test_negative_p6.sh:64-66`），
+ * 那句夹具注释其实已经把真相写出来了，只是没人往下追一步。
+ *
+ * **打标级**（下面第二张表）：逻辑解码入口。那是针对"分片打标元组带 4 字节尾缀"
+ * 这件事的，本节点没有打标表时确实无从谈起，判据保持不变。
+ */
+static const char *const shard_banned_cluster_funcs[] = {
 	"citus_move_shard_placement",
 	"citus_copy_shard_placement",
 	"citus_rebalance_start",
@@ -55,6 +77,23 @@ static const char *const shard_banned_funcs[] = {
 	"undistribute_table",
 	"citus_schema_undistribute",
 	"alter_distributed_table",
+	/*
+	 * ★ T7.9：补上审计查出的 8 个同类（Citus 13.1 里都存在，实测 pg_proc 全是
+	 * C 函数）。它们同样亲手搬/读分片数据，绕过去就是静默错读或与 raft 放置冲突。
+	 * `master_*` 是旧名，按名匹配天然覆盖。
+	 */
+	"citus_split_shard_by_split_points",
+	"isolate_tenant_to_new_shard",
+	"citus_drain_node",
+	"master_move_shard_placement",
+	"master_copy_shard_placement",
+	"replicate_table_shards",
+	"citus_schema_move",
+	"alter_table_set_access_method",
+	NULL
+};
+
+static const char *const shard_banned_marked_funcs[] = {
 	/*
 	 * ★ T6.6：逻辑解码入口。§10 早就写着"分片表逻辑解码：禁"，补丁 0006 也
 	 * 确实实装了一道守卫 —— 但它挂在**可见性层**
@@ -81,6 +120,130 @@ static const char *const shard_banned_funcs[] = {
 	NULL
 };
 
+/*
+ * ShardGuardClusterManaged —— R-P6-22 的新闸门：**本集群是不是 raft 管放置的**。
+ *
+ * 判据取 `pg_raft.raft_enabled`。为什么是它：Citus 运维类 UDF 该禁的理由就是
+ * "放置由 raft 管、数据由物理回放同步"，raft 一开这条就成立，与本节点手上有没有
+ * 打标表无关。
+ *
+ * 每 backend 解析一次并缓存：`GetConfigOption` 是哈希查找，放在 ExecutorStart 的
+ * 每条语句上不合适；而这个值在进程生命期内改变的唯一途径是 SIGHUP 改 GUC，
+ * 那种场景下"新连接才生效"是可以接受的（禁令是纵深防御的第三层，不是唯一一层）。
+ */
+static bool
+ShardGuardClusterManaged(void)
+{
+	static int cached = -1;		/* -1 未解析 / 0 否 / 1 是 */
+
+	if (cached < 0)
+	{
+		const char *v = GetConfigOption("pg_raft.raft_enabled", true, false);
+
+		cached = (v != NULL && (v[0] == 'o' || v[0] == 'O' ||
+								v[0] == 't' || v[0] == 'T' ||
+								v[0] == '1')) ? 1 : 0;
+		if (cached == 1 && v != NULL && strcmp(v, "off") == 0)
+			cached = 0;			/* "off" 也以 'o' 开头，单独排掉 */
+	}
+	return cached == 1;
+}
+
+/*
+ * ShardGuardIsReferenceTable —— T7.10（2026-09-09 用户裁定"拦"）：这张表是不是
+ * Citus **引用表**（`pg_dist_partition.partmethod = 'n'`）。
+ *
+ * 为什么要拦：DESIGN §10 一直写着"引用表建表后只读"，理由是它没有分片写集 ⇒
+ * 没有协调者分片 ⇒ 不受协调组决议保护，而 Citus 原生 2PC 恢复又被 §9.2 关掉了
+ * （`citus.recover_2pc_interval = -1`）—— 也就是说引用表的跨节点写在本方案里
+ * **既不受我们的决议保护、也不受 Citus 的恢复保护**。但那一行此前只是纸面约定：
+ * 2026-09-09 复核时 `shard_guard.c` 全文找不到任何引用表判据，测试也零断言。
+ *
+ * 缓存：与 `partition_wal.c` 的 `IsCitusDistributedTable` 同款 backend 本地哈希 ——
+ * 写路径每条语句都要问，不能每次都扫 catalog。表被 DROP/重建时 OID 会变，
+ * 旧条目自然失效（与那份缓存同一条论证）。
+ */
+typedef struct RefTableEntry
+{
+	Oid		relid;
+	bool	is_ref;
+} RefTableEntry;
+
+static HTAB *RefTableCache = NULL;
+
+static bool
+ShardGuardIsReferenceTable(Oid relid)
+{
+	RefTableEntry *entry;
+	bool		found = false;
+	bool		is_ref = false;
+	Oid			pgDistPartitionOid;
+
+	if (!OidIsValid(relid))
+		return false;
+
+	if (RefTableCache == NULL)
+	{
+		HASHCTL ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(RefTableEntry);
+		RefTableCache = hash_create("pg_partdist_reftable_cache", 64, &ctl,
+									HASH_ELEM | HASH_BLOBS);
+	}
+
+	entry = hash_search(RefTableCache, &relid, HASH_FIND, &found);
+	if (found)
+		return entry->is_ref;
+
+	pgDistPartitionOid = get_relname_relid("pg_dist_partition",
+										   PG_CATALOG_NAMESPACE);
+	if (OidIsValid(pgDistPartitionOid))
+	{
+		PG_TRY();
+		{
+			Relation	rel;
+			SysScanDesc scan;
+			ScanKeyData key;
+			HeapTuple	tup;
+			Oid			idx = get_relname_relid(
+							"pg_dist_partition_logical_relid_index",
+							PG_CATALOG_NAMESPACE);
+
+			rel = table_open(pgDistPartitionOid, AccessShareLock);
+			ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(relid));
+			scan = systable_beginscan(rel, idx, OidIsValid(idx), NULL, 1, &key);
+			tup = systable_getnext(scan);
+			if (HeapTupleIsValid(tup))
+			{
+				bool	isnull = true;
+				Datum	d = heap_getattr(tup, 2 /* partmethod */,
+										 RelationGetDescr(rel), &isnull);
+
+				if (!isnull)
+					is_ref = (DatumGetChar(d) == 'n');
+			}
+			systable_endscan(scan);
+			table_close(rel, AccessShareLock);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			is_ref = false;		/* 查不出来就不拦：守卫不能把普通库带崩 */
+		}
+		PG_END_TRY();
+	}
+
+	entry = hash_search(RefTableCache, &relid, HASH_ENTER, &found);
+	entry->relid  = relid;
+	entry->is_ref = is_ref;
+	return is_ref;
+}
+
+static bool guard_check_marked = false;		/* 本次遍历要不要查打标级清单 */
+
 static bool
 shard_guard_func_banned(Oid funcid, const char **name_out)
 {
@@ -90,15 +253,25 @@ shard_guard_func_banned(Oid funcid, const char **name_out)
 	if (name == NULL)
 		return false;
 
-	for (i = 0; shard_banned_funcs[i] != NULL; i++)
+	for (i = 0; shard_banned_cluster_funcs[i] != NULL; i++)
 	{
-		if (strcmp(name, shard_banned_funcs[i]) == 0)
+		if (strcmp(name, shard_banned_cluster_funcs[i]) == 0)
 		{
-			*name_out = shard_banned_funcs[i];	/* 静态串，出作用域仍有效 */
+			*name_out = shard_banned_cluster_funcs[i];	/* 静态串，安全 */
 			pfree(name);
 			return true;
 		}
 	}
+	if (guard_check_marked)
+		for (i = 0; shard_banned_marked_funcs[i] != NULL; i++)
+		{
+			if (strcmp(name, shard_banned_marked_funcs[i]) == 0)
+			{
+				*name_out = shard_banned_marked_funcs[i];
+				pfree(name);
+				return true;
+			}
+		}
 	pfree(name);
 	return false;
 }
@@ -235,8 +408,55 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 			ShardReplicaAccessGate(rte->relid, "查询");
 	}
 
-	if (!ShardGatingActive())
-		return;					/* 无打标表：下面的禁用项检查零成本返回 */
+	/*
+	 * ★ R-P6-22：两层判据。
+	 *   · 集群级（Citus 运维类）—— raft 一开就查，**不看本节点有没有打标表**；
+	 *   · 打标级（逻辑解码）—— 仍按本节点是否有打标表。
+	 * 两者都不成立时零成本返回，普通 PostgreSQL 用法一条指令都不多花。
+	 */
+	guard_check_marked = ShardGatingActive();
+	if (!ShardGuardClusterManaged() && !guard_check_marked)
+		return;
+
+	/*
+	 * ★ T7.10（R-P6-22 同批）：引用表运行期写 —— 拦（2026-09-09 用户裁定）。
+	 *
+	 * 判据放在**结果关系**上而不是遍历表达式：写就是写，不需要绕计划树。
+	 * 覆盖边界如实记：这里拦的是**协调者上对引用表本体的写**；worker 上那张
+	 * `<ref>_<shardid>` 分片是普通本地表，不在 `pg_dist_partition` 里，
+	 * 本判据看不见它 —— 要堵那一层得按分片名判，属后续工作。
+	 */
+	if (ShardGuardClusterManaged() &&
+		(pstmt->commandType == CMD_INSERT ||
+		 pstmt->commandType == CMD_UPDATE ||
+		 pstmt->commandType == CMD_DELETE ||
+		 pstmt->commandType == CMD_MERGE))
+	{
+		ListCell *rc;
+
+		foreach(rc, pstmt->resultRelations)
+		{
+			int				rti = lfirst_int(rc);
+			RangeTblEntry  *rte;
+
+			if (rti <= 0 || rti > list_length(pstmt->rtable))
+				continue;
+			rte = (RangeTblEntry *) list_nth(pstmt->rtable, rti - 1);
+			if (rte == NULL || rte->rtekind != RTE_RELATION)
+				continue;
+			if (ShardGuardIsReferenceTable(rte->relid))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("T7.10/§10：引用表 \"%s\" 在分片打标集群上"
+								"建表后只读，运行期写入被禁用",
+								get_rel_name(rte->relid)),
+						 errdetail("引用表没有分片写集 ⇒ 没有协调者分片 ⇒ 不受"
+								   "协调组决议保护；而 Citus 原生 2PC 恢复已按 "
+								   "§9.2 关闭（citus.recover_2pc_interval = -1）"
+								   "—— 它的跨节点写两头都没有保护。"),
+						 errhint("引用数据请在建表阶段一次性灌入。")));
+		}
+	}
 
 	shard_guard_walk_plan(pstmt->planTree);
 
