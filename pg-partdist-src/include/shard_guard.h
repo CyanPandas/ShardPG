@@ -9,4 +9,7 @@
 
 extern void ShardGuardCheckPlan(PlannedStmt *pstmt);
 
+/* T7.10：引用表运行期写守卫。由 planner_hook 在 Citus 改写之前调用。 */
+extern void ShardGuardCheckReferenceWrite(Oid relid);
+
 #endif							/* SHARD_GUARD_H */

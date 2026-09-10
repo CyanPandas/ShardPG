@@ -126,7 +126,16 @@
 | **T7.7** R-P6-4 分配器槽位回收 | 判据与 R-P6-9 的 `ShardMvccSetRemove()` 同源：DROP 提交时摘 OID，这里同时**放槽位 + 删水位文件**。做完把 `run_p6_exit.sh:165-170` 的 `mv` 净场层撤掉 | 新用例：建删 100 个分片，槽位占用回到基线；撤掉净场后门禁仍绿 |
 | **T7.8** P7-D1 leader DROP 的副本侧回收 | 新 CTRL opcode `FILESET_DROP{oid}`：follower 收到后停流、摘槽位、删壳表与 `pg_parwal/<oid>`。**注意**：不能沿用"OID 不在本地 pg_class"判据（壳表是本地真表） | 新用例：leader `DROP TABLE` → 副本壳表消失、槽位释放、目录回收；未收到 CTRL 的副本保持现状（不误删） |
 
-### 批次 3：守卫面与限制面
+### 批次 3：守卫面与限制面（2026-09-10 代码全部落地）
+
+| 任务 | 状态 |
+|---|---|
+| **R-P6-22** 闸门改集群级 | ✅ 实测：协调者白名单为空（生产形态）时 `citus_rebalance_start` / `SELECT * FROM` 形式 / `citus_drain_node` / `undistribute_table` **四条全部触发禁令**；修复前全部静默放行 |
+| **T7.9** 补 8 个 UDF | ✅ 与上同批实测 |
+| **T7.10** 引用表守卫 | ✅ 实测 INSERT/UPDATE/DELETE 三种写全部拦下。**第一版挂错了位置**：挂在 `ExecutorStart` 判 `pstmt->resultRelations` 完全不生效 —— Citus 把引用表的写重写成自己的 CustomScan，顶层已不是普通 ModifyTable。改挂 `planner_hook`（拿到的是 Citus 改写**之前**的原始 Query）才生效 |
+| **T7.11** MARKER 用 TSO start_ts | ◐ 代码落地、未单独取证。新增 `TsoPeekStartTs()`（只看不取）—— 不能用 `TsoGetStartTs()`，它会给没取过号的事务凭空发起一次 RPC |
+
+
 
 | 任务 | 修法 | 验收 |
 |---|---|---|

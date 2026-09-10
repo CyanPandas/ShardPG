@@ -242,6 +242,32 @@ ShardGuardIsReferenceTable(Oid relid)
 	return is_ref;
 }
 
+/*
+ * ShardGuardCheckReferenceWrite —— T7.10：引用表运行期写，拦。
+ *
+ * 由 `partdist_planner`（planner_hook）在**Citus 改写之前**调用 —— 挂在
+ * ExecutorStart 上判 `pstmt->resultRelations` 的第一版实测完全不生效：
+ * Citus 把引用表的写重写成自己的 CustomScan，顶层已经不是普通 ModifyTable。
+ */
+void
+ShardGuardCheckReferenceWrite(Oid relid)
+{
+	if (!ShardGuardClusterManaged())
+		return;
+	if (!ShardGuardIsReferenceTable(relid))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("T7.10/§10：引用表 \"%s\" 在分片打标集群上建表后只读，"
+					"运行期写入被禁用", get_rel_name(relid)),
+			 errdetail("引用表没有分片写集 ⇒ 没有协调者分片 ⇒ 不受协调组决议保护；"
+					   "而 Citus 原生 2PC 恢复已按 §9.2 关闭"
+					   "（citus.recover_2pc_interval = -1）—— 它的跨节点写两头"
+					   "都没有保护。"),
+			 errhint("引用数据请在建表阶段一次性灌入。")));
+}
+
 static bool guard_check_marked = false;		/* 本次遍历要不要查打标级清单 */
 
 static bool
@@ -417,46 +443,6 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 	guard_check_marked = ShardGatingActive();
 	if (!ShardGuardClusterManaged() && !guard_check_marked)
 		return;
-
-	/*
-	 * ★ T7.10（R-P6-22 同批）：引用表运行期写 —— 拦（2026-09-09 用户裁定）。
-	 *
-	 * 判据放在**结果关系**上而不是遍历表达式：写就是写，不需要绕计划树。
-	 * 覆盖边界如实记：这里拦的是**协调者上对引用表本体的写**；worker 上那张
-	 * `<ref>_<shardid>` 分片是普通本地表，不在 `pg_dist_partition` 里，
-	 * 本判据看不见它 —— 要堵那一层得按分片名判，属后续工作。
-	 */
-	if (ShardGuardClusterManaged() &&
-		(pstmt->commandType == CMD_INSERT ||
-		 pstmt->commandType == CMD_UPDATE ||
-		 pstmt->commandType == CMD_DELETE ||
-		 pstmt->commandType == CMD_MERGE))
-	{
-		ListCell *rc;
-
-		foreach(rc, pstmt->resultRelations)
-		{
-			int				rti = lfirst_int(rc);
-			RangeTblEntry  *rte;
-
-			if (rti <= 0 || rti > list_length(pstmt->rtable))
-				continue;
-			rte = (RangeTblEntry *) list_nth(pstmt->rtable, rti - 1);
-			if (rte == NULL || rte->rtekind != RTE_RELATION)
-				continue;
-			if (ShardGuardIsReferenceTable(rte->relid))
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("T7.10/§10：引用表 \"%s\" 在分片打标集群上"
-								"建表后只读，运行期写入被禁用",
-								get_rel_name(rte->relid)),
-						 errdetail("引用表没有分片写集 ⇒ 没有协调者分片 ⇒ 不受"
-								   "协调组决议保护；而 Citus 原生 2PC 恢复已按 "
-								   "§9.2 关闭（citus.recover_2pc_interval = -1）"
-								   "—— 它的跨节点写两头都没有保护。"),
-						 errhint("引用数据请在建表阶段一次性灌入。")));
-		}
-	}
 
 	shard_guard_walk_plan(pstmt->planTree);
 

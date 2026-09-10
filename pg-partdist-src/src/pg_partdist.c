@@ -2,6 +2,7 @@
 #include "metadata_cache.h"
 #include "dtx_pending.h"
 #include "shard_guard.h"
+#include "optimizer/planner.h"
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -46,6 +47,7 @@ int pg_partdist_local_node_id = -1;
 static shmem_request_hook_type    prev_shmem_request_hook    = NULL;
 static shmem_startup_hook_type    prev_shmem_startup_hook    = NULL;
 static ExecutorStart_hook_type    prev_ExecutorStart_hook    = NULL;
+static planner_hook_type          prev_planner_hook          = NULL;
 static object_access_hook_type    prev_object_access_hook    = NULL;
 static ProcessUtility_hook_type   prev_ProcessUtility_hook   = NULL;
 
@@ -179,6 +181,42 @@ partdist_shmem_startup(void)
  * so the WAL insert hook can identify WAL records belonging to it.
  * No start_lsn capture needed — the hook now buffers records directly.
  */
+/*
+ * partdist_planner —— T7.10（R-P6-22 同批，2026-09-10）：引用表运行期写守卫必须挂
+ * 在**规划之前**。
+ *
+ * 第一版挂在 `ExecutorStart` 里判 `pstmt->resultRelations`，实测**完全不生效**：
+ * Citus 把引用表的写重写成自己的 CustomScan 计划，顶层已经不是普通 ModifyTable，
+ * `resultRelations` 里根本看不到那张引用表 —— INSERT/UPDATE 照常成功。
+ * （这正是本项目 §9.2 反复强调的"判据要挂在 Citus 改写不掉的位置"。）
+ *
+ * planner_hook 拿到的是**原始 Query**：`parse->commandType` 与
+ * `parse->resultRelation` 都还是用户写的那张表，Citus 还没插手。
+ */
+static PlannedStmt *
+partdist_planner(Query *parse, const char *query_string, int cursorOptions,
+                 ParamListInfo boundParams)
+{
+    if (parse != NULL &&
+        (parse->commandType == CMD_INSERT ||
+         parse->commandType == CMD_UPDATE ||
+         parse->commandType == CMD_DELETE ||
+         parse->commandType == CMD_MERGE) &&
+        parse->resultRelation > 0 &&
+        parse->resultRelation <= list_length(parse->rtable))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *)
+            list_nth(parse->rtable, parse->resultRelation - 1);
+
+        if (rte != NULL && rte->rtekind == RTE_RELATION)
+            ShardGuardCheckReferenceWrite(rte->relid);
+    }
+
+    if (prev_planner_hook)
+        return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+    return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
 static void
 partdist_executor_start(QueryDesc *queryDesc, int eflags)
 {
@@ -544,6 +582,9 @@ _PG_init(void)
     shmem_startup_hook = partdist_shmem_startup;
 
     /* Chain executor start hook (lazy shard registration) */
+    prev_planner_hook = planner_hook;
+    planner_hook = partdist_planner;
+
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = partdist_executor_start;
 
