@@ -348,10 +348,21 @@ purge_orphan_prepared() {
 # 稳定的定义取两条可直接观测的：
 #   (a) 每个节点上**只剩 group 0** —— 上一套的数据组残留是主权抖动的直接来源；
 #   (b) group 0 的 leader 在各节点上**一致且非零** —— 控制面自己没在选举中。
-# 等不到就只告警不阻塞：宁可带着告警跑，也好过静默地把抖动算进结果。
+# ★★ T7.16（P7-E5）2026-09-11：判据由"只告警"改为"**等不到就不跑**"。
+#
+#   原写法等 60s 不收敛就打一行 ⚠ 然后 `return 0` 放行 —— 于是整批带着
+#   "存疑"跑完，而那些数字看起来和正常结论**一模一样**。这正是本条要消灭的
+#   伪信号：既会把好的判成红（R-P6-13 记的三例），也可能把该红的盖成绿。
+#
+#   新语义：
+#     · 等待从 60s 延长到 180s，且每轮之间**主动清残留数据组**（它就是抖动来源，
+#       光等不清等于指望它自己好）；
+#     · 仍不收敛 ⇒ 返回非零，调用方把该套件记为 **BLOCKED 且不执行** ——
+#       不产生任何看起来像结论的数字。BLOCKED 与 FAIL 分开统计：
+#       前者是"环境没资格给结论"，后者是"代码有问题"，混为一谈就是另一种失真。
 wait_groups_settled() {
   local t p ngroups leaders uniq_leaders ok
-  for t in $(seq 1 30); do
+  for t in $(seq 1 90); do
     ok=1
     for p in $PORTS; do
       ngroups=$(PS "$p" -Atc "SELECT count(*) FROM partdist.pg_raft_group_status()" </dev/null 2>/dev/null)
@@ -366,10 +377,20 @@ wait_groups_settled() {
         return 0
       fi
     fi
+    # 光等不行：残留数据组是抖动的直接来源，每 5 轮主动清一次。
+    if (( t % 5 == 0 )); then
+      for p in $PORTS; do
+        PS "$p" -q -c "SELECT partdist.pg_raft_group_drop(g.group_id)
+                         FROM partdist.pg_raft_group_status() g
+                        WHERE g.group_id <> 0;" </dev/null >/dev/null 2>&1
+      done
+    fi
     sleep 2
   done
-  echo "  [净场] ⚠ raft 拓扑 60s 未收敛（残留数据组或 group0 主未定），本套结果按 R-P6-13 存疑"
-  return 0
+  echo "  [净场] ✗ raft 拓扑 180s 未收敛（残留数据组或 group0 主未定）"
+  echo "         按 T7.16：**不跑**本套件，记为 BLOCKED —— 环境没资格给结论，"
+  echo "         带着抖动跑出来的数字与正常结论无法区分，那才是最坏的结果。"
+  return 1
 }
 
 scrub() {
@@ -398,7 +419,7 @@ scrub() {
     done
     sleep 2
   done
-  wait_groups_settled
+  wait_groups_settled          # 返回非零 = 拓扑没收敛，调用方据此判 BLOCKED
 }
 
 # ★ 真的清，不只是数 —— 头注释里承诺了 ⑤，只数不清就是文不对题。
@@ -530,7 +551,13 @@ declare -a NAMES=() RESULTS=()
 run_one() {  # <名字> <超时> <出身>
   local name=$1 tmo=$2 era=$3 log="$OUT/$name.log" env_pfx=""
   case " $INSIDE " in *" $name "*) env_pfx="inside" ;; esac
-  scrub
+  # ★★ T7.16：净场里的拓扑收敛等待失败 ⇒ **不跑这一套**，记 BLOCKED。
+  #   带着抖动跑出来的数字与正常结论无法区分 —— 那比不跑更坏。
+  if ! scrub; then
+    echo "BLOCKED（拓扑未收敛，未执行）"
+    NAMES+=("$name"); RESULTS+=("BLOCKED 拓扑未收敛，未执行")
+    return 0
+  fi
   pre_suite "$name"
   printf "  [%-4s] %-26s " "$era" "$name"
   if [[ "$env_pfx" == "inside" ]]; then
@@ -570,14 +597,22 @@ for entry in "${SUITES[@]}"; do
 done
 
 echo "================= 汇总 ================="
-tp=0; tf=0; bad=0
+tp=0; tf=0; bad=0; blocked=0
 for i in "${!NAMES[@]}"; do
+  # ★★ T7.16：BLOCKED 单独统计，**不并进 FAIL**。
+  #   两者含义不同：BLOCKED = 环境没资格给结论（拓扑没收敛，套件根本没跑）；
+  #   FAIL = 代码有问题。混为一谈就是另一种失真 —— 会让人去查一段其实没执行过的代码。
+  if [[ "${RESULTS[$i]}" == BLOCKED* ]]; then
+    printf "  ⊘ %-26s %s\n" "${NAMES[$i]}" "${RESULTS[$i]}"; blocked=$((blocked+1)); continue
+  fi
   p=$(echo "${RESULTS[$i]}" | grep -oE 'PASS=[0-9]+' | cut -d= -f2)
   f=$(echo "${RESULTS[$i]}" | grep -oE 'FAIL=[0-9]+' | cut -d= -f2)
   tp=$((tp + ${p:-0})); tf=$((tf + ${f:-0}))
   [[ "${f:-0}" != "0" || "${RESULTS[$i]}" == *"无汇总行"* ]] && { printf "  ✗ %-26s %s\n" "${NAMES[$i]}" "${RESULTS[$i]}"; bad=$((bad+1)); }
 done
 echo "  收尾残表：$(leftovers)"
-echo "  套件 ${#NAMES[@]} 套，其中不干净 $bad 套；断言合计 PASS=$tp FAIL=$tf"
+echo "  套件 ${#NAMES[@]} 套：不干净 $bad 套，BLOCKED $blocked 套；断言合计 PASS=$tp FAIL=$tf"
+[[ "$blocked" -gt 0 ]] && echo "  ⊘ 有 $blocked 套因拓扑未收敛**未执行** —— 本轮不构成完整出口证据（T7.16）"
 echo "  逐套日志：$OUT"
-[[ "$bad" -eq 0 ]]
+# BLOCKED 同样让门禁不通过：没跑完的轮次不能算过。
+[[ "$bad" -eq 0 && "$blocked" -eq 0 ]]
