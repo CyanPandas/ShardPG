@@ -109,7 +109,7 @@ extern void ShardFilesetMaybeEmitUpdates(void);
  * Citus 的 DDL 走 2PC ⇒ PRE_COMMIT 挂点在那笔事务里不触发，DROP 的通知因此
  * 漏发；放在提交已成定局之后既补上了这一格，又避开了 ROLLBACK PREPARED 的窗口。
  */
-extern void ShardFilesetEmitDropNotices(void);
+extern void ShardFilesetEmitDropNotices(bool force);
 
 /* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流（超限只发通知） */
 extern int  fileset_inline_max_blocks;

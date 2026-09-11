@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "access/xlogdefs.h"
 #include "fmgr.h"
+#include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -60,6 +61,25 @@ typedef struct DemuxSharedState
     bool        worker_active;          /* true while the BGW is running */
     bool        recovery_complete;      /* set to true once crash recovery BGW has finished */
     Latch      *demux_latch;            /* set at startup; backends call SetLatch to wake demux */
+
+    /*
+     * drop_notice_gen — T7.8（P7-D1）：**已提交**的"分片表被 DROP"代次。
+     *
+     * 为什么必须放 shmem 而不是后端局部变量：删表的那条连接往往当场就断了，
+     * 后端局部标志会随它一起消失，通知就永远发不出去。代次放共享内存，
+     * 任何后端在下一条语句开头看到代次变了都会补扫一遍 —— 扫描本身是
+     * 幂等的（判据是持久证据 `pg_parwal/<oid>/fileset` 存在而表已不在），
+     * 谁先扫到都一样。
+     */
+    pg_atomic_uint32 drop_notice_gen;
+
+    /*
+     * drop_notice_swept —— 已经被某个后端扫掉的代次。两者用 CAS 配对，
+     * 保证**一代只扫一次**：否则每个后端各有一份"已消费代次"，谁先跑到语句
+     * 边界谁就扫，实测同一条通知在 1 ms 内被 4 个后端各发了一遍（幂等所以
+     * 无害，但白跑 4 次 raft 提案）。
+     */
+    pg_atomic_uint32 drop_notice_swept;
 
     /* Rolling latency samples in microseconds (circular buffer) */
     int64       latency_buf[DEMUX_LATENCY_SAMPLES];

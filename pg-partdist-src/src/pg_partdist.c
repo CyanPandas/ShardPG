@@ -78,6 +78,63 @@ PG_FUNCTION_INFO_V1(pg_partdist_route_write);
  * COMMIT:
  *   Update last_committed_lsn for demux_progress() latency tracking.
  */
+/* ------------------------------------------------------------------ */
+/* T7.8（P7-D1）：分片表 DROP 之后给副本补发停流通知                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 三个看起来更自然的挂点都不成立，所以才要绕这一圈：
+ *
+ *   ① DROP 语句执行完的那一刻 —— 事务还没提交，仍可能回滚；副本一旦按通知
+ *      停了流，回滚之后就再也追不上（这正是 §12 把 fileset 发射放在 PRE_COMMIT
+ *      而不是 DDL 执行完就发的理由）。
+ *   ② `XACT_EVENT_PRE_PREPARE` —— 同上，ROLLBACK PREPARED 还开着口子。
+ *   ③ `XACT_EVENT_COMMIT` —— 那一刻本事务已经退出 ProcArray、快照已不作数，
+ *      而扫描要走 `BuildShardFileSetEx()` 的 syscache 查找。在那里做目录扫描
+ *      加 catalog 查询是不安全的，而且回调里 ERROR 会直接升成 FATAL。
+ *
+ * 于是拆成两步：提交回调里只做一次**原子自增**（无 IO、不查 catalog、不会
+ * ERROR），真正的扫描推迟到下一条语句开头 —— 那里事务上下文完整，ERROR 也
+ * 只是普通报错。代价是通知比提交晚一条语句；DROP 通知只让副本停流，不涉及
+ * 数据正确性，晚一点没有后果。
+ *
+ * 代次放 shmem（`DemuxState->drop_notice_gen`）而不是后端局部变量：删表的
+ * 连接往往当场就断了，后端局部标志会随它一起消失。
+ */
+static bool drop_seen_in_xact = false;   /* 本事务跑过 DROP TABLE */
+
+/*
+ * PartDistMaybeEmitPendingDropNotices —— 挂在每条语句开头，常态是两次原子读。
+ *
+ * 用 gen/swept 一对计数器 + CAS，保证**一代只扫一次**。写成"每个后端记一份
+ * 已消费代次"是不够的：谁先跑到语句边界谁就扫，实测同一条通知在 1 ms 内被
+ * 4 个后端各发了一遍（幂等所以无害，但白跑 4 次 raft 提案）。
+ *
+ * 抢到的后端扫失败（多半是本节点不是该分区组的 leader）也不回退代次 ——
+ * 那种情况本就轮不到本节点通知；真正的组 leader 会在自己那笔 DROP 上发。
+ * 加上没落哨兵的分片会被**下一次** DROP 的扫描再试一遍，不会永久漏。
+ */
+static void
+PartDistMaybeEmitPendingDropNotices(void)
+{
+    uint32 gen;
+    uint32 swept;
+
+    if (DemuxState == NULL)
+        return;
+
+    gen   = pg_atomic_read_u32(&DemuxState->drop_notice_gen);
+    swept = pg_atomic_read_u32(&DemuxState->drop_notice_swept);
+    if (gen == swept)
+        return;
+
+    if (!pg_atomic_compare_exchange_u32(&DemuxState->drop_notice_swept,
+                                        &swept, gen))
+        return;                 /* 别的后端抢到了，让它去扫 */
+
+    ShardFilesetEmitDropNotices(true);
+}
+
 static void
 PartWALXactCallback(XactEvent event, void *arg)
 {
@@ -127,18 +184,34 @@ PartWALXactCallback(XactEvent event, void *arg)
         case XACT_EVENT_ABORT:
             PartWALAbort();
             PartDistDtxReset();
+            drop_seen_in_xact = false;      /* T7.8：回滚了，表还在 */
             break;
 
         case XACT_EVENT_PREPARE:
             /* 事务真正结束：清掉"已落盘 LSN + 涉及分区"这套本地记账 */
             PartWALEndTxn();
             PartDistDtxReset();
+            /*
+             * T7.8：2PC 这一支交给 COMMIT PREPARED 之后那次扫描 —— 此刻
+             * 还可能 ROLLBACK PREPARED，不能算数。
+             */
+            drop_seen_in_xact = false;
             break;
 
         case XACT_EVENT_COMMIT:
             /* 事务真正结束：清掉"已落盘 LSN + 涉及分区"这套本地记账 */
             PartWALEndTxn();
             PartDistDtxReset();
+            /*
+             * T7.8：本事务删过表且已提交 —— 只推一次代次，扫描留给下一条语句。
+             * 这里能做的只有"不查 catalog、不做 IO、不会 ERROR"的动作。
+             */
+            if (drop_seen_in_xact)
+            {
+                drop_seen_in_xact = false;
+                if (DemuxState != NULL)
+                    pg_atomic_fetch_add_u32(&DemuxState->drop_notice_gen, 1);
+            }
             if (DemuxState == NULL)
                 break;
             flush_now = GetFlushRecPtr(&tli);
@@ -241,6 +314,9 @@ partdist_executor_start(QueryDesc *queryDesc, int eflags)
             }
         }
     }
+
+    /* T7.8：同 ProcessUtility —— DROP 之后常常只跟一条 SELECT，这里也要消费 */
+    PartDistMaybeEmitPendingDropNotices();
 
     /*
      * T4.6/§9.2 第 3 层：禁用项拦截（rebalancer / move_shard_placement /
@@ -359,6 +435,9 @@ partdist_process_utility(PlannedStmt *pstmt,
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
 
+    /* T7.8：上一笔已提交的 DROP，在这条语句开头补发通知（常态一次原子读） */
+    PartDistMaybeEmitPendingDropNotices();
+
     /*
      * TX-TSO-MVCC P1：VACUUM/ANALYZE/CLUSTER 点到分片打标表一律拦下 ——
      * 原生 clog 会误判分片 xid，回收/重写路径会删活元组（P1_PRECHECK 结论 D）。
@@ -404,6 +483,14 @@ partdist_process_utility(PlannedStmt *pstmt,
         ShardFilesetNoteMaybeChanged();
 
     /*
+     * T7.8：记下"本事务删过表"。此刻**不能发通知**（还没提交），
+     * 只置标志；提交回调推代次，下一条语句才真扫。
+     */
+    if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, DropStmt) &&
+        ((DropStmt *) pstmt->utilityStmt)->removeType == OBJECT_TABLE)
+        drop_seen_in_xact = true;
+
+    /*
      * ★ T7.8（P7-D1）：`COMMIT PREPARED` **执行完之后**补一遍 DROP 通知。
      *
      * 为什么非要单挂一处（2026-09-10 实测定位）：fileset 发射器只挂在
@@ -423,7 +510,7 @@ partdist_process_utility(PlannedStmt *pstmt,
      */
     if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, TransactionStmt) &&
         ((TransactionStmt *) pstmt->utilityStmt)->kind == TRANS_STMT_COMMIT_PREPARED)
-        ShardFilesetEmitDropNotices();
+        ShardFilesetEmitDropNotices(false);
 }
 
 /* ---- SIGSEGV 诊断 ---- */

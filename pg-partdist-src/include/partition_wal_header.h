@@ -226,8 +226,31 @@ PartWALRecordGxid(const PartWALRecord *rec)
  * 多一个位比多一次"为什么回放报长度不符"便宜。
  */
 #define PARTWAL_MARKER_HAS_ALLOC_WM     UINT32_C(0x0002)
+/*
+ * PARTWAL_MARKER_STS_IS_TSO —— T7.11（R-P6-18）：`start_ts` 装的是 **TSO 的号**，
+ * 不是本地墙钟。
+ *
+ * 为什么非要一位来分辨：这个字段是**双宇宙**的。TSO 是从 1 开始的小整数，
+ * 墙钟是 ~8.4e14 的微秒数，光看值猜量级是能猜，但那是猜。消费侧
+ * （`shard_visibility.c` §4.2 三态第一支）拿它与读者快照比：
+ *     slot.start_ts <= my_ts
+ * 墙钟值恒 > 任何 TSO 快照 ⇒ 第一支恒假 ⇒ **第三支"问协调者"永远不执行**，
+ * 已提交的 in-doubt 行就一直不可见。反过来 leader 自己那条
+ * `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 在遗留模式存的是 **0**
+ * （见 shard_clog.h「遗留模式 0」的约定）—— 同一个事务，leader 存 0、
+ * 副本存墙钟，两边对不上。
+ *
+ * 置位规则：**值来自 TSO 才置**。不置位就等于"这不是 TSO 宇宙的数"，回放侧
+ * 据此给分片 clog 落 0（遗留模式），而 `start_ts` 原值仍照旧进增强型 CLOG
+ * 供诊断 —— 两个消费者要的东西不一样，别互相迁就。
+ *
+ * 不影响载荷长度：长度只由 HAS_SHARD_XID / HAS_ALLOC_WM 决定（见
+ * TxnMarkerPayloadTailWords），所以这一位是纯增量的。
+ */
+#define PARTWAL_MARKER_STS_IS_TSO       UINT32_C(0x0004)
 #define PARTWAL_MARKER_KNOWN_FLAGS \
-    (PARTWAL_MARKER_HAS_SHARD_XID | PARTWAL_MARKER_HAS_ALLOC_WM)
+    (PARTWAL_MARKER_HAS_SHARD_XID | PARTWAL_MARKER_HAS_ALLOC_WM | \
+     PARTWAL_MARKER_STS_IS_TSO)
 
 typedef struct TxnMarkerPayload
 {

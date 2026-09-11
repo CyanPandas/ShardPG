@@ -707,6 +707,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     TxnMarkerPayload *m;
     bool            has_shard_xid;
     uint32          flags;
+    int64           sts;
 
     /*
      * 已提交子事务清单。中止的子事务**不在**这个列表里 —— 于是它们的 gxid
@@ -726,12 +727,9 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     flags = has_shard_xid ? (PARTWAL_MARKER_HAS_SHARD_XID |
                              PARTWAL_MARKER_HAS_ALLOC_WM) : 0;
 
-    *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, flags);
-    buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
-
-    m = (TxnMarkerPayload *) buf;
     /*
-     * ★ T7.11（R-P6-18）：start_ts 优先取 **TSO 的**，取不到才退回本地墙钟。
+     * ★ T7.11（R-P6-18）：start_ts 优先取 **TSO 的**，取不到才退回本地墙钟，
+     *   并且**用一位标出这个值属于哪个宇宙**（见 PARTWAL_MARKER_STS_IS_TSO）。
      *
      * 缺陷：这里一直无条件用 `GetCurrentTransactionStartTimestamp()`，回放侧原样
      * 写进分片 clog 的 PREPARED 槽（`ShardClogSetPrepared(..., m->start_ts)`），
@@ -743,13 +741,17 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
      * 的事务凭空发起一次 RPC —— 每条 MARKER 一次往返，且那种事务本就不该占号。
      * 返回 0 时保持原样：普通事务/遗留模式的载荷字节与从前逐字节相同。
      */
-    {
-        int64 sts = TsoPeekStartTs();
+    sts = TsoPeekStartTs();
+    if (sts > 0)
+        flags |= PARTWAL_MARKER_STS_IS_TSO;
 
-        m->start_ts = (sts > 0)
-            ? (uint64) sts
-            : (uint64) GetCurrentTransactionStartTimestamp();
-    }
+    *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, flags);
+    buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
+
+    m = (TxnMarkerPayload *) buf;
+    m->start_ts = (sts > 0)
+        ? (uint64) sts
+        : (uint64) GetCurrentTransactionStartTimestamp();
     m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
                                   : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
@@ -786,7 +788,13 @@ PartWALBuildVerdictMarker(int64 start_ts, int64 commit_ts, uint32 *out_len)
 {
     char             *buf;
     TxnMarkerPayload *m;
-    uint32            flags = PARTWAL_MARKER_HAS_SHARD_XID |
+    /*
+     * 这里的 start_ts 来自未决登记，与 leader 自己那条
+     * `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 同源 —— 要么是 TSO 号，
+     * 要么是 0（遗留模式），不会是墙钟。>0 即置位。
+     */
+    uint32            flags = (start_ts > 0 ? PARTWAL_MARKER_STS_IS_TSO : 0) |
+                              PARTWAL_MARKER_HAS_SHARD_XID |
                               PARTWAL_MARKER_HAS_ALLOC_WM;
 
     *out_len = (uint32) TxnMarkerPayloadSizeEx(0, flags);

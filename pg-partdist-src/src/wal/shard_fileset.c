@@ -32,6 +32,7 @@
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "utils/resowner.h"
 #include "storage/smgr.h"
 #include "utils/elog.h"
 #include "utils/guc.h"          /* application_name */
@@ -304,34 +305,99 @@ PartDistEmitFilesetHandover(Oid shard_oid)
 }
 
 /*
- * EmitShardDropNotice —— T7.8（P7-D1）：告诉副本"这个分片没了"。
+ * ShardDropSentinelPath —— 已发过 DROP 通知的标记，落在该分片的 parwal 目录里。
  *
- * 失败不上抛：DROP 本身是本地 DDL，已经在提交路上，不能因为通知不到副本就把它
- * 带崩；副本收不到只是回退到从前的行为（残留）。
+ * 没有它，扫描不收敛：`fileset` 文件在 DROP 之后仍然留着（那正是"这个分片曾归
+ * 本节点维护"的持久证据），于是**每来一次新的 DROP，历史上所有残留分片都会被
+ * 重发一遍通知**。重发本身无害（幂等），但日志会越积越长，raft 上也是白跑的
+ * 提案。落一个哨兵文件把它收住；哨兵丢了最坏就是多发一次。
  */
 static void
+ShardDropSentinelPath(Oid shard_oid, char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%s/%s/%u/dropped", DataDir, PARTITION_WAL_DIR,
+             shard_oid);
+}
+
+/*
+ * EmitShardDropNotice —— T7.8（P7-D1）：告诉副本"这个分片没了"。
+ *
+ * ★ 失败不上抛，而且是**真的**不上抛（2026-09-10 改正）。
+ *
+ *   原先这里只是 PG_TRY/PG_CATCH + FlushErrorState 就接着往下走。那在
+ *   `COMMIT PREPARED` 之后那条路径上勉强能用（后面没别的事要做了），可现在
+ *   扫描挂在**任意用户语句开头**，问题就现形了：PG 的 PG_CATCH **不会**把
+ *   事务恢复成可用状态，只有子事务能。实测后果是整条用户语句被带挂 ——
+ *   夹具里 `replay_set_locmap` / `replay_enable` 全线报"relation does not
+ *   exist"，因为它们前面那条建壳表的语句已经被这里的报错弄脏了。
+ *
+ *   触发它的是最普通不过的情形：本节点上留着某个已删分片的 fileset，而本节点
+ *   **不是那个分区组的 leader** —— `PartWALAppendCtrl` 于是理直气壮地报
+ *   "本节点不是该分区组的 leader"。这不是异常，是常态。
+ *
+ * 返回 true 表示通知已发出（调用方据此落哨兵）。
+ */
+static bool
 EmitShardDropNotice(Oid shard_oid)
 {
+    MemoryContext oldcxt   = CurrentMemoryContext;
+    ResourceOwner oldowner = CurrentResourceOwner;
+    volatile bool ok       = false;
+
+    /*
+     * 判据（"fileset 里有、catalog 里没了"）也放进子事务里一起做：
+     * `LoadShardFileSet` 读文件、`BuildShardFileSetEx` 走 syscache，两者都能抛。
+     * 只把发射包起来是不够的 —— 这里的每一行都跑在别人的语句上。
+     */
+    BeginInternalSubTransaction(NULL);
     PG_TRY();
     {
+        ShardFileSet old_fs;
+        ShardFileSet new_fs;
+        Oid          new_relids[SHARD_FILESET_MAX_RELS];
+
+        if (!LoadShardFileSet(shard_oid, &old_fs) ||          /* 不归本节点维护 */
+            BuildShardFileSetEx(shard_oid, &new_fs, new_relids) >= 1)   /* 表还在 */
+        {
+            ReleaseCurrentSubTransaction();
+            MemoryContextSwitchTo(oldcxt);
+            CurrentResourceOwner = oldowner;
+            return false;
+        }
+
         PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_SHARD_DROP, NULL, 0);
         PartWALNoteTouchedPartition(shard_oid);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+        ok = true;
         elog(LOG, "pg_partdist: 分片 %u 已 DROP，已通知副本停流", shard_oid);
     }
     PG_CATCH();
     {
         ErrorData *ed;
 
-        MemoryContextSwitchTo(TopMemoryContext);
+        MemoryContextSwitchTo(oldcxt);
         ed = CopyErrorData();
         FlushErrorState();
-        ereport(WARNING,
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+
+        /*
+         * LOG 而不是 WARNING：扫描是搭在别人的语句上跑的，把它的失败推给一个
+         * 毫不相干的客户端是错的 —— 何况"本节点不是该组 leader"根本不算异常。
+         */
+        ereport(LOG,
                 (errmsg("pg_partdist: 分片 %u 的 DROP 通知未能发出：%s",
                         shard_oid, ed->message),
-                 errdetail("副本侧的壳表/槽位/目录将保持残留，需要运维手工回收。")));
+                 errdetail("副本侧的壳表/槽位/目录将保持残留；本节点重新成为该组 "
+                           "leader 后会再试。")));
         FreeErrorData(ed);
     }
     PG_END_TRY();
+
+    return ok;
 }
 
 /*
@@ -357,7 +423,7 @@ EmitShardDropNotice(Oid shard_oid)
  * 分区清单是本节点实际维护的那几十个，不是全库扫描。
  */
 void
-ShardFilesetEmitDropNotices(void)
+ShardFilesetEmitDropNotices(bool force)
 {
     static TimestampTz last_scan = 0;
     TimestampTz         now;
@@ -375,12 +441,16 @@ ShardFilesetEmitDropNotices(void)
      *   看不见它。持久化的 fileset 文件（`pg_parwal/<oid>/fileset`）才是"这个
      *   分片曾经归本节点维护"的持久证据，DROP 不会把它带走。
      *
+     * force=true 时跳过频率守卫：调用方（提交后惰性补发）自己带了"代次变了"
+     * 这个更精确的守卫 —— 每笔已提交的 DROP 最多触发一次，不需要再限流；
+     * 若这里照样限流，刚删完 1 秒内的那次补发就会被吃掉，通知就丢了。
+     *
      * 频率守卫：COMMIT PREPARED 不是冷路径，1 秒一次足够（DROP 通知晚一秒到达
      * 副本没有任何后果 —— 它只是让副本停流，不涉及数据正确性）。
      *   与 ShardFreezeMaybeEmitUpdates 的时间间隔守卫同一条纪律。
      */
     now = GetCurrentTimestamp();
-    if (last_scan != 0 &&
+    if (!force && last_scan != 0 &&
         !TimestampDifferenceExceeds(last_scan, now, 1000))
         return;
     last_scan = now;
@@ -394,9 +464,9 @@ ShardFilesetEmitDropNotices(void)
     {
         Oid           shard_oid;
         char         *endptr;
-        ShardFileSet  old_fs;
-        ShardFileSet  new_fs;
-        Oid           new_relids[SHARD_FILESET_MAX_RELS];
+        char          sentinel[MAXPGPATH];
+        struct stat   st;
+        int           fd;
 
         if (de->d_name[0] == '.')
             continue;
@@ -404,12 +474,18 @@ ShardFilesetEmitDropNotices(void)
         if (*endptr != '\0' || shard_oid == InvalidOid)
             continue;
 
-        if (!LoadShardFileSet(shard_oid, &old_fs))
-            continue;           /* 没登记过 fileset：不归本节点维护 */
-        if (BuildShardFileSetEx(shard_oid, &new_fs, new_relids) >= 1)
-            continue;           /* 表还在，不是 DROP */
+        /* 已经通知过了：不重发（见 ShardDropSentinelPath 的注释） */
+        ShardDropSentinelPath(shard_oid, sentinel, sizeof(sentinel));
+        if (stat(sentinel, &st) == 0)
+            continue;
 
-        EmitShardDropNotice(shard_oid);
+        /* 判据 + 发射都在 EmitShardDropNotice 的子事务里做 */
+        if (!EmitShardDropNotice(shard_oid))
+            continue;           /* 表还在 / 不归本节点 / 本节点不是该组 leader */
+
+        fd = OpenTransientFile(sentinel, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+        if (fd >= 0)
+            CloseTransientFile(fd);
     }
     FreeDir(dir);
 }
@@ -1186,6 +1262,17 @@ RegisterShardFileSet(const ShardFileSet *fs)
     /* 2) 原子持久化（tmp + fsync + rename），bgworker 启动时重建注册用 */
     InitPartitionWALDirectory(fs->shard_oid);
     FileSetPath(fs->shard_oid, path, tmp);
+
+    /*
+     * T7.8：本分片重新登记，说明它又归本节点维护了 —— 清掉上一轮的
+     * "已通知过 DROP" 哨兵，否则同一个 OID 被复用后再删就不再发通知。
+     */
+    {
+        char sentinel[MAXPGPATH];
+
+        ShardDropSentinelPath(fs->shard_oid, sentinel, sizeof(sentinel));
+        (void) unlink(sentinel);
+    }
 
     fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
     if (fd < 0)

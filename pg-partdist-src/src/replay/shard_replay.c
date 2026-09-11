@@ -1430,7 +1430,20 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
         else if (op == XLOG_XACT_ABORT)
             ShardClogSetVerdict(ctx->shard_oid, sxid, false, 0);
         else                    /* XLOG_XACT_PREPARE */
-            ShardClogSetPrepared(ctx->shard_oid, sxid, (int64) m->start_ts,
+            /*
+             * ★ T7.11：只有标了 STS_IS_TSO 的值才配进分片 clog 的 start_ts 列，
+             *   否则落 0（`shard_clog.h` 的「遗留模式 0」约定）。
+             *
+             *   不这么做的后果不是"落个没用的数"，而是**把 §4.2 三态的第一支
+             *   废掉**：那一支拿槽里的 start_ts 与读者 TSO 快照比大小，墙钟值
+             *   （~8.4e14）恒大于任何 TSO 号 ⇒ 恒假 ⇒ 第三支"问协调者"永远
+             *   不执行 ⇒ 已提交的 in-doubt 行一直读不到。而 leader 自己那条
+             *   `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 遗留模式存的
+             *   就是 0 —— 落 0 才是和 leader 一致，不是将就。
+             */
+            ShardClogSetPrepared(ctx->shard_oid, sxid,
+                                 (m->flags & PARTWAL_MARKER_STS_IS_TSO)
+                                     ? (int64) m->start_ts : 0,
                                  (int64) gxid);
 
         REPLAY_TRACE("TRACE marker: shard clog 落账 shard=%u sxid=%u op=0x%02X",
@@ -2379,27 +2392,40 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
             cur_file = ent->file_idx;
         }
 
-        if (ent->hdr.data_len > 0)
+        /*
+         * ★ 判据是"有没有内容 **或者** 它是一条 CTRL"，不能只看 data_len
+         *   （2026-09-10，T7.8 实测）。CTRL 的身份写在 flags 里，跟它带不带
+         *   载荷无关 —— `SHARD_DROP` 本来就没有载荷（opcode 自己就是全部信息）。
+         *   只判 data_len 的话，这条通知会被下面那条"旧流占位记录，跳过"的
+         *   兼容分支整条吞掉：leader 日志里明明写着"已通知副本停流"，副本却
+         *   一直 armed=t，而且**连个报错都没有**，只有一行看着像历史遗留的
+         *   WARNING。这正是"未知记录一律 ERROR、绝不静默跳过"那条规矩要防的
+         *   形态，只不过它从占位记录这个后门溜了进来。
+         */
+        if (ent->hdr.data_len > 0 || PartWALRecordIsCtrl(&ent->hdr))
         {
             ssize_t nb;
 
-            if (ent->hdr.data_len > body_cap)
+            if (ent->hdr.data_len > 0)
             {
-                if (body != NULL)
-                    pfree(body);
-                body_cap = Max(ent->hdr.data_len, (uint32) 65536);
-                body     = palloc(body_cap);
-            }
+                if (ent->hdr.data_len > body_cap)
+                {
+                    if (body != NULL)
+                        pfree(body);
+                    body_cap = Max(ent->hdr.data_len, (uint32) 65536);
+                    body     = palloc(body_cap);
+                }
 
-            nb = pg_pread(cur_fd, body, ent->hdr.data_len,
-                          ent->off + (off_t) sizeof(PartWALRecord));
-            if (nb != (ssize_t) ent->hdr.data_len)
-                ereport(ERROR,
-                        (errcode_for_file_access(),
-                         errmsg("shard replay: shard %u @plsn %llu 记录体读取"
-                                "不完整 (%zd/%u)", ctx->shard_oid,
-                                (unsigned long long) expected,
-                                nb, ent->hdr.data_len)));
+                nb = pg_pread(cur_fd, body, ent->hdr.data_len,
+                              ent->off + (off_t) sizeof(PartWALRecord));
+                if (nb != (ssize_t) ent->hdr.data_len)
+                    ereport(ERROR,
+                            (errcode_for_file_access(),
+                             errmsg("shard replay: shard %u @plsn %llu 记录体读取"
+                                    "不完整 (%zd/%u)", ctx->shard_oid,
+                                    (unsigned long long) expected,
+                                    nb, ent->hdr.data_len)));
+            }
 
             REPLAY_TRACE("TRACE apply: plsn=%llu rmid=%u info=0x%02X len=%u "
                          "flags=0x%02X",

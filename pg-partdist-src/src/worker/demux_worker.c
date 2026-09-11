@@ -90,6 +90,8 @@ DemuxShmemInit(void)
         DemuxState->last_committed_lsn  = InvalidXLogRecPtr;
         DemuxState->worker_active       = false;
         DemuxState->demux_latch         = NULL;
+        pg_atomic_init_u32(&DemuxState->drop_notice_gen, 0);   /* T7.8 */
+        pg_atomic_init_u32(&DemuxState->drop_notice_swept, 0);
         DemuxState->latency_head        = 0;
         DemuxState->latency_count       = 0;
         memset(DemuxState->latency_buf, 0, sizeof(DemuxState->latency_buf));
