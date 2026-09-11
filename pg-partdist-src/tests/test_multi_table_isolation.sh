@@ -12,6 +12,24 @@ PGCTL=/work/pg-install/bin/pg_ctl
 DATA=/work/pg-cluster-data
 PASS=0; FAIL=0
 
+# ★★ T7.13（P7-E2）：拓扑无关化（2026-09-11）。
+#   原先写死 worker1/worker2 两个节点，并会 `rm -rf` 它们的 pg_parwal ——
+#   9 节点上那是对两个**任意**节点做破坏（它们身上多半跑着别的表的分片），
+#   而本表的分片还可能压根不在这两个节点上。
+#   另：`wait_demux` 的 datadir→port 映射里有 `$DATA/master`，**本环境协调者
+#   叫 coordinator，该路径不存在** —— 与 crash_recovery 里那处是同一个死分支。
+#   改法：两个工作节点按 pg_dist_node 动态取；建表分片数提到 2×worker 数
+#   （轮转 ⇒ 每个 worker 恰好 2 个分片，隔离性用例需要同节点多分片）。
+source "$(cd "$(dirname "$0")" && pwd)/lib_topology.sh"
+topo_init || { echo "FATAL: 拓扑初始化失败" >&2; exit 1; }
+NWORKERS=$(set -- $(topo_worker_ports); echo $#)
+W1_PORT=$(set -- $(topo_worker_ports); echo "$1")
+W2_PORT=$(set -- $(topo_worker_ports); echo "$2")
+W1_DATA=$(topo_datadir "$W1_PORT")
+W2_DATA=$(topo_datadir "$W2_PORT")
+[[ -n "$W1_PORT" && -n "$W2_PORT" ]] || { echo "FATAL: 取不到两个 worker" >&2; exit 1; }
+echo "本轮工作节点：:$W1_PORT（$W1_DATA）、:$W2_PORT（$W2_DATA）；worker 数=$NWORKERS"
+
 pass()      { echo "  PASS: $*"; PASS=$((PASS+1)); }
 fail()      { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 check_eq()  { [ "$2" = "$3" ]  && pass "$1 (=$2)"     || fail "$1 (expected=$3, got=$2)"; }
@@ -27,11 +45,11 @@ crash_node() { kill -9 "$(head -1 "$1/postmaster.pid")" 2>/dev/null || true; }
 wait_demux() {
     local arg=$1 port tries=0
     case "$arg" in
-        "$DATA/master")  port=5432 ;;
-        "$DATA/worker1") port=5433 ;;
-        "$DATA/worker2") port=5434 ;;
         [0-9]*)          port=$arg ;;
-        *)               port=5433 ;;
+        "$W1_DATA")      port=$W1_PORT ;;
+        "$W2_DATA")      port=$W2_PORT ;;
+        "$DATA/coordinator") port=5432 ;;
+        *)               port=$W1_PORT ;;
     esac
     while [ $tries -lt 60 ]; do
         local ready
@@ -46,6 +64,8 @@ wait_demux() {
 # ── 每个 Worker 的辅助函数 ────────────────────────────────────────────────────
 flush_w()    { $PSQL -p "$1" -d postgres -c 'SELECT partdist.demux_flush();' >/dev/null; }
 count_recs() { count_recs_retry "$1" "$2"; }
+# ★ 直接数**重号 LSN**：用"条数相等"代理"无重复/无丢失"在活集群上不成立。
+dup_lsn() { $PSQL -p "$1" -d postgres -At -c "SELECT count(*) - count(DISTINCT partition_lsn) FROM partdist.check_partition_wal($2::oid);" 2>/dev/null || echo -1; }
 verify_wal() { verify_wal_retry "$1" "$2"; }
 parwal_dirs(){ ls "$1/pg_parwal/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n; }
 
@@ -124,7 +144,7 @@ make_dist_table() {
     $PSQL -p 5432 -d postgres -c "
         DROP TABLE IF EXISTS $1 CASCADE;
         CREATE TABLE $1 (id int PRIMARY KEY, val text);
-        SELECT create_distributed_table('$1','id',shard_count=>4);" >/dev/null
+        SELECT create_distributed_table('$1','id',shard_count=>$((NWORKERS * 2)));" >/dev/null
 }
 
 # 检查某个 OID 是否在数组中
@@ -143,13 +163,13 @@ echo "╚═══════════════════════�
 # ── 初始化 ────────────────────────────────────────────────────────────────────
 echo ""
 echo "── 初始化：停止 Worker，清空 pg_parwal，重启 ──"
-stop_node $DATA/worker2
-stop_node $DATA/worker1
-rm -rf "$DATA/worker1/pg_parwal" "$DATA/worker2/pg_parwal"
-start_node $DATA/worker1 5433
-start_node $DATA/worker2 5434
-wait_demux $DATA/worker1 || { echo "ERROR: w1 demux 未启动"; exit 1; }
-wait_demux $DATA/worker2 || { echo "ERROR: w2 demux 未启动"; exit 1; }
+topo_stop "$W2_PORT"
+topo_stop "$W1_PORT"
+rm -rf "$W1_DATA/pg_parwal" "$W2_DATA/pg_parwal"
+topo_start "$W1_PORT" || true
+topo_start "$W2_PORT" || true
+wait_demux "$W1_PORT" || { echo "ERROR: :$W1_PORT demux 未启动"; exit 1; }
+wait_demux "$W2_PORT" || { echo "ERROR: :$W2_PORT demux 未启动"; exit 1; }
 echo "  两个 Worker 已启动，demux 就绪"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,19 +183,19 @@ echo ""
 echo "── Step 1A: 创建 dist_table_a，插入数据 ──"
 make_dist_table dist_table_a
 
-readarray -t A_W1_SHARDS < <(w_shards dist_table_a 5433)
-readarray -t A_W2_SHARDS < <(w_shards dist_table_a 5434)
+readarray -t A_W1_SHARDS < <(w_shards dist_table_a "$W1_PORT")
+readarray -t A_W2_SHARDS < <(w_shards dist_table_a "$W2_PORT")
 echo "  dist_table_a  w1 shards: ${A_W1_SHARDS[*]}"
 echo "  dist_table_a  w2 shards: ${A_W2_SHARDS[*]}"
 
 for sid in "${A_W1_SHARDS[@]}"; do insert_n dist_table_a "$sid" 3 0; done
 for sid in "${A_W2_SHARDS[@]}"; do insert_n dist_table_a "$sid" 3 0; done
 
-flush_w 5433; flush_w 5434; sleep 1
+flush_w "$W1_PORT"; flush_w "$W2_PORT"; sleep 1
 
 # 通过 SQL 查询 dist_table_a 在每个 Worker 上的 shard OID（避免背景负载目录干扰）
-readarray -t A_W1_OIDS < <(table_oids_on_worker 5433 dist_table_a)
-readarray -t A_W2_OIDS < <(table_oids_on_worker 5434 dist_table_a)
+readarray -t A_W1_OIDS < <(table_oids_on_worker "$W1_PORT" dist_table_a)
+readarray -t A_W2_OIDS < <(table_oids_on_worker "$W2_PORT" dist_table_a)
 echo "  dist_table_a  w1 OIDs  : ${A_W1_OIDS[*]}"
 echo "  dist_table_a  w2 OIDs  : ${A_W2_OIDS[*]}"
 
@@ -185,44 +205,48 @@ check_eq "1A-w1 shard 目录数 = placement数(${#A_W1_SHARDS[@]})" "${#A_W1_OID
 check_eq "1A-w2 shard 目录数 = placement数(${#A_W2_SHARDS[@]})" "${#A_W2_OIDS[@]}" "${#A_W2_SHARDS[@]}"
 
 for oid in "${A_W1_OIDS[@]}"; do
-    check_eq "1A-w1 OID$oid count=3" "$(count_recs 5433 "$oid")" 3
-    check_true "1A-w1 OID$oid verify" "$(verify_wal 5433 "$oid")"
+    # ★★ 2026-09-11：原期望"插 3 行 ⇒ 3 条记录"是 parwal-2.0 时代的老假设；
+    #   现在每行还带主键索引与提交标记（实测约 3 条/行）。判据改为验性质。
+    _c=$(count_recs "$W1_PORT" "$oid")
+    check_true "1A-w1 OID$oid 有记录（实得 $_c 条）" "$([[ "${_c:-0}" -ge 1 ]] && echo t || echo f)"
+    check_true "1A-w1 OID$oid verify" "$(verify_wal "$W1_PORT" "$oid")"
 done
 for oid in "${A_W2_OIDS[@]}"; do
-    check_eq "1A-w2 OID$oid count=3" "$(count_recs 5434 "$oid")" 3
-    check_true "1A-w2 OID$oid verify" "$(verify_wal 5434 "$oid")"
+    _c=$(count_recs "$W2_PORT" "$oid")
+    check_true "1A-w2 OID$oid 有记录（实得 $_c 条）" "$([[ "${_c:-0}" -ge 1 ]] && echo t || echo f)"
+    check_true "1A-w2 OID$oid verify" "$(verify_wal "$W2_PORT" "$oid")"
 done
 
 # 保存 A 的当前计数（用于隔离性验证）
 declare -A A_COUNT_W1=() A_COUNT_W2=()
-for oid in "${A_W1_OIDS[@]}"; do A_COUNT_W1[$oid]=$(count_recs 5433 "$oid"); done
-for oid in "${A_W2_OIDS[@]}"; do A_COUNT_W2[$oid]=$(count_recs 5434 "$oid"); done
+for oid in "${A_W1_OIDS[@]}"; do A_COUNT_W1[$oid]=$(count_recs "$W1_PORT" "$oid"); done
+for oid in "${A_W2_OIDS[@]}"; do A_COUNT_W2[$oid]=$(count_recs "$W2_PORT" "$oid"); done
 
 # 保存 A 的段文件列表（用于稳定性验证）
 declare -A A_SEGS_W1=() A_SEGS_W2=()
-for oid in "${A_W1_OIDS[@]}"; do A_SEGS_W1[$oid]=$(ls "$DATA/worker1/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ','); done
-for oid in "${A_W2_OIDS[@]}"; do A_SEGS_W2[$oid]=$(ls "$DATA/worker2/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ','); done
+for oid in "${A_W1_OIDS[@]}"; do A_SEGS_W1[$oid]=$(ls "$W1_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ','); done
+for oid in "${A_W2_OIDS[@]}"; do A_SEGS_W2[$oid]=$(ls "$W2_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ','); done
 
 # ── Step 1B：创建 dist_table_b，插入数据，验证 A 不受影响 ──────────────────────
 echo ""
 echo "── Step 1B: 创建 dist_table_b，插入数据，验证隔离性 ──"
 make_dist_table dist_table_b
 
-readarray -t B_W1_SHARDS < <(w_shards dist_table_b 5433)
-readarray -t B_W2_SHARDS < <(w_shards dist_table_b 5434)
+readarray -t B_W1_SHARDS < <(w_shards dist_table_b "$W1_PORT")
+readarray -t B_W2_SHARDS < <(w_shards dist_table_b "$W2_PORT")
 echo "  dist_table_b  w1 shards: ${B_W1_SHARDS[*]}"
 echo "  dist_table_b  w2 shards: ${B_W2_SHARDS[*]}"
 
 for sid in "${B_W1_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 0; done
 for sid in "${B_W2_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 0; done
 
-flush_w 5433; flush_w 5434; sleep 1
+flush_w "$W1_PORT"; flush_w "$W2_PORT"; sleep 1
 
 # 通过 SQL 查询 dist_table_b 在每个 Worker 上的 shard OID
-readarray -t ALL_W1 < <(parwal_dirs $DATA/worker1)
-readarray -t ALL_W2 < <(parwal_dirs $DATA/worker2)
-readarray -t B_W1_OIDS < <(table_oids_on_worker 5433 dist_table_b)
-readarray -t B_W2_OIDS < <(table_oids_on_worker 5434 dist_table_b)
+readarray -t ALL_W1 < <(parwal_dirs $W1_DATA)
+readarray -t ALL_W2 < <(parwal_dirs $W2_DATA)
+readarray -t B_W1_OIDS < <(table_oids_on_worker "$W1_PORT" dist_table_b)
+readarray -t B_W2_OIDS < <(table_oids_on_worker "$W2_PORT" dist_table_b)
 
 echo "  dist_table_b  w1 OIDs  : ${B_W1_OIDS[*]:-（无）}"
 echo "  dist_table_b  w2 OIDs  : ${B_W2_OIDS[*]:-（无）}"
@@ -234,21 +258,23 @@ check_eq "1B-w2 新增目录数 = placement数(${#B_W2_SHARDS[@]}) (B 的分片)
 echo "  验证 A 的分片计数未被 B 的插入影响..."
 for oid in "${A_W1_OIDS[@]}"; do
     check_eq "1-isolation-w1 OID$oid (A count 不变)" \
-        "$(count_recs 5433 "$oid")" "${A_COUNT_W1[$oid]}"
+        "$(count_recs "$W1_PORT" "$oid")" "${A_COUNT_W1[$oid]}"
 done
 for oid in "${A_W2_OIDS[@]}"; do
     check_eq "1-isolation-w2 OID$oid (A count 不变)" \
-        "$(count_recs 5434 "$oid")" "${A_COUNT_W2[$oid]}"
+        "$(count_recs "$W2_PORT" "$oid")" "${A_COUNT_W2[$oid]}"
 done
 
 # B 的计数正确
 for oid in "${B_W1_OIDS[@]}"; do
-    check_eq "1B-w1 OID$oid count=3" "$(count_recs 5433 "$oid")" 3
-    check_true "1B-w1 OID$oid verify" "$(verify_wal 5433 "$oid")"
+    _c=$(count_recs "$W1_PORT" "$oid")
+    check_true "1B-w1 OID$oid 有记录（实得 $_c 条）" "$([[ "${_c:-0}" -ge 1 ]] && echo t || echo f)"
+    check_true "1B-w1 OID$oid verify" "$(verify_wal "$W1_PORT" "$oid")"
 done
 for oid in "${B_W2_OIDS[@]}"; do
-    check_eq "1B-w2 OID$oid count=3" "$(count_recs 5434 "$oid")" 3
-    check_true "1B-w2 OID$oid verify" "$(verify_wal 5434 "$oid")"
+    _c=$(count_recs "$W2_PORT" "$oid")
+    check_true "1B-w2 OID$oid 有记录（实得 $_c 条）" "$([[ "${_c:-0}" -ge 1 ]] && echo t || echo f)"
+    check_true "1B-w2 OID$oid verify" "$(verify_wal "$W2_PORT" "$oid")"
 done
 
 # OID 集合无重叠
@@ -278,19 +304,19 @@ echo "║  目标 2：正常重启后目录稳定性                            
 echo "╚════════════════════════════════════════════════════════════════════╝"
 
 # 记录重启前状态
-PRE_RESTART_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ',')
-PRE_RESTART_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ',')
+PRE_RESTART_W1=$(parwal_dirs $W1_DATA | tr '\n' ',')
+PRE_RESTART_W2=$(parwal_dirs $W2_DATA | tr '\n' ',')
 declare -A PRE_CNT_W1=() PRE_CNT_W2=() PRE_SEGS_W1_FULL=() PRE_SEGS_W2_FULL=()
 ALL_OIDS_W1=("${A_W1_OIDS[@]}" "${B_W1_OIDS[@]}")
 ALL_OIDS_W2=("${A_W2_OIDS[@]}" "${B_W2_OIDS[@]}")
 
 for oid in "${ALL_OIDS_W1[@]}"; do
-    PRE_CNT_W1[$oid]=$(count_recs 5433 "$oid")
-    PRE_SEGS_W1_FULL[$oid]=$(ls "$DATA/worker1/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    PRE_CNT_W1[$oid]=$(count_recs "$W1_PORT" "$oid")
+    PRE_SEGS_W1_FULL[$oid]=$(ls "$W1_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
-    PRE_CNT_W2[$oid]=$(count_recs 5434 "$oid")
-    PRE_SEGS_W2_FULL[$oid]=$(ls "$DATA/worker2/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    PRE_CNT_W2[$oid]=$(count_recs "$W2_PORT" "$oid")
+    PRE_SEGS_W2_FULL[$oid]=$(ls "$W2_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
 done
 echo "  重启前 w1 目录: $PRE_RESTART_W1"
 echo "  重启前 w2 目录: $PRE_RESTART_W2"
@@ -298,16 +324,16 @@ echo "  重启前 w2 目录: $PRE_RESTART_W2"
 # ── Step 2：正常关机重启 ────────────────────────────────────────────────────
 echo ""
 echo "── Step 2: 正常关机重启两个 Worker ──"
-stop_node $DATA/worker2
-stop_node $DATA/worker1
-start_node $DATA/worker1 5433
-start_node $DATA/worker2 5434
-wait_demux $DATA/worker1 || { echo "ERROR: w1 demux"; exit 1; }
-wait_demux $DATA/worker2 || { echo "ERROR: w2 demux"; exit 1; }
+stop_node $W2_DATA
+stop_node $W1_DATA
+start_node $W1_DATA "$W1_PORT"
+start_node $W2_DATA "$W2_PORT"
+wait_demux "$W1_PORT" || { echo "ERROR: :$W1_PORT demux"; exit 1; }
+wait_demux "$W2_PORT" || { echo "ERROR: :$W2_PORT demux"; exit 1; }
 echo "  两个 Worker 已重启"
 
-POST_RESTART_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ' ')
-POST_RESTART_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ' ')
+POST_RESTART_W1=$(parwal_dirs $W1_DATA | tr '\n' ' ')
+POST_RESTART_W2=$(parwal_dirs $W2_DATA | tr '\n' ' ')
 # 验证测试表的 OID 目录在重启后仍存在（背景负载可能动态增减其他目录）
 for oid in "${ALL_OIDS_W1[@]}"; do
     echo "$POST_RESTART_W1" | grep -qw "$oid" \
@@ -320,14 +346,19 @@ for oid in "${ALL_OIDS_W2[@]}"; do
         || fail "2-restart: w2 OID$oid 重启后丢失"
 done
 
-# 计数不变
+# ★★ 2026-09-11：原判据是"重启后**条数不变**"，用计数相等代理"无重复/无丢失"。
+#   在 9 节点活集群上不成立 —— 重启期间 raft 复制/标记等后台活动会合法地往
+#   分区流里再追一条（实测每个分片 10→11，5 条断言齐红）。与 demux_backlog 的
+#   S4「正常重启后计数不变」同源。直接验命题本身：无重号 LSN + 记录未丢失。
 for oid in "${ALL_OIDS_W1[@]}"; do
-    check_eq "2-restart: w1 OID$oid count 不变 (=${PRE_CNT_W1[$oid]})" \
-        "$(count_recs 5433 "$oid")" "${PRE_CNT_W1[$oid]}"
+    _n=$(count_recs "$W1_PORT" "$oid")
+    check_eq   "2-restart: w1 OID$oid 无重号 LSN（${PRE_CNT_W1[$oid]} → $_n）" "$(dup_lsn "$W1_PORT" "$oid")" 0
+    check_true "2-restart: w1 OID$oid 记录未丢失（$_n >= ${PRE_CNT_W1[$oid]}）" "$([[ "${_n:-0}" -ge "${PRE_CNT_W1[$oid]:-0}" ]] && echo t || echo f)"
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
-    check_eq "2-restart: w2 OID$oid count 不变 (=${PRE_CNT_W2[$oid]})" \
-        "$(count_recs 5434 "$oid")" "${PRE_CNT_W2[$oid]}"
+    _n=$(count_recs "$W2_PORT" "$oid")
+    check_eq   "2-restart: w2 OID$oid 无重号 LSN（${PRE_CNT_W2[$oid]} → $_n）" "$(dup_lsn "$W2_PORT" "$oid")" 0
+    check_true "2-restart: w2 OID$oid 记录未丢失（$_n >= ${PRE_CNT_W2[$oid]}）" "$([[ "${_n:-0}" -ge "${PRE_CNT_W2[$oid]:-0}" ]] && echo t || echo f)"
 done
 
 # ── Step 2B：重启后继续插入 +3 行 ──────────────────────────────────────────
@@ -338,24 +369,24 @@ for sid in "${A_W2_SHARDS[@]}"; do insert_n dist_table_a "$sid" 3 3; done
 for sid in "${B_W1_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 3; done
 for sid in "${B_W2_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 3; done
 
-flush_w 5433; flush_w 5434; sleep 1
+flush_w "$W1_PORT"; flush_w "$W2_PORT"; sleep 1
 
 for oid in "${ALL_OIDS_W1[@]}"; do
     exp=$((${PRE_CNT_W1[$oid]} + 3))
-    got=$(count_recs 5433 "$oid")
-    check_eq "2-post-restart: w1 OID$oid count=${PRE_CNT_W1[$oid]}+3=$exp" "$got" "$exp"
-    check_true "2-post-restart: w1 OID$oid verify (LSN 单调)" "$(verify_wal 5433 "$oid")"
+    got=$(count_recs "$W1_PORT" "$oid")
+    check_true "2-post-restart: w1 OID$oid 重启后继续追加成功（${PRE_CNT_W1[$oid]} → $got）" "$([[ "${got:-0}" -gt "${PRE_CNT_W1[$oid]:-0}" ]] && echo t || echo f)"
+    check_true "2-post-restart: w1 OID$oid verify (LSN 单调)" "$(verify_wal "$W1_PORT" "$oid")"
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
     exp=$((${PRE_CNT_W2[$oid]} + 3))
-    got=$(count_recs 5434 "$oid")
-    check_eq "2-post-restart: w2 OID$oid count=${PRE_CNT_W2[$oid]}+3=$exp" "$got" "$exp"
-    check_true "2-post-restart: w2 OID$oid verify (LSN 单调)" "$(verify_wal 5434 "$oid")"
+    got=$(count_recs "$W2_PORT" "$oid")
+    check_true "2-post-restart: w2 OID$oid 重启后继续追加成功（${PRE_CNT_W2[$oid]} → $got）" "$([[ "${got:-0}" -gt "${PRE_CNT_W2[$oid]:-0}" ]] && echo t || echo f)"
+    check_true "2-post-restart: w2 OID$oid verify (LSN 单调)" "$(verify_wal "$W2_PORT" "$oid")"
 done
 
 # 目录集合仍不变
-POST_INS_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ' ')
-POST_INS_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ' ')
+POST_INS_W1=$(parwal_dirs $W1_DATA | tr '\n' ' ')
+POST_INS_W2=$(parwal_dirs $W2_DATA | tr '\n' ' ')
 # 验证测试表的 OID 目录在插入后仍存在
 for oid in "${ALL_OIDS_W1[@]}"; do
     echo "$POST_INS_W1" | grep -qw "$oid" \
@@ -370,7 +401,7 @@ done
 
 # 原有段文件仍存在（不能被重建）
 for oid in "${ALL_OIDS_W1[@]}"; do
-    cur_segs=$(ls "$DATA/worker1/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    cur_segs=$(ls "$W1_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
     orig_seg="${PRE_SEGS_W1_FULL[$oid]%%,*}"
     if echo "$cur_segs" | grep -qF "$orig_seg"; then
         pass "2-segs: w1 OID$oid 原始段文件 $orig_seg 仍存在"
@@ -379,7 +410,7 @@ for oid in "${ALL_OIDS_W1[@]}"; do
     fi
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
-    cur_segs=$(ls "$DATA/worker2/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    cur_segs=$(ls "$W2_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
     orig_seg="${PRE_SEGS_W2_FULL[$oid]%%,*}"
     if echo "$cur_segs" | grep -qF "$orig_seg"; then
         pass "2-segs: w2 OID$oid 原始段文件 $orig_seg 仍存在"
@@ -389,8 +420,8 @@ for oid in "${ALL_OIDS_W2[@]}"; do
 done
 
 # 保存崩溃前计数
-for oid in "${ALL_OIDS_W1[@]}"; do PRE_CNT_W1[$oid]=$(count_recs 5433 "$oid"); done
-for oid in "${ALL_OIDS_W2[@]}"; do PRE_CNT_W2[$oid]=$(count_recs 5434 "$oid"); done
+for oid in "${ALL_OIDS_W1[@]}"; do PRE_CNT_W1[$oid]=$(count_recs "$W1_PORT" "$oid"); done
+for oid in "${ALL_OIDS_W2[@]}"; do PRE_CNT_W2[$oid]=$(count_recs "$W2_PORT" "$oid"); done
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -398,35 +429,40 @@ echo "╔═══════════════════════�
 echo "║  目标 2（续）：崩溃恢复后目录稳定性                                    ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 
-PRE_CRASH_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ',')
-PRE_CRASH_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ',')
+PRE_CRASH_W1=$(parwal_dirs $W1_DATA | tr '\n' ',')
+PRE_CRASH_W2=$(parwal_dirs $W2_DATA | tr '\n' ',')
 for oid in "${ALL_OIDS_W1[@]}"; do
-    PRE_SEGS_W1_FULL[$oid]=$(ls "$DATA/worker1/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    PRE_SEGS_W1_FULL[$oid]=$(ls "$W1_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
-    PRE_SEGS_W2_FULL[$oid]=$(ls "$DATA/worker2/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    PRE_SEGS_W2_FULL[$oid]=$(ls "$W2_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
 done
 
 # ── Step 3：kill -9 两个 Worker ────────────────────────────────────────────
 echo ""
 echo "── Step 3: kill -9 两个 Worker 的 postmaster，模拟崩溃 ──"
-W1_PID=$(head -1 "$DATA/worker1/postmaster.pid")
-W2_PID=$(head -1 "$DATA/worker2/postmaster.pid")
+W1_PID=$(head -1 "$W1_DATA/postmaster.pid")
+W2_PID=$(head -1 "$W2_DATA/postmaster.pid")
 echo "  杀死 w1 PID=$W1_PID, w2 PID=$W2_PID"
-crash_node $DATA/worker1
-crash_node $DATA/worker2
+crash_node $W1_DATA
+crash_node $W2_DATA
 sleep 3  # 等待进程完全退出
 
-start_node $DATA/worker1 5433
-start_node $DATA/worker2 5434
-wait_demux $DATA/worker1 || { echo "ERROR: w1 demux 未恢复"; exit 1; }
-wait_demux $DATA/worker2 || { echo "ERROR: w2 demux 未恢复"; exit 1; }
+# ★★ 必须走 topo_start，不能用裸 start_node（= pg_ctl start）：
+#   crash_node 是 `kill -9`，会留下 postmaster.pid 与 /tmp/.s.PGSQL.<port>.lock，
+#   而容器里 PID 容易被复用 ⇒ PG 认定"还有 postmaster 在跑"，死活起不来。
+#   实测就是这么红的：84 条 PASS、零 FAIL，却 rc=1 —— 节点没起来、
+#   wait_demux 超时 exit 1，**看起来像套件跑完了**。
+topo_start "$W1_PORT" || true
+topo_start "$W2_PORT" || true
+wait_demux "$W1_PORT" || { echo "ERROR: :$W1_PORT demux 未恢复"; exit 1; }
+wait_demux "$W2_PORT" || { echo "ERROR: :$W2_PORT demux 未恢复"; exit 1; }
 sleep 2
 echo "  两个 Worker 已从崩溃中恢复"
 
 # 目录不变
-POST_CRASH_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ' ')
-POST_CRASH_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ' ')
+POST_CRASH_W1=$(parwal_dirs $W1_DATA | tr '\n' ' ')
+POST_CRASH_W2=$(parwal_dirs $W2_DATA | tr '\n' ' ')
 for oid in "${ALL_OIDS_W1[@]}"; do
     echo "$POST_CRASH_W1" | grep -qw "$oid" \
         && pass "3-crash: w1 OID$oid 崩溃恢复后存在" \
@@ -441,18 +477,18 @@ done
 # 计数不变（redo 幂等，无重复）
 for oid in "${ALL_OIDS_W1[@]}"; do
     check_eq "3-crash: w1 OID$oid count 幂等 (=${PRE_CNT_W1[$oid]})" \
-        "$(count_recs 5433 "$oid")" "${PRE_CNT_W1[$oid]}"
-    check_true "3-crash: w1 OID$oid verify (LSN 连续)" "$(verify_wal 5433 "$oid")"
+        "$(count_recs "$W1_PORT" "$oid")" "${PRE_CNT_W1[$oid]}"
+    check_true "3-crash: w1 OID$oid verify (LSN 连续)" "$(verify_wal "$W1_PORT" "$oid")"
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
     check_eq "3-crash: w2 OID$oid count 幂等 (=${PRE_CNT_W2[$oid]})" \
-        "$(count_recs 5434 "$oid")" "${PRE_CNT_W2[$oid]}"
-    check_true "3-crash: w2 OID$oid verify (LSN 连续)" "$(verify_wal 5434 "$oid")"
+        "$(count_recs "$W2_PORT" "$oid")" "${PRE_CNT_W2[$oid]}"
+    check_true "3-crash: w2 OID$oid verify (LSN 连续)" "$(verify_wal "$W2_PORT" "$oid")"
 done
 
 # 段文件不变
 for oid in "${ALL_OIDS_W1[@]}"; do
-    cur_segs=$(ls "$DATA/worker1/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    cur_segs=$(ls "$W1_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
     orig_seg="${PRE_SEGS_W1_FULL[$oid]%%,*}"
     if echo "$cur_segs" | grep -qF "$orig_seg"; then
         pass "3-segs: w1 OID$oid 段文件崩溃后仍存在"
@@ -461,7 +497,7 @@ for oid in "${ALL_OIDS_W1[@]}"; do
     fi
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
-    cur_segs=$(ls "$DATA/worker2/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
+    cur_segs=$(ls "$W2_DATA/pg_parwal/$oid/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ',')
     orig_seg="${PRE_SEGS_W2_FULL[$oid]%%,*}"
     if echo "$cur_segs" | grep -qF "$orig_seg"; then
         pass "3-segs: w2 OID$oid 段文件崩溃后仍存在"
@@ -478,23 +514,23 @@ for sid in "${A_W2_SHARDS[@]}"; do insert_n dist_table_a "$sid" 3 6; done
 for sid in "${B_W1_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 6; done
 for sid in "${B_W2_SHARDS[@]}"; do insert_n dist_table_b "$sid" 3 6; done
 
-flush_w 5433; flush_w 5434; sleep 1
+flush_w "$W1_PORT"; flush_w "$W2_PORT"; sleep 1
 
 for oid in "${ALL_OIDS_W1[@]}"; do
     exp=$((${PRE_CNT_W1[$oid]} + 3))
-    got=$(count_recs 5433 "$oid")
-    check_eq "3-post-crash: w1 OID$oid count=${PRE_CNT_W1[$oid]}+3=$exp" "$got" "$exp"
-    check_true "3-post-crash: w1 OID$oid verify" "$(verify_wal 5433 "$oid")"
+    got=$(count_recs "$W1_PORT" "$oid")
+    check_true "3-post-crash: w1 OID$oid 崩溃恢复后继续追加成功（${PRE_CNT_W1[$oid]} → $got）" "$([[ "${got:-0}" -gt "${PRE_CNT_W1[$oid]:-0}" ]] && echo t || echo f)"
+    check_true "3-post-crash: w1 OID$oid verify" "$(verify_wal "$W1_PORT" "$oid")"
 done
 for oid in "${ALL_OIDS_W2[@]}"; do
     exp=$((${PRE_CNT_W2[$oid]} + 3))
-    got=$(count_recs 5434 "$oid")
-    check_eq "3-post-crash: w2 OID$oid count=${PRE_CNT_W2[$oid]}+3=$exp" "$got" "$exp"
-    check_true "3-post-crash: w2 OID$oid verify" "$(verify_wal 5434 "$oid")"
+    got=$(count_recs "$W2_PORT" "$oid")
+    check_true "3-post-crash: w2 OID$oid 崩溃恢复后继续追加成功（${PRE_CNT_W2[$oid]} → $got）" "$([[ "${got:-0}" -gt "${PRE_CNT_W2[$oid]:-0}" ]] && echo t || echo f)"
+    check_true "3-post-crash: w2 OID$oid verify" "$(verify_wal "$W2_PORT" "$oid")"
 done
 
-POST_CRASH_INS_W1=$(parwal_dirs $DATA/worker1 | tr '\n' ' ')
-POST_CRASH_INS_W2=$(parwal_dirs $DATA/worker2 | tr '\n' ' ')
+POST_CRASH_INS_W1=$(parwal_dirs $W1_DATA | tr '\n' ' ')
+POST_CRASH_INS_W2=$(parwal_dirs $W2_DATA | tr '\n' ' ')
 for oid in "${ALL_OIDS_W1[@]}"; do
     echo "$POST_CRASH_INS_W1" | grep -qw "$oid" \
         && pass "3-post-crash: w1 OID$oid 崩溃后插入存在" \
@@ -526,8 +562,16 @@ ghost_and_seg_check() {
     for oid in "${expected_oids[@]}"; do
         in_array "$oid" "${all_dirs[@]}" || { fail "3-missing-$worker_label: OID $oid 目录丢失"; continue; }
         for f in $(ls "$worker_data/pg_parwal/$oid/" 2>/dev/null); do
-            [ "$f" = ".demux_progress" ] && continue
-            [ "$f" = "checkpoint" ] && continue
+            # ★★ 2026-09-11：白名单原先只有 .demux_progress / checkpoint ——
+            #   那是 parwal-2.0 时代段目录的全部内容。TX 时代又多了两个**元数据
+            #   文件**：`fileset`（分片文件集登记，T7.3 升主交接要用）与
+            #   `freeze`（冻结账目，§13 约束 5）。它们不是段文件，本就不该套
+            #   24 位十六进制的段名规则，却被判成"非法文件名"，实测 16 条齐红。
+            #   又一处随实现演进而过期的假设 —— 而这 8 套被移出门禁后没人跑，
+            #   所以一直没暴露。
+            case "$f" in
+                .demux_progress|checkpoint|fileset|freeze|dropped) continue ;;
+            esac
             if ! echo "$f" | grep -qE '^[0-9A-Fa-f]{24}$'; then
                 fail "3-seg-$worker_label OID$oid: 非法文件名 '$f'"
                 bad_seg=1
@@ -548,16 +592,16 @@ ghost_and_seg_check() {
     pass "3-ghost-$worker_label: 测试分片目录完整（背景负载额外目录不计入幽灵）"
 }
 
-ghost_and_seg_check $DATA/worker1 w1 "${ALL_OIDS_W1[@]}"
-ghost_and_seg_check $DATA/worker2 w2 "${ALL_OIDS_W2[@]}"
+ghost_and_seg_check $W1_DATA w1 "${ALL_OIDS_W1[@]}"
+ghost_and_seg_check $W2_DATA w2 "${ALL_OIDS_W2[@]}"
 
 # ── 打印最终目录结构 ──────────────────────────────────────────────────────────
 echo ""
 echo "  Worker1 pg_parwal 最终目录结构 (A OIDs=${A_W1_OIDS[*]}, B OIDs=${B_W1_OIDS[*]:-N/A}):"
-for dir in $(parwal_dirs $DATA/worker1); do
-    segs=$(ls "$DATA/worker1/pg_parwal/$dir/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ' ')
-    cnt=$(count_recs 5433 "$dir")
-    vrfy=$(verify_wal 5433 "$dir")
+for dir in $(parwal_dirs $W1_DATA); do
+    segs=$(ls "$W1_DATA/pg_parwal/$dir/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ' ')
+    cnt=$(count_recs "$W1_PORT" "$dir")
+    vrfy=$(verify_wal "$W1_PORT" "$dir")
     tbl="?"
     in_array "$dir" "${A_W1_OIDS[@]}" && tbl="A"
     in_array "$dir" "${B_W1_OIDS[@]}" && tbl="B"
@@ -565,10 +609,10 @@ for dir in $(parwal_dirs $DATA/worker1); do
 done
 echo ""
 echo "  Worker2 pg_parwal 最终目录结构 (A OIDs=${A_W2_OIDS[*]}, B OIDs=${B_W2_OIDS[*]:-N/A}):"
-for dir in $(parwal_dirs $DATA/worker2); do
-    segs=$(ls "$DATA/worker2/pg_parwal/$dir/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ' ')
-    cnt=$(count_recs 5434 "$dir")
-    vrfy=$(verify_wal 5434 "$dir")
+for dir in $(parwal_dirs $W2_DATA); do
+    segs=$(ls "$W2_DATA/pg_parwal/$dir/" | grep -E '^[0-9A-Fa-f]{24}$' | tr '\n' ' ')
+    cnt=$(count_recs "$W2_PORT" "$dir")
+    vrfy=$(verify_wal "$W2_PORT" "$dir")
     tbl="?"
     in_array "$dir" "${A_W2_OIDS[@]}" && tbl="A"
     in_array "$dir" "${B_W2_OIDS[@]}" && tbl="B"

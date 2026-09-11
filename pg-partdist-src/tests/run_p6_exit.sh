@@ -31,7 +31,13 @@
 # 用法：bash run_p6_exit.sh [套件名...]    # 不给参数 = 全量
 set -u
 
-C="${CONTAINER:-pg-citus-tx2-container}"
+# ★★ 2026-09-11：默认容器改为 pg-test-container。
+#   本文件在 `shardpg-test` 分支上，工作区与容器都与 tx2 强隔离（见 PG_TEST_ENV.md）。
+#   默认值原本是 pg-citus-tx2-container —— 在本分支上不带 CONTAINER= 直接跑门禁，
+#   会**打到 tx2 去**，而 tx2 承载着 demo，明确要求不受干扰。
+#   （tx2 当前是停着的，所以此前误触只是 docker exec 全部失败、汇总全 0，没造成损害；
+#    但它一旦启动，同样的误触就是真事故。默认值必须指向本线自己的容器。）
+C="${CONTAINER:-pg-test-container}"
 T="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT_DIR:-/tmp/p6_exit_$(date +%Y%m%d-%H%M%S)}"
 PORTS="$(seq 5432 5440)"
@@ -79,16 +85,38 @@ SUITES=(
   "dtx_commit_marker_tx2 1200  TX2"
   "promote_catchup_tx3   1200  TX3"
   "fastpath_divergence_tx4 1200 TX4"
+  # ── ops 时代那 8 套：**2026-09-11 起并入门禁**（T7.13 完成，口径 31 → 39）
+  #   拓扑无关化后逐套跑绿：shard_auto_init 5/0、segment_boundary_lsn 6/0、
+  #   crash_recovery 36/0、demux_backlog_recovery 29/0、corrupt_segment_recovery 44/0、
+  #   bulk_insert_recovery 9/0、enospc_recovery 12/0、multi_table_isolation 146/0。
+  #   全部经 lib_topology.sh 取节点、停了必复原（含 kill -9 的残留锁处理）。
+  "shard_auto_init          900  ops"
+  "multi_table_isolation   1800  ops"
+  "segment_boundary_lsn     900  ops"
+  "bulk_insert_recovery    1200  ops"
+  "crash_recovery          1500  ops"
+  "demux_backlog_recovery  1500  ops"
+  "corrupt_segment_recovery 1200 ops"
+  "enospc_recovery         1200  ops"
 )
-# ── ops 时代那 8 套：**默认不进门禁**（R-P6-1 的口径，第二次修订）────────
+# ── ops 时代那 8 套：**已于 2026-09-11 并入上面的 SUITES**（T7.13）────────
 #
-# 它们是为**旧的 3 节点布局**（master / worker1 / worker2）写的，在 9 节点集群上
-# 会按那套名字停节点**且不复原**，把之后每一套都变成 `connection refused`。
-# 首版把它们收编进来，实测直接毒化整批（tso_si_p3 17/21、连带 7 套全红）。
+# 历史：它们是为**旧的 3 节点布局**（master / worker1 / worker2）写的，在 9 节点
+# 集群上会按那套名字停节点**且不复原**，把之后每一套都变成 `connection refused`。
+# 首版收编直接毒化整批（tso_si_p3 17/21、连带 7 套全红），于是 2026-09-09 移出
+# 默认门禁，改用 `--with-ops` 显式带上 —— 那是 R-P6-1 三个选项里有证据的 (c) 缩编。
 #
-# 处置：从默认门禁移出，需要时用 `--with-ops` 显式带上。要真正收编，得先把它们
-# 适配到 9 节点布局并保证"停了必复原"——那是独立一项，不该挡住 P6 出口。
-# 这正是 R-P6-1 三个选项里的 (c) 缩编，且是**有证据的缩编**而不是嫌麻烦。
+# ★ 但缩编是有代价的：**移出门禁 ⇒ 没人跑 ⇒ 错了也没人知道**。T7.13 改造时发现
+#   它们早已积了一批过期假设，而且从未暴露：
+#     · 08_schema_existence 的 expected 停在 parwal-2.0 时代（实际多出 69 个对象）；
+#     · crash_recovery 里 $DATA/master 路径不存在（本环境叫 coordinator），协调者
+#       从未被停/启，退出码被 `| tail -1` 吞掉 —— 死代码；
+#     · "1 行 1 条记录"的计数期望在 4 套里出现 7 次（实际每行约 3 条）；
+#     · multi_table_isolation 的段目录白名单不认 TX 时代新增的 fileset/freeze；
+#     · enospc 的 C 注入库把 worker1 写死在 TARGET_PREFIX 里 —— 只改 .sh 会变成
+#       "脚本在 A 节点注入、库只拦 B 节点"，注入失效而用例照样通过（假绿）。
+#
+# 下面的数组保留仅为 `--with-ops` 的向后兼容；默认门禁已直接包含这 8 套。
 OPS_SUITES=(
   "shard_auto_init          600  ops"
   "multi_table_isolation    600  ops"
@@ -485,7 +513,18 @@ ARGS=()
 for a in "$@"; do
   if [[ "$a" == "--with-ops" ]]; then WITH_OPS=1; else ARGS+=("$a"); fi
 done
-[[ "$WITH_OPS" == "1" ]] && SUITES+=("${OPS_SUITES[@]}")
+# ★ 2026-09-11：这 8 套已直接进 SUITES，`--with-ops` 不能再无脑追加 ——
+#   否则它们会被**跑两遍**（整轮时长翻倍，且第二遍在第一遍留下的现场上跑，
+#   结果不可信）。保留该开关只为向后兼容：只补 SUITES 里还没有的。
+if [[ "$WITH_OPS" == "1" ]]; then
+  for _ops in "${OPS_SUITES[@]}"; do
+    _n=${_ops%% *}
+    _dup=0
+    for _s in "${SUITES[@]}"; do [[ "${_s%% *}" == "$_n" ]] && { _dup=1; break; }; done
+    [[ "$_dup" == "0" ]] && SUITES+=("$_ops")
+  done
+  unset _ops _n _dup _s
+fi
 WANT=("${ARGS[@]+"${ARGS[@]}"}")
 declare -a NAMES=() RESULTS=()
 run_one() {  # <名字> <超时> <出身>

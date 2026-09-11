@@ -11,16 +11,37 @@
 #   4. Performance — Bulk INSERT overhead < 20% vs baseline (median of 3 x 20k rows)
 #   5. Regression  — All 37 existing tests still pass
 
-set -euo pipefail
+set -Eeuo pipefail
+# ★ -E（errtrace）不可少：trap ERR 默认**不被函数继承**，而 set -e 照样会因
+#   函数内部的失败终止脚本 —— 没有 -E 时陷阱一声不响，比没装还误导。
+trap 'echo "★ ERR: line $LINENO 命令失败 -> $BASH_COMMAND" >&2' ERR
 
 PSQL="/work/pg-install/bin/psql"
 PG_CTL="/work/pg-install/bin/pg_ctl"
 COORD_PORT=5432
-W1_PORT=5433
+W1_PORT=5433   # 保留仅为兼容旧引用；实际请用 $ALL_W / $WPORT
 W2_PORT=5434
 COORD_DATA=/work/pg-cluster-data/master
 W1_DATA=/work/pg-cluster-data/worker1
 W2_DATA=/work/pg-cluster-data/worker2
+
+
+# ★★ T7.13（P7-E2）：拓扑无关化（2026-09-11）。
+#   本套件的 count_all_parwal / verify_monotone 是**跨"两个 worker"求和/求与**，
+#   在 3 节点布局下"两个 worker"恰好就是全部 worker；9 节点上不成立 ——
+#   bulk_t 的分片会散在 8 个 worker 上，只统计 worker1/2 等于**漏掉大部分分片**，
+#   求和偏小、求与漏检，而断言仍会"通过"，是最危险的那种假绿。
+#   忠实的推广是**遍历全部 worker**（按 pg_dist_node 动态取）。
+source "$(cd "$(dirname "$0")" && pwd)/lib_topology.sh"
+topo_init || { echo "FATAL: 拓扑初始化失败" >&2; exit 1; }
+ALL_W=$(topo_worker_ports)
+WPORT=$(set -- $ALL_W; echo "$1")      # TEST 3 的 kill -9 对象
+WDATA=$(topo_datadir "$WPORT")
+[[ -n "$ALL_W" && -n "$WPORT" ]] || { echo "FATAL: 取不到 worker 列表" >&2; exit 1; }
+echo "worker 端口（动态）：$ALL_W；kill -9 对象：:$WPORT"
+
+# 在任意一组端口上跑同一条 SQL，逐行输出（供求和/求与用）
+each_w_sql() { local p; for p in $ALL_W; do $PSQL -U postgres -p "$p" -At -c "$1" 2>/dev/null | grep -v '^$' | tail -1; done; }
 PASS=0
 FAIL=0
 
@@ -46,7 +67,7 @@ check() {
 
 wait_cluster() {
     local port tries
-    for port in $COORD_PORT $W1_PORT $W2_PORT; do
+    for port in $COORD_PORT $ALL_W; do
         tries=0
         until $PSQL -U postgres -p $port -c "SELECT 1" >/dev/null 2>&1; do
             sleep 0.5; tries=$((tries+1))
@@ -56,9 +77,20 @@ wait_cluster() {
 }
 
 restart_all() {
-    $PG_CTL -D $COORD_DATA  restart -w -l $COORD_DATA/pg.log  >/dev/null 2>&1
-    $PG_CTL -D $W1_DATA     restart -w -l $W1_DATA/pg.log     >/dev/null 2>&1
-    $PG_CTL -D $W2_DATA     restart -w -l $W2_DATA/pg.log     >/dev/null 2>&1
+    local p d
+    # ★ 每条 pg_ctl 都要 `|| true`：本脚本开了 `set -euo pipefail`，
+    #   任何一个节点 restart 返回非零都会让整个脚本**无声退出**
+    #   （实测就这么停在 TEST 2，日志最后一行是"Records before restart"，
+    #   看起来像卡住，其实是死了）。同 lib_topology.sh 里立的那条纪律。
+    $PG_CTL -D $COORD_DATA restart -w -l $COORD_DATA/pg.log >/dev/null 2>&1 || true
+    # ★★ 协调者重启后必须删 TSO boot 标记，否则全簇停发号（本环境规程，
+    #   见 PG_TEST_ENV §4.1 ①）。原套件写于无 TSO 的 parwal-2.0 时代，没有这一步。
+    rm -f "$COORD_DATA/pg_tso_boot" 2>/dev/null || true
+    $PG_CTL -D $COORD_DATA restart -w -l $COORD_DATA/pg.log >/dev/null 2>&1 || true
+    for p in $ALL_W; do
+        d=$(topo_datadir "$p")
+        $PG_CTL -D "$d" restart -w -l "$d/pg.log" >/dev/null 2>&1 || true
+    done
     wait_cluster
 }
 
@@ -74,8 +106,8 @@ reset_parwal() {
     local sql="SET citus.override_table_visibility TO off;
                SELECT partdist.reset_partition_wal_state(c.oid)
                FROM pg_class c WHERE c.relname ~ '^bulk_t_[0-9]{4,}\$';"
-    $PSQL -U postgres -p $W1_PORT -c "$sql" >/dev/null 2>&1 || true
-    $PSQL -U postgres -p $W2_PORT -c "$sql" >/dev/null 2>&1 || true
+    local p
+    for p in $ALL_W; do $PSQL -U postgres -p "$p" -c "$sql" >/dev/null 2>&1 || true; done
 }
 
 # Count total PartWAL records across all bulk_t shards on both workers
@@ -86,10 +118,9 @@ count_records() {
                                  FROM partdist.check_partition_wal(c.oid)) AS cnt
                          FROM pg_class c
                          WHERE c.relname ~ '^bulk_t_[0-9]{4,}\$') t;"
-    local w1 w2
-    w1=$(w1_sql "$cnt_sql" | tail -1)
-    w2=$(w2_sql "$cnt_sql" | tail -1)
-    echo $(( ${w1:-0} + ${w2:-0} ))
+    local v total=0
+    for v in $(each_w_sql "$cnt_sql"); do total=$(( total + ${v:-0} )); done
+    echo "$total"
 }
 
 # Return "t" if all bulk_t shards on both workers have monotone LSN
@@ -100,10 +131,9 @@ verify_monotone() {
                      FROM (SELECT partdist.verify_partition_wal(c.oid) AS v
                            FROM pg_class c
                            WHERE c.relname ~ '^bulk_t_[0-9]{4,}\$') t;"
-    local m1 m2
-    m1=$(w1_sql "$check_sql" | tail -1)
-    m2=$(w2_sql "$check_sql" | tail -1)
-    if [[ "$m1" == "t" && "$m2" == "t" ]]; then echo "t"; else echo "f"; fi
+    local v all=t
+    for v in $(each_w_sql "$check_sql"); do [[ "$v" == "t" ]] || all=f; done
+    echo "$all"
 }
 
 # ---------------------------------------------------------------------------
@@ -181,15 +211,18 @@ test_crash() {
     cnt_pre=$(count_records)
     echo "  Records before crash: $cnt_pre"
 
-    # Kill worker1
+    # Kill 工作节点 :$WPORT（动态取，不再写死 worker1）
     local pid
-    pid=$(head -1 $W1_DATA/postmaster.pid 2>/dev/null || echo "")
+    pid=$(head -1 "$WDATA/postmaster.pid" 2>/dev/null || echo "")
     if [[ -z "$pid" ]]; then
-        fail "Crash: could not find worker1 PID"; return
+        fail "Crash: 取不到 :$WPORT 的 postmaster PID"; return
     fi
     kill -9 "$pid" 2>/dev/null; sleep 3
 
-    $PG_CTL -D $W1_DATA start -w -l $W1_DATA/pg.log >/dev/null 2>&1
+    # ★ 必须走 topo_start：kill -9 会留下 postmaster.pid 与
+    #   /tmp/.s.PGSQL.<port>.lock，而容器里 PID 容易被复用 ⇒ PG 认定
+    #   "还有 postmaster 在跑"，裸 `pg_ctl start` 死活起不来（本项目实测踩过）。
+    topo_start "$WPORT" || true
     sleep 3; wait_cluster
 
     local cnt_post

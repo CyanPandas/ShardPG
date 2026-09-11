@@ -23,12 +23,36 @@
 # Usage: run inside the container or via:
 #   docker exec pg-citus-cluster-container bash /work/pg-partdist-src/tests/test_enospc_recovery.sh
 
-set -euo pipefail
+set -Eeuo pipefail
+# ★ -E（errtrace）：trap ERR 默认不被函数继承，而 set -e 照样会因函数内部的
+#   失败终止脚本 —— 没有 -E 时陷阱一声不响，比没装还误导。
+trap 'echo "★ ERR: line $LINENO 命令失败 -> $BASH_COMMAND" >&2' ERR
 export PATH=/work/pg-install/bin:$PATH
 
-WORKER1_DATA=/work/pg-cluster-data/worker1
-WORKER1_PORT=5433
-WORKER2_PORT=5434
+# ★★ T7.13（P7-E2）：拓扑无关化（2026-09-11）。
+#   本套件建的是**各 worker 上的本地表**（非分布表），不依赖 Citus 分片落点 ——
+#   它只需要"两个不同的 worker"。所以写死 worker1/worker2 的唯一后果是：
+#   一旦这两个节点被别的套件停掉/占用，就会莫名其妙地红。按 pg_dist_node 动态取。
+source "$(cd "$(dirname "$0")" && pwd)/lib_topology.sh"
+topo_init || { echo "FATAL: 拓扑初始化失败" >&2; exit 1; }
+WORKER1_PORT=$(set -- $(topo_worker_ports); echo "$1")
+WORKER2_PORT=$(set -- $(topo_worker_ports); echo "$2")
+WORKER1_DATA=$(topo_datadir "$WORKER1_PORT")
+[[ -n "$WORKER1_PORT" && -n "$WORKER2_PORT" && -d "$WORKER1_DATA" ]] \
+    || { echo "FATAL: 取不到两个可用 worker（W1=$WORKER1_PORT W2=$WORKER2_PORT）" >&2; exit 1; }
+echo "本轮节点：注入 ENOSPC 的 :$WORKER1_PORT（$WORKER1_DATA）；对照 :$WORKER2_PORT"
+
+# ★★ 注入库的目标路径必须与**本轮选中的节点**一致。
+#   enospc_inject.c 原先把 worker1 写死在 TARGET_PREFIX 里；脚本动态选节点之后
+#   若不同步，就会"脚本在 :$WORKER1_PORT 注入、库却只拦 worker1 的写" ——
+#   注入不生效而用例照样跑完，是最难查的那种假绿。所以每轮按实际节点重编。
+INJECT_SRC=/work/pg-partdist-src/enospc_inject.c
+if [ -f "$INJECT_SRC" ]; then
+    gcc -shared -fPIC -DTARGET_PREFIX="\"$WORKER1_DATA/pg_parwal/\"" \
+        -o /tmp/libenospc_inject.so "$INJECT_SRC" -ldl 2>/dev/null \
+        && echo "  注入库已按 $WORKER1_DATA/pg_parwal/ 重新编译" \
+        || echo "  ⚠ 注入库编译失败，将沿用已有的 /tmp/libenospc_inject.so"
+fi
 
 # pg_ctl must run as the postgres user when invoked as root
 pgctl() {
@@ -133,7 +157,7 @@ echo ""
 echo "=== Phase 1: Restart worker1 with LD_PRELOAD injector ==="
 # ===================================================================
 
-pgctl pg_ctl -D "$WORKER1_DATA" -m fast stop 2>&1 | tail -1
+pgctl pg_ctl -D "$WORKER1_DATA" -m fast stop 2>&1 | tail -1 || true
 sleep 1
 
 if [ "$(id -u)" = "0" ]; then
@@ -304,9 +328,9 @@ echo ""
 echo "=== Phase 7: Cleanup — restart worker1 without LD_PRELOAD ==="
 # ===================================================================
 
-pgctl pg_ctl -D "$WORKER1_DATA" -m fast stop 2>&1 | tail -1
+pgctl pg_ctl -D "$WORKER1_DATA" -m fast stop 2>&1 | tail -1 || true
 sleep 1
-pgctl pg_ctl -D "$WORKER1_DATA" start -l "$WORKER1_DATA/pg.log" -w -t 30 2>&1 | tail -2
+pgctl pg_ctl -D "$WORKER1_DATA" start -l "$WORKER1_DATA/pg.log" -w -t 30 2>&1 | tail -2 || true
 psql -U postgres -p $WORKER1_PORT -c "SELECT 1;" > /dev/null
 echo "Worker1 restarted without LD_PRELOAD"
 

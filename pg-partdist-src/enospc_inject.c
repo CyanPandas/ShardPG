@@ -22,7 +22,18 @@
 #include <sys/types.h>
 
 #define INJECT_TRIGGER "/tmp/enospc_inject_active"
+/*
+ * ★★ T7.13（2026-09-11）：目标路径改为**编译期可传入**。
+ *   原先写死 worker1 —— 与 test_enospc_recovery.sh 写死 worker1 是同一个
+ *   3 节点假设。脚本改成按 pg_dist_node 动态选节点之后，若这里还钉在
+ *   worker1，就会出现"脚本在 :5437 上注入、库却只拦 worker1 的写"——
+ *   **注入不生效，而用例照样跑完**，是最难查的那种假绿。
+ *   编译：gcc -shared -fPIC -DTARGET_PREFIX='"'"'"<dir>/pg_parwal/"'"'"' \
+ *              -o /tmp/libenospc_inject.so enospc_inject.c -ldl
+ */
+#ifndef TARGET_PREFIX
 #define TARGET_PREFIX  "/work/pg-cluster-data/worker1/pg_parwal/"
+#endif
 #define TARGET_LEN     (sizeof(TARGET_PREFIX) - 1)
 
 static ssize_t (*real_write)(int, const void *, size_t) = NULL;

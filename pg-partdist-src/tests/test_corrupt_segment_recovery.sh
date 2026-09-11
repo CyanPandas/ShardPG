@@ -16,6 +16,21 @@
 PSQL=/work/pg-install/bin/psql
 PGCTL=/work/pg-install/bin/pg_ctl
 DATA=/work/pg-cluster-data
+
+# ★★ T7.13（P7-E2）：拓扑无关化（2026-09-11）。
+#   原先写死 worker1(:5433) 为工作节点，并用 shard_count=>4 —— 9 节点上那 4 个
+#   分片会散到 4 个**任意** worker，固定盯 worker1 有一半概率一个都取不到，
+#   于是 die "无法在 :$WPORT 找到 corrupt_test 的 OID"，看起来像产品缺陷。
+#   本套件**不停节点**（全程只读写段文件），所以只需把工作节点动态取、
+#   分片数提到 worker 数（轮转 ⇒ 每个 worker 恰好 1 个）。
+source "$(cd "$(dirname "$0")" && pwd)/lib_topology.sh"
+topo_init || { echo "FATAL: 拓扑初始化失败" >&2; exit 1; }
+NWORKERS=$(set -- $(topo_worker_ports); echo $#)
+WPORT=$(set -- $(topo_worker_ports); echo "$1")
+WDATA=$(topo_datadir "$WPORT")
+[[ -n "$WPORT" && -d "$WDATA" ]] || { echo "FATAL: 取不到可用 worker（WPORT=$WPORT）" >&2; exit 1; }
+echo "本轮工作节点：:$WPORT（$WDATA）；worker 数=$NWORKERS"
+
 HEADER_SIZE=40     # sizeof(PartWALHeader) = 40 字节（parwal-2.0 record version 2，含 xid），已在测试开头验证
 PASS=0; FAIL=0
 LOG_START_LINE=0   # snapshot of pg.log line count at test start
@@ -50,7 +65,7 @@ check_ge() {
 }
 
 # ── Worker1 helper ──────────────────────────────────────────────────
-psql1()    { $PSQL -p 5433 -U postgres -d postgres "$@"; }
+psql1()    { $PSQL -p "$WPORT" -U postgres -d postgres "$@"; }
 psql1_at() { psql1 -At -c "$1"; }
 psql0()    { $PSQL -p 5432 -U postgres -d postgres "$@"; }
 
@@ -90,14 +105,14 @@ END \$\$;"
 # 找到 partition 对应的段文件（最新的那个）
 get_seg_file() {
     local pid=$1
-    local dir="$DATA/worker1/pg_parwal/$pid"
+    local dir="$WDATA/pg_parwal/$pid"
     ls "$dir"/ 2>/dev/null | grep -v '^checkpoint$' | sort | tail -1 | xargs -I{} echo "$dir/{}"
 }
 
 no_panic_in_log() {
     local label=$1
     local new_content
-    new_content=$(tail -n +"$((LOG_START_LINE + 1))" "$DATA/worker1/pg.log" 2>/dev/null)
+    new_content=$(tail -n +"$((LOG_START_LINE + 1))" "$WDATA/pg.log" 2>/dev/null)
     # Only check for PANIC (true crash); FATAL is a connection-level error, expected under load
     if echo "$new_content" | grep -qE '\bPANIC\b'; then
         fail "$label: PANIC found in pg.log since test start"
@@ -113,7 +128,7 @@ echo "  pg_partdist — 段文件损坏恢复测试"
 echo "════════════════════════════════════════════════════════════════"
 
 # ── 全局设置 ─────────────────────────────────────────────────────────
-LOG_START_LINE=$(wc -l < "$DATA/worker1/pg.log" 2>/dev/null || echo 0)
+LOG_START_LINE=$(wc -l < "$WDATA/pg.log" 2>/dev/null || echo 0)
 echo "  pg.log 当前行数快照: $LOG_START_LINE（仅检查测试期间新增的 PANIC/FATAL）"
 
 echo ""
@@ -121,10 +136,10 @@ echo "── 设置：创建分布式表 ──"
 psql0 -o /dev/null -c "
     DROP TABLE IF EXISTS corrupt_test CASCADE;
     CREATE TABLE corrupt_test (id int PRIMARY KEY, val text);
-    SELECT create_distributed_table('corrupt_test','id',shard_count=>4);"
+    SELECT create_distributed_table('corrupt_test','id',shard_count=>$NWORKERS);"
 
 P_OID=$(psql1_at "SELECT oid FROM pg_class WHERE relname='corrupt_test' AND relkind='r' LIMIT 1;")
-[ -n "$P_OID" ] || die "无法在 worker1 找到 corrupt_test 的 OID"
+[ -n "$P_OID" ] || die "无法在 :$WPORT 找到 corrupt_test 的 OID"
 echo "  Worker1 OID: $P_OID"
 
 # ── 验证 sizeof(PartWALHeader) = HEADER_SIZE ──────────────────────────
@@ -316,9 +331,9 @@ psql1 -c 'SELECT pg_switch_wal();' -o /dev/null   # 二次确保段号递增
 write_records "$P_OID" 5
 flush_w1
 
-NSEGS=$(ls "$DATA/worker1/pg_parwal/$P_OID/" 2>/dev/null | wc -l)
+NSEGS=$(ls "$WDATA/pg_parwal/$P_OID/" 2>/dev/null | wc -l)
 echo "  当前段文件数: $NSEGS"
-SEG_B=$(ls "$DATA/worker1/pg_parwal/$P_OID/" 2>/dev/null | grep -v '^checkpoint$' | sort | tail -1 | xargs -I{} echo "$DATA/worker1/pg_parwal/$P_OID/{}")
+SEG_B=$(ls "$WDATA/pg_parwal/$P_OID/" 2>/dev/null | grep -v '^checkpoint$' | sort | tail -1 | xargs -I{} echo "$WDATA/pg_parwal/$P_OID/{}")
 [ "$SEG_A" != "$SEG_B" ] && pass "C4: 新记录写入了新段文件 SEG_B" || fail "C4: pg_switch_wal 未产生新段文件（可能 WAL 未换段）"
 
 TOTAL_BEFORE=$(count_records "$P_OID")
@@ -358,7 +373,7 @@ check_true "C4 完整恢复后 verify=true" "$C4_VFY_REC"
 echo ""
 echo "── 最终 PostgreSQL 日志检查 ──"
 # ════════════════════════════════════════════════════════════════════════
-PANIC_COUNT=$(tail -n +"$((LOG_START_LINE + 1))" "$DATA/worker1/pg.log" 2>/dev/null | grep -cE '\bPANIC\b' || true)
+PANIC_COUNT=$(tail -n +"$((LOG_START_LINE + 1))" "$WDATA/pg.log" 2>/dev/null | grep -cE '\bPANIC\b' || true)
 check_eq "Worker1 日志中（测试期间）PANIC 次数=0（不计 FATAL 连接错误）" "${PANIC_COUNT:-0}" "0"
 
 # ── 清理 ──────────────────────────────────────────────────────────────
