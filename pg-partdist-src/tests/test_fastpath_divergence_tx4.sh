@@ -35,6 +35,9 @@ PASS=0; FAIL=0
 
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
+# 关掉 Citus 的分片表可见性开关：MX 模式下分片表默认不在 pg_class 可见范围内，
+# `'<tbl>'::regclass` 会报 relation does not exist（T7.14 的基线发射要按名字取表）。
+PSQLV() { local port=$1; shift; docker exec -i -u postgres -e PGOPTIONS="-c citus.override_table_visibility=false" "$CONTAINER" /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 
 check() {
   if [[ -n "$2" && "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
@@ -135,12 +138,37 @@ check "回滚 prepared 后仍判为分叉（既成事实，须重做基线才能
 check "该 xid 本地判决已变为 aborted" \
       "$(PSQL $PA -Atc "SELECT pg_xact_status(${pxid}::text::xid8)")" "aborted"
 
+echo "========== [6] ★ T7.14：重做物理基线 → 分叉消除 → 重新获得参选资格 =========="
+# P7-E3 的缺口：本套件此前只验到"检测到分叉 + 升主被永久拒绝"，**没有归队的一半**。
+# 一个只会把节点永久判死、没有复活路径的规则，在生产上等同于"该分片少一个副本"。
+# 三个基线消费者（初始配对 / 永久分叉 / 快路径分叉）中，前两个各有 e2e，
+# 这一条补上第三个。
+#
+# 判据链条（缺一不可）：
+#   ① 基线发射成功且返回游标；② 分叉判据归零；③ promote_prepare 不再返回 -1。
+# ③ 是要害：-1 是"永不放行"，只要它还是 -1，前两条绿了也没有意义。
+base=$(PSQLV $PA -Atc "SELECT partdist.shard_baseline_emit('${TBL}'::regclass)" 2>&1 | tail -1)
+check "重做物理基线成功（base_plsn=${base}）" \
+      "$([[ "$base" =~ ^[0-9]+$ && "$base" -gt 0 ]] && echo ok)" "ok"
+
+d3=$(PSQL $PA -Atc "SELECT partdist.pg_raft_check_fastpath_divergence(${LOID}::oid)")
+check "★ 重做基线后分叉判据归零（d=${d3}）" "$d3" "0"
+
+p2=$(PSQL $PA -Atc "SELECT partdist.pg_raft_promote_prepare(${GID}, 2000)")
+check "★★ 升主前置不再是 -1（重新获得参选资格，p=${p2}）" \
+      "$([[ -n "$p2" && "$p2" -ge 0 ]] && echo ok)" "ok"
+
 echo ""
 health_check_no_crash
 # 丢提案时的表现正是"全 PASS + 有丢弃 = 运气"（见 lib_node_health.sh 头注释）——
 # 本用例全靠 Raft 把记录/标记送到 follower，必须一并核查。
 health_check_no_drops
 health_check_worker_pool
+# ★ 断言数守卫：本轮若中途静默退出（set -e / 节点起不来等），PASS/FAIL 统计
+#   看起来仍正常，只有"少跑了几条"能暴露。本项目已三次栽在这种静默形态上。
+if [[ "$((PASS+FAIL))" -lt 16 ]]; then
+  echo "FATAL: 只跑了 $((PASS+FAIL)) 条断言（应 >=16）——夹具中途退出，结果不可信"; exit 98
+fi
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "TX4 快路径分叉归队规则：全部通过"; else echo "TX4 快路径分叉归队规则：存在 FAIL"; fi
 

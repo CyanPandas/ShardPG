@@ -633,11 +633,32 @@ BEGIN
     WHILE i >= 1 AND scanned < p_max_scan LOOP
         scanned := scanned + 1;
         BEGIN
-            SELECT r.flags, r.info, r.gxid INTO rec
+            SELECT r.flags, r.info, r.gxid, r.data INTO rec
               FROM partdist.partwal_read_record(p_loid, i) r;
         EXCEPTION WHEN OTHERS THEN
             EXIT;                       -- 读不出来（截断/损坏）：不再往前
         END;
+
+        -- ★★ T7.14（P7-E3）2026-09-11：遇到**物理基线**即停 —— 它之前的记录
+        --   已被基线取代，不可能再造成分叉。
+        --
+        --   为什么非加不可：此前本函数只管从流尾往前扫，**完全不看基线**。
+        --   于是快路径分叉一旦发生就**没有任何归队路径** —— 重做物理基线之后
+        --   判据依然是 1、promote_prepare 依然返回 -1（永不放行），该副本被
+        --   永久判死，等于那个分片从此少一个副本。实测：基线发射成功
+        --   （base_plsn=35）而 d 仍为 1。
+        --   计划里"分叉是既成事实，**只有重做物理基线才行**"这句话，在本次
+        --   实装前是**不成立**的 —— 基线做了也不消除。现在才名副其实。
+        --
+        --   判据是 FILESET_UPDATE(opcode=0x01) 且载荷 flags 含 FULL_BASELINE
+        --   (0x0002)；载荷布局见 PartWALCtrlFilesetUpdate：nrels(4B) + flags(2B)，
+        --   故 flags 在偏移 4 的两字节小端。基线之后 follower 从新游标起放，
+        --   陈旧 COMMIT 标记永远不会被重放，所以"基线之前"确实与分叉无关。
+        IF rec.flags = 4 AND rec.info = 1
+           AND rec.data IS NOT NULL AND length(rec.data) >= 6
+           AND ((get_byte(rec.data, 5) << 8) | get_byte(rec.data, 4)) & 2 <> 0 THEN
+            EXIT;
+        END IF;
 
         -- flags=2 MARKER, info=0 XLOG_XACT_COMMIT
         IF rec.flags = 2 AND rec.info = 0 THEN
