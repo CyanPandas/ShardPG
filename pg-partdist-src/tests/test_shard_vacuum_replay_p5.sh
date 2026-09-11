@@ -277,7 +277,11 @@ TB=$(PSQL $pport -Atc "SET citus.override_table_visibility=false;
 check "算出截断点" "$([[ -n "$TB" && "$TB" -gt 3 ]] && echo ok)" "ok"
 # 本环境 TSO 未配置 ⇒ 提交写下的 commit_ts 恒 0，② 的守卫会（正确地）拦下；
 # 照 T5.2/T5.3c 的办法补真时间戳。
-PSQL $pport -Atc "SELECT sclog_wts(${SOID}::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TB-1))) g WHERE sclog_read(${SOID}::oid, g::bigint)=2" </dev/null >/dev/null
+# ★★ 2026-09-11：commit_ts 不写死（同 test_shard_vacuum_p5）。
+#   SI 判据是 commit_ts < 读者 start_ts，start_ts 来自 TSO 计数器；写死 1000
+#   等于隐含假设"TSO 已涨过 1000"。刚重置的集群 TSO 只有一两百（实测 160），
+#   判据翻转 ⇒ 活行读不回来。与 R-P6-20 同类："此前能跑只因现场有垫片"。
+PSQL $pport -Atc "SELECT sclog_wts(${SOID}::oid, g::bigint, 2, 1::bigint) FROM generate_series(3, $((TB-1))) g WHERE sclog_read(${SOID}::oid, g::bigint)=2" </dev/null >/dev/null
 SW=$(PSQL $pport -Atc "SELECT swept||'/'||sanitized||'/'||removed_aborted||'/'||removed_dead||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('${shard_tbl}'::regclass, ${TB}::bigint)" </dev/null | tail -1)
 check "sweep 干净收尾（零跳页零推迟）" "$(echo "$SW" | cut -d/ -f1,5,6)" "true/0/0"
 check "★ 主堆 + TOAST 一起清：删死元组 > 9" \

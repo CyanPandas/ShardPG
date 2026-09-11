@@ -102,6 +102,22 @@ CREATE OR REPLACE FUNCTION sclog_wts(oid, bigint, int, bigint) RETURNS void
   AS '$libdir/pg_partdist','partdist_shard_clog_write_ts' LANGUAGE C STRICT;
 SQL
 check "测试函数就绪" "$?" "0"
+
+# ★★ 2026-09-11：commit_ts 不再写死 1000。
+#
+#   本套件有 6 处 `sclog_wts(..., 2, 1000)` —— 把死元组所属事务的 commit_ts
+#   手工写成 1000，好让它们"已提交"。但 SI 的可见性判据是
+#   **commit_ts < 读者 start_ts**（§4.1），而 start_ts 来自 TSO 计数器。
+#   于是这 6 处隐含一个前提：**TSO 已经涨过 1000**。
+#   集群跑久了自然成立；**刚重置过的集群 TSO 只有一两百**，判据当场翻转，
+#   所有"活行仍可见"的断言齐红（实测 13 条），而 vacuum 本身全过 ——
+#   看起来像可见性回归，其实是用例对现场的隐藏依赖。
+#   与 R-P6-20 同一类："此前能跑只因现场有垫片"，环境一重置就现原形。
+#
+#   改法：取 1（TSO 从 1 起发，任何读者的 start_ts 都 >= 1，且本套件写的是
+#   **已经死掉**的元组，commit_ts 取最小值不影响它们"已提交"的语义）。
+#   不取当前 TSO 的原因：那是个移动目标，读的时刻与断言的时刻之间还会涨。
+CTS_COMMITTED=1
 DATADIR=$(PSQL "$WPORT" -Atc "SHOW data_directory" </dev/null)
 
 echo "========== [1] 构造四种 xmax 形态 =========="
@@ -258,7 +274,7 @@ INSERT INTO p5idx VALUES (4);
 DELETE FROM p5idx WHERE id IN (1,3);
 SQL
 TIX=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5idx',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OI::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TIX-1))) g WHERE sclog_read($OI::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OI::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TIX-1))) g WHERE sclog_read($OI::oid, g::bigint)=2" </dev/null >/dev/null
 IDX0=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM bt_page_items('p5idx_i',1)" </dev/null)
 check "清理前索引叶页有 4 条索引项" "$IDX0" "4"
 D5=$(PSQL "$WPORT" -Atc "SELECT tuples_removed||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_remove_dead('p5idx'::regclass, $TIX::bigint)" </dev/null)
@@ -299,7 +315,7 @@ check "中止删除行的 xmax 非 0" "$([[ -n "$XAB" && "$XAB" != "0" ]] && ech
 #   是"commit_ts < GlobalSafeTs"，0 会被守卫 fail-closed 拦住（实测确认）。
 #   照 T5.2 的办法用 sclog_wts 给已提交条目补上真时间戳，只动 COMMITTED 的，
 #   中止那条原样留着。
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OC::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TC-1))) g WHERE sclog_read($OC::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OC::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TC-1))) g WHERE sclog_read($OC::oid, g::bigint)=2" </dev/null >/dev/null
 check "已提交条目已补 commit_ts（中止那条仍是 ABORTED）" \
       "$(PSQL "$WPORT" -Atc "SELECT sclog_read($OC::oid,$XAB::bigint)" </dev/null)" "3"
 
@@ -351,7 +367,7 @@ INSERT INTO p5hot VALUES (1,'a');
 UPDATE p5hot SET v='b' WHERE id=1;
 SQL
 THOT=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5hot',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OHOT::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((THOT-1))) g WHERE sclog_read($OHOT::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OHOT::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((THOT-1))) g WHERE sclog_read($OHOT::oid, g::bigint)=2" </dev/null >/dev/null
 neg "★ 带索引 + HOT 链的死根元组即拒（LP_REDIRECT 未实现）" "带 HOT 链的死根元组" \
     "SELECT tuples_removed FROM partdist.shard_remove_dead('p5hot'::regclass, $THOT::bigint)"
 check "被拒后 p5hot 的行仍可见" "$(PSQL "$WPORT" -Atc "SELECT v FROM p5hot WHERE id=1" </dev/null)" "b"
@@ -383,7 +399,7 @@ check "TOAST 索引项数 = chunk 数" "$ti0" "$tn0"
 PSQL "$WPORT" -q -c "DELETE FROM p5t WHERE id <= 4;" </dev/null >/dev/null
 check "删后可见 4 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5t" </dev/null)" "4"
 TT=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5t',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OT::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TT-1))) g WHERE sclog_read($OT::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OT::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TT-1))) g WHERE sclog_read($OT::oid, g::bigint)=2" </dev/null >/dev/null
 # 清理前先把活行内容记下来，清完要逐字节对上（TOAST 取值走的正是那个索引）
 md5_before=$(PSQL "$WPORT" -Atc "SELECT md5(string_agg(v,'' ORDER BY id)) FROM p5t" </dev/null)
 SWT=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||removed_dead||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5t'::regclass, $TT::bigint)" </dev/null)
@@ -427,7 +443,7 @@ BEGIN; INSERT INTO p5e VALUES (9,'ghost'); ROLLBACK;   -- 中止插入 ⇒ ① �
 BEGIN; DELETE FROM p5e WHERE id=1; ROLLBACK;      -- 中止删除 ⇒ ③ 消毒（不消则截断后活行被判死）
 SQL
 TE=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5e',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OE::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TE-1))) g WHERE sclog_read($OE::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OE::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TE-1))) g WHERE sclog_read($OE::oid, g::bigint)=2" </dev/null >/dev/null
 check "构造后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
 check "初始水位 0/0"    "$(WM "$OE")" "0/0"
 # ★★ 核心验收：页未清完就截断，必须被拦
@@ -524,7 +540,7 @@ DELETE FROM p5h WHERE id=3;
 BEGIN; INSERT INTO p5h VALUES (9,'ghost'); ROLLBACK;
 SQL
 TH=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5h',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OH::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TH-1))) g WHERE sclog_read($OH::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OH::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TH-1))) g WHERE sclog_read($OH::oid, g::bigint)=2" </dev/null >/dev/null
 check "构造后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5h" </dev/null)" "2"
 # ★ 确定性地造出"趟不完整"：同一 session 里开着游标 FETCH 过一行，第 0 页就被
 #   本后端多钉了一个 pin，回收行指针要的 cleanup lock（要求 refcount==1）
@@ -566,7 +582,7 @@ BEGIN; INSERT INTO p5i VALUES (9,'ghost'); ROLLBACK;
 BEGIN; DELETE FROM p5i WHERE id=1; ROLLBACK;
 SQL
 TI=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5i',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OI2::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TI-1))) g WHERE sclog_read($OI2::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OI2::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TI-1))) g WHERE sclog_read($OI2::oid, g::bigint)=2" </dev/null >/dev/null
 SW3=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5i'::regclass, $TI::bigint)" </dev/null)
 check "sweep 干净收尾（未截断）" "$SW3" "true/0/0"
 check "★ 处于状态二：0/$TI（vx 跑在 tb 前面）" "$(WM "$OI2")" "0/$TI"
@@ -619,7 +635,7 @@ NX=$(PSQL "$WPORT" -Atc "SELECT age FROM partdist.shard_xid_age($OJ::oid)" </dev
 check "未截断时龄 = next_xid（tb=0）" "$([[ -n "$NX" && "$NX" -gt 3 ]] && echo ok)" "ok"
 check "相位 0（远未到龄）" "$(PHASE "$OJ")" "0"
 TJ=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5j',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TJ-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TJ-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
 PSQL "$WPORT" -Atc "SELECT swept FROM partdist.shard_vacuum_sweep('p5j'::regclass, $TJ::bigint)" </dev/null >/dev/null
 check "现处于状态二（0/$TJ）" "$(WM "$OJ")" "0/$TJ"
 # ★★ 状态二正是"基点选错就出错"的窗口：拿 vx 算龄会算成 next-vx（偏小），
@@ -680,7 +696,7 @@ check "p5k 未达停发线（相位 1 而非 2）" "$(PHASE "$OK2")" "1"
 # ★ 停发状态下 vacuum 自身必须还能跑 —— 它不领分片 xid，否则就死锁了：
 #   要解锁得推进截断点，而推进截断点又被停发挡住。
 TJ2=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5j',0)) WHERE lp_flags=1" </dev/null)
-PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, 1000::bigint) FROM generate_series(3, $((TJ2-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OJ::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((TJ2-1))) g WHERE sclog_read($OJ::oid, g::bigint)=2" </dev/null >/dev/null
 SWZ=$(PSQL "$WPORT" -Atc "SELECT swept FROM partdist.shard_vacuum_sweep('p5j'::regclass, $TJ2::bigint)" </dev/null)
 # 裸列输出布尔是 t（而 ||'/' 拼接走 boolean→text 输出函数、给的是 true）
 check "★ 停发状态下 vacuum 自身仍可运行（它不领分片 xid）" "$SWZ" "t"
