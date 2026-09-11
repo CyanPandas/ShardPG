@@ -17,6 +17,7 @@
 #   ./reproduce-env.sh up        # 克隆 + 起容器 + 编扩展 + initdb + 接线 + 等收敛
 #   ./reproduce-env.sh verify    # 六项一致性/功能校验（V1..V6，冒烟）
 #   ./reproduce-env.sh test      # 全量验收十套件，对齐分支记录的回归数字
+#   ./reproduce-env.sh reset     # 只重建数据目录（容器/扩展保留，不重新克隆）
 #   ./reproduce-env.sh destroy   # 删容器 + 删克隆目录
 #   ./reproduce-env.sh all       # up + verify
 #   ./reproduce-env.sh full      # up + verify + test（要几小时，但这才是"复现到已验证状态"）
@@ -116,6 +117,14 @@ do_up() {
   DEX bash -c 'cd /work/pg-raft-src && make clean >/dev/null 2>&1; make -s PG_CONFIG=/work/pg-install/bin/pg_config && make -s install PG_CONFIG=/work/pg-install/bin/pg_config' >/dev/null
   echo "两个扩展编译安装完成"
 
+  wire_cluster
+}
+
+# ------------------------------------------------------------------
+# wire_cluster —— initdb + 配置 + 装扩展 + Citus 接线 + 等 group0 收敛。
+# do_up 与 do_reset 共用同一份模板：复制一份出来迟早会和 do_up 走散。
+# ------------------------------------------------------------------
+wire_cluster() {
   echo "========== [4/6] initdb + 配置 ${N_NODES} 个节点 =========="
   local PEERS; PEERS=$(build_peers)
   local i dir port
@@ -198,6 +207,28 @@ SQL
   [[ -n "$leader" && "$leader" != "0" ]] || die "group0 在 60s 内未选出 leader"
   echo "group0 leader = node ${leader}（${t}s 收敛）"
   echo "环境 ${ENV_NAME} 就绪：容器 ${CONTAINER}，${N_NODES} 节点（coordinator:5432 + worker1..${N_WORKERS}:5433..$(node_port "$N_NODES")）"
+}
+
+# ------------------------------------------------------------------
+# do_reset —— 只重建 N 个数据目录，容器与已装好的扩展原样保留。
+#
+# 为什么需要它：`up` 会从 GitHub 重新克隆，**工作区里尚未提交的改动会被丢掉**。
+# 而验收又必须在干净集群上跑（跑过几轮的集群会积任期、残留 fileset、
+# 陈旧 partition_map 行，结果不作数）。改代码期间要干净现场，用这一支。
+# 注意：它不重编扩展 —— 自己先 make install 好，再 reset，最后节点是新起的，
+# 装载的就是新 .so。
+# ------------------------------------------------------------------
+do_reset() {
+  docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" || die "容器 $CONTAINER 不在运行，reset 需要一个已建好的环境"
+  echo "========== [reset] 停节点 + 清数据目录 =========="
+  local i
+  for i in $(seq 1 "$N_NODES"); do
+    DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/$(node_dir $i)" -m immediate stop >/dev/null 2>&1 || true
+  done
+  DEX0 rm -rf /work/pg-cluster-data
+  DEX0 mkdir -p /work/pg-cluster-data
+  DEX0 chown -R postgres:postgres /work/pg-cluster-data
+  wire_cluster
 }
 
 # ============================ verify ============================
@@ -397,8 +428,9 @@ case "${1:-all}" in
   up)      do_up ;;
   verify)  do_verify ;;
   test)    do_test ;;
+  reset)   do_reset ;;
   destroy) do_destroy ;;
   all)     do_up; do_verify ;;
   full)    do_up; do_verify; do_test ;;
-  *)       die "用法: $0 {up|verify|test|destroy|all|full}" ;;
+  *)       die "用法: $0 {up|verify|test|reset|destroy|all|full}" ;;
 esac

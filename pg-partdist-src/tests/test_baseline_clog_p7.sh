@@ -47,22 +47,36 @@ cleanup
 leader=$(PSQL $COORD -Atc "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()" </dev/null)
 check "group0 有 leader" "$([[ -n "$leader" && "$leader" != "0" ]] && echo ok)" "ok"
 PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_master = on;" </dev/null >/dev/null
+# ★ 协调者**自己也要配 tso_conninfo**：本套件的 join 三元组是在协调者上取的，
+#   而 `partdist_tso_client_start_ts()` 走的是**客户端**通路。不配就返回 0，
+#   join_info 变成 "gx,0,gsid" 非法值、事务当场中止 —— 而此前之所以能跑，
+#   是**靠上一轮 ALTER SYSTEM 的残留**；环境一重建就现原形。
+#   （与 R-P6-20 同一类："此前能跑只因现场有垫片"。）
+PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres';" </dev/null >/dev/null
 PSQL $COORD -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 tso=$(PSQL $COORD -Atc "SELECT partdist.partdist_tso_client_start_ts()" </dev/null 2>&1 | tail -1)
 check "TSO 可发号（boot 防呆未挡）" "$([[ "$tso" =~ ^[0-9]+$ ]] && echo ok)" "ok"
 
 echo "========== [1] 单分片分布表 =========="
-PSQL $COORD -q -c "DROP TABLE IF EXISTS t72_b;" </dev/null >/dev/null 2>&1
-PSQL $COORD -v ON_ERROR_STOP=1 -q </dev/null <<'SQL'
+# ★★ 每轮用**新表名**，不复用 t72_b（2026-09-10 实测教训）。
+#   本套件按设计会在 worker 上直删分片表、把协调者侧的分布表留成半删状态，
+#   而那张表**再也删不掉**：DROP 走 Citus 2PC，会被 §10「含分片打标表 DROP
+#   禁 PREPARE」拦下；就算绕到各节点本地删，那个分区组这时往往已经因为主副本
+#   的表先没了而凑不齐多数派，propose 直接失败。
+#   于是复用同一个表名的话，第二轮必撞 "relation already exists"。
+#   顺手尽力清一次历史残留，失败就算了 —— 清不掉正是上面那个原因。
+TBASE="t72_b_$(date +%H%M%S)"
+PSQL $COORD -q -c "DROP TABLE IF EXISTS ${TBASE};" </dev/null >/dev/null 2>&1
+PSQL $COORD -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.shard_count = 1;
 SET citus.shard_replication_factor = 1;
-CREATE TABLE t72_b(id int, v text);
-SELECT create_distributed_table('t72_b','id');
-ALTER TABLE t72_b SET (autovacuum_enabled = off);
+CREATE TABLE ${TBASE}(id int, v text);
+SELECT create_distributed_table('${TBASE}','id');
+ALTER TABLE ${TBASE} SET (autovacuum_enabled = off);
 SQL
-GA=$(PSQL $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='t72_b'::regclass" </dev/null)
+GA=$(PSQL $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='${TBASE}'::regclass" </dev/null)
 PA=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GA" </dev/null)
-TBL="t72_b_${GA}"
+TBL="${TBASE}_${GA}"
 check "单分片就绪（shard=$GA @:$PA）" "$([[ -n "$GA" && -n "$PA" ]] && echo ok)" "ok"
 f1=""; f2=""
 for p in 5433 5434 5435 5436 5437 5438; do
@@ -90,6 +104,9 @@ check "leader 打标生效（oid=$OID_A）" "$guc" "$OID_A"
 echo "========== [3] ★ 先写数据（判决落进 leader 的分片 clog）=========="
 GX=$(PSQL $COORD -Atc "SELECT partdist.partdist_gxid_next()" </dev/null | tail -1)
 STS=$(PSQL $COORD -Atc "SELECT partdist.partdist_tso_client_start_ts()" </dev/null | tail -1)
+# ★ 先断言三元组本身合法，别把"取号取到 0"留给后面的断言去表现成"行取不到"
+check "join 三元组合法（gxid=$GX start_ts=$STS，二者都须 >0）" \
+      "$([[ "$GX" =~ ^[0-9]+$ && "$GX" -gt 0 && "$STS" =~ ^[0-9]+$ && "$STS" -gt 0 ]] && echo ok)" "ok"
 w=$(PSQLV $PA -At </dev/null 2>&1 <<SQL
 BEGIN;
 SET LOCAL pg_partdist.join_info = '${GX},${STS},${GA}';
@@ -115,7 +132,7 @@ for fp in $f1 $f2; do
   PSQL $fp -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.enable_ddl_propagation = off;
 DROP TABLE IF EXISTS ${TBL};
-CREATE TABLE ${TBL} (LIKE t72_b INCLUDING ALL);
+CREATE TABLE ${TBL} (LIKE ${TBASE} INCLUDING ALL);
 ALTER TABLE ${TBL} SET (autovacuum_enabled = off);
 SQL
   np=$(PSQL $fp -Atc "SELECT partdist.replay_set_locmap('${TBL}', ARRAY[${roles}], ARRAY[${ords}], ARRAY[${spcs}]::oid[], ARRAY[${dbs}]::oid[], ARRAY[${rels}]::oid[])" </dev/null)
@@ -139,6 +156,19 @@ base=$(PSQLV $PA -Atc "SELECT partdist.shard_baseline_emit('${TBL}'::regclass)" 
 check "物理基线已发射（base_plsn=$base）" "$([[ "$base" =~ ^[0-9]+$ ]] && echo ok)" "ok"
 
 echo "========== [5] ★★ 副本回放后，基线之前的分片 xid 也有判决 =========="
+# ★ 主可能在建站→写数据→发基线这段时间里漂走（本宿主机 2 核 9 节点，实测 30 秒内
+#   就漂过；partition_map 与 pg_dist_placement 都正确跟随 —— 路由层是好的，是夹具
+#   假设了"主不动"）。这里按**当前** placement 重算主与副本，别认开局那个。
+NEWPA=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GA" </dev/null)
+if [[ -n "$NEWPA" && "$NEWPA" != "$PA" ]]; then
+  echo "        [注意] 分片主已从 :$PA 漂到 :$NEWPA，按当前 placement 重算副本"
+  PA=$NEWPA
+  f1=""; f2=""
+  for p in 5433 5434 5435 5436 5437 5438; do
+    [[ "$p" == "$PA" ]] && continue
+    if [[ -z "$f1" ]]; then f1=$p; elif [[ -z "$f2" ]]; then f2=$p; break; fi
+  done
+fi
 ok5=""; det=""
 for fp in $f1 $f2; do
   foid=$(PSQLV $fp -Atc "SELECT '${TBL}'::regclass::oid" </dev/null | tail -1)
@@ -176,19 +206,26 @@ done
 check "DROP 之前副本是 armed 的（$armed_before）" \
       "$([[ "$armed_before" == *"armed=t"* ]] && echo ok)" "ok"
 
-# ★ 先撤白名单再删：**带白名单删分布表会被 §10 的"含分片打标表 DROP 禁 PREPARE"
-#   拦下**（Citus 的 DDL 走 2PC），表会静默存活 —— 于是"DROP 了却没通知副本"
-#   看起来像本修复没生效，实则 DROP 根本没发生。这条坑本仓库
-#   test_dtx_convergence_p4.sh 里已经记过一次，这里照做。
-for p in $(seq 5432 5440); do
-  PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null 2>&1
-  PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
-done
+# ★★ 为什么不走 `DROP TABLE ${TBASE}`（协调者侧）：
+#   ① 带白名单删分布表会被 §10「含分片打标表 DROP 禁 PREPARE」拦下（Citus DDL 走
+#      2PC），表静默存活 —— 于是"DROP 了却没通知副本"看起来像修复没生效；
+#   ② **撤白名单也不再管用**（T7.4 之后）：升主/建组会把 OID 加进 shmem 打标集，
+#      `ShardGatingActive()` 因此保持为真，禁令照拦。那个行为本身是**对的**
+#      （这个分片确实是打标的），要改的是夹具。
+#   所以这里在**主节点上直接删分片表**（`enable_ddl_propagation=off`），
+#   这正是 leader 侧"fileset 里有、catalog 里没了"的形态 —— T7.8 要验的就是它。
+LEADPORT=$PA
+PSQLV $LEADPORT -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE ${TBL};" </dev/null >/dev/null 2>&1
+gone=$(PSQLV $LEADPORT -Atc "SELECT count(*) FROM pg_class WHERE relname='${TBL}'" </dev/null | tail -1)
+check "主节点 :$LEADPORT 上分片表已删除" "$gone" "0"
+# ★★ 通知**不是**在 DROP 语句执行完那一刻发的，也不在 PRE_COMMIT 上
+#   （2026-09-10 修正：我上一版注释写的"没有 2PC 就走 PRE_COMMIT 那条常规
+#     路径"是错的 —— PRE_COMMIT 上只有 fileset 发射器，压根没有 DROP 扫描，
+#     所以普通 DROP 一条通知都发不出来，实测 leader 日志里零命中）。
+#   现在是**提交后惰性补发**：提交回调只推一次 shmem 代次，扫描推迟到
+#   本节点**下一条语句**开头。所以这里必须在主节点上再发一条语句去触发它。
+PSQLV $LEADPORT -Atc "SELECT 1" </dev/null >/dev/null 2>&1
 sleep 2
-PSQL $COORD -q -c "DROP TABLE t72_b;" </dev/null >/dev/null 2>&1
-gone=$(PSQL $COORD -Atc "SELECT count(*) FROM pg_class WHERE relname='t72_b'" </dev/null)
-check "leader 侧 DROP 成功（协调者上已不存在）" "$gone" "0"
-sleep 3
 ok6=""; det6=""
 for fp in $f1 $f2; do
   foid=$(PSQLV $fp -Atc "SELECT '${TBL}'::regclass::oid" </dev/null 2>/dev/null | tail -1)
@@ -196,7 +233,7 @@ for fp in $f1 $f2; do
   for t in $(seq 1 30); do
     ftip=$(PSQL $fp -Atc "SELECT partdist.get_partition_flush_lsn(${foid})" </dev/null 2>/dev/null)
     [[ -n "$ftip" && "$ftip" != "0" ]] && \
-      PSQL $fp -q -c "SELECT partdist.replay_catchup(${foid}::regclass, ${ftip}, 30000)" </dev/null >/dev/null 2>&1
+      PSQL $fp -q -c "SELECT partdist.replay_catchup(${foid}::regclass, ${ftip}, 3000)" </dev/null >/dev/null 2>&1
     a=$(PSQL $fp -Atc "SELECT armed FROM partdist.replay_status() WHERE shard=${foid}" </dev/null 2>/dev/null | tail -1)
     [[ "$a" == "f" ]] && { ok6=ok; det6+="[:$fp armed=f（${t}s）] "; break; }
     sleep 1
@@ -211,7 +248,7 @@ echo "            运维做删除；摘掉 armed 之后它就是一张普通本�
 
 echo
 echo "结果：PASS=${PASS} FAIL=${FAIL}"
-if [[ "$NCHECK" -lt 15 ]]; then
-  echo "FATAL: 只跑了 ${NCHECK} 条断言（应 >=15）——夹具中途退出，结果不可信"; exit 98
+if [[ "$NCHECK" -lt 16 ]]; then
+  echo "FATAL: 只跑了 ${NCHECK} 条断言（应 >=16）——夹具中途退出，结果不可信"; exit 98
 fi
 exit $FAIL

@@ -256,8 +256,29 @@ echo "========== [4] 跨分片 2PC 提交 + 判决收敛 =========="
 # ★ 写入要能容忍**分区主的自治切换**：切主后 placement 会跟着走（路由层已实证），
 #   但正在飞的那条语句会撞 `本节点不是该分区组的 leader / 请经路由层重试`。
 #   夹具照它自己的 DETAIL 办：重试，并在每次重试前重取 join 三元组、补白名单。
+# ★★ T7.16（P7-E5）：写之前**等拓扑稳定**，而不是撞上了才重试。
+#   2026-09-10 实测：本宿主机 2 核跑 9 节点，group0 一度连着 term=38/41/44 改选
+#   （load average 11+），三次重试全部撞在「分区主副本可能已切换」上，套件红了 ——
+#   而这与被测的 R-P6-15/R-P6-18 毫无关系。这正是计划里说的"批次红、单跑绿"
+#   伪信号：判据不该是"重试几次碰运气"，而该是"等不到稳定就一直等"。
+#   稳定判据：两个分片的 placement 连续 STABLE_N 次取样不变。
+wait_topology_stable() {
+  local prev="" cur n=0 t
+  for t in $(seq 1 90); do
+    cur=$(PSQL $COORD -Atc "SELECT string_agg(p.shardid||':'||n.nodeport, ',' ORDER BY p.shardid) FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid IN ($GA,$GB)" </dev/null 2>/dev/null)
+    if [[ -n "$cur" && "$cur" == "$prev" ]]; then
+      n=$((n+1)); [[ "$n" -ge 4 ]] && { echo "        拓扑已稳定（${t}s）：$cur"; return 0; }
+    else
+      n=0
+    fi
+    prev="$cur"; sleep 2
+  done
+  echo "        ⚠ 90s 内拓扑仍未稳定（最后一次：$prev）——继续尝试，但本轮结果存疑"
+  return 1
+}
 txn_ok=""
-for try in 1 2 3; do
+for try in 1 2 3 4 5 6; do
+  wait_topology_stable
   GX=$(PSQL $COORD -Atc "SELECT partdist.partdist_gxid_next()" </dev/null | tail -1)
   STS=$(PSQL $COORD -Atc "SELECT partdist.partdist_tso_client_start_ts()" </dev/null | tail -1)
   out=$(PSQL $COORD -v ON_ERROR_STOP=1 -At </dev/null 2>&1 <<SQL
@@ -275,7 +296,7 @@ SQL
   mark_all
   sleep 3
 done
-check "跨分片 2PC 事务提交成功（第 ${try} 次，gxid=$GX coord_gsid=$GA）" "$txn_ok" "ok"
+check "跨分片 2PC 事务提交成功（第 ${try}/6 次，gxid=$GX coord_gsid=$GA）" "$txn_ok" "ok"
 
 # ★ 主可能已经漂走：后面的断言一律按**当前** placement 取节点，不认开局那个。
 PA=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GA" </dev/null)
@@ -316,18 +337,44 @@ check "leader 判决带非零 commit_ts（cts=$CTS）" \
 
 echo "========== [5][6] leader 段流：判决标记带分片 xid 尾 =========="
 after=$(PSQL $PA -Atc "SELECT partdist.get_partition_flush_lsn(${LOID})" </dev/null)
-# COMMIT 标记 = flags 位 2(MARKER) 且 info=0(XLOG_XACT_COMMIT)；取最后一条
+# COMMIT 标记 = flags 位 2(MARKER) 且 info=0(XLOG_XACT_COMMIT)。
+# ★★ 定位判据是「载荷尾部的分片 xid == 本行 xmin」，**不是**"取最后一条"
+#    （2026-09-10 改正）。"最后一条"以前碰巧就是本事务的判决标记，但同一个
+#    分区上任何一笔普通本地事务都会在它之后再写一条 24 字节、flags=0 的
+#    COMMIT 标记 —— 夹具于是对着一个**陌生事务**做断言，报出
+#    「长度=24 期望 32 / flags=0 期望 7 / start_ts 是墙钟」三连红，
+#    看着像修复失效，实测流里 g=7 明明是 len=32 pflags=7 sxid=3 start_ts=88，
+#    完全正确，只是被 g=9 挡在了后面。
+#    按分片 xid 定位是**自证**的：找得到就说明尾部真的带了这一笔的分片 xid
+#    （这正是 R-P6-15 的判据），找不到则如实红。
 cmk=$(PSQL $PA -Atc "
   SELECT g FROM generate_series(1, ${after}) g,
        LATERAL partdist.partwal_read_record(${LOID}::oid, g) r
-   WHERE r.flags = 2 AND r.info = 0 ORDER BY g DESC LIMIT 1" </dev/null)
-check "leader 有 COMMIT 标记" "$([[ -n "$cmk" ]] && echo ok)" "ok"
+   WHERE r.flags = 2 AND r.info = 0
+     AND length(r.data) >= 28
+     AND ((get_byte(r.data,27)::bigint<<24)|(get_byte(r.data,26)::bigint<<16)|(get_byte(r.data,25)::bigint<<8)|get_byte(r.data,24)::bigint) = ${SX}
+   ORDER BY g DESC LIMIT 1" </dev/null)
+check "★ leader 流里有携带本行分片 xid(=$SX) 的 COMMIT 标记（R-P6-15 判据）" \
+      "$([[ -n "$cmk" ]] && echo ok)" "ok"
 if [[ -n "$cmk" ]]; then
   dlen=$(PSQL $PA -Atc "SELECT length(data) FROM partdist.partwal_read_record(${LOID}::oid, ${cmk})" </dev/null)
   # 24 头 + 4 分片 xid + 4 发号水位 = 32；修复前是 24
   check "★ 判决标记长度=32（带分片 xid 尾；修复前为 24）" "$dlen" "32"
   flg=$(PSQL $PA -Atc "SELECT ((get_byte(data,23)::bigint<<24)|(get_byte(data,22)::bigint<<16)|(get_byte(data,21)::bigint<<8)|get_byte(data,20)::bigint) FROM partdist.partwal_read_record(${LOID}::oid, ${cmk})" </dev/null)
-  check "★ 判决标记 flags 含 HAS_SHARD_XID(0x1)+HAS_ALLOC_WM(0x2)" "$flg" "3"
+  # ★ T7.11 起期望值从 3 变 7：多了 STS_IS_TSO(0x4)。
+  #   判决标记的 start_ts 取自未决登记，与 leader 自己那条
+  #   `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 同源，是 TSO 号，故置位。
+  check "★ 判决标记 flags = HAS_SHARD_XID(0x1)+HAS_ALLOC_WM(0x2)+STS_IS_TSO(0x4)" "$flg" "7"
+  # ★★ T7.11（R-P6-18）的直接判据：标记里的 start_ts 必须**就是** TSO 发的那个号。
+  #   修复前这里是 `GetCurrentTransactionStartTimestamp()` 的墙钟微秒（~8.4e14），
+  #   与 TSO 不同宇宙 —— 回放侧原样写进副本的 PREPARED 槽，§4.2 三态第一支
+  #   （`slot.start_ts <= 读者快照`）恒假，第三支"问协调者"永远不执行。
+  #   载荷布局：start_ts 是偏移 0 的 8 字节小端（见 TxnMarkerPayload）。
+  mts=$(PSQL $PA -Atc "SELECT ((get_byte(data,7)::bigint<<56)|(get_byte(data,6)::bigint<<48)|(get_byte(data,5)::bigint<<40)|(get_byte(data,4)::bigint<<32)|(get_byte(data,3)::bigint<<24)|(get_byte(data,2)::bigint<<16)|(get_byte(data,1)::bigint<<8)|get_byte(data,0)::bigint) FROM partdist.partwal_read_record(${LOID}::oid, ${cmk})" </dev/null)
+  check "★★ 标记 start_ts == 本事务的 TSO 号（mts=$mts，TSO=$STS；修复前是墙钟微秒）" \
+        "$mts" "$STS"
+  check "★★ 该值在 TSO 宇宙（<1e9；墙钟量级是 ~8.4e14）" \
+        "$([[ "$mts" =~ ^[0-9]+$ && "$mts" -lt 1000000000 ]] && echo ok)" "ok"
   msx=$(PSQL $PA -Atc "SELECT ((get_byte(data,27)::bigint<<24)|(get_byte(data,26)::bigint<<16)|(get_byte(data,25)::bigint<<8)|get_byte(data,24)::bigint) FROM partdist.partwal_read_record(${LOID}::oid, ${cmk})" </dev/null)
   check "★ 标记里的分片 xid == 该行 xmin" "$msx" "$SX"
 fi
@@ -338,7 +385,7 @@ echo "========== [7] ★★ follower 回放后判决落账（R-P6-15 的直接�
 #   实测中 :5435 中途被选成新主（日志：「已接管为主，解除副本读闸门；此后拒绝
 #   对它触发回放」）—— 它不再是副本，对它断言回放没有意义。这是环境的拓扑
 #   抖动（R-P6-13），不是本修复的问题；夹具按现状取角色。
-ok7=""; det7=""
+ok7=""; det7=""; fsts=""
 for fp in $f1 $f2; do
   [[ -z "$SX" || ! "$SX" =~ ^[0-9]+$ ]] && break
   foid=$(PSQLV $fp -Atc "SELECT '${TBL}'::regclass::oid" </dev/null | tail -1)
@@ -358,11 +405,23 @@ for fp in $f1 $f2; do
   det7+="[:$fp oid=$foid $ff] "
   if [[ "$ff" == *"st=2"* ]]; then
     fcts=$(sed -E 's/.*cts=([0-9]+).*/\1/' <<< "$ff")
+    fsts=$(sed -E 's/.*sts=([0-9]+).*/\1/' <<< "$ff")
     [[ "$fcts" == "$CTS" ]] && { ok7=ok; break; }
   fi
 done
 check "★★ 至少一个副本判 st=2 且 cts 与 leader 相同（修复前恒为 st=1 PREPARED）" "$ok7" "ok"
 echo "        取证：$det7"
+
+# ★★ T7.11 的副本侧判据。
+#   分片 clog 的 start_ts 列在判决落账时是**保留**的（shard_clog.h：「读改写保留
+#   既有 start_ts 列」），所以此刻读到的 sts 仍是 **PREPARE 时刻**写进去的那个值
+#   —— 于是不必去抢 PREPARED 这个瞬态窗口，就能证明副本落的不是墙钟。
+#   修复前这里是 ~8.4e14 的微秒墙钟；leader 自己那条遗留模式存的却是 0，
+#   同一个事务两边对不上。
+check "★★ 副本 clog 的 sts 与 leader 的 TSO 号一致（fsts=$fsts，TSO=$STS）" \
+      "$fsts" "$STS"
+check "★★ 副本 sts 在 TSO 宇宙（<1e9；修复前是 ~8.4e14 的墙钟微秒）" \
+      "$([[ "$fsts" =~ ^[0-9]+$ && "$fsts" -lt 1000000000 ]] && echo ok)" "ok"
 
 echo "========== [8] 阴性：ABORT 的跨分片事务同样落到副本 =========="
 GX2=$(PSQL $COORD -Atc "SELECT partdist.partdist_gxid_next()" </dev/null | tail -1)
@@ -381,8 +440,8 @@ check "ROLLBACK 的行不可见" \
 echo
 echo "结果：PASS=${PASS} FAIL=${FAIL}"
 # ★ 计数守卫：零个检查会静默通过（feedback: test-harness-silent-pass）
-if [[ "$NCHECK" -lt 24 ]]; then
-  echo "FATAL: 只跑了 ${NCHECK} 条断言（应 >=24）——夹具中途退出，结果不可信"
+if [[ "$NCHECK" -lt 28 ]]; then
+  echo "FATAL: 只跑了 ${NCHECK} 条断言（应 >=28）——夹具中途退出，结果不可信"
   exit 98
 fi
 health_check_no_drops || true

@@ -60,10 +60,23 @@ PSQLO $W "$NOPROP" -q -c "INSERT INTO t66neg SELECT g,'v'||g FROM generate_serie
 vis=$(PSQLO $W "$NOPROP" -Atc "SELECT count(*) FROM t66neg" </dev/null 2>&1 | head -1)
 check "打标后写入的行可见（$vis 行）" "$vis" "20"
 
-# ★ 协调者侧也要打标：Citus 运维六项的闸门判据是 ShardGatingActive()，
-#   白名单只设在 worker 上时，协调者那支根本不生效（首版因此取空）。
-PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${OID}'" </dev/null >/dev/null
-PSQL $COORD -q -c "SELECT pg_reload_conf()" </dev/null >/dev/null
+# ★★ R-P6-22（2026-09-10 修复后撤掉的夹具拐杖）——**这两行以前在这里**：
+#
+#     # 协调者侧也要打标：Citus 运维六项的闸门判据是 ShardGatingActive()，
+#     # 白名单只设在 worker 上时，协调者那支根本不生效（首版因此取空）。
+#     ALTER SYSTEM SET pg_partdist.shard_relids = '<worker 上那张表的 OID>'
+#
+# 那句注释其实已经把真相写出来了，只是没人往下追一步：**协调者上本来就没有
+# 打标表、也没人给它设白名单**，所以生产形态下 §9.2 第 3 层整层是熄火的 ——
+# 而 `$OID` 还是 worker 5433 上 `t66neg` 的 OID，在协调者上根本不指向任何打标表。
+# 夹具用一个不相干的 OID 把闸门掰开，然后断言闸门生效，等于没验。
+#
+# T7.9/R-P6-22 把判据换成**集群级**（`pg_raft.raft_enabled`：本集群由 raft 管放置
+# ⇒ Citus 搬运类 UDF 一律禁，与本节点有没有打标表无关）之后，拐杖可以撤掉。
+# 下面这条断言就是撤掉的凭据：协调者白名单必须**为空**，禁令仍然要触发。
+coord_guc=$(PSQL $COORD -Atc "SHOW pg_partdist.shard_relids" </dev/null)
+check "★★ 协调者白名单为空（生产形态；禁令不再靠夹具掰闸门）" \
+      "$([[ -z "$coord_guc" ]] && echo empty)" "empty"
 
 # ban <名字> <期望出现的片段> <SQL...>
 ban() {
@@ -158,16 +171,50 @@ check "★★ 禁：citus_rebalance_start —— 子查询套一层" \
 sm4=$(PSQL $COORD -Atc "WITH x AS (SELECT * FROM citus_rebalance_start()) SELECT * FROM x" </dev/null 2>&1 | tr '\n' ' ')
 check "★★ 禁：citus_rebalance_start —— CTE（走 pstmt->subplans）" \
       "$([[ "$sm4" == *"T4.6/§9.2"* ]] && echo banned)" "banned"
+# ★ T7.9：审计查出的 8 个同类 UDF（Citus 13.1 里都存在，实测 pg_proc 全是 C 函数）。
+#   它们同样亲手搬/读分片数据；此前一个都不在清单里。逐个一条负向断言。
+for fn in "citus_drain_node('localhost',5433)" \
+          "citus_split_shard_by_split_points(1,ARRAY['0']::text[],ARRAY[1]::int[])" \
+          "isolate_tenant_to_new_shard('pg_dist_node',1)" \
+          "master_move_shard_placement(1,'localhost',5433,'localhost',5434)" \
+          "master_copy_shard_placement(1,'localhost',5433,'localhost',5434)" \
+          "replicate_table_shards('pg_dist_node')" \
+          "citus_schema_move('public','localhost',5433)" \
+          "alter_table_set_access_method('pg_dist_node','heap')"; do
+  nm=${fn%%(*}
+  out=$(PSQL $COORD -Atc "SELECT ${fn}" </dev/null 2>&1 | tr '\n' ' ')
+  check "★ 禁（T7.9 新补）：${nm}" \
+        "$([[ "$out" == *"T4.6/§9.2"* ]] && echo banned)" "banned"
+done
+
 # 阴性对照：修好的遍历**不能**误伤普通函数（否则就是"全禁"式假通过）
 ok1=$(PSQL $COORD -Atc "SELECT count(*) FROM generate_series(1,3)" </dev/null 2>&1 | head -1)
 check "  阴性对照：普通函数 FROM 形式仍放行" "$ok1" "3"
 
-echo "================ [6] 引用表：取证而非断言 ================"
-# V3 裁定"建表后只读"是**运行纪律**，没有代码拦截。这里只记录事实，
-# 不写成断言 —— 把纪律伪装成断言，会让人以为它有强制力。
-nref=$(PSQL $COORD -Atc "SELECT count(*) FROM pg_dist_partition WHERE partmethod='n'" </dev/null 2>&1 | tail -1)
-echo "  [取证] 本集群引用表数量 = ${nref:-取不到}（V3 裁定：建表后只读，无代码拦截）"
-check "引用表取证可得" "$([[ "$nref" =~ ^[0-9]+$ ]] && echo ok)" "ok"
+echo "================ [6] 引用表运行期写：真断言（T7.10，2026-09-09 用户裁定拦）================"
+# ★ 这一节以前只是"取证而非断言"，理由写着"V3 裁定建表后只读是**运行纪律**，
+#   没有代码拦截 —— 把纪律伪装成断言，会让人以为它有强制力"。那句话是对的，
+#   而 2026-09-09 用户裁定"拦"、T7.10 把守卫实装之后，它就该升级成真断言了。
+#
+#   守卫挂在 **planner_hook** 上：第一版挂 ExecutorStart 判 pstmt->resultRelations
+#   完全不生效 —— Citus 把引用表的写重写成自己的 CustomScan，顶层已不是普通
+#   ModifyTable。planner_hook 拿到的是 Citus 改写**之前**的原始 Query。
+PSQL $COORD -q -c "DROP TABLE IF EXISTS t66ref" </dev/null >/dev/null 2>&1
+PSQL $COORD -q -c "CREATE TABLE t66ref(id int primary key, v text)" </dev/null >/dev/null 2>&1
+mk=$(PSQL $COORD -Atc "SELECT create_reference_table('t66ref')" </dev/null 2>&1 | tail -1)
+pm=$(PSQL $COORD -Atc "SELECT partmethod FROM pg_dist_partition WHERE logicalrelid='t66ref'::regclass" </dev/null 2>&1 | tail -1)
+check "引用表夹具就绪（partmethod=$pm）" "$pm" "n"
+for st in "INSERT INTO t66ref VALUES (1,'x')" \
+          "UPDATE t66ref SET v='y'" \
+          "DELETE FROM t66ref"; do
+  out=$(PSQL $COORD -Atc "$st" </dev/null 2>&1 | tr '\n' ' ')
+  check "★★ 禁：引用表运行期写 —— ${st%% *}" \
+        "$([[ "$out" == *"T7.10/§10"* ]] && echo banned)" "banned"
+done
+# 阴性对照：读必须放行（守卫只挂在 INSERT/UPDATE/DELETE/MERGE 上）
+rd=$(PSQL $COORD -Atc "SELECT count(*) FROM t66ref" </dev/null 2>&1 | tail -1)
+check "  阴性对照：引用表 SELECT 仍放行" "$([[ "$rd" =~ ^[0-9]+$ ]] && echo ok)" "ok"
+PSQL $COORD -q -c "DROP TABLE IF EXISTS t66ref" </dev/null >/dev/null 2>&1
 
 echo "================ [7] 清理 ================"
 PSQL $W -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids" </dev/null >/dev/null

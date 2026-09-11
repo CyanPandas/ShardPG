@@ -682,6 +682,29 @@ ShardReplayMarkerRecord(ShardReplayCtx *ctx, PartWALRecord *h, TxnMarkerPayload 
 - 元组可见的最终条件(读路径,本期不实现):状态 = COMMITTED **且**
   `commit_ts ≤ 快照 start_ts`(§10)。
 
+> **★ 2026-09-10 补(T7.11 / R-P6-18):`start_ts` 是双宇宙字段,必须带位标注。**
+>
+> `TxnMarkerPayload.start_ts` 可能装两种东西:**TSO 的号**(从 1 开始的小整数),
+> 或**本地墙钟微秒**(`GetCurrentTransactionStartTimestamp()`,~8.4e14)。
+> 光看值猜量级是能猜,但那是猜。新增 `PARTWAL_MARKER_STS_IS_TSO`(0x0004)
+> 把它说清楚:**值来自 TSO 才置位**。
+>
+> 为什么这一位不是可有可无:回放侧把它原样写进分片 clog 的 PREPARED 槽
+> (`ShardClogSetPrepared`),而 §4.2 三态处置的第一支拿它跟读者快照比大小——
+> ```c
+> if (my_ts > 0 && (int64) slot.start_ts <= my_ts && slot.global_xid != 0)
+> ```
+> 墙钟值恒 > 任何 TSO 快照 ⇒ 第一支恒假 ⇒ **第三支"问协调者"永远不执行** ⇒
+> 已提交的 in-doubt 行一直读不到。更难查的是:leader 自己那条
+> `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 在遗留模式存的是 **0**
+> (见 `shard_clog.h`「遗留模式 0」的约定)——同一个事务,leader 存 0、
+> 副本存墙钟,两边对不上,而两边都"没报错"。
+>
+> 落地规则:**没标位就给分片 clog 落 0**(与 leader 一致),而 `start_ts` 原值
+> 仍照旧进增强型 CLOG 供诊断——两个消费者要的东西不一样,别互相迁就。
+> 该位不影响载荷长度(长度只由 `HAS_SHARD_XID` / `HAS_ALLOC_WM` 决定),
+> 是纯增量的;旧流不带这位,于是被无歧义地当作"非 TSO 宇宙"。
+
 ### 7.7 阶段三 C:应用 CTRL 记录(D1 已实装)
 
 头部约定:`flags` 含 `PARTWAL_FLAG_CTRL`;`rmid = PARTWAL_CTRL_RMID`(0xFF 哨兵值,
@@ -689,11 +712,28 @@ ShardReplayMarkerRecord(ShardReplayCtx *ctx, PartWALRecord *h, TxnMarkerPayload 
 设成不可能被当 rmgr 用的值,是为了万一有人误按 rmid 分派时立刻炸掉,
 而不是安静地走进某个 rmgr 的 redo);`info = opcode`。
 
-目前仅 `FILESET_UPDATE`(§12):按新 fileset 全量描述重建 loc_map,处理完毕才继续
-后续 DATA 记录——控制记录之后的 DATA 才会引用新 relfilenode,apply 串行 ⇒ 无竞态。
+已实装的 opcode:`FILESET_UPDATE`(§12,按新 fileset 全量描述重建 loc_map)、
+`FREEZE_UPDATE`(§13 冻结账目)、`SHARD_CLOG`(T7.2,基线搬分片 clog)、
+`SHARD_DROP`(T7.8,leader 删了这个分片,收到即停流摘槽位)。控制记录处理完毕才
+继续后续 DATA 记录——之后的 DATA 才会引用新 relfilenode,apply 串行 ⇒ 无竞态。
 
 **未知 opcode 一律 ERROR**,与 §7.3 未知 rmid 同款 fail-fast:控制记录改变的是
 "后续记录怎么解释",静默跳过一条没读懂的控制记录,等于在错误的映射上继续 redo。
+
+> **★ 派发判据是 flags,不是"有没有载荷"(2026-09-10,T7.8 实测补上的一课)。**
+>
+> 主循环里原本有一条排在三路派发**之前**的快路径:`data_len == 0` ⇒ 当成
+> "旧 group-commit 缺陷留下的占位记录",告警一句然后跳过。`SHARD_DROP` 恰恰
+> **没有载荷**(opcode 自己就是全部信息),于是整条通知被那条兼容分支吞掉。
+>
+> 现象极具迷惑性:leader 日志白纸黑字写着"分片 … 已 DROP,已通知副本停流",
+> 副本却一直 `armed=t`,而且**连个报错都没有**——只有一行看着像历史遗留的
+> WARNING。上面那条"未知 opcode 一律 ERROR"的规矩形同虚设,因为记录根本没走到
+> 派发那一步。
+>
+> 判据已改为 `data_len > 0 || PartWALRecordIsCtrl(&hdr)`:CTRL 的身份写在 flags
+> 里,与它带不带载荷无关。**教训**:任何"提前跳过"的快路径都要先问一句"它会不会
+> 把一类合法记录也一并跳过",尤其是这种为兼容历史数据留的后门。
 
 ### 7.8 阶段四:游标推进与持久化
 

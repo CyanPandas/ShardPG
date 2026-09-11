@@ -18,10 +18,18 @@ set -uo pipefail
 export PATH=/work/pg-install/bin:$PATH
 
 COORD_PORT=5432
-W1_PORT=5433
-W2_PORT=5434
-W1_DATA=/work/pg-cluster-data/worker1
-W2_DATA=/work/pg-cluster-data/worker2
+# ★★ T7.13（P7-E2）：拓扑无关化（2026-09-10）。
+#   本套件其实**不依赖 Citus 分片落点** —— 它用合成 OID（TEST_OID）直接调
+#   `write_partition_wal_record()`，只需要"某个 worker"。所以写死 worker1 的
+#   唯一后果是：3 节点布局下碰巧总是对的，9 节点上也能跑，但一旦 worker1
+#   被别的套件停掉/占用就会莫名其妙地红。改成按 pg_dist_node 动态取第一个 worker。
+#   （另：原来的 W2_PORT / W2_DATA 是**死变量**，全文零引用，一并删掉。）
+source "$(cd "$(dirname "$0")" && pwd)/lib_topology.sh"
+topo_init || { echo "FATAL: 拓扑初始化失败"; exit 1; }
+W1_PORT=$(set -- $(topo_worker_ports); echo "$1")
+W1_DATA=$(topo_datadir "$W1_PORT")
+[[ -n "$W1_PORT" && -d "$W1_DATA" ]] || { echo "FATAL: 取不到可用 worker（W1_PORT=$W1_PORT W1_DATA=$W1_DATA）"; exit 1; }
+echo "本轮工作节点：:$W1_PORT（$W1_DATA）"
 
 TEST_OID=99001          # 用于测试的虚拟 Oid（无需真实关系）
 INSERTS_PER_BATCH=5     # 每批写入的 PartWALHeader 记录数

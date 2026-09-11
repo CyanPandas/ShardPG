@@ -44,8 +44,23 @@ if ! flock -n 9; then echo "FATAL: 另一个 T7.3 验收正在运行"; exit 99; 
 
 source "$HERE/lib_node_health.sh"; health_mark_start
 
+# ★★ 停节点的套件**必须**自带复原（2026-09-10 补）。
+#   在此之前 [5] 杀完旧主就不管了：跑完那个节点一直躺着，后面每个套件都被它
+#   毒化 —— 实测紧接着的 test_slot_reclaim_p7 第一条断言就死在"节点 :5433 可连"。
+#   这正是计划里给 OPS 8 套记的 P7-E2（"停错节点且不复原"），只不过出现在
+#   P7 自己的新套件里。中途被 Ctrl-C 打断也要能复原，所以挂在 EXIT 上。
+KILLED_NODE=""
+KILLED_PORT=""
 cleanup() {
-  local p
+  local p t
+  if [[ -n "$KILLED_NODE" ]]; then
+    DEX bash -c "/work/pg-install/bin/pg_ctl -D /work/pg-cluster-data/${KILLED_NODE} -l /work/pg-cluster-data/${KILLED_NODE}.log start" </dev/null >/dev/null 2>&1
+    for t in $(seq 1 60); do
+      [[ "$(PSQL $KILLED_PORT -Atc 'SELECT 1' </dev/null 2>/dev/null | tail -1)" == "1" ]] && break
+      sleep 1
+    done
+    echo "  [cleanup] 已复原被杀节点 ${KILLED_NODE}（:${KILLED_PORT}，${t}s）"
+  fi
   for p in $(seq 5432 5440); do
     PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
@@ -70,30 +85,39 @@ if [[ ! "$tso" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "========== [1] 夹具：2 分片分布表 =========="
-PSQL $COORD -q -c "DROP TABLE IF EXISTS t73_mk;" </dev/null >/dev/null 2>&1
-PSQL $COORD -v ON_ERROR_STOP=1 -q </dev/null <<'SQL'
+# ★★ 每轮新表名，不复用 t73_mk（2026-09-10 实测教训，与 test_baseline_clog_p7 同因）。
+#   本套件跑完会在**旧主**上留下带数据的壳表，而那张表删不掉：DROP 时
+#   `PartWALAppendCtrl` 报"分区主副本可能已切换"，整个 DROP 事务中止。
+#   于是第二轮的 `DROP TABLE IF EXISTS ${TBL}; CREATE TABLE ...` 里 DROP 先失败、
+#   CREATE 跟着没执行，`replay_set_locmap` 对上了**旧表**，报
+#   "base_part_lsn=0 声明从流起点开始，但本地关系已有 1 个块" —— 看着像回放缺陷，
+#   其实是夹具没洗干净。底层缺陷登记为 P7-D3，未修。
+#   注意：这和 [5] 的"杀完主要复原"是**两回事**，两个都补上才真能重复跑。
+TBASE="t73_mk_$(date +%H%M%S)"
+PSQL $COORD -q -c "DROP TABLE IF EXISTS ${TBASE};" </dev/null >/dev/null 2>&1
+PSQL $COORD -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.shard_count = 2;
 SET citus.shard_replication_factor = 1;
-CREATE TABLE t73_mk(id int, v text);
-SELECT create_distributed_table('t73_mk','id');
-ALTER TABLE t73_mk SET (autovacuum_enabled = off);
+CREATE TABLE ${TBASE}(id int, v text);
+SELECT create_distributed_table('${TBASE}','id');
+ALTER TABLE ${TBASE} SET (autovacuum_enabled = off);
 SQL
-GA=$(PSQL $COORD -Atc "SELECT min(shardid) FROM pg_dist_shard WHERE logicalrelid='t73_mk'::regclass" </dev/null)
-GB=$(PSQL $COORD -Atc "SELECT max(shardid) FROM pg_dist_shard WHERE logicalrelid='t73_mk'::regclass" </dev/null)
+GA=$(PSQL $COORD -Atc "SELECT min(shardid) FROM pg_dist_shard WHERE logicalrelid='${TBASE}'::regclass" </dev/null)
+GB=$(PSQL $COORD -Atc "SELECT max(shardid) FROM pg_dist_shard WHERE logicalrelid='${TBASE}'::regclass" </dev/null)
 PA=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GA" </dev/null)
 PB=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GB" </dev/null)
 check "两分片落在不同 worker（A@:$PA B@:$PB）" "$([[ -n "$PA" && -n "$PB" && "$PA" != "$PB" ]] && echo ok)" "ok"
 
 KA=""; KB=""
 for k in $(seq 1 200); do
-  s=$(PSQL $COORD -Atc "SELECT get_shard_id_for_distribution_column('t73_mk', $k)" </dev/null)
+  s=$(PSQL $COORD -Atc "SELECT get_shard_id_for_distribution_column('${TBASE}', $k)" </dev/null)
   [[ "$s" == "$GA" && -z "$KA" ]] && KA=$k
   [[ "$s" == "$GB" && -z "$KB" ]] && KB=$k
   [[ -n "$KA" && -n "$KB" ]] && break
 done
 check "取到命中两分片的分布键（KA=$KA KB=$KB）" "$([[ -n "$KA" && -n "$KB" ]] && echo ok)" "ok"
 
-TBL="t73_mk_${GA}"
+TBL="${TBASE}_${GA}"
 f1=""; f2=""
 for p in 5433 5434 5435 5436 5437 5438 5439 5440; do
   [[ "$p" == "$PA" || "$p" == "$PB" ]] && continue
@@ -148,7 +172,7 @@ provision_shard() {   # <leader_port> <gid> <tbl> <members_expr> <f1> <f2>
     PSQL $fp -v ON_ERROR_STOP=1 -q </dev/null <<SQL
 SET citus.enable_ddl_propagation = off;
 DROP TABLE IF EXISTS ${tbl};
-CREATE TABLE ${tbl} (LIKE t73_mk INCLUDING ALL);
+CREATE TABLE ${tbl} (LIKE ${TBASE} INCLUDING ALL);
 ALTER TABLE ${tbl} SET (autovacuum_enabled = off);
 SQL
     np=$(PSQL $fp -Atc "SELECT partdist.replay_set_locmap('${tbl}', ARRAY[${roles}], ARRAY[${ords}], ARRAY[${spcs}]::oid[], ARRAY[${dbs}]::oid[], ARRAY[${rels}]::oid[])" </dev/null)
@@ -202,7 +226,7 @@ bring_up_group() {  # <leader_port> <gid> <members_expr> <f1> <f2>
 }
 
 provision_shard $PA $GA "$TBL" "$members"   $f1 $f2
-provision_shard $PB $GB "t73_mk_${GB}" "$members_b" $f1 $f2
+provision_shard $PB $GB "${TBASE}_${GB}" "$members_b" $f1 $f2
 for p in $PA $PB $f1 $f2; do PSQL $p -q -c "SELECT partdist.rebuild_shard_identity();" </dev/null >/dev/null; done
 bring_up_group $PA $GA "$members"   $f1 $f2
 bring_up_group $PB $GB "$members_b" $f1 $f2
@@ -224,7 +248,7 @@ echo "========== [3b] 打标：组内**全体成员**都要配白名单 ========
 mark_all() {
   local pp oid list
   for pp in $PA $PB $f1 $f2; do
-    list=$(PSQLV $pp -Atc "SELECT string_agg(oid::text, ',') FROM pg_class WHERE relname IN ('t73_mk_${GA}','t73_mk_${GB}') AND relkind='r'" </dev/null | tail -1)
+    list=$(PSQLV $pp -Atc "SELECT string_agg(oid::text, ',') FROM pg_class WHERE relname IN ('${TBASE}_${GA}','${TBASE}_${GB}') AND relkind='r'" </dev/null | tail -1)
     [[ -z "$list" ]] && continue
     PSQL $pp -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${list}';" </dev/null >/dev/null
     PSQL $pp -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
@@ -261,8 +285,8 @@ for try in 1 2 3; do
 BEGIN;
 SET LOCAL citus.propagate_set_commands = 'local';
 SET LOCAL pg_partdist.join_info = '${GX},${STS},${GA}';
-  INSERT INTO t73_mk VALUES (${KA}, 'a-commit');
-  INSERT INTO t73_mk VALUES (${KB}, 'b-commit');
+  INSERT INTO ${TBASE} VALUES (${KA}, 'a-commit');
+  INSERT INTO ${TBASE} VALUES (${KB}, 'b-commit');
 COMMIT;
 SELECT 'txn_done';
 SQL
@@ -314,7 +338,9 @@ check "leader 判决带非零 commit_ts（cts=$CTS）" \
 echo "========== [5] 杀主 → 新主当选 → 路由跟随 =========="
 OLD_PRIMARY=$PA
 NEWP=""
-DEX bash -c "/work/pg-install/bin/pg_ctl -D /work/pg-cluster-data/worker$((OLD_PRIMARY-5432)) -m immediate stop" </dev/null >/dev/null 2>&1
+KILLED_NODE="worker$((OLD_PRIMARY-5432))"   # 先登记再杀：中途挂了也能复原
+KILLED_PORT=$OLD_PRIMARY
+DEX bash -c "/work/pg-install/bin/pg_ctl -D /work/pg-cluster-data/${KILLED_NODE} -m immediate stop" </dev/null >/dev/null 2>&1
 for t in $(seq 1 90); do
   NEWP=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$GA" </dev/null 2>/dev/null)
   [[ -n "$NEWP" && "$NEWP" != "$OLD_PRIMARY" ]] && break
