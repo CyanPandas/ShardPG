@@ -38,6 +38,19 @@ need_nm() {    # need_nm <说明> <符号>
   if [[ "$n" -gt 0 ]]; then say "$1" "OK"; else say "$1" "缺失（二进制未重编？）"; fail=1; fi
 }
 
+# ★ static 函数不进动态符号表，`nm -D` 查不到 —— 对这类只能按 strings 找。
+#   （实测教训：给 0010 的 XLogAdvancePendingInsertPosition 先用了 need_nm，
+#    立刻报"缺失"，而仓库与容器的 bin/postgres **md5 完全相同**且都含该字符串 ——
+#    是判据选错了，不是补丁缺失。守卫产生假警报比漏检更糟：它会让人去重编一个
+#    本来就好的二进制。）
+need_str() {   # need_str <说明> <字符串>
+  local n
+  if [[ ! -x "$ROOT/bin/postgres" ]]; then say "$1" "缺 bin/postgres"; fail=1; return; fi
+  n=$(strings "$ROOT/bin/postgres" 2>/dev/null | grep -cF "$2" || true)
+  n=${n:-0}
+  if [[ "$n" -gt 0 ]]; then say "$1" "OK"; else say "$1" "缺失（二进制未重编？）"; fail=1; fi
+}
+
 echo "检查 pg-install 内核补丁：$ROOT"
 need_grep "0001   wal_insert_hook 声明（xloginsert.h）" \
           "$ROOT/include/postgresql/server/access/xloginsert.h" "wal_insert_hook"
@@ -52,16 +65,38 @@ need_grep "0004   pre_record_commit_hook 声明（xact.h）" \
 need_nm   "0004   pre_record_commit_hook 符号（bin/postgres，DTX-2PC 决议挂点）" \
           "pre_record_commit_hook"
 
+# ★★ 2026-09-11 补：0005–0010 六个补丁**此前完全没有覆盖**，脚本却输出
+#   "四个补丁齐全" —— 一个只验 3/10 的守卫，却给出"齐全"的结论，正是
+#   §6.2 那类"看起来验过了"。而它是 reproduce-env.sh 在**建容器之前**用来
+#   拦截"pg-install 没打补丁"的唯一关口：漏检的补丁一旦缺失，环境会以
+#   各种难查的方式坏掉（TX-TSO-MVCC 的分片 xid、可见性、2PC rmgr 全在这几个里）。
+#
+#   触发这次复查的是 T7.12-P1 的 shard_clog_p2：它靠 `pg_waldump | grep
+#   "shard xids:"` 取证而红，当时怀疑二进制缺 0007。实测**十个补丁的特征符号
+#   在二进制里全都在**，方向被排除 —— 但也就此暴露了守卫的漏检。
+need_nm   "0005   shard_relation_xid_hook 符号（分片 xid 打标）" \
+          "shard_relation_xid_hook"
+need_nm   "0006   shard_visibility_hook 符号（分片可见性）" \
+          "shard_visibility_hook"
+need_nm   "0007   shard_xact_wal_list_hook 符号（xact 记录带分片 xid）" \
+          "shard_xact_wal_list_hook"
+need_nm   "0008   shard_vacuum_read_hook 符号（vacuum 读钩子）" \
+          "shard_vacuum_read_hook"
+need_nm   "0009   shard_at_prepare_hook 符号（2PC rmgr）" \
+          "shard_at_prepare_hook"
+need_str  "0010   XLogAdvancePendingInsertPosition（升主推进写入位置；static，按 strings 验）" \
+          "XLogAdvancePendingInsertPosition"
+
 if [[ "$fail" -ne 0 ]]; then
   cat <<'EOF'
 
 ！这份 pg-install 不是打过补丁的构建，pg_partdist 编不过。
   修法见 pg-partdist-src/patches/README.md 的「补丁与仓库里 pg-install/ 的关系」：
-  在容器里用 postgres-src 基线 + 四个补丁重编，再把 bin/postgres 与受影响的
-  头文件同步回仓库并提交。
+  在容器里用 postgres-src 基线 + **全部十个补丁**重编，再把 bin/postgres 与
+  受影响的头文件同步回仓库并提交。
 EOF
   exit 1
 fi
 
-echo "  → 四个补丁齐全"
+echo "  → 十个补丁齐全（0001/0001v2/0002/0004 声明+符号，0005–0010 符号）"
 exit 0
