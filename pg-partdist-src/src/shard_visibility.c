@@ -26,6 +26,8 @@
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
+#include "shard_route.h"
+#include "enhanced_clog.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -291,6 +293,145 @@ sv_is_shard_rel(Oid tableOid)
 	return OidIsValid(ShardXidLookupByOid(tableOid));
 }
 
+/* ---- R3 读路径：回放来的壳表（FOLLOWER_REPLAY_DESIGN.md §9.4/§10） ---- */
+
+/*
+ * 元组头里的 xid 是**别的节点**发的号，本机 clog 对它毫无意义。两跳解析：
+ * xid --查本分区 xid_map--> gxid --查 pg_gclog--> 判决。
+ *
+ * 与分片 clog 那条路的关系：两者互补，不重叠。
+ *   · 分片 clog（pg_shard_clog/<oid>）键是**分片 xid**，只有在 leader 上被
+ *     打过标的表才有；回放侧 U-P5-1 会照着流把它重建出来。
+ *   · gclog（pg_gclog/<node>/）键是 gxid，**任何**被捕获的分区都有 ——
+ *     MARKER 是按分区发的，与打不打标无关。
+ * 于是没打标的分布表（tx3 夹具就是）升主后只能走这条路：它的元组 xmin 是
+ * 旧 leader 的**原生** xid，分片 clog 里根本没有这个号。
+ */
+static bool
+gvis_committed(GlobalTransactionId gxid, int64 *cts_out)
+{
+	TxnStatus	st = TXN_RUNNING;
+	uint64		sts = 0;
+	uint64		cts = 0;
+
+	*cts_out = 0;
+	/* 段/槽不存在 = 全零 = RUNNING = 未决 = 不可见，语义上就是我们要的默认值 */
+	(void) EnhancedClogReadStatus(gxid, &st, &sts, &cts);
+	if (st != TXN_COMMITTED)
+		return false;
+	*cts_out = (int64) cts;
+	return true;
+}
+
+/*
+ * 原生 xid 在快照里算不算"并发"。内核的 XidInMVCCSnapshot 是 static，这里按
+ * 同一规则重写一份。
+ *
+ * 已知边界：不处理 takenDuringRecovery 的 subxip 分支 —— 升主后的新主不在
+ * 恢复态，本函数只服务"xmin 是回放号、xmax 是新主自己发的号"这种混合元组，
+ * 那个分支到不了。
+ */
+static bool
+xid_in_snapshot(TransactionId xid, Snapshot snapshot)
+{
+	uint32		i;
+
+	if (TransactionIdPrecedes(xid, snapshot->xmin))
+		return false;
+	if (TransactionIdFollowsOrEquals(xid, snapshot->xmax))
+		return true;
+	for (i = 0; i < snapshot->xcnt; i++)
+		if (TransactionIdEquals(xid, snapshot->xip[i]))
+			return true;
+	return false;
+}
+
+/*
+ * 返回 true = 本函数已给出判决；false = 这条元组不归 R3 管，退回本机语义
+ * （§9.4 规则 1，以及规则 3 里 xid > W 的那一半）。
+ */
+static bool
+sv_replayed_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
+				 bool *visible)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	GlobalTransactionId gmin;
+	GlobalTransactionId gmax;
+	TransactionId rawmax;
+	int64		my_ts;
+	int64		cts = 0;
+
+	gmin = PartDistResolveGxid(htup->t_tableOid,
+							   HeapTupleHeaderGetRawXmin(tuple));
+	if (!GlobalXidIsValid(gmin))
+		return false;			/* 不属于回放宇宙 */
+
+	my_ts = TsoGetStartTs();
+
+	if (!gvis_committed(gmin, &cts))
+	{
+		/* 未决 / 中止 / 被 ROLLBACK TO 的子事务（缺席=RUNNING）一律不可见 */
+		*visible = false;
+		return true;
+	}
+	/*
+	 * §4.1 真 SI：快照之后才提交的不可见。遗留模式（无 ts）退回"已提交即可见"。
+	 *
+	 * ★ 时间戳宇宙（2026-09-12 实测确认，不是推断）：gclog 槽里的 commit_ts
+	 *   来自 MARKER，而 MARKER 的 commit_ts 由 `TsoMarkerCommitTs()` 给 ——
+	 *   配了 TSO 就是 TSO 号，没配就是本地墙钟（~2.1e9 / ~8.4e14）。读者这边
+	 *   `TsoGetStartTs()` 同样是"配了才有号、没配返回 0"。TSO 是**整簇一致**的
+	 *   配置，于是两边恒在同一个宇宙里：要么都是 TSO 号（可比），要么读者
+	 *   my_ts=0 走遗留分支（根本不比）。本环境 `pg_partdist.tso_conninfo` 默认
+	 *   为空，tx3 走的正是后者。
+	 *
+	 *   **已知边界**：leader 写标记时没配 TSO、读者读的时候配上了（或反过来），
+	 *   会拿墙钟去比 TSO 号 —— 墙钟恒大 ⇒ 已提交的行永久不可见。这与分片 clog
+	 *   那条路的现状**同源**（`ShardClogSetVerdict` 存的也是同一个 commit_ts），
+	 *   根治要给 commit_ts 配一个类似 PARTWAL_MARKER_STS_IS_TSO 的宇宙标志位
+	 *   （tso_client.c 里记为开放问题）。中途改 TSO 配置本就不是受支持的操作，
+	 *   这里不为它单独改 gclog 的磁盘格式，但把依赖写明。
+	 */
+	if (my_ts > 0 && cts >= my_ts)
+	{
+		*visible = false;
+		return true;
+	}
+
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+	{
+		*visible = true;
+		return true;
+	}
+
+	rawmax = HeapTupleHeaderGetRawXmax(tuple);
+	gmax = PartDistResolveGxid(htup->t_tableOid, rawmax);
+	if (!GlobalXidIsValid(gmax))
+	{
+		/*
+		 * 混合元组：xmin 是回放来的，xmax 是本机（升主后的新主）自己发的号。
+		 * 这一半按**本机**规则判 —— 不能整条退回本机，那样 xmin 会被拿去查
+		 * 本机 clog，正是本模块要消灭的那个错误。
+		 */
+		if (xid_in_snapshot(rawmax, snapshot) ||
+			!TransactionIdDidCommit(rawmax))
+			*visible = true;	/* 删除者未提交/与我并发 ⇒ 行仍可见 */
+		else
+			*visible = false;
+		return true;
+	}
+
+	if (!gvis_committed(gmax, &cts))
+	{
+		*visible = true;		/* 删除未决或中止 ⇒ 行仍在 */
+		return true;
+	}
+	/* xmax 对称：删除的 commit_ts ≥ 快照 ⇒ 删除对我不可见 ⇒ 行仍可见 */
+	*visible = (my_ts > 0 && cts >= my_ts);
+	return true;
+}
+
 static bool
 sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 				  bool *visible)
@@ -301,7 +442,7 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	int64		cts = 0;
 
 	if (!OidIsValid(shard))
-		return false;
+		return sv_replayed_mvcc(htup, snapshot, buffer, visible);
 
 	ShardAccessGate(shard, "MVCC 读");
 

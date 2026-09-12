@@ -160,6 +160,17 @@ if [[ -n "$newp" && "$newp" != "$pnode" && "$newp" != "0" ]]; then
   nmax=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off; SELECT coalesce(max(id),0) FROM ${TBL}" | tail -1)
   check "新主壳表内容完整（max(id)=${NROWS}）" "$nmax" "$NROWS"
 
+  # ★ 取证：光看"读到 40 行"证不了**路径**。这张表没打过分片标，元组 xmin 是
+  #   旧 leader 的**原生** xid —— 万一本机 clog 里碰巧同号的事务也是 committed，
+  #   行照样读得出来，而 R3 一步都没走。route_resolve 把 §9.4 的两跳摊开：
+  #   角色必须是 promoted、xid 必须能经 xid_map 翻出 gxid、gclog 必须判 committed。
+  rr=$(PSQL $newport -Atc "SET citus.enable_ddl_propagation=off;
+      SELECT r.role||'|'||coalesce(r.gxid::text,'null')||'|'||r.status
+        FROM partdist.route_resolve(${noid}::oid,
+               (SELECT xmin::text::bigint FROM ${TBL} ORDER BY id LIMIT 1)) r" | tail -1)
+  check "R3 取证：promoted + xid→gxid + gclog=committed（${rr}）" \
+        "$([[ "$rr" == promoted\|*\|committed && "$rr" != *"|null|"* ]] && echo ok)" "ok"
+
   # ★ 对照组：**未当选**的那个 follower 必须仍然 applied=0。
   #
   # 没有这一条，[2]（字节到齐时 applied=0）与 [4]（十几秒后 applied>=tip）

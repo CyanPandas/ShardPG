@@ -358,12 +358,17 @@ for t in $(seq 1 60); do
   sleep 1
 done
 check "自动清扫在 ${t}s 内收敛两参与者" "$conv" "ok"
-# ★ T7.1 期修：日志布局有两种，只查一种会假红。
-#   setup-raft.sh 建的环境把日志写在 <datadir>/startup.log；
-#   reproduce-env.sh 建的环境（pg-test / 全新复现）写在 <datadir>.log。
-#   心跳工作者的清扫留痕落在**节点主日志**里，本环境正是后者 ——
-#   只 grep */startup.log 时恒为 0，表现为一条与产品无关的红。
-autolog=$(docker exec -u postgres "$CONTAINER" bash -c "cat /work/pg-cluster-data/*/startup.log /work/pg-cluster-data/*.log 2>/dev/null | grep -c '未决 2PC 清扫收敛'" </dev/null)
+# ★ T7.1 期修：日志布局不止一种，只查一种会假红。
+#   setup-raft.sh 建的环境写 <datadir>/startup.log；
+#   reproduce-env.sh 建的环境（pg-test / 全新复现）写 <datadir>.log；
+#   ★★ 2026-09-12 又冒出第三种：出口门禁 run_p6_exit.sh 的净场会**全停全起**，
+#      拉起时给的是 `-l <datadir>/pg.log` —— 于是整批里节点日志叫 pg.log，
+#      上面两个 glob 一个都不沾。表现为"单跑绿、进批就红"，而它上面那条
+#      『自动清扫在 Ns 内收敛两参与者』是 PASS 的 —— 清扫**确实发生了**，
+#      红的只是取证路径。
+#   所以这里按"数据目录下的任何 .log + 数据目录同名 .log"一网打尽，
+#   别再按具体文件名猜布局。
+autolog=$(docker exec -u postgres "$CONTAINER" bash -c "cat /work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log 2>/dev/null | grep -c '未决 2PC 清扫收敛'" </dev/null)
 check "工作者清扫日志留痕（≥1，实际 $autolog）" "$([[ -n "$autolog" && "$autolog" -ge 1 ]] && echo ok)" "ok"
 
 echo "========== [5] ABORT 决议学习（清扫写 ABORTED）=========="
@@ -442,7 +447,15 @@ SX7=$(echo "$p7" | grep -E '^[0-9]+$' | tail -1)
 PSQL $pport_a -q -c "SELECT partdist.dtx_note_coord(${DTX7}, ${gid_a});" </dev/null >/dev/null
 pc7=$(PSQL $pport_a -Atc "SELECT partdist.dtx_pending_count()" </dev/null)
 AD=$(PSQL $pport_a -Atc "SHOW data_directory" </dev/null)
-replay0=$(DEX bash -c "grep -ac '未决 2PC 日志重放' $AD/startup.log" </dev/null 2>/dev/null || echo 0)
+# ★ 2026-09-12：`grep -c` 计数为 0 时**退出码是 1**，于是 `|| echo 0` 也会触发，
+#   变量拿到的是两行 "0\n0" —— 下面的 `[[ "$replay1" -gt "$replay0" ]]` 当场
+#   报 `syntax error in expression (error token is "0")`。实测就这么出现过一次，
+#   只因另一个 `||` 分支恰好成立才没把断言打红。计数一律走 `| tail -1` 取末行。
+#   日志文件名同样不能只猜一种（见上面 autolog 那段）。
+_count_replay_log() {
+  DEX bash -c "cat $AD/startup.log $AD/pg.log ${AD}.log 2>/dev/null | grep -ac '未决 2PC 日志重放' || true" </dev/null 2>/dev/null | tail -1
+}
+replay0=$(_count_replay_log); replay0=${replay0:-0}
 DEX /work/pg-install/bin/pg_ctl -D "$AD" -m immediate stop </dev/null >/dev/null 2>&1
 sleep 1
 DEX /work/pg-install/bin/pg_ctl -D "$AD" -l "$AD/startup.log" start </dev/null >/dev/null 2>&1
@@ -455,7 +468,7 @@ pc7b=$(PSQL $pport_a -Atc "SELECT partdist.dtx_pending_count()" </dev/null)
 # ★ 瞬时计数不可靠：重放出来的登记会在 <1s 内被清扫/广播收敛掉（实测
 # "日志重放：1 条待收敛" 与 "清扫收敛 1 笔" 相隔 0.4s）。改判日志证据：
 # 崩前有登记 ⇒ 重启必须留下一条"未决 2PC 日志重放：N 条待收敛"。
-replay1=$(DEX bash -c "grep -ac '未决 2PC 日志重放' $AD/startup.log" </dev/null 2>/dev/null || echo 0)
+replay1=$(_count_replay_log); replay1=${replay1:-0}
 if [[ "$pc7" -ge 1 ]]; then
   check "登记跨崩溃重建（重放日志 $replay0→$replay1；崩后计数=$pc7b，秒级收敛属正常）" \
         "$([[ "$replay1" -gt "$replay0" || "$pc7b" -ge 1 ]] && echo ok)" "ok"

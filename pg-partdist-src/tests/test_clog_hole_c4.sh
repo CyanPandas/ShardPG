@@ -53,14 +53,66 @@ SELECT create_distributed_table('c4_dist','id');
 ALTER TABLE c4_dist SET (autovacuum_enabled = off);
 SQL
 gid=$(PSQLQ $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='c4_dist'::regclass")
-pport=$(PSQLQ $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=${gid}")
-pid=$((pport-5431)); f1=""
+placement_port() {
+  PSQLQ $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p
+                       JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary'
+                      WHERE p.shardid=${gid}" | tail -1
+}
+pport=$(placement_port)
+p0=""
 for p in 5433 5434 5435 5436 5437 5438 5439 5440; do
-  [[ "$p" == "$pport" ]] && continue; f1=$p; break
+  [[ "$p" == "$pport" ]] && continue; p0=$p; break
 done
+
+# ★★ 2026-09-12：建组必须排在 fileset/locmap **之前**，且不能和选举较劲。
+#
+# 旧版顺序是"先按 placement 定主从、铺 fileset 与 locmap，再建组，建完发现
+# 主没落在 placement 节点就 drop 重来"。这在 9 节点上会自己把环境搞坏：
+# 每重来一次就是一次选举，一旦当选的是**另一个**成员，切主重构的"上报 →
+# group0 登记 → 落路由层"链路就把 Citus 的 placement 迁到当选者身上
+# （见 docs 里的切主重构决策）。等循环终于把 Raft leader 逼回原节点，
+# placement 已经留在对面了 —— 于是：
+#   · 经协调者的 INSERT 被路由到对面，撞上"本节点不是该分区组的 leader"；
+#   · 对面的路由项已置 role=promoted，replay_catchup 直接拒绝
+#     "shard N 已升主，不再回放别人的流"。
+# 实测就是这两条把 [3] 打红（2026-09-11 批次 P3 段），而被测的 clog 页边界
+# 逻辑压根没跑到。
+#
+# 新版：建组一次，**谁当选就认谁**，等 placement 收敛到当选者之后，再按
+# 收敛后的真相铺 fileset 与 locmap。夹具顺应产品语义，而不是反过来掰它。
+m1=$pport; m2=$p0                      # 分区组的两个成员（端口），下面只在这两个之间认主
+mem="ARRAY[$((m1-5431)), $((m2-5431))]"
+for p in $pport $p0; do PSQLQ $p -q -c "SELECT partdist.pg_raft_group_drop(${gid});" >/dev/null 2>&1; done
+sleep 3
+PSQLQ $pport -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${mem});" >/dev/null
+sleep 1
+PSQLQ $p0    -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${mem});" >/dev/null
+lead=""
+for t in $(seq 1 40); do
+  for p in $pport $p0; do
+    if [[ "$(PSQLQ $p -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid}" 2>/dev/null)" == "leader" ]]; then
+      lead=$p; break
+    fi
+  done
+  [[ -n "$lead" ]] && break
+  sleep 1
+done
+check "分区组选出 leader(:${lead:-∅})" "$([[ -n "$lead" ]] && echo ok)" "ok"
+
+# 等 placement 追上当选者（路由层登记是异步的）。收敛不了就按当选者算，
+# 后面经协调者的写入会以自己的方式报错，不在这里掩盖。
+for t in $(seq 1 20); do
+  pport=$(placement_port)
+  [[ "$pport" == "$lead" ]] && break
+  sleep 1
+done
+check "placement 与分区组 leader 一致(:${pport} vs :${lead:-∅})" "$pport" "${lead:-$pport}"
+# 成员只有两个：主之外那个就是 follower。
+if [[ "$pport" == "$m2" ]]; then f1=$m1; else f1=$m2; fi
+pid=$((pport-5431))
 fdir="worker$((f1-5432))"
 check "夹具就位（shard=${gid} leader=:${pport} follower=:${f1}）" \
-  "$([[ -n "$gid" && -n "$pport" && -n "$f1" ]] && echo ok)" "ok"
+  "$([[ -n "$gid" && -n "$pport" && -n "$f1" && "$pport" != "$f1" ]] && echo ok)" "ok"
 
 shard_tbl="c4_dist_${gid}"
 nrels=$(PSQLQ $pport -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('${shard_tbl}')" | tail -1)
@@ -79,22 +131,6 @@ np=$(PSQLQ $f1 -Atc "SELECT partdist.replay_set_locmap('${shard_tbl}', ARRAY[${r
 check "follower locmap 配对 4 对" "$np" "4"
 for p in $pport $f1; do PSQLQ $p -q -c "SELECT partdist.rebuild_shard_identity();" >/dev/null; done
 
-mem="ARRAY[${pid}, $((f1-5431))]"
-st=""
-for attempt in 1 2 3; do
-  for p in $pport $f1; do PSQLQ $p -q -c "SELECT partdist.pg_raft_group_drop(${gid});" >/dev/null 2>&1; done
-  sleep 3
-  PSQLQ $pport -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${mem});" >/dev/null
-  sleep 1
-  PSQLQ $f1 -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${mem});" >/dev/null
-  for t in $(seq 1 25); do
-    st=$(PSQLQ $pport -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid}" 2>/dev/null)
-    [[ "$st" == "leader" ]] && break; sleep 1
-  done
-  [[ "$st" == "leader" ]] && break
-  echo "  第 ${attempt} 次建组主没落在 placement 节点(当前=$st)，重来"
-done
-check "分区组 leader 就位(:${pport})" "$st" "leader"
 PSQLQ $f1 -q -c "ALTER SYSTEM SET pg_partdist.replay_trust_local_segments = on;" >/dev/null
 PSQLQ $f1 -q -c "SELECT pg_reload_conf();" >/dev/null
 en=$(PSQLQ $f1 -Atc "SELECT partdist.replay_enable('${shard_tbl}')")

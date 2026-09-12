@@ -121,14 +121,26 @@ LOID=$(PSQL $PA -Atc "SELECT partdist.local_partition_for_shard(${GA})")
 before=$(PSQL $PA -Atc "SELECT partdist.get_partition_flush_lsn(${LOID})")
 
 echo "========== [3] 跨分区 2PC 事务（含 SAVEPOINT，走 PRE_PREPARE）=========="
-PSQL $COORD -v ON_ERROR_STOP=1 -q <<SQL
+# ★ 两个子事务的 xid 在**写入时点、由写者自己**取 —— 见 [6] 里那段长注释。
+#   子事务内部读自己刚写的行必然可见，取到的 xmin 就是本子事务的分片 xid；
+#   这和"谁判它提交没提交"完全无关，因此可以当判据。
+sub_cap=$(PSQL $COORD -v ON_ERROR_STOP=1 -q -At <<SQL
 BEGIN;
   INSERT INTO tx2_mk VALUES (${KA}, 'top-a');
-  SAVEPOINT s1;  INSERT INTO tx2_mk VALUES (${KA}, 'sub-keep'); RELEASE SAVEPOINT s1;
-  SAVEPOINT s2;  INSERT INTO tx2_mk VALUES (${KA}, 'sub-drop'); ROLLBACK TO SAVEPOINT s2;
+  SAVEPOINT s1;  INSERT INTO tx2_mk VALUES (${KA}, 'sub-keep');
+  SELECT 'KEEP=' || xmin::text::bigint FROM tx2_mk WHERE v='sub-keep';
+  RELEASE SAVEPOINT s1;
+  SAVEPOINT s2;  INSERT INTO tx2_mk VALUES (${KA}, 'sub-drop');
+  SELECT 'DROP=' || xmin::text::bigint FROM tx2_mk WHERE v='sub-drop';
+  ROLLBACK TO SAVEPOINT s2;
   INSERT INTO tx2_mk VALUES (${KB}, 'top-b');
 COMMIT;
 SQL
+)
+xid_keep=$(sed -n 's/^KEEP=//p' <<<"$sub_cap" | tail -1)
+xid_drop=$(sed -n 's/^DROP=//p' <<<"$sub_cap" | tail -1)
+check "夹具：写入时点取到两个子事务的分片 xid（keep=${xid_keep:-∅} drop=${xid_drop:-∅}）" \
+      "$([[ "$xid_keep" =~ ^[0-9]+$ && "$xid_drop" =~ ^[0-9]+$ && "$xid_keep" != "$xid_drop" ]] && echo ok)" "ok"
 check "跨分区事务提交成功" \
       "$(PSQL $COORD -Atc "SELECT count(*) FROM tx2_mk WHERE v IN ('top-a','sub-keep','top-b')")" "3"
 after=$(PSQL $PA -Atc "SELECT partdist.get_partition_flush_lsn(${LOID})")
@@ -219,25 +231,24 @@ if [[ -n "$prep" && -n "$comm" ]]; then
     check "follower :$fp 已提交子事务经 parent 链判为 committed（${nok}/${nsub}）" \
           "$nok" "$nsub"
 
-    # 被 ROLLBACK TO 掉的子事务判决。
+    # 被 ROLLBACK TO 掉的子事务判决（xid 在 [3] 写入时点就已取到）。
     #
-    # ★ 判据必须**独立于被测载荷**推导。上一版是拿 PREPARE 标记里的子事务清单
+    # ★ 判据必须**独立于被测载荷**推导。第一版是拿 PREPARE 标记里的子事务清单
     # 去反推"谁不在清单里"，这是自证：若实现错误地把被 ROLLBACK TO 的子事务
     # 也写进了已提交清单，它就会被 `continue` 排除出审查，同时 nok==nsub 也照样
     # 成立 —— 全绿，而 follower 上 'sub-drop' 那行会被判成已提交、升主后可见。
     #
-    # 改为从**壳表元组的 xmin** 取那个 xid：回放已经把元组物理落到页面上了，
-    # 而 follower 的 SELECT 尚未接 gclog（那是 R3），所以行读得出来、xmin 就是
-    # 当时写它的那个子事务号。语义上这是"谁写了这一行"的唯一真相源。
-    xid_drop=$(PSQL $fp -Atc "SET citus.enable_ddl_propagation=off;
-        SELECT xmin::text::bigint FROM ${TBL} WHERE v='sub-drop'" | tail -1)
-    xid_keep=$(PSQL $fp -Atc "SET citus.enable_ddl_propagation=off;
-        SELECT xmin::text::bigint FROM ${TBL} WHERE v='sub-keep'" | tail -1)
-    check "follower :$fp 夹具成立：壳表上取到 sub-drop/sub-keep 的 xmin" \
-          "$([[ "$xid_drop" =~ ^[0-9]+$ && "$xid_keep" =~ ^[0-9]+$ ]] && echo ok)" "ok"
-    check "follower :$fp 两个子事务确实是不同的 xid" \
-          "$([[ -n "$xid_drop" && "$xid_drop" != "$xid_keep" ]] && echo ok)" "ok"
-
+    # 第二版改成"在 follower 上 SELECT 壳表、取元组 xmin"，理由写的是
+    # 「follower 的 SELECT 尚未接 gclog（那是 R3），所以行读得出来」。
+    # ★★ 2026-09-12 实测：这个前提**已经不成立**。follower 的读侧现在按分片
+    # clog 判决，被 ROLLBACK TO 的那个子事务判不出 committed，于是 'sub-drop'
+    # 那行**读不出来** —— 取到空串，两条断言连带红。这红的是夹具，不是产品：
+    # 行读不出来恰恰是**正确**行为。拿"当前实现碰巧还没做某件事"当夹具地基，
+    # 就是把验收绑在实现的欠账上，欠账一还夹具就塌。
+    #
+    # 第三版（本版）把取号挪到**写入时点、写者自己的会话里**：子事务读自己
+    # 刚写的行必然可见，xmin 就是本子事务的分片 xid。这既是"谁写了这一行"的
+    # 真相源，又与判决逻辑、与读侧做到哪一步都无关。
     if [[ "$xid_drop" =~ ^[0-9]+$ ]]; then
       dst=$(PSQL $fp -Atc "SELECT status FROM partdist.gclog_status(${citus_gid}, ${xid_drop})")
       check "follower :$fp 被 ROLLBACK TO 的子事务(xid=${xid_drop})判决不是 committed" \

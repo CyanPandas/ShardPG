@@ -1132,6 +1132,27 @@ CREATE OR REPLACE FUNCTION shard_divergence(p_shard OID)
 COMMENT ON FUNCTION shard_divergence(OID) IS
     '§13 约束 13 的检测面：该分片有没有被标记为「副本可能已分叉」，返回标记时刻与原因，无标记返回 NULL。标记由复制挂钩失败时就地写下（非事务性——出事的事务马上要中止，写表会一起回滚）。修复是重做物理基线：shard_baseline_emit / provision_shard_replica 成功后会自己清。';
 
+-- R3 读路径取证（FOLLOWER_REPLAY_DESIGN.md §9.4）：把"两跳"摊开。
+--   role       本关系在本节点的角色：native_leader / replica / promoted
+--   watermark  升主水位 W（promoted 才有意义）
+--   nxidmap    本后端缓存的 xid_map 条目数
+--   gxid       该 xid 翻出来的全局事务号；NULL = 不属于回放宇宙
+--   status     gclog 里的判决：running/prepared/committed/aborted，
+--              或 not_replayed（gxid 解不出来）
+CREATE OR REPLACE FUNCTION route_resolve(
+    p_rel OID,
+    p_xid BIGINT,
+    OUT role TEXT,
+    OUT watermark BIGINT,
+    OUT nxidmap INTEGER,
+    OUT gxid BIGINT,
+    OUT status TEXT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_route_resolve';
+
+COMMENT ON FUNCTION route_resolve(OID, BIGINT) IS
+    'R3 读路径取证：本关系的路由角色/升主水位/xid_map 规模，以及给定 xid 翻成的 gxid 与 gclog 判决。';
+
 CREATE OR REPLACE FUNCTION route_status(p_shard OID)
     RETURNS TEXT LANGUAGE c STABLE
     AS 'MODULE_PATHNAME', 'partdist_route_status';

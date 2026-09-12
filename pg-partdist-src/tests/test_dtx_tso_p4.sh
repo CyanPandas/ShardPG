@@ -752,10 +752,22 @@ echo "========== [Q] 三态问询三分支 =========="
 #   ② 加 ON_ERROR_STOP=1，让 PREPARE 失败直接暴露为前置失败。
 # 写入必须落在 raft leader 上 —— 任期栅栏会正确拒绝非 leader 的本地写入
 #（`本节点不是该分区组的 leader`），这是产品的正确行为，夹具要跟随它。
+#
+# ★★ 2026-09-12 再修：**"raft 组主"不等于"能在本地读写这份分片的节点"。**
+#   组主身份来自 raft 选举，而本地那份可能只是**副本壳表** —— 对它读写会被
+#   访问闸正确拒绝（"不允许在本节点上对副本壳表执行查询"）。实测撞上过：
+#   QNODE 选中 :5435（确是组主），PREPARE 落不下去（in-doubt 实存=0），
+#   紧接着的读者拿回的是访问闸的 HINT 而不是计数，两条断言连带红，
+#   而错误信息此前被 `2>/dev/null` 吞掉，只剩一句"实际取不到值"。
+#   所以候选除了"是组主"，还要**当场探一次本地读**：这正是后面要用的前提，
+#   与其推断角色，不如直接验它。
 QNODE=""
 for t in $(seq 1 45); do
   for cand in $pport_a $f1_a $f2_a; do
-    [[ "$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]] && { QNODE=$cand; break; }
+    [[ "$(PSQL $cand -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid_a}" </dev/null 2>/dev/null | tail -1)" == "leader" ]] || continue
+    probe=$(PSQL $cand -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a}" </dev/null 2>&1 | tail -1)
+    [[ "$probe" =~ ^[0-9]+$ ]] || continue
+    QNODE=$cand; break
   done
   [[ -n "$QNODE" ]] && break
   sleep 1
@@ -803,9 +815,14 @@ Q3TRACE="/tmp/q3_trace_$$.txt"
   done
 } > "$Q3TRACE" 2>&1
 t0=$(date +%s)
-qv=$(PSQL $QNODE -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>/dev/null | tail -1)
+# ★ 2026-09-12：stderr 原来是 `2>/dev/null`，这条一旦红只说"实际取不到值"，
+#   到底是读者被挡住了、还是查询直接报错，从日志上分不出来 —— 而这两种
+#   诊断方向完全相反。改成合并捕获：出错就把错误首行带进断言文本。
+qraw=$(PSQL $QNODE -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM t47d_${gid_a} WHERE id=${KA[5]}" </dev/null 2>&1 | tail -1)
 t1=$(date +%s)
-check "Q1/Q2：in-doubt 读者不阻塞（$((t1-t0))s）且不可见" \
+qv="$qraw"; qerr=""
+if [[ ! "$qraw" =~ ^[0-9]+$ ]]; then qv=""; qerr="；读者返回的不是计数：${qraw}"; fi
+check "Q1/Q2：in-doubt 读者不阻塞（$((t1-t0))s）且不可见${qerr}" \
       "$([[ "$qv" == "0" && $((t1-t0)) -le 5 ]] && echo ok)" "ok"
 # Q3：补决议后问询学到判决 → 可见
 CTSQ=$(PSQL $COORD -Atc "SELECT partdist_tso_commit_ts()" </dev/null)

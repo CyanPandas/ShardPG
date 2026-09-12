@@ -12,6 +12,7 @@ OBJS = \
 	src/replay/enhanced_clog.o \
 	src/replay/shard_replay.o \
 	src/replay/replay_checkpoint.o \
+	src/replay/shard_route.o \
 	src/replay/replay_worker.o \
 	src/dtx/dtx_participant.o \
 	src/dtx_pending.o \

@@ -91,7 +91,26 @@ else
   [ "$coord_null" = "NULL" ] && ok "coordinator does not host the shard (NULL)" || bad "coordinator unexpectedly returned $coord_null"
 
   echo "[D] prune: after dropping the table + rebuild, its rows vanish"
-  P "$COORD" -c "SET citus.enable_ddl_propagation=on; DROP TABLE partdist_p0_refdemo;" >/dev/null 2>&1
+  # ★★ 2026-09-12：DROP 原来是 `>/dev/null 2>&1` 吞掉一切。它一旦失败
+  #   （净场刚全停全起，慢一拍的 worker 会让分布式 DDL 报错），分片表还在，
+  #   rebuild_shard_identity 自然不会剪掉那些行 —— 于是一条**前置失败**被
+  #   报成 "demo shard rows survived prune"，看起来像剪枝逻辑坏了。
+  #   实测表现为"单跑绿、进批红"。现在：错误必须看得见，并且显式验一遍
+  #   "分片表真没了"再去谈剪枝。
+  drop_out=""
+  for attempt in 1 2 3; do
+    drop_out=$(P "$COORD" -c "SET citus.enable_ddl_propagation=on; DROP TABLE IF EXISTS partdist_p0_refdemo;" 2>&1)
+    grep -qi "ERROR" <<<"$drop_out" || break
+    sleep 3
+  done
+  gone_ok=1
+  for p in "${WORKERS[@]}"; do
+    still=$(P "$p" -c "SET citus.override_table_visibility TO off;
+        SELECT count(*) FROM pg_class WHERE relname='partdist_p0_refdemo_$REF';" | tail -n1)
+    [ "$still" = "0" ] || gone_ok=0
+  done
+  [ "$gone_ok" = "1" ] && ok "prune 前置：分片表已从各 worker 消失" \
+    || bad "prune 前置不成立：分片表仍在（DROP 输出：$(grep -i ERROR <<<"$drop_out" | head -1))"
   pruned_ok=1
   for p in "${WORKERS[@]}"; do
     P "$p" -c "SELECT partdist.rebuild_shard_identity();" >/dev/null

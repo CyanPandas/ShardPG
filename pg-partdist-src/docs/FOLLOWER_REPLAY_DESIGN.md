@@ -93,7 +93,7 @@ secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo �
 | # | 修正 | 章节 |
 |---|------|------|
 | ① | **捕获侧漏掉无块引用记录**:`XLOG_SMGR_TRUNCATE/CREATE` 只有 `XLogRegisterData`,`blocks[]` 恒空,原捕获判据永不命中,而 §5.3 要求捕获它。v3 只做了 follower 侧 main-data 重映射(附录 A),**捕获侧的另一半缺失** ⇒ 副本永不截断,静默分歧 | §5.2、§5.3、§14.2 |
-| ② | **R4 硬阻断于 R3**:promoted shard 的元组 xmin 是旧 leader 的 xid,读它必须走 §9.4 规则 3(R3 实装);R3 又阻塞于本文档外的全局 MVCC 文档 ⇒ R4 验收的"继续读写"在 R3 前不可达 | §14.2 |
+| ② | ~~**R4 硬阻断于 R3**~~ **2026-09-12 部分解除**:R3 **读**路径已实装(§10.1),promoted shard 的元组按 §9.4 规则 3 经 xid_map→gclog 判可见,`promote_catchup_tx3` 24/0 且带两跳取证。**写**仍未解除 —— `satisfies_self/dirty/update` 还是本机语义,所以 R4 的"继续**读写**"目前只到"继续**读**" | §14.2 |
 | ③ | **per-shard 常驻 bgworker 撞 `max_worker_processes`**(默认 8,实测环境即 8),而每节点 shard 数为几十~上百 ⇒ 改为 worker 池 + 轮转认领;与 pg_raft 的 `RAFT_MAX_GROUPS=32` 同形状,应统一处置 | §7、§13.10 |
 | ④ | **`EB_SKIP_EXTENSION_LOCK` 写死在 `xlogutils.c:526`,不受 `InRecovery` 控制** ⇒ "单写者"不能只写在前置条件里,必须落成排他认领锁,否则并发扩展同一文件是静默堆损坏 | §13.10 |
 | ⑤ | ~~decoded 内含指向 body 的裸指针~~ **实现时复核推翻**:PG16.14 `DecodeXLogRecord` 深拷贝全部载荷进 decoded 尾部空间,`body` 在 decode 返回后即可复用。**真正的陷阱在读取侧**:`readRecordBuf` 仅对跨页记录持有原始字节,取"原始记录字节"必须自行装配(旧 demux 崩溃恢复路径曾因此写入垃圾 payload,已随 R1 修复) | §7.4 |
@@ -983,6 +983,8 @@ TSO 就位后只换取值来源,不动布局。`reserved` 与 `TxnMarkerPayload`
 
 ### 9.4 ShardRouteEntry 可见性路由表(R3 实装,本期建结构)
 
+> ★ 2026-09-12：**R3 读路径已实装**,但形态与本节的 shmem 路由表不同(键换成本地关系 OID、数据源换成 apply_checkpoint)。差异与理由见 §10.1。
+
 ```c
 /* include/shard_route.h */
 typedef enum
@@ -1063,6 +1065,39 @@ extern void ShardXidMapTruncate(Oid shard_oid, TransactionId frozen_bound);
 回放模块本期**调用**:`EnhancedClogWriteStatus`、`ShardXidMapInsert`、
 `PartDistRouteRegister/UpdateFileset`(注册与 fileset 维护)、
 `PartDistAdvanceNextXidPastXid`。其余为读侧预留,签名冻结、实现留空。
+
+### 10.1 R3 读路径已实装(2026-09-12)
+
+`include/shard_route.h` + `src/replay/shard_route.c`,接在
+`src/shard_visibility.c` 的 `sv_satisfies_mvcc` 上。实装形态与上面的预留签名
+**有三处有意的偏差**,都是实测之后的选择:
+
+| 预留 | 实装 | 为什么 |
+|---|---|---|
+| 键是 `RelFileLocator`,查 shmem 路由表 | 键是**本地关系 OID**,查 `pg_parwal/<oid>/apply_checkpoint` | 回放侧 `ctx->shard_oid` 本来就是本地壳表 OID(分片 clog、checkpoint 目录都按它编址),而可见性钩子拿到的 `htup->t_tableOid` 正是同一个值 —— 省掉一整张 shmem 表,且**一次 catalog 都不碰**(硬要求:可见性可能在持缓冲区锁时被调) |
+| xid_map 迁到 shmem DSA + dshash | 后端本地缓存,按 local_xid 升序的**数组**,二分查找 | apply_checkpoint 本来就是数组格式;16 B/条、单分区上限 100 万,比 dshash 省一半内存,也不必在 `shmem_startup` 里预建 DSA。跨后端共享留到有性能证据再做 |
+| `HeapTupleSatisfiesGlobalMVCC` 独立入口 | 并入既有 `sv_satisfies_mvcc`(补丁 0006 钩子) | 那个钩子**不由 `is_shard_rel` 把门**,返回 false 即退回本机语义 —— 于是接管读路径不需要动 `is_shard_rel`,delete/update/prune 的内核分支一行都不受影响 |
+
+**交付面 = MVCC 读,仅此一条。** `satisfies_self / dirty / update` 仍走本机
+语义:升主后的新主**读得到**切主前的行,但对这些行 UPDATE/DELETE 时判可更新性
+走的还是本机 clog,结论不可信。这是有意划的界 —— 写路径要处理"谁能改一条别人
+宇宙里的元组",涉及行锁、xmax 消毒与回卷,属 §11(R4)。所以 §14.2 的
+"R4 阻断于 R3"现在只松了**读**的那一半。
+
+**取证面**:`partdist.route_resolve(rel, xid)` → `(role, watermark, nxidmap,
+gxid, status)`,把两跳摊开。`promote_catchup_tx3` 用它断言"是**走 R3** 读到的"
+而不是"碰巧读到"——那张表没打过分片标,元组 xmin 是旧 leader 的原生 xid,
+本机 clog 里碰巧同号且同为 committed 的事务会让行数断言在 R3 一步没走的情况下
+照样绿。实测串:`promoted|562949953568093|committed`(gxid 高 16 位 = 原主
+node 2)。
+
+**时间戳宇宙的依赖**:gclog 槽里的 commit_ts 来自 MARKER,配了 TSO 是 TSO 号、
+没配是本地墙钟;读者的 `TsoGetStartTs()` 同样"配了才有号"。TSO 是整簇一致的
+配置,两边因此恒在同一宇宙。**已知边界**:leader 写标记时没配、读者读时配上了
+(或反过来)会拿墙钟比 TSO 号,墙钟恒大 ⇒ 已提交的行永久不可见。这与分片 clog
+那条路同源(`ShardClogSetVerdict` 存的是同一个 commit_ts),根治要给 commit_ts
+配一个类似 `PARTWAL_MARKER_STS_IS_TSO` 的宇宙标志位 —— 记为开放问题,
+见 `src/tso_client.c` 里那段留痕。
 
 ---
 

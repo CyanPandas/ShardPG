@@ -44,11 +44,20 @@ need_nm() {    # need_nm <说明> <符号>
 #    是判据选错了，不是补丁缺失。守卫产生假警报比漏检更糟：它会让人去重编一个
 #    本来就好的二进制。）
 need_str() {   # need_str <说明> <字符串>
+  need_str_in "$1" "bin/postgres" "$2"
+}
+
+# ★★ 2026-09-12 补：判据要落到**具体哪个二进制**上。
+#   PostgreSQL 的 rmgrdesc/*.c 会被编译**两次** —— 一次进 bin/postgres，
+#   一次进 bin/pg_waldump（后者用符号链接把 desc 源拉进 src/bin/pg_waldump
+#   单独编）。所以"只重编后端并同步 bin/postgres"会留下一个**能跑但解不出
+#   新记录体的 pg_waldump**：它不报错，只是静静地少打一段注解。
+need_str_in() {  # need_str_in <说明> <相对二进制路径> <字符串>
   local n
-  if [[ ! -x "$ROOT/bin/postgres" ]]; then say "$1" "缺 bin/postgres"; fail=1; return; fi
-  n=$(strings "$ROOT/bin/postgres" 2>/dev/null | grep -cF "$2" || true)
+  if [[ ! -x "$ROOT/$2" ]]; then say "$1" "缺 $2"; fail=1; return; fi
+  n=$(strings "$ROOT/$2" 2>/dev/null | grep -cF "$3" || true)
   n=${n:-0}
-  if [[ "$n" -gt 0 ]]; then say "$1" "OK"; else say "$1" "缺失（二进制未重编？）"; fail=1; fi
+  if [[ "$n" -gt 0 ]]; then say "$1" "OK"; else say "$1" "缺失（$2 未重编？）"; fail=1; fi
 }
 
 echo "检查 pg-install 内核补丁：$ROOT"
@@ -72,8 +81,12 @@ need_nm   "0004   pre_record_commit_hook 符号（bin/postgres，DTX-2PC 决议�
 #   各种难查的方式坏掉（TX-TSO-MVCC 的分片 xid、可见性、2PC rmgr 全在这几个里）。
 #
 #   触发这次复查的是 T7.12-P1 的 shard_clog_p2：它靠 `pg_waldump | grep
-#   "shard xids:"` 取证而红，当时怀疑二进制缺 0007。实测**十个补丁的特征符号
-#   在二进制里全都在**，方向被排除 —— 但也就此暴露了守卫的漏检。
+#   "shard xids:"` 取证而红。第一轮只查了 bin/postgres，十个补丁的特征符号
+#   全都在，于是"方向被排除"—— **这个结论是错的**：0007 改的是 xactdesc.c，
+#   而解码那份注解的是 **bin/pg_waldump**，它停留在打补丁之前的版本
+#   （2026-09-12 实测：bin/postgres 含 "shard xids:"，bin/pg_waldump 不含）。
+#   产品侧一直是对的，红的是取证工具。教训：**一个补丁"在不在"要按它实际
+#   影响的每个产物分别验，不能只挑主二进制。**
 need_nm   "0005   shard_relation_xid_hook 符号（分片 xid 打标）" \
           "shard_relation_xid_hook"
 need_nm   "0006   shard_visibility_hook 符号（分片可见性）" \
@@ -87,6 +100,11 @@ need_nm   "0009   shard_at_prepare_hook 符号（2PC rmgr）" \
 need_str  "0010   XLogAdvancePendingInsertPosition（升主推进写入位置；static，按 strings 验）" \
           "XLogAdvancePendingInsertPosition"
 
+# 前端产物：pg_waldump 自带一份 xactdesc.o，必须同样带 0007 的注解代码，
+# 否则 commit/abort 记录体里的分片 xid 块解不出来（取证类用例会无声地红）。
+need_str_in "0007   pg_waldump 能解分片 xid 注解（前端另编一份 xactdesc.o）" \
+            "bin/pg_waldump" "shard xids:"
+
 if [[ "$fail" -ne 0 ]]; then
   cat <<'EOF'
 
@@ -98,5 +116,5 @@ EOF
   exit 1
 fi
 
-echo "  → 十个补丁齐全（0001/0001v2/0002/0004 声明+符号，0005–0010 符号）"
+echo "  → 十个补丁齐全（0001/0001v2/0002/0004 声明+符号，0005–0010 符号，0007 另验 pg_waldump）"
 exit 0

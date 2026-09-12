@@ -246,11 +246,22 @@ done
 # 事务又会在 leader 上悄悄吃掉号 —— 两边本就不该相等。
 lead_next=$(PSQL $pport -Atc "SELECT partdist.shard_xid_next(${SOID}::oid)" </dev/null | tail -1)
 check "leader 已发过号（next_xid > 3）" "$([[ -n "$lead_next" && "$lead_next" -gt 3 ]] && echo ok)" "ok"
+# ★★ 2026-09-12 改判据：原先比的是 `follower 水位 >= leader **当前** next_xid`，
+#   实测 6 >= 8 不成立。而上面那段注释自己的论证是矛盾的 —— 它说"中止且字节未
+#   入流的事务会在 leader 上**悄悄吃掉号**，两边本就不该相等"，可被悄悄吃掉的号
+#   只会让 **leader 的 next_xid 更大**，正好让 `follower >= leader` 更难成立，
+#   不是更容易。拿一个会随 leader 后续活动单向增长的量做下界，判据本身就不成立。
+#
+#   真正要保的安全性质只有一条：**升主后不能把已经用在回放元组上的号再发一次**。
+#   所以该比的是"follower 自己 clog 里已判定的最大分片 xid"，而不是 leader 的
+#   实时 next_xid —— 前者才是这个节点升主后可能撞上的号的上界。
 for fp in $f1 $f2; do
   foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
   fnext=$(PSQL "$fp" -Atc "SELECT partdist.shard_xid_next(${foid}::oid)" </dev/null | tail -1)
-  check "★ follower :$fp 接住了发号水位（$fnext >= $lead_next）" \
-        "$([[ -n "$fnext" && "$fnext" -ge "$lead_next" ]] && echo ok)" "ok"
+  # 已判定（st<>0）的最大分片 xid；扫描范围与上面 SCLOG() 的 3..15 同源
+  fmax=$(PSQL "$fp" -Atc "SELECT coalesce(max(g),2) FROM generate_series(3,15) g WHERE sclog_read(${foid}::oid, g::bigint) <> 0" </dev/null | tail -1)
+  check "★ follower :$fp 的发号水位盖过已回放的最大分片 xid（next=$fnext > max_seen=$fmax；leader 当前 next=$lead_next 仅作参考）" \
+        "$([[ -n "$fnext" && -n "$fmax" && "$fnext" -gt "$fmax" ]] && echo ok)" "ok"
 done
 # ★ "持久"二字要验：重启一个 follower，水位必须还在（否则升主就会从 3 号重发）
 f1data=$(PSQL $f1 -Atc "SHOW data_directory" </dev/null)
@@ -258,8 +269,11 @@ DEX /work/pg-install/bin/pg_ctl -D "$f1data" -m fast restart -l "$f1data/restart
 up=""; for t in $(seq 1 45); do up=$(PSQL $f1 -Atc "SELECT 1" </dev/null 2>/dev/null); [[ "$up" == "1" ]] && break; sleep 1; done
 check "follower :$f1 重启就绪" "$up" "1"
 foid1=$(PSQL "$f1" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null | tail -1)
-check "★ 重启后发号水位仍在（这才叫持久）" \
-      "$([[ "$(PSQL "$f1" -Atc "SELECT partdist.shard_xid_next(${foid1}::oid)" </dev/null | tail -1)" -ge "$lead_next" ]] && echo ok)" "ok"
+# 同上：持久性验的是"重启后水位没退回去"，下界仍取本节点已回放的最大分片 xid。
+fnext1=$(PSQL "$f1" -Atc "SELECT partdist.shard_xid_next(${foid1}::oid)" </dev/null | tail -1)
+fmax1=$(PSQL "$f1" -Atc "SELECT coalesce(max(g),2) FROM generate_series(3,15) g WHERE sclog_read(${foid1}::oid, g::bigint) <> 0" </dev/null | tail -1)
+check "★ 重启后发号水位仍在（这才叫持久；next=$fnext1 > max_seen=$fmax1）" \
+      "$([[ -n "$fnext1" && -n "$fmax1" && "$fnext1" -gt "$fmax1" ]] && echo ok)" "ok"
 
 F1MAIN=$(FPATH_MAIN $f1); F2MAIN=$(FPATH_MAIN $f2)
 md5_f1_pre=$(DEX md5sum "$F1MAIN" </dev/null 2>/dev/null | cut -d' ' -f1)
