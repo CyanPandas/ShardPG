@@ -574,9 +574,22 @@ run_one() {  # <名字> <超时> <出身>
   #   收编的第一步是先能正确读出它们的结论。
   r=$(grep -oE 'PASS=[0-9]+ +FAIL=[0-9]+' "$log" | tail -1)
   if [[ -z "$r" ]]; then
+    # ★★ 2026-09-12：收编的 ops 8 套各用各的汇总格式，首版只认两种，
+    #   于是 5 套明明**全绿**（6/36/29/44/12，与单跑一致）却被记成
+    #   "无汇总行:超时或早退" —— 汇总里显示 PASS=0 FAIL=0 且判为不干净。
+    #   这是**最坏的一类 harness 债**：它把通过的套件报成异常，
+    #   而人会去查一段其实没问题的代码。实测格式：
+    #     · `PASSED : n` / `FAILED : n`（冒号前有空格，segment_boundary_lsn）
+    #     · `Tests passed: n` / `Tests failed: n`（crash_recovery、demux_backlog）
+    #     · `通过: n` / `失败: n`（corrupt_segment_recovery）
+    #     · `PASS: n  FAIL: n`（enospc_recovery）
     local pp ff
-    pp=$(grep -oE 'PASSED: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
-    ff=$(grep -oE 'FAILED: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
+    pp=$(grep -oE '(PASSED|Tests passed|通过) *: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
+    ff=$(grep -oE '(FAILED|Tests failed|失败) *: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
+    if [[ -z "$pp" || -z "$ff" ]]; then
+      pp=$(grep -oE 'PASS: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
+      ff=$(grep -oE 'FAIL: *[0-9]+' "$log" | tail -1 | grep -oE '[0-9]+')
+    fi
     [[ -n "$pp" && -n "$ff" ]] && r="PASS=$pp FAIL=$ff"
   fi
   if [[ -z "$r" ]]; then
