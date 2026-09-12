@@ -98,6 +98,14 @@ extern void ShardXidRaiseAllocWatermark(Oid shard, TransactionId alloc_wm);
 /* T5.4：本分片下一个待发号（vacuum 的 fail-closed 上界）。0 = 取不到 */
 extern TransactionId ShardXidNextToIssue(Oid shard);
 
+/* T7.17（P7-V1）：自动启动器开关（GUC pg_partdist.shard_vacuum_auto） */
+extern bool shard_vacuum_auto_enabled;
+
+/* T7.17（P7-V1）：到龄分片枚举，供 vacuum 自动启动器用。只读 shmem */
+extern int	ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max);
+extern int	ShardXidTwoStateShards(Oid *shards, int max);
+extern int	ShardXidOverdueCount(void);
+
 extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 									 TransactionId *vacuum_xid);
 extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,

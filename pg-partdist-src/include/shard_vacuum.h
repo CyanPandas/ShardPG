@@ -140,4 +140,11 @@ typedef enum ShardVacuumRecoverAction
 
 extern int	ShardVacuumRecover(Oid shard);
 
+/* T7.17（P7-V1）：一次自动启动最多处理几个分片。锁与页面扫描都在这条路上，
+ * 不设上限时"很多分片同时到龄"会把一次调用拖得很长。 */
+#define SHARD_VACUUM_AUTO_BATCH		4
+
+/* 心跳工作者的自连触发（无 DB 语境时用） */
+extern void ShardVacuumSelfTriggerAuto(void);
+
 #endif							/* SHARD_VACUUM_H */

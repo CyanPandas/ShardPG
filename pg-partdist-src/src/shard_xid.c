@@ -44,6 +44,7 @@
 
 /* T5.6：回卷护栏两阶段的阈值（设计 §7），GUC 可调 —— 验收要把它们调小 */
 static int	shard_vacuum_max_age = 200000000;
+bool		shard_vacuum_auto_enabled = true;	/* T7.17：自动启动器开关 */
 static int	shard_xid_stop_age = 2146483648;
 
 /* ---- T1.1：GUC 白名单 ---- */
@@ -970,6 +971,94 @@ shard_xid_wraparound_gate(Oid shard, const ShardXidSlot *slot)
 						 "partdist.shard_clog_truncate() 推进截断点。")));
 }
 
+/*
+ * T7.17（P7-V1）：列出**到龄**的分片，供自动启动器取用。
+ *
+ * 判据与阶段 1 护栏同源（`age >= shard_vacuum_max_age`）—— 这一点是有意的：
+ * 护栏发 WARNING 说"该跑 vacuum 了"，自动启动器就该在同一条线上动手，
+ * 两者用不同判据会出现"警告了但不动手"或"没警告却在动手"的错位。
+ *
+ * 只读共享内存、不碰 catalog、不做 IO：调用方是心跳工作者（无 DB 语境），
+ * 它拿到非空结果才会去自连一个真 backend 干活。零到龄分片时代价 = 一次
+ * LW_SHARED + 一趟 64 槽的线性扫描。
+ */
+int
+ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max)
+{
+	int			i;
+	int			n = 0;
+
+	if (ShardXidCtl == NULL || max <= 0)
+		return 0;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS && n < max; i++)
+	{
+		ShardXidSlot *slot = &ShardXidCtl->slots[i];
+		TransactionId age;
+
+		if (slot->shard_relid == InvalidOid)
+			continue;
+		age = shard_xid_age_locked(slot);
+		if (age < (TransactionId) shard_vacuum_max_age)
+			continue;
+		shards[n] = slot->shard_relid;
+		if (ages != NULL)
+			ages[n] = age;
+		n++;
+	}
+	LWLockRelease(ShardXidCtl->lock);
+	return n;
+}
+
+/*
+ * T7.17：处于「趟完、截断没做」（设计 §6.5 两态之二）的分片。
+ *
+ * ★ 为什么要和"到龄"分开列：这一格与龄无关 —— 它是**上一趟在落标记与截断
+ *   之间崩过一次**留下的，页面动作已经全部完成并持久，只差最后一步截断。
+ *   在此之前 `ShardVacuumRecover()` **只有手工入口**（SQL 函数），也就是说
+ *   这一格能一直挂到该分片到龄为止：那段时间里 clog 段文件不回收、免查区
+ *   不前进，而修复它只需要一次几乎零成本的补截断。
+ */
+int
+ShardXidTwoStateShards(Oid *shards, int max)
+{
+	int			i;
+	int			n = 0;
+
+	if (ShardXidCtl == NULL || max <= 0)
+		return 0;
+
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS && n < max; i++)
+	{
+		ShardXidSlot *slot = &ShardXidCtl->slots[i];
+
+		if (slot->shard_relid == InvalidOid)
+			continue;
+		if (!TransactionIdIsValid(slot->vacuum_xid) ||
+			slot->vacuum_xid <= slot->trunc_before)
+			continue;
+		shards[n++] = slot->shard_relid;
+	}
+	LWLockRelease(ShardXidCtl->lock);
+	return n;
+}
+
+/* 同上，只要个数（心跳每 5 s 一次，别为计数分配数组） */
+int
+ShardXidOverdueCount(void)
+{
+	Oid			buf[SHARD_XID_MAX_SLOTS];
+
+	int			n = ShardXidOverdueShards(buf, NULL, SHARD_XID_MAX_SLOTS);
+
+	/* 两态之二同样要人管（见 ShardXidTwoStateShards 的注释） */
+	if (n == 0)
+		n = ShardXidTwoStateShards(buf, SHARD_XID_MAX_SLOTS);
+	return n;
+}
+
 static TransactionId
 shard_xid_allocate(Oid shard)
 {
@@ -1404,10 +1493,22 @@ ShardXidDefineGUCs(void)
 		"pg_partdist.shard_vacuum_max_age",
 		"阶段 1：分片 xid 龄达到此值即到龄，须尽快跑分片 vacuum。",
 		"分片版的 autovacuum_freeze_max_age。龄 = next_xid - clog_truncate_before。"
-		"到龄本身只发 WARNING —— 自动启动器尚未实现（见 DEV PLAN T5.6 记要）。",
+		"到龄发一条 WARNING，并（在 pg_partdist.shard_vacuum_auto 打开时）"
+		"由心跳工作者触发 partdist.shard_vacuum_auto()（T7.17/P7-V1）。",
 		&shard_vacuum_max_age,
 		200000000,
 		1, INT_MAX,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"pg_partdist.shard_vacuum_auto",
+		"分片 vacuum 自动启动器（T7.17/P7-V1）。",
+		"打开后，TSO 心跳工作者每轮检查是否有分片到龄，有则自连触发 "
+		"partdist.shard_vacuum_auto()。关掉即退回「只发 WARNING、全靠手工」的"
+		"旧行为 —— 出问题时这是第一个该关的开关。",
+		&shard_vacuum_auto_enabled,
+		true,
 		PGC_SIGHUP,
 		0, NULL, NULL, NULL);
 

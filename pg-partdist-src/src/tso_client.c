@@ -21,6 +21,7 @@
 #include "tso.h"
 #include "global_mvcc.h"
 #include "shard_xid.h"
+#include "shard_vacuum.h"
 #include "dtx_pending.h"
 
 #include "fmgr.h"
@@ -655,6 +656,17 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 */
 		if (DtxPendingCount() > 0)
 			DtxPendingSelfTriggerSweep();
+
+		/*
+		 * T7.17（P7-V1）：分片 vacuum 自动启动器。
+		 *
+		 * 搭在这个心跳上而不是另起一个 bgworker：它已经是"每几秒醒一次、
+		 * 无 DB 语境、需要时自连一个 backend 干活"的形态，与自动 vacuum
+		 * 要的节奏完全一致；另起一个只是多一份要维护的生命周期。
+		 * 零到龄分片时代价 = 一次 LW_SHARED + 64 槽线性扫描，不自连。
+		 */
+		if (shard_vacuum_auto_enabled && ShardXidOverdueCount() > 0)
+			ShardVacuumSelfTriggerAuto();
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

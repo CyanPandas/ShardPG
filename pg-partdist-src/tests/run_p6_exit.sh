@@ -61,6 +61,7 @@ SUITES=(
   "dtx_tso_p4            1800  P4"
   "shard_vacuum_p5        900  P5"
   "shard_vacuum_replay_p5 900  P5"
+  "shard_vacuum_auto_p7   900  P5"   # T7.17（P7-V1）分片 vacuum 自动启动器
   # ── P6 新增
   "shard_baseline_p6      900  P6"
   "locmap_base_p6         900  P6"

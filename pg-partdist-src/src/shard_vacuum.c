@@ -48,6 +48,11 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "storage/itemptr.h"
+#include "access/xact.h"			/* T7.17：逐分片内部子事务 */
+#include "utils/syscache.h"
+#include "tso.h"
+#include "libpq-fe.h"			/* T7.17：自连触发 */
+#include "postmaster/postmaster.h"	/* PostPortNumber */
 #include "utils/memutils.h"		/* maintenance_work_mem */
 #include "utils/relcache.h"
 
@@ -1198,4 +1203,254 @@ partdist_shard_vacuum_recover(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(
 		(act == SHARD_VACUUM_RECOVER_TRUNCATE) ? "truncated" : "nothing"));
+}
+
+/* ================================================================== */
+/* T7.17（P7-V1）：分片 vacuum 自动启动器                              */
+/* ================================================================== */
+
+/*
+ * shard_vacuum_auto() —— 把"到龄了该跑 vacuum"从一条 WARNING 变成真的会跑。
+ *
+ * 在此之前，分片 xid 到龄只由 `shard_xid_wraparound_gate()` 发一条 WARNING，
+ * 真正的三步（算目标 → 趟页面 → 截断 clog）全靠人手工敲。运维一旦没看见那条
+ * WARNING，龄会一路涨到停发线，**该分片进只读** —— 一个本可以自动化的动作，
+ * 代价却是分片级不可写。
+ *
+ * 本函数就是那三步的无人值守版本，逐个到龄分片走：
+ *   ① 两态恢复优先（设计 §6.5）：`trunc_before < shard_vacuum_xid` 说明上一轮
+ *      "趟完了、截断没做"，此时**只补截断，绝不重跑页面趟**；
+ *   ② 否则算目标：从当前截断点顺扫到本分片的 next_xid（fail-closed 上界），
+ *      拿 GlobalSafeTs 作放行线；
+ *   ③ 目标有推进才动手：整趟页面动作 → 干净才截断。
+ *
+ * ★ 三条有意的保守选择：
+ *
+ *   · **取不到 GlobalSafeTs 就不清**。`TsoGetGlobalSafeTs()` 失败返回 0，
+ *     而 `ShardVacuumComputeTarget` 对 safe_ts=0 会以 `no-safe-ts` 停在原地。
+ *     少清一轮无害；拿一个不可信的安全线去截断 clog 是不可逆的。
+ *
+ *   · **一次只做有限个分片**（`p_max_shards`）。本函数跑在心跳自连出来的
+ *     普通 backend 里，而页面趟要拿 ShareUpdateExclusiveLock 并可能扫很多页。
+ *     不设上限的话，一个"很多分片同时到龄"的节点会被一次调用占住很久。
+ *
+ *   · **单个分片失败不拖累其余**。每个分片包一个内部子事务 —— 这是 T7.8 用
+ *     血换来的纪律：`PG_TRY/PG_CATCH + FlushErrorState` **不会**把事务恢复成
+ *     可用状态，只有 `BeginInternalSubTransaction` / `RollbackAndRelease` 才会。
+ *     表被 DROP 了、锁等超时了、某个分片的账目有洞，都只该让**那一个**分片
+ *     这轮跳过。
+ */
+PG_FUNCTION_INFO_V1(partdist_shard_vacuum_auto);
+Datum
+partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
+{
+	int32		max_shards = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
+	Oid			shards[SHARD_XID_MAX_SLOTS];
+	TransactionId ages[SHARD_XID_MAX_SLOTS];
+	int			nover;
+	int			i;
+	int			considered = 0;
+	int			swept_n = 0;
+	int			truncated_n = 0;
+	int64		safe_ts;
+	StringInfoData detail;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	TupleDesc	tupdesc;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	if (max_shards <= 0 || max_shards > SHARD_XID_MAX_SLOTS)
+		max_shards = SHARD_XID_MAX_SLOTS;
+
+	initStringInfo(&detail);
+	nover = ShardXidOverdueShards(shards, ages, max_shards);
+
+	/*
+	 * ★ 到龄之外，还要捞上"趟完、截断没做"的（设计 §6.5 两态之二）。
+	 *   那一格与龄无关：页面动作早已完成并持久，只差一次几乎零成本的补截断，
+	 *   而在本函数之前 `ShardVacuumRecover()` 只有手工入口 —— 不捞的话它能
+	 *   一直挂到该分片到龄，这段时间 clog 段不回收、免查区不前进。
+	 */
+	if (nover < max_shards)
+	{
+		Oid			two[SHARD_XID_MAX_SLOTS];
+		int			ntwo = ShardXidTwoStateShards(two, SHARD_XID_MAX_SLOTS);
+		int			k,
+					j;
+
+		for (k = 0; k < ntwo && nover < max_shards; k++)
+		{
+			for (j = 0; j < nover; j++)
+				if (shards[j] == two[k])
+					break;
+			if (j < nover)
+				continue;		/* 已在到龄名单里 */
+			ages[nover] = 0;
+			shards[nover++] = two[k];
+		}
+	}
+
+	safe_ts = TsoGetGlobalSafeTs();
+
+	for (i = 0; i < nover; i++)
+	{
+		Oid			shard = shards[i];
+		MemoryContext oldcxt = CurrentMemoryContext;
+		ResourceOwner oldowner = CurrentResourceOwner;
+
+		considered++;
+
+		BeginInternalSubTransaction(NULL);
+		PG_TRY();
+		{
+			TransactionId tb,
+						vx,
+						ceiling,
+						target;
+			const char *reason = NULL;
+
+			ShardVacuumGetWatermarks(shard, &tb, &vx);
+
+			/* ① 两态恢复：趟完未截断 —— 只补截断 */
+			if (vx > tb)
+			{
+				if (ShardVacuumRecover(shard) == SHARD_VACUUM_RECOVER_TRUNCATE)
+				{
+					truncated_n++;
+					appendStringInfo(&detail, "%s%u:recover", i ? " " : "", shard);
+				}
+			}
+			else
+			{
+				ceiling = ShardXidNextToIssue(shard);
+				target = ShardVacuumComputeTarget(shard, tb, safe_ts,
+												  ceiling, &reason);
+
+				if (!TransactionIdIsValid(target) || target < tb)
+					appendStringInfo(&detail, "%s%u:%s", i ? " " : "", shard,
+									 reason ? reason : "no-target");
+				else
+				{
+					TransactionId newtb = target + 1;
+					Relation	rel;
+					ShardVacuumPageStats st;
+					int64		san = 0,
+								rab = 0,
+								rdead = 0;
+					bool		swept;
+
+					/*
+					 * 表可能刚被 DROP（槽位回收与 catalog 不是同一个提交点）。
+					 * 先探一次 syscache，省得让一条 relation_open 的 ERROR
+					 * 走完整条子事务回滚路径。
+					 */
+					if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(shard)))
+						appendStringInfo(&detail, "%s%u:gone", i ? " " : "", shard);
+					else
+					{
+						rel = relation_open(shard, ShareUpdateExclusiveLock);
+						/* 编号变体：嵌在外层 PG_TRY 里，不编号会遮蔽它的局部量 */
+						PG_TRY(2);
+						{
+							swept = ShardVacuumSweep(rel, newtb, &st,
+													 &san, &rab, &rdead);
+						}
+						PG_FINALLY(2);
+						{
+							relation_close(rel, ShareUpdateExclusiveLock);
+						}
+						PG_END_TRY(2);
+
+						if (!swept)
+							appendStringInfo(&detail, "%s%u:not-swept(skip=%ld,defer=%ld)",
+											 i ? " " : "", shard,
+											 (long) st.pages_skipped,
+											 (long) st.tuples_deferred);
+						else
+						{
+							swept_n++;
+							ShardClogTruncate(shard, newtb);
+							truncated_n++;
+							appendStringInfo(&detail, "%s%u:%u->%u",
+											 i ? " " : "", shard,
+											 (unsigned) tb, (unsigned) newtb);
+						}
+					}
+				}
+			}
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcxt);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcxt);
+			CurrentResourceOwner = oldowner;
+
+			/*
+			 * LOG 而不是 WARNING：本函数多半是心跳自连触发的，把一个分片的
+			 * 失败推给一个毫不相干的客户端会话是错的（同 T7.8 的判断）。
+			 */
+			ereport(LOG,
+					(errmsg("pg_partdist: 分片 %u 的自动 vacuum 本轮跳过：%s",
+							shard, edata->message)));
+			appendStringInfo(&detail, "%s%u:error", i ? " " : "", shard);
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	}
+
+	values[0] = Int32GetDatum(considered);
+	values[1] = Int32GetDatum(swept_n);
+	values[2] = Int32GetDatum(truncated_n);
+	values[3] = CStringGetTextDatum(detail.data);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * 心跳工作者的自连触发（无 DB 语境，纯 libpq —— 与 DtxPendingSelfTriggerSweep
+ * 同一条路子）。
+ *
+ * ★ 为什么不在 bgworker 里直接干：页面趟要开关系、拿锁、跑索引 AM，这些都
+ *   需要 catalog 与一个正经的事务环境，而心跳 worker 是 `dbname=NULL` 起来的
+ *   （只走完 BaseInit，不连任何库）。自连出一个干净 backend 是既有做法，
+ *   也顺带把"一次调用占住多久"限制在那个 backend 里，不拖住心跳。
+ */
+void
+ShardVacuumSelfTriggerAuto(void)
+{
+	char		conninfo[256];
+	PGconn	   *conn;
+	PGresult   *res;
+
+	snprintf(conninfo, sizeof(conninfo),
+			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
+			 PostPortNumber);
+	conn = PQconnectdb(conninfo);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		PQfinish(conn);
+		return;
+	}
+	res = PQexec(conn,
+				 "SELECT shards_considered, shards_truncated, detail "
+				 "FROM partdist.shard_vacuum_auto(" CppAsString2(SHARD_VACUUM_AUTO_BATCH) ")");
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
+		strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+		ereport(LOG,
+				(errmsg("pg_partdist: 分片 vacuum 自动启动器处理 %s 个到龄分片，"
+						"截断 %s 个：%s",
+						PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
+						PQgetvalue(res, 0, 2))));
+	PQclear(res);
+	PQfinish(conn);
 }

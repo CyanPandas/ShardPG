@@ -613,6 +613,24 @@ CREATE OR REPLACE FUNCTION shard_vacuum_sweep(
 COMMENT ON FUNCTION shard_vacuum_sweep(REGCLASS, BIGINT) IS
     'T5.4：一整趟页面动作（③ xmax 消毒 → ① 删中止 xmin → ② 删已提交删除的死元组）。③ 必须最先——① 对"仍挂 HOT 链的 heap-only 元组"的推迟要靠 ③ 清 xmax 才解除。整趟干净才落 shard_vacuum_xid 标记，否则返回 swept=false 且不动水位，截断随之被拦。';
 
+-- T7.17（P7-V1）：分片 vacuum 自动启动器。
+-- 把"到龄了该跑 vacuum"从一条 WARNING 变成真的会跑：逐个到龄分片走
+-- 「两态恢复 → 算目标 → 趟页面 → 截断」，单个分片失败只让那一个跳过。
+-- 判据与阶段 1 护栏同源（age >= shard_vacuum_max_age），所以不会出现
+-- "警告了却不动手"或"没警告却在动手"的错位。
+-- p_max_shards <= 0 表示不限（上限仍是 64 个槽位）。
+CREATE OR REPLACE FUNCTION shard_vacuum_auto(
+    p_max_shards INTEGER DEFAULT 0,
+    OUT shards_considered INTEGER,
+    OUT shards_swept INTEGER,
+    OUT shards_truncated INTEGER,
+    OUT detail TEXT
+) RETURNS record LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_auto';
+
+COMMENT ON FUNCTION shard_vacuum_auto(INTEGER) IS
+    'T7.17：分片 vacuum 自动启动器。心跳工作者按 pg_partdist.shard_vacuum_auto 自连触发，也可手工调用。detail 逐分片回填结果：<oid>:<旧截断点>-><新截断点> / recover / gone / not-swept(...) / <停因> / error。取不到 GlobalSafeTs 时一律停在 no-safe-ts —— 少清一轮无害，拿不可信的安全线截断 clog 不可逆。';
+
 -- T5.4：截断本分片 clog。门禁 = 顺序铁律；内部次序 = 先推水位后删文件。
 CREATE OR REPLACE FUNCTION shard_clog_truncate(p_shard OID, p_trunc_before BIGINT)
 RETURNS INTEGER LANGUAGE c STRICT VOLATILE

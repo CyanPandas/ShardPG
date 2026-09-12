@@ -79,7 +79,7 @@
 
 | ID | 事项 | 09-09 复核 |
 |---|---|---|
-| **P7-V1** | 分片 vacuum **无自动启动器**，到龄只 WARNING（`shard_xid.c:1381`） | 未做 |
+| **P7-V1** | 分片 vacuum **无自动启动器**，到龄只 WARNING（`shard_xid.c:1381`） | **✅ 已做（2026-09-12，T7.17）**：`partdist.shard_vacuum_auto()` 把三步（算目标 → 趟页面 → 截断）串成无人值守版本，由 TSO 心跳工作者按 `pg_partdist.shard_vacuum_auto`（默认 on）自连触发。判据与阶段 1 护栏同源（`age >= shard_vacuum_max_age`），不会出现"警告了却不动手"。验收 `test_shard_vacuum_auto_p7.sh` **29/0**，含"不手工调、心跳 2 s 内自己把截断点从 6 推到 9 + 节点日志留痕"与"开关 off 时同样条件下一动不动、同一时刻手工调用仍能推进"两条对照。<br>★ **顺带补掉一格**：`ShardVacuumRecover()`（§6.5「趟完未截断」）此前**只有手工入口**，崩在那一格的分片要一直挂到它到龄才有人管 —— 自动启动器现在把这一格也一并捞起来（与龄无关，补一次几乎零成本的截断）。<br>★ **实测暴露的依赖**：截断放行判据是 `commit_ts < GlobalSafeTs`，而 commit_ts 在写入那一刻定宇宙 —— **先写数据后配 TSO**，clog 里存的是墙钟，拿去和 TSO 号比恒不放行，detail 一路 `commit-ts-too-new`、截断点一步不动。这就是 **P7-G4** 在 vacuum 路径上的样子，用例头注释已写明"TSO 必须在写入之前上线" |
 | **P7-V2** | 分片 vacuum **无尾部截断**（`shard_vacuum.c` 无 `smgrtruncate`/`RelationTruncate`） | 未做 |
 | **P7-V3** | 两处覆盖缺口：clog 整段删除分支；停在页面循环中间的崩溃 | 未做（需生产路径故障注入点） |
 | **P7-D3**<br>（2026-09-10 新登记） | **半删的分片会把那张分布表锁死在协调者上，永远删不掉**。在 worker 上直删分片表（运维绕过 §10 的常规手法，T7.8 夹具用的也是它）之后：① 协调者侧 `DROP TABLE` 走 Citus 2PC，被 §10「含分片打标表 DROP 禁 PREPARE」拦下 —— 拦的是**另一个**还留着壳表的副本；② 绕到各节点本地删（`enable_ddl_propagation=off`）同样不行 —— 那个分区组这时往往已经因为主副本的表先没了而凑不齐多数派，`PartWALAppendCtrl` 的 propose 直接失败（实测 `组 102008 propose plsn=58 失败 … record 58 未达多数派`）。于是那张表**两条路都走不通**。<br>与 P7-D1 是一体两面：D1 管的是"副本知不知道分片没了"，D3 管的是"分片没了之后那张分布表还能不能删掉"。发通知修好了不等于回收闭环了 | **未修，仅登记**。当前只能靠"整簇重建"清掉，验收因此不可重复跑。<br>**★ 它还会伪装成别的缺陷**：`test_promote_handover_p7` 第二轮报的是 `replay_set_locmap: base_part_lsn=0 声明"从流起点开始"，但本地关系 17522 已有 1 个块` —— 看着像回放侧的基线缺陷，实际链条是「旧主上的壳表删不掉 → 夹具里 `DROP TABLE IF EXISTS` 先失败 → 跟在同一个 `ON_ERROR_STOP` 块里的 `CREATE TABLE` 没执行 → `replay_set_locmap` 对上了**上一轮的旧表**」。这类"报错点离病根三跳远"的形态最费诊断时间，登记在案。<br>`test_baseline_clog_p7.sh` 与 `test_promote_handover_p7.sh` 均已改成每轮 `TBASE="…_$(date +%H%M%S)"` 规避。修法方向：DROP 的 §10 禁令对"分片表已经不在本地"的节点应放行；或给分区组一条"成员已不存在"的退出路径，让 propose 不必凑多数派 |
@@ -360,7 +360,8 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${OID}'"
       后仍全绿）+ 8 个 UDF 名字 + 引用表守卫 + MARKER 用 TSO start_ts；
       §10 每条限制各有一条负向断言
 - [x] OPS 8 套改造成拓扑无关并入门禁（口径 31 → **39 套**，T7.13，2026-09-11）
-- [ ] **39 套全量一次跑完、零 FAIL**，且是在最终二进制上跑的（时机已裁定为
+- [ ] **全量一次跑完、零 FAIL**（口径 2026-09-12 起 **40 套** —— T7.17 新增
+      `shard_vacuum_auto_p7`），且是在最终二进制上跑的（时机已裁定为
       批次 1–3 落地之后）
       · 2026-09-11/12 分四段跑完：**≈1595 条 / FAIL 17**，全部定因并修完 → 见 §2「T7.12 收口」
       · **仍差"一次跑完"**：四段是分开跑的，且批次内有主漂假红（**P7-E7**，宿主机无 swap）。
