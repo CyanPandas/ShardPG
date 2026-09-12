@@ -42,6 +42,8 @@
 | **R-P6-16** | **升主不发 `FILESET_UPDATE`**：`PartDistRoutePromote()`（`shard_fileset.c:1838`）只做"角色 + 捕获"两件事，不广播新主的 relfilenumber | **✅ 已修（2026-09-09，T7.3）**：`PartDistEmitFilesetHandover()` + 新标志位 `PARTWAL_FSUPD_PRIMARY_HANDOVER`（只重绑、不截断、不发 FPI）。验收 `test_promote_handover_p7.sh` **35/0**（2026-09-10 连跑两遍复核，两遍同数） | 其余副本 locmap 仍对着旧主文件号 ⇒ `replay_catchup` 报"未知 relfilelocator" ⇒ **切主一次，该分片其余副本全部失去再次当选资格**，直到从新主重新供给 |
 | **R-P6-21** | **供给/升主不携带"打标身份"**：`shard_fileset.c`/`raft_boundary.c` 均无 `ShardMvccSetAdd`；`mvcc_set` 只由 `partdist_set_shard_mvcc()` 或重启扫目录装载 | **✅ 已修（2026-09-09，T7.4）**：升主时按持久证据（`pg_shard_clog/<oid>` 存在）继承打标身份。验收同上，实测新主写入 xmin=4（分片 xid，非原生大 xid） | 升主后的新主若未事先手工加白名单又未重启，**写入不打标、读走原生路径** —— `handover_provision_p7` [3b] 与 `promote_catchup_tx3` [4] 都是在这个状态下通过的，**通过的原因是错的** |
 
+| **P7-P1**<br>（2026-09-12 新登记） | **on-access 剪枝的豁免判据漏掉"回放壳表"**：补丁 0005 在 `heap_page_prune_opt()` 开头对分片关系直接 return，但判据是 `shard_relation_xid_hook`（= 在 `partition_map` 里**登记过打标**）。**没打过标**的分布表，其副本壳表不在这道豁免里 —— 而 R-P6-21 的打标身份继承靠的是"`pg_shard_clog/<oid>` 存在"，没打标的分片压根没有这个目录，继承不到 | **未修，仅登记**。<br>**具体原因**：回放把 leader 的元组原样落到本节点页面上，元组头里是**外来** xid；升主后访问闸放行，一条普通 `SELECT` 触发的 on-access 剪枝会拿**本机 clog** 去判那些外来 xid 的死活，判成 dead 即就地清掉。<br>**为什么至今没炸**：`pd_prune_xid` 是 leader 写下的页面提示，只插入的页多半为 0，`heap_page_prune_opt` 因此不进入剪枝；有过 UPDATE/DELETE 的页就说不准。tx3 夹具正是纯插入，所以 24/0 通过。<br>**与 R3 的关系**：本隐患**先于 R3 读路径就存在**（旧行为是读成空表，SELECT 一样会触发剪枝），R3 既没引入也没消除它 —— 但读通之后人会真的去读，撞上的概率变高。<br>**修法方向**：把豁免判据从"打过标"放宽到"路由表命中"（要动内核补丁 0005，`shard_relation_p_prune` 需要第二个判据源）；或升主时强制重做物理基线。**在那之前，promoted 分片仍应按只读对待**（已写进 `include/shard_route.h` 与 `FOLLOWER_REPLAY_DESIGN.md` §10.1） | 已提交数据在**正常读取**时被就地清掉，不自愈 |
+
 ### 1.2 ★★ 可用性 / 资源（批次 2）
 
 | ID | 缺陷 | 09-09 复核 | 影响 |
@@ -57,7 +59,8 @@
 |---|---|---|---|
 | **P7-G1** | §9.2 第 3 层禁用清单**漏 8 个同类 Citus UDF**：`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method` | 未修（`shard_guard.c:50-80` 清单实为 7 个 citus UDF + 5 个逻辑解码入口；11 个 UDF 在 Citus 13.1 里全是 C 函数，实测在库） | 它们同样亲手搬/读分片数据，绕过去就是静默错读或与 raft 放置冲突。**注意补名字只堵入口，不堵通路**（§3.1），而且在补名字之前先得让守卫在协调者上真的生效（R-P6-22，§3.2） |
 | **P7-G2** | **引用表运行期写：零守卫、零断言**，DESIGN §10 那行还挂着"【需核实现状】" | 未修（`shard_guard.c` 零命中 `reference`） | §10 写"建表后只读"，实际拦不住 |
-| **R-P6-18** | MARKER 的 `start_ts` 是墙钟（`partwal_sync.c:733` `GetCurrentTransactionStartTimestamp()`），不是 TSO start_ts | **未修** | R-P3-2「双 ts 宇宙串线」成真：升主后 §4.2 三态处置拿它与 TSO 快照比，**恒为"跳过"** |
+| **R-P6-18** | MARKER 的 `start_ts` 是墙钟（`partwal_sync.c:733` `GetCurrentTransactionStartTimestamp()`），不是 TSO start_ts | **✅ 已修（T7.11）**：新增标志位 `PARTWAL_MARKER_STS_IS_TSO`，消费侧只认带位的值，不带位一律落 0（遗留模式） | R-P3-2「双 ts 宇宙串线」成真：升主后 §4.2 三态处置拿它与 TSO 快照比，**恒为"跳过"** |
+| **P7-G4**<br>（2026-09-12 新登记） | **`commit_ts` 没有对应的宇宙标志位**，与 R-P6-18 是同一件事的另一半 | **未修，仅登记**。<br>**具体原因**：`TsoMarkerCommitTs()` 配了 TSO 返回 TSO 号、没配返回本地墙钟（~2.1e9 / ~8.4e14），而槽里只存值不存来源。`ShardClogSetVerdict()` 与 gclog 槽都原样收下。判据 §4.1 是 `commit_ts < 读者 start_ts`，墙钟恒大于任何 TSO 号。<br>**为什么现在不炸**：TSO 是**整簇一致**的配置，写侧与读侧恒在同一宇宙 —— 要么都是 TSO 号（可比），要么读者 `my_ts=0` 走遗留分支（根本不比）。<br>**触发条件**：leader 写标记时没配 TSO、读者读时配上了（或反过来），即**中途改 TSO 配置**。那不是受支持的操作，所以定级为 ★ 而不是 ★★★。<br>**★ 留痕**：2026-09-12 曾把遗留分支改成返回 0 试图根治，**实测否证并已回退**（`promote_catchup_tx3` 毫无变化、`dtx_commit_marker_tx2` 由 39/2 恶化到 33/6）。经过写在 `src/tso_client.c`。<br>**修法方向**：照 `PARTWAL_MARKER_STS_IS_TSO` 的样子给 commit_ts 也加一位，并让 gclog 槽的 `status` 高位带上它（历史槽高位为 0 = 遗留 = 安全方向） | 只在中途改 TSO 配置时发作：已提交的行永久不可见 |
 | **R-P6-22** | **禁用清单在协调者上根本不生效**：`ShardGuardCheckPlan` 的快门是 `ShardGatingActive()`（本节点 `shard_relids` 非空 或 shmem `mvcc_n>0`），而打标表长在 worker、协调者两者皆空 ⇒ 只在协调者上调用的 `citus_rebalance_start` / `citus_drain_node` / `undistribute_table` 等**一条都不触发**。`negative_p6` 全绿是因为夹具用一个 worker 上的表 OID 给协调者开了闸门（`:64-66`） | **2026-09-09 新发现**（本次查证第 6 条时撞出，实测三节点白名单全空） | §9.2 第 3 层禁用整层在生产形态下熄火 —— 比"漏 8 个名字"严重得多。见 §3.2 |
 | **P7-G3** | DESIGN §10 缺 4 行、错 1 行 | **本次已补**，见 §5 | — |
 
@@ -100,6 +103,18 @@
 （R-P6-7 根因）**无自动守卫**；`REPLAY_MAX_SHARDS = 64` 定长槽位；单事务 DROP > 16 张
 打标表即 ERROR；`dtx_close_indoubt` 四级落空无告警面；GlobalSafeTs 被钉死无监控面；
 根 `README.md` 仍是 2.0 三节点文档（**本次已补导读**，见 §5）。
+
+### 1.8 2026-09-12 定因 17 条失败时新登记的缺陷（除 P7-P1 / P7-G4 外全部已修）
+
+| ID | 缺陷与**具体原因** | 处置 |
+|---|---|---|
+| **P7-W1** | **仓库里的 `pg-install/bin/pg_waldump` 停留在补丁 0007 之前**。原因：`src/backend/access/rmgrdesc/*.c` 在 PG 的构建里被编译**两次** —— 一次进 `bin/postgres`，一次经 `src/bin/pg_waldump/` 下的符号链接**单独编一份**。补丁 0007 改的正是 `xactdesc.c`，而"改完同步 `bin/postgres`"的既定流程只覆盖了前者。后果不是报错，是**静静地少打一段注解**：版本号一样、能跑、`COMMIT` 记录里的 `; shard xids:` 就是不出现。`test_shard_clog_p2` 两条取证断言因此恒红，而产品侧一直是对的 | **✅ 已修**：容器内离线重编该前端二进制并同步回仓库（办法记在 memory `project-repro-pg-install`）；守卫 `check_pg_install_patched.sh` 新增 `need_str_in "bin/pg_waldump" "shard xids:"`，并把"补丁在不在要按**每个产物**分别验"写进注释 |
+| **P7-T1** | **夹具与选举较劲，反而把环境搞坏**（`test_clog_hole_c4.sh`）。原因：旧版顺序是"按 placement 定主从 → 铺 fileset/locmap → 建组 → 主没落在 placement 节点就 drop 重来"。每重来一次就是一次选举；当选者一旦是另一个成员，切主链路（自治选举 → 上报 → group0 登记 → **落路由层**）就把 Citus 的 placement **迁到当选者身上**。等循环把 raft leader 逼回原节点，placement 已经留在对面 ⇒ 经协调者的 INSERT 被路由到对面撞"本节点不是该分区组的 leader"，对面又已置 `role=promoted` 直接拒绝回放 | **✅ 已修**：建组排到 fileset/locmap **之前**，**谁当选认谁**，等 placement 收敛到当选者之后再按收敛后的真相铺。12/2 → 15/0 |
+| **P7-T2** | **夹具把"raft 组主"当成"能在本地读写这份分片的节点"**（`test_dtx_tso_p4.sh`）。原因：组主身份来自 raft 选举，而该节点本地那一份可能只是**副本壳表** —— 对它读写会被访问闸正确拒绝。实测 QNODE 选中 `:5435`（确是组主），PREPARE 落不下去、读者拿回的是访问闸的 HINT 而不是计数 | **✅ 已修**：候选除"是组主"外，再**当场探一次本地读**（那正是后续步骤要用的前提，与其推断角色不如直接验）。48/1 → 49/0 |
+| **P7-T3** | **两处"吞错误"把前置失败伪装成产品缺陷**。① `test_shard_identity_p0.sh` 的 `DROP TABLE ... >/dev/null 2>&1`：净场刚全停全起时慢一拍的 worker 会让分布式 DDL 报错，分片表还在 ⇒ 剪枝自然剪不掉 ⇒ 报成 `demo shard rows survived prune`。② `test_dtx_tso_p4.sh` 的读者 `2>/dev/null`：一红只剩一句"实际取不到值"，"被挡住"与"查询报错"这两个方向完全相反却分不出来 | **✅ 已修**：①错误可见 + 重试 + 显式验"分片表真没了"（9/1 → 11/0）；②合并捕获，错误首行带进断言文本 —— 改完当轮就把访问闸那条真因照了出来 |
+| **P7-T4** | **取证只认两种日志布局**（`test_dtx_convergence_p4.sh`）。原因：`setup-raft.sh` 写 `<datadir>/startup.log`、`reproduce-env.sh` 写 `<datadir>.log`，而**出口门禁净场用 `-l <datadir>/pg.log` 拉起节点** —— 第三种布局两个 glob 都不沾，表现为"单跑绿、进批红"，而它上面那条功能断言是 PASS 的（清扫确实发生了）。<br>顺带修掉一个潜伏 bug：`grep -c … \|\| echo 0` 在**计数为 0 时 grep 退出码是 1**，`\|\|` 也触发，变量拿到两行 `0\n0`，把 `[[ ]]` 打成 `syntax error in expression` | **✅ 已修**：按"数据目录下任何 `.log` + 同名 `.log`"一网打尽，别再按文件名猜布局；计数一律 `\| tail -1`。44/1 → 45/0 |
+| **P7-T5** | **夹具地基绑在实现的欠账上**（`test_dtx_commit_marker_tx2.sh`）。原因：它取被 `ROLLBACK TO` 的子事务 xid 的办法是"在 follower 上 SELECT 壳表读 xmin"，理由写着「follower 的 SELECT 尚未接 gclog（那是 R3），所以行读得出来」。欠账一还，行就读不出来了 —— 而**读不出来恰恰是正确行为** | **✅ 已修**：取号挪到**写入时点、写者自己的会话里**（子事务读自己刚写的行必然可见），与判决逻辑、与读侧做到哪一步都无关。39/2 → 40/0 |
+| **P7-E7** | **宿主机无 swap，Raft 心跳被饿死导致自发选举**。原因：总内存 3.9 GB、`Swap: 0`，9 节点常驻 + 长会话之后可用内存一度只剩 122 MB。表现是**批次里随机某套因"主漂"全红，单跑必绿** —— 2026-09-12 实测 `dtx_replay_tx1` 批次 73/10 / 单跑 83/0，`promote_catchup_tx3` 批次 21/3 / 单跑 24/0 | **环境事项，非产品缺陷**。处置：宿主机加 2 GB swap（需 root）。在那之前，**批次里的主漂红必须用单跑复核后才能定性**，不得直接当产品缺陷记账 |
 
 ---
 
@@ -210,6 +225,42 @@
 （tx2 的那两条则是**前提过期**：它假设"follower 读不接 gclog 所以行读得出来"，
 而分片可见性钩子早已生效 —— 那一条属 A 类，改用例即可。）
 
+### ★★ T7.12 收口（2026-09-12）：17 条 → 0 条，R3 读路径按 C 类裁定当场实装
+
+用户裁定「C 类现在实装，先把其他三类修完后装」。执行顺序与结果：
+
+| 类 | 套件 | 修前 | 修后 | 根因（一句话） |
+|---|---|---|---|---|
+| D | `shard_clog_p2` | 62/2 | **64/0** | 取证工具陈旧，产品一直是对的 —— 见 **P7-W1** |
+| D | `shard_vacuum_replay_p5` | 61/3 | **64/0** | 旧判据与它自己的注释自相矛盾（中止事务会在 leader 上悄悄吃号，使 leader 的 `next_xid` 更大，`follower >= leader` 必不成立）。改为「follower 水位 > 本节点已判定的最大分片 xid」 |
+| A | `dtx_commit_marker_tx2` | 39/2 | **40/0** | 前提被产品演进作废 —— 见 **P7-T5** |
+| B | `clog_hole_c4` | 12/2 | **15/0** | 夹具与选举较劲 —— 见 **P7-T1** |
+| B | `shard_identity_p0` | 9/1 | **11/0** | 吞错误把前置失败伪装成产品缺陷 —— 见 **P7-T3**① |
+| B | `dtx_convergence_p4` | 44/1 | **45/0** | 取证只认两种日志布局 —— 见 **P7-T4** |
+| C | `promote_catchup_tx3` | 21/2 | **24/0** | **R3 读路径实装**（下详） |
+| C | `lazy_replay_l1` | 56/1 | **57/0** | 同上 |
+| — | `dtx_tso_p4` | 48/1 | **49/0** | 本轮新暴露，非原 17 条 —— 见 **P7-T2** |
+
+**R3 读路径实装要点**（完整说明见 `FOLLOWER_REPLAY_DESIGN.md` §10.1）：
+新增 `include/shard_route.h` + `src/replay/shard_route.c`，两跳解析
+`tuple.xmin → xid_map → gxid → pg_gclog → 判决`，接在补丁 0006 的
+`sv_satisfies_mvcc` 上。**该钩子不由 `is_shard_rel` 把门、返回 false 即退回本机
+语义**，所以接管读路径没有动内核的 delete/update/prune 分支 —— 这也正是
+**P7-P1** 仍然成立的原因（剪枝那一格没被这次改动碰到）。
+与 §9.4 预留签名的三处有意偏差（键换本地关系 OID、xid_map 用升序数组而非
+dshash、并入既有钩子而非独立入口）连同理由写在 §10.1。
+取证面 `partdist.route_resolve(rel, xid)` 把两跳摊开，`promote_catchup_tx3` 用它
+断言"**是走 R3 读到的**"而不是"碰巧读到"——那张表没打过标，元组 xmin 是旧
+leader 的原生 xid，本机 clog 里碰巧同号且同为 committed 的事务会让行数断言在
+R3 一步没走的情况下照样绿。实测串 `promoted|562949953568093|committed`。
+
+**交付面 = MVCC 读，仅此一条。** `satisfies_self / dirty / update` 仍走本机语义 ⇒
+§14.2 的「R4 硬阻断于 R3」只松了**读**的那一半。
+
+**门禁复核**：P1 段 10 套 **565/1** →（`dtx_tso_p4` 修完）全绿；P3 段 11 套逐套
+单跑/净场跑全绿。批次内 `dtx_replay_tx1`(73/10) 与 `promote_catchup_tx3`(21/3)
+曾因主漂红，单跑 83/0、24/0 —— 原因见 **P7-E7**（宿主机无 swap）。
+
 ### 批次 5：生产化缺件
 
 `T7.17` 分片 vacuum 自动启动器（P7-V1）；`T7.18` 尾部截断（P7-V2）；
@@ -308,9 +359,12 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${OID}'"
 - [ ] 批次 3 修完：R-P6-22 闸门改判据（`negative_p6` **撤掉给协调者设白名单那两行**
       后仍全绿）+ 8 个 UDF 名字 + 引用表守卫 + MARKER 用 TSO start_ts；
       §10 每条限制各有一条负向断言
-- [ ] OPS 8 套改造成拓扑无关并入门禁（口径 31 → **39 套**）
+- [x] OPS 8 套改造成拓扑无关并入门禁（口径 31 → **39 套**，T7.13，2026-09-11）
 - [ ] **39 套全量一次跑完、零 FAIL**，且是在最终二进制上跑的（时机已裁定为
       批次 1–3 落地之后）
+      · 2026-09-11/12 分四段跑完：**≈1595 条 / FAIL 17**，全部定因并修完 → 见 §2「T7.12 收口」
+      · **仍差"一次跑完"**：四段是分开跑的，且批次内有主漂假红（**P7-E7**，宿主机无 swap）。
+        加 swap 后需再来一次**不分段**的全量
 - [ ] 批次 5 生产化三条（vacuum 自动启动器 / 尾部截断 / 覆盖缺口）
 - [ ] 批次 6 六条（含 raft 侧）
 - [x] 本文 §3 六条**已逐条裁定**（2026-09-09）
