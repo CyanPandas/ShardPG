@@ -44,6 +44,8 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
+#include "catalog/storage.h"		/* T7.18：RelationTruncate */
+#include "access/tableam.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -922,6 +924,142 @@ sweep_one_rel(Relation rel, Oid shard, TransactionId cur_tb,
 	stats->tuples_deferred += one.tuples_deferred;
 }
 
+/* ================================================================== */
+/* T7.18（P7-V2）：尾部截断                                            */
+/* ================================================================== */
+
+bool		shard_vacuum_truncate_enabled = true;
+
+/*
+ * 阈值照抄内核 vacuumlazy.c：尾巴太短不值得为它去抢排他锁。
+ * 绝对值挡住"大表上几页空尾"，分数挡住"小表上按比例已经很可观的空尾"。
+ */
+#define SHARD_TRUNCATE_MINIMUM		1000
+#define SHARD_TRUNCATE_FRACTION		16
+
+/*
+ * 从尾往前数连续的"没有任何行"的页，返回"截断之后应有的块数"。
+ *
+ * ★ 判据必须逐个查行指针，**不能用 `PageIsEmpty`**（2026-09-12 实测踩过）。
+ *   `PageIsEmpty` 要求 `pd_lower` 退回页头，也就是**一个行指针都不剩**；而三类
+ *   动作清完一页之后留下的是一排 `LP_UNUSED`，行指针数组多半还在。第一版用
+ *   `PageIsEmpty` 的后果是：`removed_dead=3000`（元组确实删干净了）、
+ *   `pg_relation_size` 却一块没少，而且**连一条 DEBUG 都不打** —— 早退路径
+ *   是静默的，看起来就像"截断功能没接上"。
+ *   内核 `count_nondeletable_pages` 用的正是"逐个 `ItemIdIsUsed`"，照它来。
+ *
+ * 顺带保留 `PageIsNew` 的快路：新页没有行指针数组可查。
+ */
+static BlockNumber
+shard_vacuum_count_trailing_empty(Relation rel, BlockNumber nblocks)
+{
+	BlockNumber blkno = nblocks;
+
+	while (blkno > 0)
+	{
+		Buffer		buf;
+		Page		page;
+		bool		hastup = false;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno - 1,
+								 RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (!PageIsNew(page) && !PageIsEmpty(page))
+		{
+			OffsetNumber offnum;
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+			for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+			{
+				ItemId		itemid = PageGetItemId(page, offnum);
+
+				/* LP_UNUSED 之外一律算"有东西"（LP_DEAD 也算，还没清完） */
+				if (ItemIdIsUsed(itemid))
+				{
+					hastup = true;
+					break;
+				}
+			}
+		}
+		UnlockReleaseBuffer(buf);
+
+		if (hastup)
+			break;
+		blkno--;
+	}
+	return blkno;
+}
+
+/*
+ * 把尾部连续空页还给文件系统。
+ *
+ * ★ 三条纪律，都与内核 lazy_truncate_heap 同源，但取了更保守的一头：
+ *
+ *   · **抢不到排他锁就算了**（`ConditionalLockRelation`，绝不等待）。
+ *     内核会带超时地等，还会反复重试；这里不等 —— 截断是纯粹的空间回收，
+ *     推迟到下一轮毫无代价，而在 vacuum 路径上阻塞用户查询是有代价的。
+ *
+ *   · **拿到锁之后必须重新数一遍**。第一遍是在 ShareUpdateExclusiveLock 下
+ *     数的，并发写入完全可能刚在尾页上插了一行。拿第一遍的结果去截断，
+ *     就是把刚写进去的数据直接删掉。
+ *
+ *   · **RelationTruncate 一并处理 FSM/VM 并发 XLOG_SMGR_TRUNCATE**，副本侧靠
+ *     `ApplySmgrRecord` 原样回放（补丁 0001v2 专门保证 RM_SMGR 这类"无块引用"
+ *     的记录也会被捕获进分区流）。所以本动作对副本是可见、可复制的，
+ *     不会造成主从物理分歧。
+ */
+static void
+shard_vacuum_truncate_tail(Relation rel, ShardVacuumPageStats *stats)
+{
+	BlockNumber old_nblocks;
+	BlockNumber new_nblocks;
+
+	if (!shard_vacuum_truncate_enabled)
+		return;
+
+	old_nblocks = RelationGetNumberOfBlocks(rel);
+	if (old_nblocks == 0)
+		return;
+
+	new_nblocks = shard_vacuum_count_trailing_empty(rel, old_nblocks);
+	if (new_nblocks >= old_nblocks)
+		return;
+	if ((old_nblocks - new_nblocks) < SHARD_TRUNCATE_MINIMUM &&
+		(old_nblocks - new_nblocks) < old_nblocks / SHARD_TRUNCATE_FRACTION)
+		return;					/* 尾巴太短，不值得抢锁 */
+
+	if (!ConditionalLockRelation(rel, AccessExclusiveLock))
+	{
+		ereport(DEBUG1,
+				(errmsg("pg_partdist: 关系 %u 的尾部截断让路（拿不到排他锁），"
+						"下一轮再说", RelationGetRelid(rel))));
+		return;
+	}
+
+	PG_TRY();
+	{
+		/* ★ 持锁后重数：上一遍是在并发写入之下数的 */
+		old_nblocks = RelationGetNumberOfBlocks(rel);
+		new_nblocks = shard_vacuum_count_trailing_empty(rel, old_nblocks);
+		if (new_nblocks < old_nblocks)
+		{
+			RelationTruncate(rel, new_nblocks);
+			stats->blocks_truncated += (int64) (old_nblocks - new_nblocks);
+			ereport(DEBUG1,
+					(errmsg("pg_partdist: 关系 %u 尾部截断 %u → %u 块",
+							RelationGetRelid(rel), old_nblocks, new_nblocks)));
+		}
+	}
+	PG_FINALLY();
+	{
+		UnlockRelation(rel, AccessExclusiveLock);
+	}
+	PG_END_TRY();
+}
+
 bool
 ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 				 ShardVacuumPageStats *stats,
@@ -977,6 +1115,27 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 	 */
 	if (stats->pages_skipped > 0 || stats->tuples_deferred > 0)
 		return false;
+
+	/*
+	 * T7.18（P7-V2）：三类动作干净收尾之后，把尾部空页还给文件系统。
+	 * 排在落标记之前，好让下面那次 XLogFlush 把截断记录一并刷掉。
+	 */
+	shard_vacuum_truncate_tail(rel, stats);
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		Relation	toastrel = table_open(rel->rd_rel->reltoastrelid,
+										  ShareUpdateExclusiveLock);
+
+		PG_TRY(3);
+		{
+			shard_vacuum_truncate_tail(toastrel, stats);
+		}
+		PG_FINALLY(3);
+		{
+			table_close(toastrel, ShareUpdateExclusiveLock);
+		}
+		PG_END_TRY(3);
+	}
 
 	/*
 	 * ★★ 落标记之前必须先把页面改动的 WAL 刷到盘上（T5.5 动手前查出的自身
@@ -1377,6 +1536,10 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
 							appendStringInfo(&detail, "%s%u:%u->%u",
 											 i ? " " : "", shard,
 											 (unsigned) tb, (unsigned) newtb);
+							/* T7.18：尾部截断了多少块，跟着一起报 */
+							if (st.blocks_truncated > 0)
+								appendStringInfo(&detail, "/trunc=%ld",
+												 (long) st.blocks_truncated);
 						}
 					}
 				}

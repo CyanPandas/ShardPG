@@ -31,6 +31,7 @@ typedef struct ShardVacuumPageStats
 	int64		pages_skipped;	/* ①：拿不到 cleanup lock 而跳过的页数 */
 	int64		tuples_touched; /* ③ 消毒条数 / ① 移除条数 */
 	int64		tuples_deferred;	/* ①：死但仍挂在 HOT 链上，本趟不动 */
+	int64		blocks_truncated;	/* T7.18：尾部截断掉的块数（含 TOAST） */
 } ShardVacuumPageStats;
 
 /*
@@ -143,6 +144,9 @@ extern int	ShardVacuumRecover(Oid shard);
 /* T7.17（P7-V1）：一次自动启动最多处理几个分片。锁与页面扫描都在这条路上，
  * 不设上限时"很多分片同时到龄"会把一次调用拖得很长。 */
 #define SHARD_VACUUM_AUTO_BATCH		4
+
+/* T7.18（P7-V2）：尾部截断开关（GUC pg_partdist.shard_vacuum_truncate） */
+extern bool shard_vacuum_truncate_enabled;
 
 /* 心跳工作者的自连触发（无 DB 语境时用） */
 extern void ShardVacuumSelfTriggerAuto(void);

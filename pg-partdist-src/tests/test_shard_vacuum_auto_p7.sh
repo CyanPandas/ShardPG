@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# [宿主机] T7.17（P7-V1）分片 vacuum **自动启动器**验收。
+# [宿主机] 批次 5 生产化两条的验收：
+#   T7.17（P7-V1）分片 vacuum **自动启动器**
+#   T7.18（P7-V2）分片 vacuum **尾部截断**（见 [7]）
 #
 # 在此之前，分片 xid 到龄只发一条 WARNING，三步（算目标 → 趟页面 → 截断 clog）
 # 全靠人手工敲；运维没看见那条 WARNING，龄就一路涨到停发线，**该分片进只读**。
@@ -58,6 +60,7 @@ restore_gucs() {
   PSQL "$WPORT" -q \
     -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_max_age" \
     -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_auto" \
+    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_truncate" \
     -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo" \
     -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 || true
   PSQL "$COORD" -q -c "ALTER SYSTEM RESET pg_partdist.tso_master" \
@@ -207,6 +210,11 @@ got=$(set_guc pg_partdist.shard_vacuum_auto on)
 check "开关已恢复" "$got" "on"
 
 echo "========== [6] 两态恢复：趟完未截断，只补截断 =========="
+# ★ 先把心跳关掉再造场景：开着的话它会抢在我的手工调用之前把这一格补掉，
+#   于是 detail 里什么都没有 —— 上一轮实测就这么红过一次（水位确实收敛了，
+#   只是不是我这次调用干的）。要验"谁干的"，就得让场上只有一个人。
+got=$(set_guc pg_partdist.shard_vacuum_auto off)
+check "两态场景前：心跳已关（实得 $got）" "$got" "off"
 tb4=$(TB "$OA")
 # ★ 目标必须 > FIRST_SHARD_XID(3)：`ShardClogTruncate` 对更小的目标直接返回 0
 #   （"没什么可截的"，设计如此）。前面几节没能把截断点推起来时，这一节会拿
@@ -220,8 +228,68 @@ d6=$(PSQL "$WPORT" -Atc "SELECT detail FROM partdist.shard_vacuum_auto(8)" </dev
 check "detail 记 recover（detail=${d6}）" \
       "$(grep -qc "${OA}:recover" <<<"$d6" >/dev/null && echo ok)" "ok"
 check "截断点补到 vx（两水位重新相等）" "$(WM "$OA")" "$((tb4+1))/$((tb4+1))"
+got=$(set_guc pg_partdist.shard_vacuum_auto on)
+check "两态场景后：心跳已恢复" "$got" "on"
 
-echo "========== [7] 表没了但槽位还在：记 gone，不报错 =========="
+echo "========== [7] ★ T7.18（P7-V2）：尾部截断把空间还回去 =========="
+# 在此之前，分片 vacuum 只清元组、不还空间：`shard_vacuum.c` 全文没有
+# smgrtruncate/RelationTruncate，删掉整表尾部之后关系文件仍是原大小。
+#
+# ★ 整节把心跳关掉：本节验的是 **sweep 的收尾动作**，场上只能有一个清扫者 ——
+#   否则心跳会抢在手工 sweep 之前把元组清掉，手工那一次拿到 removed_dead=0，
+#   断言就变成在验"谁先动手"而不是"截断做没做"（上一轮实测红过一次）。
+got=$(set_guc pg_partdist.shard_vacuum_auto off)
+check "截断一节前：心跳已关（实得 $got）" "$got" "off"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
+SET citus.enable_ddl_propagation TO off;
+DROP TABLE IF EXISTS va_trunc;
+CREATE TABLE va_trunc(id int primary key, v text) WITH (autovacuum_enabled=off);
+SQL
+OT=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='va_trunc'" </dev/null)
+PSQL "$WPORT" -q -c "INSERT INTO partdist.partition_map (partition_id, primary_node) VALUES ($OT, 1) ON CONFLICT DO NOTHING" </dev/null >/dev/null
+regt=$(PSQL "$WPORT" -Atc "SELECT partdist.partdist_set_shard_mvcc('va_trunc'::regclass); SELECT 'ok'" </dev/null 2>&1 | tail -1)
+check "截断夹具：打标登记成功" "$regt" "ok"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
+SET citus.enable_ddl_propagation TO off;
+INSERT INTO va_trunc SELECT g, repeat('x', 120) FROM generate_series(1, 6000) g;
+SQL
+sz0=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)
+check "截断夹具：关系已有足够多的页（${sz0} 块，需 >= 16）" \
+      "$([[ -n "$sz0" && "$sz0" -ge 16 ]] && echo ok)" "ok"
+# 删掉**尾部**那一半 —— id 大的是后插入的，落在尾页上
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_trunc WHERE id > 3000" </dev/null >/dev/null
+# ★ 这一节直接驱动 sweep，不走心跳：截断是 sweep 的收尾动作，与"什么时候被
+#   触发"是两件事；混在一起验，时序一抖就分不清是截断没做还是压根没触发。
+#   （触发那一半已由 [4] 单独验过。）
+swp=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
+        SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_trunc'::regclass,
+          partdist.shard_xid_next('va_trunc'::regclass::oid)::bigint)" </dev/null | tail -1)
+check "整趟干净且删掉了尾部那 3000 行（${swp}）" "$swp" "true|3000"
+sz1=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)
+check "★ 尾部截断把关系缩小了（${sz0} → ${sz1} 块）" \
+      "$([[ -n "$sz1" && -n "$sz0" && "$sz1" -lt "$sz0" ]] && echo ok)" "ok"
+check "截断之后剩下的行一条不少（3000）" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_trunc" </dev/null | tail -1)" "3000"
+check "截断之后仍能按主键读到边界行（id=3000）" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_trunc WHERE id=3000" </dev/null | tail -1)" "1"
+# 关掉开关：同样造一段空尾，大小不许再变
+got=$(set_guc pg_partdist.shard_vacuum_truncate off)
+check "截断开关已关（实得 $got）" "$got" "off"
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_trunc WHERE id > 1500" </dev/null >/dev/null
+sz2=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)
+swp2=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
+        SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_trunc'::regclass,
+          partdist.shard_xid_next('va_trunc'::regclass::oid)::bigint)" </dev/null | tail -1)
+check "关掉截断后元组照样被清掉（${swp2}）" "$swp2" "true|1500"
+check "关掉之后关系大小不变（${sz2} 块）—— 只清元组、不还空间" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)" "$sz2"
+got=$(set_guc pg_partdist.shard_vacuum_truncate on)
+check "截断开关已恢复" "$got" "on"
+got=$(set_guc pg_partdist.shard_vacuum_auto on)
+check "截断一节后：心跳已恢复" "$got" "on"
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE va_trunc" </dev/null >/dev/null
+
+echo "========== [8] 表没了但槽位还在：记 gone，不报错 =========="
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE va_auto;" </dev/null >/dev/null
 # DROP 会一并归还槽位（T7.7），所以这里不强求 detail 里一定出现 gone ——
 # 要验的是**不报错、不拖累同批**：函数照常返回一行。
@@ -234,7 +302,7 @@ check "夹具表 DROP 之后自动启动器仍正常返回（considered=${d7}）
 neg "水位不变式 tb <= vx 违反即拒" "不变式" \
     "SELECT partdist.shard_vacuum_set_watermarks($OA::oid, 10::bigint, 5::bigint)"
 
-echo "========== [8] 负向计数守卫 + 节点健康 =========="
+echo "========== [9] 负向计数守卫 + 节点健康 =========="
 check "负向用例计数守卫（应跑 1 条）" "$NEG_RUN" "1"
 health_check_no_crash
 

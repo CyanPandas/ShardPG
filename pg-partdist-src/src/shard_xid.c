@@ -11,6 +11,7 @@
 #include "shard_xid.h"
 #include "shard_replay.h"	/* T6.3c：副本壳表闸门 */
 #include "shard_clog.h"
+#include "shard_vacuum.h"
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
@@ -1508,6 +1509,17 @@ ShardXidDefineGUCs(void)
 		"partdist.shard_vacuum_auto()。关掉即退回「只发 WARNING、全靠手工」的"
 		"旧行为 —— 出问题时这是第一个该关的开关。",
 		&shard_vacuum_auto_enabled,
+		true,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"pg_partdist.shard_vacuum_truncate",
+		"分片 vacuum 的尾部截断（T7.18/P7-V2）。",
+		"三类页面动作干净收尾后，把尾部连续空页还给文件系统。抢不到排他锁就"
+		"让路、下一轮再说 —— 截断是纯空间回收，推迟无代价，阻塞用户查询有代价。"
+		"关掉即退回「只清元组、不还空间」的旧行为。",
+		&shard_vacuum_truncate_enabled,
 		true,
 		PGC_SIGHUP,
 		0, NULL, NULL, NULL);
