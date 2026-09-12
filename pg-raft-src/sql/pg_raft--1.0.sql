@@ -254,6 +254,21 @@ CREATE OR REPLACE FUNCTION pg_raft_group_drop_internal(p_group_id bigint)
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_drop';
 
+-- T7.20（P7-R1）：成员变更的**安全路径**。
+-- 在此之前唯一的办法是在每个节点上各自重调 pg_raft_group_create(gid, 新成员集) ——
+-- 那是没有协调的：变更期间不同节点持有不同成员集，同一个组因此有两套不相交的
+-- 多数派定义。现在走日志：一条 CONFIG 条目复制到多数派，各节点在 append 那一刻
+-- 同步切到新成员集（Raft 论文 §4.1 的单节点变更；不做 joint consensus）。
+-- 四道门禁：必须是 leader / 成员集必须已知 / 同时只允许一个未提交的变更 /
+-- 一次只加或减一个。要"三换三"就调三次。
+CREATE OR REPLACE FUNCTION pg_raft_group_change_member(
+    p_group_id bigint, p_node_id integer, p_add boolean DEFAULT true
+) RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_change_member';
+
+COMMENT ON FUNCTION pg_raft_group_change_member(bigint, integer, boolean) IS
+    'T7.20/P7-R1：经 Raft 日志做成员变更（一次一个节点）。只能在该组 leader 上发起；成员集未知、已有未提交变更、一次动多个、把成员减到空，四种情形一律 ERROR。';
+
 CREATE OR REPLACE FUNCTION pg_raft_group_propose(
     p_group_id bigint, p_op_type text, p_payload text
 ) RETURNS bigint LANGUAGE c STRICT VOLATILE

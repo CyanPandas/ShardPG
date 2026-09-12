@@ -214,6 +214,30 @@ typedef struct RaftGroupState
     int                 replicate_pid;         /* 持有者 backend PID；持有者消失时由等待者回收 */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
+
+    /*
+     * T7.20（P7-R1）：成员变更。
+     *
+     * 走 Raft 论文 §4.1 的**一次只加/减一个节点**，不做 joint consensus ——
+     * 后者只有在需要"原子地换掉多个成员"时才必要，而单节点变更已经能证明
+     * 安全：任意一步里新旧两个成员集的多数派**必然相交**（只差一个成员，
+     * 两个多数派不可能不相交），所以不会出现两个互不相交的多数派各自选出
+     * leader。代价是"三换三"要做三次，而收益是实现面小一个数量级 ——
+     * 在一个全簇共识层上，这个取舍偏向能审查得过来的那一边。
+     *
+     * 生效时机是 **append 而不是 commit**（Raft 的原始规则）：条目一进日志
+     * 就按新成员集算多数派。反过来（等提交再生效）会让提交这条 CONFIG 本身
+     * 所需的多数派仍按旧集算，而旧集可能已经不再是权威 —— 那正是论文里
+     * 反复强调的不安全点。
+     *
+     * 因为"同时只允许一个未提交的变更"，未决状态只需记一条：
+     *   pending_cfg_index > 0 ⇒ 有一条已 append、未提交的 CONFIG；
+     *   committed_members[]  ⇒ 回滚目标（日志被截断时退回这里）。
+     */
+    bool                config_from_log;    /* 成员集已由日志接管，partition_map 不再覆盖 */
+    int64               pending_cfg_index;  /* 未提交的 CONFIG 条目 index；0 = 无 */
+    int                 n_committed_members;
+    int                 committed_members[RAFT_MAX_PEERS];
     RaftConsensusShmem  cons;
     RaftLogShmem        log;
 } RaftGroupState;
@@ -283,6 +307,7 @@ PG_FUNCTION_INFO_V1(pg_raft_group_reset);
 PG_FUNCTION_INFO_V1(pg_raft_group_status);
 PG_FUNCTION_INFO_V1(pg_raft_group_propose);
 PG_FUNCTION_INFO_V1(pg_raft_data_propose);
+PG_FUNCTION_INFO_V1(pg_raft_group_change_member);
 
 static void restore_hard_state_if_needed(RaftGroupCtx *ctx);
 static void persist_hard_state_unlocked(RaftGroupCtx *ctx);
@@ -318,6 +343,7 @@ static int64 group_local_partition(RaftGroupCtx *ctx);
 static bool raft_spi_ctx = false;
 
 static bool raft_persist_spi_begin(bool *spi_owned);
+static bool raft_config_persist(RaftGroupCtx *ctx, const char *payload);
 static void group_apply_pending(RaftGroupCtx *ctx);
 static bool dtx_dtxid_from_gid(const char *gid, int64 *dtxid);
 static void dtx_ack_sweep(void);
@@ -455,10 +481,26 @@ raft_group_ensure(int64 group_id, const int *members, int n_members,
         /* 已存在：允许更新成员集（控制面下发配置） */
         if (members != NULL && n_members > 0)
         {
+            /*
+             * ★★ T7.20：成员集一旦由日志接管，这里**不许再覆盖**。
+             *
+             * 实测踩到（2026-09-12）：`restore_groups_if_needed()` 的
+             * `groups_restored` 是**每后端**静态量 —— 于是每开一个新 backend
+             * 就会拿 `partdist.raft_group` 里那一行去重置 shmem 成员集。
+             * 成员变更刚把成员集改成 {2,3,4,5} 并提交，紧接着一条普通查询
+             * （新 backend）就把它打回 {2,3,4}，而且**一声不响**。
+             * 症状是"加成员报成功、隔一会儿又变回去"，看起来像共识没生效。
+             *
+             * 注册表是**重启**恢复成员集的来源，不是运行期的权威；运行期的
+             * 权威是日志。两者只在 apply 那一刻由 raft_config_persist 对齐。
+             */
             SpinLockAcquire(&RaftGroups->mutex);
-            ctx->g->n_members = 0;
-            for (i = 0; i < n_members && ctx->g->n_members < RAFT_MAX_PEERS; i++)
-                ctx->g->members[ctx->g->n_members++] = members[i];
+            if (!ctx->g->config_from_log)
+            {
+                ctx->g->n_members = 0;
+                for (i = 0; i < n_members && ctx->g->n_members < RAFT_MAX_PEERS; i++)
+                    ctx->g->members[ctx->g->n_members++] = members[i];
+            }
             SpinLockRelease(&RaftGroups->mutex);
         }
         return true;
@@ -580,6 +622,15 @@ group_resolve_membership(RaftGroupCtx *ctx)
     if (group_membership_known(ctx))
         return true;
 
+    /*
+     * T7.20：成员集一旦由日志接管，**partition_map 不再是权威**。
+     * 走到这里说明当前成员集为空，而 config_from_log 为真意味着日志里那条
+     * CONFIG 把成员减到了 0 —— 那是不该发生的（变更接口拦了空集），
+     * 此时从 partition_map 补一份回去只会制造两套不一致的多数派定义。
+     */
+    if (ctx->g->config_from_log)
+        return false;
+
     n = group_members_from_partition_map(ctx->group_id, members);
     if (n <= 0)
         return false;
@@ -684,6 +735,203 @@ static RaftLogEntry *log_slot(RaftGroupCtx *ctx, int64 index);
  * follower 必须**先把字节落盘 fsync 再 ack**，故"多数派提交"即"多数派已持久化"。
  */
 #define RAFT_OP_PARWAL "OP_PARWAL"
+
+/* T7.20（P7-R1）：成员变更条目。payload = {"members":[a,b,c]} */
+#define RAFT_OP_CONFIG "OP_CONFIG"
+
+/*
+ * 从 CONFIG 载荷里解出成员列表。
+ *
+ * 只扫**第一个 `[` 与其后第一个 `]` 之间**的整数。这么写是有意的：载荷是本模块
+ * 自己生成的、形如 `{"members":[2,3,4]}`，而它会经 `partdist.raft_log.payload`
+ * （jsonb）往返一次被规范化（键序、空格都可能变），按文本比对或按固定偏移取值
+ * 都不可靠 —— 只认括号里的数字，两种形态都能吃下。
+ * 反过来这也是一条约束：**CONFIG 载荷里不许再出现第二个数组或别的数字字段**。
+ */
+static int
+raft_config_parse(const char *payload, int *out)
+{
+    const char *p = payload;
+    int         n = 0;
+
+    if (payload == NULL)
+        return 0;
+    while (*p && *p != '[')
+        p++;
+    if (*p != '[')
+        return 0;
+    p++;
+    while (*p && *p != ']' && n < RAFT_MAX_PEERS)
+    {
+        if (*p >= '0' && *p <= '9')
+        {
+            int v = 0;
+
+            while (*p >= '0' && *p <= '9')
+                v = v * 10 + (*p++ - '0');
+            out[n++] = v;
+        }
+        else
+            p++;
+    }
+    return n;
+}
+
+/* 把成员列表写成 CONFIG 载荷（JSON 数组，供 jsonb 列收下） */
+static void
+raft_config_format(const int *members, int n, StringInfo out)
+{
+    int i;
+
+    appendStringInfoString(out, "{\"members\":[");
+    for (i = 0; i < n; i++)
+        appendStringInfo(out, "%s%d", i ? "," : "", members[i]);
+    appendStringInfoString(out, "]}");
+}
+
+/*
+ * 一条 CONFIG 条目进了日志 —— **立刻**生效（Raft 的 append-time 规则）。
+ *
+ * 不在 log->mutex 里做：成员集由 RaftGroups->mutex 罩着，两把自旋锁嵌套没有
+ * 必要也不安全，调用方一律在释放日志锁之后再调本函数。
+ */
+static void
+raft_config_apply(RaftGroupCtx *ctx, int64 index, const char *payload)
+{
+    int members[RAFT_MAX_PEERS];
+    int n = raft_config_parse(payload, members);
+    int i;
+
+    if (n <= 0)
+    {
+        elog(WARNING, "pg_raft: 组 %lld 的 CONFIG 条目 %lld 解不出成员集，忽略",
+             (long long) ctx->group_id, (long long) index);
+        return;
+    }
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    /* 第一次被日志接管时，把当时的成员集记作"已提交态"，作为回滚目标 */
+    if (!ctx->g->config_from_log)
+    {
+        ctx->g->n_committed_members = ctx->g->n_members;
+        for (i = 0; i < ctx->g->n_members; i++)
+            ctx->g->committed_members[i] = ctx->g->members[i];
+        ctx->g->config_from_log = true;
+    }
+    ctx->g->n_members = n;
+    for (i = 0; i < n; i++)
+        ctx->g->members[i] = members[i];
+    ctx->g->pending_cfg_index = index;
+    SpinLockRelease(&RaftGroups->mutex);
+
+    elog(LOG, "pg_raft: 组 %lld 成员集经日志条目 %lld 生效，共 %d 个成员（未提交）",
+         (long long) ctx->group_id, (long long) index, n);
+}
+
+/*
+ * 日志被截断到 new_last 之后：未提交的那条 CONFIG 若被截掉，成员集必须退回
+ * 上一个**已提交**的配置。
+ *
+ * 不退回的后果不是"多算一个成员"，而是**本节点与其它节点对多数派的定义不一致** ——
+ * 与 group_membership_known() 头注释里那个 hearsay 事故同一个形态。
+ */
+static void
+raft_config_rollback(RaftGroupCtx *ctx, int64 new_last)
+{
+    bool reverted = false;
+    int  i;
+
+    /* 无锁快路径：见 raft_config_note_commit 的注释 */
+    if (ctx->g->pending_cfg_index == 0)
+        return;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (ctx->g->pending_cfg_index > 0 && ctx->g->pending_cfg_index > new_last)
+    {
+        ctx->g->n_members = ctx->g->n_committed_members;
+        for (i = 0; i < ctx->g->n_committed_members; i++)
+            ctx->g->members[i] = ctx->g->committed_members[i];
+        ctx->g->pending_cfg_index = 0;
+        reverted = true;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    if (reverted)
+        elog(LOG, "pg_raft: 组 %lld 的未提交成员变更随日志截断（到 %lld）回滚",
+             (long long) ctx->group_id, (long long) new_last);
+}
+
+/* 未提交的 CONFIG 落在提交点之下 ⇒ 变更定案，当前成员集升为"已提交态" */
+static void
+raft_config_note_commit(RaftGroupCtx *ctx, int64 commit_index)
+{
+    bool settled = false;
+    int  i;
+
+    /*
+     * ★★ 无锁快路径，**不是优化而是必需**（2026-09-12 实测，A/B 对照定因）。
+     *
+     * 本函数挂在两条**最热**的路上：每一次 group_propose（提交路径上，每条
+     * parwal 记录一次）和每一次 pg_raft_append_entries（每个心跳每个组一次）。
+     * 第一版无条件去抢 `RaftGroups->mutex` —— 那是**全局**的组表自旋锁，被
+     * 全部 32 个组、全部 backend 共用。在这台 2 核机上，把它压进提交路径的
+     * 结果是心跳被挤掉、选举频繁触发：实测 `replica_gate_p6` 由 33/0 掉到
+     * 23/10 与 32/1（两轮），症状是"分区组 leader 就位"刚断言完，紧接着的
+     * 本地写入就被"本节点不是该分区组的 leader"拒掉。改前的同一套 33/0。
+     *
+     * pending_cfg_index 只在持锁时被写，无锁读它做**早退判据**是安全的：
+     * 读到 0 说明此刻没有未决变更，不必进锁；真有变更时读到非 0，再进锁复核。
+     * 成员变更是罕见操作，慢路径多一次锁毫无代价。
+     */
+    if (ctx->g->pending_cfg_index == 0)
+        return;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    if (ctx->g->pending_cfg_index > 0 &&
+        ctx->g->pending_cfg_index <= commit_index)
+    {
+        ctx->g->n_committed_members = ctx->g->n_members;
+        for (i = 0; i < ctx->g->n_members; i++)
+            ctx->g->committed_members[i] = ctx->g->members[i];
+        ctx->g->pending_cfg_index = 0;
+        settled = true;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+
+    if (settled)
+    {
+        StringInfoData payload;
+
+        elog(LOG, "pg_raft: 组 %lld 的成员变更已提交，成员集定案",
+             (long long) ctx->group_id);
+
+        /*
+         * ★ 定案即落注册表，**不等 apply**。
+         *   apply 只在拿得到 apply 认领的那个 backend 上推进，follower 上
+         *   未必及时跑到；而注册表是重启恢复成员集的来源 —— 落后一拍就意味着
+         *   "重启后恢复出旧成员集"，也就是两套多数派定义。
+         *   raft_config_persist 内部拿不到 SPI 会自己返回 false，不致报错。
+         */
+        SpinLockAcquire(&RaftGroups->mutex);
+        i = ctx->g->n_members;
+        SpinLockRelease(&RaftGroups->mutex);
+        if (i > 0)
+        {
+            int cur[RAFT_MAX_PEERS];
+            int k;
+
+            SpinLockAcquire(&RaftGroups->mutex);
+            for (k = 0; k < i && k < RAFT_MAX_PEERS; k++)
+                cur[k] = ctx->g->members[k];
+            SpinLockRelease(&RaftGroups->mutex);
+
+            initStringInfo(&payload);
+            raft_config_format(cur, i, &payload);
+            (void) raft_config_persist(ctx, payload.data);
+            pfree(payload.data);
+        }
+    }
+}
 
 /* 从描述符 JSON 里抠出一个整型字段（不引 jsonb，简单扫描即可） */
 static int
@@ -1641,7 +1889,52 @@ apply_one_entry(RaftGroupCtx *ctx, const RaftLogEntry *e)
     }
     if (strcmp(e->op_type, RAFT_OP_PARWAL) == 0)
         return data_entry_apply(ctx, e);
+    if (strcmp(e->op_type, RAFT_OP_CONFIG) == 0)
+        return raft_config_persist(ctx, e->payload);
     return true;        /* 组内的非数据条目（如 OP_TEST）无副作用 */
+}
+
+/*
+ * T7.20（P7-R1）：已提交的成员集落进注册表 `partdist.raft_group.members`。
+ *
+ * 为什么要落：shmem 里的成员集活不过一次重启，而**重启后恢复出错误的成员集
+ * 就是两套多数派定义** —— 本节点按旧集算、别人按新集算。注册表本来就是重启
+ * 恢复成员集的来源（restore_groups_if_needed 读它），把它写对即可，
+ * 不引入第二份持久结构。
+ *
+ * 只在 apply（= 该条目已提交）时调：未提交的变更不该留下持久痕迹，
+ * 它随时可能被截断回滚。
+ */
+static bool
+raft_config_persist(RaftGroupCtx *ctx, const char *payload)
+{
+    int            members[RAFT_MAX_PEERS];
+    int            n;
+    int            i;
+    StringInfoData sql;
+    bool           spi_owned;
+
+    n = raft_config_parse(payload, members);
+    if (n <= 0)
+        return true;            /* 解不出来就别写坏值；上游已发过 WARNING */
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;           /* 拿不到 SPI：数据组会重试 apply */
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "INSERT INTO partdist.raft_group (group_id, members) "
+                     "VALUES (%lld, ARRAY[", (long long) ctx->group_id);
+    for (i = 0; i < n; i++)
+        appendStringInfo(&sql, "%s%d", i ? "," : "", members[i]);
+    appendStringInfoString(&sql,
+                     "]::integer[]) ON CONFLICT (group_id) DO UPDATE "
+                     "SET members = EXCLUDED.members");
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+
+    raft_persist_spi_end(spi_owned);
+    return true;
 }
 
 static void
@@ -2410,13 +2703,31 @@ parse_peers(void)
     peers_parsed = true;
 }
 
-/* 该 peer 槽位是否参与本组复制（非本节点，且属于本组成员集） */
+/*
+ * 该 peer 槽位是否参与本组复制（非本节点，且属于本组成员集）。
+ *
+ * ★ T7.20：成员变更未提交期间，**旧成员集里的节点也要继续收**（Raft 论文
+ *   §4.2.2 的建议）。被移除的那个节点如果收不到"把它移除"的那条 CONFIG，
+ *   它会一直以为自己还在组里 —— 于是继续按本组的选举超时发起竞选，反复打扰
+ *   一个它已经不属于的组。让它收到那条记录，它自己就退出了。
+ *   注意这**不影响多数派计算** —— 多数派只看当前成员集（group_cluster_size），
+ *   这里放宽的只是"发给谁"。
+ */
 static bool
 peer_in_group(RaftGroupCtx *ctx, int slot)
 {
+    int i;
+
     if (peers[slot].node_id == pg_raft_node_id)
         return false;
-    return group_has_member(ctx, peers[slot].node_id);
+    if (group_has_member(ctx, peers[slot].node_id))
+        return true;
+
+    if (ctx->g->pending_cfg_index > 0)
+        for (i = 0; i < ctx->g->n_committed_members; i++)
+            if (ctx->g->committed_members[i] == peers[slot].node_id)
+                return true;
+    return false;
 }
 
 static void
@@ -3823,6 +4134,9 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
     }
     SpinLockRelease(&ctx->log->mutex);
 
+    /* T7.20：被丢弃的若是那条未提交的 CONFIG，成员集必须退回已提交态 */
+    raft_config_rollback(ctx, idx - 1);
+
     /*
      * ★ leader 侧失败回滚**不再截断 parwal 字节**（2026-08-03 修，raft_17
      * 阶段二实测抓获的丢数据）。
@@ -3931,6 +4245,18 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     if (idx <= 0)
         return 0;
 
+    /*
+     * T7.20：CONFIG 条目在 **append 那一刻**生效，并且**必须重算多数派** ——
+     * 上面那个 majority 是按旧成员集算的，而提交这条 CONFIG 本身要用的就是
+     * 新成员集（Raft 的 append-time 规则）。沿用旧值会出现"按旧集算够了票、
+     * 按新集其实不够"的提交，正是论文里反复强调的不安全点。
+     */
+    if (strcmp(op_type, RAFT_OP_CONFIG) == 0)
+    {
+        raft_config_apply(ctx, idx, payload);
+        majority = cluster_majority(ctx);
+    }
+
     persist_log_entry_sql(ctx, idx, term, op_type, payload, false);
     raft_spi_ctx = true;
     acks = sync_replicate_index(ctx, idx, term);
@@ -3947,6 +4273,9 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     committed_upto = ctx->log->commit_index;
     SpinLockRelease(&ctx->log->mutex);
     persist_hard_state_unlocked(ctx);
+
+    /* T7.20：提交点越过那条 CONFIG ⇒ 成员变更定案 */
+    raft_config_note_commit(ctx, committed_upto);
 
     if (committed_upto < idx)
     {
@@ -4072,6 +4401,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
 {
     bool         has_entry = (entry_idx > 0 && entry_op != NULL && entry_payload != NULL);
     int64        commit_to_mark;
+    int64        cfg_commit = 0;         /* T7.20：提交点快照，用于成员变更定案 */
     int64        conflict_plsn = -1;
 
     *success = 0;
@@ -4179,6 +4509,8 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                  */
                 SpinLockRelease(&ctx->log->mutex);
                 delete_log_entries_after_sql(ctx, entry_idx - 1);
+                /* T7.20：截掉的那段里若有未提交的 CONFIG，成员集必须退回 */
+                raft_config_rollback(ctx, entry_idx - 1);
                 SpinLockAcquire(&ctx->log->mutex);
             }
             else
@@ -4199,6 +4531,9 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                 return true;
             }
             SpinLockRelease(&ctx->log->mutex);
+            /* T7.20：follower 也在 append 那一刻生效，与 leader 同一规则 */
+            if (strcmp(entry_op, RAFT_OP_CONFIG) == 0)
+                raft_config_apply(ctx, entry_idx, entry_payload);
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
         }
@@ -4221,8 +4556,12 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     }
 
     advance_commit_index_locked(ctx, leader_commit);
+    cfg_commit = ctx->log->commit_index;
     commit_to_mark = ctx->log->commit_index;
     SpinLockRelease(&ctx->log->mutex);
+
+    /* T7.20：提交点越过那条 CONFIG ⇒ 成员变更定案 */
+    raft_config_note_commit(ctx, cfg_commit);
 
     /*
      * 日志冲突截断后，必须**先**把 parwal 里对应的字节也截掉，再写新字节。
@@ -4720,6 +5059,146 @@ pg_raft_group_propose(PG_FUNCTION_ARGS)
     pfree(op_type);
     pfree(payload);
     PG_RETURN_INT64(idx);
+}
+
+/*
+ * pg_raft_group_change_member(group_id, node_id, add) → text
+ *
+ * T7.20（P7-R1）：**成员变更的安全路径**。在此之前唯一的办法是在每个节点上
+ * 各自重调 `pg_raft_group_create(gid, 新成员集)` —— 那是**没有协调的**：
+ * 变更期间不同节点持有不同的成员集，于是同一个组在不同节点上有两套不相交的
+ * 多数派定义，Leader Completeness 失去交集保证（与 group_membership_known()
+ * 头注释里那个 hearsay 事故同一个形态，只是换了触发方式）。
+ *
+ * 现在走日志：一条 CONFIG 条目复制到多数派，各节点在 **append 那一刻**同步
+ * 切到新成员集。四道门禁：
+ *   ① 必须是本组 leader —— 只有 leader 能往日志里 append；
+ *   ② 成员集必须已知 —— 未知即不参与（§9.2），更谈不上变更；
+ *   ③ **同时只允许一个未提交的变更** —— 这是单节点变更安全性的前提：
+ *      任意时刻只有相邻两个配置存在，它们的多数派必然相交；
+ *   ④ **一次只加/减一个** —— 同上。要"三换三"就调三次。
+ * 另加一条实际约束：不许把成员集减到空（那会让本组永久不可用）。
+ */
+Datum
+pg_raft_group_change_member(PG_FUNCTION_ARGS)
+{
+    int64          group_id = PG_GETARG_INT64(0);
+    int            node_id  = PG_GETARG_INT32(1);
+    bool           add      = PG_GETARG_BOOL(2);
+    RaftGroupCtx   ctx;
+    int            cur[RAFT_MAX_PEERS];
+    int            ncur = 0;
+    int            next[RAFT_MAX_PEERS];
+    int            nnext = 0;
+    int            i;
+    bool           present = false;
+    bool           is_leader;
+    int64          pending;
+    int64          commit_idx;
+    int64          idx;
+    StringInfoData payload;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("pg_raft 未启用")));
+
+    parse_peers();
+    restore_groups_if_needed();
+
+    if (!raft_group_ctx(group_id, &ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("pg_raft: 本节点上没有组 %lld", (long long) group_id)));
+
+    /* ① 只有 leader 能改 */
+    SpinLockAcquire(&ctx.cons->mutex);
+    is_leader = (ctx.cons->state == RAFT_LEADER);
+    SpinLockRelease(&ctx.cons->mutex);
+    if (!is_leader)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 本节点不是组 %lld 的 leader，成员变更只能在 leader 上发起",
+                        (long long) group_id),
+                 errhint("用 partdist.pg_raft_group_status() 找到当前 leader 再重试。")));
+
+    /* ② 成员集必须已知 */
+    if (!group_membership_known(&ctx))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 组 %lld 的成员集未知，不能变更",
+                        (long long) group_id),
+                 errdetail("成员集未知的组不参与选举与提案（DTX_2PC_DESIGN.md §9.2）。"),
+                 errhint("先用 partdist.pg_raft_group_create(gid, ARRAY[...]) 交底。")));
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    ncur = ctx.g->n_members;
+    for (i = 0; i < ncur; i++)
+        cur[i] = ctx.g->members[i];
+    pending = ctx.g->pending_cfg_index;
+    SpinLockRelease(&RaftGroups->mutex);
+
+    SpinLockAcquire(&ctx.log->mutex);
+    commit_idx = ctx.log->commit_index;
+    SpinLockRelease(&ctx.log->mutex);
+
+    /* ③ 同时只允许一个未提交的变更 */
+    if (pending > 0 && pending > commit_idx)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 组 %lld 还有一个未提交的成员变更（日志条目 %lld，提交点 %lld）",
+                        (long long) group_id, (long long) pending,
+                        (long long) commit_idx),
+                 errdetail("单节点成员变更的安全性前提是「任意时刻只有相邻两个配置」——"
+                           "并发两个变更会让两个多数派不再必然相交。"),
+                 errhint("等上一个变更提交后再发起下一个。")));
+
+    /* ④ 一次只加/减一个 */
+    for (i = 0; i < ncur; i++)
+        if (cur[i] == node_id)
+            present = true;
+
+    if (add && present)
+        ereport(ERROR,
+                (errcode(ERRCODE_DUPLICATE_OBJECT),
+                 errmsg("pg_raft: 节点 %d 已经是组 %lld 的成员",
+                        node_id, (long long) group_id)));
+    if (!add && !present)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                 errmsg("pg_raft: 节点 %d 不是组 %lld 的成员",
+                        node_id, (long long) group_id)));
+    if (!add && ncur <= 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_raft: 不许把组 %lld 的成员集减到空",
+                        (long long) group_id),
+                 errdetail("空成员集 = 该组永久不可用（没有任何节点能凑出多数派）。")));
+
+    for (i = 0; i < ncur; i++)
+        if (add || cur[i] != node_id)
+            next[nnext++] = cur[i];
+    if (add)
+        next[nnext++] = node_id;
+
+    initStringInfo(&payload);
+    raft_config_format(next, nnext, &payload);
+
+    idx = group_propose(&ctx, RAFT_OP_CONFIG, payload.data);
+    pfree(payload.data);
+
+    if (idx <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 组 %lld 的成员变更未能提交（多数派不足或日志环满）",
+                        (long long) group_id),
+                 errdetail("变更已按 append-time 规则生效过又被回滚，成员集保持变更前的样子。"),
+                 errhint("查 partdist.pg_raft_group_flow_stats() 看丢弃计数。")));
+
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+        "group %lld: %s node %d, members now %d, log index %lld",
+        (long long) group_id, add ? "added" : "removed", node_id,
+        nnext, (long long) idx)));
 }
 
 Datum
