@@ -134,6 +134,19 @@ typedef struct ShardXidState
 	ShardXidShadow shadow[SHARD_XID_MAX_SLOTS];
 
 	/*
+	 * T7.17：自动 vacuum 的轮转游标。
+	 *
+	 * ★ 为什么非要它：自动启动器一次只处理有限个分片（锁与页面扫描都在那条
+	 *   路上），而"到龄"名单是按槽位顺序扫出来的。固定从 0 开始扫的话，一旦
+	 *   到龄的分片多于一批，**后面的永远轮不到** —— 实测把 shard_vacuum_max_age
+	 *   调到 1（于是全节点分片都到龄）时，新建的那个分片一直排在第 5 位之后，
+	 *   40 s 都没被服务过一次，看起来就像"心跳没干活"。
+	 *   游标放共享内存而不是后端局部：启动器每次都是心跳**新自连**出来的
+	 *   backend，局部变量活不过一次调用。
+	 */
+	uint32		vacuum_cursor;
+
+	/*
 	 * T2.7 partition_map 驱动门控：已登记打标的表 OID 集合。真相 =
 	 * partition_map.shard_mvcc 列（注册函数写）；本集合是运行时判定用的
 	 * 影子，重启时由 ShardXidShmemInit 扫 pg_shard_xid/ 目录重建（注册即
@@ -992,21 +1005,29 @@ ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max)
 	if (ShardXidCtl == NULL || max <= 0)
 		return 0;
 
-	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
-	for (i = 0; i < SHARD_XID_MAX_SLOTS && n < max; i++)
+	/* 从上次停下的地方接着扫，绕一圈为止（轮转，见 vacuum_cursor 的注释） */
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
 	{
-		ShardXidSlot *slot = &ShardXidCtl->slots[i];
-		TransactionId age;
+		uint32		start = ShardXidCtl->vacuum_cursor % SHARD_XID_MAX_SLOTS;
 
-		if (slot->shard_relid == InvalidOid)
-			continue;
-		age = shard_xid_age_locked(slot);
-		if (age < (TransactionId) shard_vacuum_max_age)
-			continue;
-		shards[n] = slot->shard_relid;
-		if (ages != NULL)
-			ages[n] = age;
-		n++;
+		for (i = 0; i < SHARD_XID_MAX_SLOTS && n < max; i++)
+		{
+			uint32		idx = (start + (uint32) i) % SHARD_XID_MAX_SLOTS;
+			ShardXidSlot *slot = &ShardXidCtl->slots[idx];
+			TransactionId age;
+
+			if (slot->shard_relid == InvalidOid)
+				continue;
+			age = shard_xid_age_locked(slot);
+			if (age < (TransactionId) shard_vacuum_max_age)
+				continue;
+			shards[n] = slot->shard_relid;
+			if (ages != NULL)
+				ages[n] = age;
+			n++;
+			/* 下一轮从**本条的下一个**槽位起扫 */
+			ShardXidCtl->vacuum_cursor = idx + 1;
+		}
 	}
 	LWLockRelease(ShardXidCtl->lock);
 	return n;

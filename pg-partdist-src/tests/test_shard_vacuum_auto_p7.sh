@@ -180,7 +180,14 @@ INSERT INTO va_auto SELECT g, 'r2-'||g FROM generate_series(201,215) g;
 DELETE FROM va_auto WHERE id BETWEEN 201 AND 205;
 BEGIN; INSERT INTO va_auto SELECT g, 'r2a'||g FROM generate_series(301,305) g; ROLLBACK;
 SQL
-logmark=$(DEX bash -c "wc -l < /work/pg-cluster-data/worker$((WPORT-5432)).log 2>/dev/null || echo 0" </dev/null | tr -d '[:space:]')
+# ★ 日志文件名不能猜（P7-T4 的同一个坑，我在这套里又踩了一次）：
+#   setup-raft.sh 写 <datadir>/startup.log；reproduce-env.sh 写 <datadir>.log；
+#   而**出口门禁净场用 `-l <datadir>/pg.log` 拉起节点**。写死任何一种，
+#   单跑绿、进批就红（实测 `worker1.log: No such file or directory`）。
+#   按"数据目录下任何 .log + 同名 .log"一网打尽。
+NODELOGS="/work/pg-cluster-data/worker$((WPORT-5432))/*.log /work/pg-cluster-data/worker$((WPORT-5432)).log"
+logmark=$(DEX bash -c "cat $NODELOGS 2>/dev/null | wc -l" </dev/null | tr -d '[:space:]')
+logmark=${logmark:-0}
 tb2=$(TB "$OA")
 auto_ok=""; waited=0
 for t in $(seq 1 40); do
@@ -189,7 +196,7 @@ for t in $(seq 1 40); do
   sleep 1
 done
 check "★ 心跳在 ${waited}s 内自动推进了截断点（$tb2 → $(TB "$OA")）" "$auto_ok" "ok"
-hit=$(DEX bash -c "tail -n +$((logmark + 1)) /work/pg-cluster-data/worker$((WPORT-5432)).log 2>/dev/null | grep -c '分片 vacuum 自动启动器'" </dev/null | tr -d '[:space:]')
+hit=$(DEX bash -c "cat $NODELOGS 2>/dev/null | tail -n +$((logmark + 1)) | grep -c '分片 vacuum 自动启动器' || true" </dev/null | tail -1 | tr -d '[:space:]')
 check "★ 节点日志留痕（≥1，实际 $hit）" "$([[ -n "$hit" && "$hit" -ge 1 ]] && echo ok)" "ok"
 
 echo "========== [5] 开关 off：同样条件下一动不动 =========="

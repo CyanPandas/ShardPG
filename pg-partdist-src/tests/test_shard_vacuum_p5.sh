@@ -58,6 +58,26 @@ neg() {  # neg <名字> <期望片段> <SQL>
   NEG_RUN=$((NEG_RUN+1))
 }
 
+# ★★ 2026-09-12（T7.17 之后必须加）：本套件验的是 **vacuum 的手工三步内部**，
+#   其中好几处刻意停在中间态取证（最典型的是「趟完标记落到 N」那条，期望
+#   `0/N` —— 标记落了、截断**故意**还没做）。而新上线的自动启动器默认开着，
+#   它会在后台把这一格补掉，于是读出 `N/N`，断言红得与被测内容毫无关系。
+#   场上只能有一个清扫者：整套关掉，EXIT 复原。
+_VAC_AUTO_RESTORE=0
+vac_auto_off() {
+  PSQL "$WPORT" -q -c "ALTER SYSTEM SET pg_partdist.shard_vacuum_auto = off" \
+                -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 && _VAC_AUTO_RESTORE=1
+  sleep 1
+}
+vac_auto_restore() {
+  [[ "$_VAC_AUTO_RESTORE" == "1" ]] || return 0
+  PSQL "$WPORT" -q -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_auto" \
+                -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 || true
+  echo "  [复原] pg_partdist.shard_vacuum_auto 已 RESET"
+}
+trap vac_auto_restore EXIT
+vac_auto_off
+
 source "$(dirname "$0")/lib_node_health.sh"
 health_mark_start
 
