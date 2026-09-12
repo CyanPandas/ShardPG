@@ -28,6 +28,26 @@ COORD=5432
 PASS=0; FAIL=0
 
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
+
+# ★★ 停节点的套件必须自带复原（本项目为此吃过亏：P7-E6 让紧随其后的套件
+#   死在"节点可连"上，和它要验的东西毫无关系）。[9] 段会停两个 follower，
+#   这里挂 EXIT 钩子 —— 中途 Ctrl-C / 断言 exit / set -e 早退都能复原。
+#   **先登记再停**：停到一半被打断也要能救回来。
+_R2_STOPPED=""
+r2_restore_nodes() {
+  local fp d t
+  for fp in $_R2_STOPPED; do
+    d="/work/pg-cluster-data/worker$((fp-5432))"
+    DEX /work/pg-install/bin/pg_ctl -D "$d" -l "$d/pg.log" -o "-p $fp" start -w -t 60 >/dev/null 2>&1 || true
+    for t in $(seq 1 30); do
+      [[ "$(PSQL "$fp" -Atc 'SELECT 1' 2>/dev/null | tail -1)" == "1" ]] && break
+      sleep 1
+    done
+    echo "  [收尾] 已复原节点 :$fp"
+  done
+  _R2_STOPPED=""
+}
+trap r2_restore_nodes EXIT
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 
 check() {  # check <名字> <实际> <期望>
@@ -375,12 +395,27 @@ echo "========== [9] 中止路径：ABORT 标记 =========="
 #   丢弃不再直接等于无痕分叉"，它是**复制健康度**的观测口。
 #   做法同"故意 kill -9 之后重开崩溃窗口"：本节收尾处重取基线，让收尾那句回去
 #   测**非预期**的丢弃。
-# 拆掉两个 follower 的组 → leader 凑不齐多数派 → 复制挂钩 ERROR → 事务中止。
+# 让 leader 凑不齐多数派 → 复制挂钩 ERROR → 事务中止。
 # 此时 DATA 记录已落盘（[A] 在挂钩之前），必须补一条 ABORT 标记。
+#
+# ★★ 2026-09-12 改手段：原先用 `pg_raft_group_reset()` 拆掉两个 follower 的组，
+#   **那个前提已经被产品演进作废了**。`raft_consensus.c:4280` 起有一段有意设计：
+#     /* follower 可能是第一次听说这个数据组：按 leader 的通告自动建组 */
+#   并且注释写明「成员集未知只剥夺**主动**参与（竞选/当选/提案），不剥夺被动接收
+#   —— 否则 hearsay 引导路径被砍，全新分片永远建不起来」。
+#   于是 reset 之后第一条 AppendEntries 就把组**自动重建**回来，follower 照常
+#   落盘并 ack，多数派毫发无损 ⇒ 写入成功 ⇒ 本节四条断言齐红
+#   （实测：期望 ABORT MARKER info=32，实得 info=0 的 COMMIT 标记）。
+#   这不是产品缺陷，是**用例的手段失效**：它测的是一个已经不存在的失败模式。
+#
+#   改用**自动建组救不回来**的手段：直接停掉这两个节点 —— 停机的节点不会 ack，
+#   leader 的多数派算术（按它自己的成员集做）就真的凑不齐。
+#   停完必复原（见 [收尾]）。
 for fp in $f1 $f2; do
-  PSQL $fp -q -c "SELECT partdist.pg_raft_group_reset();" >/dev/null 2>&1
+  _R2_STOPPED+="$fp "          # 先登记再停
+  DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/worker$((fp-5432))" -m fast stop >/dev/null 2>&1 || true
 done
-sleep 2
+sleep 3
 before=$(flush_lsn $pport $loid)
 errcnt=$(PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO r2_txn VALUES (90,'abort-me');" 2>&1 | grep -c "ERROR")
 after=$(flush_lsn $pport $loid)
@@ -407,13 +442,24 @@ if [[ "$after" -gt "$before" ]]; then
   check "该 gxid 没有 COMMIT 标记（标记在复制成功后才写）" "$nc" "0"
 
   # 中止事务落到 follower 的 gclog 里应当是 aborted（commit_ts=0）。
-  # 注意本轮 follower 的组已被 reset，ABORT 标记还没被复制过去 ——
+  # 注意本轮两个 follower 是**停机**状态，ABORT 标记还没被复制过去 ——
   # 所以这里查的是 leader 侧本地回放不到的情况，只核对 leader 段流已写下标记；
   # follower 侧的 aborted 判决要等下一次该分区有写入把标记带过去（FRD §4.3）。
   alocal=$(PSQL $pport -Atc "SELECT ${axid} & ((1::bigint<<48)-1)")
   echo "    （中止事务 xid=${alocal}；ABORT 标记未复制到 follower，"
   echo "      其 gclog 判决要等该分区下一次写入带过去 —— 未决=不可见，语义安全）"
 fi
+
+# ★ 本段结束就复原，不等 EXIT：[10] 起的若干段还要用这两个 follower
+#   （replay_freeze_status / 回放追平等），躺着的节点会让它们以
+#   "取不到值"的形式连片变红，而那与被测内容毫无关系。
+r2_restore_nodes
+# 组也要重建：停机期间 leader 可能已把它们踢出感知，且本节点的组记录还在，
+# 但为稳妥起见按原成员集重新 ensure 一次，失败不致命。
+for fp in $f1 $f2; do
+  PSQL $fp -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null 2>&1 || true
+done
+sleep 2
 
 echo "========== [10] 冻结账目暴露面（FRD §13 约束 5）=========="
 # autovacuum_enabled=off 挡不住防回卷：autovacuum.c 里是
