@@ -1524,6 +1524,20 @@ ShardXidDefineGUCs(void)
 		PGC_SIGHUP,
 		0, NULL, NULL, NULL);
 
+	DefineCustomEnumVariable(
+		"pg_partdist.shard_vacuum_fault",
+		"分片 vacuum 的故障注入点（T7.19/P7-V3，验收用）。",
+		"off = 关闭（生产环境必须是这个）；mid_prune = 页面循环跑到第 2 页时"
+		"中止，制造设计 §6.5 的两态之一（整趟重来）；after_mark = 落完"
+		"「趟完」标记、截断之前中止，制造两态之二（只补截断）。"
+		"抛的是普通 ERROR 而非 PANIC —— 两态的判据是「标记有没有落盘」，"
+		"而标记走的是带 fsync 的水位文件，事务中止即与真崩溃等价。",
+		&shard_vacuum_fault_point,
+		0,
+		shard_vacuum_fault_options,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"pg_partdist.shard_xid_stop_age",
 		"阶段 2：分片 xid 龄达到此值即拒发新号，该分片进只读。",

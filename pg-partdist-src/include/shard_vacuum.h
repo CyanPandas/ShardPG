@@ -20,6 +20,7 @@
 #define SHARD_VACUUM_H
 
 #include "postgres.h"
+#include "utils/guc.h"
 
 #include "utils/relcache.h"
 
@@ -144,6 +145,10 @@ extern int	ShardVacuumRecover(Oid shard);
 /* T7.17（P7-V1）：一次自动启动最多处理几个分片。锁与页面扫描都在这条路上，
  * 不设上限时"很多分片同时到龄"会把一次调用拖得很长。 */
 #define SHARD_VACUUM_AUTO_BATCH		4
+
+/* T7.19（P7-V3）：生产路径故障注入点（GUC pg_partdist.shard_vacuum_fault） */
+extern int	shard_vacuum_fault_point;
+extern const struct config_enum_entry shard_vacuum_fault_options[];
 
 /* T7.18（P7-V2）：尾部截断开关（GUC pg_partdist.shard_vacuum_truncate） */
 extern bool shard_vacuum_truncate_enabled;

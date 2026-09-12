@@ -52,6 +52,7 @@
 #include "storage/itemptr.h"
 #include "access/xact.h"			/* T7.17：逐分片内部子事务 */
 #include "utils/syscache.h"
+#include "utils/guc.h"
 #include "tso.h"
 #include "libpq-fe.h"			/* T7.17：自连触发 */
 #include "postmaster/postmaster.h"	/* PostPortNumber */
@@ -579,6 +580,50 @@ shard_vacuum_flush_batch(Relation rel, ShardVacuumDeadItems *dead,
 }
 
 /* ================================================================== */
+/* T7.19（P7-V3）：生产路径上的故障注入点                              */
+/* ================================================================== */
+
+/*
+ * 设计 §6.5 的两态恢复有两条路，而其中两条**分支此前没有任何用例能走到** ——
+ * 它们要求"在页面循环中间崩一次"和"落完标记、截断之前崩一次"，而这两个时刻
+ * 都在一个 C 函数内部，从 SQL 面够不着。没人走过的恢复路径，等于没有。
+ *
+ * 于是在产品路径上开一个**显式的**注入点。三条纪律：
+ *   · 默认 off，判据是一次整型比较，热路径上等于不存在；
+ *   · 只在 `shard_vacuum_*` 这一族里生效，不散到别处；
+ *   · 抛的是普通 ERROR 而不是 PANIC —— 事务中止即可制造"标记没落下"的效果，
+ *     不必真把节点打死（真崩溃的等价性由"标记有没有落盘"保证，而标记走的是
+ *     带 fsync 的水位文件）。
+ */
+typedef enum ShardVacuumFaultPoint
+{
+	SV_FAULT_OFF = 0,
+	SV_FAULT_MID_PRUNE,			/* 页面循环跑到第 2 页时中止（两态之一） */
+	SV_FAULT_AFTER_MARK			/* 落完"趟完"标记、截断之前中止（两态之二） */
+} ShardVacuumFaultPoint;
+
+int			shard_vacuum_fault_point = SV_FAULT_OFF;
+
+const struct config_enum_entry shard_vacuum_fault_options[] = {
+	{"off", SV_FAULT_OFF, false},
+	{"mid_prune", SV_FAULT_MID_PRUNE, false},
+	{"after_mark", SV_FAULT_AFTER_MARK, false},
+	{NULL, 0, false}
+};
+
+static void
+shard_vacuum_fault(int point, const char *what)
+{
+	if (shard_vacuum_fault_point != point)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("pg_partdist: 注入的 vacuum 故障点 \"%s\" 触发", what),
+			 errdetail("由 GUC pg_partdist.shard_vacuum_fault 打开，"
+					   "用于验收设计 §6.5 的两态恢复。生产环境应保持 off。")));
+}
+
+/* ================================================================== */
 /* 页面趟主体                                                          */
 /* ================================================================== */
 
@@ -634,6 +679,10 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 		Size		freespace;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/* T7.19：页面循环跑到一半崩一次（两态之一：整趟重来） */
+		if (blkno == 1)
+			shard_vacuum_fault(SV_FAULT_MID_PRUNE, "mid_prune");
 
 		buf = ReadBuffer(rel, blkno);
 
@@ -1162,6 +1211,12 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 	ShardVacuumGetWatermarks(shard, &cur_tb, &cur_vx);
 	if (trunc_before > cur_vx)
 		ShardVacuumSetWatermarks(shard, cur_tb, trunc_before);
+
+	/*
+	 * T7.19：标记已落盘（带 fsync）、截断尚未做 —— 这一刻崩掉，重启后就是
+	 * 设计 §6.5 的两态之二，恢复应当**只补截断、绝不重跑页面趟**。
+	 */
+	shard_vacuum_fault(SV_FAULT_AFTER_MARK, "after_mark");
 
 	return true;
 }

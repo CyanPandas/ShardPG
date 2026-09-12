@@ -61,6 +61,7 @@ restore_gucs() {
     -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_max_age" \
     -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_auto" \
     -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_truncate" \
+    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_fault" \
     -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo" \
     -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 || true
   PSQL "$COORD" -q -c "ALTER SYSTEM RESET pg_partdist.tso_master" \
@@ -285,11 +286,90 @@ check "关掉之后关系大小不变（${sz2} 块）—— 只清元组、不�
       "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)" "$sz2"
 got=$(set_guc pg_partdist.shard_vacuum_truncate on)
 check "截断开关已恢复" "$got" "on"
-got=$(set_guc pg_partdist.shard_vacuum_auto on)
-check "截断一节后：心跳已恢复" "$got" "on"
+# ★ 心跳留到 [10] 结束再开 —— [8]/[9] 验的同样是 sweep 内部，场上仍只能有
+#   一个清扫者。实测开着跑过一轮：心跳抢先把 va_fault 清完并把水位推到 5/5，
+#   于是"标记一个都没落下"和"整趟重来一次就干净"两条连带红，而红的原因与
+#   注入点毫无关系。
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE va_trunc" </dev/null >/dev/null
 
-echo "========== [8] 表没了但槽位还在：记 gone，不报错 =========="
+echo "========== [8] ★ T7.19（P7-V3）两态之一：页面循环中间崩 → 整趟重来 =========="
+# 设计 §6.5 的两条恢复路此前**没有任何用例能走到** —— 它们要求"在页面循环中间
+# 崩一次"和"落完标记、截断之前崩一次"，这两个时刻都在一个 C 函数内部，从 SQL
+# 面够不着。没人走过的恢复路径等于没有，所以在产品路径上开了显式注入点。
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
+SET citus.enable_ddl_propagation TO off;
+DROP TABLE IF EXISTS va_fault;
+CREATE TABLE va_fault(id int primary key, v text) WITH (autovacuum_enabled=off);
+SQL
+OF=$(PSQL "$WPORT" -Atc "SELECT oid FROM pg_class WHERE relname='va_fault'" </dev/null)
+PSQL "$WPORT" -q -c "INSERT INTO partdist.partition_map (partition_id, primary_node) VALUES ($OF, 1) ON CONFLICT DO NOTHING" </dev/null >/dev/null
+regf=$(PSQL "$WPORT" -Atc "SELECT partdist.partdist_set_shard_mvcc('va_fault'::regclass); SELECT 'ok'" </dev/null 2>&1 | tail -1)
+check "故障注入夹具：打标登记成功" "$regf" "ok"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
+SET citus.enable_ddl_propagation TO off;
+INSERT INTO va_fault SELECT g, repeat('y',120) FROM generate_series(1,6000) g;
+DELETE FROM va_fault WHERE id > 3000;
+SQL
+wm_before=$(WM "$OF")
+got=$(set_guc pg_partdist.shard_vacuum_fault mid_prune)
+check "注入点已设为 mid_prune（实得 $got）" "$got" "mid_prune"
+neg "页面循环中间被注入中止" "注入的 vacuum 故障点" \
+    "SET citus.enable_ddl_propagation=off; SELECT swept FROM partdist.shard_vacuum_sweep('va_fault'::regclass, partdist.shard_xid_next('va_fault'::regclass::oid)::bigint)"
+check "★ 两态之一：标记一个都没落下（水位原样 ${wm_before}）" "$(WM "$OF")" "$wm_before"
+got=$(set_guc pg_partdist.shard_vacuum_fault off)
+check "注入点已关" "$got" "off"
+swpf=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
+        SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_fault'::regclass,
+          partdist.shard_xid_next('va_fault'::regclass::oid)::bigint)" </dev/null | tail -1)
+check "★ 整趟重来一次就干净（${swpf}）" "$swpf" "true|3000"
+check "重来之后数据完好（3000 行）" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_fault" </dev/null | tail -1)" "3000"
+
+echo "========== [9] ★ T7.19 两态之二：落完标记崩 → 只补截断 =========="
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_fault WHERE id > 1500" </dev/null >/dev/null
+got=$(set_guc pg_partdist.shard_vacuum_fault after_mark)
+check "注入点已设为 after_mark（实得 $got）" "$got" "after_mark"
+neg "落完标记、截断之前被注入中止" "注入的 vacuum 故障点" \
+    "SET citus.enable_ddl_propagation=off; SELECT swept FROM partdist.shard_vacuum_sweep('va_fault'::regclass, partdist.shard_xid_next('va_fault'::regclass::oid)::bigint)"
+wm2=$(WM "$OF"); tb2=${wm2%%/*}; vx2=${wm2##*/}
+check "★ 两态之二成立：标记落了、截断没做（${wm2}）" \
+      "$([[ -n "$tb2" && -n "$vx2" && "$vx2" -gt "$tb2" ]] && echo ok)" "ok"
+got=$(set_guc pg_partdist.shard_vacuum_fault off)
+check "注入点已关（二）" "$got" "off"
+act=$(PSQL "$WPORT" -Atc "SELECT partdist.shard_vacuum_recover($OF::oid)" </dev/null | tail -1)
+check "恢复动作 = truncated（只补截断）" "$act" "truncated"
+check "两水位重新相等（${vx2}/${vx2}）" "$(WM "$OF")" "$vx2/$vx2"
+# ★ "只补截断、不重跑页面趟"的取证：页面早在崩之前就清完了，所以紧接着再跑
+#   一整趟必然一条都删不动。删得动就说明上一趟其实没清完，标记是假的。
+swpf2=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
+        SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_fault'::regclass,
+          partdist.shard_xid_next('va_fault'::regclass::oid)::bigint)" </dev/null | tail -1)
+check "★ 页面确实早已清完（再跑一趟删不动：${swpf2}）" "$swpf2" "true|0"
+check "恢复之后数据完好（1500 行）" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_fault" </dev/null | tail -1)" "1500"
+
+echo "========== [10] ★ T7.19：clog 整段删除分支 =========="
+# 段 = 2^20 个 xid，靠真发号跨段要烧一百万个，跑不起。这一支验的是
+# `ShardClogTruncate` 的**整段 unlink 循环**，前置门禁（趟完才许截断）由 [9]
+# 单独验过，所以这里直接把"趟完"标记抬到段边界之上，只驱动那个循环。
+segs0=$(DEX bash -c "ls /work/pg-cluster-data/worker$((WPORT-5432))/pg_shard_clog/$OF 2>/dev/null | wc -l" </dev/null | tr -d '[:space:]')
+check "截断前该分片有 clog 段文件（${segs0} 个）" \
+      "$([[ -n "$segs0" && "$segs0" -ge 1 ]] && echo ok)" "ok"
+PSQL "$WPORT" -q -c "SELECT partdist.shard_vacuum_set_watermarks($OF::oid, $vx2::bigint, 2100000::bigint)" </dev/null >/dev/null
+nseg=$(PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OF::oid, 1500000::bigint)" </dev/null | tail -1)
+check "★ 整段删除分支：删掉了 ≥1 个整段（实删 ${nseg}）" \
+      "$([[ -n "$nseg" && "$nseg" -ge 1 ]] && echo ok)" "ok"
+segs1=$(DEX bash -c "ls /work/pg-cluster-data/worker$((WPORT-5432))/pg_shard_clog/$OF 2>/dev/null | wc -l" </dev/null | tr -d '[:space:]')
+check "段文件确实少了（${segs0} → ${segs1}）" \
+      "$([[ -n "$segs1" && -n "$segs0" && "$segs1" -lt "$segs0" ]] && echo ok)" "ok"
+# 截断点之下进免查隐式冻结区 = "已提交且对一切快照可见"，所以老行照样读得到
+check "截断之后老数据仍可见（免查区语义，1500 行）" \
+      "$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_fault" </dev/null | tail -1)" "1500"
+PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE va_fault" </dev/null >/dev/null
+got=$(set_guc pg_partdist.shard_vacuum_auto on)
+check "sweep 内部诸节结束：心跳已恢复" "$got" "on"
+
+echo "========== [11] 表没了但槽位还在：记 gone，不报错 =========="
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE va_auto;" </dev/null >/dev/null
 # DROP 会一并归还槽位（T7.7），所以这里不强求 detail 里一定出现 gone ——
 # 要验的是**不报错、不拖累同批**：函数照常返回一行。
@@ -302,8 +382,8 @@ check "夹具表 DROP 之后自动启动器仍正常返回（considered=${d7}）
 neg "水位不变式 tb <= vx 违反即拒" "不变式" \
     "SELECT partdist.shard_vacuum_set_watermarks($OA::oid, 10::bigint, 5::bigint)"
 
-echo "========== [9] 负向计数守卫 + 节点健康 =========="
-check "负向用例计数守卫（应跑 1 条）" "$NEG_RUN" "1"
+echo "========== [12] 负向计数守卫 + 节点健康 =========="
+check "负向用例计数守卫（应跑 3 条）" "$NEG_RUN" "3"
 health_check_no_crash
 
 echo ""
