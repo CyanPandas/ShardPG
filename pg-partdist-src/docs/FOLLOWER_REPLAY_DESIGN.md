@@ -79,6 +79,10 @@ secondary(§9 前提)。持续回放意味着每个节点常驻几十条 redo �
   > 验收见 `tests/test_promote_catchup_tx3.sh`(19/19)。
 - 追平失败被 `PG_TRY` 捕获落到 `FAILED`,不拖垮 worker(shmem worker 崩溃会连带
   整个节点重置);游标在 `apply_checkpoint` 里,下次触发只补未完成的部分。
+- **目标之内的字节还没到齐**(catchup 给的上界超过本地已收到的位置)时,槽位停在
+  `CATCHING_UP`,worker **按 `replay_naptime_ms` 轮询**等尾部,每个目标只打一行
+  "字节尚未到达"。catchup 调用方超时返回后目标仍挂在槽位上,字节一到 worker 自行
+  放到上界再回 `IDLE`。**没进展不算干活**,不许零间隔重试(§13 约束 16,T7.28)。
 
 **§7 以下各节描述的回放管线本身(五阶段、loc_map、页级幂等、apply checkpoint)
 全部照旧有效**,只是"每 shard 一个 worker 串行消费"改为"每 shard 一个 worker
@@ -1921,6 +1925,43 @@ TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role
     3 个人造陈旧目录被清掉(8→4),而**活着的关系配 grace=0 不动它**(流仍完整 12 条),
     `DROP TABLE` 之后立刻可回收。
 
+16. **★ 等尾部不许空转:"没进展"不能当成"干了活"** (已修,2026-09-13,T7.28 / P7-P2)
+
+    `ShardReplayRun` 读到期望的 plsn 缺失、且后面没有更大的 plsn 时,判定为
+    "尾部尚未到达",**正常返回**(§7.3 空洞判定的另一支)。worker 主循环原先写的是
+    `did_work = ok`:只要没抛错就算干了活,主循环末尾 `WaitLatch` 的超时因此取 0,
+    立刻重来。每一圈重建一次段索引,再打一行 `追平至 N`。
+
+    触发条件很普通:`replay_catchup` 给的上界超过了本地已收到的字节(字节还在路上,
+    或者组已经没了、永远不会来)。调用方超时报错走人之后,`target_plsn` 和
+    `CATCHING_UP` 仍挂在槽位上,**于是 worker 永远转下去**。
+
+    实测证据:
+    - tx2 容器 worker3 的一个日志 11 小时刷到 **20.7 GB**,三处 30 MB 抽样全是同两个
+      分片的 `追平至 0`,同一毫秒反复出现。整个容器 68.5 GB 可写层里有 60.5 GB 是日志。
+      叠加门禁净场"日志只改名归档、不删"(`run_p6_exit.sh` 的 `rotate_logs`),
+      磁盘被写到 94%。
+    - 在 pg-test 上复现(`test_replay_spin_p7.sh`,修复前):catchup 超时后 10 秒内
+      `追平至` 新增 **5246 行**,worker 占约 17% 单核;槽位 `catching_up`,
+      target=223、applied=23 纹丝不动。
+
+    **修法**:只有 `applied_part_lsn` 真的前进了才置 `did_work`,`追平至` 也只在
+    前进时打。没进展就按 `replay_naptime_ms` 轮询,并对同一个目标只打一行
+    `已放到 X,目标 Y 的字节尚未到达,按 N ms 轮询等待`(有进展后重新计)。
+    这样等待既不刷屏,也不静默。顺带修正:原先的 `did_work = ok` 是赋值,
+    多个槽位时只有最后一个槽位的结果算数,现改为只增不减。
+
+    **代价**:晚到的尾部最多晚一个 naptime(默认 200 ms)被捡起。catchup 调用方本来
+    就是 50 ms 轮询等待,平时惰性槽位根本走不到这里,可以忽略。
+
+    **验收** `tests/test_replay_spin_p7.sh`(已入 `run_p6_exit.sh` 门禁):
+    - 等尾部 10 秒内 `追平至` 新增 0 行、CPU 约 0%,等待提示恰好 1 行。
+      判据前置了"确实停在等待态"的守卫(target 仍挂着、applied 未到),
+      否则"没刷日志"可能只是因为 worker 根本没在等。
+    - 字节晚到后**不重新触发**,worker 自行追到上界且不越界,回到 `idle`。
+    - 追满后主堆与 leader 逐字节一致。
+    - 修复前 18/2(两条红即复现),修复后 22/0。
+
 ---
 
 ## 14. 代码落点与分阶段计划
@@ -1960,6 +2001,7 @@ pg-partdist-src/
     pagecmp.py                 页面比对(内核 heap_mask() 掩码集合,**堆页专用**)
     test_follower_replay_r1.sh R1 物理回放闭环
     test_lazy_replay_l1.sh     L1 惰性触发语义
+    test_replay_spin_p7.sh     [新] 等尾部不许空转(§13 约束 16,T7.28)
     test_txn_layer_r2.sh       R2 事务层(gclog 直接查账)
     test_ddl_fileset_d1.sh     [新] D1 DDL/fileset 控制通道(§12)
     test_local_wal_conflict.sh [新] 本地 WAL 崩溃恢复不得覆盖回放结果(§13 约束 12)

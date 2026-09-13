@@ -1058,6 +1058,7 @@ void
 ReplayWorkerMain(Datum arg)
 {
     ShardReplayCtx *ctxs[REPLAY_MAX_SHARDS] = {NULL};
+    uint64          wait_logged[REPLAY_MAX_SHARDS] = {0};  /* T7.28：已报过"等尾部"的目标 */
     MemoryContext   work_cxt;
 
     pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
@@ -1285,6 +1286,7 @@ ReplayWorkerMain(Datum arg)
 
                 ctx->last_ckpt_time = GetCurrentTimestamp();
                 ctxs[i] = ctx;
+                wait_logged[i] = 0;
                 MemoryContextSwitchTo(old);
 
                 /* 认领时把持久化游标同步进槽位，供 catchup 的"已到位"判定 */
@@ -1313,7 +1315,9 @@ ReplayWorkerMain(Datum arg)
             if (bound > ctxs[i]->applied_part_lsn)
             {
                 MemoryContext old = MemoryContextSwitchTo(work_cxt);
+                uint64         before = ctxs[i]->applied_part_lsn;
                 bool           ok = true;
+                bool           progressed;
 
                 /*
                  * 追平失败不能拖垮 worker（否则整个节点连带重置）：
@@ -1345,11 +1349,31 @@ ReplayWorkerMain(Datum arg)
 
                 MemoryContextSwitchTo(old);
                 MemoryContextReset(work_cxt);
-                did_work = ok;
+
+                /*
+                 * ★ T7.28（P7-P2）：did_work 只认**真的往前放了**。
+                 *
+                 * ShardReplayRun 读到"尾部尚未到达"是正常返回（见那里的空洞
+                 * 判定），首版却把它和"放完了一批"一样记成 did_work ⇒ 下面
+                 * WaitLatch 超时取 0 ⇒ 立刻重来：每圈重建一次段索引、打一行
+                 * `追平至 N`。catchup 调用方超时走人之后 target 与 CATCHING_UP
+                 * 仍挂在槽位上，于是字节不来就**永远**转下去 —— tx2 上一个节点
+                 * 日志 11 小时刷到 20.7 GB，全是同两个分片的 `追平至 0`。
+                 *
+                 * 没进展就按 naptime 轮询（晚到的尾部照样会被捡起来，只是最多
+                 * 晚一个 naptime）。另一处顺带修正：原先是 `did_work = ok` 赋值，
+                 * 多个槽位时只有**最后一个**槽位的结果算数。
+                 */
+                progressed = ok && ctxs[i]->applied_part_lsn > before;
+                if (progressed)
+                {
+                    did_work = true;
+                    wait_logged[i] = 0;
+                }
 
                 if (ok)
                 {
-                    /* 收尾 checkpoint：追平结束即持久化游标 */
+                    /* 收尾 checkpoint：追平结束即持久化游标（没进展时它自己直接返回） */
                     ShardReplayDoCheckpoint(ctxs[i]);
                     LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
                     s->applied = ctxs[i]->applied_part_lsn;
@@ -1368,10 +1392,27 @@ ReplayWorkerMain(Datum arg)
                         s->state = REPLAY_IDLE;     /* 回到休眠 */
                     LWLockRelease(ReplayCtl->lock);
 
-                    ereport(LOG,
-                            (errmsg("pg_partdist replay: shard %u 追平至 %llu",
-                                    s->shard_oid,
-                                    (unsigned long long) ctxs[i]->applied_part_lsn)));
+                    if (progressed)
+                        ereport(LOG,
+                                (errmsg("pg_partdist replay: shard %u 追平至 %llu",
+                                        s->shard_oid,
+                                        (unsigned long long) ctxs[i]->applied_part_lsn)));
+                    else if (!ctxs[i]->needs_struct && wait_logged[i] != bound)
+                    {
+                        /*
+                         * 等尾部不许静默：每个目标只报一次（有进展后重新计），
+                         * 否则"catchup 超时之后槽位还挂着目标"只能靠翻
+                         * replay_status() 才看得见。
+                         */
+                        ereport(LOG,
+                                (errmsg("pg_partdist replay: shard %u 已放到 %llu，"
+                                        "目标 %llu 的字节尚未到达，按 %d ms 轮询等待",
+                                        s->shard_oid,
+                                        (unsigned long long) ctxs[i]->applied_part_lsn,
+                                        (unsigned long long) bound,
+                                        replay_naptime_ms)));
+                        wait_logged[i] = bound;
+                    }
                 }
                 else
                 {
