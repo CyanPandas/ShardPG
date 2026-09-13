@@ -57,18 +57,18 @@
 
 | ID | 缺陷 | 09-09 复核 | 影响 |
 |---|---|---|---|
-| **P7-G1** | §9.2 第 3 层禁用清单**漏 8 个同类 Citus UDF**：`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method` | 未修（`shard_guard.c:50-80` 清单实为 7 个 citus UDF + 5 个逻辑解码入口；11 个 UDF 在 Citus 13.1 里全是 C 函数，实测在库） | 它们同样亲手搬/读分片数据，绕过去就是静默错读或与 raft 放置冲突。**注意补名字只堵入口，不堵通路**（§3.1），而且在补名字之前先得让守卫在协调者上真的生效（R-P6-22，§3.2） |
-| **P7-G2** | **引用表运行期写：零守卫、零断言**，DESIGN §10 那行还挂着"【需核实现状】" | 未修（`shard_guard.c` 零命中 `reference`） | §10 写"建表后只读"，实际拦不住 |
+| **P7-G1** | §9.2 第 3 层禁用清单**漏 8 个同类 Citus UDF**：`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method` | **✅ 已修（2026-09-10，T7.9，`bed624f`）**：8 个同类 UDF 补进 `shard_guard.c` 清单，实测 Citus 13.1 里都存在且都是 C 函数。前提 R-P6-22 同批先修（闸门改集群级），否则补了名字在协调者上也不触发。<br>（09-09 复核原文：未修，清单实为 7 个 citus UDF + 5 个逻辑解码入口） | 它们同样亲手搬/读分片数据，绕过去就是静默错读或与 raft 放置冲突。**注意补名字只堵入口，不堵通路**（§3.1），而且在补名字之前先得让守卫在协调者上真的生效（R-P6-22，§3.2） |
+| **P7-G2** | **引用表运行期写：零守卫、零断言**，DESIGN §10 那行还挂着"【需核实现状】" | **✅ 已修（2026-09-10，T7.10，`bed624f` + `3a89e10`）**：挂 `planner_hook`，按原始 Query 的 `resultRelation` 查 `pg_dist_partition.partmethod='n'`；协调者上 INSERT / UPDATE / DELETE 全拦，SELECT 放行（`negative_p6` 含阴性对照）。★ 第一版挂 `ExecutorStart` 判 `resultRelations`，被 Citus 改写成 CustomScan 绕过，实测**完全不生效**。覆盖边界：worker 上的 `<ref>_<shardid>` 分片不在 `pg_dist_partition` 里，看不见（DESIGN §10）。<br>（09-09 复核原文：未修，`shard_guard.c` 零命中 `reference`） | §10 写"建表后只读"，实际拦不住 |
 | **R-P6-18** | MARKER 的 `start_ts` 是墙钟（`partwal_sync.c:733` `GetCurrentTransactionStartTimestamp()`），不是 TSO start_ts | **✅ 已修（T7.11）**：新增标志位 `PARTWAL_MARKER_STS_IS_TSO`，消费侧只认带位的值，不带位一律落 0（遗留模式） | R-P3-2「双 ts 宇宙串线」成真：升主后 §4.2 三态处置拿它与 TSO 快照比，**恒为"跳过"** |
 | **P7-G4**<br>（2026-09-12 新登记） | **`commit_ts` 没有对应的宇宙标志位**，与 R-P6-18 是同一件事的另一半 | **未修，仅登记**。<br>**具体原因**：`TsoMarkerCommitTs()` 配了 TSO 返回 TSO 号、没配返回本地墙钟（~2.1e9 / ~8.4e14），而槽里只存值不存来源。`ShardClogSetVerdict()` 与 gclog 槽都原样收下。判据 §4.1 是 `commit_ts < 读者 start_ts`，墙钟恒大于任何 TSO 号。<br>**为什么现在不炸**：TSO 是**整簇一致**的配置，写侧与读侧恒在同一宇宙 —— 要么都是 TSO 号（可比），要么读者 `my_ts=0` 走遗留分支（根本不比）。<br>**触发条件**：leader 写标记时没配 TSO、读者读时配上了（或反过来），即**中途改 TSO 配置**。那不是受支持的操作，所以定级为 ★ 而不是 ★★★。<br>**★ 留痕**：2026-09-12 曾把遗留分支改成返回 0 试图根治，**实测否证并已回退**（`promote_catchup_tx3` 毫无变化、`dtx_commit_marker_tx2` 由 39/2 恶化到 33/6）。经过写在 `src/tso_client.c`。<br>**修法方向**：照 `PARTWAL_MARKER_STS_IS_TSO` 的样子给 commit_ts 也加一位，并让 gclog 槽的 `status` 高位带上它（历史槽高位为 0 = 遗留 = 安全方向） | 只在中途改 TSO 配置时发作：已提交的行永久不可见 |
-| **R-P6-22** | **禁用清单在协调者上根本不生效**：`ShardGuardCheckPlan` 的快门是 `ShardGatingActive()`（本节点 `shard_relids` 非空 或 shmem `mvcc_n>0`），而打标表长在 worker、协调者两者皆空 ⇒ 只在协调者上调用的 `citus_rebalance_start` / `citus_drain_node` / `undistribute_table` 等**一条都不触发**。`negative_p6` 全绿是因为夹具用一个 worker 上的表 OID 给协调者开了闸门（`:64-66`） | **2026-09-09 新发现**（本次查证第 6 条时撞出，实测三节点白名单全空） | §9.2 第 3 层禁用整层在生产形态下熄火 —— 比"漏 8 个名字"严重得多。见 §3.2 |
+| **R-P6-22** | **禁用清单在协调者上根本不生效**：`ShardGuardCheckPlan` 的快门是 `ShardGatingActive()`（本节点 `shard_relids` 非空 或 shmem `mvcc_n>0`），而打标表长在 worker、协调者两者皆空 ⇒ 只在协调者上调用的 `citus_rebalance_start` / `citus_drain_node` / `undistribute_table` 等**一条都不触发**。`negative_p6` 全绿是因为夹具用一个 worker 上的表 OID 给协调者开了闸门（`:64-66`） | **✅ 已修（2026-09-10，`bed624f`；夹具拐杖 `97632ce` 撤除）**：禁用清单拆两张 —— Citus 运维 / 搬运类改走集群级闸门 `ShardGuardClusterManaged()`（= `pg_raft.raft_enabled`），逻辑解码入口仍按打标判据。`negative_p6` 撤掉给协调者设白名单的两行、改为断言"协调者白名单为空"后 **40/0**：`citus_rebalance_start` / `SELECT * FROM` 形式 / `citus_drain_node` / `undistribute_table` 四条全部触发，修复前全部静默放行。<br>（09-09 登记原文：新发现，实测三节点白名单全空） | §9.2 第 3 层禁用整层在生产形态下熄火 —— 比"漏 8 个名字"严重得多。见 §3.2 |
 | **P7-G3** | DESIGN §10 缺 4 行、错 1 行 | **本次已补**，见 §5 | — |
 
 ### 1.4 ◐ 出口动作 / 门禁（批次 4）
 
 | ID | 事项 | 09-09 复核 |
 |---|---|---|
-| **P7-E1** | **31 套全量在最新二进制上一次没跑过**（`run_p6_exit.sh` `SUITES` 实数 31；最近一次全量是 T6.8 的 28 套 1191/31，其后批次 #7–#11 改了回放 redo、路由层、`promote_prepare`、整个 PG 二进制、发号起点） | 未跑。出口清单原文的"29 套"口径也已过时 |
+| **P7-E1** | **31 套全量在最新二进制上一次没跑过**（`run_p6_exit.sh` `SUITES` 实数 31；最近一次全量是 T6.8 的 28 套 1191/31，其后批次 #7–#11 改了回放 redo、路由层、`promote_prepare`、整个 PG 二进制、发号起点） | **◐ 分段跑完，未一次跑完**：T7.12（2026-09-11/12）分四段 ≈1595 条 / FAIL 17，全部定因清零（§2「T7.12 收口」）；口径已由 31 扩到 **47 套**（OPS 8 套 + P7 新套件）。不分段全量属出口动作，**2026-09-13 用户裁定暂缓**（宿主机无 swap，见 P7-E7） |
 | **P7-E2** | OPS 8 套按 3 节点布局写，9 节点上会停错节点且不复原 | **已裁定：改造进门禁**（2026-09-09）。拓扑无关化后并入 `SUITES`，口径 31 → 39 套。T7.13 |
 | **P7-E6**<br>（2026-09-10 新登记） | **同一个毛病出现在 P7 自己的新套件里**：`test_promote_handover_p7.sh` [5] 杀掉旧主之后**从不复原**。实测后果是后面每个套件都被毒化 —— 紧接着跑的 `test_slot_reclaim_p7` 第一条断言就死在"节点 :5433 可连"，而那和它要验的槽位回收毫无关系，很容易被误判成"槽位回收回归了" | **已修（2026-09-10）**：复原挂进该套件的 `cleanup()`（EXIT trap，中途 Ctrl-C 也能复原），并在**杀之前**先登记 `KILLED_NODE`。纪律：**停节点的套件必须自带复原**，这条同样适用于 T7.13 的 OPS 8 套改造。<br>⚠️ 光复原**还不够**：该套件的不可重复有**两个**独立原因，另一个是旧主上留下的壳表删不掉（P7-D3），已一并改成每轮换表名。**验收：干净集群上连跑两遍，两遍都 35/0**（2026-09-10）——只补一个的时候第二遍必红 |
 | **P7-E3** | 三个基线消费者 e2e：初始配对 ✓、永久分叉 ✓、**快路径分叉 ✗**（`test_fastpath_divergence_tx4.sh` 只验到 `promote_prepare` 返回 -1，无重做基线步骤） | **✅ 已补（2026-09-11，T7.14）**：`test_fastpath_divergence_tx4.sh` **20/0**，取证 `p=1`（重做基线后 `promote_prepare` 由 -1 转正值，副本重新获得参选资格）。<br>★ **补测试的过程挖出并修掉了一个真缺陷** —— 见 T7.14 |
@@ -395,21 +395,26 @@ PSQL $COORD -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${OID}'"
 
 ## 4 出口标准（P7 什么时候算完）
 
-- [ ] 批次 1 四条各有**新套件**，且"切主后已提交数据可见"这条命题有端到端取证
+- [x] 批次 1 四条各有**新套件**，且"切主后已提交数据可见"这条命题有端到端取证
+      · T7.1 `dtx_verdict_marker_p7` 38/0、T7.2 `baseline_clog_p7` 18/0、T7.3/T7.4 `promote_handover_p7` 35/0 × 2 轮；
+        端到端：新主写入带分片 xid + 另一副本回放新主的流（`promote_handover_p7`），新主经 R3 读出回放数据（`promote_catchup_tx3` 24/0，`route_resolve` 取证串 `promoted|…|committed`）
 - [ ] 批次 2 四条修完，`run_p6_exit.sh` 的净场层（`mv` 水位文件）可以**撤掉**且门禁仍绿
+      · 四条已修（T7.5–T7.8）；净场层 `reap_xid_slots` **仍在**，"撤掉后门禁仍绿"未验 —— 需整批门禁，随出口动作暂缓
 - [ ] 批次 3 修完：R-P6-22 闸门改判据（`negative_p6` **撤掉给协调者设白名单那两行**
       后仍全绿）+ 8 个 UDF 名字 + 引用表守卫 + MARKER 用 TSO start_ts；
       §10 每条限制各有一条负向断言
+      · 前四项已落地并实测（`bed624f` / `3a89e10` / `97632ce`，`negative_p6` 40/0 且协调者白名单为空）；
+        **"§10 每条限制各有一条负向断言"未逐条核对**，故本格暂不勾
 - [x] OPS 8 套改造成拓扑无关并入门禁（口径 31 → **39 套**，T7.13，2026-09-11）
-- [ ] **全量一次跑完、零 FAIL**（口径 2026-09-12 起 **40 套** —— T7.17 新增
-      `shard_vacuum_auto_p7`），且是在最终二进制上跑的（时机已裁定为
+- [ ] **全量一次跑完、零 FAIL**（口径 2026-09-13 起 **47 套** —— T7.17 起陆续并入
+      `shard_vacuum_auto_p7` 及批次 6 / T7.26–T7.28 的新套件），且是在最终二进制上跑的（时机已裁定为
       批次 1–3 落地之后）
       · 2026-09-11/12 分四段跑完：**≈1595 条 / FAIL 17**，全部定因并修完 → 见 §2「T7.12 收口」
       · **仍差"一次跑完"**：四段是分开跑的，且批次内有主漂假红（**P7-E7**，宿主机无 swap）。
         加 swap 后需再来一次**不分段**的全量
 - [x] 批次 5 生产化三条（vacuum 自动启动器 / 尾部截断 / 覆盖缺口）——
       T7.17/T7.18/T7.19，2026-09-12，`test_shard_vacuum_auto_p7.sh` 62/0
-- [x] 批次 6 六条（含 raft 侧）—— T7.20–T7.25，2026-09-12/13。另登记施工中新发现 4 条（§1.9：P7-W2 捕获环覆盖**未修**，W3/T6/T7 已修）
+- [x] 批次 6 六条（含 raft 侧）—— T7.20–T7.25，2026-09-12/13。另登记施工中新发现（§1.9）：P7-W2（T7.27）、W3、T6、T7、P7-P2（T7.28）已修；**P7-W4 未修**、P7-W5 为工程债
       · 同样**不是"一次跑完"**：各条验收与 raft/回放回归是按批次分开跑的，宿主机无 swap 期间（P7-E7）
         后台任务被系统按低内存反复杀掉，门禁改为脱离会话运行（`setsid nohup`）才跑完
 - [x] 本文 §3 六条**已逐条裁定**（2026-09-09）

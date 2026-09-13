@@ -5049,6 +5049,44 @@ ERROR:  TSO 不可达或拒绝服务（取 start_ts 失败）
    改为：先断言 COMMIT 语句成功，再轮询（带 `dtx_pending_sweep()`）等收敛后
    断言可见性。
 
+#### 批次 #14：P7 批次 1–6 收口汇总（2026-09-09 ~ 09-13）
+
+逐条根因、修法与取证细节在 `pg-partdist-src/docs/P7_REMEDIATION_PLAN.md`（§1 总账、§2「T7.12
+收口」），本节只记**验收数字与落点提交**，免得两处各写一份再走散。全部在 `pg-test-container`
+（1 协调者 + 8 worker）上实测。
+
+| 任务 | 缺陷 / 事项 | 验收 | 提交 |
+|---|---|---|---|
+| T7.1 | R-P6-15 2PC 判决标记不带分片 xid | `dtx_verdict_marker_p7` 34/0（T7.11 后 38/0） | `2f7f6c1` |
+| T7.2 | R-P6-17 基线不搬分片 clog | `baseline_clog_p7` 18/0 | `7769bfc` `2281176` |
+| T7.3 / T7.4 | R-P6-16 升主不发文件号交接 / R-P6-21 打标身份不继承 | `promote_handover_p7` 35/0 × 2 轮 | `9290e78` |
+| T7.5 | R-P6-20 TSO RPC 裸函数名 | 默认 search_path 下取号 1→2→3→4 | `2f7f6c1` |
+| T7.6 | R-P6-19 回放 fd 泄漏 | 代码走查（无直接用例） | `7769bfc` |
+| T7.7 | R-P6-4 分片 xid 槽位不回收 | `slot_reclaim_p7` 5/0（70 轮建删） | `7769bfc` |
+| T7.8 | P7-D1 leader DROP 副本不停流 | `baseline_clog_p7` 18/0（副本日志取证 armed=f） | `2281176` `97632ce` |
+| T7.9 + R-P6-22 | 守卫闸门改集群级 + 补 8 个 UDF | `negative_p6` 40/0（协调者白名单为空） | `bed624f` `97632ce` |
+| T7.10 | P7-G2 引用表运行期写守卫 | 三种写全拦 + SELECT 阴性对照 | `bed624f` `3a89e10` |
+| T7.11 | R-P6-18 MARKER start_ts 双宇宙 | `dtx_verdict_marker_p7` 38/0（start_ts == TSO 号） | `bed624f` `97632ce` |
+| T7.12 | 全量（分四段） | ≈1595 条 / FAIL 17 → 基线对照零回归 → 17 条清零 | `508c411` 等 |
+| T7.13 | OPS 8 套拓扑无关化并入门禁 | 8 套 287/0 | `9e6c81e` |
+| T7.14 | P7-E3 快路径分叉无归队路径 | `fastpath_divergence_tx4` 20/0 | `c5dbf8b` |
+| T7.16 | P7-E5 拓扑未收敛判 BLOCKED | 拓扑正常时无误判 | `caed466` |
+| R3 | 回放数据读路径实装 | `promote_catchup_tx3` 21/2→24/0、`lazy_replay_l1` 57/0 | `508c411` |
+| T7.17–T7.19 | P7-V1/V2/V3 vacuum 自动启动器 / 尾部截断 / 故障注入点 | `shard_vacuum_auto_p7` 62/0 | `b99f130` `c39525a` `2b138be` `1c73cbd` |
+| T7.20 | P7-R1 Raft 单节点成员变更 | `raft_membership_r1` 18/0 + 切主套件回归 | `bfa35f3` |
+| T7.21 | P7-R3 流式物理基线 | `shard_baseline_p6` 45/0 | `7ff51fa` |
+| T7.22 | R-P6-14 逻辑解码协议入口 | `logical_repl_guard_p7` 20/0 | `7ff51fa` |
+| T7.23 | P7-R2 组数上限 + 整表供副本 | `raft_groups_p7` 11/0 | `7ff51fa` |
+| T7.24 | R-P4-13 副本追加去重只看编号 | 批次复核 8 套零 FAIL（tx1 83/0） | `7ff51fa` |
+| T7.25 | P7-R4 DDL 自动跟随 | `ddl_auto_follow_p7` 118/0 | `7ff51fa` |
+| T7.26 | P7-P1 回放壳表被原生剪枝清掉 | `replica_prune_guard_p7` 39/0（修前丢 33 行） | `d344487` |
+| T7.27 | P7-W2 捕获环满覆盖 | `partwal_ring_p7` 14/0 | `d344487` |
+| T7.28 | P7-P2 回放 worker 等尾部空转 | `replay_spin_p7` 22/0（修前 18/2）；回归 9 套 449/0 | `3eb8d97` |
+
+**未闭合**（2026-09-13）：P7-W4（leader ROLLBACK 后副本静默分叉）、P7-G4（commit_ts 无宇宙
+标志位）、P7-D3（半删分片锁死分布表）、P7-V4（打标登记全手工）、工程债 P7-W5；出口动作
+（不分段全量、"不做的事"运维规程）**用户裁定暂缓**。
+
 ---
 
 #### ★ P6 是最后一期：不做的事也必须有裁定
@@ -5556,13 +5594,13 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
 
     | ID | 缺陷 | 严重度 | 09-09 复核 |
     |---|---|---|---|
-    | **R-P6-15** | **2PC 阶段 3 的 COMMIT 标记不带分片 xid**。`dtx_participant.c:467` 在 `COMMIT PREPARED` 里调 `PartWALBuildMarkerPayload()`，而该函数按 `ShardXidXactCount() > 0` 决定带不带分片 xid 尾（`partwal_sync.c:723-727`）——`COMMIT PREPARED` 跑在**另一个没碰过分片表的事务**里，计数恒 0 ⇒ 24 字节旧格式 ⇒ 回放侧 `sxid` 非法、`ShardClogSetVerdict` 被跳过（`shard_replay.c:1340-1351`），只有 gclog 得到 COMMITTED。**后果**：副本分片 clog 对每笔跨分片事务**永远 PREPARED**；决议被 FORGET 回收、`pg_dist_transaction` 已 GC ⇒ `dtx_close_indoubt` 四级全落空 ⇒ **切主后 2PC 提交的行在新主上永久不可见**。方向是 fail-safe（没误判 ABORT），但**不可恢复** | ★★★ | 未修 |
-    | **R-P6-16** | **升主不发 `FILESET_UPDATE`**。`PartDistRoutePromote()` 只做"角色 + 捕获"，不广播新主的 relfilenumber ⇒ 其余副本 locmap 仍对着旧主文件号 ⇒ `replay_catchup` 报"未知 relfilelocator"⇒ **该分片其余副本切主一次后全部失去再次当选资格**。批次 #10 的 p7 [3b] 只断言了"收到"，没断言"放得了" | ★★★ | 未修 |
-    | **R-P6-17** | **物理基线不搬分片 clog**。`shard_baseline_emit` 只灌页面 + 抬发号水位，基线游标之前的 MARKER 不再回放 ⇒ 在已有数据之后才供给的副本，对基线前提交的每个分片 xid **没有判决**；升主后那些行是 RUNNING，再被 `shard_claim_on_promote` 改判 ABORTED ⇒ **丢行**。供给只对"先供给、后写数据"的分片安全 —— 这也解释了 p7"新主读到 40 行"为何只是原生路径的巧合 | ★★★ | 未修 |
-    | **R-P6-18** | **MARKER 的 `start_ts` 是本地墙钟**（`partwal_sync.c:733`），不是 TSO start_ts；回放侧原样写进分片 clog 的 PREPARED 槽。实测副本上 `sts=842001420732582`。这正是 **R-P3-2「双 ts 宇宙串线」成真**：升主后 §4.2 三态处置第一支拿它与 TSO 快照比，恒为"跳过" | ★ | 未修 |
-    | **R-P6-19** | **回放 worker 泄漏目录描述符**。同节点连续多次 `replay_catchup`（三槽位）后报 `exceeded maxAllocatedDescs (328)`，该节点此后**所有回放失败**直到 worker 重启。某条 `AllocateDir` 路径缺 `FreeDir`（六个文件里调用计数配平，故泄漏在异常提前返回路径上） | ★★ | 未修 |
-    | **R-P6-20** | **TSO 客户端 RPC 不带 schema 前缀**。`tso_client.c:416/442/454/502/556` 发裸函数名，而批次 #9 的 `refresh_extension_sql.sh` 把这些 C 函数装进了 `partdist` 模式；协调者默认 `search_path = "$user", public` ⇒ 取号/心跳/commit_ts/safe_ts 全部 `function does not exist` ⇒ **全簇分片写 fail-closed**。此前能跑只因 P4 期各套件在 `public` 里现建同名垫片。演示环境靠 `ALTER DATABASE ... SET search_path` 绕过 | ★★（一行改） | 未修 |
-    | **R-P6-21** | **供给 / 升主不携带"打标身份"**。`mvcc_set` 只由 `partdist_set_shard_mvcc()` 或重启扫 `pg_shard_xid/` 装载；`provision_shard_replica` / `PartDistRoutePromote` 都不加，follower 也从不设白名单 ⇒ **升主后的新主若未事先手工加白名单又未重启，写入不打标、读走原生路径**。p7 [3b] 与 tx3 [4] 都是在这个状态下通过的 —— **通过的原因是错的** | ★★★ | 未修 |
+    | **R-P6-15** | **2PC 阶段 3 的 COMMIT 标记不带分片 xid**。`dtx_participant.c:467` 在 `COMMIT PREPARED` 里调 `PartWALBuildMarkerPayload()`，而该函数按 `ShardXidXactCount() > 0` 决定带不带分片 xid 尾（`partwal_sync.c:723-727`）——`COMMIT PREPARED` 跑在**另一个没碰过分片表的事务**里，计数恒 0 ⇒ 24 字节旧格式 ⇒ 回放侧 `sxid` 非法、`ShardClogSetVerdict` 被跳过（`shard_replay.c:1340-1351`），只有 gclog 得到 COMMITTED。**后果**：副本分片 clog 对每笔跨分片事务**永远 PREPARED**；决议被 FORGET 回收、`pg_dist_transaction` 已 GC ⇒ `dtx_close_indoubt` 四级全落空 ⇒ **切主后 2PC 提交的行在新主上永久不可见**。方向是 fail-safe（没误判 ABORT），但**不可恢复** | ★★★ | 未修 → **✅ 已修（09-09，T7.1）** |
+    | **R-P6-16** | **升主不发 `FILESET_UPDATE`**。`PartDistRoutePromote()` 只做"角色 + 捕获"，不广播新主的 relfilenumber ⇒ 其余副本 locmap 仍对着旧主文件号 ⇒ `replay_catchup` 报"未知 relfilelocator"⇒ **该分片其余副本切主一次后全部失去再次当选资格**。批次 #10 的 p7 [3b] 只断言了"收到"，没断言"放得了" | ★★★ | 未修 → **✅ 已修（09-09，T7.3）** |
+    | **R-P6-17** | **物理基线不搬分片 clog**。`shard_baseline_emit` 只灌页面 + 抬发号水位，基线游标之前的 MARKER 不再回放 ⇒ 在已有数据之后才供给的副本，对基线前提交的每个分片 xid **没有判决**；升主后那些行是 RUNNING，再被 `shard_claim_on_promote` 改判 ABORTED ⇒ **丢行**。供给只对"先供给、后写数据"的分片安全 —— 这也解释了 p7"新主读到 40 行"为何只是原生路径的巧合 | ★★★ | 未修 → **✅ 已修（09-09，T7.2）** |
+    | **R-P6-18** | **MARKER 的 `start_ts` 是本地墙钟**（`partwal_sync.c:733`），不是 TSO start_ts；回放侧原样写进分片 clog 的 PREPARED 槽。实测副本上 `sts=842001420732582`。这正是 **R-P3-2「双 ts 宇宙串线」成真**：升主后 §4.2 三态处置第一支拿它与 TSO 快照比，恒为"跳过" | ★ | 未修 → **✅ 已修（09-10/11，T7.11）** |
+    | **R-P6-19** | **回放 worker 泄漏目录描述符**。同节点连续多次 `replay_catchup`（三槽位）后报 `exceeded maxAllocatedDescs (328)`，该节点此后**所有回放失败**直到 worker 重启。某条 `AllocateDir` 路径缺 `FreeDir`（六个文件里调用计数配平，故泄漏在异常提前返回路径上） | ★★ | 未修 → **✅ 已修（09-09，T7.6）** |
+    | **R-P6-20** | **TSO 客户端 RPC 不带 schema 前缀**。`tso_client.c:416/442/454/502/556` 发裸函数名，而批次 #9 的 `refresh_extension_sql.sh` 把这些 C 函数装进了 `partdist` 模式；协调者默认 `search_path = "$user", public` ⇒ 取号/心跳/commit_ts/safe_ts 全部 `function does not exist` ⇒ **全簇分片写 fail-closed**。此前能跑只因 P4 期各套件在 `public` 里现建同名垫片。演示环境靠 `ALTER DATABASE ... SET search_path` 绕过 | ★★（一行改） | 未修 → **✅ 已修（09-09，T7.5）** |
+    | **R-P6-21** | **供给 / 升主不携带"打标身份"**。`mvcc_set` 只由 `partdist_set_shard_mvcc()` 或重启扫 `pg_shard_xid/` 装载；`provision_shard_replica` / `PartDistRoutePromote` 都不加，follower 也从不设白名单 ⇒ **升主后的新主若未事先手工加白名单又未重启，写入不打标、读走原生路径**。p7 [3b] 与 tx3 [4] 都是在这个状态下通过的 —— **通过的原因是错的** | ★★★ | 未修 → **✅ 已修（09-09，T7.4）** |
 
 26. **R-P6-22 §9.2 第 3 层禁用清单在协调者上根本不生效**（2026-09-09 查证第 6 条
     待裁项时撞出，**新发现**）：`ShardGuardCheckPlan()` 走禁用清单之前有一道快门
@@ -5594,6 +5632,10 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
     **集群级判据**（查 `partdist.partition_map` / `pg_dist_partition` 是否存在打标分片，
     或一个显式的集群级开关）。改完 `negative_p6` **必须撤掉给协调者设白名单那两行**，
     断言仍绿才算数。
+
+    **状态：✅ 已修（2026-09-10，`bed624f`；夹具拐杖于 `97632ce` 撤除）**。判据取了"显式的
+    集群级开关"那一支：`ShardGuardClusterManaged()` = `pg_raft.raft_enabled`。`negative_p6`
+    撤掉协调者白名单两行、改断言"协调者白名单为空"后 **40/0**。详见 P7 计划 §1.3。
 
 ---
 
