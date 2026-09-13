@@ -321,13 +321,18 @@ gvis_committed(GlobalTransactionId gxid, int64 *cts_out)
 	TxnStatus	st = TXN_RUNNING;
 	uint64		sts = 0;
 	uint64		cts = 0;
+	bool		cts_is_tso = false;
 
 	*cts_out = 0;
 	/* 段/槽不存在 = 全零 = RUNNING = 未决 = 不可见，语义上就是我们要的默认值 */
-	(void) EnhancedClogReadStatus(gxid, &st, &sts, &cts);
+	(void) EnhancedClogReadStatusEx(gxid, &st, &sts, &cts, &cts_is_tso);
 	if (st != TXN_COMMITTED)
 		return false;
-	*cts_out = (int64) cts;
+	/*
+	 * ★ T7.29（P7-G4）：不是 TSO 宇宙的 commit_ts 不许拿去和快照比 —— 按 0
+	 *   （遗留语义：对一切快照可见），与 leader 本地遗留模式的账一致。
+	 */
+	*cts_out = cts_is_tso ? (int64) cts : 0;
 	return true;
 }
 
@@ -393,12 +398,11 @@ sv_replayed_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	 *   my_ts=0 走遗留分支（根本不比）。本环境 `pg_partdist.tso_conninfo` 默认
 	 *   为空，tx3 走的正是后者。
 	 *
-	 *   **已知边界**：leader 写标记时没配 TSO、读者读的时候配上了（或反过来），
-	 *   会拿墙钟去比 TSO 号 —— 墙钟恒大 ⇒ 已提交的行永久不可见。这与分片 clog
-	 *   那条路的现状**同源**（`ShardClogSetVerdict` 存的也是同一个 commit_ts），
-	 *   根治要给 commit_ts 配一个类似 PARTWAL_MARKER_STS_IS_TSO 的宇宙标志位
-	 *   （tso_client.c 里记为开放问题）。中途改 TSO 配置本就不是受支持的操作，
-	 *   这里不为它单独改 gclog 的磁盘格式，但把依赖写明。
+	 *   **中途改配置**（leader 写标记时没配 TSO、读者读的时候配上了）：原先会拿
+	 *   墙钟去比 TSO 号 —— 墙钟恒大 ⇒ 已提交的行永久不可见（P7-G4，实测 40 行
+	 *   → 0 行）。**T7.29 已修**：MARKER 带 CTS_IS_TSO，gclog 槽记宇宙位，
+	 *   gvis_committed 对非 TSO 宇宙的 commit_ts 给 0；分片 clog 那条路在回放
+	 *   落账时即落 0。
 	 */
 	if (my_ts > 0 && cts >= my_ts)
 	{

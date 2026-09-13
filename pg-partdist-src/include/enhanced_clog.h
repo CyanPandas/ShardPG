@@ -82,6 +82,17 @@ typedef struct EnhancedClogSlot
 
 #define GCLOG_SLOT_SIZE         ((uint32) sizeof(EnhancedClogSlot))
 
+/*
+ * status 字段的布局（T7.29 / P7-G4）：低 8 位是 TxnStatus，第 8 位记 commit_ts 的宇宙。
+ *
+ * GCLOG_STATUS_CTS_IS_TSO：本槽 commit_ts 是 TSO 号（来自带 PARTWAL_MARKER_CTS_IS_TSO
+ * 的标记）。不带位 = 本地墙钟或来源不明（含一切历史槽），可见性比较按 commit_ts=0
+ * 处理（遗留语义：对一切快照可见）；原值照存，gclog_status() 照常显示。
+ * 读写一律经下面的 API 屏蔽掉宇宙位，调用方拿到的 TxnStatus 与改动前逐值相同。
+ */
+#define GCLOG_STATUS_MASK           UINT32_C(0x000000FF)
+#define GCLOG_STATUS_CTS_IS_TSO     UINT32_C(0x00000100)
+
 /* 每段容纳的 xid 数：1M 槽 × 24B = 24MB/段（稀疏，实占远小于此） */
 #define GCLOG_XIDS_PER_SEGMENT  (UINT32_C(1) << 20)
 
@@ -96,7 +107,7 @@ typedef struct EnhancedClogSlot
  */
 extern void EnhancedClogWriteStatus(GlobalTransactionId gxid,
                                     uint64 start_ts, uint64 commit_ts,
-                                    TxnStatus status);
+                                    TxnStatus status, bool cts_is_tso);
 
 /*
  * 同上，但额外记下 parent_xid（顶层事务的**本地** xid，与 gxid 同节点）。
@@ -105,13 +116,21 @@ extern void EnhancedClogWriteStatus(GlobalTransactionId gxid,
 extern void EnhancedClogWriteStatusWithParent(GlobalTransactionId gxid,
                                               uint64 start_ts, uint64 commit_ts,
                                               TxnStatus status,
-                                              TransactionId parent_xid);
+                                              TransactionId parent_xid,
+                                              bool cts_is_tso);
 
 /* 读一条判决。未写过的槽返回 true 且 status = TXN_RUNNING（空洞语义）。
  * 段文件不存在同样按空洞处理。R3 读路径的入口，本期供验收用例核账。 */
 extern bool EnhancedClogReadStatus(GlobalTransactionId gxid,
                                    TxnStatus *status,
                                    uint64 *start_ts, uint64 *commit_ts);
+
+/* 同上，另给出 commit_ts 是否属于 TSO 宇宙（子事务取顶层槽的位）。
+ * 做可见性比较的调用方必须用这个版本：不是 TSO 号就不能拿去和快照比。 */
+extern bool EnhancedClogReadStatusEx(GlobalTransactionId gxid,
+                                     TxnStatus *status,
+                                     uint64 *start_ts, uint64 *commit_ts,
+                                     bool *cts_is_tso);
 
 /* fsync 本进程写过、尚未落盘的全部段（§8.4 步骤 2） */
 extern void EnhancedClogSync(void);

@@ -157,16 +157,17 @@ GClogMarkDirty(uint16 node_id, uint32 segno)
 void
 EnhancedClogWriteStatus(GlobalTransactionId gxid,
                         uint64 start_ts, uint64 commit_ts,
-                        TxnStatus status)
+                        TxnStatus status, bool cts_is_tso)
 {
     EnhancedClogWriteStatusWithParent(gxid, start_ts, commit_ts, status,
-                                      InvalidTransactionId);
+                                      InvalidTransactionId, cts_is_tso);
 }
 
 void
 EnhancedClogWriteStatusWithParent(GlobalTransactionId gxid,
                                   uint64 start_ts, uint64 commit_ts,
-                                  TxnStatus status, TransactionId parent_xid)
+                                  TxnStatus status, TransactionId parent_xid,
+                                  bool cts_is_tso)
 {
     uint16            node_id = GxidNodeId(gxid);
     uint64            local_xid = GxidLocalXid(gxid);
@@ -185,7 +186,8 @@ EnhancedClogWriteStatusWithParent(GlobalTransactionId gxid,
     memset(&slot, 0, sizeof(slot));   /* 任何将来字段都归零 */
     slot.start_ts   = start_ts;
     slot.commit_ts  = commit_ts;
-    slot.status     = (uint32) status;
+    slot.status     = (uint32) status |
+                      (cts_is_tso ? GCLOG_STATUS_CTS_IS_TSO : 0);   /* T7.29 */
     slot.parent_xid = (uint32) parent_xid;
 
     fd = GClogOpenSegFile(node_id, segno, true);
@@ -211,6 +213,13 @@ bool
 EnhancedClogReadStatus(GlobalTransactionId gxid, TxnStatus *status,
                        uint64 *start_ts, uint64 *commit_ts)
 {
+    return EnhancedClogReadStatusEx(gxid, status, start_ts, commit_ts, NULL);
+}
+
+bool
+EnhancedClogReadStatusEx(GlobalTransactionId gxid, TxnStatus *status,
+                         uint64 *start_ts, uint64 *commit_ts, bool *cts_is_tso)
+{
     uint16            node_id = GxidNodeId(gxid);
     uint64            local_xid = GxidLocalXid(gxid);
     uint32            segno;
@@ -222,6 +231,7 @@ EnhancedClogReadStatus(GlobalTransactionId gxid, TxnStatus *status,
     if (status != NULL)     *status = TXN_RUNNING;
     if (start_ts != NULL)   *start_ts = 0;
     if (commit_ts != NULL)  *commit_ts = 0;
+    if (cts_is_tso != NULL) *cts_is_tso = false;
 
     if (local_xid == 0)
         return false;
@@ -258,7 +268,7 @@ EnhancedClogReadStatus(GlobalTransactionId gxid, TxnStatus *status,
      * 顶层若仍是 TXN_PREPARED（判决还没到），原样返回未决 —— 未决即不可见，
      * 正是 2PC in-doubt 期间要的语义。
      */
-    if ((TxnStatus) slot.status == TXN_PREPARED &&
+    if ((TxnStatus) (slot.status & GCLOG_STATUS_MASK) == TXN_PREPARED &&
         slot.parent_xid != InvalidTransactionId)
     {
         EnhancedClogSlot  pslot;
@@ -279,20 +289,22 @@ EnhancedClogReadStatus(GlobalTransactionId gxid, TxnStatus *status,
             CloseTransientFile(pfd);
 
             if (nb == (ssize_t) sizeof(pslot) &&
-                (TxnStatus) pslot.status != TXN_RUNNING)
+                (TxnStatus) (pslot.status & GCLOG_STATUS_MASK) != TXN_RUNNING)
             {
-                /* 时间戳也取父亲的：整棵提交树共享一个提交时刻 */
-                if (status != NULL)     *status = (TxnStatus) pslot.status;
+                /* 时间戳也取父亲的：整棵提交树共享一个提交时刻（宇宙位同理） */
+                if (status != NULL)     *status = (TxnStatus) (pslot.status & GCLOG_STATUS_MASK);
                 if (start_ts != NULL)   *start_ts = slot.start_ts;
                 if (commit_ts != NULL)  *commit_ts = pslot.commit_ts;
+                if (cts_is_tso != NULL) *cts_is_tso = (pslot.status & GCLOG_STATUS_CTS_IS_TSO) != 0;
                 return true;
             }
         }
     }
 
-    if (status != NULL)     *status = (TxnStatus) slot.status;
+    if (status != NULL)     *status = (TxnStatus) (slot.status & GCLOG_STATUS_MASK);
     if (start_ts != NULL)   *start_ts = slot.start_ts;
     if (commit_ts != NULL)  *commit_ts = slot.commit_ts;
+    if (cts_is_tso != NULL) *cts_is_tso = (slot.status & GCLOG_STATUS_CTS_IS_TSO) != 0;
     return true;
 }
 

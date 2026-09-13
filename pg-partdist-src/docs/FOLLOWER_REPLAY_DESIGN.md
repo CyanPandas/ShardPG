@@ -963,6 +963,12 @@ typedef struct EnhancedClogSlot
 TSO 就位后只换取值来源,不动布局。`reserved` 与 `TxnMarkerPayload`/`XidMapEntry`
 同理:槽直写磁盘,不留未初始化的填充洞。
 
+> **2026-09-13 回填(布局以 `include/enhanced_clog.h` 为准)**:`reserved` 早已改作
+> `parent_xid`(子事务→顶层链接);`status` 现为**低 8 位 TxnStatus + 第 8 位
+> `GCLOG_STATUS_CTS_IS_TSO`**(T7.29 / P7-G4:本槽 commit_ts 是否 TSO 号)。读写一律经
+> `EnhancedClogReadStatus[Ex]` / `EnhancedClogWriteStatus*` 屏蔽宇宙位;做可见性比较的
+> 调用方用 `Ex` 版本,不带位的 commit_ts 按 0 比较。见 §13 约束 17。
+
 **全零槽 = `TXN_RUNNING` = 未决 = 不可见。** 这正是稀疏文件空洞读出来的样子,
 也正是想要的默认值:没有判决的事务一律当作还没提交。段文件因此**必然稀疏**,
 只有真正回放过的 xid 才占实际块。
@@ -1961,6 +1967,16 @@ TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role
     - 字节晚到后**不重新触发**,worker 自行追到上界且不越界,回到 `idle`。
     - 追满后主堆与 leader 逐字节一致。
     - 修复前 18/2(两条红即复现),修复后 22/0。
+
+17. **★ commit_ts 是双宇宙字段,宇宙必须随记录走** (已修,2026-09-13,T7.29 / P7-G4)
+
+    leader 本地的账在遗留模式下 commit_ts 存 0,MARKER 却填墙钟;回放原样写进副本的
+    分片 clog 与 gclog。TSO 整簇一致时不发作;**中途给读者配上 TSO**,可见性判据
+    `commit_ts < 读者 start_ts` 拿墙钟(~8.4e14)比 TSO 号恒假 ⇒ 已提交的行永久不可见。
+
+    修法:MARKER 带 `PARTWAL_MARKER_CTS_IS_TSO`;回放落分片 clog 不带位落 0;gclog 原值
+    照存、槽里记宇宙位,R3 比较时不带位按 0。验收 `tests/test_cts_universe_p7.sh`:
+    升主后给新主配上 TSO,修复前 40 行 → 0 行(21/1),修复后仍 40 行(22/0)。
 
 ---
 

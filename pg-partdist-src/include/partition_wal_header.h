@@ -248,9 +248,25 @@ PartWALRecordGxid(const PartWALRecord *rec)
  * TxnMarkerPayloadTailWords），所以这一位是纯增量的。
  */
 #define PARTWAL_MARKER_STS_IS_TSO       UINT32_C(0x0004)
+/*
+ * PARTWAL_MARKER_CTS_IS_TSO —— T7.29（P7-G4）：`commit_ts` 装的是 **TSO 的号**。
+ *
+ * 与 STS_IS_TSO 是同一件事的另一半。leader 本地的账在遗留模式下 commit_ts 一律
+ * 存 **0**（TsoStashedCommitTs / 0007 提交记录 / DTX 决议 ts），唯独 MARKER 这条路
+ * （TsoMarkerCommitTs）遗留模式填**墙钟** —— 同一笔提交，leader 记 0、副本记墙钟。
+ * TSO 整簇一致时两边恒同宇宙、不发作；**中途给读者配上 TSO**，§4.1 判据
+ * `commit_ts < 读者 start_ts` 拿墙钟（~8.4e14）比 TSO 号恒假 ⇒ 已提交的行永久不可见
+ * （test_cts_universe_p7.sh 实测：40 行 → 0 行）。
+ *
+ * 置位规则：值来自 TSO 才置。回放侧据此：分片 clog 不带位落 0（与 leader 同一本账）；
+ * gclog 原值照存供诊断，但槽里记下宇宙位，R3 比较时不带位按 0（见 enhanced_clog.h）。
+ * 不带位的**历史**标记按遗留语义处理 —— 方向是"对一切快照可见"，不会让行消失。
+ * 不影响载荷长度。
+ */
+#define PARTWAL_MARKER_CTS_IS_TSO       UINT32_C(0x0008)
 #define PARTWAL_MARKER_KNOWN_FLAGS \
     (PARTWAL_MARKER_HAS_SHARD_XID | PARTWAL_MARKER_HAS_ALLOC_WM | \
-     PARTWAL_MARKER_STS_IS_TSO)
+     PARTWAL_MARKER_STS_IS_TSO | PARTWAL_MARKER_CTS_IS_TSO)
 
 typedef struct TxnMarkerPayload
 {

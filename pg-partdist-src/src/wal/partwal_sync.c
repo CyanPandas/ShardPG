@@ -743,6 +743,8 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     bool            has_shard_xid;
     uint32          flags;
     int64           sts;
+    int64           cts = 0;
+    bool            cts_is_tso = false;
 
     /*
      * 已提交子事务清单。中止的子事务**不在**这个列表里 —— 于是它们的 gxid
@@ -780,6 +782,17 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     if (sts > 0)
         flags |= PARTWAL_MARKER_STS_IS_TSO;
 
+    /*
+     * ★ T7.29（P7-G4）：commit_ts 同样标出宇宙。值不改（遗留模式仍是墙钟，载荷
+     *   字节与从前相同），只在来自 TSO 时置 CTS_IS_TSO —— 见该宏的注释。
+     */
+    if (with_commit_ts)
+    {
+        cts = TsoMarkerCommitTsEx(&cts_is_tso);
+        if (cts_is_tso)
+            flags |= PARTWAL_MARKER_CTS_IS_TSO;
+    }
+
     *out_len = (uint32) TxnMarkerPayloadSizeEx(nchildren, flags);
     buf = palloc0(*out_len);        /* palloc0：flags 与尾部必须是确定字节 */
 
@@ -787,8 +800,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
     m->start_ts = (sts > 0)
         ? (uint64) sts
         : (uint64) GetCurrentTransactionStartTimestamp();
-    m->commit_ts = with_commit_ts ? (uint64) TsoMarkerCommitTs()
-                                  : UINT64CONST(0);
+    m->commit_ts = with_commit_ts ? (uint64) cts : UINT64CONST(0);
     m->nsubxacts = (uint32) nchildren;
     m->flags     = flags;
 
@@ -829,6 +841,8 @@ PartWALBuildVerdictMarker(int64 start_ts, int64 commit_ts, uint32 *out_len)
      * 要么是 0（遗留模式），不会是墙钟。>0 即置位。
      */
     uint32            flags = (start_ts > 0 ? PARTWAL_MARKER_STS_IS_TSO : 0) |
+                              /* T7.29：commit_ts 来自决议，TSO 号或遗留 0，同理 >0 即置位 */
+                              (commit_ts > 0 ? PARTWAL_MARKER_CTS_IS_TSO : 0) |
                               PARTWAL_MARKER_HAS_SHARD_XID |
                               PARTWAL_MARKER_HAS_ALLOC_WM;
 

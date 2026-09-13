@@ -521,7 +521,8 @@ TsoStashedCommitTs(void)
  *   碰不到这一支"的推断是错的。
  *
  *   教训：**看起来自洽的推理 + 同文件的"正确先例"，都不能替代实测**。
- *   commit_ts 是否该有类似 STS_IS_TSO 的标志位仍是个开放问题，但答案不是
+ *   commit_ts 是否该有类似 STS_IS_TSO 的标志位 —— 2026-09-13 T7.29 已答：要，
+ *   见下方 TsoMarkerCommitTsEx 与 PARTWAL_MARKER_CTS_IS_TSO；答案仍不是
  *   "把遗留分支改成 0"。
  * TSO 模式：返回本事务的 PRE_COMMIT 暂存值（懒取：首次调用即取号），保证
  * 同一事务的 MARKER、0007 尾块、DTX 记录用同一个 ts。COMMIT PREPARED 的
@@ -532,9 +533,30 @@ TsoStashedCommitTs(void)
 int64
 TsoMarkerCommitTs(void)
 {
+	return TsoMarkerCommitTsEx(NULL);
+}
+
+/*
+ * T7.29（P7-G4）：同 TsoMarkerCommitTs，并经 *is_tso 告知取到的是哪个宇宙的值。
+ *
+ * 上面留痕里那个"开放问题"的答案：**是，要有标志位，但值本身不改**。遗留分支照旧
+ * 返回墙钟（MARKER 载荷字节不变，gclog_status 与 tx2/r2 的"commit_ts 非 0"断言不受
+ * 影响），由组装方据 is_tso 给 MARKER 置 PARTWAL_MARKER_CTS_IS_TSO；消费侧不带位就
+ * 不拿它和 TSO 快照比。改"值"（返回 0）打破的是诊断面与既有断言，改"来源标记"
+ * 只改变判定，这是两件事。
+ */
+int64
+TsoMarkerCommitTsEx(bool *is_tso)
+{
 	if (!tso_configured())
+	{
+		if (is_tso != NULL)
+			*is_tso = false;
 		return (int64) GetCurrentTimestamp();
+	}
 	TsoStashCommitTs();
+	if (is_tso != NULL)
+		*is_tso = true;
 	return cur_commit_ts;
 }
 

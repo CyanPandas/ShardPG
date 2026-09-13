@@ -95,6 +95,14 @@ SUITES=(
   "replica_prune_guard_p7 1200  P7"   # T7.26（P7-P1）回放壳表不许被原生剪枝清掉
   "partwal_ring_p7         900  P7"   # T7.27（P7-W2）捕获环背压 + 溢出记账 + 分叉自愈
   "replay_spin_p7          900  P7"   # T7.28（P7-P2）回放 worker 等尾部不许空转
+  "cts_universe_p7        1200  P7"   # T7.29（P7-G4）commit_ts 宇宙位：中途配 TSO 已提交行不许消失
+  # ── P7 批次 1 验收：**2026-09-13 起并入门禁**。此前这四套只在各自任务里跑过，
+  #   从没进过 SUITES —— 而点名一个不在清单里的套件，门禁原先会**静默跳过**（见下方
+  #   WANT 校验），于是"批次 1 各有新套件"这句出口标准实际上没有任何东西在持续验证。
+  "dtx_verdict_marker_p7  1200  P7"   # T7.1/T7.11 判决标记带分片 xid 与宇宙位
+  "baseline_clog_p7        900  P7"   # T7.2/T7.8 基线搬分片 clog + DROP 通知
+  "promote_handover_p7    1500  P7"   # T7.3/T7.4 升主文件号交接 + 打标身份继承
+  "slot_reclaim_p7        1200  P7"   # T7.7 分片 xid 槽位回收（70 轮建删）
   # ── ops 时代那 8 套：**2026-09-11 起并入门禁**（T7.13 完成，口径 31 → 39）
   #   拓扑无关化后逐套跑绿：shard_auto_init 5/0、segment_boundary_lsn 6/0、
   #   crash_recovery 36/0、demux_backlog_recovery 29/0、corrupt_segment_recovery 44/0、
@@ -555,6 +563,19 @@ pre_suite() {
   esac
 }
 
+
+# ★ 2026-09-13：点名的套件必须在清单里（放在净场之前：点错名字不该先重启一遍集群）。原先只是按清单过滤 WANT，点名一个不在 SUITES 里的
+#   名字会被**静默跳过** —— 实测一次点名 13 套、真正只跑了 11 套，汇总照样打印，看不出少了什么。
+for _w in "$@"; do
+  [[ "$_w" == "--with-ops" ]] && continue
+  _hit=0
+  for _s in "${SUITES[@]}" "${OPS_SUITES[@]}"; do [[ "${_s%% *}" == "$_w" ]] && { _hit=1; break; }; done
+  if [[ "$_hit" == 0 ]]; then
+    echo "FATAL: 点名的套件 '$_w' 不在 SUITES 清单里（拼写错误，或尚未并入门禁）—— 不跑，免得静默少跑" >&2
+    exit 2
+  fi
+done
+unset _w _s _hit
 
 wait_idle
 rotate_logs

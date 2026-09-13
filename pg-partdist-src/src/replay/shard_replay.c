@@ -1426,7 +1426,14 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
         ShardXidRedoAdvance(ctx->shard_oid, sxid);
 
         if (op == XLOG_XACT_COMMIT)
-            ShardClogSetVerdict(ctx->shard_oid, sxid, true, (int64) m->commit_ts);
+            /*
+             * ★ T7.29（P7-G4）：commit_ts 同 start_ts —— 不是 TSO 号就落 0。leader
+             *   本地的账在遗留模式下存的就是 0（TsoStashedCommitTs），落 0 是与 leader
+             *   同一本账；落墙钟则中途配上 TSO 的读者拿它比快照，已提交的行永久不可见。
+             */
+            ShardClogSetVerdict(ctx->shard_oid, sxid, true,
+                                (m->flags & PARTWAL_MARKER_CTS_IS_TSO)
+                                    ? (int64) m->commit_ts : 0);
         else if (op == XLOG_XACT_ABORT)
             ShardClogSetVerdict(ctx->shard_oid, sxid, false, 0);
         else                    /* XLOG_XACT_PREPARE */
@@ -1452,10 +1459,15 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 
     if (op == XLOG_XACT_COMMIT)
     {
-        EnhancedClogWriteStatus(gxid, m->start_ts, m->commit_ts, TXN_COMMITTED);
+        /* T7.29：gclog 原值照存供诊断，宇宙位随槽走，R3 比较时据此决定比不比 */
+        bool    cts_is_tso = (m->flags & PARTWAL_MARKER_CTS_IS_TSO) != 0;
+
+        EnhancedClogWriteStatus(gxid, m->start_ts, m->commit_ts, TXN_COMMITTED,
+                                cts_is_tso);
         for (i = 0; i < m->nsubxacts; i++)
             EnhancedClogWriteStatus(MakeGlobalXid(origin, subxacts[i]),
-                                    m->start_ts, m->commit_ts, TXN_COMMITTED);
+                                    m->start_ts, m->commit_ts, TXN_COMMITTED,
+                                    cts_is_tso);
     }
     else if (op == XLOG_XACT_PREPARE)
     {
@@ -1469,14 +1481,15 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
          * 携带顶层 xid。读路径靠这条链把子事务解析到顶层的判决上
          * （见 enhanced_clog.h 里 parent_xid 的注释）。
          */
-        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_PREPARED);
+        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_PREPARED, false);
         for (i = 0; i < m->nsubxacts; i++)
             EnhancedClogWriteStatusWithParent(MakeGlobalXid(origin, subxacts[i]),
                                               m->start_ts, 0, TXN_PREPARED,
-                                              (TransactionId) GxidLocalXid(gxid));
+                                              (TransactionId) GxidLocalXid(gxid),
+                                              false);
     }
     else
-        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_ABORTED);
+        EnhancedClogWriteStatus(gxid, m->start_ts, 0, TXN_ABORTED, false);
 }
 
 /* ================================================================== */

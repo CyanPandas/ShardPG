@@ -364,7 +364,9 @@ if [[ -n "$cmk" ]]; then
   # ★ T7.11 起期望值从 3 变 7：多了 STS_IS_TSO(0x4)。
   #   判决标记的 start_ts 取自未决登记，与 leader 自己那条
   #   `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 同源，是 TSO 号，故置位。
-  check "★ 判决标记 flags = HAS_SHARD_XID(0x1)+HAS_ALLOC_WM(0x2)+STS_IS_TSO(0x4)" "$flg" "7"
+  # T7.29（P7-G4）起判决标记还要带 CTS_IS_TSO(0x8)：本套件配了 TSO，判决 commit_ts 是 TSO 号。
+  # 少这一位，副本会把它当遗留宇宙按 0 落分片 clog —— 与 leader 的账不再逐字节相同（见 [7]）。
+  check "★ 判决标记 flags = HAS_SHARD_XID(0x1)+HAS_ALLOC_WM(0x2)+STS_IS_TSO(0x4)+CTS_IS_TSO(0x8)" "$flg" "15"
   # ★★ T7.11（R-P6-18）的直接判据：标记里的 start_ts 必须**就是** TSO 发的那个号。
   #   修复前这里是 `GetCurrentTransactionStartTimestamp()` 的墙钟微秒（~8.4e14），
   #   与 TSO 不同宇宙 —— 回放侧原样写进副本的 PREPARED 槽，§4.2 三态第一支
