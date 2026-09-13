@@ -20,7 +20,9 @@
 #      （命令行里就写着套件路径），实测白等 30 分钟。模式锚成 `^bash \./test_`。
 #   ③ 日志轮转 —— health_check_no_crash 要 grep /work/pg-cluster-data/*/*.log，
 #      实测这些日志几小时内涨到 24 GB，单次健康检查耗时 7 分 40 秒并把套件撑爆
-#      900s 超时。跑前归档（改名保留，不删）。
+#      900s 超时。跑前归档（改名移出 glob），**只保留最近 KEEP_LOG_ARCHIVES 代**（默认 3，
+#      `all` = 全留）。原先"只改名不删"单调累积：tx2 容器曾因此攒到 55.7 GB（叠加回放
+#      空转刷日志，P7-P2），把宿主机磁盘写到 94%。
 #   ④ 陈旧 pg_shard_xid 槽位回收（R-P6-4）—— 分配器槽位只增不减且有 64 硬上限，
 #      跨过之后该节点所有打标验收在登记那步就死，报错与被测内容毫无关系。
 #   ⑤ 残表按前缀清 —— 夹具残表单调累积（P5 出口记的"跑前 9 张、跑完 10 张"）。
@@ -163,6 +165,31 @@ wait_idle() {
 }
 
 # ── ③ 日志轮转 ──────────────────────────────────────────────────
+# 归档按"代"（文件名里的 archive-<时间戳>）分组，只留最新的 $2 代。
+# 时间戳是 %Y%m%d-%H%M%S，字典序即时间序；早期的 archive-20260902 形态同样排得进去。
+# 一代是同一次净场改名出来的全部节点日志 —— 按代删而不是按文件龄删，保证留下的
+# 每一代都是完整的一轮现场（崩溃取证要对照多个节点同一时刻的日志）。
+prune_log_archives() {
+  local root=$1 keep=$2
+  [[ "$keep" == all ]] && { echo "  [净场] 日志归档全部保留（KEEP_LOG_ARCHIVES=all）"; return 0; }
+  [[ "$keep" =~ ^[0-9]+$ && "$keep" -ge 1 ]] || { echo "  [净场] KEEP_LOG_ARCHIVES=$keep 非法（要 >=1 的整数或 all），本轮不删"; return 0; }
+  docker exec -i -u postgres "$C" bash -c '
+    root=$1; keep=$2
+    gens=$(ls "$root"/*/*.archive-*.txt "$root"/*.archive-*.txt 2>/dev/null \
+           | sed -E "s/.*\.archive-(.*)\.txt\$/\1/" | LC_ALL=C sort -u)
+    total=$(printf "%s\n" "$gens" | grep -c .)
+    old=$(printf "%s\n" "$gens" | grep . | head -n -"$keep")
+    nf=0; nb=0
+    for g in $old; do
+      for f in "$root"/*/*.archive-"$g".txt "$root"/*.archive-"$g".txt; do
+        [ -f "$f" ] || continue
+        nb=$((nb + $(stat -c %s "$f"))); rm -f "$f" && nf=$((nf+1))
+      done
+    done
+    echo "  [净场] 日志归档共 $total 代，保留最近 $keep 代，删除 $(printf "%s\n" "$old" | grep -c .) 代 / $nf 个文件 / $((nb/1048576)) MB"
+  ' _ "$root" "$keep" </dev/null 2>/dev/null
+}
+
 rotate_logs() {
   local ts sz
   sz=$(docker exec -i "$C" bash -lc 'du -cb /work/pg-cluster-data/*/*.log 2>/dev/null | tail -1 | cut -f1' 2>/dev/null)
@@ -183,7 +210,8 @@ rotate_logs() {
       [ -f \"\$f\" ] || continue
       mv \"\$f\" \"\${f%.log}.archive-${ts}.txt\" && n=\$((n+1))
     done
-    echo \"  [净场] 归档 \$n 个日志（改名保留，不删除）\"" 2>/dev/null
+    echo \"  [净场] 归档 \$n 个日志（改名移出健康检查扫描面）\"" 2>/dev/null
+  prune_log_archives /work/pg-cluster-data "${KEEP_LOG_ARCHIVES:-3}"
   docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" bash -lc '
     for d in coordinator worker1 worker2 worker3 worker4 worker5 worker6 worker7 worker8; do
       /work/pg-install/bin/pg_ctl start -D /work/pg-cluster-data/$d \

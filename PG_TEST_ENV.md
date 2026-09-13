@@ -51,12 +51,19 @@ ENV_NAME=pg_test BRANCH=shardpg-test \
 docker exec -it -u postgres pg-test-container \
   /work/pg-install/bin/psql -p 5432 -U postgres -d postgres
 
-# 把工作区代码同步进容器后重编扩展
-docker cp ~/shardpg-test-work/pg-partdist-src pg-test-container:/work/
-docker exec -i -u postgres pg-test-container bash -c \
-  'cd /work/pg-partdist-src && make -s PG_CONFIG=/work/pg-install/bin/pg_config && \
-   make -s install PG_CONFIG=/work/pg-install/bin/pg_config'
+# 把工作区代码同步进容器、重编、安装扩展（两个扩展都做；可只给一个目标名）
+bash ~/shardpg-test-work/pg-partdist-src/scripts/sync_build.sh [pg-partdist-src|pg-raft-src]
+# 只核对"容器源码 == 工作区"与".so 导出符号齐全"，不构建：
+bash ~/shardpg-test-work/pg-partdist-src/scripts/sync_build.sh --check
 ```
+
+> **不要再用 `docker cp` + `make -s` 手工同步**（2026-09-13，P7-W5）。那条路在"看起来成功"
+> 的状态下装进去过旧 .so 两次：`docker cp` 漏带 `include/`；`grep error` 把编译错误滤掉后
+> `make install` 拿 stale `.o` 重链；`docker cp` 保留宿主机 mtime，源文件比容器 `.o` 旧时
+> make 直接判"已是最新"；PGXS 未开 autodepend，头文件变了不触发重编。`sync_build.sh`
+> 按内容同步并刷新 mtime、同步后逐文件核对、头文件变了自动 `make clean`、编译输出不过滤
+> （implicit declaration 也判失败）、核对已装 .so 与构建产物一致、逐个核对应导出符号。
+> 它报"头文件有变"时，节点必须**整簇重启**才算生效。
 
 清理（`verify_cleanup.sh` 不覆盖本环境）：
 
