@@ -1288,6 +1288,14 @@ CTRL 记录的 `orig_lsn` 取**当前 WAL 插入位置**(`GetXLogInsertRecPtr()`
 与其让一次 `VACUUM FULL` 把几十 GB 塞进 Raft 日志,不如显式退回基线拷贝。
 follower 见到该位一律停在栅栏上。
 
+**灌页分块排空(T7.21,2026-09-13)**:FPI 先经捕获环(全节点共享 8192 槽)再进分区流,
+`log_newpage_range` 每条 XLOG_FPI 带 32 块 ⇒ 1 GB 内联 = 4096 槽。环满时
+`PartWALInsert` 覆盖未消费条目只打 WARNING(登记为 P7-W2),所以内联灌页与全量基线
+都改为按 `pg_partdist.fileset_baseline_chunk_blocks`(默认 16384 块)攒够一块就
+`PartWALFlush` 一次,环里未排空的 FPI 恒小于一块。计数跨关系/fork 累计,小表的 DDL
+一次都不会额外排空(每次排空都是一次 XLogFlush)。全量基线(§13 约束 2)的 1 GB
+硬上限只在分块关闭(=0)时保留。
+
 ### 12.2 follower 侧:换表还是停下来
 
 判据是**结构有没有变**,即新 fileset 的 `(role, ord)` 集合是否与当前 loc_map
@@ -1297,7 +1305,7 @@ follower 见到该位一律停在栅栏上。
 | 情形 | DDL | 处置 |
 |---|---|---|
 | 集合不变,只换文件号 | `VACUUM FULL` / `REINDEX` / `TRUNCATE` / 重写类 `ALTER` | **全自动**:原地换 loc_map,把换了号的成员对应的本地文件**截成 0 块**,后续 FPI 填满 |
-| 集合变了(增或减) | `CREATE INDEX` / `DROP INDEX` | **停在结构栅栏** `REPLAY_NEEDS_STRUCT` |
+| 集合变了(增或减) | `CREATE INDEX` / `DROP INDEX` | **停在结构栅栏** `REPLAY_NEEDS_STRUCT`;2026-09-13 起由回放启动器**自动跟随**(§12.2.1),关掉开关则等人工 |
 
 **为什么集合变了不能自动配:`ord` 是位置,不是身份。** leader 删掉 `ord=0` 的
 索引之后,原来的 `ord=1` 会补位成 `ord=0`。照 `(role, ord)` 硬配,follower 会把
@@ -1309,10 +1317,14 @@ leader 新 0 号索引的内容灌进本地那个本该被删掉的 0 号索引�
 而两侧文件长度不同这件事本身就会让页面比对直接判负。截断幂等:崩溃后从游标重放
 会再截一次 0、再放同一批 FPI,结果相同。
 
-**栅栏的语义是「游标一个字节都没推进」**:全部校验通过之前不动任何字节,
+**栅栏的语义是「游标一个字节都没推进」**(T7.25 之后精确地说:除紧挨在前面的
+`DDL_HINT` 那一条之外一条都没推进 —— 那条只落旁路文件、不碰页面):全部校验通过之前不动任何字节,
 `ApplyCtrlRecord()` 返回 false 后应用循环直接跳出,`applied_part_lsn` 停在该
 CTRL 记录**之前**。所以它与 `REPLAY_FAILED` 是两回事,值得单列一个状态:
-前者补齐本地结构 + 重跑 `replay_set_locmap()` 就能原地继续,后者通常意味着这个
+前者补齐本地结构 + 重跑 `replay_set_locmap()`(**第 7 参必须传
+`partdist.replay_pending_base(oid)`**,2026-09-13 补 —— 缺省的 0 是"从流起点开始"的
+断言,本地非空即被拒;此前这句漏了第 7 参,D1 能绿只因为那一步紧跟在 TRUNCATE 之后)
+就能原地继续,后者通常意味着这个
 副本要重做。混成一个状态,运维分不清"补个索引就行"和"这副本废了"。
 
 栅栏的解除靠 `replay_set_locmap()`:它写完新 locmap 会把槽位的 `locmap_gen` 加一,
@@ -1322,12 +1334,45 @@ worker 抱着旧表还是撞同一道栅栏。
 `replay_catchup()` 遇到栅栏**立即报错返回**,不干等到超时:它要等的是人工动作,
 而超时报出来的会是"追平超时",把原因盖掉。
 
+#### 12.2.1 DDL 自动跟随(T7.25 / P7-R4,2026-09-13)
+
+上面"为什么集合变了不能自动配"的结论不变 —— **按 ord 硬配**仍然是错的。自动跟随
+做的是人工步骤本身:先把本地结构补得和 leader 一样,再配。
+
+1. **leader**:结构变化(`(role, ord)` 集合不同)时,在 `FILESET_UPDATE` **之前**
+   发一条 `DDL_HINT`(0x05),载荷是新 fileset 全部普通索引的
+   `pg_get_indexdef_string` 清单,按 ord 升序、`\n` 分隔。只换文件号的变更不发。
+2. **回放进程**(无 catalog,不做 DDL):消费 `DDL_HINT` 时把它落成
+   `pg_parwal/<oid>/ddl_hint`;撞结构栅栏时把 leader 的新 fileset 落成
+   `pg_parwal/<oid>/pending_fileset`,照旧停住。
+3. **回放启动器**:每轮扫 `NEEDS_STRUCT` 且有 `pending_fileset` 的槽位,自连
+   backend 调 `partdist.replay_auto_follow(oid)`:
+   - 对账:去掉索引名后按**多重集**匹配本地索引与清单,多的删(是约束的走
+     `DROP CONSTRAINT`)、缺的按清单顺序建;
+   - **核对顺序**:按本地 `indexrelid` 升序重取一遍,必须与清单逐条相等才往下走 ——
+     ord 是 `RelationGetIndexList` 的 OID 序,新建的 OID 一般比留下的大,但 OID
+     回卷或两侧历史不对称时这个前提会破,那时宁可整个回滚、留在栅栏;
+   - `replay_set_locmap()` 按 leader 新 fileset 重配,起效游标取栅栏处落下的
+     `pending_base` = max(配对起效游标, 已落 checkpoint 游标)(重新认领本来就按它起跑);
+   - 旁路待办由回放进程在 `FILESET_UPDATE` 真正应用时清掉(重配后会从 durable 游标
+     重跑、再消费一次 `DDL_HINT`,不能只靠 SQL 侧清)。
+   每槽 5 s 限速;没跟上(`no-hint` / 报错)退避 60 s。
+4. 两侧必须用**同一个**索引定义生成器:`partdist.indexdef_string()` 包的就是内核
+   `pg_get_indexdef_string`。SQL 的 `pg_get_indexdef()` 格式化参数不同,拿它对账
+   会把同一个索引判成不同。
+
+开关 `pg_partdist.replay_auto_follow_ddl`(默认 on,`PGC_SIGHUP`)。
+**不覆盖**:列变更(不改 fileset、不触发栅栏,副本壳表列定义是否跟随本节未验证);
+TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role, ord)` 会 ERROR、
+整个跟随回滚留在栅栏 —— 按代码推断,未实测);升级前的 leader 发的栅栏(无提示,返回 `no-hint`)。
+
 ### 12.3 opcode 清单
 
 | opcode | 载荷 | 用途 |
 |---|---|---|
 | `FILESET_UPDATE` (0x01) | `PartWALCtrlFilesetUpdate` + `ShardFileSetRel[]` | 物理文件集合变更(§12.1/§12.2) |
 | `FREEZE_UPDATE` (0x02) | `PartWALCtrlFreezeUpdate` + `PartWALFreezeEntry[]` | 冻结账目同步(§13 约束 5,D2) |
+| `DDL_HINT` (0x05) | 索引定义文本清单(按 ord 升序,换行分隔,可为空串) | 结构栅栏的自动跟随提示(§12.2.1,T7.25);发射失败随 `FILESET_UPDATE` 一起让 DDL 事务中止 |
 
 两者的**失败语义刻意不同**,别照抄:
 
@@ -1344,10 +1389,13 @@ worker 抱着旧表还是撞同一道栅栏。
 - **`ALTER TABLE ... SET TABLESPACE`** 改的是 `spcOid`,机制上与换 relfilenode
   同路(diff 按整个 `RelFileLocator` 比),但 follower 侧本地表空间未必存在,
   未验证。
-- follower 侧的结构补齐目前是**人工**的(或由上层协调通道驱动)。让 replay
-  worker 自己跑 SPI DDL 的路走不通:它得从本地堆读数据建索引,而回放元组在 R3
-  之前根本不可见,建出来是空的(虽然后续 FPI 会覆盖),且要把 DDL 与
-  `InRecovery = true` 混在一个进程里。
+- ~~follower 侧的结构补齐目前是**人工**的~~ **2026-09-13 起由回放启动器自动跟随**
+  (§12.2.1)。当初否掉的是"让 **replay worker** 自己跑 SPI DDL":要把 DDL 与
+  `InRecovery = true` 混在一个进程里。现在的做法绕开了这一点 —— DDL 由启动器
+  **自连的普通 backend** 执行,回放进程只落旁路文件。"从本地堆建出来的索引是空的"
+  这一条依然成立、也依然无害:配完 locmap 后回放从 `FILESET_UPDATE` 继续,换了号的
+  成员先截 0、再由 leader 的 FPI 整页灌满,本地建索引时读到了什么不影响最终字节
+  (`test_ddl_auto_follow_p7` 逐文件比对验证)。
 
 ---
 
@@ -1929,6 +1977,8 @@ GUC(前缀沿用 `pg_partdist.`):`replay_workers`(worker 池大小,默认 4,§7)
 `replay_naptime_ms`、`replay_checkpoint_interval_ms`、
 `replay_checkpoint_bytes`、`replay_trust_local_segments`(测试模式,§6)、
 `fileset_inline_max_blocks`(D1,§12,默认 131072)、
+`fileset_baseline_chunk_blocks`(T7.21,§12.1,默认 16384;0 = 关闭分块、恢复 1 GB 基线硬上限)、
+`replay_auto_follow_ddl`(T7.25,§12.2.1,默认 on)、
 `freeze_sync_interval_ms`(D2,§13 约束 5,默认 60000;0 = 每事务查,测试用)、
 `replay_dw_enabled`(sidecar,§8.5,**未实现**)、
 `debug_segv_backtrace`(诊断,`PGC_POSTMASTER`,默认 off)。

@@ -1484,6 +1484,88 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
 /* ================================================================== */
 
 /*
+ * T7.25（P7-R4）：DDL 自动跟随的两份待办文件。
+ *   ddl_hint         —— leader 发来的索引定义清单（DDL_HINT 载荷原样）
+ *   pending_fileset  —— 撞上结构栅栏的那条 FILESET_UPDATE 载荷原样
+ * 两份都在，回放启动器才会调起 partdist.replay_auto_follow()。
+ * 写法：tmp + fsync + rename，与 checkpoint 同一条纪律（半截文件比没有更坏）。
+ */
+#define REPLAY_DDL_HINT_FILENAME        "ddl_hint"
+#define REPLAY_PENDING_FILESET_FILENAME "pending_fileset"
+#define REPLAY_PENDING_BASE_FILENAME    "pending_base"
+
+static void
+ReplayWriteSideFile(Oid shard_oid, const char *name, const char *buf, uint32 len)
+{
+    char path[MAXPGPATH];
+    char tmp[MAXPGPATH];
+    int  fd;
+
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s", DataDir, PARTITION_WAL_DIR, shard_oid, name);
+    snprintf(tmp, MAXPGPATH, "%s.tmp", path);
+
+    fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("shard replay: 无法创建 \"%s\": %m", tmp)));
+    if (len > 0 && write(fd, buf, len) != (ssize_t) len)
+    {
+        CloseTransientFile(fd);
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("shard replay: 写 \"%s\" 失败: %m", tmp)));
+    }
+    if (pg_fsync(fd) != 0)
+    {
+        CloseTransientFile(fd);
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("shard replay: fsync \"%s\" 失败: %m", tmp)));
+    }
+    CloseTransientFile(fd);
+    durable_rename(tmp, path, ERROR);
+}
+
+/*
+ * T7.25：撞结构栅栏时留下两份待办 —— leader 的新 fileset，以及**重配时该用的起效游标**。
+ *
+ * ★ 为什么非要带游标（2026-09-13 实测踩出来）：重配走 replay_set_locmap()，它的
+ *   base_part_lsn 缺省是 0，而 0 是"从流起点开始"的**断言**（T6.2），本地关系
+ *   非空即拒。首版自动跟随就是这么调的，于是只要副本上有数据就永远跟不上 ——
+ *   D1 的人工恢复步骤恰好跟在 TRUNCATE 后面（主堆 0 块）才没暴露。
+ *
+ *   该传的值是 max(配对起效游标, 已落 checkpoint 的游标)：重配后 worker 丢弃
+ *   ctx 重新认领，起跑游标本来就按这个 max 算（见 replay_worker.c 认领处），
+ *   所以传它**不改变任何行为**，只是让 replay_set_locmap 不必把它当首次配对来核对。
+ *   不能传 applied：applied 与 durable 之间的页面修改未必落盘，崩溃后从 applied
+ *   起跑会跳过它们。
+ *
+ *   先写游标、后写 fileset：启动器以 pending_fileset 出现为触发条件。
+ */
+static void
+ReplayRemoveSideFile(Oid shard_oid, const char *name)
+{
+    char path[MAXPGPATH];
+
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s", DataDir, PARTITION_WAL_DIR, shard_oid, name);
+    if (unlink(path) != 0 && errno != ENOENT)
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("shard replay: 删除旁路文件 \"%s\" 失败: %m", path)));
+}
+
+static void
+ReplayWritePendingFollow(ShardReplayCtx *ctx, const char *body, uint32 len)
+{
+    uint64 base = Max(ctx->base_part_lsn, ctx->durable_part_lsn);
+
+    ReplayWriteSideFile(ctx->shard_oid, REPLAY_PENDING_BASE_FILENAME,
+                        (const char *) &base, sizeof(base));
+    ReplayWriteSideFile(ctx->shard_oid, REPLAY_PENDING_FILESET_FILENAME, body, len);
+}
+
+/*
  * 记下"停在结构栅栏上"。返回 false 让调用方跳出应用循环 **且不推进游标** ——
  * 这是 NEEDS_STRUCT 与 FAILED 的实质区别：栅栏是可原地恢复的，
  * 运维把本地结构补齐、重跑 replay_set_locmap() 之后，从同一个游标继续即可。
@@ -1754,6 +1836,23 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         return true;
     }
 
+    /*
+     * T7.25（P7-R4）：结构提示只落盘、不动结构 —— 回放 worker 没有 catalog，
+     * 也不该在回放线程里跑 DDL。真正动手的是回放启动器调起的
+     * partdist.replay_auto_follow()（普通 backend，有 SPI）。
+     * 覆盖写：只有"最近一次结构变化"的清单才有意义。幂等。
+     */
+    if (hdr->info == PARTWAL_CTRL_DDL_HINT)
+    {
+        ReplayWriteSideFile(ctx->shard_oid, REPLAY_DDL_HINT_FILENAME,
+                            body, hdr->data_len);
+        ereport(LOG,
+                (errmsg("pg_partdist replay: shard %u @plsn %llu 收到 DDL 结构提示（%u 字节）",
+                        ctx->shard_oid, (unsigned long long) hdr->partition_lsn,
+                        hdr->data_len)));
+        return true;
+    }
+
     if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu 未知 CTRL opcode "
@@ -1832,12 +1931,16 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      * 因为两侧 (role, ord) 各自唯一，这两条合起来即集合相等。
      */
     if (upd->nrels != (uint32) hash_get_num_entries(ctx->loc_map))
+    {
+        /* T7.25：留下待办，交给回放启动器自动跟随 */
+        ReplayWritePendingFollow(ctx, body, hdr->data_len);
         return ReplayFenceStruct(ctx,
                                  "leader fileset 成员数由 %ld 变为 %u"
                                  "（索引增删）—— 请在本地 shell 表上做等价"
                                  "结构变更后重跑 replay_set_locmap()",
                                  hash_get_num_entries(ctx->loc_map),
                                  upd->nrels);
+    }
 
     memset(&lm, 0, sizeof(lm));
     lm.magic     = REPLAY_LOCMAP_MAGIC;
@@ -1865,11 +1968,14 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         RelFileLocator local;
 
         if (!LocalLocForRoleOrd(ctx, rels[i].role, rels[i].ord, &local))
+        {
+            ReplayWritePendingFollow(ctx, body, hdr->data_len);
             return ReplayFenceStruct(ctx,
                                      "leader 的 (role=%u, ord=%u) 在本地"
                                      " shell 表上无对应关系 —— 请做等价结构"
                                      "变更后重跑 replay_set_locmap()",
                                      rels[i].role, rels[i].ord);
+        }
 
         lm.pairs[lm.npairs].leader_loc = rels[i].loc;
         lm.pairs[lm.npairs].local_loc  = local;
@@ -1964,6 +2070,16 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
     ShardReplayWriteLocMap(&lm);
     ctx->base_part_lsn = lm.base_part_lsn;      /* T6.2：与文件保持一致 */
     ReplaySlotRefreshLocs(ctx->shard_oid);
+
+    /*
+     * T7.25：FILESET_UPDATE 真正应用了 ⇒ 这一轮结构变化已跟上，旁路待办作废。
+     * 必须在这里清而不只靠 replay_auto_follow 清：重配后 worker 从 durable 游标
+     * 重新起跑，会**再消费一遍**栅栏前那条 DDL_HINT、把 ddl_hint 写回来。留着
+     * 它，下一次不带提示的栅栏（例如 TOAST 新增）就会拿到这份过期清单去对账。
+     */
+    ReplayRemoveSideFile(ctx->shard_oid, REPLAY_DDL_HINT_FILENAME);
+    ReplayRemoveSideFile(ctx->shard_oid, REPLAY_PENDING_FILESET_FILENAME);
+    ReplayRemoveSideFile(ctx->shard_oid, REPLAY_PENDING_BASE_FILENAME);
 
     ereport(LOG,
             (errmsg("shard replay: shard %u @plsn %llu 已应用 FILESET_UPDATE"

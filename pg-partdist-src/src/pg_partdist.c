@@ -643,6 +643,25 @@ _PG_init(void)
     );
 
     /*
+     * T7.21（P7-R3）：物理基线按块流式发射，每块之后排空共享捕获环再复制。
+     * 不分块时一次灌完的 FPI 描述符会占满 8192 槽的捕获环，环满只 WARNING
+     * 并覆盖未消费条目 = 静默丢页。
+     */
+    DefineCustomIntVariable(
+        "pg_partdist.fileset_baseline_chunk_blocks",
+        "物理基线流式发射的分块大小（块数）；0 = 不分块。",
+        "每灌完这么多块就排空一次捕获环并复制，环占用因此与基线总大小无关。"
+        "关掉分块时基线仍受 fileset_inline_max_blocks 硬上限约束。",
+        &fileset_baseline_chunk_blocks,
+        16384,              /* 128 MB = 512 个 FPI 描述符 ≈ 6% 捕获环 */
+        0,
+        INT_MAX,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL
+    );
+
+    /*
      * GUC: 两次冻结账目检查的最小间隔（§13 约束 5）。relfrozenxid 是以千万
      * xid 为尺度变化的慢变量，分钟级滞后毫无影响；设 0 表示每个事务都查，
      * 仅供验收用例使用。
@@ -674,6 +693,9 @@ _PG_init(void)
 
     prev_ExecutorStart_hook = ExecutorStart_hook;
     ExecutorStart_hook = partdist_executor_start;
+
+    /* T7.22（R-P6-14）：复制协议不走执行器，逻辑复制连接在认证处拦 */
+    ShardGuardInstallAuthHook();
 
     /* Chain object-access hook */
     prev_object_access_hook = object_access_hook;

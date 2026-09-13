@@ -113,6 +113,7 @@ extern void ShardFilesetEmitDropNotices(bool force);
 
 /* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流（超限只发通知） */
 extern int  fileset_inline_max_blocks;
+extern int  fileset_baseline_chunk_blocks;   /* T7.21（P7-R3）：流式基线分块 */
 
 /* ------------------------------------------------------------------ */
 /* T6.1（P6）：全量物理基线                                            */

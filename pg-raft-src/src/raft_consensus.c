@@ -121,7 +121,22 @@ static bool in_txn_replication = false;
 
 /* group 0 = 控制面；其余为数据面分区组 */
 #define RAFT_CONTROL_GROUP  INT64CONST(0)
-#define RAFT_MAX_GROUPS     32
+/*
+ * T7.23（P7-R2）：组数上限不再是编译期常量。
+ *
+ * 原来 `RAFT_MAX_GROUPS = 32` 写死在共享内存布局里，每节点至多 31 个数据组 ——
+ * 一张 32 分片的分布表就能把整个节点的组表吃满，再建组只剩一条 WARNING。
+ * 现在由 PGC_POSTMASTER GUC `pg_raft.max_groups` 决定组表大小；默认仍是 32，
+ * 与改动前逐字节同构，不调它就什么都不变。
+ *
+ * 为什么不顺手把上限调很高：每个组带一个 RAFT_LOG_CAPACITY 条、每条约 0.8 KB
+ * 的日志环，约 104 KB/组 —— 256 个组就是 26 MB 共享内存，9 节点 234 MB。
+ * 那是一个要按机器配置来定的数，不该由代码替运维决定。真正把单组成本降下来
+ * 需要日志外部化（E1–E4，曾整条回滚），那是另一件事。
+ */
+#define RAFT_MAX_GROUPS_DEFAULT 32
+int         pg_raft_max_groups = RAFT_MAX_GROUPS_DEFAULT;
+#define RAFT_MAX_GROUPS     (RaftGroups != NULL ? RaftGroups->max_groups : pg_raft_max_groups)
 
 typedef struct RaftConsensusShmem
 {
@@ -246,7 +261,8 @@ typedef struct RaftGroupTable
 {
     slock_t         mutex;              /* 仅保护注册表本身（in_use/group_id/members） */
     int             n_groups;
-    RaftGroupState  groups[RAFT_MAX_GROUPS];
+    int             max_groups;         /* T7.23：建表时的 pg_raft.max_groups，此后恒定 */
+    RaftGroupState  groups[FLEXIBLE_ARRAY_MEMBER];
 } RaftGroupTable;
 
 /* 组上下文：把"选中的那一组"显式传递，避免任何隐式当前组全局量 */
@@ -326,7 +342,7 @@ static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partitio
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
-                             const char *data_hex);
+                             const char *data_hex, bool fresh_append);
 static int64 group_local_partition(RaftGroupCtx *ctx);
 
 /*
@@ -374,7 +390,8 @@ static void control_maybe_compact(RaftGroupCtx *ctx);
 Size
 pg_raft_consensus_shmem_size(void)
 {
-    return MAXALIGN(sizeof(RaftGroupTable));
+    return MAXALIGN(offsetof(RaftGroupTable, groups) +
+                    mul_size((Size) pg_raft_max_groups, sizeof(RaftGroupState)));
 }
 
 static void
@@ -429,8 +446,9 @@ pg_raft_consensus_shmem_init(void)
 
     if (!found)
     {
-        memset(RaftGroups, 0, sizeof(RaftGroupTable));
+        memset(RaftGroups, 0, pg_raft_consensus_shmem_size());
         SpinLockInit(&RaftGroups->mutex);
+        RaftGroups->max_groups = pg_raft_max_groups;
         RaftGroups->n_groups = 0;
         /* 控制面组恒存在，且成员为全体 peers（members 留空表示全体） */
         raft_group_init_slot(&RaftGroups->groups[0], RAFT_CONTROL_GROUP, NULL, 0);
@@ -1064,7 +1082,8 @@ data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn)
  * 返回 false 表示未能落盘 —— 此时不得 ack。
  */
 static bool
-data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
+data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex,
+                 bool fresh_append)
 {
     StringInfoData sql;
     bool           spi_owned;
@@ -1123,10 +1142,18 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex)
      * 还有它作为 primary 的本地 demux 写入），applied_part_lsn 将指向本地
      * 不存在的记录。
      */
+    /*
+     * T7.24（R-P4-13 根因）：新追加走 _fresh 入口。编号被本地孤儿记录占住时，
+     * 只有新追加才许在 parwal 侧截断重写 —— 本节点 raft 日志里没有更靠后的
+     * 条目，流里更靠后的记录必然是孤儿；重传则只标分叉、不截断
+     * （截了 raft 日志却没截，leader 不会重发，那段字节就丢了）。
+     */
     appendStringInfo(&sql,
-                     "SELECT partdist.partwal_follower_append("
+                     "SELECT partdist.%s("
                      "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %d, %lld::bigint, "
                      "decode(%s, 'hex'))",
+                     fresh_append ? "partwal_follower_append_fresh"
+                                  : "partwal_follower_append",
                      (unsigned) local_oid,
                      (long long) entry_partition_lsn(payload),
                      quote_literal_cstr(orig_lsn),
@@ -1194,6 +1221,48 @@ data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid, int64 plsn, int info)
             elog(WARNING,
                  "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
                  (long long) ctx->group_id, (long long) plsn);
+        else if (SPI_processed == 0)
+        {
+            /*
+             * ★ R-P4-13 诊断：插入 0 行此前**一声不响** —— SPI_OK_INSERT 照样
+             *   返回，于是"apply 游标推进了、决议行却没有"这件事从日志上完全
+             *   看不出来（原登记里"日志里没有任何 DECISION 登记痕迹，既无成功
+             *   记录也无失败告警"说的正是这一格）。
+             *   0 行有两种可能，处置完全相反：① 行已经在（ON CONFLICT 生效，
+             *   正常）；② 本节点字节里**读不出**这条 DTX 记录（WHERE d.dtxid IS
+             *   NOT NULL 把它滤掉）—— 那才是缺陷。分开报。
+             */
+            bool readable = false;
+            bool exists = false;
+
+            pfree(sql.data);
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT (d.dtxid IS NOT NULL), "
+                             "       EXISTS (SELECT 1 FROM partdist.dtx_decision dd "
+                             "               WHERE dd.dtxid = d.dtxid) "
+                             "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d",
+                             (unsigned) local_oid, (long long) plsn);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                bool isnull;
+
+                readable = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                      SPI_tuptable->tupdesc, 1, &isnull)) && !isnull;
+                exists = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                    SPI_tuptable->tupdesc, 2, &isnull)) && !isnull;
+            }
+            if (!readable)
+                elog(WARNING,
+                     "pg_raft: R-P4-13 组 %lld 的 DECISION 条目(plsn=%lld)在本节点字节里读不出"
+                     "（local_oid=%u）—— 决议行未登记",
+                     (long long) ctx->group_id, (long long) plsn, (unsigned) local_oid);
+            else if (!exists)
+                elog(WARNING,
+                     "pg_raft: R-P4-13 组 %lld 的 DECISION 条目(plsn=%lld)读得出却插不进"
+                     "（local_oid=%u）",
+                     (long long) ctx->group_id, (long long) plsn, (unsigned) local_oid);
+        }
         pfree(sql.data);
     }
 }
@@ -3547,10 +3616,15 @@ send_heartbeats(RaftGroupCtx *ctx)
 static bool
 data_group_promote_prepare(int64 group_id)
 {
-    static struct {
+    typedef struct {
         int64       group_id;
         TimestampTz first_try;
-    } deadline_state[RAFT_MAX_GROUPS];
+    } DeadlineSlot;
+    /*
+     * T7.23：组数上限运行期才知道，本地表改成首次使用时按 max_groups 分配
+     * （TopMemoryContext，进程内常驻，与原 static 数组生命周期相同）。
+     */
+    static DeadlineSlot *deadline_state = NULL;
     static bool  deadline_init = false;
 
     PGconn      *conn;
@@ -3566,7 +3640,9 @@ data_group_promote_prepare(int64 group_id)
 
     if (!deadline_init)
     {
-        memset(deadline_state, 0, sizeof(deadline_state));
+        deadline_state = (DeadlineSlot *)
+            MemoryContextAllocZero(TopMemoryContext,
+                                   sizeof(DeadlineSlot) * (Size) RAFT_MAX_GROUPS);
         deadline_init = true;
     }
 
@@ -4402,6 +4478,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     bool         has_entry = (entry_idx > 0 && entry_op != NULL && entry_payload != NULL);
     int64        commit_to_mark;
     int64        cfg_commit = 0;         /* T7.20：提交点快照，用于成员变更定案 */
+    bool         fresh_append = false;   /* T7.24：本条是否落在本地日志末尾之后 */
     int64        conflict_plsn = -1;
 
     *success = 0;
@@ -4519,6 +4596,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
 
         if (entry_idx == ctx->log->last_log_index + 1)
         {
+            fresh_append = true;
             /*
              * 环满时 append 会失败；此时绝不能 ack（success 保持 0），否则
              * leader 会把一条本节点根本没有的条目计入多数派——提交点可能
@@ -4577,7 +4655,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      */
     if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0)
     {
-        if (!data_entry_store(ctx, entry_payload, entry_data_hex))
+        if (!data_entry_store(ctx, entry_payload, entry_data_hex, fresh_append))
             return true;
     }
 

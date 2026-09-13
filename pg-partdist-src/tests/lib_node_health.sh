@@ -72,12 +72,17 @@ health_live_logs() {
 
 health_crash_lines() {
   [[ -z "$_HEALTH_START_TS" ]] && return 0
+  # ★ 2026-09-13：PANIC 必须按**日志级别**匹配（`UTC [pid] PANIC:`），不能在全文里
+  #   找 "PANIC:" 这个词。实测误报：回放侧 R-P4-20 守卫**拦下** PANIC 时打的
+  #   DETAIL 里写着「继续 redo 会触发不可捕获的PANIC: invalid max offset number」，
+  #   于是一个**成功防住崩溃**的守卫被数成了 4 次崩溃，整轮被判"节点崩了、
+  #   diff 不可信"。守卫越尽职、越会被这条检查冤枉。
   # 扫描集合 = 各节点**当前真正**的日志 ∪ 历史约定路径（时间窗内的旧世代日志
   # 仍然算数）。两者可能指向同一文件，故最后 sort -u 去重，避免一次崩溃被数两遍。
   local live
   live=$(health_live_logs | tr '\n' ' ')
   docker exec -u postgres "$CONTAINER" bash -c \
-    "grep -HE \"terminated by signal (11|6|4|7)|PANIC:\" $live /work/pg-cluster-data/*/restart.log /work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log 2>/dev/null" \
+    "grep -HE \"terminated by signal (11|6|4|7)|UTC \\[[0-9]+\\] PANIC:\" $live /work/pg-cluster-data/*/restart.log /work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log 2>/dev/null" \
   2>/dev/null | sort -u \
   | awk -v ts="$_HEALTH_START_TS" '
       {

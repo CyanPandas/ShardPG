@@ -2020,3 +2020,81 @@ leader 在这两句之间真的换了人。
 
 改前 25/8、改后 29/4 —— **不是本次改动引入的**，与 P7-D3（半删分片把分布表
 锁死在协调者上）的已知形态一致，该套件的注释里也记着同一个坑。单列不混算。
+
+## T7.24（R-P4-13 根因）副本追加区分"新追加 / 重传" —— 2026-09-13，在库
+
+**状态：在库**。raft 侧改动在 `src/raft_consensus.c`（`data_entry_store` 多一个参数、
+`pg_raft_append_entries` 判定、apply 诊断），配套的 C 入口在
+`pg-partdist-src/src/raft_boundary.c`（`partwal_follower_append_fresh`）。
+
+### 定因
+
+R-P4-13 挂了很久的描述是"apply 侧决议登记缺失"。**apply 没有错**，错在更早一步：
+副本追加的去重 `AppendPartWALRecordAt` 对 `plsn <= 本地已有最大编号` 一律当"重传"
+丢弃，**只看编号不看内容**。
+
+链条：某节点当 leader 时先落本地 DATA、提案没提交（失多数派 / 丢领导权）
+→ `discard_uncommitted_entry` 按设计**不截 parwal 字节**
+→ 新 leader（日志完整）把同一个 plsn 分给另一条已提交记录（实测是 DTX 判决）
+→ 复制回旧 leader，编号不大于本地最大 ⇒ 被当重传吞掉
+→ apply 按 plsn 读判决，读到的是那条孤儿 DATA ⇒ 决议行登记不上，**无任何告警**。
+
+实测现场：`:5433` 的 plsn=15 本地字节是 `flags=1 info=0`，raft 日志说它是
+`flags=8 info=2`。同一机制下被顶替的若是 DATA，**副本会回放一条从未提交的物理变更**
+—— 决议行缺失只是恰好露出来的那个症状。
+
+### 为什么必须区分"新追加"与"重传"（第一版就栽在这）
+
+第一版：编号已存在且内容不一致 ⇒ 一律截到 plsn-1 重写。它**只截了分区流、没截
+raft 日志**。若这条是 leader 的重传（条目本来就在本节点 raft 日志里），分区流里
+更靠后的记录可能是已提交、已 ack 的；截掉后 leader 按 `match_index` 不会重发，
+那段字节永久丢失。实测一次重传 plsn=2 触发替换，3..51 全被截掉，
+`dtx_replay_tx1` **83/0 → 76/7**。
+
+现行规则，判据是**本条落不落在本节点 raft 日志末尾之后**
+（`entry_idx == log->last_log_index + 1`）：
+
+| 情形 | 本地字节与本条一致 | 不一致 |
+|---|---|---|
+| 新追加（`_fresh` 入口） | 真重复，去重 | 本地必是孤儿（对应日志条目早被 discard）⇒ **截到 plsn-1 重写**，WARNING 留痕 |
+| 重传（原入口） | 真重传，去重 | **不截**；`ShardMarkDiverged` 交给重做基线，照常 ack（不 ack 只会让 leader 无限重试） |
+
+另起 `_fresh` 入口而不是给原函数加第 9 个参数：加参数要先 DROP 旧签名，9 节点滚动
+升级期间会有"新 pg_raft 调旧签名"的重载歧义窗口。
+
+### apply 侧补的诊断
+
+`data_apply_dtx_one` 插入决议行 0 行时此前**一声不响**（`SPI_OK_INSERT` 照样返回）。
+现在再查一次：本节点字节里读不读得出这条判决，分别打
+「在本节点字节里读不出」/「读得出却插不进」两种 WARNING —— 前者指向流内容，
+后者指向决议表本身，方向完全相反。
+
+### 验收
+
+批次复核（`shard_baseline_p6` / `replica_gate_p6` / `promote_p6` / `dtx_convergence_p4` /
+`dtx_tso_p4` / `dtx_replay_tx1` / `raft_membership_r1` / `logical_repl_guard_p7`）
+**全部零 FAIL**（45/33/39/45/49/83/18/14）。同一轮节点日志：孤儿替换 **7** 次、
+重传不一致 **0** 次、R-P4-13 诊断 WARNING **0** 条（修前同类批次 2 条）。
+
+## T7.23（P7-R2）组数上限可配 —— 2026-09-13，在库
+
+**状态：在库**。`src/pg_raft.c`（GUC）、`include/pg_raft.h`、`src/raft_consensus.c`。
+
+- `RAFT_MAX_GROUPS` 由编译期常量 32 改为 GUC **`pg_raft.max_groups`**
+  （默认 32，2–4096，`PGC_POSTMASTER`）。宏保留名字，展开为
+  `RaftGroups->max_groups`（shmem 已建）或 GUC 值（建 shmem 之前）——
+  所有 `for (i = 0; i < RAFT_MAX_GROUPS; i++)` 调用点一行不改。
+- `RaftGroupTable` 的 `groups[]` 改柔性数组，shmem 尺寸
+  `offsetof(groups) + max_groups × sizeof(RaftGroupState)`；初始化时把上限写进表头，
+  **运行期一律读表头**，不读 GUC —— 两者只在 postmaster 启动那一刻相等，
+  以后谁改了 `postgresql.auto.conf` 都不能让读者越界。
+- `data_group_promote_prepare` 的截止期表原是 `static DeadlineSlot[RAFT_MAX_GROUPS]`，
+  改为进程内首次使用时按上限从 `TopMemoryContext` 分配。
+- **没有顺手调高默认值**：每组带一个 `RAFT_LOG_CAPACITY` 条的日志环，默认值翻倍
+  就是每节点常驻内存翻倍，而本机 3.9 GB 跑 9 节点已在饿死心跳（P7-E7）。
+- 计划里写的前置"日志外部化"没有做：上限问题的本体是"编译期常量"，与"日志在不在
+  shmem"正交；后者只决定每组内存代价。
+
+"给一张表全部分片建组 + 供副本"的编排是 plpgsql（`partdist.raft_replicate_table_shards`，
+在 pg_partdist 的 SQL 里），不在本模块。验收 `test_raft_groups_p7.sh`，结果见
+`P7_REMEDIATION_PLAN.md` §1.6 P7-R2。

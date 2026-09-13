@@ -64,8 +64,8 @@ DESIGN §10 或运维规程）/ **裁掉**（从方案中移除）。
 | # | 事项 | 建议 |
 |---|---|---|
 | 1 | leader `DROP TABLE` ⇒ 副本侧静默，壳表/槽位/目录永不回收 | 做（新 opcode） |
-| 2 | leader 任何 DDL ⇒ follower 停栅栏，人工等价 DDL | 推后（专项），先写运维规程 |
-| 3 | 物理基线 1 GB 上限（`fileset_inline_max_blocks`） | 推后（流式基线专项）；先写进 §10 |
+| 2 | leader 任何 DDL ⇒ follower 停栅栏，人工等价 DDL | 推后（专项），先写运维规程 → **2026-09-13 已做**（T7.25 DDL 自动跟随，见 P7_REMEDIATION_PLAN P7-R4） |
+| 3 | 物理基线 1 GB 上限（`fileset_inline_max_blocks`） | 推后（流式基线专项）；先写进 §10 → **2026-09-13 已做**（T7.21 流式基线，见 P7-R3） |
 | 4 | 分配器 shmem 槽位 64/节点、无产品侧回收 | 做（同判据回收器） |
 | 5 | 禁用清单漏 8 个 Citus UDF（split / isolate_tenant / drain_node / master_* / replicate_table_shards / schema_move / set_access_method） | 做（加名字） |
 | 6 | 引用表运行期写无守卫 | 见 §一-4 |
@@ -73,7 +73,7 @@ DESIGN §10 或运维规程）/ **裁掉**（从方案中移除）。
 | 8 | `RAFT_MAX_GROUPS=32`；每分片建组/供副本全手工 | 推后；先做"给一张表全部分片建组+供副本"的脚本 |
 | 9 | 升主 deadline 60s 兜底放行 | 接受，写运维规程 |
 | 10 | 子事务禁写分片表（设计 §5.4 未实现） | 接受，写进 §10 |
-| 11 | R-P6-14 逻辑解码禁令绕过（walsender） | 推后（内核补丁面） |
+| 11 | R-P6-14 逻辑解码禁令绕过（walsender） | 推后（内核补丁面） → **2026-09-13 已堵，未动内核**（T7.22 认证钩子 + 登记时终止，见 R-P6-14） |
 
 ## 五、环境与流程
 

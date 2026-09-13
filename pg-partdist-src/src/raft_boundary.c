@@ -257,6 +257,7 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
  */
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_read_record);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_follower_append);
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_follower_append_fresh);
 PG_FUNCTION_INFO_V1(pg_partdist_follower_set_applied_part_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_truncate_to);
 
@@ -409,8 +410,27 @@ pg_partdist_partwal_read_record(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
+static Datum follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append);
+
 Datum
 pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
+{
+	return follower_append_impl(fcinfo, false);
+}
+
+/*
+ * T7.24：与上面同参数，但声明"这条是新追加"（落在本节点 raft 日志末尾之后）。
+ * 另起入口而不是给原函数加第 9 个参数 —— 加参数要先 DROP 旧签名，9 个节点
+ * 滚动升级期间会出现"新 pg_raft 调旧签名"的重载歧义窗口。
+ */
+Datum
+pg_partdist_partwal_follower_append_fresh(PG_FUNCTION_ARGS)
+{
+	return follower_append_impl(fcinfo, true);
+}
+
+static Datum
+follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 {
 	Oid					partition_id = PG_GETARG_OID(0);
 	int64				partition_lsn = PG_GETARG_INT64(1);
@@ -443,6 +463,115 @@ pg_partdist_partwal_follower_append(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
 							partition_id)));
+
+		/*
+		 * ★★ R-P4-13 的真根因（2026-09-13 定因）：**去重只按编号、不看内容**。
+		 *
+		 * AppendPartWALRecordAt 对 `plsn <= 本地已有最大编号` 一律当"重传"丢弃。
+		 * 可本地那一条未必是这一条：
+		 *   · 某节点当 leader 时写了本地 DATA（[A] 先落盘），提案却没提交
+		 *     （失多数派 / 丢了领导权）—— discard_uncommitted_entry 按设计
+		 *     **不截 parwal 字节**（"留作孤儿等重推"，防误截并发事务的记录）；
+		 *   · 新 leader 的日志是完整的（Leader Completeness），它把同一个
+		 *     plsn 分给了**另一条**已提交的记录（实测是 DTX 判决）；
+		 *   · 复制到旧 leader 这里：编号 <= 本地最大 ⇒ 判"重传" ⇒ 丢弃。
+		 *   于是**副本流里躺着一条从未提交的 DATA，冒充那条已提交的判决**。
+		 *   apply 照推游标，按 plsn 去读判决却读到 DATA，决议行从此登记不上 ——
+		 *   这就是 R-P4-13 "日志游标齐平、本地却无决议行、且无任何告警"。
+		 *   实测现场：:5433（分片本体）的 plsn=15 是 flags=1 info=0，而 raft
+		 *   日志说 plsn=15 是 flags=8 info=2。
+		 *
+		 *   决议行缺失只是露出来的症状；同一机制下，被顶替的若是 DATA，
+		 *   回放就会在副本上重放一条从未提交的物理变更。
+		 *
+		 * 修法：编号已存在时**逐字段核对**。一致 ⇒ 真重传，照旧去重；不一致 ⇒
+		 * 本地那条是孤儿，按已提交的这条为准：截到 plsn-1 再写。
+		 *
+		 * 为什么"以传进来的为准"一定对：新 leader 日志完整，它能把这个编号分给
+		 * 别的记录，说明**没有任何已提交记录用过这个编号** —— 本地那条必然未提交。
+		 * （这与 raft 日志冲突截断时同步截 parwal 是同一条规则，只是那条路径只在
+		 * 日志里真的有冲突条目时才会触发，而孤儿字节对应的日志条目早已被 discard。）
+		 */
+		if ((uint64) partition_lsn <= writer->last_partition_lsn)
+		{
+			PartWALRecord	old;
+			char		   *old_data = NULL;
+			bool			same = false;
+
+			if (partwal_find_record(partition_id, (uint64) partition_lsn,
+									&old, &old_data))
+			{
+				same = (old.flags == (uint8) flags &&
+						old.info == (uint8) info &&
+						old.rmid == (uint8) rmid &&
+						old.orig_lsn == orig_lsn &&
+						old.data_len == (uint32) VARSIZE_ANY_EXHDR(data) &&
+						(old.data_len == 0 ||
+						 memcmp(old_data, VARDATA_ANY(data), old.data_len) == 0));
+				if (old_data != NULL)
+					pfree(old_data);
+			}
+
+			/*
+			 * ★★ 只有**新追加**时才许截（2026-09-13 实测纠正第一版）。
+			 *
+			 * 第一版不分情形一律"截到 plsn-1 再写"。那**只截了分区流、没截
+			 * raft 日志**：若这条是 leader 的**重传**（条目本来就在本节点
+			 * raft 日志里），流里更靠后的记录可能是已提交、已 ack 的 ——
+			 * 截掉之后 leader 按 match_index 不会重发，那段字节就永久丢了。
+			 * 实测：一次重传 plsn=2 触发替换，把 3..51 一并截掉，
+			 * dtx_replay_tx1 由 83/0 掉到 76/7。
+			 *
+			 * 两种情形分开处置：
+			 *   · 新追加：本节点 raft 日志里没有比它更靠后的条目，分区流里
+			 *     更靠后的记录**必然**是孤儿（它们对应的日志条目早被 discard）
+			 *     ⇒ 截掉是安全的。R-P4-13 正是这一种。
+			 *   · 重传：不截。本地字节与已提交记录不一致是**已经发生**的分叉
+			 *     （改动前它会被静默去重吞掉），标记分叉交给既有修复路径
+			 *     （重做物理基线会清标），并照常 ack —— 不 ack 只会让 leader
+			 *     无限重试同一条，复制卡死。
+			 */
+			if (!same && !fresh_append)
+			{
+				char reason[256];
+
+				snprintf(reason, sizeof(reason),
+						 "follower_append: plsn=%lld 本地字节（flags=%u info=%u）与重传的已提交记录"
+						 "（flags=%d info=%d）不一致",
+						 (long long) partition_lsn, (unsigned) old.flags,
+						 (unsigned) old.info, flags, info);
+				ShardMarkDiverged(partition_id, reason);
+				ereport(WARNING,
+						(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 与重传的已提交记录不一致，"
+								"已标记分叉（不截断）", partition_id, (long long) partition_lsn),
+						 errdetail("%s", reason),
+						 errhint("该副本需重做物理基线（partdist.repair_diverged_shards()）。")));
+			}
+			else if (!same)
+			{
+				ereport(WARNING,
+						(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 本地是孤儿记录"
+								"（flags=%u info=%u），被已提交的记录（flags=%d info=%d）取代",
+								partition_id, (long long) partition_lsn,
+								(unsigned) old.flags, (unsigned) old.info,
+								flags, info),
+						 errdetail("新追加：本节点 raft 日志里没有更靠后的条目，分区流里 %lld 之后"
+								   "的记录必然是未提交提案留下的孤儿；按已提交记录为准截断重写。",
+								   (long long) partition_lsn - 1)));
+				DestroyPartitionWALWriter(writer);
+				if (!TruncatePartWALTo(partition_id, (RelFileNumber) partition_id,
+									   (uint64) partition_lsn - 1))
+					ereport(ERROR,
+							(errmsg("partwal_follower_append: 分区 %u 截到 %lld 失败，拒绝 ack",
+									partition_id, (long long) partition_lsn - 1)));
+				writer = CreatePartitionWALWriter(partition_id,
+												  (RelFileNumber) partition_id);
+				if (writer == NULL)
+					ereport(ERROR,
+							(errmsg("partwal_follower_append: 截断后无法为分区 %u 重建写入器",
+									partition_id)));
+			}
+		}
 
 		/*
 		 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。

@@ -3,6 +3,7 @@
 
 #include "pg_partdist.h"
 #include "nodes/nodes.h"
+#include "access/xlogdefs.h"
 #include "utils/rel.h"
 
 /*
@@ -72,6 +73,10 @@ extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);
 extern void ShardMvccSetAdd(Oid relid);
 /* R-P6-9：DROP 提交时把 OID 摘掉，否则 OID 复用会误伤无关表 */
 extern void ShardMvccSetRemove(Oid relid);
+
+/* T7.22（R-P6-14 补）：最后一张打标表 DROP 时的 WAL 位点；数据目录下持久化 */
+#define SHARD_LOGICAL_FENCE_FILE	"pg_partdist_logical_fence"
+extern XLogRecPtr ShardLogicalFenceLsn(void);
 
 /* T7.7（R-P6-4）：DROP 提交时归还分配器槽位与影子。与 ShardMvccSetRemove 同源。 */
 extern void ShardXidSlotRelease(Oid relid);

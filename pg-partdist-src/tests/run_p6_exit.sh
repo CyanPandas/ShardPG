@@ -87,6 +87,9 @@ SUITES=(
   "promote_catchup_tx3   1200  TX3"
   "fastpath_divergence_tx4 1200 TX4"
   "raft_membership_r1     1200  R1"   # T7.20（P7-R1）Raft 成员变更安全路径
+  "logical_repl_guard_p7   900  P7"   # T7.22（R-P6-14）逻辑复制协议入口禁令
+  "ddl_auto_follow_p7     1500  D1"   # T7.25（P7-R4）DDL 自动跟随
+  "raft_groups_p7         1500  R2"   # T7.23（P7-R2）组数上限可配 + 整表供副本
   # ── ops 时代那 8 套：**2026-09-11 起并入门禁**（T7.13 完成，口径 31 → 39）
   #   拓扑无关化后逐套跑绿：shard_auto_init 5/0、segment_boundary_lsn 6/0、
   #   crash_recovery 36/0、demux_backlog_recovery 29/0、corrupt_segment_recovery 44/0、

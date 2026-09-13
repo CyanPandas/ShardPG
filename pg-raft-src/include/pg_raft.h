@@ -46,6 +46,7 @@ typedef struct RaftLeaderShmem
 } RaftLeaderShmem;
 
 extern int  pg_raft_node_id;
+extern int  pg_raft_max_groups;          /* T7.23（P7-R2）：组表大小 */
 extern int  pg_raft_probe_interval_ms;
 extern int  pg_raft_probe_fail_threshold;
 extern int  pg_raft_leader_lease_ms;

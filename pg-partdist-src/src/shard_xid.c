@@ -12,6 +12,7 @@
 #include "shard_replay.h"	/* T6.3c：副本壳表闸门 */
 #include "shard_clog.h"
 #include "shard_vacuum.h"
+#include "shard_guard.h"
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
@@ -31,6 +32,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "storage/fd.h"
+#include "access/xlog.h"			/* T7.22：GetXLogInsertRecPtr */
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -155,9 +157,22 @@ typedef struct ShardXidState
 	 */
 	int			mvcc_n;
 	Oid			mvcc_set[SHARD_XID_MAX_SLOTS];
+
+	/*
+	 * T7.22（R-P6-14 补）：逻辑解码围栏。本节点**最近一次**打标集合变空（最后
+	 * 一张打标表被 DROP）时的 WAL 插入位点 —— 在它之前的 WAL 里可能有打标记录。
+	 * 打标集合非空时 ShardGatingActive() 已经把逻辑解码整个禁掉；集合变空之后
+	 * 禁令随之解除，但一个**跨越打标期存活下来的旧逻辑槽**重连时，解码的正是
+	 * 那段 WAL。所以集合空了之后还要看：有没有逻辑槽的确认位点早于这道围栏。
+	 * 持久化在数据目录下 SHARD_LOGICAL_FENCE_FILE，启动时装回；只增不减。
+	 */
+	XLogRecPtr	logical_fence_lsn;
 } ShardXidState;
 
 static ShardXidState *ShardXidCtl = NULL;
+
+static void ShardLogicalFencePersist(XLogRecPtr fence);
+static XLogRecPtr ShardLogicalFenceLoad(void);
 
 /* ---- T1.3：后端本地 事务↔分片 xid 映射 ---- */
 
@@ -1596,6 +1611,7 @@ ShardXidShmemInit(void)
 		memset(ShardXidCtl->shadow, 0, sizeof(ShardXidCtl->shadow));
 		memset(ShardXidCtl->mvcc_set, 0, sizeof(ShardXidCtl->mvcc_set));
 		ShardXidCtl->mvcc_n = 0;
+		ShardXidCtl->logical_fence_lsn = ShardLogicalFenceLoad();
 		ShardXidCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_shard_xid")[0].lock;
 
@@ -1663,6 +1679,13 @@ ShardMvccSetAdd(Oid relid)
 	ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n] = relid;
 	ShardXidCtl->mvcc_n++;
 	LWLockRelease(ShardXidCtl->lock);
+
+	/*
+	 * T7.22（R-P6-14）：登记打标就是"逻辑解码开始危险"的那一刻 —— 断开此前
+	 * 已经连着的逻辑 walsender，否则它会在第一条打标记录到来时让整节点重置。
+	 * 新连接由认证钩子拦（shard_guard.c）。
+	 */
+	(void) ShardGuardTerminateLogicalWalsenders();
 }
 
 /*
@@ -1723,6 +1746,7 @@ void
 ShardMvccSetRemove(Oid relid)
 {
 	int			i;
+	XLogRecPtr	fence = InvalidXLogRecPtr;
 
 	if (ShardXidCtl == NULL)
 		return;					/* shmem 未起：没什么可摘 */
@@ -1735,9 +1759,90 @@ ShardMvccSetRemove(Oid relid)
 			ShardXidCtl->mvcc_set[i] =
 				ShardXidCtl->mvcc_set[ShardXidCtl->mvcc_n - 1];
 			ShardXidCtl->mvcc_n--;
+
+			/*
+			 * T7.22：最后一张打标表没了 ⇒ 立逻辑解码围栏。取当前插入位点：
+			 * DROP 持 AccessExclusiveLock，写这张表的事务都已结束，打标记录
+			 * 必然全在它之前。
+			 */
+			if (ShardXidCtl->mvcc_n == 0)
+			{
+				fence = GetXLogInsertRecPtr();
+				if (fence > ShardXidCtl->logical_fence_lsn)
+					ShardXidCtl->logical_fence_lsn = fence;
+				else
+					fence = InvalidXLogRecPtr;
+			}
 			break;
 		}
 	LWLockRelease(ShardXidCtl->lock);
+
+	if (fence != InvalidXLogRecPtr)
+		ShardLogicalFencePersist(fence);
+}
+
+/*
+ * T7.22：逻辑解码围栏的持久化。本函数从 DROP 的提交回调里调下来 ——
+ * 提交已经发生，这里**不许 ERROR**，失败只记 WARNING（后果是重启后围栏回退到
+ * 上一次落盘的值，已登记在注释里，不静默）。
+ */
+static void
+ShardLogicalFencePersist(XLogRecPtr fence)
+{
+	char		tmp[MAXPGPATH];
+	char		buf[64];
+	int			len;
+	int			fd;
+
+	snprintf(tmp, sizeof(tmp), "%s.tmp", SHARD_LOGICAL_FENCE_FILE);
+	len = snprintf(buf, sizeof(buf), "%X/%X\n", LSN_FORMAT_ARGS(fence));
+
+	fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 || write(fd, buf, len) != len || pg_fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			CloseTransientFile(fd);
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 逻辑解码围栏 %X/%X 落盘失败：%m",
+						LSN_FORMAT_ARGS(fence)),
+				 errdetail("本次运行期内围栏照常生效；重启后回退到上一次落盘的值。")));
+		return;
+	}
+	CloseTransientFile(fd);
+	if (durable_rename(tmp, SHARD_LOGICAL_FENCE_FILE, WARNING) != 0)
+		return;
+	ereport(LOG,
+			(errmsg("pg_partdist: 本节点已无打标表，逻辑解码围栏立在 %X/%X"
+					"（确认位点早于它的逻辑槽仍被拒绝）",
+					LSN_FORMAT_ARGS(fence))));
+}
+
+static XLogRecPtr
+ShardLogicalFenceLoad(void)
+{
+	FILE	   *f;
+	unsigned int hi,
+				lo;
+	XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+	f = AllocateFile(SHARD_LOGICAL_FENCE_FILE, "r");
+	if (f == NULL)
+		return InvalidXLogRecPtr;
+	if (fscanf(f, "%X/%X", &hi, &lo) == 2)
+		lsn = ((uint64) hi << 32) | lo;
+	FreeFile(f);
+	return lsn;
+}
+
+/*
+ * 无锁读：64 位对齐字、只增不减，读到旧值的后果只是"晚一拍立起来"——
+ * 而写侧是 DROP 提交回调，此时新连接/新语句还没有机会用到它。
+ */
+XLogRecPtr
+ShardLogicalFenceLsn(void)
+{
+	return ShardXidCtl != NULL ? ShardXidCtl->logical_fence_lsn : InvalidXLogRecPtr;
 }
 
 /*

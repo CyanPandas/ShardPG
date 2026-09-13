@@ -194,15 +194,28 @@ md5_l_pre=$(MD5 "$LMAIN")
 check "分叉已成立：f1 与 leader 不一致" \
       "$([[ -n "$md5_f1_bad" && "$md5_f1_bad" != "$md5_l_pre" ]] && echo ok)" "ok"
 
-echo "================ [3] 负向：块数超过 inline 上限必须显式报错 ================"
-neg=$(PSQL $pport -Atc "SET pg_partdist.fileset_inline_max_blocks = 1; SELECT partdist.shard_baseline_emit('${shard_tbl}'::regclass)" </dev/null 2>&1 | tr '\n' ' ')
-check "超限时显式 ERROR（不静默降级）" \
+echo "================ [3] 负向：**关掉流式分块**时，块数超过 inline 上限仍须显式报错 ================"
+# ★ T7.21（P7-R3）之后，这道上限只在 fileset_baseline_chunk_blocks = 0 时生效。
+#   它原本的真实作用是"别让一次灌的 FPI 描述符撑满 8192 槽的共享捕获环"
+#   （环满只 WARNING 并覆盖未消费条目 = 静默丢页），分块排空之后环占用与总大小无关。
+neg=$(PSQL $pport -Atc "SET pg_partdist.fileset_baseline_chunk_blocks = 0; SET pg_partdist.fileset_inline_max_blocks = 1; SELECT partdist.shard_baseline_emit('${shard_tbl}'::regclass)" </dev/null 2>&1 | tr '\n' ' ')
+check "关掉分块 + 超限 ⇒ 显式 ERROR（不静默降级）" \
       "$([[ "$neg" == *"超过 pg_partdist.fileset_inline_max_blocks"* ]] && echo banned)" "banned"
 plsn_after_neg=$(PSQL $pport -Atc "SELECT partdist.get_partition_flush_lsn(${LEADER_OID})" </dev/null | tail -1)
 check "报错的那次没有留下半条记录（plsn 未变）" "$plsn_after_neg" "$plsn1"
 
-echo "================ [4] 发射全量物理基线 ================"
-base_plsn=$(PSQL $pport -Atc "SELECT partdist.shard_baseline_emit('${shard_tbl}'::regclass)" </dev/null 2>&1 | tail -1)
+echo "================ [4] ★ T7.21：**流式**发射全量物理基线（越过旧上限、强制多块） ================"
+# 把 inline 上限压到 1、分块压到 2 块：旧实现在这里必然 ERROR；新实现必须
+# 分多块发完，并且后面 [5] 的逐字节比对（pagecmp）照样要过 —— 这才证明
+# "分块排空之间穿插的记录"没有打乱副本。
+logmark=$(DEX bash -c "cat /work/pg-cluster-data/worker$((pport-5432))/*.log /work/pg-cluster-data/worker$((pport-5432)).log 2>/dev/null | wc -l" </dev/null | tr -d '[:space:]')
+logmark=${logmark:-0}
+base_plsn=$(PSQL $pport -Atc "SET pg_partdist.fileset_inline_max_blocks = 1; SET pg_partdist.fileset_baseline_chunk_blocks = 2; SELECT partdist.shard_baseline_emit('${shard_tbl}'::regclass)" </dev/null 2>&1 | tail -1)
+nchunk=$(DEX bash -c "cat /work/pg-cluster-data/worker$((pport-5432))/*.log /work/pg-cluster-data/worker$((pport-5432)).log 2>/dev/null | tail -n +$((logmark + 1)) | grep -c '块流式发射' || true" </dev/null | tail -1 | tr -d '[:space:]')
+check "★ 越过旧 inline 上限的基线不再报错（base_part_lsn=$base_plsn）" \
+      "$([[ "$base_plsn" =~ ^[0-9]+$ ]] && echo ok)" "ok"
+check "★ 基线确实分多块流式发射（日志留痕 ${nchunk} 条）" \
+      "$([[ -n "$nchunk" && "$nchunk" -ge 1 ]] && echo ok)" "ok"
 check "shard_baseline_emit 返回数字（base_part_lsn=$base_plsn）" \
       "$([[ "$base_plsn" =~ ^[0-9]+$ && "$base_plsn" -gt 0 ]] && echo ok)" "ok"
 check "base_part_lsn 落在旧 plsn 之后（$base_plsn > $plsn1）" \

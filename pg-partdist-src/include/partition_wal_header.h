@@ -348,6 +348,24 @@ typedef struct TxnMarkerPayload
  */
 #define PARTWAL_CTRL_SHARD_DROP      UINT8_C(0x04)
 
+/*
+ * T7.25（P7-R4）：DDL 自动跟随的**结构提示**。
+ *
+ * 当 leader 的 fileset **成员结构**（(role, ord) 集合）发生变化 —— 典型是
+ * CREATE INDEX / DROP INDEX —— 紧挨在 FILESET_UPDATE **之前**发一条。载荷是
+ * 新 fileset 里全部普通索引的定义（`pg_get_indexdef_string`，已是分片限定名，
+ * 副本上的壳表同名，可原样执行），按 ord 升序、以 '\n' 分隔；无索引时载荷为空。
+ *
+ * 为什么发**全量定义清单**而不是 diff：leader 侧分不清"新建的索引"与
+ * "被 VACUUM FULL/REINDEX 换了文件号的老索引"（两者都是 loc 变了），而副本
+ * 拿全量清单与本地索引按**去掉索引名之后的定义**对账，缺的建、多的删，
+ * 天然幂等、不怕重放。
+ *
+ * 副本收到它只落盘（pg_parwal/<oid>/ddl_hint）并推进游标；真正动结构的是
+ * 回放启动器在撞上结构栅栏之后调起的 partdist.replay_auto_follow()。
+ */
+#define PARTWAL_CTRL_DDL_HINT        UINT8_C(0x05)
+
 typedef struct PartWALCtrlShardClog
 {
     uint32      first_sxid;     /* 本块第一个分片 xid                        */

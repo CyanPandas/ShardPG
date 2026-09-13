@@ -85,8 +85,8 @@ vacuum / 内核补丁 / 测试体系）扫代码与文档，**凡"实测"均为�
 | 条目 | 性质 | 证据 |
 |---|---|---|
 | **leader `DROP TABLE` ⇒ 副本侧静默**：无 opcode，follower 的壳表 + 回放槽位 + `pg_parwal/<oid>` **永不回收** —— 回收判据是"OID 不在本地 `pg_class`"，而壳表是本地真表 | [缺陷] | `shard_fileset.c:929–933`（"属后续工作；这里保持沉默"）；FRD §12.4 |
-| **leader 任何一次 DDL ⇒ follower 停在结构栅栏，需人工等价 DDL + 重跑 `replay_set_locmap`** | [边界·运维成本极高] | `replay_worker.c:701–709, 1082–1086`；FRD §12.4 "结构补齐是人工的"。供给只在初始时 `LIKE INCLUDING ALL`，之后不跟 |
-| **物理基线上限 1 GB**：`fileset_inline_max_blocks = 131072`，超出显式 ERROR ⇒ **大于 1 GB 的分片既不能供给、也不能修复分叉** —— 没有流式基线 | [未做] | `shard_fileset.c:158, 268–275, 376` |
+| **leader 任何一次 DDL ⇒ follower 停在结构栅栏，需人工等价 DDL + 重跑 `replay_set_locmap`** | [边界·运维成本极高] | `replay_worker.c:701–709, 1082–1086`；FRD §12.4 "结构补齐是人工的"。供给只在初始时 `LIKE INCLUDING ALL`，之后不跟。**→ 2026-09-13 T7.25 自动跟随（P7-R4）** |
+| **物理基线上限 1 GB**：`fileset_inline_max_blocks = 131072`，超出显式 ERROR ⇒ **大于 1 GB 的分片既不能供给、也不能修复分叉** —— 没有流式基线 | [未做] | `shard_fileset.c:158, 268–275, 376`。**→ 2026-09-13 T7.21 流式基线（P7-R3）** |
 | 遗留宇宙（R1/R2/L1 时代）副本：R3（`PartDistResolveGxid` / `HeapTupleSatisfiesGlobalMVCC` / `ShardRouteEntry`）**从未实装**，升主后不可读；读会设 hint bit 写本地 WAL（约束 12 残留） | [未做·可裁掉] | grep 四个符号仅剩 `shard_xidmap.h:9` 一条注释；FRD §14.2。新宇宙（打标分片）下 promoted 分片可读已由 `promote_catchup_tx3` / `handover_provision_p7` 实证 —— **R3 的必要性只剩遗留宇宙**，应裁定"遗留副本退役"而不是继续挂着 |
 | 快路径分叉 / 降级归队：检测到分叉只 `replay_disable` + WARNING；降级分支只收回身份；**归队重做基线全靠人工** | [未做] | `pg_raft--1.0.sql` promote_prepare 分叉分支；`raft_boundary.c:230–240` |
 | `REPLAY_MAX_SHARDS = 64` 定长槽位 | [边界] | `shard_replay.h:275` |
@@ -99,7 +99,7 @@ vacuum / 内核补丁 / 测试体系）扫代码与文档，**凡"实测"均为�
 | 条目 | 性质 | 证据 |
 |---|---|---|
 | **§9.2 第 3 层禁用清单漏了 8 个同类 UDF**（同样亲手搬/读分片数据，且都在 Citus 13.1 库里存在）：`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method` | [缺陷] | `shard_guard.c:52–75` 清单 vs 协调者 `pg_proc` 实查。按名匹配，`master_*` 旧名与 `drain_node`（内部直接调 C 函数、不经 ExecutorStart）都绕得过 |
-| 逻辑解码禁令只覆盖 SQL；walsender `START_REPLICATION` 绕得过（R-P6-14） | [缺陷·已定性] | 需内核层判据，未做 |
+| 逻辑解码禁令只覆盖 SQL；walsender `START_REPLICATION` 绕得过（R-P6-14） | [缺陷·已定性] | 需内核层判据，未做。**→ 2026-09-13 T7.22 已堵（认证钩子，未动内核）** |
 | **引用表运行期写：§10 说"建表后只读"，代码零守卫、测试零断言** | [未做] | grep `reference|引用表` 在 `shard_guard.c`/`shard_xid.c` 零命中 |
 | 禁用清单不看 joinqual / 索引 quals | [边界] | `shard_guard.c` 注释自陈；低风险 |
 | 单事务 DROP > 16 张打标表即 ERROR（`SHARD_CLOG_PENDING_DROPS_MAX`）—— `DROP SCHEMA ... CASCADE` 会撞 | [边界] | `shard_clog.c:357–381` |

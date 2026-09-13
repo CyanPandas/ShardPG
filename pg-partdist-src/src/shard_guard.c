@@ -48,6 +48,12 @@
 #include "utils/guc.h"		/* R-P6-22：读 pg_raft.raft_enabled */
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "miscadmin.h"				/* MyProcPid */
+#include "libpq/auth.h"				/* T7.22：认证钩子 */
+#include "replication/slot.h"		/* T7.22：终止逻辑 walsender */
+#include "replication/walsender.h"	/* T7.22：am_db_walsender */
+#include "storage/proc.h"
+#include <signal.h>
 
 /*
  * 禁用清单（§9.2 第 3 层「禁用」行 + §10）。
@@ -270,6 +276,46 @@ ShardGuardCheckReferenceWrite(Oid relid)
 
 static bool guard_check_marked = false;		/* 本次遍历要不要查打标级清单 */
 
+/*
+ * T7.22（R-P6-14 补）：有没有**跨越打标期**的逻辑槽 —— 确认位点早于逻辑解码围栏
+ * （最后一张打标表 DROP 时的 WAL 位点）。有则把槽名写进 name_out。
+ *
+ * 为什么看 confirmed_flush 而不是 restart_lsn：restart_lsn 之后、confirmed_flush
+ * 之前的记录解码器只用来重建快照、不输出变更；会被**输出**成错误分组的只有
+ * confirmed_flush 之后的那段。
+ */
+static bool
+shard_guard_stale_logical_slot(XLogRecPtr fence, char *name_out, int name_len,
+							   XLogRecPtr *confirmed_out)
+{
+	int			i;
+	bool		found = false;
+
+	if (fence == InvalidXLogRecPtr || ReplicationSlotCtl == NULL)
+		return false;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots && !found; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+		XLogRecPtr	confirmed;
+
+		if (!s->in_use || !SlotIsLogical(s))
+			continue;
+		SpinLockAcquire(&s->mutex);
+		confirmed = s->data.confirmed_flush;
+		if (confirmed < fence)
+		{
+			strlcpy(name_out, NameStr(s->data.name), name_len);
+			*confirmed_out = confirmed;
+			found = true;
+		}
+		SpinLockRelease(&s->mutex);
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	return found;
+}
+
 static bool
 shard_guard_func_banned(Oid funcid, const char **name_out)
 {
@@ -293,6 +339,17 @@ shard_guard_func_banned(Oid funcid, const char **name_out)
 		{
 			if (strcmp(name, shard_banned_marked_funcs[i]) == 0)
 			{
+				char		slot[NAMEDATALEN];
+				XLogRecPtr	confirmed = InvalidXLogRecPtr;
+
+				/*
+				 * T7.22：本节点已无打标表时，只有"跨越打标期的旧逻辑槽还在"才禁。
+				 * 槽扫描只在真的调到解码函数时才做，普通语句一次都不多花。
+				 */
+				if (!ShardGatingActive() &&
+					!shard_guard_stale_logical_slot(ShardLogicalFenceLsn(),
+													slot, sizeof(slot), &confirmed))
+					break;
 				*name_out = shard_banned_marked_funcs[i];
 				pfree(name);
 				return true;
@@ -440,7 +497,8 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 	 *   · 打标级（逻辑解码）—— 仍按本节点是否有打标表。
 	 * 两者都不成立时零成本返回，普通 PostgreSQL 用法一条指令都不多花。
 	 */
-	guard_check_marked = ShardGatingActive();
+	guard_check_marked = ShardGatingActive() ||
+		ShardLogicalFenceLsn() != InvalidXLogRecPtr;
 	if (!ShardGuardClusterManaged() && !guard_check_marked)
 		return;
 
@@ -449,4 +507,128 @@ ShardGuardCheckPlan(PlannedStmt *pstmt)
 	/* CTE / 子查询：initPlan、SubPlan 都指向这里，走一遍即全覆盖 */
 	foreach(lc, pstmt->subplans)
 		shard_guard_walk_plan((Plan *) lfirst(lc));
+}
+
+/* ================================================================== */
+/* T7.22（R-P6-14）：逻辑复制协议入口（walsender）的禁令               */
+/* ================================================================== */
+
+/*
+ * 背景：分片打标记录在 insert/update/multi_insert 的主数据**末尾追加 4 字节
+ * 分片 xid 尾缀**（补丁 0005），而逻辑解码走的是原生解析器，按记录长度反算
+ * 元组长度会多算那 4 字节 ⇒ 拷贝越界 ⇒ 栈保护器 abort ⇒ **整节点重置**。
+ * T6.6 因此在 SQL 面禁了建槽与取变更（shard_banned_marked_funcs）。
+ *
+ * R-P6-14：那道禁令挂在 ExecutorStart 上，而**复制协议根本不走执行器** ——
+ * `psql "replication=database"` 连上来发 `CREATE_REPLICATION_SLOT s LOGICAL
+ * test_decoding` / `START_REPLICATION SLOT s LOGICAL 0/0`，走的是
+ * exec_replication_command()，SQL 面的禁令一行都不经过。
+ *
+ * 原登记写的是"真堵要在 LogicalDecodingProcessRecord 加判据 = 内核补丁面"。
+ * 这里换了一个**不动内核**、同样前移到入口的做法：
+ *
+ *   ① 连接认证钩子：`am_db_walsender`（= replication=database，逻辑复制专属）
+ *      且本节点有打标表 ⇒ 拒绝连接。物理复制（replication=true）不受影响 ——
+ *      它只搬原始 WAL 字节，解码器一行都不跑，没有越界可言。
+ *   ② 登记打标的那一刻，**终止已经连着的逻辑 walsender**。①只管新连接；
+ *      一个在"本节点还没有打标表"时连上来的逻辑订阅，会在第一条打标记录到来时
+ *      当场崩掉整个节点。登记就是危险开始的时刻，在这里断开它。
+ *
+ * 与内核判据相比的边界（如实写明）：①②合起来覆盖"建槽、开流、在流中"三种
+ * 情形；**没**覆盖的是 GUC 测试通道（pg_partdist.shard_relids）在运行期被改
+ * 非空时已连着的逻辑 walsender —— GUC 的 assign 钩子会在每个后端各跑一遍，
+ * 不适合在那里发终止信号。那条通道只用于验收，生产登记走 partition_map。
+ * 根治仍是让解码器认识那 4 字节尾缀。
+ */
+static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
+
+static void
+shard_guard_client_auth(Port *port, int status)
+{
+	if (prev_client_auth_hook)
+		prev_client_auth_hook(port, status);
+
+	if (status != STATUS_OK || !am_db_walsender)
+		return;
+
+	/*
+	 * ★ 禁令的理由是**语义**的，不是崩溃：解码器按原生 xid 组事务，对分片表
+	 * 就是错的分组（§10「分片表逻辑解码：禁」）。R-P6-7 当年那次崩溃已查明是
+	 * 构建产物 ABI 撕裂、clean rebuild 后消失，别再拿它当理由。
+	 */
+	if (ShardGatingActive())
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("本节点有分片打标表，拒绝逻辑复制连接（replication=database）"),
+				 errdetail("逻辑解码按原生 xid 组事务，对分片打标表是错误的分组"
+						   "（§10「分片表逻辑解码：禁」，R-P6-14）。"
+						   "物理复制（replication=true）不受此限。"),
+				 errhint("SQL 面的建槽与取变更同样被禁。")));
+
+	{
+		char		slot[NAMEDATALEN];
+		XLogRecPtr	confirmed = InvalidXLogRecPtr;
+		XLogRecPtr	fence = ShardLogicalFenceLsn();
+
+		if (shard_guard_stale_logical_slot(fence, slot, sizeof(slot), &confirmed))
+			ereport(FATAL,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("逻辑槽 \"%s\" 跨越了分片打标期，拒绝逻辑复制连接（replication=database）",
+							slot),
+					 errdetail("该槽确认位点 %X/%X 早于本节点最后一张打标表被删除时的位点 %X/%X；"
+							   "那段 WAL 里的打标记录按原生 xid 解码是错误的分组。",
+							   LSN_FORMAT_ARGS(confirmed), LSN_FORMAT_ARGS(fence)),
+					 errhint("删掉该槽（pg_drop_replication_slot）后重建；新建的槽从当前位点起解码，不受影响。")));
+	}
+}
+
+void
+ShardGuardInstallAuthHook(void)
+{
+	prev_client_auth_hook = ClientAuthentication_hook;
+	ClientAuthentication_hook = shard_guard_client_auth;
+}
+
+/*
+ * 终止本节点所有**活跃的逻辑**复制槽持有者。返回发出终止信号的个数。
+ * 物理槽（data.database == InvalidOid）不碰。
+ */
+int
+ShardGuardTerminateLogicalWalsenders(void)
+{
+	int			i;
+	int			n = 0;
+	pid_t		pids[64];
+	int			npid = 0;
+
+	if (ReplicationSlotCtl == NULL)
+		return 0;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (i = 0; i < max_replication_slots && npid < (int) lengthof(pids); i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+		pid_t		pid;
+
+		if (!s->in_use || !SlotIsLogical(s))
+			continue;
+		SpinLockAcquire(&s->mutex);
+		pid = s->active_pid;
+		SpinLockRelease(&s->mutex);
+		if (pid != 0 && pid != MyProcPid)
+			pids[npid++] = pid;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+
+	for (i = 0; i < npid; i++)
+	{
+		if (kill(pids[i], SIGTERM) == 0)
+		{
+			n++;
+			ereport(LOG,
+					(errmsg("pg_partdist: 本节点开始有分片打标表，已终止逻辑复制进程 %d（R-P6-14）",
+							(int) pids[i])));
+		}
+	}
+	return n;
 }

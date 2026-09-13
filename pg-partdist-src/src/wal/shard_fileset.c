@@ -20,6 +20,7 @@
 #include "shard_fileset.h"
 #include "partition_wal.h"
 #include "partwal_sync.h"
+#include "utils/ruleutils.h"		/* T7.25：pg_get_indexdef_string */
 #include "shard_xid.h"	/* 批次 #10：路由层角色切换 */
 #include "shard_replay.h"	/* 批次 #10：路由层角色切换 */
 
@@ -159,6 +160,12 @@ static bool fileset_maybe_changed = false;
 /* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流 */
 int fileset_inline_max_blocks = 131072;     /* 1 GB */
 
+/*
+ * T7.21（P7-R3）：流式基线的分块大小（块数）。每灌完这么多块就排空一次捕获环
+ * 并复制出去，再灌下一块。0 = 不分块（回到一次灌完的旧行为）。
+ */
+int fileset_baseline_chunk_blocks = 16384;  /* 128 MB */
+
 void
 ShardFilesetNoteMaybeChanged(void)
 {
@@ -207,6 +214,8 @@ FileSetEquals(const ShardFileSet *a, const ShardFileSet *b)
  *     逐字节副本，连"洞内残字节"都一致，正好省掉一处判据例外。
  * 代价只是一次性 DDL 多搬一点字节，而 DDL 之后的新文件本就是紧实的。
  */
+static uint64 FileSetLogRelationPagesChunked(Oid relid, uint64 *pending);
+
 static uint64
 FileSetLogRelationPages(Oid relid, bool do_log)
 {
@@ -235,6 +244,94 @@ FileSetLogRelationPages(Oid relid, bool do_log)
     }
 
     relation_close(rel, AccessShareLock);
+    return total;
+}
+
+/*
+ * T7.21（P7-R3）：**流式**物理基线 —— 按块灌 FPI，每灌完一块就排空捕获环并复制。
+ *
+ * ★ 为什么非分块不可：FPI 不是直接进分区流的，而是先经 wal_insert_hook 写一条
+ *   描述符进**全节点共享**的捕获环（`PARTWAL_BUFFER_SLOTS = 8192` 槽），
+ *   等 PartWALFlush 排空。`log_newpage_range` 每条 XLOG_FPI 最多带 32 块，
+ *   所以一次灌完的基线占 `块数/32` 个槽 —— 1 GB 就是 4096 槽，**半个环**。
+ *   而环满时 `PartWALInsert` **只打一条 WARNING 就覆盖未消费的条目**
+ *   （它跑在 XLogInsert 里，没法等、也没法排空），被覆盖的那几页从此不在流里：
+ *   副本基线缺页，**静默物理分歧**。安静节点上 1 GB 上限还留有 2 倍余量，
+ *   可一旦同时有别的写入分享同一个环，这点余量就不存在了。
+ *
+ *   原来的 1 GB 硬上限因此不是"保守"，而是**恰好卡在环容量的一半**、且只在
+ *   无并发负载时成立的偶然安全；它的副作用是大于 1 GB 的分片既不能供给、
+ *   也不能修复分叉（P7-R3）。
+ *
+ * ★ 分块之后，环占用被压到 `chunk/32` 槽（默认 16384 块 = 512 槽 ≈ 6% 环），
+ *   与基线总大小无关；复制侧的背压由 raft 的 wait_for_log_room 承担。
+ *   事务中途排空是既有做法（DDL 发 FILESET_UPDATE 前、dtx 判决补发后都这么调），
+ *   `PartWALFlush` 自己会先 XLogFlush 到对应 LSN。
+ *
+ * ★ 分块跨越并发写入仍然物理一致：每张 FPI 是"此刻"的页面全像；之后对该页的
+ *   任何修改在 WAL 里 LSN 都更大，回放侧 redo 按 orig_lsn 与页 LSN 比较，
+ *   已含进全像的修改会被跳过 —— 与 PG 自己"模糊拷贝 + WAL 回放"的基础备份
+ *   同一个道理，与是否分块无关。
+ */
+static uint64
+FileSetLogRelationPagesChunked(Oid relid, uint64 *pending)
+{
+    Relation    rel;
+    ForkNumber  fork;
+    uint64      total = 0;
+    int         nchunks = 0;
+
+    if (fileset_baseline_chunk_blocks <= 0)
+        return FileSetLogRelationPages(relid, true);
+
+    rel = try_relation_open(relid, AccessShareLock);
+    if (rel == NULL)
+        return 0;
+
+    for (fork = 0; fork <= MAX_FORKNUM; fork++)
+    {
+        BlockNumber nblocks;
+        BlockNumber start;
+
+        if (!smgrexists(RelationGetSmgr(rel), fork))
+            continue;
+
+        nblocks = smgrnblocks(RelationGetSmgr(rel), fork);
+        for (start = 0; start < nblocks;)
+        {
+            BlockNumber end = start + (BlockNumber) fileset_baseline_chunk_blocks;
+
+            if (end > nblocks || end < start)
+                end = nblocks;
+
+            CHECK_FOR_INTERRUPTS();
+            log_newpage_range(rel, fork, start, end, false /* page_std */);
+            total += (uint64) (end - start);
+            start = end;
+
+            nchunks++;
+
+            /*
+             * 攒够一块才排空。按"未排空块数"而不是"每块必排"：调用方逐个
+             * 关系、逐个 fork 调进来，小关系一块都攒不满 —— 每块必排的话，
+             * 一次 TRUNCATE 小表也要多做几次 XLogFlush（每次都是一次 fsync）。
+             * 计数跨调用累计（由调用方持有），环里未排空的 FPI 因此恒 < 一块。
+             */
+            *pending += (uint64) (end - start);
+            if (*pending >= (uint64) fileset_baseline_chunk_blocks)
+            {
+                PartWALFlush(InvalidXLogRecPtr, false);
+                *pending = 0;
+            }
+        }
+    }
+
+    relation_close(rel, AccessShareLock);
+
+    if (nchunks > 1)
+        ereport(LOG,
+                (errmsg("pg_partdist: 关系 %u 的物理基线分 %d 块流式发射，共 %llu 块",
+                        relid, nchunks, (unsigned long long) total)));
     return total;
 }
 
@@ -538,6 +635,49 @@ EmitFilesetUpdate(Oid shard_oid, const ShardFileSet *old_fs,
      */
     RegisterShardFileSet(new_fs);
 
+    /*
+     * T7.25（P7-R4）：成员**结构**变了（(role, ord) 集合不同）⇒ 在 FILESET_UPDATE
+     * 之前先发一条结构提示，载荷是新 fileset 全部普通索引的定义清单。
+     * 只换文件号的变更（VACUUM FULL / REINDEX / TRUNCATE）结构不变，副本侧本来
+     * 就能全自动跟上，不发。
+     */
+    {
+        bool structural = (old_fs->nrels != new_fs->nrels);
+
+        for (i = 0; !structural && i < new_fs->nrels; i++)
+            if (FileSetFind(old_fs, new_fs->rels[i].role, new_fs->rels[i].ord) == NULL)
+                structural = true;
+
+        if (structural)
+        {
+            StringInfoData hint;
+            int            ord;
+            int            nidx = 0;
+
+            initStringInfo(&hint);
+            /* 按 ord 升序输出，与副本侧 RelationGetIndexList 的 OID 序对齐 */
+            for (ord = 0; ord < SHARD_FILESET_MAX_RELS; ord++)
+                for (i = 0; i < new_fs->nrels; i++)
+                    if (new_fs->rels[i].role == SHARD_REL_INDEX &&
+                        new_fs->rels[i].ord == ord)
+                    {
+                        char *def = pg_get_indexdef_string(new_relids[i]);
+
+                        if (nidx++ > 0)
+                            appendStringInfoChar(&hint, '\n');
+                        appendStringInfoString(&hint, def);
+                        pfree(def);
+                    }
+
+            PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_DDL_HINT,
+                              hint.data, (uint32) hint.len);
+            ereport(LOG,
+                    (errmsg("pg_partdist: shard %u 成员结构变化，已发 DDL 结构提示"
+                            "（%d 个索引定义）", shard_oid, nidx)));
+            pfree(hint.data);
+        }
+    }
+
     payload_len = (uint32) PartWALCtrlFilesetUpdateSize(new_fs->nrels);
     payload = palloc0(payload_len);
     payload->nrels    = (uint32) new_fs->nrels;
@@ -550,10 +690,22 @@ EmitFilesetUpdate(Oid shard_oid, const ShardFileSet *old_fs,
                       (const char *) payload, payload_len);
     pfree(payload);
 
-    /* CTRL 已在流里，现在灌内容 —— 顺序不能反（follower 要先换完表） */
+    /*
+     * CTRL 已在流里，现在灌内容 —— 顺序不能反（follower 要先换完表）。
+     *
+     * T7.21：这里同样走分块排空。内联上限 1 GB = 4096 个环槽（半个捕获环），
+     * 一次 VACUUM FULL 灌满的同时若别的会话也在写同一个节点，环就会满、
+     * `PartWALInsert` 覆盖未消费条目（P7-W2）—— 与基线路径是同一个风险，
+     * 只是这里上限更低、所以此前没人撞见。
+     */
     if ((flags & PARTWAL_FSUPD_NEEDS_REBASELINE) == 0)
+    {
+        uint64 pending = 0;
+
+        /* 尾巴（不足一块）留给提交时的那次排空，与此前的时序一致 */
         for (i = 0; i < nchanged; i++)
-            (void) FileSetLogRelationPages(new_relids[changed[i]], true);
+            (void) FileSetLogRelationPagesChunked(new_relids[changed[i]], &pending);
+    }
 
     ereport(LOG,
             (errmsg("pg_partdist: shard %u fileset 变更已发射（%d 个成员，"
@@ -627,16 +779,22 @@ ShardBaselineEmit(Oid shard_oid)
     for (i = 0; i < nrels; i++)
         total_blocks += FileSetLogRelationPages(relids[i], false);
 
-    if (total_blocks > (uint64) fileset_inline_max_blocks)
+    /*
+     * T7.21（P7-R3）：流式发射之后，基线**不再按总块数设硬上限**。
+     * 原上限的真实作用是"别让一次灌的 FPI 描述符撑满共享捕获环"（见
+     * FileSetLogRelationPagesChunked 的注释），分块排空之后环占用与总大小无关。
+     * 只有显式把分块关掉（fileset_baseline_chunk_blocks = 0）时才保留旧门禁。
+     */
+    if (fileset_baseline_chunk_blocks <= 0 &&
+        total_blocks > (uint64) fileset_inline_max_blocks)
         ereport(ERROR,
                 (errmsg("pg_partdist: shard %u 的物理基线涉及 %llu 个块，"
                         "超过 pg_partdist.fileset_inline_max_blocks = %d",
                         shard_oid, (unsigned long long) total_blocks,
                         fileset_inline_max_blocks),
-                 errdetail("基线是**显式**操作，这里不做静默降级 —— 一次灌太多块"
-                           "会把 Raft 日志环顶爆（§13 约束 13），后果是永久分叉。"),
-                 errhint("确认该 shard 的体量后调高 "
-                         "pg_partdist.fileset_inline_max_blocks 再重试。")));
+                 errdetail("流式基线已被关掉（pg_partdist.fileset_baseline_chunk_blocks = 0），"
+                           "一次灌完会撑满共享捕获环、静默丢页。"),
+                 errhint("打开流式基线，或确认体量后调高 fileset_inline_max_blocks。")));
 
     /*
      * 注册必须在 log_newpage_range 之前 —— 捕获钩子的判据是"文件号命中反向
@@ -657,9 +815,20 @@ ShardBaselineEmit(Oid shard_oid)
                                   (const char *) payload, payload_len);
     pfree(payload);
 
-    /* CTRL 已在流里，现在灌全部内容 —— 顺序不能反 */
-    for (i = 0; i < nrels; i++)
-        (void) FileSetLogRelationPages(relids[i], true);
+    /*
+     * CTRL 已在流里，现在灌全部内容 —— 顺序不能反。
+     * T7.21：按块流式灌，每块之后排空捕获环（见 FileSetLogRelationPagesChunked）。
+     * 先排空一次：CTRL 与之前缓冲的记录必须排在第一块 FPI 之前。
+     */
+    PartWALFlush(InvalidXLogRecPtr, false);
+    {
+        uint64 pending = 0;
+
+        for (i = 0; i < nrels; i++)
+            (void) FileSetLogRelationPagesChunked(relids[i], &pending);
+        if (pending > 0)
+            PartWALFlush(InvalidXLogRecPtr, false);
+    }
 
     /*
      * ★ T7.2（R-P6-17）：页面之外，**分片 clog 也要搬**。

@@ -100,6 +100,14 @@ need_nm   "0009   shard_at_prepare_hook 符号（2PC rmgr）" \
 need_str  "0010   XLogAdvancePendingInsertPosition（升主推进写入位置；static，按 strings 验）" \
           "XLogAdvancePendingInsertPosition"
 
+# ★ 2026-09-13 补：补丁 0010 同时改了 xlog.h（加 XLogRequestInsertPositionAdvance
+#   的原型），而仓库 pg-install 的头文件**没同步** —— 二进制里有这个函数，
+#   pg_partdist 却一直在"隐式声明"下编过（-Wimplicit-function-declaration），
+#   靠 x86-64 调用约定碰巧能跑；换一个把该告警升为错误的编译器（GCC 14 默认）
+#   就直接编不过。与 P7-W1 同类：补丁影响的每个产物都要验，头文件也是产物。
+need_grep "0010   XLogRequestInsertPositionAdvance 原型（xlog.h）" \
+          "$ROOT/include/postgresql/server/access/xlog.h" "XLogRequestInsertPositionAdvance"
+
 # 前端产物：pg_waldump 自带一份 xactdesc.o，必须同样带 0007 的注解代码，
 # 否则 commit/abort 记录体里的分片 xid 块解不出来（取证类用例会无声地红）。
 need_str_in "0007   pg_waldump 能解分片 xid 注解（前端另编一份 xactdesc.o）" \

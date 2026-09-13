@@ -47,6 +47,12 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/postmaster.h"	/* T7.25：PostPortNumber */
+#include "libpq-fe.h"				/* T7.25：自连 */
+#include "utils/ruleutils.h"		/* T7.25：pg_get_indexdef_string */
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "postmaster/interrupt.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -69,6 +75,7 @@ int  replay_workers                = 1;
 int  replay_naptime_ms             = 200;
 int  replay_checkpoint_interval_ms = 2000;
 int  replay_checkpoint_records     = 512;
+extern bool replay_auto_follow_ddl;    /* T7.25：定义在文件尾 */
 bool replay_trust_local_segments   = false;
 int  replay_debug_delay_ms         = 0;
 int  replay_reclaim_grace_secs     = 300;
@@ -105,6 +112,12 @@ DefineReplayGUCs(void)
                             NULL, &replay_checkpoint_records,
                             512, 1, 1000000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomBoolVariable("pg_partdist.replay_auto_follow_ddl",
+                             "T7.25：副本撞上 DDL 结构栅栏后，由回放启动器自动对账索引并重配 locmap",
+                             "关掉即退回「停在栅栏、等运维手工补结构」的旧行为。",
+                             &replay_auto_follow_ddl,
+                             true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomBoolVariable("pg_partdist.replay_trust_local_segments",
                              "测试模式：本地段内容即回放上界（FRD §6）",
                              NULL, &replay_trust_local_segments,
@@ -733,6 +746,8 @@ ShardReplayCatchUp(Oid shard_oid, uint64 bound, int timeout_ms)
 /* launcher                                                            */
 /* ================================================================== */
 
+static void LauncherAutoFollowDdl(void);
+
 void
 RegisterReplayLauncher(void)
 {
@@ -868,6 +883,9 @@ ReplayLauncherMain(Datum arg)
                 have_enabled = true;
         }
         LWLockRelease(ReplayCtl->lock);
+
+        /* T7.25（P7-R4）：停在 DDL 结构栅栏的槽位，自动跟随 */
+        LauncherAutoFollowDdl();
 
         /* 回收已退出 worker 的句柄；回收完 nhandles 就是当前存活数 */
         {
@@ -2052,4 +2070,255 @@ pg_partdist_advance_wal_to(PG_FUNCTION_ARGS)
     XLogRequestInsertPositionAdvance(target);
 
     PG_RETURN_LSN(GetXLogInsertRecPtr());
+}
+
+/* ================================================================== */
+/* T7.25（P7-R4）：DDL 自动跟随                                        */
+/* ================================================================== */
+
+/*
+ * 背景：leader 上一次 CREATE INDEX / DROP INDEX，副本就停在结构栅栏
+ * （REPLAY_NEEDS_STRUCT），直到运维在壳表上手工做**等价**结构变更、再重跑
+ * replay_set_locmap() —— test_ddl_fileset_d1 的 [9] 就是那段人工步骤。
+ * 一张表有几个副本、一天有几次 DDL，就是几乘几次人工，而且忘了做的那个副本
+ * 会一直停着、升不了主。
+ *
+ * 自动化拆成三段，各自待在该待的地方：
+ *   ① leader：成员结构变化时，FILESET_UPDATE 之前随流发一条 DDL_HINT
+ *      （全部索引定义清单）—— shard_fileset.c；
+ *   ② 回放 worker：收到提示落盘；撞栅栏时把 FILESET_UPDATE 载荷也落盘
+ *      —— shard_replay.c。回放 worker 没有 catalog，**绝不**在那里跑 DDL；
+ *   ③ 回放启动器：发现"停在栅栏 + 两份待办都在"就自连一个普通 backend，调
+ *      partdist.replay_auto_follow() 对账索引、重配 locmap —— 本文件。
+ */
+bool replay_auto_follow_ddl = true;   /* GUC；声明在文件头 */
+
+static char *
+replay_read_side_file(Oid shard_oid, const char *name, int *len_out)
+{
+    char        path[MAXPGPATH];
+    struct stat st;
+    int         fd;
+    char       *buf;
+
+    *len_out = -1;
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s", DataDir, PARTITION_WAL_DIR, shard_oid, name);
+    if (stat(path, &st) != 0)
+        return NULL;
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return NULL;
+    buf = palloc((Size) st.st_size + 1);
+    if (st.st_size > 0 && read(fd, buf, (size_t) st.st_size) != st.st_size)
+    {
+        CloseTransientFile(fd);
+        pfree(buf);
+        return NULL;
+    }
+    CloseTransientFile(fd);
+    buf[st.st_size] = '\0';
+    *len_out = (int) st.st_size;
+    return buf;
+}
+
+/*
+ * replay_pending_follow(shard oid)
+ *   → (ddl_hint text, roles int[], ords int[], spcs oid[], dbs oid[], relnums oid[])
+ * 没有 pending_fileset 时返回一行全 NULL。
+ */
+PG_FUNCTION_INFO_V1(partdist_replay_pending_follow);
+Datum
+partdist_replay_pending_follow(PG_FUNCTION_ARGS)
+{
+    Oid         shard = PG_GETARG_OID(0);
+    TupleDesc   tupdesc;
+    Datum       values[6];
+    bool        nulls[6] = {true, true, true, true, true, true};
+    int         flen;
+    int         hlen;
+    char       *fbuf;
+    char       *hbuf;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be a row type");
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    fbuf = replay_read_side_file(shard, "pending_fileset", &flen);
+    if (fbuf != NULL && flen >= (int) sizeof(PartWALCtrlFilesetUpdate))
+    {
+        const PartWALCtrlFilesetUpdate *upd = (const PartWALCtrlFilesetUpdate *) fbuf;
+        const ShardFileSetRel *rels = PartWALCtrlFilesetRels(upd);
+        uint32      n = upd->nrels;
+        Datum      *r = palloc(sizeof(Datum) * Max(n, 1));
+        Datum      *o = palloc(sizeof(Datum) * Max(n, 1));
+        Datum      *sp = palloc(sizeof(Datum) * Max(n, 1));
+        Datum      *db = palloc(sizeof(Datum) * Max(n, 1));
+        Datum      *rn = palloc(sizeof(Datum) * Max(n, 1));
+        uint32      i;
+
+        if ((Size) flen < PartWALCtrlFilesetUpdateSize(n))
+            ereport(ERROR,
+                    (errmsg("replay_pending_follow: shard %u 的 pending_fileset 被截断", shard)));
+        for (i = 0; i < n; i++)
+        {
+            r[i]  = Int32GetDatum((int32) rels[i].role);
+            o[i]  = Int32GetDatum((int32) rels[i].ord);
+            sp[i] = ObjectIdGetDatum(rels[i].loc.spcOid);
+            db[i] = ObjectIdGetDatum(rels[i].loc.dbOid);
+            rn[i] = ObjectIdGetDatum((Oid) rels[i].loc.relNumber);
+        }
+        values[1] = PointerGetDatum(construct_array(r,  (int) n, INT4OID, 4, true, TYPALIGN_INT));
+        values[2] = PointerGetDatum(construct_array(o,  (int) n, INT4OID, 4, true, TYPALIGN_INT));
+        values[3] = PointerGetDatum(construct_array(sp, (int) n, OIDOID, 4, true, TYPALIGN_INT));
+        values[4] = PointerGetDatum(construct_array(db, (int) n, OIDOID, 4, true, TYPALIGN_INT));
+        values[5] = PointerGetDatum(construct_array(rn, (int) n, OIDOID, 4, true, TYPALIGN_INT));
+        nulls[1] = nulls[2] = nulls[3] = nulls[4] = nulls[5] = false;
+
+        hbuf = replay_read_side_file(shard, "ddl_hint", &hlen);
+        if (hbuf != NULL)
+        {
+            values[0] = CStringGetTextDatum(hbuf);
+            nulls[0] = false;
+        }
+    }
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * 撞栅栏时记下的重配起效游标（见 shard_replay.c ReplayWritePendingFollow）。
+ * 没有待办时返回 NULL。人工恢复同样该用它作 replay_set_locmap 的第 7 参。
+ */
+PG_FUNCTION_INFO_V1(partdist_replay_pending_base);
+Datum
+partdist_replay_pending_base(PG_FUNCTION_ARGS)
+{
+    Oid     shard = PG_GETARG_OID(0);
+    int     len;
+    char   *buf = replay_read_side_file(shard, "pending_base", &len);
+    uint64  base;
+
+    if (buf == NULL || len != (int) sizeof(uint64))
+        PG_RETURN_NULL();
+    memcpy(&base, buf, sizeof(base));
+    PG_RETURN_INT64((int64) base);
+}
+
+/* 自动跟随完成后清掉待办 */
+PG_FUNCTION_INFO_V1(partdist_replay_pending_follow_clear);
+Datum
+partdist_replay_pending_follow_clear(PG_FUNCTION_ARGS)
+{
+    Oid     shard = PG_GETARG_OID(0);
+    char    path[MAXPGPATH];
+    int     n = 0;
+
+    snprintf(path, MAXPGPATH, "%s/%s/%u/pending_fileset", DataDir, PARTITION_WAL_DIR, shard);
+    if (unlink(path) == 0)
+        n++;
+    snprintf(path, MAXPGPATH, "%s/%s/%u/ddl_hint", DataDir, PARTITION_WAL_DIR, shard);
+    if (unlink(path) == 0)
+        n++;
+    snprintf(path, MAXPGPATH, "%s/%s/%u/pending_base", DataDir, PARTITION_WAL_DIR, shard);
+    (void) unlink(path);
+    PG_RETURN_INT32(n);
+}
+
+/*
+ * indexdef_string(index oid) —— 内核 pg_get_indexdef_string 的 SQL 包装。
+ *
+ * ★ 为什么不直接用 SQL 的 pg_get_indexdef()：leader 侧提示是用
+ *   pg_get_indexdef_string 生成的，两者的格式化参数不同（表空间子句、缩进），
+ *   拿不同格式去做文本对账会把相同的索引判成不同 —— 然后删掉再建一遍。
+ *   两侧必须用同一个生成器。
+ */
+PG_FUNCTION_INFO_V1(partdist_indexdef_string);
+Datum
+partdist_indexdef_string(PG_FUNCTION_ARGS)
+{
+    Oid indexoid = PG_GETARG_OID(0);
+
+    PG_RETURN_TEXT_P(cstring_to_text(pg_get_indexdef_string(indexoid)));
+}
+
+/*
+ * 回放启动器的一轮自动跟随：停在结构栅栏、且两份待办都在的槽位，
+ * 自连 backend 调 partdist.replay_auto_follow()。
+ * 限速：每个槽位至少隔 5 s 才重试一次，失败不刷屏。
+ */
+static void
+LauncherAutoFollowDdl(void)
+{
+    static TimestampTz last_try[REPLAY_MAX_SHARDS];
+    Oid         cand[REPLAY_MAX_SHARDS];
+    int         idx[REPLAY_MAX_SHARDS];
+    int         ncand = 0;
+    int         i;
+    TimestampTz now = GetCurrentTimestamp();
+
+    if (!replay_auto_follow_ddl || ReplayCtl == NULL)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+        if (s->shard_oid != InvalidOid && s->state == REPLAY_NEEDS_STRUCT)
+        {
+            cand[ncand] = s->shard_oid;
+            idx[ncand++] = i;
+        }
+    }
+    LWLockRelease(ReplayCtl->lock);
+
+    for (i = 0; i < ncand; i++)
+    {
+        char        path[MAXPGPATH];
+        struct stat st;
+        char        conninfo[256];
+        char        sql[128];
+        PGconn     *conn;
+        PGresult   *res;
+
+        snprintf(path, MAXPGPATH, "%s/%s/%u/pending_fileset",
+                 DataDir, PARTITION_WAL_DIR, cand[i]);
+        if (stat(path, &st) != 0)
+            continue;           /* 不是 DDL 引起的栅栏，留给人 */
+        if (!TimestampDifferenceExceeds(last_try[idx[i]], now, 5000))
+            continue;
+        last_try[idx[i]] = now;
+
+        snprintf(conninfo, sizeof(conninfo),
+                 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
+                 PostPortNumber);
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            PQfinish(conn);
+            continue;
+        }
+        snprintf(sql, sizeof(sql), "SELECT partdist.replay_auto_follow(%u)", cand[i]);
+        res = PQexec(conn, sql);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
+        {
+            const char *out = PQgetvalue(res, 0, 0);
+
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: shard %u DDL 自动跟随：%s",
+                            cand[i], out)));
+            /* 没跟上（no-hint 等需人工的情形）：退避到 60 s，别每 5 s 刷一条 */
+            if (strncmp(out, "followed", 8) != 0)
+                last_try[idx[i]] = now + 55 * USECS_PER_SEC;
+        }
+        else
+        {
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: shard %u DDL 自动跟随失败，稍后重试：%s",
+                            cand[i], PQerrorMessage(conn))));
+            last_try[idx[i]] = now + 55 * USECS_PER_SEC;
+        }
+        PQclear(res);
+        PQfinish(conn);
+    }
 }

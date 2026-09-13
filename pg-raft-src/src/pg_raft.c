@@ -1029,6 +1029,16 @@ _PG_init(void)
                                    "Raft cluster members: 'id@host:port,...' (include self).",
                                    NULL, &pg_raft_peers, "",
                                    PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+        /*
+         * T7.23（P7-R2）：每节点 Raft 组数上限（含控制面组）。决定共享内存里
+         * 组表的大小，所以只能在启动时定。每组约 104 KB（日志环 128 条）。
+         */
+        DefineCustomIntVariable("pg_raft.max_groups",
+                                "Maximum Raft groups per node (including the control group).",
+                                "Sizes the shared group table at startup; ~104 KB per group.",
+                                &pg_raft_max_groups, 32, 2, 4096,
+                                PGC_POSTMASTER, 0, NULL, NULL, NULL);
     }
 
     if (!process_shared_preload_libraries_in_progress)

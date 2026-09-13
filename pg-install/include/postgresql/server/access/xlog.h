@@ -199,6 +199,8 @@ extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
 								   int num_fpi,
 								   bool topxid_included);
 extern void XLogFlush(XLogRecPtr record);
+/* pg_partdist 补丁 0010：在线推进本地 WAL 插入位点（升主，FRD §11 步骤 4） */
+extern void XLogRequestInsertPositionAdvance(XLogRecPtr target);
 extern bool XLogBackgroundFlush(void);
 extern bool XLogNeedsFlush(XLogRecPtr record);
 extern int	XLogFileInit(XLogSegNo logsegno, TimeLineID logtli);
