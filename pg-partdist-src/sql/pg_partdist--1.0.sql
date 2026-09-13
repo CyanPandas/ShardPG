@@ -1193,6 +1193,19 @@ CREATE OR REPLACE FUNCTION route_status(p_shard OID)
 COMMENT ON FUNCTION route_status(OID) IS
     'FRD §11 步骤 5 的观测面：该分片在**本节点**上的角色（promoted / replica_or_plain）、写入会不会被 wal_insert_hook 捕获、fileset 成员数、分配器水位。此前这三件事分散在 replay_status() / 文件系统 / shard_xid_next()，交接出问题时最需要的恰恰是这一句。';
 
+-- T7.27（P7-W2）：捕获环观测面
+CREATE OR REPLACE FUNCTION partwal_ring_stats(
+    OUT capacity INTEGER,
+    OUT unconsumed INTEGER,
+    OUT overwrites BIGINT,
+    OUT backpressure_flushes BIGINT,
+    OUT diverged_pending BOOLEAN
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_partwal_ring_stats';
+
+COMMENT ON FUNCTION partwal_ring_stats() IS
+    'T7.27/P7-W2：全节点共享捕获环的容量、未消费槽位数、累计覆盖次数（>0 即有记录没进分区流、副本缺记录）、写路径背压排空次数、是否有待自动修复的分叉标记。';
+
 CREATE OR REPLACE FUNCTION repair_diverged_shards()
     RETURNS TEXT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';

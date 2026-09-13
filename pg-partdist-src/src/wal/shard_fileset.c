@@ -2033,6 +2033,9 @@ ShardMarkDiverged(Oid shard_oid, const char *reason)
                 (errcode_for_file_access(),
                  errmsg("pg_partdist: 分叉标记 \"%s\" 落盘不完整: %m", path)));
     CloseTransientFile(fd);
+
+    /* T7.27：通知心跳工作者有新标记待自动修复 */
+    PartWALNoteDivergedPending();
 }
 
 /* 返回标记内容（palloc），没有标记返回 NULL */
@@ -2235,25 +2238,49 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
          * 只对本节点是组 leader 的分片动手。判据与写栅栏同源 —— 副本上发基线
          * 一定被拒，硬试只会把一个可读的报告变成一串 ERROR。
          */
-        PG_TRY();
+        /*
+         * ★ T7.27：每个分片包一层**子事务**。原先是裸 PG_TRY + FlushErrorState 之后
+         *   接着干 —— 基线发射半路 ERROR 时持有的锁、buffer pin、打开的段文件都没人
+         *   释放，后面的分片在一个"出过错但没回滚"的事务状态里继续跑。手工偶尔
+         *   调一次侥幸无事；心跳要周期性地自动调它，就不能再侥幸了。
+         */
         {
-            (void) ShardBaselineEmit(shard);   /* 成功即清标 */
-            nrepaired++;
-            appendStringInfo(&out, " repaired:%u", shard);
+            MemoryContext   oldctx = CurrentMemoryContext;
+            ResourceOwner   oldowner = CurrentResourceOwner;
+
+            BeginInternalSubTransaction(NULL);
+            MemoryContextSwitchTo(oldctx);
+            PG_TRY();
+            {
+                (void) ShardBaselineEmit(shard);   /* 成功即清标 */
+                ReleaseCurrentSubTransaction();
+                MemoryContextSwitchTo(oldctx);
+                CurrentResourceOwner = oldowner;
+                nrepaired++;
+                appendStringInfo(&out, " repaired:%u", shard);
+            }
+            PG_CATCH();
+            {
+                /* 发不出去（多半不是 leader / 多数派没恢复）：留标记，报出来 */
+                MemoryContextSwitchTo(oldctx);
+                FlushErrorState();
+                RollbackAndReleaseCurrentSubTransaction();
+                MemoryContextSwitchTo(oldctx);
+                CurrentResourceOwner = oldowner;
+                nskipped++;
+                appendStringInfo(&out, " skipped:%u", shard);
+            }
+            PG_END_TRY();
         }
-        PG_CATCH();
-        {
-            /* 发不出去（多半不是 leader / 多数派没恢复）：留标记，报出来 */
-            FlushErrorState();
-            nskipped++;
-            appendStringInfo(&out, " skipped:%u", shard);
-        }
-        PG_END_TRY();
     }
     FreeDir(d);
 
     {
         StringInfoData s2;
+
+        /* 修不掉的留给下一轮自动修复（节点级限流，见 PartWALDivergedRepairDue） */
+        if (nskipped > 0)
+            PartWALNoteDivergedPending();
 
         initStringInfo(&s2);
         appendStringInfo(&s2, "repaired=%d skipped=%d stale_cleaned=%d%s",

@@ -72,6 +72,8 @@ typedef struct PartWALSlot
  * PartWAL shared control structure -- mirrors XLogCtlData.
  * One lock covers both the ring buffer and the relfilenode hash.
  */
+#define PARTWAL_LOST_MAX 16
+
 typedef struct PartWALCtlData
 {
     LWLock        *lock;            /* protects all fields below */
@@ -80,6 +82,26 @@ typedef struct PartWALCtlData
     TimestampTz    freeze_last_check;  /* §13 约束 5：上次冻结账目检查的时刻。
                                          * **必须是节点级共享的**，不能是 backend
                                          * 本地 static —— 见 PartWALFreezeCheckDue */
+
+    /*
+     * T7.27（P7-W2）：捕获环的背压与溢出记账。
+     *
+     * nvalid          未消费槽位数。写路径钩子据此判断要不要就地排空（背压）。
+     * ring_overwrites 累计覆盖次数；覆盖 = 有记录没进分区流 = 副本少一条。
+     * lost_parts      被覆盖记录所属的分区（去重），由下一次 PartWALFlush 取走并
+     *                 打分叉标记；装不下即 lost_overflow（那时对全部分区打标）。
+     * diverged_pending 有新的分叉标记待自动修复（心跳工作者看它决定要不要自连
+     *                 调 repair_diverged_shards）。启动时置 true，覆盖重启前留下的标记。
+     */
+    int            nvalid;
+    uint64         ring_overwrites;
+    uint64         backpressure_flushes;
+    int            nlost;
+    bool           lost_overflow;
+    Oid            lost_parts[PARTWAL_LOST_MAX];
+    bool           diverged_pending;
+    TimestampTz    repair_last_try;
+
     PartWALSlot    slots[PARTWAL_BUFFER_SLOTS];
 } PartWALCtlData;
 
@@ -126,6 +148,18 @@ extern bool  PartWALHasPendingRecords(void);
  * 表现是 R1 的 TOAST 文件大小两侧对不上。
  */
 extern bool  PartWALFreezeCheckDue(int interval_ms);
+
+/*
+ * T7.27（P7-W2）捕获环背压：由补丁 0005 的写路径钩子（heap 插入/更新/删除开头，
+ * 不在临界区、不持 buffer 锁）调用。环占用过高水位、且本后端有待排空记录时，
+ * 就地 PartWALFlush(Invalid, false) —— 大事务不再能把环写爆。
+ */
+extern int   partwal_ring_high_water;
+extern void  PartWALBackpressure(void);
+
+/* 有新的分叉标记待修复（ShardMarkDiverged 调）；到期判定（心跳调，节点级限流） */
+extern void  PartWALNoteDivergedPending(void);
+extern bool  PartWALDivergedRepairDue(int interval_ms);
 
 /*
  * 给一个分区追加一条 CTRL 控制记录并就地复制（FRD §7.7/§12）。

@@ -13,6 +13,7 @@
 #include "shard_clog.h"
 #include "shard_vacuum.h"
 #include "shard_guard.h"
+#include "partwal_sync.h"		/* T7.27：写路径背压 */
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
@@ -1500,8 +1501,18 @@ static bool
 shard_relation_xid_impl(struct RelationData *relation, bool assign,
 						TransactionId *sxid)
 {
-	Oid			shard = ShardXidRelidLookup((Relation) relation);
+	Oid			shard;
 
+	/*
+	 * T7.27（P7-W2）：写路径的背压点。补丁 0005 在 heap_insert / multi_insert /
+	 * update / delete 的**开头**以 assign=true 调本钩子 —— 那时不在临界区、
+	 * 不持 buffer 锁，是整条写路径上唯一能安全排空捕获环的位置。
+	 * 对所有关系都调（被捕获的分区表不一定打标）；不需要排空时是几次整型比较。
+	 */
+	if (assign)
+		PartWALBackpressure();
+
+	shard = ShardXidRelidLookup((Relation) relation);
 	if (!OidIsValid(shard))
 		return false;
 	if (assign)

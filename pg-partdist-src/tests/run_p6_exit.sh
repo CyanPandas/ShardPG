@@ -90,6 +90,8 @@ SUITES=(
   "logical_repl_guard_p7   900  P7"   # T7.22（R-P6-14）逻辑复制协议入口禁令
   "ddl_auto_follow_p7     1500  D1"   # T7.25（P7-R4）DDL 自动跟随
   "raft_groups_p7         1500  R2"   # T7.23（P7-R2）组数上限可配 + 整表供副本
+  "replica_prune_guard_p7 1200  P7"   # T7.26（P7-P1）回放壳表不许被原生剪枝清掉
+  "partwal_ring_p7         900  P7"   # T7.27（P7-W2）捕获环背压 + 溢出记账 + 分叉自愈
   # ── ops 时代那 8 套：**2026-09-11 起并入门禁**（T7.13 完成，口径 31 → 39）
   #   拓扑无关化后逐套跑绿：shard_auto_init 5/0、segment_boundary_lsn 6/0、
   #   crash_recovery 36/0、demux_backlog_recovery 29/0、corrupt_segment_recovery 44/0、

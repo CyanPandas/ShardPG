@@ -171,6 +171,56 @@ ReplayShmemInit(void)
 /* ================================================================== */
 
 bool allow_replica_access = false;   /* GUC：见 shard_replay.h 的说明 */
+bool replica_prune_guard = true;     /* GUC：T7.26，见 shard_replay.h */
+
+/*
+ * ShardReplayProtectedRel — T7.26（P7-P1）剪枝守卫的判据。
+ *
+ * ★ 与 ShardReplicaIsLocal 的区别：那个是**访问闸门**的判据，已升主的分片要放行
+ *   （T6.8）；这个是**回收判活**的判据，升主之后恰恰最需要它 —— 新主页面上的元组
+ *   仍是旧 leader 发的号，本机 clog 对它们毫无意义。所以只要槽位里配过对就算，
+ *   不看 promoted、不看 armed。
+ *
+ * ★ 调用点在 HeapTupleSatisfiesVacuumHorizon 里，**每个元组一次**，且持有 buffer
+ *   内容锁。所以：①无副本时零成本返回；②集合按代次缓存在本后端，代次不变不取锁；
+ *   ③代次变了才取一次共享锁重建（补丁 0002 的豁免钩子在刷页路径上已经是
+ *   "buffer 锁 → ReplayCtl->lock" 这个顺序，这里与之一致，不引入新的锁序）。
+ */
+bool
+ShardReplayProtectedRel(Oid relid)
+{
+    static uint64 cached_gen = PG_UINT64_MAX;
+    static int    ncached = 0;
+    static Oid    cached[2 * REPLAY_MAX_SHARDS];
+    int           i;
+
+    if (!replica_prune_guard || !OidIsValid(relid) ||
+        ReplayCtl == NULL || ReplayCtl->nreplicas == 0)
+        return false;
+
+    if (ReplayCtl->protect_gen != cached_gen)
+    {
+        LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+        ncached = 0;
+        for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        {
+            ReplayShardSlot *s = &ReplayCtl->slots[i];
+
+            if (s->shard_oid == InvalidOid || s->nlocs == 0)
+                continue;
+            cached[ncached++] = s->shard_oid;
+            if (OidIsValid(s->toast_oid))
+                cached[ncached++] = s->toast_oid;
+        }
+        cached_gen = ReplayCtl->protect_gen;
+        LWLockRelease(ReplayCtl->lock);
+    }
+
+    for (i = 0; i < ncached; i++)
+        if (cached[i] == relid)
+            return true;
+    return false;
+}
 
 /*
  * ShardReplicaIsLocal — 本节点上这个 relid 是不是副本壳表（T6.3c）。
@@ -551,6 +601,25 @@ ReplaySlotLoadLocsLocked(ReplayShardSlot *s)
         if (j == s->nlocs && s->nlocs < SHARD_FILESET_MAX_RELS)
             s->locs[s->nlocs++] = lm.pairs[i].local_loc.relNumber;
     }
+
+    /* T7.26：TOAST OID（旁路文件由 replay_set_locmap 写；没有即无 TOAST 或旧副本） */
+    {
+        char    path[MAXPGPATH];
+        int     fd;
+        Oid     toast = InvalidOid;
+
+        snprintf(path, MAXPGPATH, "%s/%s/%u/%s", DataDir, PARTITION_WAL_DIR,
+                 s->shard_oid, REPLAY_PROTECT_TOAST_FILENAME);
+        fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+        if (fd >= 0)
+        {
+            if (read(fd, &toast, sizeof(toast)) != sizeof(toast))
+                toast = InvalidOid;
+            CloseTransientFile(fd);
+        }
+        s->toast_oid = toast;
+    }
+    ReplayCtl->protect_gen++;
 }
 
 static void
@@ -563,6 +632,7 @@ ReplayRecountReplicasLocked(void)
             ReplayCtl->slots[i].nlocs > 0)
             n++;
     ReplayCtl->nreplicas = n;
+    ReplayCtl->protect_gen++;
 }
 
 /* ================================================================== */
@@ -1396,6 +1466,8 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
         memset(s, 0, sizeof(ReplayShardSlot));
         nslots++;
     }
+    if (nslots > 0)
+        ReplayRecountReplicasLocked();
     LWLockRelease(ReplayCtl->lock);
 
     /* ---- 2) 删目录：关系已不存在、且过了宽限期 ---- */
@@ -1836,6 +1908,35 @@ pg_partdist_replay_set_locmap(PG_FUNCTION_ARGS)
             ereport(LOG,
                     (errmsg("pg_partdist replay: 建槽前回收了 %d 个陈旧槽位、"
                             "%d 个陈旧目录", freed, removed)));
+    }
+
+    /*
+     * T7.26（P7-P1）：记下壳表的 TOAST OID，供剪枝守卫在无 catalog 的判活路径上
+     * 认出 TOAST 元组。必须在槽位加载**之前**写好。
+     */
+    {
+        Relation rel = relation_open(local_relid, AccessShareLock);
+        Oid      toast = rel->rd_rel->reltoastrelid;
+        char     path[MAXPGPATH];
+        char     tmp[MAXPGPATH];
+        int      fd;
+
+        relation_close(rel, AccessShareLock);
+        snprintf(path, MAXPGPATH, "%s/%s/%u/%s", DataDir, PARTITION_WAL_DIR,
+                 local_relid, REPLAY_PROTECT_TOAST_FILENAME);
+        snprintf(tmp, MAXPGPATH, "%s.tmp", path);
+        fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+        if (fd < 0 || write(fd, &toast, sizeof(toast)) != sizeof(toast) ||
+            pg_fsync(fd) != 0)
+        {
+            if (fd >= 0)
+                CloseTransientFile(fd);
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("replay_set_locmap: 写剪枝守卫旁路文件 \"%s\" 失败: %m", tmp)));
+        }
+        CloseTransientFile(fd);
+        durable_rename(tmp, path, ERROR);
     }
 
     /* 槽位登记（豁免钩子即刻生效；enabled 仍需 replay_enable） */

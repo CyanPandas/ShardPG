@@ -27,6 +27,7 @@
 #include "tso.h"
 #include "shard_visibility.h"
 #include "shard_route.h"
+#include "shard_replay.h"		/* T7.26：剪枝守卫判据 */
 #include "enhanced_clog.h"
 
 #include "access/heapam.h"
@@ -290,7 +291,14 @@ ShardAccessGate(Oid shard, const char *what)
 static bool
 sv_is_shard_rel(Oid tableOid)
 {
-	return OidIsValid(ShardXidLookupByOid(tableOid));
+	/*
+	 * T7.26（P7-P1）：回放壳表（及其 TOAST 表）也算。补丁 0006 只在
+	 * HeapTupleSatisfiesVacuumHorizon 与逻辑解码的历史快照里调本钩子 ——
+	 * 前者正是 on-access 剪枝 / VACUUM / 建索引扫描判活的入口；后者对壳表
+	 * 报错本来就对。satisfies_mvcc 等不经本钩子，R3 读路径不受影响。
+	 */
+	return OidIsValid(ShardXidLookupByOid(tableOid)) ||
+		ShardReplayProtectedRel(tableOid);
 }
 
 /* ---- R3 读路径：回放来的壳表（FOLLOWER_REPLAY_DESIGN.md §9.4/§10） ---- */
@@ -752,7 +760,36 @@ sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
 
 	if (!OidIsValid(shard))
+	{
+		/*
+		 * ★ T7.26（P7-P1）：回放壳表的元组 —— **一律判为不可回收**。
+		 *
+		 * 缺陷原形：补丁 0005 的剪枝豁免只认"打过标"的关系。没打标的分布表，
+		 * 副本（以及升主后的新主）页面上的元组带的是**旧 leader 发的原生 xid**，
+		 * 本机 clog 对这些号要么是空洞（读作中止）、要么撞上本机同号的无关事务。
+		 * 于是一条普通 SELECT 碰上"带 pd_prune_xid 且快满"的页，on-access 剪枝就
+		 * 按本机 clog 把已提交的行判成 DEAD 就地清掉，还写本地 WAL（副本从此分叉）。
+		 *
+		 * 为什么不做"按 R3 精确判活"：判 DEAD 的后果是**不可逆地删数据**，而 R3
+		 * 只覆盖读（satisfies_mvcc），xid_map/gclog 的边界情形（未回放完、升主后
+		 * 本机新号与回放号混杂）在这里判错一次就是丢行。回收推迟到 R4 或重做
+		 * 物理基线；代价是壳表上的死元组暂时收不回来（膨胀），不是正确性。
+		 *
+		 *   未删（或只是加锁）⇒ LIVE；被删 ⇒ RECENTLY_DEAD（内核会配一个最新的
+		 *   dead_after，调用方的"能否回收"判定恒走保守分支）。
+		 */
+		if (ShardReplayProtectedRel(htup->t_tableOid))
+		{
+			if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
+				!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+				HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+				*res = (int) HEAPTUPLE_LIVE;
+			else
+				*res = (int) HEAPTUPLE_RECENTLY_DEAD;
+			return true;
+		}
 		return false;
+	}
 
 	if (IsAutoVacuumWorkerProcess())
 		ereport(ERROR,

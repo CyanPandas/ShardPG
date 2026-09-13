@@ -277,6 +277,9 @@ typedef uint64 (*ShardReplayCatchUpFn) (Oid shard_oid, uint64 bound,
 /* replay_enable（= armed）的持久化标记文件（pg_parwal/<oid>/ 下） */
 #define REPLAY_ENABLED_FILENAME "replay_enabled"
 
+/* T7.26：壳表 TOAST OID 的旁路文件（剪枝守卫用；pg_parwal/<oid>/ 下，4 字节） */
+#define REPLAY_PROTECT_TOAST_FILENAME "protect_toast"
+
 /*
  * 回放状态机（惰性形态）。
  *
@@ -347,16 +350,40 @@ typedef struct ReplayShardSlot
 
     /* U-P5-1 之二：leader 发号水位的交接位（0 = 无待落盘的值）*/
     TransactionId      alloc_wm;
+
+    /*
+     * T7.26（P7-P1）：壳表的 TOAST 表 OID。剪枝守卫要按**元组的 t_tableOid**
+     * 认"这是回放来的关系"，而 TOAST 元组的 t_tableOid 是 TOAST 表自己的 OID ——
+     * 只认主堆的话，大字段所在的 TOAST 页照样会被原生剪枝清掉。判活钩子里不许
+     * 碰 catalog，所以在 replay_set_locmap（有 catalog）时写进分片目录的旁路文件，
+     * 槽位加载时读回来。
+     */
+    Oid                toast_oid;
 } ReplayShardSlot;
 
 typedef struct ReplayCtlData
 {
     LWLock *lock;
     int     nreplicas;      /* 有 locs 的槽位数；0 = 豁免钩子快速返回 */
+
+    /*
+     * T7.26：受保护关系集合（各槽位的壳表主堆 + TOAST）的代次。凡改动
+     * shard_oid / toast_oid / nlocs 都 +1；判活钩子在每个后端缓存一份集合，
+     * 代次没变就不取锁 —— 那条路径每个元组调一次。
+     */
+    uint64  protect_gen;
     ReplayShardSlot slots[REPLAY_MAX_SHARDS];
 } ReplayCtlData;
 
 extern PGDLLIMPORT ReplayCtlData *ReplayCtl;
+
+/*
+ * T7.26（P7-P1）：本关系是不是**回放来的**壳表（或其 TOAST 表），不论副本还是
+ * 已升主。补丁 0006/0008 的判活钩子据此对它的元组一律判"不可回收"。
+ * 不碰 catalog；GUC pg_partdist.replica_prune_guard=off 时恒 false（仅取证对照用）。
+ */
+extern bool replica_prune_guard;
+extern bool ShardReplayProtectedRel(Oid relid);
 
 extern void RequestReplayShmem(void);
 extern void ReplayShmemInit(void);

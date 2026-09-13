@@ -13,6 +13,7 @@
 #include "partwal_sync.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
+#include "shard_vacuum.h"
 #include "global_mvcc.h"
 #include "dtx_participant.h"
 #include "shard_xid.h"
@@ -583,6 +584,58 @@ _PG_init(void)
         false,
         PGC_SUSET,
         0,
+        NULL, NULL, NULL
+    );
+
+    /*
+     * T7.26（P7-P1）：回放壳表的剪枝守卫。**不是**调优开关 —— 关掉即恢复旧的
+     * 危险行为（普通读触发的原生剪枝按本机 clog 清掉回放来的已提交行）。
+     * 存在的唯一理由是验收里做"关掉就会剪"的对照，证明守卫真的在起作用。
+     * PGC_SUSET：普通用户动不了。
+     */
+    DefineCustomBoolVariable(
+        "pg_partdist.replica_prune_guard",
+        "回放壳表（副本/已升主）的元组一律判为不可回收（默认 on）。",
+        "壳表元组带其他节点发的 xid，本机 clog 对它们无意义；关掉后 on-access 剪枝与 "
+        "VACUUM 会按本机 clog 把已提交的行当垃圾清掉。仅供取证对照，生产不得关闭。",
+        &replica_prune_guard,
+        true,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL
+    );
+
+    /* T7.27（P7-W2）：捕获环背压与分叉自动修复 */
+    DefineCustomIntVariable(
+        "pg_partdist.partwal_ring_high_water",
+        "捕获环占用达到该百分比时，写路径就地排空（背压）。0 = 关闭。",
+        "捕获环是全节点共享的 8192 槽，满了只能覆盖未消费的记录（副本缺记录）。"
+        "背压在 heap 插入/更新/删除开头触发，不在临界区；关掉后单个大事务即可把环写爆。",
+        &partwal_ring_high_water,
+        50, 0, 95,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
+        "pg_partdist.auto_repair_diverged",
+        "心跳工作者自动对带分叉标记的分片重做物理基线（默认 on）。",
+        "标记来源：复制挂钩失败、重传内容不一致（R-P4-13）、捕获环溢出（P7-W2）。"
+        "本节点不是组 leader 的分片发不出基线，留待下一轮。",
+        &shard_auto_repair_diverged,
+        true,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomIntVariable(
+        "pg_partdist.auto_repair_interval_s",
+        "分叉标记自动修复的节点级最小间隔（秒）。",
+        NULL,
+        &shard_auto_repair_interval_s,
+        60, 5, 86400,
+        PGC_SIGHUP,
+        GUC_UNIT_S,
         NULL, NULL, NULL
     );
 

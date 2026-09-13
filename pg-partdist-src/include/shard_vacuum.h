@@ -156,4 +156,9 @@ extern bool shard_vacuum_truncate_enabled;
 /* 心跳工作者的自连触发（无 DB 语境时用） */
 extern void ShardVacuumSelfTriggerAuto(void);
 
+/* T7.27：分叉标记自动修复（心跳工作者调） */
+extern bool shard_auto_repair_diverged;
+extern int  shard_auto_repair_interval_s;
+extern void ShardDivergedSelfTriggerRepair(void);
+
 #endif							/* SHARD_VACUUM_H */

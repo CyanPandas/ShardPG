@@ -61,6 +61,7 @@
 
 #include "shard_clog.h"
 #include "shard_vacuum.h"
+#include "partwal_sync.h"	/* T7.27：分叉自动修复的触发位 */
 #include "shard_xid.h"
 
 /*
@@ -1643,6 +1644,54 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
  *   （只走完 BaseInit，不连任何库）。自连出一个干净 backend 是既有做法，
  *   也顺带把"一次调用占住多久"限制在那个 backend 里，不拖住心跳。
  */
+/*
+ * T7.27（P7-W2 闭环）：分叉标记的自动修复。
+ *
+ * 标记由三处写下：复制挂钩失败、副本收到与已提交记录不一致的重传（R-P4-13）、
+ * 捕获环溢出（P7-W2）。此前修复全靠人手调 repair_diverged_shards()，或者等下一次
+ * 升主顺带跑一次 —— 标记写下之后可能几天没人看。这里由心跳按节点级限流周期性
+ * 自连调用；本节点不是组 leader 的分片会被 skipped（发不出基线），留待下一轮。
+ */
+bool		shard_auto_repair_diverged = true;	/* GUC，见 pg_partdist.c */
+int			shard_auto_repair_interval_s = 60;
+
+void
+ShardDivergedSelfTriggerRepair(void)
+{
+	char		conninfo[256];
+	PGconn	   *conn;
+	PGresult   *res;
+
+	snprintf(conninfo, sizeof(conninfo),
+			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
+			 PostPortNumber);
+	conn = PQconnectdb(conninfo);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		PQfinish(conn);
+		PartWALNoteDivergedPending();	/* 连不上：下一轮再试 */
+		return;
+	}
+	res = PQexec(conn, "SELECT partdist.repair_diverged_shards()");
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
+	{
+		const char *out = PQgetvalue(res, 0, 0);
+
+		if (strncmp(out, "repaired=0 skipped=0 stale_cleaned=0", 36) != 0)
+			ereport(LOG,
+					(errmsg("pg_partdist: 分叉标记自动修复：%s", out)));
+	}
+	else
+	{
+		ereport(LOG,
+				(errmsg("pg_partdist: 分叉标记自动修复调用失败：%s",
+						PQerrorMessage(conn))));
+		PartWALNoteDivergedPending();
+	}
+	PQclear(res);
+	PQfinish(conn);
+}
+
 void
 ShardVacuumSelfTriggerAuto(void)
 {

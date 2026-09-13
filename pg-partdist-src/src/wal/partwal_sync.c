@@ -52,6 +52,8 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "fmgr.h"
+#include "access/htup_details.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -263,6 +265,13 @@ PartWALSyncShmemInit(void)
         PartWALCtl->write_pos         = 0;
         PartWALCtl->flushed_upto      = InvalidXLogRecPtr;
         PartWALCtl->freeze_last_check = 0;
+        PartWALCtl->nvalid            = 0;
+        PartWALCtl->ring_overwrites   = 0;
+        PartWALCtl->backpressure_flushes = 0;
+        PartWALCtl->nlost             = 0;
+        PartWALCtl->lost_overflow     = false;
+        PartWALCtl->diverged_pending  = true;   /* 重启前留下的分叉标记也要修 */
+        PartWALCtl->repair_last_try   = 0;
         memset(PartWALCtl->slots, 0, sizeof(PartWALCtl->slots));
     }
 
@@ -400,10 +409,36 @@ PartWALInsert(XLogRecPtr end_lsn,
          */
         slot = &PartWALCtl->slots[PartWALCtl->write_pos];
         if (slot->valid)
+        {
+            /*
+             * ★ T7.27（P7-W2）：覆盖 = 那条记录永远进不了分区流 = 副本少一条。
+             *   这里在 XLogInsert 里（多半在临界区），既不能等也不能 ERROR，
+             *   只能**记账**：记下它属于哪个分区，下一次 PartWALFlush 给该分区
+             *   打分叉标记，由心跳自动重做物理基线。此前只有这条 WARNING ——
+             *   日志里一闪而过，副本从此静默少页。
+             *   正常负载下走不到这里：写路径钩子在环过半时就地排空（背压）。
+             */
+            int k;
+
+            PartWALCtl->ring_overwrites++;
+            for (k = 0; k < PartWALCtl->nlost; k++)
+                if (PartWALCtl->lost_parts[k] == slot->partition_id)
+                    break;
+            if (k == PartWALCtl->nlost)
+            {
+                if (PartWALCtl->nlost < PARTWAL_LOST_MAX)
+                    PartWALCtl->lost_parts[PartWALCtl->nlost++] = slot->partition_id;
+                else
+                    PartWALCtl->lost_overflow = true;
+            }
             ereport(WARNING,
                     (errmsg("pg_partdist: PartWAL ring buffer full at slot %d; "
-                            "overwriting unconsumed entry",
-                            PartWALCtl->write_pos)));
+                            "overwriting unconsumed entry of partition %u "
+                            "（副本将缺这条记录，已记账待标分叉）",
+                            PartWALCtl->write_pos, slot->partition_id)));
+        }
+        else
+            PartWALCtl->nvalid++;
 
         /*
          * 记下分区号供出锁后登记触达集合 —— entry 指向共享哈希表，
@@ -1162,8 +1197,170 @@ PartWALReplicateTouched(void)
     }
 }
 
+/* ================================================================== */
+/* T7.27（P7-W2）：捕获环背压 + 溢出记账 + 自动修复的触发位             */
+/* ================================================================== */
+
+int  partwal_ring_high_water = 50;      /* GUC：占用百分比；0 = 关闭背压 */
+static bool partwal_in_flush = false;   /* 本后端正在 PartWALFlush 里（含复制挂钩的嵌套 SPI） */
+
+static void PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker);
+
+/*
+ * 把覆盖记账取走，给对应分区打分叉标记。锁外做：打标要写文件。
+ *
+ * 为什么是"打标 + 自动重做基线"而不是"让事务 ERROR"：被覆盖的记录不一定属于
+ * 当前事务，而且有些写入（VACUUM 的剪枝/截断）是**非事务**的 —— 事务回滚了，
+ * leader 页面上的改动还在。唯一对所有情形都成立的修复是让副本重新对齐
+ * leader 的物理页面，也就是重做物理基线（FULL_BASELINE 会先截断副本全部成员）。
+ */
+static void
+PartWALHandleLostRecords(void)
+{
+    Oid     parts[PARTWAL_LOST_MAX];
+    int     n = 0;
+    int     i;
+    bool    overflow;
+    uint64  total;
+    char    reason[256];
+
+    if (PartWALCtl == NULL ||
+        (PartWALCtl->nlost == 0 && !PartWALCtl->lost_overflow))
+        return;                 /* 无锁快门：绝大多数调用在这里返回 */
+
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    n = PartWALCtl->nlost;
+    memcpy(parts, PartWALCtl->lost_parts, sizeof(Oid) * n);
+    overflow = PartWALCtl->lost_overflow;
+    total = PartWALCtl->ring_overwrites;
+    PartWALCtl->nlost = 0;
+    PartWALCtl->lost_overflow = false;
+    LWLockRelease(PartWALCtl->lock);
+
+    snprintf(reason, sizeof(reason),
+             "捕获环溢出：未消费的分区 WAL 记录被覆盖（累计覆盖 %llu 次，P7-W2）",
+             (unsigned long long) total);
+
+    if (overflow)
+    {
+        Oid     all[PARTWAL_LOST_MAX * 64];
+        int     nall = PartWALSyncListPartitions(all, lengthof(all));
+
+        for (i = 0; i < nall; i++)
+            ShardMarkDiverged(all[i], reason);
+        n = nall;
+    }
+    else
+        for (i = 0; i < n; i++)
+            ShardMarkDiverged(parts[i], reason);
+
+    ereport(WARNING,
+            (errmsg("pg_partdist: 捕获环溢出，%d 个分区的副本缺记录，已标记分叉%s",
+                    n, overflow ? "（受影响分区超过记账上限，已对全部捕获分区打标）" : ""),
+             errdetail("累计覆盖 %llu 次。被覆盖的记录永远进不了分区流。",
+                       (unsigned long long) total),
+             errhint("心跳工作者会自动调 partdist.repair_diverged_shards() 重做物理基线；"
+                     "也可手工调用。持续出现说明有不经写路径钩子的大批量写入（如大表 VACUUM）。")));
+}
+
+void
+PartWALBackpressure(void)
+{
+    int high;
+
+    if (PartWALCtl == NULL || partwal_ring_high_water <= 0 ||
+        partwal_in_flush || CritSectionCount > 0)
+        return;
+    if (partwal_my_max_lsn == InvalidXLogRecPtr)
+        return;                 /* 本后端没有待排空的记录 —— 它排不动别人的 */
+
+    high = (PARTWAL_BUFFER_SLOTS * partwal_ring_high_water) / 100;
+    if (PartWALCtl->nvalid < high)
+        return;                 /* 无锁读：差一两个不要紧，下一行再判 */
+    if (!IsTransactionState())
+        return;
+
+    PartWALCtl->backpressure_flushes++;     /* 观测计数，不要求精确 */
+    PartWALFlush(InvalidXLogRecPtr, false);
+}
+
+void
+PartWALNoteDivergedPending(void)
+{
+    if (PartWALCtl != NULL)
+        PartWALCtl->diverged_pending = true;
+}
+
+bool
+PartWALDivergedRepairDue(int interval_ms)
+{
+    TimestampTz now = GetCurrentTimestamp();
+    bool        due = false;
+
+    if (PartWALCtl == NULL || !PartWALCtl->diverged_pending)
+        return false;
+
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    if (PartWALCtl->diverged_pending &&
+        TimestampDifferenceExceeds(PartWALCtl->repair_last_try, now, interval_ms))
+    {
+        PartWALCtl->repair_last_try = now;
+        PartWALCtl->diverged_pending = false;   /* 修不掉的由修复函数重新置位 */
+        due = true;
+    }
+    LWLockRelease(PartWALCtl->lock);
+    return due;
+}
+
+/* 观测面：partdist.partwal_ring_stats() */
+PG_FUNCTION_INFO_V1(partdist_partwal_ring_stats);
+Datum
+partdist_partwal_ring_stats(PG_FUNCTION_ARGS)
+{
+    TupleDesc   tupdesc;
+    Datum       values[5];
+    bool        nulls[5] = {false, false, false, false, false};
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be a row type");
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    if (PartWALCtl == NULL)
+        PG_RETURN_NULL();
+    LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+    values[0] = Int32GetDatum(PARTWAL_BUFFER_SLOTS);
+    values[1] = Int32GetDatum(PartWALCtl->nvalid);
+    values[2] = Int64GetDatum((int64) PartWALCtl->ring_overwrites);
+    values[3] = Int64GetDatum((int64) PartWALCtl->backpressure_flushes);
+    values[4] = BoolGetDatum(PartWALCtl->diverged_pending);
+    LWLockRelease(PartWALCtl->lock);
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * PartWALFlush —— 对外入口：先处理溢出记账，再做真正的排空。
+ * partwal_in_flush 让复制挂钩里嵌套的 SPI 写入不会再触发背压、递归进来。
+ */
 void
 PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
+{
+    bool save = partwal_in_flush;
+
+    PartWALHandleLostRecords();
+    partwal_in_flush = true;
+    PG_TRY();
+    {
+        PartWALFlushImpl(upto_lsn, write_marker);
+    }
+    PG_FINALLY();
+    {
+        partwal_in_flush = save;
+    }
+    PG_END_TRY();
+}
+
+static void
+PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker)
 {
     int                 i;
     Oid                 cache_partition[PARTWAL_WRITER_CACHE_MAX];
@@ -1367,6 +1564,7 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
             last_lsn = slot->orig_lsn;
 
             slot->valid = false;  /* consumed */
+            PartWALCtl->nvalid--;
 
             if (!cache_it)
                 DestroyPartitionWALWriter(writer);
@@ -1548,11 +1746,22 @@ PartWALAbort(void)
     already_on_disk = (PartWALCtl->flushed_upto != InvalidXLogRecPtr &&
                        PartWALCtl->flushed_upto >= my_max);
 
+    /*
+     * ★ T7.27：事务中途排空过（写路径背压、或基线分块）⇒ 前面那几段 DATA 已经
+     *   在流里、甚至已复制到多数派，哪怕后面还有没排空的记录。只看 my_max 会
+     *   判成"没落盘"而不补 ABORT 标记 —— 副本上那批 DATA 的 gxid 永远无终态。
+     */
+    if (partwal_my_flushed_lsn != InvalidXLogRecPtr)
+        already_on_disk = true;
+
     for (i = 0; i < PARTWAL_BUFFER_SLOTS; i++)
     {
         PartWALSlot *slot = &PartWALCtl->slots[i];
         if (slot->valid && slot->backend_id == MyBackendId)
+        {
             slot->valid = false;
+            PartWALCtl->nvalid--;
+        }
     }
 
     /*

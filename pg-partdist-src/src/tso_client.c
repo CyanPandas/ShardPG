@@ -19,6 +19,7 @@
 #include "postgres.h"
 
 #include "tso.h"
+#include "partwal_sync.h"
 #include "global_mvcc.h"
 #include "shard_xid.h"
 #include "shard_vacuum.h"
@@ -667,6 +668,14 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 */
 		if (shard_vacuum_auto_enabled && ShardXidOverdueCount() > 0)
 			ShardVacuumSelfTriggerAuto();
+
+		/*
+		 * T7.27（P7-W2）：分叉标记自动修复。无待修标记时只是一次布尔读；
+		 * 有标记也按 auto_repair_interval_s 节点级限流（基线是重活）。
+		 */
+		if (shard_auto_repair_diverged &&
+			PartWALDivergedRepairDue(shard_auto_repair_interval_s * 1000))
+			ShardDivergedSelfTriggerRepair();
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
