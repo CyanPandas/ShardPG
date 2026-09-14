@@ -85,6 +85,8 @@ partdist_groupid_persist(int32 gid)
     close(fd);
 }
 
+bool partdist_nodeid_catalog_forbidden = false;
+
 static int32
 partdist_groupid_from_file(void)
 {
@@ -116,6 +118,23 @@ PartDistCitusGroupIdInternal(void)
     {
         cached_group_id = partdist_groupid_from_file();
         return cached_group_id;
+    }
+
+    /*
+     * ★ T7.32（P7-W4）：事务中止回调里把未排空的记录写进分区流时要合成 gxid，
+     *   那里不许读 catalog。只认侧影文件；没有就 ERROR（**不缓存** —— 缓存一个
+     *   -1 会让本后端此后所有 gxid 的节点号变成 0），由 PartWALAbort 兜底打分叉标记。
+     */
+    if (partdist_nodeid_catalog_forbidden)
+    {
+        int32   v = partdist_groupid_from_file();
+
+        if (v < 0)
+            ereport(ERROR,
+                    (errmsg("pg_partdist: 事务中止路径上取不到本节点 groupid"),
+                     errdetail("$PGDATA/pg_partdist_groupid 侧影缺失，而此处不许读 catalog。")));
+        cached_group_id = v;
+        return v;
     }
 
     oid = get_relname_relid("pg_dist_local_group", PG_CATALOG_NAMESPACE);

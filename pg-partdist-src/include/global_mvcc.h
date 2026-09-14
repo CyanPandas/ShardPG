@@ -45,6 +45,9 @@ typedef uint64 GlobalTransactionId;
 extern int    partdist_node_id;         /* GUC；-1 = 自动取 Citus group id */
 extern uint16 PartDistLocalNodeId(void);
 extern int32  PartDistCitusGroupId(void);   /* 原始 group id，-1 = 无 Citus */
+/* T7.32：置位期间解析节点号**绝不读 catalog**（事务中止回调里没有可用快照），
+ * 只认缓存或 $PGDATA/pg_partdist_groupid 侧影；两者都没有即 ERROR 交调用方兜底。 */
+extern bool   partdist_nodeid_catalog_forbidden;
 extern void   DefineGlobalMVCCGUCs(void);
 
 #endif /* GLOBAL_MVCC_H */

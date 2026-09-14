@@ -305,11 +305,15 @@ COMMIT 标记在**本事务 DATA 记录复制成功之后**才落盘,由此得�
 已不是该组 leader),事务中止时就要再补一条 ABORT 标记 —— 同一个 gxid 先
 COMMIT 后 ABORT,回放侧只要停在两者之间就会把一个已回滚的事务判成可见。
 
-- ABORT 标记(`commit_ts = 0`)在 `XACT_EVENT_ABORT` 补写,条件是本事务的字节
-  **已经落进段文件**:group commit 下被 peer backend 顺手写掉,或本事务过了
-  PRE_COMMIT 之后才失败。此时丢弃 ring buffer 槽位已无意义,follower 迟早
-  拿到这批 DATA 记录,必须给它们一个终态。abort 路径不调用复制挂钩(中止中
-  再 ERROR 会升级为 FATAL),标记由该分区下一次写入的区间式复制带走。
+- ABORT 标记(`commit_ts = 0`)在 `XACT_EVENT_ABORT` 补写。**2026-09-14 起(T7.32 / P7-W4)
+  中止路径先把本事务尚未排空的 DATA 记录排进段文件,再补标记** —— 与原生 WAL 一致:
+  INSERT 不论提交还是回滚都照写,回滚的元组是 leader 页面上的物理事实。原先这里
+  **丢弃**未排空的槽位,只在"字节已落盘"(group commit 被顺手写掉 / 过了 PRE_COMMIT
+  才失败)时补标记,后果是副本页内行号断档,且页上第一条带"建新页"标记的插入若恰好
+  属于回滚事务,之后**已提交**的插入在副本上找不到这一页、被静默跳过(§13 约束 18)。
+  排空规则同提交路径(先 `XLogFlush`、LSN 不超过本事务上界的全部槽位按 orig_lsn 排),
+  但不写 COMMIT 标记、不调复制挂钩(中止中再 ERROR 会升级为 FATAL),字节与标记由该
+  分区下一次写入的区间式复制带走;排空失败则给分区打分叉标记,交心跳重做物理基线。
 - **2PC 尚未覆盖**:`XACT_EVENT_PRE_PREPARE` 不写 COMMIT 标记 —— prepared
   事务还可能 `ROLLBACK PREPARED`,此刻写 COMMITTED 会让最终回滚的数据在
   follower 上变可见。代价是 2PC 事务在 follower 上保持"未决 = 不可见",
@@ -1980,6 +1984,25 @@ TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role
     修法:MARKER 带 `PARTWAL_MARKER_CTS_IS_TSO`;回放落分片 clog 不带位落 0;gclog 原值
     照存、槽里记宇宙位,R3 比较时不带位按 0。验收 `tests/test_cts_universe_p7.sh`:
     升主后给新主配上 TSO,修复前 40 行 → 0 行(21/1),修复后仍 40 行(22/0)。
+
+18. **★ 回滚事务的物理记录照样进流** (已修,2026-09-14,T7.32 / P7-W4)
+
+    leader 顶层 `ROLLBACK` 时,`PartWALAbort` 原先把本事务还没排空的捕获槽位**直接丢弃**。
+    被回滚的元组在 leader 页面上是物理事实(`heap_insert` 不因回滚撤销页面改动),副本
+    收不到 ⇒ 页内行号断档;CHECKPOINT 之后页上第一条插入带"建新页"标记,若它属于回滚
+    事务,之后已提交的插入在副本上找不到这一页,redo 当作页面不存在静默跳过 ⇒ **已提交
+    的行在副本上丢失,回放却报成功**;同时没有 ABORT 标记,gclog 里这笔事务永远无终态。
+
+    修法见 §4.3 写入时机。三条实现约束:① 流不许超前于已落盘的 pg_wal(先 `XLogFlush`);
+    ② 排空要连同 LSN 不超过本事务上界的**他人**槽位一起排(按 start_lsn 回读 pg_wal),
+    否则同分区 plsn 与 orig_lsn 倒挂;③ 中止回调里合成 gxid 取节点号**禁读 catalog**,
+    只认 `$PGDATA/pg_partdist_groupid` 侧影,取不到即走分叉标记退路。
+
+    验收 `tests/test_abort_page_p7.sh`:修复前 31/11(主堆 leader 8192 vs 副本 0 字节、
+    PK 索引大小不一致、gclog=running),修复后 97/0:回滚后同页提交、跨页带 TOAST 的回滚、
+    并发(会话 1 未结束时会话 2 在同分区回滚)、ROLLBACK TO SAVEPOINT 后提交,副本逐字节
+    一致且 gclog=aborted;挪走侧影文件制造排空失败 ⇒ 客户端收 WARNING、分区打分叉标记、
+    心跳 4 s 内自动重做基线、之后逐字节一致(连 TOAST 索引元页的 pd_lsn 都随基线对齐)。
 
 ---
 

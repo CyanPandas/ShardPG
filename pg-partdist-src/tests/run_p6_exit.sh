@@ -98,6 +98,7 @@ SUITES=(
   "cts_universe_p7        1200  P7"   # T7.29（P7-G4）commit_ts 宇宙位：中途配 TSO 已提交行不许消失
   "shard_mvcc_register_p7 1800  P7"   # T7.30（P7-V4）分布表一条命令打标 + 身份随切主走
   "drop_mvcc_2pc_p7       1200  P7"   # T7.31（P7-D3）含打标表 DROP 可 PREPARE，回收随 COMMIT PREPARED
+  "abort_page_p7          1200  P7"   # T7.32（P7-W4）leader ROLLBACK 后副本物理页面仍一致
   # ── P7 批次 1 验收：**2026-09-13 起并入门禁**。此前这四套只在各自任务里跑过，
   #   从没进过 SUITES —— 而点名一个不在清单里的套件，门禁原先会**静默跳过**（见下方
   #   WANT 校验），于是"批次 1 各有新套件"这句出口标准实际上没有任何东西在持续验证。

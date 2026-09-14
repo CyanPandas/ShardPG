@@ -51,6 +51,7 @@ ORDER BY proname;
  get_follower_applied_part_lsn
  get_partition_flush_lsn
  global_id_for_partition
+ indexdef_string
  init_partition_wal
  local_partition_for_shard
  partdist_global_safe_ts
@@ -68,9 +69,11 @@ ORDER BY proname;
  partition_wal_path
  partwal_append_dtx_record
  partwal_follower_append
+ partwal_follower_append_fresh
  partwal_notify_primary_switch
  partwal_read_dtx_record
  partwal_read_record
+ partwal_ring_stats
  partwal_truncate_to
  pg_partdist_bump_metadata_version
  pg_partdist_cache_invalidate
@@ -79,21 +82,28 @@ ORDER BY proname;
  pg_partdist_route_write
  pg_partdist_version
  provision_shard_replica
+ raft_replicate_table_shards
  read_all_headers
  rebuild_shard_identity
  register_shard_fileset
  register_shard_identity
  repair_diverged_shards
+ replay_auto_follow
  replay_catchup
  replay_disable
  replay_enable
  replay_freeze_status
  replay_locmap
+ replay_pending_base
+ replay_pending_follow
+ replay_pending_follow_clear
  replay_reclaim_stale
  replay_set_locmap
  replay_status
  reset_partition_wal_state
+ route_resolve
  route_status
+ set_table_shard_mvcc
  shard_baseline_emit
  shard_claim_on_promote
  shard_clear_divergence
@@ -101,9 +111,12 @@ ORDER BY proname;
  shard_divergence
  shard_fileset
  shard_global_id
+ shard_mvcc_register
+ shard_mvcc_status
  shard_remove_aborted
  shard_remove_dead
  shard_sanitize_xmax
+ shard_vacuum_auto
  shard_vacuum_recover
  shard_vacuum_set_watermarks
  shard_vacuum_sweep
@@ -114,5 +127,5 @@ ORDER BY proname;
  shard_xid_raise_watermark
  verify_partition_wal
  write_partition_wal_record
-(88 rows)
+(101 rows)
 

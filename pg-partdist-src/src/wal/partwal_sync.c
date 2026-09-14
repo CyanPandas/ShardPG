@@ -41,6 +41,7 @@
 #include "demux_worker.h"
 #include "shard_fileset.h"
 #include "shard_xid.h"		/* U-P5-1：MARKER 携带分片 xid */
+#include "global_mvcc.h"		/* T7.32：中止路径禁读 catalog 取节点号 */
 
 #include "access/heapam_xlog.h"
 #include "access/rmgr.h"
@@ -1218,7 +1219,7 @@ PartWALReplicateTouched(void)
 int  partwal_ring_high_water = 50;      /* GUC：占用百分比；0 = 关闭背压 */
 static bool partwal_in_flush = false;   /* 本后端正在 PartWALFlush 里（含复制挂钩的嵌套 SPI） */
 
-static void PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker);
+static void PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate);
 
 /*
  * 把覆盖记账取走，给对应分区打分叉标记。锁外做：打标要写文件。
@@ -1364,7 +1365,7 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
     partwal_in_flush = true;
     PG_TRY();
     {
-        PartWALFlushImpl(upto_lsn, write_marker);
+        PartWALFlushImpl(upto_lsn, write_marker, true);
     }
     PG_FINALLY();
     {
@@ -1373,8 +1374,13 @@ PartWALFlush(XLogRecPtr upto_lsn, bool write_marker)
     PG_END_TRY();
 }
 
+/*
+ * replicate=false 只给 PartWALAbort 用（T7.32）：中止回调里不做复制 —— 复制挂钩要等
+ * 多数派、可能访问 catalog，都不适合放在事务中止路径上。挂钩是区间式的，这些记录由
+ * 同分区的下一次写入顺带送出（与既有 ABORT 标记同一条路）。
+ */
 static void
-PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker)
+PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
 {
     int                 i;
     Oid                 cache_partition[PARTWAL_WRITER_CACHE_MAX];
@@ -1403,7 +1409,8 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker)
          * 挂钩是区间式的，空集合 / 无新字节时等价于 no-op。集合本身不在这里
          * 清（归 PartWALEndTxn / PartWALAbort），与 D1 纯结构变更路径同规则。
          */
-        PartWALReplicateTouched();
+        if (replicate)
+            PartWALReplicateTouched();
         return;
     }
 
@@ -1642,7 +1649,8 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker)
      * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
      * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
      */
-    PartWALReplicateTouched();
+    if (replicate)
+        PartWALReplicateTouched();
 
     /*
      * COMMIT 标记**在 DATA 复制成功之后**才写，因此有一条强不变式：
@@ -1712,8 +1720,10 @@ PartWALEndTxn(void)
 }
 
 /* ================================================================== */
-/* PartWALAbort -- discard this backend's pending ring-buffer slots    */
+/* PartWALAbort -- 中止：排空本事务的记录，补 ABORT 标记                */
 /* ================================================================== */
+
+#define PARTWAL_ABORT_LOST_MAX 32
 
 void
 PartWALAbort(void)
@@ -1724,6 +1734,10 @@ PartWALAbort(void)
     char           *payload = NULL;
     uint32          payload_len = 0;
     bool            already_on_disk;
+    bool            drain_failed = false;
+    char            drain_err[256] = "";
+    Oid             lost[PARTWAL_ABORT_LOST_MAX];
+    int             nlost = 0;
 
     /*
      * 两条来源：还没 flush 过（partwal_my_max_lsn）、或者已经 flush 完了但
@@ -1749,6 +1763,58 @@ PartWALAbort(void)
     if (partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
         payload = PartWALBuildTxnMarker(false, &payload_len);
 
+    /*
+     * ★ T7.32（P7-W4）：还没排空的记录**不再丢弃**，排进分区流。
+     *
+     * 原生 WAL 对 INSERT 不论提交还是回滚都照写（回滚只追加 ABORT 记录，元组留在页上、
+     * 之后才被标 dead），所以原生备库的页面恒与主一致。这里原先把本事务未排空的槽位
+     * 直接丢弃 —— 被回滚的元组在 leader 页面上是物理事实，副本却收不到：页内行号断档；
+     * CHECKPOINT 之后页上第一条插入还带"建新页"标记、恰好属于被回滚的事务 ⇒ 之后
+     * **已提交**的插入在副本上找不到这一页，redo 当作页面不存在静默跳过 ⇒ 已提交的行
+     * 在副本上丢失，回放却报成功（test_abort_page_p7.sh：副本主堆 0 块 vs leader 1 块）。
+     *
+     * 做法与提交路径的排空完全相同（PartWALFlushImpl），三点差别：
+     *   · 不写 COMMIT 标记，下面照旧补 ABORT 标记（排空成功 ⇒ already_on_disk 必为真）；
+     *   · 不复制（replicate=false）：挂钩要等多数派、可能碰 catalog，不属于中止路径；
+     *     这些字节由同分区的下一次写入顺带送出 —— 与原先的 ABORT 标记是同一条路；
+     *   · 合成 gxid 取节点号时禁读 catalog（中止回调里没有快照），只认侧影文件。
+     * 仍按"LSN 不超过本事务上界的**全部**槽位"排空（含别的后端的，按 start_lsn 回读
+     * pg_wal），不能只排自己的：同分区里 orig_lsn 更小的他人槽位会在之后拿到更大的
+     * plsn，段号与 plsn 就此倒挂（见 PartWALFlushImpl 的排序注释）。XLogFlush 在
+     * PartWALFlushImpl 里先做 —— 分区流不许超前于已落盘的 pg_wal，否则 leader 崩溃
+     * 丢掉的记录副本却留着，那才是真分叉。
+     *
+     * 失败（磁盘满、侧影文件缺失……）不许抛：中止回调里 ERROR 会升 FATAL。退路是
+     * 丢弃槽位并给这些分区打分叉标记，交心跳自动重做物理基线 —— 不许静默丢记录。
+     */
+    if (partwal_my_max_lsn != InvalidXLogRecPtr)
+    {
+        MemoryContext   oldcxt = CurrentMemoryContext;
+        bool            save_flush = partwal_in_flush;
+
+        partwal_in_flush = true;
+        partdist_nodeid_catalog_forbidden = true;
+        PG_TRY();
+        {
+            PartWALFlushImpl(partwal_my_max_lsn, false, false);
+        }
+        PG_CATCH();
+        {
+            ErrorData  *ed;
+
+            MemoryContextSwitchTo(TopMemoryContext);
+            ed = CopyErrorData();
+            FlushErrorState();
+            strlcpy(drain_err, ed->message, sizeof(drain_err));
+            FreeErrorData(ed);
+            MemoryContextSwitchTo(oldcxt);
+            drain_failed = true;
+        }
+        PG_END_TRY();
+        partdist_nodeid_catalog_forbidden = false;
+        partwal_in_flush = save_flush;
+    }
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
     /*
@@ -1768,11 +1834,21 @@ PartWALAbort(void)
     if (partwal_my_flushed_lsn != InvalidXLogRecPtr)
         already_on_disk = true;
 
+    /*
+     * 排空成功时这里一个本后端槽位都不剩；只有排空失败才会丢弃 —— 那就把受影响的
+     * 分区记下来，锁外打分叉标记。
+     */
     for (i = 0; i < PARTWAL_BUFFER_SLOTS; i++)
     {
         PartWALSlot *slot = &PartWALCtl->slots[i];
         if (slot->valid && slot->backend_id == MyBackendId)
         {
+            int     k;
+
+            for (k = 0; k < nlost && lost[k] != slot->partition_id; k++)
+                ;
+            if (k == nlost && nlost < PARTWAL_ABORT_LOST_MAX)
+                lost[nlost++] = slot->partition_id;
             slot->valid = false;
             PartWALCtl->nvalid--;
         }
@@ -1826,6 +1902,41 @@ PartWALAbort(void)
     }
 
     LWLockRelease(PartWALCtl->lock);
+
+    if (drain_failed)
+    {
+        char    reason[400];
+
+        /* 排空中途失败时，本事务碰过的分区都可能缺了一段 —— 一并打标 */
+        for (i = 0; i < partwal_my_ntouched; i++)
+        {
+            int     k;
+
+            for (k = 0; k < nlost && lost[k] != partwal_my_touched[i]; k++)
+                ;
+            if (k == nlost && nlost < PARTWAL_ABORT_LOST_MAX)
+                lost[nlost++] = partwal_my_touched[i];
+        }
+        snprintf(reason, sizeof(reason),
+                 "事务中止时未能把已产生的记录排进分区流（P7-W4）：%s", drain_err);
+        for (i = 0; i < nlost; i++)
+        {
+            PG_TRY();
+            {
+                ShardMarkDiverged(lost[i], reason);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+        }
+        ereport(WARNING,
+                (errmsg("pg_partdist: 事务中止时排空分区记录失败，%d 个分区已标记分叉：%s",
+                        nlost, drain_err),
+                 errhint("心跳工作者会自动重做物理基线；也可手工调 partdist.repair_diverged_shards()。")));
+    }
+
     if (payload != NULL)
         pfree(payload);
     FreePartWALPendingContent();
