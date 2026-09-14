@@ -382,6 +382,24 @@ typedef struct TxnMarkerPayload
  */
 #define PARTWAL_CTRL_DDL_HINT        UINT8_C(0x05)
 
+/*
+ * T7.30（P7-V4）：**leader 把这个分片登记成了分片打标表**。
+ *
+ * 为什么副本需要知道：副本侧"这张表是打标表"的唯一持久证据是
+ * `pg_shard_clog/<本地 oid>` 目录（T7.4 升主继承身份就认它），而这个目录原先
+ * 只在回放到**带分片 xid 的 MARKER** 时才被建出来。于是"刚打完标、还没写过一行
+ * 就切主"的分片，新主继承不到身份 —— 之后的写入**悄悄**走原生路径，这个分片
+ * 从此不再是打标分片，没有任何报错。
+ *
+ * 副本收到即建证据目录（幂等），**不**把表加进本节点的打标集合：副本进了集合，
+ * vacuum 自动启动器会在副本壳表上本地动页面，与回放写同一批文件（§13 约束 12）。
+ * 身份仍按 T7.4 只在升主那一刻继承。
+ *
+ * 发射点两处：登记时（`partdist.shard_mvcc_register`）与物理基线末尾（后加入的
+ * 副本从基线游标起放，看不到登记时那一条）。载荷为空。
+ */
+#define PARTWAL_CTRL_SHARD_MVCC      UINT8_C(0x06)
+
 typedef struct PartWALCtrlShardClog
 {
     uint32      first_sxid;     /* 本块第一个分片 xid                        */

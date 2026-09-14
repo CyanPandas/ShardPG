@@ -1346,6 +1346,90 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'partdist_set_shard_mvcc'
 LANGUAGE C STRICT;
 
+-- T7.30（P7-V4）：按全局分片号在**本节点**登记打标（placement 上调用；副本壳表、非空表拒绝）。
+-- 分布表请用协调者上的 set_table_shard_mvcc(regclass)，它逐 placement 下发本函数。
+CREATE OR REPLACE FUNCTION shard_mvcc_register(p_shardid bigint)
+RETURNS text
+AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_register'
+LANGUAGE C STRICT VOLATILE;
+
+-- T7.30 观测点："registered=yes|no evidence=yes|no replica=yes|no"
+CREATE OR REPLACE FUNCTION shard_mvcc_status(p_rel oid)
+RETURNS text
+AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_status'
+LANGUAGE C STRICT STABLE;
+
+-- T7.30（P7-V4）：**协调者上一次调用**，把一张分布表的全部分片登记为打标表。
+-- 取代"组内每个成员各自 ALTER SYSTEM SET pg_partdist.shard_relids = '<本节点 OID 列表>'"
+-- 的手工做法。时机：建表（含索引 —— 打标后禁 CREATE INDEX）之后、写入数据之前。
+-- 副本不登记：身份随 CTRL SHARD_MVCC / 物理基线落成证据目录，升主时继承（T7.4）。
+-- 每行一个 placement；status 以 registered/already 开头为成功，其余为失败原因。幂等，可重跑。
+CREATE OR REPLACE FUNCTION set_table_shard_mvcc(p_table regclass)
+RETURNS TABLE(shardid bigint, node_port integer, status text)
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    v       record;
+    v_ok    boolean;
+    v_res   text;
+    v_n     integer := 0;
+    v_bad   integer := 0;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_partition d
+                    WHERE d.logicalrelid = p_table AND d.partmethod <> 'n') THEN
+        RAISE EXCEPTION 'set_table_shard_mvcc: % 不是（非引用表的）分布表', p_table;
+    END IF;
+
+    -- ⓪ 分片身份（shard_identity）：建表之后没人自动填，登记靠它把 shardid 翻成本地 OID。
+    --   每个涉及的节点跑一次，幂等（与 raft_replicate_table_shards 同款前置）。
+    FOR v IN
+        SELECT DISTINCT n.nodename, n.nodeport
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+          JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+         WHERE s.logicalrelid = p_table
+    LOOP
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v.nodename], ARRAY[v.nodeport],
+               ARRAY['SELECT partdist.rebuild_shard_identity()'], false) r;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'set_table_shard_mvcc: %:% 上重建分片身份失败（%）',
+                v.nodename, v.nodeport, v_res;
+        END IF;
+    END LOOP;
+
+    FOR v IN
+        SELECT s.shardid AS sid, n.nodename, n.nodeport
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+          JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+         WHERE s.logicalrelid = p_table
+         ORDER BY s.shardid, n.nodeport
+    LOOP
+        v_n := v_n + 1;
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v.nodename], ARRAY[v.nodeport],
+               ARRAY[format('SELECT partdist.shard_mvcc_register(%s)', v.sid)], false) r;
+        shardid   := v.sid;
+        node_port := v.nodeport;
+        status    := CASE WHEN v_ok THEN v_res ELSE 'FAILED: ' || v_res END;
+        IF status !~ '^(registered|already) ' THEN
+            v_bad := v_bad + 1;
+        END IF;
+        RETURN NEXT;
+    END LOOP;
+
+    IF v_n = 0 THEN
+        RAISE EXCEPTION 'set_table_shard_mvcc: % 没有任何 placement', p_table;
+    END IF;
+    IF v_bad > 0 THEN
+        RAISE WARNING 'set_table_shard_mvcc: % 个 placement 中 % 个登记失败，见 status 列；修正后可重跑（幂等）',
+            v_n, v_bad;
+    END IF;
+END
+$fn$;
+
 -- TX-TSO-MVCC（T3.1）：TSO 服务入口（v1 = master 内存计数器，设计 §2.4）。
 -- 只有 pg_partdist.tso_master=on 的节点服务；worker 经 libpq 调用（T3.2）。
 CREATE OR REPLACE FUNCTION partdist_tso_start_ts(node int, oldest bigint)

@@ -61,6 +61,14 @@ ShardClogDirExists(Oid shard)
 	return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
 }
 
+static void ShardClogEnsureDir(Oid shard);
+
+void
+ShardClogEnsureEvidence(Oid shard)
+{
+	ShardClogEnsureDir(shard);
+}
+
 /* EEXIST 是常态 —— 多后端并发建同一个目录 */
 static void
 ShardClogEnsureDir(Oid shard)
@@ -521,6 +529,13 @@ ShardClogHasPendingDrops(void)
 	return pending_drops_n > 0;
 }
 
+int
+ShardClogPendingDropList(const Oid **oids)
+{
+	*oids = pending_drops;
+	return pending_drops_n;
+}
+
 /*
  * 提交时点执行删除。提交已成事实，这里不许 ERROR（会把提交翻成 PANIC 级
  * 混乱）—— 删不掉只 WARNING，残留是无害孤儿（头文件"已知边界"）。
@@ -529,14 +544,32 @@ ShardClogHasPendingDrops(void)
 void
 ShardClogAtCommit(void)
 {
-	int			i;
+	ShardClogGcDropped(pending_drops, pending_drops_n);
+	pending_drops_n = 0;
+}
 
-	for (i = 0; i < pending_drops_n; i++)
+/*
+ * T7.31（P7-D3）：回收主体从 ShardClogAtCommit 抽出来，两条提交路径共用 ——
+ * 本后端直接提交（上面），与 COMMIT PREPARED 的 2PC 回调（shard_xid.c）。
+ * 后者跑在**执行 COMMIT PREPARED 的那个后端**里，与当初 DROP 的后端无关，
+ * 所以清单只能从 2PC 记录里拿，不能读本进程的 pending_drops。
+ */
+void
+ShardClogGcDropped(const Oid *oids, int n)
+{
+	int			i;
+	Oid			dropped[SHARD_CLOG_PENDING_DROPS_MAX];
+
+	/* 调用方可能传的就是 pending_drops 本身，先拷一份 */
+	n = Min(n, SHARD_CLOG_PENDING_DROPS_MAX);
+	memcpy(dropped, oids, (size_t) n * sizeof(Oid));
+
+	for (i = 0; i < n; i++)
 	{
 		char		path[MAXPGPATH];
 		struct stat st;
 
-		ShardClogDirPath(path, MAXPGPATH, pending_drops[i]);
+		ShardClogDirPath(path, MAXPGPATH, dropped[i]);
 		/* 目录可能从未建过（表没写过判决）——rmtree 会自己打 WARNING，先探 */
 		if (stat(path, &st) == 0 && !rmtree(path, true))
 			ereport(WARNING,
@@ -544,7 +577,7 @@ ShardClogAtCommit(void)
 							"残留为无害孤儿", path)));
 
 		snprintf(path, MAXPGPATH, "%s/pg_shard_xid/%u",
-				 DataDir, pending_drops[i]);
+				 DataDir, dropped[i]);
 		if (unlink(path) != 0 && errno != ENOENT)
 			ereport(WARNING,
 					(errcode_for_file_access(),
@@ -559,7 +592,7 @@ ShardClogAtCommit(void)
 		 * 就撞上 §10 的 PRE_PREPARE 禁令删不掉。实测表现为夹具残表逐轮累积
 		 * （122→244→366），症状伪装成"回放写多了"。
 		 */
-		ShardMvccSetRemove(pending_drops[i]);
+		ShardMvccSetRemove(dropped[i]);
 
 		/*
 		 * T7.7（R-P6-4）：分配器槽位也要还。`SHARD_XID_MAX_SLOTS = 64` 是定长
@@ -567,9 +600,8 @@ ShardClogAtCommit(void)
 		 * 第 65 张。门禁一直靠"移走水位文件 + 重启"绕过去，等于把这条缺陷藏在
 		 * 净场脚本里。判据与上面那句同源：都在 DROP 的提交时点，回滚不执行。
 		 */
-		ShardXidSlotRelease(pending_drops[i]);
+		ShardXidSlotRelease(dropped[i]);
 	}
-	pending_drops_n = 0;
 }
 
 void

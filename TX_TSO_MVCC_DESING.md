@@ -358,6 +358,21 @@ COMMITTED/ABORTED。写入幂等。parent_xid 承载子事务链（仿 pg_subtra
 
 ---
 
+### 5.6 打标登记入口与身份传播（T7.30，2026-09-14 回填）
+
+**入口**：分布表在协调者上一次调用 `partdist.set_table_shard_mvcc(表)`，逐 placement 下发
+`partdist.shard_mvcc_register(shardid)`。时机固定为**建完表与索引之后、写入数据之前**
+（打标后禁 CREATE INDEX；打标前写入的行带原生 xid，打标后读不到 —— 故首次登记要求主堆 0 块）。
+GUC 白名单 `pg_partdist.shard_relids` 仍保留为测试通道；`partdist_set_shard_mvcc(regclass)`
+只适用于本地表（它按本地 OID 查 partition_map，而分布式流程的 partition_id 是 shardid）。
+
+**只在 placement 上登记**：副本进打标集合，vacuum 自动启动器会在副本文件上本地改页面，
+与回放写同一批文件。副本的身份在**升主时**凭持久证据 `pg_shard_clog/<oid>` 继承（T7.4）。
+
+**证据怎么到副本**：登记时发 CTRL `SHARD_MVCC`(0x06)、物理基线末尾再发一次；副本收到只建证据
+目录。在此之前证据只随"带分片 xid 的 MARKER"产生 ⇒ 刚打标、还没写就切主的分片，新主继承不到
+身份，写入悄悄走原生路径（`test_shard_mvcc_register_p7.sh` [5] 与 [8] 对照）。
+
 ## 6 Vacuum / GC
 
 ### 6.1 三变量（每分片）
@@ -640,6 +655,7 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 | CIC / CLUSTER / VACUUM FULL | **禁（V4 已裁定，2026-08-13）**；P5 freeze/回收全章落地后再评估 CLUSTER/VACUUM FULL，CIC 随索引专项 | CIC 的多快照阶段与 validate 等待全按原生 xid 机制，且 P 期分片表本就禁索引；CLUSTER/VACUUM FULL 走 rewriteheap 的 freeze/裁决会拿分片 xid 查原生 clog，且换 relfilenode 需 fileset 重绑（复制面）。ANALYZE 已于 T2.6 解禁（补丁 0008 读侧分叉，只判不收） |
 | Citus rebalancer / move_shard_placement / undistribute_table / alter_distributed_table | 禁 | 原生快照读分片表 = 静默错读；与 raft 管理的放置冲突；搬分片 = 后续 raft 成员变更专项（§9.2）。**实装位置**：`ShardGuardCheckPlan` **遍历计划树**取 FunctionScan/targetlist/qual（T6.6 修正——首版扫 `pstmt->rtable` 的 `rte->functions` 是死代码，setrefs.c 已把它清成 NIL，于是 `SELECT * FROM f(...)` 整类写法一直绕得过去，R-P6-8）。**★ 2026-09-09 复核：清单漏了 8 个同类 UDF**（`citus_split_shard_by_split_points`、`isolate_tenant_to_new_shard`、`citus_drain_node`、`master_move_shard_placement`、`master_copy_shard_placement`、`replicate_table_shards`、`citus_schema_move`、`alter_table_set_access_method`），补名字即可堵住它们的 SQL 入口。**但两件事要分清**：① 补名字只堵**入口**，不堵**通路** —— 这 11 个 UDF 在 Citus 13.1 里全是 C 函数，`citus_drain_node` 的函数体在 C 层直接走搬迁逻辑，不会再发一条 `SELECT citus_move_shard_placement(...)`，真正搬数据的 worker 侧 `worker_*` / `citus_internal_*` 也不在清单里；② **★★ R-P6-22（2026-09-09 新发现）：这道守卫在协调者上根本不生效** —— `ShardGuardCheckPlan` 的快门是 `ShardGatingActive()`（本节点 `shard_relids` 非空 或 shmem `mvcc_n>0`），而打标表长在 worker、协调者两者皆空，于是**只在协调者上调用的本行这几个 UDF 一条都不触发**；`negative_p6` 全绿是因为夹具用一个 worker 上的表 OID 给协调者开了闸门。修法与取证见 P7 计划 §3.2 与 T7.9 |
 | 含分片写的 PREPARE TRANSACTION | P1 禁（PRE_PREPARE 拦截，且拦截先于 PartWAL 刷流——回调 LIFO 序，见 DEV PLAN T1.9 记要） | 后端映射/临时提交表无法跨会话延续 prepared 事务；若字节先进流再中止，还会打断在途复制、让 leader plsn 跑到多数派前头（T1.9 实测） |
+| 含分片打标表 DROP 的事务执行 PREPARE（含 Citus 以 2PC 下发的分布表 DROP） | **已解禁（T7.31，2026-09-14）**——原先禁 | 原禁令理由是 DROP 后的文件回收记在本进程内存、COMMIT PREPARED 在别的会话结算不了；代价却是**任何打标分布表都无法从协调者删除**（P7-D3）。现回收清单写进分片 2PC 段（info=`SHARD_2PC_INFO_DROPS`），COMMIT PREPARED 回调结算、ROLLBACK PREPARED 不回收、prepared 事务跨重启仍结算（`test_drop_mvcc_2pc_p7.sh`）|
 | 分片打标表的 Citus 路由写（coordinator 经手的 INSERT/UPDATE/DELETE/COPY） | **P1 禁；P4 之后解禁——★ 2026-09-09 回填**：MX 接线（§9.1）+ 决议搬迁（DTX-2PC）落地后，Citus 驱动的 2PC 写是**正路**，tx1/tx2/tx4 三套验收全部走这条路。本行原文只对 P1–P3 成立 | 本分支 Citus 分布式写一律 2PC（PREPARE TRANSACTION，DTX 链路即建于其上）→ 撞上一条禁令，事务在 PREPARE 点中止（T1.9 实测两轮）；2PC × 打标的接线 = P4 正题（决议搬迁 + MX） |
 | 引用表运行期写入 | **禁（2026-09-09 裁定：拦；2026-09-10 T7.10 守卫已实装）**——★ 复核发现代码**零守卫、测试零断言**（`shard_guard.c` 全文无引用表判据），此前本行只是纸面约定。守卫已实装（`shard_guard.c` `ShardGuardIsReferenceTable()`：按 `pg_dist_partition.partmethod='n'` 判定，backend 本地哈希缓存；判据挂在 `pstmt->resultRelations` 上）。**覆盖边界如实记**：拦的是协调者上对引用表**本体**的写；worker 上那张 `<ref>_<shardid>` 分片是普通本地表、不在 `pg_dist_partition` 里，本判据看不见它 —— 要堵那一层得按分片名判，属后续工作 | 无分片写集 ⇒ 无协调者分片；Citus 原生 2PC 恢复已关（§9.2） |
 | 分片表的**子事务写**（SAVEPOINT / plpgsql `EXCEPTION` 块内写打标表） | 禁（ERROR）——**★ 2026-09-09 补行** | §5.4 承诺的 per-shard 子 xid + parent 链**未实现**（`shard_xid.c:1213-1220` 直接拒写，`shard_clog.h:51` 的 `parent_xid` 恒 0）。此前 §10 无此行，而代码一直在拦 |

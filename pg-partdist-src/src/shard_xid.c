@@ -39,6 +39,9 @@
 #include "storage/shmem.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
+#include "access/relation.h"		/* T7.30：relation_open */
+#include "storage/bufmgr.h"			/* T7.30：RelationGetNumberOfBlocks */
+#include "utils/builtins.h"			/* T7.30：cstring_to_text */
 
 /*
  * 回卷护栏：P1 不处理 32 位分片 xid 回卷（设计 §7 推 P5），逼近上限直接
@@ -288,6 +291,12 @@ shard_oid_is_mvcc(ShardRelidsCfg *cfg, Oid relid)
 	if (cfg != NULL && cfg->n > 0 && oid_whitelisted(cfg, relid))
 		return true;
 	return shard_mvcc_set_contains(relid);
+}
+
+bool
+ShardRelIsMvcc(Oid relid)
+{
+	return shard_oid_is_mvcc(shard_relids_cfg, relid);
 }
 
 static bool
@@ -1440,13 +1449,17 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			/*
 			 * T4.3 放行条件：已 join 全局事务（gxid 在手）的分片写允许
 			 * PREPARE——PREPARED 落账与 2PC 段注册在 at_prepare 钩子里做
-			 * （StartPrepare 之后）。未 join 的分片写维持 P1 禁令；含分片
-			 * 表 DROP 的事务仍禁（挂起 GC 无法跨会话结算）。
+			 * （StartPrepare 之后）。未 join 的分片写维持 P1 禁令。
+			 *
+			 * ★ T7.31（P7-D3）：含分片打标表 DROP 的事务**不再禁 PREPARE**。
+			 *   原先禁的理由是"挂起的文件回收记在本进程内存里，COMMIT PREPARED
+			 *   在别的会话执行，结算不了"。后果却比残留几个文件严重得多：Citus
+			 *   把分布表的 DROP 以 2PC 下发到每个 placement，于是**任何打标分布表
+			 *   都无法从协调者删除**；运维只好去 worker 上本地删分片表，而那条路
+			 *   正是 P7-D3 "半删分片把分布表永久锁死在协调者上"的起点。
+			 *   现在清单在 at_prepare 里写进 2PC 记录（info=SHARD_2PC_INFO_DROPS），
+			 *   COMMIT PREPARED 的回调据此回收，ROLLBACK PREPARED 什么都不做。
 			 */
-			if (ShardClogHasPendingDrops())
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("不支持对含分片打标表 DROP 的事务执行 PREPARE TRANSACTION")));
 			if (xact_map_n > 0 && TsoCurrentGxid() == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1902,6 +1915,14 @@ shard_xact_wal_list_impl(uint32 **pairs, uint64 *commit_ts)
 
 /* ---- T4.3：分片 2PC 段（补丁 0009） ---- */
 
+/*
+ * 分片 2PC 段的记录种类（RegisterTwoPhaseRecord 的 info）。
+ *   0                       ShardTwoPhasePayload：分片写的 PREPARED 落账（T4.3）
+ *   SHARD_2PC_INFO_DROPS    Oid[]：本事务 DROP 掉的打标表，COMMIT PREPARED 时回收（T7.31）
+ * 历史 prepared 事务只有 info=0 的记录，语义不变。
+ */
+#define SHARD_2PC_INFO_DROPS	1
+
 typedef struct ShardTwoPhasePayload
 {
 	int64		gxid;
@@ -1978,6 +1999,19 @@ shard_at_prepare_impl(void)
 	int			i;
 	int64		gxid;
 	int64		sts;
+	const Oid  *drops;
+	int			ndrops;
+
+	/*
+	 * ★ T7.31（P7-D3）：挂起的 DROP 回收清单跟着 2PC 状态走。必须排在下面
+	 * "没有分片写就返回"之前 —— Citus 下发的 DROP 事务一个分片 xid 都不发。
+	 * 本进程的 pending_drops 随后由 XACT_EVENT_PREPARE 的 ShardClogAtAbort 清掉，
+	 * 不会在本进程再被执行一次。
+	 */
+	ndrops = ShardClogPendingDropList(&drops);
+	if (ndrops > 0)
+		RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, SHARD_2PC_INFO_DROPS,
+							   (void *) drops, (uint32) ndrops * sizeof(Oid));
 
 	if (xact_map_n == 0)
 		return;
@@ -2023,6 +2057,10 @@ shard_twophase_recover_impl(TransactionId xid, uint16 info,
 	uint32		pairs[2 * DTX_PENDING_MAX_PAIRS];
 	int			i;
 
+	/* T7.31：DROP 清单在恢复时无事可做 —— 等 COMMIT/ROLLBACK PREPARED 再结算 */
+	if (info == SHARD_2PC_INFO_DROPS)
+		return;
+
 	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
 	for (i = 0; i < hdr.nxids; i++)
@@ -2053,6 +2091,22 @@ static void
 shard_twophase_postcommit_impl(TransactionId xid, uint16 info,
 							   void *recdata, uint32 len)
 {
+	/*
+	 * T7.31（P7-D3）：DROP 已随 COMMIT PREPARED 提交 ⇒ 回收。跑在执行 COMMIT
+	 * PREPARED 的后端里（可能是 Citus 的另一个连接），清单只认 2PC 记录。
+	 * 已知边界与非 2PC 路径相同：崩在提交记录与本回调之间 ⇒ 孤儿文件，
+	 * 注册前清目录兜底 OID 复用。
+	 */
+	if (info == SHARD_2PC_INFO_DROPS)
+	{
+		Oid			oids[64];
+		int			n = (int) Min(len / sizeof(Oid), lengthof(oids));
+
+		memcpy(oids, recdata, (size_t) n * sizeof(Oid));
+		ShardClogGcDropped(oids, n);
+		elog(LOG, "pg_partdist: COMMIT PREPARED 回收 %d 张已删除的分片打标表", n);
+		return;
+	}
 	elog(DEBUG1, "pg_partdist: 分片 2PC 段 postcommit（终局待决议广播，T4.5）");
 }
 
@@ -2064,6 +2118,10 @@ shard_twophase_postabort_impl(TransactionId xid, uint16 info,
 	ShardTwoPhasePayload hdr;
 	const char *pairs_base;
 	int			i;
+
+	/* T7.31：DROP 被回滚 ⇒ 表还在，什么都不回收 */
+	if (info == SHARD_2PC_INFO_DROPS)
+		return;
 
 	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
@@ -2362,6 +2420,170 @@ partdist_set_shard_mvcc(PG_FUNCTION_ARGS)
 	ShardMvccSetAdd(relid);
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * partdist.shard_mvcc_register(p_shardid bigint) —— T7.30（P7-V4）：按**全局分片号**
+ * 把本节点上的那份分片登记为分片打标表。
+ *
+ * 为什么不能用 partdist_set_shard_mvcc(regclass)：那条入口按**本地 OID** 去
+ * `UPDATE partition_map WHERE partition_id = oid`，而分布式流程（raft_apply）写进
+ * partition_map 的 partition_id 是 **Citus shardid** —— 对分布表恒报"没有登记行"，
+ * 只剩 GUC 白名单 `shard_relids` 这条测试通道能用：组内**每个成员**各自
+ * ALTER SYSTEM、列出**本节点的** OID（同一分片各节点 OID 不同）。这就是 P7-V4
+ * "逐分片逐节点手工"的真实形态。
+ *
+ * 本函数由协调者上的 partdist.set_table_shard_mvcc(regclass) 逐 placement 下发：
+ *   ① shard_identity 把 shardid 翻成本地 OID（翻不出 = 本节点没这个分片）；
+ *   ② 拒绝副本壳表：副本进打标集合，vacuum 自动启动器会在副本文件上本地动页面
+ *      （§13 约束 12）；副本身份仍按 T7.4 在升主那一刻凭证据继承；
+ *   ③ 首次登记要求主堆 0 块：打标之前写入的行带原生 xid，打标后按分片可见性规则
+ *      读不到 —— 与其让数据"消失"，不如当场拒绝；
+ *   ④ 登记：水位文件（启动装载的登记表）+ 打标集合 + 本地证据目录；
+ *   ⑤ 发 CTRL SHARD_MVCC 让副本建证据目录（堵"打完标还没写就切主，新主继承不到"）。
+ *      ⑤ 在子事务里做，失败不回滚 ④：此时多半还没有分区组，后加入的副本由物理基线
+ *      末尾那一条补上（见 shard_fileset.c）。结果如实写进返回值。
+ *
+ * 不碰 partition_map.shard_mvcc 列（与 T7.4 同理：那是 group0 复制的控制面）。幂等。
+ */
+PG_FUNCTION_INFO_V1(partdist_shard_mvcc_register);
+Datum
+partdist_shard_mvcc_register(PG_FUNCTION_ARGS)
+{
+	int64		shardid = PG_GETARG_INT64(0);
+	Oid			relid = InvalidOid;
+	char		sql[160];
+	bool		already;
+	char		relkind;
+	BlockNumber nblocks;
+	Relation	rel;
+	MemoryContext oldcxt;
+	ResourceOwner oldowner;
+	volatile bool notified = false;
+	char		notice_err[200] = "";
+	StringInfoData out;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("shard_mvcc_register 需要超级用户")));
+
+	/* ① 全局分片号 → 本地 OID */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("SPI_connect 失败")));
+	snprintf(sql, sizeof(sql),
+			 "SELECT local_oid FROM partdist.shard_identity WHERE global_shard_id = %lld",
+			 (long long) shardid);
+	if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+									  SPI_tuptable->tupdesc, 1, &isnull);
+
+		if (!isnull)
+			relid = DatumGetObjectId(d);
+	}
+	SPI_finish();
+	if (!OidIsValid(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("本节点没有分片 %lld（shard_identity 里查不到）", (long long) shardid),
+				 errhint("先在本节点执行 partdist.rebuild_shard_identity()；"
+						 "若分片确实不在本节点，应到它的 placement 上登记。")));
+
+	/* ② 副本壳表不登记 */
+	if (ShardReplicaIsLocal(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("分片 %lld 在本节点是副本壳表（oid %u），打标只在 placement 上登记",
+						(long long) shardid, relid),
+				 errdetail("副本进了打标集合，vacuum 自动启动器会在副本文件上本地改页面，"
+						   "与回放写同一批文件。副本的打标身份在升主时凭 pg_shard_clog "
+						   "证据目录继承。")));
+
+	rel = relation_open(relid, AccessShareLock);
+	relkind = rel->rd_rel->relkind;
+	nblocks = RelationGetNumberOfBlocks(rel);
+	relation_close(rel, AccessShareLock);
+	if (relkind != RELKIND_RELATION)
+		ereport(ERROR,
+				(errmsg("分片 %lld 的本地关系 %u 不是普通表（relkind=%c）",
+						(long long) shardid, relid, relkind)));
+
+	/* ③ 首次登记要求空表 */
+	already = ShardRelIsMvcc(relid);
+	if (!already && nblocks > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("分片 %lld（oid %u）已有 %u 个堆块，不能登记为打标表",
+						(long long) shardid, relid, nblocks),
+				 errdetail("打标之前写入的行带原生 xid，打标后按分片可见性规则读不到 —— "
+						   "登记会让这些数据\"消失\"。"),
+				 errhint("在建表（含索引，打标后禁 CREATE INDEX）之后、写入数据之前登记。")));
+
+	/* ④ 登记 */
+	ShardMvccEnsureWatermarkFile(relid);
+	ShardMvccSetAdd(relid);
+	ShardClogEnsureEvidence(relid);
+
+	/* ⑤ 通知副本建证据目录（子事务：失败不回滚登记） */
+	oldcxt = CurrentMemoryContext;
+	oldowner = CurrentResourceOwner;
+	BeginInternalSubTransaction(NULL);
+	PG_TRY();
+	{
+		PartWALAppendCtrl(relid, PARTWAL_CTRL_SHARD_MVCC, NULL, 0);
+		PartWALNoteTouchedPartition(relid);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		notified = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(oldcxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		strlcpy(notice_err, ed->message, sizeof(notice_err));
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+
+	elog(LOG, "pg_partdist: 分片 %lld（oid %u）%s登记为打标表，副本通知%s%s",
+		 (long long) shardid, relid, already ? "已是打标表，重复" : "",
+		 notified ? "已发出" : "未发出：", notified ? "" : notice_err);
+
+	initStringInfo(&out);
+	appendStringInfo(&out, "%s oid=%u replica_notice=%s%s",
+					 already ? "already" : "registered", relid,
+					 notified ? "sent" : "failed: ", notified ? "" : notice_err);
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * partdist.shard_mvcc_status(oid) —— T7.30 观测点：本节点眼里这张表的打标状态。
+ *   registered = 本节点把它当打标表（写入打分片 xid、读走分片可见性）
+ *   evidence   = pg_shard_clog/<oid> 证据目录在不在（副本升主继承身份认它）
+ *   replica    = 是不是副本壳表
+ */
+PG_FUNCTION_INFO_V1(partdist_shard_mvcc_status);
+Datum
+partdist_shard_mvcc_status(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	StringInfoData out;
+
+	initStringInfo(&out);
+	appendStringInfo(&out, "registered=%s evidence=%s replica=%s",
+					 ShardRelIsMvcc(relid) ? "yes" : "no",
+					 ShardClogDirExists(relid) ? "yes" : "no",
+					 ShardReplicaIsLocal(relid) ? "yes" : "no");
+	PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 
 /* ---- T5.6 观测点：分片 xid 龄与护栏相位 ---- */

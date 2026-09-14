@@ -105,8 +105,18 @@ PSQL "$WPORT" -q -c "INSERT INTO p2a VALUES (1,'a');" </dev/null >/dev/null
 PSQL "$WPORT" -q -c "BEGIN; DROP TABLE p2a; ROLLBACK;" </dev/null >/dev/null
 d1=$(DEX ls -d "$DATADIR/pg_shard_clog/$OA" </dev/null 2>/dev/null | wc -l)
 check "DROP 回滚不删 clog 目录" "$d1" "1"
-neg "含分片 DROP 的事务禁 PREPARE" "不支持" "BEGIN; DROP TABLE p2a; PREPARE TRANSACTION 'p2t';"
-PSQL "$WPORT" -q -c "DROP TABLE p2a;" </dev/null >/dev/null
+# ★ T7.31（P7-D3）起：含分片打标表 DROP 的事务**可以** PREPARE。原先这里是负向断言"禁 PREPARE"——
+#   那条禁令让 Citus 以 2PC 下发的分布表 DROP 必失败，任何打标分布表都删不掉。现在回收清单进
+#   2PC 记录、COMMIT PREPARED 时结算；下面"DROP 提交删 clog 目录 / 水位文件"两条断言由它满足。
+#   首次在新二进制上跑旧断言的实测后果：PREPARE 成功留下悬空 prepared 事务，紧跟的
+#   `DROP TABLE p2a` 等锁等到套件超时 —— 所以这里必须在同一段里把 prepared 事务结算掉。
+pr=$(PSQL "$WPORT" -Atc "BEGIN; DROP TABLE p2a; PREPARE TRANSACTION 'p2t';" </dev/null 2>&1 | tail -1)
+check "含分片 DROP 的事务可 PREPARE（T7.31；此前禁）" "$pr" "PREPARE TRANSACTION"
+d0=$(DEX ls -d "$DATADIR/pg_shard_clog/$OA" </dev/null 2>/dev/null | wc -l)
+check "PREPARE 之后、提交之前 clog 目录仍在" "$d0" "1"
+cp=$(PSQL "$WPORT" -Atc "COMMIT PREPARED 'p2t';" </dev/null 2>&1 | tail -1)
+check "另一会话 COMMIT PREPARED" "$cp" "COMMIT PREPARED"
+[[ "$cp" == "COMMIT PREPARED" ]] || PSQL "$WPORT" -q -c "ROLLBACK PREPARED 'p2t';" </dev/null >/dev/null 2>&1
 d1=$(DEX ls -d "$DATADIR/pg_shard_clog/$OA" </dev/null 2>/dev/null | wc -l)
 d2=$(DEX ls "$DATADIR/pg_shard_xid/$OA" </dev/null 2>/dev/null | wc -l)
 check "DROP 提交删 clog 目录" "$d1" "0"
@@ -227,7 +237,8 @@ nx2=$(PSQL "$WPORT" -Atc "INSERT INTO p2fn VALUES (1); SELECT xmin::text::bigint
 check "未登记对照表仍原生" "$nx2" "t"
 
 echo "========== [7] 负向计数守卫 + 清理 + 节点健康 =========="
-check "负向用例计数守卫（应跑 10 条）" "$NEG_RUN" "10"
+# T7.31：原 10 条负向里"含分片 DROP 的事务禁 PREPARE"已随禁令解除改为正向断言（见 [3]），故 10 → 9
+check "负向用例计数守卫（应跑 9 条）" "$NEG_RUN" "9"
 PSQL "$WPORT" -q -c "DROP TABLE p2f, p2fn;" </dev/null >/dev/null
 PSQL "$WPORT" -q -c "DELETE FROM partdist.partition_map WHERE partition_id=$OF;" </dev/null >/dev/null
 PSQL "$WPORT" -q -c "DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_write(oid,bigint,int); DROP FUNCTION IF EXISTS sclog_claim(oid); DROP FUNCTION IF EXISTS partdist_set_shard_mvcc(regclass,boolean);" </dev/null >/dev/null

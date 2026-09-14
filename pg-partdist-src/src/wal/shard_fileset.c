@@ -845,6 +845,14 @@ ShardBaselineEmit(Oid shard_oid)
     if (ShardClogDirExists(shard_oid))
         (void) ShardClogEmitBaseline(shard_oid, ShardXidNextToIssue(shard_oid));
 
+    /*
+     * ★ T7.30（P7-V4）：打标身份也随基线走。后加入的副本从基线游标起放，看不到
+     * 登记时发的那条 SHARD_MVCC；而一个刚打标、还没有任何判决的分片，上面那段
+     * 一块 clog 都不发 —— 副本上就没有证据目录，升主继承不到身份。
+     */
+    if (ShardRelIsMvcc(shard_oid))
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_SHARD_MVCC, NULL, 0);
+
     ereport(LOG,
             (errmsg("pg_partdist: shard %u 物理基线已发射（%d 个成员，%llu 块，"
                     "base_part_lsn=%llu）",

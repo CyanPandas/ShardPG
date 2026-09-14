@@ -96,6 +96,8 @@ SUITES=(
   "partwal_ring_p7         900  P7"   # T7.27（P7-W2）捕获环背压 + 溢出记账 + 分叉自愈
   "replay_spin_p7          900  P7"   # T7.28（P7-P2）回放 worker 等尾部不许空转
   "cts_universe_p7        1200  P7"   # T7.29（P7-G4）commit_ts 宇宙位：中途配 TSO 已提交行不许消失
+  "shard_mvcc_register_p7 1800  P7"   # T7.30（P7-V4）分布表一条命令打标 + 身份随切主走
+  "drop_mvcc_2pc_p7       1200  P7"   # T7.31（P7-D3）含打标表 DROP 可 PREPARE，回收随 COMMIT PREPARED
   # ── P7 批次 1 验收：**2026-09-13 起并入门禁**。此前这四套只在各自任务里跑过，
   #   从没进过 SUITES —— 而点名一个不在清单里的套件，门禁原先会**静默跳过**（见下方
   #   WANT 校验），于是"批次 1 各有新套件"这句出口标准实际上没有任何东西在持续验证。
@@ -442,18 +444,24 @@ scrub() {
   ensure_nodes_up
   tso_epoch_reset_if_blocked
   purge_orphan_prepared
+  local g bad=0
   for p in $PORTS; do
     # ★ replay_trust_local_segments 也要复位（T6.8-2）：它现在**真的有效力**了
     #   —— 开着就允许 replay_catchup 不给上界、直接追到本地段末尾。
     #   12 个套件在自己开头把它设 on 且从不还原，不在这里复位的话，
     #   后面套件的 fail-closed 守卫会被前面那套悄悄遮掉。需要它的套件自己开。
-    PS "$p" -q -c "ALTER SYSTEM RESET pg_partdist.shard_relids;
-                   ALTER SYSTEM RESET pg_partdist.tso_conninfo;
-                   ALTER SYSTEM RESET pg_partdist.allow_replica_access;
-                   ALTER SYSTEM RESET pg_partdist.replay_trust_local_segments;
-                   ALTER SYSTEM RESET pg_partdist.replay_debug_trace;" </dev/null >/dev/null 2>&1
+    #
+    # ★★ 2026-09-13：**每条 ALTER SYSTEM 必须自己占一个 -c**（夹具规则第 2 条）。
+    #   原先五条写在同一个 -c 里 = 隐式事务块 ⇒ `ALTER SYSTEM cannot run inside a
+    #   transaction block`，而输出丢进 /dev/null —— 于是这段净场**自写成以来一条 GUC
+    #   都没复位过**，前一套留下的白名单 / TSO 配置一直漏进后一套（节点日志里实测
+    #   可见该报错）。现在逐条执行，失败计数并打印，不再吞掉。
+    for g in shard_relids tso_conninfo allow_replica_access replay_trust_local_segments replay_debug_trace; do
+      PS "$p" -q -c "ALTER SYSTEM RESET pg_partdist.$g;" </dev/null >/dev/null 2>&1 || bad=$((bad+1))
+    done
     PS "$p" -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
   done
+  [[ "$bad" -gt 0 ]] && echo "  [净场] ⚠ GUC 复位失败 ${bad} 次（节点不可达？）"
   # 两轮：单轮按端口顺序复位时，未复位的节点会把组心跳回已复位的节点上
   for round in 1 2; do
     for p in $PORTS; do

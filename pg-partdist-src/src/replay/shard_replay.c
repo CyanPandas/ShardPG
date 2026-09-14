@@ -1866,6 +1866,21 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         return true;
     }
 
+    /*
+     * T7.30（P7-V4）：leader 把本分片登记成了打标表。副本只建证据目录，**不**进
+     * 本节点打标集合（见 PARTWAL_CTRL_SHARD_MVCC 的注释）；身份在升主时由 T7.4
+     * 凭这个目录继承。幂等。
+     */
+    if (hdr->info == PARTWAL_CTRL_SHARD_MVCC)
+    {
+        ShardClogEnsureEvidence(ctx->shard_oid);
+        ereport(LOG,
+                (errmsg("pg_partdist replay: shard %u @plsn %llu 收到打标登记通知，"
+                        "已建 pg_shard_clog 证据目录", ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn)));
+        return true;
+    }
+
     if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu 未知 CTRL opcode "

@@ -140,6 +140,9 @@ extern int	ShardClogTruncate(Oid shard, TransactionId trunc_before);
 
 /* T7.4（R-P6-21）：本节点是否有该分片的 clog 目录 = 它是不是打标分片的持久证据 */
 extern bool ShardClogDirExists(Oid shard);
+/* T7.30：建出 pg_shard_clog/<oid> 证据目录（幂等）。副本收到 CTRL SHARD_MVCC、
+ * leader 登记打标时各调一次；T7.4 升主继承身份认的就是它。 */
+extern void ShardClogEnsureEvidence(Oid shard);
 
 /*
  * T7.2（R-P6-17）：分片 clog 随物理基线一起搬。
@@ -156,5 +159,11 @@ extern void ShardClogRememberDrop(Oid shard);
 extern bool ShardClogHasPendingDrops(void);
 extern void ShardClogAtCommit(void);	/* 执行挂起的删除 */
 extern void ShardClogAtAbort(void);		/* 丢弃挂起的删除 */
+/* T7.31（P7-D3）：取出本事务挂起的 DROP 清单（PREPARE 时写进 2PC 记录用）。
+ * 返回个数，*oids 指向内部数组，下一次 AtCommit/AtAbort 之前有效。 */
+extern int	ShardClogPendingDropList(const Oid **oids);
+/* T7.31：对一批已确定提交删除的打标表执行文件/集合/槽位回收（COMMIT PREPARED 回调用）。
+ * 不 ERROR，删不掉只 WARNING —— 提交已成事实。 */
+extern void ShardClogGcDropped(const Oid *oids, int n);
 
 #endif							/* SHARD_CLOG_H */

@@ -1382,7 +1382,10 @@ TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role
 |---|---|---|
 | `FILESET_UPDATE` (0x01) | `PartWALCtrlFilesetUpdate` + `ShardFileSetRel[]` | 物理文件集合变更(§12.1/§12.2) |
 | `FREEZE_UPDATE` (0x02) | `PartWALCtrlFreezeUpdate` + `PartWALFreezeEntry[]` | 冻结账目同步(§13 约束 5,D2) |
+| `SHARD_CLOG` (0x03) | `PartWALCtrlShardClog` + 32 字节槽数组 | 物理基线搬分片 clog(T7.2,R-P6-17);副本原样落 `pg_shard_clog/<本地 oid>` |
+| `SHARD_DROP` (0x04) | 空 | leader 已 DROP 该分片(T7.8,P7-D1);副本停流摘槽位,不删壳表 |
 | `DDL_HINT` (0x05) | 索引定义文本清单(按 ord 升序,换行分隔,可为空串) | 结构栅栏的自动跟随提示(§12.2.1,T7.25);发射失败随 `FILESET_UPDATE` 一起让 DDL 事务中止 |
+| `SHARD_MVCC` (0x06) | 空 | leader 已把该分片登记为打标表(T7.30,P7-V4);登记时与物理基线末尾各发一次。副本只建 `pg_shard_clog/<oid>` 证据目录,**不**进打标集合,身份在升主时由 T7.4 凭该目录继承 |
 
 两者的**失败语义刻意不同**,别照抄:
 

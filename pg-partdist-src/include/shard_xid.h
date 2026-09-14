@@ -81,6 +81,8 @@ extern XLogRecPtr ShardLogicalFenceLsn(void);
 /* T7.7（R-P6-4）：DROP 提交时归还分配器槽位与影子。与 ShardMvccSetRemove 同源。 */
 extern void ShardXidSlotRelease(Oid relid);
 extern void ShardMvccEnsureWatermarkFile(Oid relid);
+/* T7.30：本节点是否把这张表当打标表（GUC 白名单 ∪ 登记集合，与写/读路径同一谓词） */
+extern bool ShardRelIsMvcc(Oid relid);
 
 /* P1 数据保护拦截：VACUUM/ANALYZE/CLUSTER 点名白名单表一律 ERROR
  * （P1_PRECHECK 结论 D：原生 clog 会误判分片 xid，重写/回收路径必须封死） */
