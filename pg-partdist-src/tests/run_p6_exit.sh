@@ -586,6 +586,23 @@ for _w in "$@"; do
 done
 unset _w _s _hit
 
+# ★ 2026-09-14（P7-T10）：起跑前确认**容器里的扩展就是本工作区这份代码**。
+#   门禁用的是工作区的测试脚本，跑的却是容器里已装的 .so —— 两者不一致时（改了代码/SQL
+#   还没 sync_build），测出来的数字属于哪份代码谁也说不清；净场里重放 SQL 声明时还会把
+#   工作区的 plpgsql 提前装进库。按内容比对源码 + 核对 .so 导出符号，不一致即停。
+#   刻意拿旧二进制对照（A/B）时，请从对应版本的 git worktree 里跑门禁（其 WS_ROOT 与
+#   容器一致即可通过）；实在要跳过，显式给 ALLOW_STALE_BUILD=1。
+if [[ "${ALLOW_STALE_BUILD:-0}" != 1 ]]; then
+  _sb=$(CONTAINER="$C" bash "$T/../scripts/sync_build.sh" --check 2>&1)
+  if [[ $? -ne 0 ]]; then
+    echo "FATAL: 容器 $C 里的扩展与本工作区源码不一致 —— 先跑 scripts/sync_build.sh（ALLOW_STALE_BUILD=1 可跳过）" >&2
+    printf '%s\n' "$_sb" | grep -E "✗|^ +[<>] " | head -12 | sed 's/^/    /' >&2
+    exit 3
+  fi
+  echo "  [前置] 容器扩展 == 工作区源码，已装 .so 导出符号齐全（sync_build.sh --check）"
+  unset _sb
+fi
+
 wait_idle
 rotate_logs
 prepare_env

@@ -17,13 +17,37 @@
 # （2026-09-13 之前只重放 C 函数，理由是"plpgsql 可能依赖顺序"；实际 plpgsql 的
 #  函数体在建函数时只查语法不查表，风险并不存在，而漏掉它们的代价见下方 T7.25 注释。
 #  sql 语言函数会在建时校验引用对象，缺表时该条报错、其余照跑，报错数照常计入。）
+#
+# ★ 2026-09-14（P7-T10）：SQL 的来源默认改为**容器里已安装的那份**
+#   （`$(pg_config --sharedir)/extension/pg_partdist--1.0.sql`，与已装 .so 同一次
+#   make install 的产物，也正是 CREATE EXTENSION 会执行的内容），不再读工作区。
+#   原先读工作区：工作区领先于容器 .so 时（改了 SQL、还没 sync_build），plpgsql 函数被
+#   **提前**装进库，C 函数因符号缺失装不上 —— 实测 `set_table_shard_mvcc` 在它下发调用的
+#   C 函数还不存在时就已在库，而门禁汇总不会因此变红。
+#   要刻意重放工作区版本（例如只改了 plpgsql、明知不需要重编）时显式给 SQL_SOURCE=workspace。
 set -u
-C="${CONTAINER:-pg-citus-tx2-container}"
-SQLFILE="$(cd "$(dirname "$0")/.." && pwd)/sql/pg_partdist--1.0.sql"
+C="${CONTAINER:-pg-test-container}"   # 2026-09-14：原默认 tx2 容器，本分支上误触会打到承载 demo 的环境
 PORTS="${PORTS:-$(seq 5432 5440)}"
 SCHEMA="${SCHEMA:-partdist}"
+SQL_SOURCE="${SQL_SOURCE:-installed}"
 
-[[ -f "$SQLFILE" ]] || { echo "FATAL: 找不到 $SQLFILE"; exit 1; }
+case "$SQL_SOURCE" in
+  installed)
+    SQLFILE=$(mktemp)
+    trap 'rm -f "$SQLFILE"' EXIT
+    docker exec -i -u postgres "$C" bash -c \
+      'cat "$(/work/pg-install/bin/pg_config --sharedir)/extension/pg_partdist--1.0.sql"' \
+      > "$SQLFILE" </dev/null 2>/dev/null
+    [[ -s "$SQLFILE" ]] || { echo "FATAL: 读不到容器 $C 里已安装的 pg_partdist--1.0.sql（还没 make install？）"; exit 1; }
+    echo "  SQL 来源：容器 $C 已安装的 extension/pg_partdist--1.0.sql（与已装 .so 同版本）"
+    ;;
+  workspace)
+    SQLFILE="$(cd "$(dirname "$0")/.." && pwd)/sql/pg_partdist--1.0.sql"
+    [[ -f "$SQLFILE" ]] || { echo "FATAL: 找不到 $SQLFILE"; exit 1; }
+    echo "  SQL 来源：工作区 $SQLFILE（SQL_SOURCE=workspace —— 工作区若领先于已装 .so，C 函数会装不上）"
+    ;;
+  *) echo "FATAL: SQL_SOURCE 只能是 installed 或 workspace（实际 $SQL_SOURCE）"; exit 1 ;;
+esac
 
 # 抽出函数声明：从 CREATE OR REPLACE FUNCTION 到引号外以 ';' 结尾的那一句。
 tmp=$(mktemp)
@@ -81,9 +105,10 @@ done
 #   首版自检是"C 函数总数 >= 抽出条数"——那是个数量对比，96 >= 73 轻松通过，
 #   而实际有 9 个函数一个都没建上。**数总量抓不住"少了哪几个"**。
 vport=$(echo $PORTS | awk '{print $2}')
-names=$(grep -oE "^CREATE OR REPLACE FUNCTION [a-z_]+" /tmp/_refresh_names.txt 2>/dev/null | awk '{print $NF}')
+# 2026-09-14：函数名要认数字（原 [a-z_]+ 把 t10_demo_probe 截成 t，自检报"缺 t"）；
+#   并删掉一行在文件写出之前就去读它的死代码。
 docker exec -i "$C" cat /tmp/refresh_ext.sql 2>/dev/null > /tmp/_refresh_names.txt || true
-names=$(grep -oE "^CREATE OR REPLACE FUNCTION [a-z_]+" /tmp/_refresh_names.txt | awk '{print $NF}' | sort -u)
+names=$(grep -oE "^CREATE OR REPLACE FUNCTION [a-z_][a-z0-9_]*" /tmp/_refresh_names.txt | awk '{print $NF}' | sort -u)
 nname=$(printf '%s\n' "$names" | grep -c . || true)
 inlist=$(printf "'%s'," $names | sed 's/,$//')
 gone=$(docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" \
