@@ -1214,6 +1214,16 @@ node 2)。
 >    是它自己回放出来的、与新主同源,且交接 CTRL 后面**没有 FPI**。照截就是
 >    把副本清空后等一批永远不会来的记录 —— 那不是修复,是更坏的缺陷。
 >    `base_part_lsn` 同理不动。
+>    ★ **2026-09-14 P7-T8:广播改为有条件**(`PartDistRoutePromoteEx(oid, emit_handover)`)。
+>    `partwal_notify_primary_switch` 在 `new == 本节点` 时按
+>    `old_primary != 0 || ShardReplicaIsLocal(oid)` 决定发不发:真切换、或本节点
+>    原本是副本 ⇒ 发;**首次登记为主(old=0)且本节点就是 fileset 源头** ⇒ 不发。
+>    后一种情形副本的 locmap 本来就是按本节点文件号配的,广播没有任何信息量;
+>    而它发生在建组后第一次 `OP_PARTITION_PRIMARY` apply 里,副本常常还没就绪,
+>    提案凑不齐多数派 ⇒ plsn=1 被拒两次(实测 `quorum_drops` +2,`last_drop_plsn=1`),
+>    孤儿重推的 ERROR 还会打断那次 apply。判据必须在置 promoted 记号**之前**取
+>    (置位后 `ShardReplicaIsLocal` 就不再为真)。`promote_handover_p7` 的真切换
+>    路径仍然发广播。
 >
 > ④ **打标身份**(R-P6-21):判定一张表是否分片打标只看本节点白名单/shmem 集合,
 >    而该集合只由 `partdist_set_shard_mvcc()` 或**重启扫目录**装载,副本从不设 ——

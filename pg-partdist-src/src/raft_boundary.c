@@ -213,7 +213,22 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 		 * 要等 EnsurePartWALRegistered 惰性登记才进流；在交接点显式做掉，
 		 * 那个窗口就没了。
 		 */
-		PartDistRoutePromote(loid);
+		/*
+		 * ★ P7-T8（2026-09-14）：交接广播只在副本的 locmap 可能对着别人的文件号时发。
+		 *   · old_primary_node != 0 —— 真正的切主：前任主可能已让副本改配对到它的号，
+		 *     哪怕这次当选的是最初的 leader 也要广播；
+		 *   · old_primary_node == 0 —— 首次登记：本节点若**不是副本**（没有配对过
+		 *     locmap 的回放槽位），它就是 fileset 源头、副本本就按它配对，广播多余；
+		 *     本节点若是副本（首次选举被副本抢到），它的号与源头不同，照样广播。
+		 *   必须在 PartDistRoutePromoteEx 置"已升主"**之前**判：ShardReplicaIsLocal
+		 *   对已升主的槽位返回 false。
+		 *   修复前：首次登记时副本常常还没就绪，广播提案凑不齐多数派 ⇒ plsn=1 被拒两次
+		 *   （txn_layer_r2 [3] 实测 quorum_drops +2、last_drop_plsn=1），孤儿重推的
+		 *   ERROR 还会打断这次 apply。P7-T8 丢提案额度超限的**稳定**来源另有一处
+		 *   （[9] 窗口里的心跳自动修复），见 P7_REMEDIATION_PLAN 该条。
+		 */
+		PartDistRoutePromoteEx(loid,
+							   old_primary_node != 0 || ShardReplicaIsLocal(loid));
 		ereport(LOG,
 				(errmsg("pg_partdist: 分片 %u（本地 OID %u）已接管为主，"
 						"解除副本读闸门；此后拒绝对它触发回放",

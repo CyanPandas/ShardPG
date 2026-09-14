@@ -457,7 +457,9 @@ scrub() {
     #   transaction block`，而输出丢进 /dev/null —— 于是这段净场**自写成以来一条 GUC
     #   都没复位过**，前一套留下的白名单 / TSO 配置一直漏进后一套（节点日志里实测
     #   可见该报错）。现在逐条执行，失败计数并打印，不再吞掉。
-    for g in shard_relids tso_conninfo allow_replica_access replay_trust_local_segments replay_debug_trace; do
+    #   2026-09-14 P7-T8：auto_repair_diverged 也在列 —— txn_layer_r2 [9] 会在 leader 上
+    #   临时关掉它，套件被打断时 EXIT 钩子之外再兜一层。
+    for g in shard_relids tso_conninfo allow_replica_access replay_trust_local_segments replay_debug_trace auto_repair_diverged; do
       PS "$p" -q -c "ALTER SYSTEM RESET pg_partdist.$g;" </dev/null >/dev/null 2>&1 || bad=$((bad+1))
     done
     PS "$p" -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1

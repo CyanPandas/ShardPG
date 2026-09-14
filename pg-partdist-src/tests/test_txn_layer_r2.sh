@@ -47,7 +47,16 @@ r2_restore_nodes() {
   done
   _R2_STOPPED=""
 }
-trap r2_restore_nodes EXIT
+# [9] 窗口里关掉的分叉标记自动修复（见 [9] 的 P7-T8 注释）。与复原节点分开：
+# 节点在 [9] 末尾就要复原，自动修复要等收尾丢弃检查之后才还原。
+_R2_REPAIR_OFF=""
+r2_restore_repair() {
+  [[ -z "$_R2_REPAIR_OFF" ]] && return
+  PSQL "$_R2_REPAIR_OFF" -q -c "ALTER SYSTEM RESET pg_partdist.auto_repair_diverged;" >/dev/null 2>&1
+  PSQL "$_R2_REPAIR_OFF" -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
+  _R2_REPAIR_OFF=""
+}
+trap 'r2_restore_nodes; r2_restore_repair' EXIT
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
 
 check() {  # check <名字> <实际> <期望>
@@ -411,6 +420,25 @@ echo "========== [9] 中止路径：ABORT 标记 =========="
 #   改用**自动建组救不回来**的手段：直接停掉这两个节点 —— 停机的节点不会 ack，
 #   leader 的多数派算术（按它自己的成员集做）就真的凑不齐。
 #   停完必复原（见 [收尾]）。
+#
+# ★★ 2026-09-14 P7-T8：停机窗口里先关掉 leader 的**分叉标记自动修复**。
+#   本节的中止事务会让复制挂钩失败 ⇒ leader 给分区打分叉标记（§13 约束 13 的
+#   检测）⇒ T7.27 起心跳工作者几秒内就自连调 repair_diverged_shards() ⇒ 基线在
+#   多数派缺失时发不出去，**每次尝试被拒两次提案**（门禁节点日志：同一个 backend
+#   两次 `reject propose`，第一次只见 WARNING、第二次 ERROR 出来），且它的
+#   FILESET_UPDATE 可能落在 ABORT 标记之后的流尾（修复前取证轮实测尾部读到 4|255|1|72）。
+#   实测（门禁日志）：[9] 本身 1 次 + 自动修复 2 次 = :5433+3，正是"恒差 1"；
+#   额度 2 是 T7.27 之前按"1~2 次"标定的。自动修复是本节之外的并发写者，
+#   它在故意拆多数派时的失败是**设计行为**（修不掉留待下一轮），不是本节要验的
+#   对象 —— 所以关掉它而不是把额度抬到 3/4：额度不动，非预期的丢弃照样抓。
+#   到收尾丢弃检查之后才还原（复原节点后立刻打开，它会赶在副本就绪前再试一次）。
+#   EXIT 钩子兜底还原；门禁净场也复位这个 GUC。
+_R2_REPAIR_OFF=$pport
+PSQL $pport -q -c "ALTER SYSTEM SET pg_partdist.auto_repair_diverged = off;" >/dev/null 2>&1
+PSQL $pport -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1
+sleep 1
+check "leader :$pport 已在拆多数派窗口前关闭自动修复" \
+      "$(PSQL $pport -Atc 'SHOW pg_partdist.auto_repair_diverged' 2>/dev/null)" "off"
 for fp in $f1 $f2; do
   _R2_STOPPED+="$fp "          # 先登记再停
   DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/worker$((fp-5432))" -m fast stop >/dev/null 2>&1 || true
@@ -482,8 +510,11 @@ health_check_no_crash
 #   1~2 次 quorum_drop（实测两者都出现过）。不给额度这条断言永远红 ——
 #   它在断言本套件自己造出来的东西，被当成 R-P4-22 挂了很久。
 #   额度之外多一次仍然红，非预期的丢弃照样抓得住。
+#   2026-09-14 P7-T8：此前实测恒为 3 = [9] 本身 1 次 + T7.27 心跳自动修复在同一窗口里
+#   重发基线被拒 2 次 —— 已在 [9] 里关掉它，额度仍是 2（见 [9] 注释）。
 health_check_no_drops 2
 health_check_worker_pool
+r2_restore_repair   # 丢弃检查之后才还原 [9] 关掉的自动修复
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "R2 事务层验收：全部通过"; else echo "R2 事务层验收：存在 FAIL"; fi
 

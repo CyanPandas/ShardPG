@@ -2331,6 +2331,12 @@ PG_FUNCTION_INFO_V1(partdist_route_status);
 void
 PartDistRoutePromote(Oid shard_oid)
 {
+    PartDistRoutePromoteEx(shard_oid, true);
+}
+
+void
+PartDistRoutePromoteEx(Oid shard_oid, bool emit_handover)
+{
     ShardFileSet fs;
 
     if (!OidIsValid(shard_oid))
@@ -2380,8 +2386,18 @@ PartDistRoutePromote(Oid shard_oid)
      * 那些副本从此放不了新主的流、也失去再次当选资格（R-P4-15 拦升主的那一格），
      * 直到有人从新主重新供给它们。批次 #10 的 p7 [3b] 只断言了副本**收到**新主的
      * 记录，没断言**放得了**，所以这条缺陷当时没被测出来。
+     *
+     * ★ P7-T8（2026-09-14）：只在"副本的 locmap 可能对着别人的文件号"时才广播，
+     *   由调用方判定（见 raft_boundary.c）。首次登记主节点、且本节点就是 fileset
+     *   源头时，副本正是按本节点的文件号配对的，广播不带任何新信息；而它恰好发生在
+     *   control-plane apply 里、副本常常还没开始应答数据组的窗口，凑不齐多数派时
+     *   plsn=1 被拒两次（txn_layer_r2 [3] 实测），孤儿重推的 ERROR 还打断那条 apply。
      */
-    PartDistEmitFilesetHandover(shard_oid);
+    if (emit_handover)
+        PartDistEmitFilesetHandover(shard_oid);
+    else
+        elog(LOG, "pg_partdist: 分片 %u 首次登记为主、本节点即 fileset 源头，"
+             "副本已按本节点文件号配对，跳过交接广播", shard_oid);
 }
 
 /*

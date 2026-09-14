@@ -176,8 +176,11 @@ extern void  ShardClearDiverged(Oid shard_oid);
 extern void  ShardPromotedMarkWrite(Oid shard_oid, bool promoted);
 extern bool  ShardPromotedMarkRead(Oid shard_oid);
 
-/* FRD §11 步骤 5：升主的角色切换（角色 + 捕获登记） */
+/* FRD §11 步骤 5：升主的角色切换（角色 + 捕获登记 + 打标身份 + 文件号交接广播） */
 extern void  PartDistRoutePromote(Oid shard_oid);
+/* 同上；emit_handover=false 跳过第 ④ 步的交接广播（P7-T8：首次登记且本节点就是
+ * fileset 源头时，副本本就按本节点文件号配对，广播既多余又会在副本就绪前丢提案） */
+extern void  PartDistRoutePromoteEx(Oid shard_oid, bool emit_handover);
 
 /*
  * T7.3（R-P6-16）：升主后把本节点的 fileset 广播出去，让其余副本把 locmap
