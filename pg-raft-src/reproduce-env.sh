@@ -104,7 +104,12 @@ do_up() {
     echo "镜像不存在，从克隆构建..."
     docker build -t "$IMAGE" "$CLONE_DIR"
   fi
-  docker run -d --name "$CONTAINER" "$IMAGE" sleep infinity >/dev/null
+  # ★ --init（2026-09-14）：PID 1 必须能回收孤儿。没有它 PID 1 就是 `sleep infinity`，
+  #   pg_ctl 起的 postmaster（以及 kill -9 后留下的 backend）退出后全挂在它名下成僵尸、
+  #   永不回收。僵尸照样占容器 pids cgroup 的名额（systemd 默认 TasksMax = 内核
+  #   threads-max 的 15%，4 GB 机器上是 4621）。pg-test 4 天攒到 2486 个、每天 +400~700，
+  #   名额一满容器里一切 fork 都失败：postgres 起不了 backend / bgworker，看起来像产品缺陷。
+  docker run -d --init --name "$CONTAINER" "$IMAGE" sleep infinity >/dev/null
   DEX0 mkdir -p /work
   for d in pg-install pg-partdist-src pg-raft-src; do
     docker cp "$CLONE_DIR/$d" "$CONTAINER:/work/$d"

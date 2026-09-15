@@ -605,6 +605,25 @@ if [[ "${ALLOW_STALE_BUILD:-0}" != 1 ]]; then
   unset _sb
 fi
 
+# ★ 2026-09-14：容器进程名额。PID 1 不是 init（旧 reproduce-env.sh 起的容器是
+#   `sleep infinity`）时，退出的 postmaster / 被 kill -9 遗留的 backend 永不回收，僵尸照占
+#   pids cgroup 名额；名额满了容器里一切 fork 失败，套件会以"连不上 / bgworker 起不来"的
+#   形态整片变红。pg-test 实测 4 天 2486 个、每天 +400~700。占用过 80% 直接停，过 50% 警告。
+_pid1=$(docker exec "$C" cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')
+_pcur=$(docker exec "$C" cat /sys/fs/cgroup/pids.current 2>/dev/null)
+_pmax=$(docker exec "$C" cat /sys/fs/cgroup/pids.max 2>/dev/null)
+_zomb=$(docker exec "$C" ps -eo stat= 2>/dev/null | grep -c '^Z')
+if [[ "$_pcur" =~ ^[0-9]+$ && "$_pmax" =~ ^[0-9]+$ ]]; then
+  echo "  [前置] 容器进程名额 ${_pcur}/${_pmax}，僵尸 ${_zomb}，PID 1 = ${_pid1}"
+  if (( _pcur * 100 >= _pmax * 80 )); then
+    echo "FATAL: 容器 $C 进程名额已用 ${_pcur}/${_pmax}（僵尸 ${_zomb}）—— 按 PG_TEST_ENV.md「容器进程名额」重建带 --init 的容器" >&2
+    exit 3
+  elif (( _pcur * 100 >= _pmax * 50 )); then
+    echo "  [前置] ⚠ 进程名额过半，僵尸在累积（PID 1 不是 init？）—— 见 PG_TEST_ENV.md「容器进程名额」"
+  fi
+fi
+unset _pid1 _pcur _pmax _zomb
+
 wait_idle
 rotate_logs
 prepare_env

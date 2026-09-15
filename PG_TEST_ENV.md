@@ -40,6 +40,38 @@ docker stop pg-test-container && docker start pg-citus-tx2-container
 
 并存的后果在 tx2 那边实测过：OOM + 连环改选 + 数据组丢主，症状会伪装成回放缺陷。
 
+## 3.1 容器进程名额（2026-09-14：僵尸进程会把容器 fork 名额耗尽）
+
+**现象**：旧 `reproduce-env.sh` 用 `docker run -d … sleep infinity` 起容器，PID 1 是 `sleep`，
+不回收孤儿。`pg_ctl` 起的 postmaster 在 `docker exec` 返回后就挂到 PID 1 名下，节点每停一次、
+每被 kill -9 一次（连同它遗留的 backend）都变成一个永不回收的僵尸。僵尸不占 CPU/内存，但**照占
+容器 pids cgroup 的名额**：systemd 给 docker scope 的默认 `TasksMax` = 内核 threads-max 的 15%，
+本机（4 GB）是 **4621**。
+
+**实测**（pg-test，建于 09-10）：4 天攒到 **2486** 个僵尸（全是 uid 999 的 postgres），按创建日
+196 / 705 / 680 / 483 / 422，名额已用 2749/4621。照这个速度 3~4 天用满 —— 之后容器里一切 fork 失败：
+postgres 起不了 backend / bgworker，`docker exec` 也可能失败，套件会整片以"连不上"的形态变红，
+极易误判成产品缺陷。
+
+**处置**：
+1. `reproduce-env.sh` 已改为 `docker run -d --init …`（PID 1 = docker-init/tini，负责回收），新建环境不再有这个问题。
+2. **已存在的容器**加不了 `--init`，要重建。数据全在可写层（无 volume，`/work` 约 0.8 GB），所以走
+   "快照 → 带 --init 重起"，不丢数据：
+   ```bash
+   # 1) 干净停 9 个节点（-m fast，确认 postmaster.pid 全部消失）
+   # 2) 快照 + 旧容器改名留作回滚
+   docker stop -t 5 pg-test-container
+   docker commit pg-test-container pg-test-env-snap:<日期>-preinit
+   docker rename pg-test-container pg-test-container-preinit
+   # 3) 同名同 hostname 带 --init 重起（集群元数据只用 127.0.0.1/localhost，与 hostname 无关）
+   docker run -d --init --hostname <旧 hostname> --name pg-test-container pg-test-env-snap:<日期>-preinit sleep infinity
+   # 4) 起 9 个节点，rm coordinator/pg_tso_boot，核对 PID 1 = /sbin/docker-init、僵尸 0
+   # 回滚：docker rm -f pg-test-container && docker rename pg-test-container-preinit pg-test-container && docker start pg-test-container
+   ```
+3. 门禁 `run_p6_exit.sh` 起跑前打印名额 / 僵尸数 / PID 1：用量过 50% 警告，过 80% FATAL（退出码 3）。
+
+其余三套 9 节点容器（replay / tx / tx2）同样是 `sleep infinity`，**本线不动**；它们启动后长期跑测试也会遇到同一问题。
+
 ## 4. 常用命令
 
 ```bash
