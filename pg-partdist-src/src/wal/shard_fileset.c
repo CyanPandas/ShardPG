@@ -906,14 +906,17 @@ ShardFreezeNoteUserActivity(void)
     shard_freeze_user_activity = true;
 }
 
+static void fsync_shard_dir(Oid shard_oid);   /* 定义在 fileset 持久化一节 */
+
 static void
 FreezePath(Oid shard_oid, char *path, char *tmp)
 {
     snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
              DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FREEZE_FILENAME);
     if (tmp != NULL)
-        snprintf(tmp, MAXPGPATH, "%s/%s/%u/%s.tmp",
-                 DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FREEZE_FILENAME);
+        snprintf(tmp, MAXPGPATH, "%s/%s/%u/%s.tmp.%d",
+                 DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FREEZE_FILENAME,
+                 MyProcPid);
 }
 
 /*
@@ -1029,9 +1032,14 @@ StoreShardFreeze(Oid shard_oid, const PartWALFreezeEntry *ents, int n)
     {
         CloseTransientFile(fd);
         if (rename(tmp, path) != 0)
+        {
             ereport(WARNING,
                     (errcode_for_file_access(),
                      errmsg("pg_partdist: 无法就位 freeze 文件 \"%s\": %m", path)));
+            (void) unlink(tmp);
+        }
+        else
+            fsync_shard_dir(shard_oid);
     }
     else
     {
@@ -1417,10 +1425,35 @@ FileSetPath(Oid shard_oid, char *path, char *tmp)
 {
     snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
              DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FILESET_FILENAME);
+    /*
+     * ★ 临时文件名带 PID（2026-09-15，Codex 复核 + 32 客户端实测 90 次/分钟）：
+     *   多个 backend 会并发登记同一分片（每个新 backend 首次 DML 都走
+     *   EnsurePartWALRegistered），共用一个 fileset.tmp 时 O_TRUNC 会截掉别人
+     *   已写好的内容、rename 抢先者把 tmp 挪走后落后者 rename 报 ENOENT
+     *   （"无法就位 fileset 文件 … No such file or directory"），期间 fileset
+     *   文件还会瞬时为 0 字节 —— LoadShardFileSet 的探测者（DDL 变更发射、冻结
+     *   账目、升主）读到它就把分片当"不归本节点维护"。每个 backend 各写各的
+     *   tmp，rename 仍是原子替换，谁后谁赢，内容一致。
+     */
     if (tmp != NULL)
-        snprintf(tmp, MAXPGPATH, "%s/%s/%u/%s.tmp",
+        snprintf(tmp, MAXPGPATH, "%s/%s/%u/%s.tmp.%d",
                  DataDir, PARTITION_WAL_DIR, shard_oid,
-                 SHARD_FILESET_FILENAME);
+                 SHARD_FILESET_FILENAME, MyProcPid);
+}
+
+/*
+ * 目录项持久化：tmp 已 fsync、rename 已成功之后，还要 fsync 一次所在目录 ——
+ * 否则崩溃后目录里可能既没有新文件也没有旧文件（ext4 默认不保证 rename 的
+ * 目录项在崩溃前落盘）。fileset 文件是重启后重建捕获登记的唯一依据，丢了它
+ * 该分片的写入从重启起就静默不进流。
+ */
+static void
+fsync_shard_dir(Oid shard_oid)
+{
+    char dir[MAXPGPATH];
+
+    snprintf(dir, MAXPGPATH, "%s/%s/%u", DataDir, PARTITION_WAL_DIR, shard_oid);
+    (void) fsync_fname(dir, true);
 }
 
 void
@@ -1451,13 +1484,30 @@ RegisterShardFileSet(const ShardFileSet *fs)
         (void) unlink(sentinel);
     }
 
+    /*
+     * ★ 内容没变就不重写（2026-09-15）。本函数按 DML 频度被每个 backend 调
+     *   （去重只在 backend 本地），连接池一抖动就是一批 backend 各自"首次登记"
+     *   同一分片 —— 每次都是写文件 + fsync + rename，全在写路径上白花，也正是
+     *   上面那个并发窗口的来源。已持久化的内容与本次一致时，上面的 shmem 登记
+     *   已经做完（幂等），这里直接返回；只有 fileset 真变了（DDL）才落盘。
+     */
+    {
+        ShardFileSet    cur;
+
+        if (LoadShardFileSet(fs->shard_oid, &cur) &&
+            memcmp(&cur, fs, sizeof(*fs)) == 0)
+            return;
+    }
+
     fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
     if (fd < 0)
     {
         ereport(WARNING,
                 (errcode_for_file_access(),
                  errmsg("pg_partdist: 无法创建 fileset 临时文件 \"%s\": %m",
-                        tmp)));
+                        tmp),
+                 errhint("shmem 登记已生效、本次运行照常捕获，但重启后该分片不会"
+                         "重建登记；修好文件系统后重跑 partdist.register_shard_fileset()。")));
         return;
     }
 
@@ -1469,10 +1519,17 @@ RegisterShardFileSet(const ShardFileSet *fs)
     {
         CloseTransientFile(fd);
         if (rename(tmp, path) != 0)
+        {
             ereport(WARNING,
                     (errcode_for_file_access(),
                      errmsg("pg_partdist: 无法就位 fileset 文件 \"%s\": %m",
-                            path)));
+                            path),
+                     errhint("shmem 登记已生效、本次运行照常捕获，但重启后该分片不会"
+                             "重建登记；修好文件系统后重跑 partdist.register_shard_fileset()。")));
+            (void) unlink(tmp);
+        }
+        else
+            fsync_shard_dir(fs->shard_oid);
     }
     else
     {
@@ -2182,6 +2239,41 @@ ShardPromotedMarkRead(Oid shard_oid)
     return (stat(path, &st) == 0);
 }
 
+/*
+ * P7-W6：分片所在数据组此刻是否"本节点是 leader 且多数派存活"。
+ * 没有身份登记（不在任何组）或 pg_raft 未装时返回 true —— 那时基线只进本地流，
+ * 与多数派无关。SPI 自连自断，调用方不需要在 SPI 里。
+ */
+static bool
+shard_group_quorum_alive(Oid shard_oid)
+{
+    char    sql[320];
+    bool    alive = true;
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return true;
+    if (SPI_execute("SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n "
+                    "ON n.oid = p.pronamespace WHERE n.nspname = 'partdist' "
+                    "AND p.proname = 'pg_raft_group_quorum_alive'", true, 1) == SPI_OK_SELECT &&
+        SPI_processed == 1)
+    {
+        snprintf(sql, sizeof(sql),
+                 "SELECT partdist.pg_raft_group_quorum_alive(global_shard_id) "
+                 "FROM partdist.shard_identity WHERE local_oid = %u", shard_oid);
+        if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            bool    isnull;
+            Datum   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                      1, &isnull);
+
+            if (!isnull)
+                alive = DatumGetBool(d);
+        }
+    }
+    SPI_finish();
+    return alive;
+}
+
 PG_FUNCTION_INFO_V1(partdist_repair_diverged_shards);
 
 /*
@@ -2245,7 +2337,21 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
         /*
          * 只对本节点是组 leader 的分片动手。判据与写栅栏同源 —— 副本上发基线
          * 一定被拒，硬试只会把一个可读的报告变成一串 ERROR。
+         *
+         * ★ P7-W6（2026-09-15）：上面这句此前没有代码兑现；而且 leader 也未必
+         *   发得出去 —— "复制挂钩失败"这类标记恰恰意味着多数派刚刚没了，马上
+         *   重试几乎必败（每次被拒两次提案 quorum_drops +2，CTRL/FPI 先落进本地
+         *   流成孤儿；txn_layer_r2 [9] 拆多数派窗口实测）。先问 pg_raft：本节点
+         *   是该组 leader 且多数派最近有应答才发；否则记 quorum_wait 留待下一轮
+         *   （计入 skipped，心跳按间隔重试）。
          */
+        if (!shard_group_quorum_alive(shard))
+        {
+            nskipped++;
+            appendStringInfo(&out, " quorum_wait:%u", shard);
+            continue;
+        }
+
         /*
          * ★ T7.27：每个分片包一层**子事务**。原先是裸 PG_TRY + FlushErrorState 之后
          *   接着干 —— 基线发射半路 ERROR 时持有的锁、buffer pin、打开的段文件都没人

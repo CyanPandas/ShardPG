@@ -172,6 +172,12 @@ typedef struct RaftLogShmem
     int64        base_term;
     int64        peer_next_index[RAFT_MAX_PEERS];
     int64        peer_match_index[RAFT_MAX_PEERS];
+    TimestampTz  peer_last_ack[RAFT_MAX_PEERS];  /* 对端最近一次应答 AppendEntries RPC 的时刻
+                                                 * （接受或拒绝都算"活着"；P7-W6 多数派存活
+                                                 * 探测，见 pg_raft_group_quorum_alive）。0 = 从未 */
+    TimestampTz  peer_last_fail[RAFT_MAX_PEERS]; /* 对端最近一次 RPC 失败（连不上/超时）的时刻。
+                                                 * fail 晚于 ack ⇒ 判死，停机的 follower 一个
+                                                 * 心跳周期内就能判出，不用等时间窗过期 */
     bool         repl_inited;
     int          apply_owner_pid;   /* 串行化 apply 的认领（0 = 无人持有），
                                      * 保证 N 先于 N+1 生效。
@@ -430,6 +436,8 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.quorum_drops = 0;
     g->log.last_drop_plsn = 0;
     g->log.last_apply_fail = RAFT_APPLYFAIL_NONE;
+    memset(g->log.peer_last_ack, 0, sizeof(g->log.peer_last_ack));
+    memset(g->log.peer_last_fail, 0, sizeof(g->log.peer_last_fail));
 
     g->last_data_plsn = 0;
     g->replicate_in_progress = false;
@@ -3385,6 +3393,22 @@ compute_new_commit_index(RaftGroupCtx *ctx, int64 current_term)
     return ctx->log->commit_index;
 }
 
+/* P7-W6：记下对端最近一次应答 / 失败的时刻（多数派存活探测的原始数据） */
+static void
+peer_stamp(RaftGroupCtx *ctx, int peer_slot, bool responded)
+{
+    TimestampTz now = GetCurrentTimestamp();
+
+    if (peer_slot < 0 || peer_slot >= RAFT_MAX_PEERS)
+        return;
+    SpinLockAcquire(&ctx->log->mutex);
+    if (responded)
+        ctx->log->peer_last_ack[peer_slot] = now;
+    else
+        ctx->log->peer_last_fail[peer_slot] = now;
+    SpinLockRelease(&ctx->log->mutex);
+}
+
 static void
 replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
 {
@@ -3516,15 +3540,22 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
                                      entry.index, entry.term,
                                      entry.op_type, entry.payload, data_hex,
                                      &rt, &ok_flag))
+        {
+            peer_stamp(ctx, peer_slot, false);
             return;
+        }
     }
     else
     {
         if (!send_append_entries_rpc(ctx, &peers[peer_slot], term, leader_id,
                                      prev_idx, prev_term, leader_commit,
                                      0, 0, NULL, NULL, NULL, &rt, &ok_flag))
+        {
+            peer_stamp(ctx, peer_slot, false);
             return;
+        }
     }
+    peer_stamp(ctx, peer_slot, true);   /* P7-W6：RPC 有回应（接受或拒绝）= 对端活着 */
 
     if (rt > term)
     {
@@ -3595,6 +3626,151 @@ send_heartbeats(RaftGroupCtx *ctx)
 /* ---- 选举 ---- */
 
 /*
+ * ───────────── P7-R5（2026-09-15）：登记控制面期间不能断心跳 ─────────────
+ *
+ * 数据组新 leader 在 tick 里同步做"自连本节点跑升主前置 + 向 group0 leader 登记"，
+ * 全程阻塞：自连要起一个新 backend（加载 Citus/partdist/raft），登记那条语句里是
+ * 一次同步复制到全体节点的 group0 提案 + 协调者上的 apply（partition_map、
+ * pg_dist_placement、交接）。CPU 饱和时（pg-test e2-medium 跑套件 idle 0–2%）
+ * 当选→登记实测 10–14 s，而这段时间本节点**所有组一个心跳都不发**，
+ * election_timeout=6000 的 follower 到点就把它推翻：txn_layer_r2 门禁 5 轮 4 轮
+ * 建组后主漂移、第一笔写被判中止。
+ *
+ * 处置：两条语句改走**专用连接**（不与 peer_conn[] 共用 —— 等待期间要拿
+ * peer_conn[] 继续发心跳，同一连接上不能挂两条在途查询），异步发送，每
+ * heartbeat_ms 给本节点所有 leader 组发一轮心跳，并设上界（超时即重置连接、
+ * 保留 pending 下个 tick 重来）。
+ */
+#define RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS   (pg_raft_promote_catchup_slice_ms + 8000)
+#define RAFT_REPORT_EXEC_TIMEOUT_MS            30000
+
+static PGconn *self_conn = NULL;           /* 连回本节点（升主前置） */
+static PGconn *report_conn = NULL;         /* 连 group0 leader（登记） */
+static int     report_conn_node = 0;
+
+static void
+dedicated_conn_reset(PGconn **slot)
+{
+    if (*slot != NULL)
+    {
+        PQfinish(*slot);
+        *slot = NULL;
+    }
+}
+
+static PGconn *
+dedicated_conn_get(PGconn **slot, const char *host, int port)
+{
+    char conninfo[512];
+
+    if (*slot != NULL)
+    {
+        if (PQstatus(*slot) == CONNECTION_OK)
+            return *slot;
+        dedicated_conn_reset(slot);
+    }
+    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+    *slot = PQconnectdb(conninfo);
+    if (PQstatus(*slot) != CONNECTION_OK)
+    {
+        elog(WARNING, "pg_raft: 专用连接 %s:%d 失败: %s", host, port,
+             PQerrorMessage(*slot));
+        dedicated_conn_reset(slot);
+        return NULL;
+    }
+    return *slot;
+}
+
+/* 给本节点当 leader 的每一个组发一轮心跳（等待长语句期间调） */
+static void
+heartbeat_all_leader_groups(void)
+{
+    int i;
+
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+        RaftGroupCtx    ctx;
+        int             state;
+
+        if (!g->in_use)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        if (!group_has_member(&ctx, pg_raft_node_id))
+            continue;
+        SpinLockAcquire(&ctx.cons->mutex);
+        state = ctx.cons->state;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (state == RAFT_LEADER)
+            send_heartbeats(&ctx);
+    }
+}
+
+/*
+ * 异步执行 + 等待期间照发心跳 + 上界。返回首个结果（调用方 PQclear）；
+ * NULL = 超时/连接坏，调用方必须重置该连接（上面还挂着在途查询）。
+ */
+static PGresult *
+pq_exec_heartbeating(PGconn *conn, const char *sql, int timeout_ms)
+{
+    TimestampTz start = GetCurrentTimestamp();
+    TimestampTz last_hb = start;
+    PGresult   *first = NULL;
+    PGresult   *r;
+
+    if (!PQsendQuery(conn, sql))
+        return NULL;
+
+    for (;;)
+    {
+        while (PQisBusy(conn))
+        {
+            int             sock = PQsocket(conn);
+            fd_set          rf;
+            struct timeval  tv;
+            TimestampTz     now;
+
+            if (sock < 0 ||
+                TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+            {
+                if (first)
+                    PQclear(first);
+                return NULL;
+            }
+            FD_ZERO(&rf);
+            FD_SET(sock, &rf);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100 * 1000;
+            (void) select(sock + 1, &rf, NULL, NULL, &tv);
+            CHECK_FOR_INTERRUPTS();
+            if (!PQconsumeInput(conn))
+            {
+                if (first)
+                    PQclear(first);
+                return NULL;
+            }
+            now = GetCurrentTimestamp();
+            if (TimestampDifferenceExceeds(last_hb, now, pg_raft_heartbeat_ms))
+            {
+                heartbeat_all_leader_groups();
+                last_hb = now;
+            }
+        }
+        r = PQgetResult(conn);
+        if (r == NULL)
+            break;
+        if (first == NULL)
+            first = r;
+        else
+            PQclear(r);
+    }
+    return first;
+}
+
+/*
  * data_group_promote_prepare — 上报前把本节点该分片"准备成主"。
  *
  * 做两件事（实现在 partdist.pg_raft_promote_prepare，见 pg_raft--1.0.sql）：
@@ -3629,7 +3805,6 @@ data_group_promote_prepare(int64 group_id)
 
     PGconn      *conn;
     PGresult    *res;
-    char         selfconn[256];
     char         sql[256];
     bool         ok = false;
     int          verdict = 0;
@@ -3663,12 +3838,11 @@ data_group_promote_prepare(int64 group_id)
         deadline_state[slot].first_try = now;
     }
 
-    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
-    conn = PQconnectdb(selfconn);
-    if (PQstatus(conn) != CONNECTION_OK)
+    /* P7-R5：专用缓存连接（不再每 tick 新起一个 backend）+ 等待期间照发心跳 */
+    conn = dedicated_conn_get(&self_conn, "127.0.0.1", PostPortNumber);
+    if (conn == NULL)
     {
-        elog(WARNING, "pg_raft: 升主前置连回本节点失败: %s", PQerrorMessage(conn));
-        PQfinish(conn);
+        elog(WARNING, "pg_raft: 升主前置连回本节点失败");
         return false;
     }
 
@@ -3676,14 +3850,20 @@ data_group_promote_prepare(int64 group_id)
              "SELECT partdist.pg_raft_promote_prepare(%lld, %d)",
              (long long) group_id, pg_raft_promote_catchup_slice_ms);
 
-    res = PQexec(conn, sql);
+    res = pq_exec_heartbeating(conn, sql, RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS);
+    if (res == NULL)
+    {
+        elog(WARNING, "pg_raft: 升主前置超过 %d ms 未返回或连接失效(组 %lld)，下个 tick 重试",
+             RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS, (long long) group_id);
+        dedicated_conn_reset(&self_conn);
+        return false;
+    }
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
         verdict = atoi(PQgetvalue(res, 0, 0));
     else
         elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
              (long long) group_id, PQerrorMessage(conn));
     PQclear(res);
-    PQfinish(conn);
 
     ok = (verdict == 1);
 
@@ -3822,14 +4002,32 @@ data_group_try_report(RaftGroupCtx *ctx)
 
     if (peer_in_backoff(&peers[slot]))
         return;
-    conn = peer_conn_get(&peers[slot]);
+
+    /*
+     * P7-R5：登记走专用连接（group0 leader 换人就重连），异步等待期间给本节点
+     * 全部 leader 组发心跳。这条语句里是一次同步的 group0 提案 + 协调者 apply，
+     * 饱和机器上多秒；原先用 peer_conn[] 同步 PQexec，期间零心跳。
+     */
+    if (report_conn != NULL && report_conn_node != leader0)
+        dedicated_conn_reset(&report_conn);
+    conn = dedicated_conn_get(&report_conn, peers[slot].host, peers[slot].port);
     if (conn == NULL)
     {
         peer_mark_result(&peers[slot], false);
         return;
     }
+    report_conn_node = leader0;
 
-    res = PQexec(conn, sql);
+    res = pq_exec_heartbeating(conn, sql, RAFT_REPORT_EXEC_TIMEOUT_MS);
+    if (res == NULL)
+    {
+        elog(WARNING,
+             "pg_raft: group %lld 向控制面(node %d)登记超过 %d ms 未返回或连接失效，下个 tick 重试",
+             (long long) ctx->group_id, leader0, RAFT_REPORT_EXEC_TIMEOUT_MS);
+        dedicated_conn_reset(&report_conn);
+        peer_mark_result(&peers[slot], false);
+        return;
+    }
     if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
     {
         long long v = atoll(PQgetvalue(res, 0, 0));
@@ -3847,7 +4045,7 @@ data_group_try_report(RaftGroupCtx *ctx)
     else
     {
         if (PQstatus(conn) != CONNECTION_OK)
-            peer_conn_reset(slot);
+            dedicated_conn_reset(&report_conn);
         peer_mark_result(&peers[slot], false);
     }
     PQclear(res);
@@ -5380,6 +5578,61 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
  * 后两个非零就意味着：该分区的副本**可能已与 leader 永久分叉**（leader 的物理
  * 变更不随事务回滚），需要重做物理基线。last_drop_plsn 给出最早的怀疑点。
  */
+/*
+ * pg_raft_group_quorum_alive(group_id) → boolean（P7-W6，2026-09-15）
+ *
+ * 本节点是该组 leader，且"自己 + 最近 2 个选举超时内应答过 AppendEntries 的
+ * 成员"够多数派，才返回 true。给 partdist 的分叉标记自动修复用：标记多半正是
+ * 多数派刚丢时打下的，立刻重发基线必败（每次被拒两次提案、CTRL/FPI 先落进本地
+ * 流成孤儿）。判据用**时间**而不用 match_index：停机的 follower 停机前把一切都
+ * ack 过了，match_index 看起来很健康。应答/失败的时刻由 replicate_to_peer 记
+ * （心跳也走它），一个心跳周期内就能判出停机的 follower。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_quorum_alive);
+Datum
+pg_raft_group_quorum_alive(PG_FUNCTION_ARGS)
+{
+    int64        gid = PG_GETARG_INT64(0);
+    RaftGroupCtx ctx;
+    TimestampTz  acks[RAFT_MAX_PEERS];
+    TimestampTz  fails[RAFT_MAX_PEERS];
+    TimestampTz  now = GetCurrentTimestamp();
+    int          state;
+    int          alive = 1;          /* 自己 */
+    int          majority;
+    int          i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_BOOL(false);
+    parse_peers();
+    if (!raft_group_ctx(gid, &ctx))
+        PG_RETURN_BOOL(false);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    state = ctx.cons->state;
+    SpinLockRelease(&ctx.cons->mutex);
+    if (state != RAFT_LEADER)
+        PG_RETURN_BOOL(false);
+
+    majority = cluster_majority(&ctx);
+    SpinLockAcquire(&ctx.log->mutex);
+    memcpy(acks, ctx.log->peer_last_ack, sizeof(acks));
+    memcpy(fails, ctx.log->peer_last_fail, sizeof(fails));
+    SpinLockRelease(&ctx.log->mutex);
+
+    for (i = 0; i < n_peers && i < RAFT_MAX_PEERS; i++)
+    {
+        if (peers[i].node_id == pg_raft_node_id || !peer_in_group(&ctx, i))
+            continue;
+        /* 最近一次应答晚于最近一次失败，且应答不算太久（2 个选举超时） */
+        if (acks[i] != 0 && acks[i] > fails[i] &&
+            !TimestampDifferenceExceeds(acks[i], now,
+                                        2 * pg_raft_election_timeout_ms))
+            alive++;
+    }
+    PG_RETURN_BOOL(alive >= majority);
+}
+
 PG_FUNCTION_INFO_V1(pg_raft_group_flow_stats);
 Datum
 pg_raft_group_flow_stats(PG_FUNCTION_ARGS)

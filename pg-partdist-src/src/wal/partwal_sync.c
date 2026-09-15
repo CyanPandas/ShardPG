@@ -567,9 +567,25 @@ AssembleRawWALRecord(XLogReaderState *state, XLogRecPtr start_lsn,
         uint32     hdrsz;
         uint32     avail;
         uint32     n;
+        uint32     reqlen;
 
-        if (PartWALReadPage(state, pagestart, XLOG_BLCKSZ, cur, pagebuf) < 0)
+        /*
+         * 只要求"到本记录在本页的末尾"这么多字节，不要求整页（2026-09-15）。
+         * PartWALReadPage 现在按 flush 位点截断返回长度（reader 页缓存不能残留
+         * 未刷盘的零），peer 记录多半就在当前这一页、页尾还没写满 —— 要整页
+         * 必然短读失败。记录本身 ≤ upto ≤ flush 位点，要多少给多少永远够。
+         * 续段页 cur 在页首，这里算出的是不含页头的下界（≤ 真正要读的长度），
+         * 只会少要不会多要；真正拷的 [hdrsz, hdrsz+n) 仍在已刷盘范围内。
+         */
+        reqlen = (uint32) (cur % XLOG_BLCKSZ) + (total_len - copied);
+        if (reqlen > XLOG_BLCKSZ)
+            reqlen = XLOG_BLCKSZ;
+
+        if (PartWALReadPage(state, pagestart, (int) reqlen, cur, pagebuf) < 0)
         {
+            ereport(WARNING,
+                    (errmsg("pg_partdist: 装配原始 WAL 记录时读页失败 @%X/%08X（页 %X/%08X，需 %u 字节）",
+                            LSN_FORMAT_ARGS(start_lsn), LSN_FORMAT_ARGS(pagestart), reqlen)));
             pfree(buf);
             return NULL;
         }
@@ -1386,6 +1402,10 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     Oid                 cache_partition[PARTWAL_WRITER_CACHE_MAX];
     PartitionWALWriter *cache_writer[PARTWAL_WRITER_CACHE_MAX];
     int                 ncached = 0;
+#define PARTWAL_READFAIL_MAX 32
+    Oid                 readfail[PARTWAL_READFAIL_MAX];  /* peer 槽位回读失败、记录未进流的分区 */
+    int                 nreadfail = 0;
+    int                 nreadfail_slots = 0;
     XLogRecPtr          last_lsn = InvalidXLogRecPtr;
     XLogRecPtr          marker_lsn;
     TransactionId       my_xid;
@@ -1567,17 +1587,41 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
                     }
                 }
 
-                /*
-                 * gxid 在这里合成，而不是在捕获点（PartWALInsert）。
-                 * 捕获点跑在 XLogInsert 内部，那里不允许碰目录，而节点号要
-                 * 扫 pg_dist_local_group —— 所以捕获侧只记 32 位本地 xid，
-                 * 到 flush 路径（已在事务上下文里）再补上高 16 位来源节点。
-                 */
-                AppendPartWALRecord(writer, slot->orig_lsn,
-                                    slot->rmid, slot->info,
-                                    wal_data, wal_len,
-                                    MakeGlobalXid(PartDistLocalNodeId(), wal_xid),
-                                    PARTWAL_FLAG_DATA);
+                if (wal_data == NULL)
+                {
+                    /*
+                     * ★ 2026-09-15（Codex 复核，32 客户端实测 42 次/分钟）：
+                     *   回读失败时原先照样 AppendPartWALRecord(…, NULL, 0, …)，
+                     *   往流里写一条 data_len=0 的 DATA 记录；副本回放到它只打
+                     *   一句 WARNING 就跳过并推进游标 —— 那条物理变更从此在副本上
+                     *   静默缺失，没有任何标记。现在**不写**：把分区记下来，锁外
+                     *   打分叉标记，交心跳自动重做物理基线（与 P7-W2 覆盖、P7-W4
+                     *   中止排空失败同一处置）。槽位照样消费（否则永远重试）。
+                     *   失败的主因（reader 页缓存里残留未刷盘的零字节）已在
+                     *   PartWALReadPage 按 flush 位点截断修掉，这里是兜底。
+                     */
+                    int k;
+
+                    nreadfail_slots++;
+                    for (k = 0; k < nreadfail && readfail[k] != slot->partition_id; k++)
+                        ;
+                    if (k == nreadfail && nreadfail < PARTWAL_READFAIL_MAX)
+                        readfail[nreadfail++] = slot->partition_id;
+                }
+                else
+                {
+                    /*
+                     * gxid 在这里合成，而不是在捕获点（PartWALInsert）。
+                     * 捕获点跑在 XLogInsert 内部，那里不允许碰目录，而节点号要
+                     * 扫 pg_dist_local_group —— 所以捕获侧只记 32 位本地 xid，
+                     * 到 flush 路径（已在事务上下文里）再补上高 16 位来源节点。
+                     */
+                    AppendPartWALRecord(writer, slot->orig_lsn,
+                                        slot->rmid, slot->info,
+                                        wal_data, wal_len,
+                                        MakeGlobalXid(PartDistLocalNodeId(), wal_xid),
+                                        PARTWAL_FLAG_DATA);
+                }
 
                 if (read_buf != NULL)
                     pfree(read_buf);
@@ -1620,6 +1664,32 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
         PartWALCtl->flushed_upto = upto_lsn;
 
     LWLockRelease(PartWALCtl->lock);
+
+    if (nreadfail > 0)
+    {
+        char    reason[256];
+
+        snprintf(reason, sizeof(reason),
+                 "group-commit 排空时 peer 槽位的 WAL 字节回读失败，%d 条记录未进流"
+                 "（P7-W7）", nreadfail_slots);
+        for (i = 0; i < nreadfail; i++)
+        {
+            PG_TRY();
+            {
+                ShardMarkDiverged(readfail[i], reason);
+            }
+            PG_CATCH();
+            {
+                FlushErrorState();
+            }
+            PG_END_TRY();
+        }
+        ereport(WARNING,
+                (errmsg("pg_partdist: 排空时 %d 条 peer 记录无法从 pg_wal 回读、未写入分区流，"
+                        "%d 个分区已标记分叉", nreadfail_slots, nreadfail),
+                 errhint("心跳工作者会自动重做物理基线；也可手工调 partdist.repair_diverged_shards()。")));
+    }
+#undef PARTWAL_READFAIL_MAX
 
     /* Advance last_processed_lsn for demux_progress() / demux_flush() */
     if (DemuxState != NULL && last_lsn != InvalidXLogRecPtr)
@@ -1979,6 +2049,31 @@ PartWALReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr,
     count = read(state->seg.ws_file, readBuf, XLOG_BLCKSZ);
 
     /*
+     * ★★ 只把**已刷盘**的那部分算作读到（2026-09-15，Codex 复核）。
+     *
+     * 段文件是整段预分配的（wal_init_zero=on），read() 永远给满一页，页尾
+     * 还没写到的部分是零。XLogReader 会把整页连同 readLen=8192 **缓存**在
+     * reader 里（ReadPageInternal：同段同页且 reqLen <= readLen 就不再读盘）。
+     * 本 reader 是 backend 级 static、跨事务复用：上一次读的页当时只写了一半，
+     * 这次要读的 peer 记录恰好落在同一页的后半 —— XLogFlush 已把字节刷到盘上，
+     * reader 却拿缓存里的零交差："无法读取 peer WAL 记录 … expected at least 24,
+     * got 0"，32 客户端实测每分钟 42 次，每次都往流里写一条空记录。
+     * 截到 flush 位点，缓存里的 readLen 就是诚实的，后面要更多字节时自然重读。
+     * 取 flush 而不是 write 位点：分区流不能领先于已落盘的 pg_wal（[A] 先于 [B]）。
+     * 崩溃恢复期不查 flush 位点（GetFlushRecPtr 断言不在恢复中；那时读的都是
+     * 已落盘的历史段）。
+     */
+    if (count > 0 && !RecoveryInProgress())
+    {
+        XLogRecPtr  flushed = GetFlushRecPtr(NULL);
+
+        if (targetPagePtr >= flushed)
+            return -1;
+        if ((XLogRecPtr) count > flushed - targetPagePtr)
+            count = (ssize_t) (flushed - targetPagePtr);
+    }
+
+    /*
      * 短读按失败处理（page_read 回调的契约是"至少 reqLen 字节"）。
      * 此前 count < reqLen 也当成功返回，readBuf 尾部是未初始化内存 ——
      * AssembleRawWALRecord 有 CRC 兜底，但 XLogReadRecord 路径会拿它当
@@ -1995,7 +2090,8 @@ PartWALOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
     char fname[MAXPGPATH];
     char path[MAXPGPATH];
 
-    *tli_p = 1;
+    /* 时间线取当前插入时间线（PITR / 提升之后不再是 1），恢复期退回 1 */
+    *tli_p = RecoveryInProgress() ? 1 : GetWALInsertionTimeLine();
     XLogFileName(fname, *tli_p, nextSegNo, state->segcxt.ws_segsize);
     snprintf(path, MAXPGPATH, "%s/pg_wal/%s", DataDir, fname);
 

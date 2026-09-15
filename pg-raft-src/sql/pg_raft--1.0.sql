@@ -333,6 +333,16 @@ COMMENT ON FUNCTION pg_raft_group_flow_stats() IS
 '非零意味着有提案被丢弃 —— 数据组上这等于副本可能与 leader 永久分叉（leader 的'
 '物理变更如 VACUUM 尾部截断不随事务回滚），需要重做物理基线。';
 
+-- P7-W6（2026-09-15）：多数派存活探测，给分叉标记自动修复当前置判据
+CREATE OR REPLACE FUNCTION pg_raft_group_quorum_alive(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_quorum_alive';
+
+COMMENT ON FUNCTION pg_raft_group_quorum_alive(bigint) IS
+'本节点是该组 leader，且"自己 + 最近 2 个选举超时内应答过 AppendEntries 的成员"够多数派'
+'时为 true。partdist.repair_diverged_shards() 据此决定此刻发不发物理基线（多数派缺失时'
+'发必败，且每次被拒两次提案）。';
+
 COMMENT ON FUNCTION pg_raft_group_status() IS
     '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
     'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'

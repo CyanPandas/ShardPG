@@ -59,8 +59,8 @@ typedef struct PartWALSlot
     XLogRecPtr      start_lsn;      /* 记录起始 LSN(ProcLastRecPtr)。group-commit
                                      * 场景下本 backend 消费 peer 槽位时，其字节
                                      * 不在本 backend 的 pending 数组里，须按此
-                                     * 起点从 pg_wal 回读 —— 否则流里出现
-                                     * data_len=0 的 DATA 记录，物理回放断链 */
+                                     * 起点从 pg_wal 回读；回读失败时该记录不进流、
+                                     * 分区打分叉标记（不再写 data_len=0 的空记录） */
     TransactionId   xid;            /* originating transaction ID */
     uint8           rmid;
     uint8           info;

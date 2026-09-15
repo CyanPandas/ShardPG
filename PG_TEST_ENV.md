@@ -153,6 +153,23 @@ docker exec -i -u postgres pg-test-container bash -c \
 最后节点是新起的，装载的就是新 `.so`）。改了 shmem 结构的话必须整簇重起 ——
 `reset` 天然满足。
 
+## 4.3 再三条（2026-09-15，P7-W6/W7 期踩出来）
+
+1. **给 pg_raft 加 SQL 函数要手工滚到 9 节点**：`sync_build.sh` 只装 .so（守卫⑥核对符号在
+   .so 里），门禁的 `refresh_extension_sql.sh` 只对齐 pg_partdist 的函数面，pg_raft 的没人管。
+   用 `bash pg-partdist-src/scripts/apply_pg_raft_sql.sh 函数名…`：从 `pg_raft--1.0.sql` 抽块、
+   替换 MODULE_PATHNAME、带 `citus.enable_ddl_propagation=off` 逐节点执行（Citus 否则拦 worker
+   上的 CREATE FUNCTION："operation is not allowed on this node"）、`ALTER EXTENSION pg_raft ADD`
+   入籍，最后核对 SQL 文件里全部函数在 9 节点点得到名。
+2. **高并发取证用 `tests/test_highload_w7.sh`**（已入门禁，默认 16 客户端 40 s，`CLIENTS=/DUR=`
+   可调）。32 客户端会把协调者 `max_connections=100` 打满（pgbench 32 + Citus 每客户端到各
+   worker 的连接），worker 侧 TSO 取 commit_ts 的自连失败 ⇒ 事务报 `TSO 不可达或拒绝服务`
+   中止 —— 环境配置，不是产品缺陷。这台 2 vCPU 机器 tps 只有 30–40，8 客户端 idle 就已 0%，
+   延迟 p99 秒级是饱和，不要拿它判写路径性能。
+3. `pkill -f 模式` 会匹配到**发起它的那个 shell 自己**（命令行里就含模式串）把自己杀掉，
+   后面的步骤一个都不跑（2026-09-15 实测）。要杀后台链，把命令写进脚本文件再执行，或按
+   `pgrep` 结果排除 `$$`。
+
 ## 5. 当前在这块场地上做什么
 
 **批次 #12 起：P6 缺陷收口（P7）。** 盘点见

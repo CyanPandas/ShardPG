@@ -595,6 +595,12 @@ ShardReplayDataRecord(ShardReplayCtx *ctx, PartWALRecord *h, char *body)
 > record 指针直指页读缓冲,`readRecordBuf` 里是陈旧内容。凡需要"原始连续
 > 记录字节"(写 parwal、group-commit peer 槽位回读)必须按页自行装配并以
 > `xl_crc` 校验(实现见 `partwal_sync.c` 的 `AssembleRawWALRecord`)。
+>
+> **2026-09-15 再补一刀(P7-W7)**:这个 reader 是 backend 级 static、跨事务复用,
+> 页读回调若把整页(含未写到的零尾)交给它,它就把 readLen=8192 **缓存**起来,下次读同
+> 一页后半的 peer 记录时直接拿缓存里的零交差 —— 字节明明已 `XLogFlush` 落盘。页读回调
+> 现在按 `GetFlushRecPtr()` 截断返回长度,`AssembleRawWALRecord` 只要求到本记录页内末尾
+> 的字节(要整页在当前页必然短读)。见 §13 约束 19。
 
 注:`xl_xid` 与头部 `gxid` 内嵌的 xid **不一定相同**——子事务的记录 `xl_xid` 是
 subxid,而头部 gxid 是顶层事务的。因此第 2 步以 `xl_xid` 为键、以
@@ -2013,6 +2019,34 @@ TOAST 的新增(提示里只有索引,`replay_set_locmap` 找不到对应 `(role
     并发(会话 1 未结束时会话 2 在同分区回滚)、ROLLBACK TO SAVEPOINT 后提交,副本逐字节
     一致且 gclog=aborted;挪走侧影文件制造排空失败 ⇒ 客户端收 WARNING、分区打分叉标记、
     心跳 4 s 内自动重做基线、之后逐字节一致(连 TOAST 索引元页的 pd_lsn 都随基线对齐)。
+
+19. **★ peer 槽位回读只认已刷盘字节;回读失败不写空记录;fileset 持久化不许并发互踩**
+    (已修,2026-09-15,T7.34 / P7-W7)
+
+    group-commit 下本 backend 排空 peer backend 的槽位要按 start_lsn 从 pg_wal 回读原始
+    字节。回读用的 XLogReader 是 backend 级 static、跨事务复用,页读回调把整页 8192 字节
+    连同未写到的零尾一起交给 reader 缓存;下一次要读同一页后半的 peer 记录时,字节已
+    `XLogFlush` 落盘,reader 却拿缓存里的零交差("无法读取 peer WAL 记录 … expected at
+    least 24, got 0")。失败路径原先照样 `AppendPartWALRecord(…, NULL, 0, …)` 写一条
+    data_len=0 的 DATA 记录,副本回放到它只打 WARNING 就跳过并推进游标 —— **那条物理
+    变更在副本上静默缺失,无任何标记**。同一轮取证还撞见 fileset 持久化竞争:多个 backend
+    首次 DML 各自登记同一分片,共用一个 `fileset.tmp`,O_TRUNC 截掉别人的内容、rename
+    抢先者把 tmp 挪走后落后者报 ENOENT,期间 fileset 文件瞬时 0 字节,`LoadShardFileSet`
+    的探测者(DDL 变更发射、冻结账目、升主)把分片当"不归本节点维护"。
+
+    修法:① `PartWALReadPage` 按 `GetFlushRecPtr()` 截断返回长度(取 flush 而非 write
+    位点:分区流不许领先已落盘 pg_wal,约束 18 ①),reader 缓存的 readLen 从此诚实;
+    `AssembleRawWALRecord` 只要求到本记录页内末尾的字节,不再要整页;时间线不再写死 1。
+    ② 回读失败**不写记录**:锁内记下分区,锁外打分叉标记,交心跳重做基线(与 W2 覆盖、
+    W4 中止排空失败同一处置)。③ fileset/freeze 的 tmp 名带 PID,rename 失败清 tmp,
+    就位后 fsync 目录;内容与已持久化的一致时不重写(连接池一抖动一批 backend 各自
+    "首次登记",全是白花的 fsync+rename,也正是竞争窗口本身)。
+
+    取证 `tests/test_highload_w7.sh`(pg-test 1c+8w,e2-medium 2 vCPU,32 客户端 60 s):
+    修复前 fileset rename 失败 90 次、peer WAL 回读失败 42 次;只做①的截断、未改 Assemble
+    时回读失败反升到 407 次(整页短读,反证 Assemble 也在当前页上读);全部修完 **0 次**。
+    延迟 p99 4.2 s 经等待事件采样判为机器饱和(8 客户端 idle 已 0%、86% ClientRead、
+    LWLock:pg_partdist_sync 2%),不是写路径锁队列,套件只打印不断言。
 
 ---
 

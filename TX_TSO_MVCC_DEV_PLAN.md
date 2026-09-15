@@ -5086,9 +5086,10 @@ ERROR:  TSO 不可达或拒绝服务（取 start_ts 失败）
 | T7.30 | P7-V4 打标登记全手工 + 未写即切主丢身份 | `shard_mvcc_register_p7` 41/0（含未写即切主继承、白名单对照） | `8d9396c` |
 | T7.31 | P7-D3 含打标表 DROP 禁 PREPARE ⇒ 打标分布表删不掉 | `drop_mvcc_2pc_p7` 34/0；真实残表 4 张修前报错、修后全删；V4+D3 回归 13 套 批次 412/12，4 套红逐套复核全绿（shard_clog_p2 66/0、dtx_convergence_p4 45/0、dtx_tso_p4 49/0、handover_provision_p7 33/0） | `8d9396c` |
 | T7.32 | P7-W4 leader ROLLBACK 后副本页面静默分叉（已提交行丢失） | `abort_page_p7` 97/0（修前 31/11）；回归 22 套（含 ops 8 套）批次 864/1，crash_recovery 单跑 36/0、shard_auto_init 重建过期的 08_schema_existence 期望后 5/0 | `890ec89` |
-| T7.33 | P7-T8 txn_layer_r2 丢提案额度恒超 1（首次登记多余的交接广播 + [9] 窗口里的心跳自动修复） | `txn_layer_r2` 53/0、丢弃 `:5433+1`（`election_timeout_ms` 临时 20000，见 P7-R5）；回归 4 套 133/0（promote_handover_p7 真切换仍广播） | 本次 |
+| T7.33 | P7-T8 txn_layer_r2 丢提案额度恒超 1（首次登记多余的交接广播 + [9] 窗口里的心跳自动修复） | `txn_layer_r2` 53/0、丢弃 `:5433+1`（`election_timeout_ms` 临时 20000，见 P7-R5）；回归 4 套 133/0（promote_handover_p7 真切换仍广播） | `a9f6e3f` |
+| T7.34 | P7-R5 登记控制面期间不发心跳被副本推翻 + P7-W6 自动修复在多数派缺失期间照样发基线 + P7-W7 高并发写入下 peer WAL 回读拿零字节/写空记录、fileset 持久化并发互踩 | `txn_layer_r2` **56/0 × 2 轮**（`election_timeout_ms` 保持默认 6000、零主漂移；含 W6 三条新断言 quorum_wait / quorum_drops 1→1）；新套件 `highload_w7`（32 客户端 60 s：fileset rename 失败 90 → 0、peer WAL 回读失败 42 → 0）；回归见本次提交说明 | 本次 |
 
-**未闭合**（2026-09-14）：P7-R5（数据组新 leader 在 tick 里同步登记控制面、CPU 饱和时被副本推翻）、P7-W6（自动修复在多数派缺失期间照样重发基线）—— 均为 T7.33 取证时新登记、未修；P7-T8 已修（T7.33）；P7-T10 已修（门禁起跑前核对容器扩展 == 工作区、SQL 重放改读已安装版本）；
+**未闭合**（2026-09-15）：**P7 登记在册的缺陷已全部闭合** —— P7-R5 / P7-W6 / P7-W7（Codex 复核提出的高并发写入健壮性）于 T7.34 修完，P7-T8 / P7-T10 于 T7.33 修完。
 出口动作（不分段全量、"不做的事"运维规程）**用户裁定暂缓**。
 P7-G4 / P7-V4 / P7-D3 / P7-W4 / P7-W5 已于 2026-09-13/14 闭合（T7.29–T7.32、`5268690`、`890ec89`）。
 
