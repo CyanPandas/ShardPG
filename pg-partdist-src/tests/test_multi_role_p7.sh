@@ -8,7 +8,8 @@
 #   M      ●主    ●主    ○从       ○从        ← M 同时 2 主 + 2 从
 #   C1     —      —      ●主       —
 #   C2     —      —      —         ●主
-#   A 组 {M,X1,X2}×2 皆 M 当选     B 组 {Ci,M,X3} 各 Ci 当选
+#   4 个组的成员集都取全部 worker（3 worker 时即 {W1,W2,W3}，多数派 2）；
+#   A1/A2 由 M 抢当选，B1/B2 由各自的 Ci 抢当选
 #
 # 用一张 16 分片表按 placement 落位挑角色：某节点自然承载 ≥2 分片 → 那两个当 A1/A2
 # （M 是它们的主）；另挑两个主在不同节点的分片当 B1/B2（M 去当它们的从）。四者是
@@ -38,7 +39,15 @@ source "$(dirname "$0")/lib_node_health.sh"; health_mark_start
 echo "========== [0] 前置：group0 收敛 + 测试模式 + 抬 election_timeout（规则 19） =========="
 leader=$(PSQL $COORD -Atc "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()")
 check "group0 有 leader" "$([[ -n "$leader" && "$leader" != "0" ]] && echo ok)" "ok"
-for p in 5433 5434 5435 5436 5437 5438 5439 5440 $COORD; do
+# ---- 拓扑自适应：动态读 worker 列表与 raft 节点号（不再假设 8 worker / port-5431）----
+WORKERS=($(PSQL $COORD -Atc "SELECT nodeport FROM pg_dist_node WHERE noderole='primary' AND groupid<>0 AND isactive ORDER BY nodeport"))
+NW=${#WORKERS[@]}
+check "至少 3 个 worker（3 成员组才有多数派 2，容得下两个从滞后）" "$([[ "$NW" -ge 3 ]] && echo ok)" "ok"
+declare -A NID
+for p in "${WORKERS[@]}"; do NID[$p]=$(PSQL $p -Atc "SHOW pg_raft.node_id" | tail -1); done
+ALLMEM="ARRAY[$(for p in "${WORKERS[@]}"; do printf '%s,' "${NID[$p]}"; done | sed 's/,$//')]"
+echo "  拓扑：${NW} 个 worker = ${WORKERS[*]}   组成员集=$ALLMEM"
+for p in "${WORKERS[@]}" $COORD; do
   PSQL $p -q -c "ALTER SYSTEM SET pg_raft.election_timeout_ms = 20000;" </dev/null >/dev/null
   PSQL $p -q -c "ALTER SYSTEM SET pg_partdist.replay_trust_local_segments = on;" </dev/null >/dev/null
   PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
@@ -50,7 +59,7 @@ cleanup() {
   for g in $MADE_GROUPS; do port="${g%%:*}"; gid="${g##*:}"; PSQL "$port" -q -c "SELECT partdist.pg_raft_group_drop($gid)" </dev/null >/dev/null 2>&1 || true; done
   for t in $SHELLS; do PSQL "$M" -q -c "SELECT partdist.replay_disable('$t'); SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS $t" </dev/null >/dev/null 2>&1 || true; done
   PSQL $COORD -q -c "DROP TABLE IF EXISTS mr" </dev/null >/dev/null 2>&1 || true
-  for p in 5433 5434 5435 5436 5437 5438 5439 5440 $COORD; do
+  for p in "${WORKERS[@]}" $COORD; do
     PSQL $p -q -c "ALTER SYSTEM RESET pg_raft.election_timeout_ms;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.replay_trust_local_segments;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
@@ -75,23 +84,20 @@ check "找到承载 ≥2 分片的节点 M（多主的前提）" "$([[ -n "$M" ]
 A_SIDS=($(awk -v m="$M" '$2==m{print $1}' <<<"$MAP" | head -2))
 # 另挑两个主在**不同且非 M**节点的分片当 B1/B2
 B_LINES=($(awk -v m="$M" '$2!=m && !seen[$2]++{print $1":"$2}' <<<"$MAP" | head -2))
-Mn=$((M-5431))
+Mn=${NID[$M]}
 echo "  M=:$M(node$Mn)  |  A1=${A_SIDS[0]} A2=${A_SIDS[1]}(主都在 M)  |  B1=${B_LINES[0]} B2=${B_LINES[1]}(主各在别处)"
 check "挑到 2 个主在 M 的分片(A1/A2)" "$([[ -n "${A_SIDS[0]}" && -n "${A_SIDS[1]}" ]] && echo ok)" "ok"
 check "挑到 2 个主在不同他节点的分片(B1/B2)" "$([[ -n "${B_LINES[0]}" && -n "${B_LINES[1]}" ]] && echo ok)" "ok"
 C1=${B_LINES[0]##*:}; C2=${B_LINES[1]##*:}
 # 3 个凑多数派的额外 worker（排除 M/C1/C2/协调者）
-others=(); for p in 5433 5434 5435 5436 5437 5438 5439 5440; do [[ "$p" == "$M" || "$p" == "$C1" || "$p" == "$C2" ]] && continue; others+=("$p"); done
-X1=${others[0]}; X2=${others[1]}; X3=${others[2]}
-check "凑够 3 个额外 worker" "$([[ -n "$X3" ]] && echo ok)" "ok"
 
-for p in $M $C1 $C2 $X1 $X2 $X3; do PSQL $p -q -c "SELECT partdist.rebuild_shard_identity();" </dev/null >/dev/null; done
+for p in "${WORKERS[@]}"; do PSQL $p -q -c "SELECT partdist.rebuild_shard_identity();" </dev/null >/dev/null; done
 
 echo "========== [2a] 建 2 个 A 组：M 抢当选（多主） =========="
-amem="ARRAY[$Mn,$((X1-5431)),$((X2-5431))]"
+amem="$ALLMEM"
 for sid in "${A_SIDS[@]}"; do
   PSQL $M -q -c "SELECT partdist.pg_raft_group_create($sid, $amem);" </dev/null >/dev/null; sleep 2
-  for p in $X1 $X2; do PSQL $p -q -c "SELECT partdist.pg_raft_group_create($sid, $amem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$sid "; done
+  for p in "${WORKERS[@]}"; do [[ "$p" == "$M" ]] && continue; PSQL $p -q -c "SELECT partdist.pg_raft_group_create($sid, $amem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$sid "; done
   MADE_GROUPS+="$M:$sid "
   st=""; for t in $(seq 1 40); do st=$(PSQL $M -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$sid" 2>/dev/null|tail -1); [[ "$st" == "leader" ]] && break; sleep 1; done
   check "A 组 $sid 主落在 M" "$st" "leader"
@@ -99,8 +105,8 @@ done
 
 echo "========== [2b] 建 2 个 B 组：Ci 抢当选，M 供从副本（多从） =========="
 for bl in "${B_LINES[@]}"; do
-  sid=${bl%%:*}; c=${bl##*:}; cn=$((c-5431)); shell="mr_${sid}"
-  bmem="ARRAY[$cn,$Mn,$((X3-5431))]"
+  sid=${bl%%:*}; c=${bl##*:}; cn=${NID[$c]}; shell="mr_${sid}"
+  bmem="$ALLMEM"
   nrel=$(PSQL $c -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('mr_${sid}')" | tail -1)
   check "C(:$c) 登记 B$sid fileset(2)" "$nrel" "2"
   PSQL $M -v ON_ERROR_STOP=1 -q >/dev/null <<SQL
@@ -116,7 +122,7 @@ SQL
   np=$(PSQL $M -Atc "SELECT partdist.replay_set_locmap('$shell', ARRAY[$rl], ARRAY[$od], ARRAY[$sp]::oid[], ARRAY[$db]::oid[], ARRAY[$rn]::oid[])" | tail -1)
   check "M 上 B$sid 从 locmap 配对(2)" "$np" "2"
   PSQL $c -q -c "SELECT partdist.pg_raft_group_create($sid, $bmem);" </dev/null >/dev/null; sleep 2
-  for p in $M $X3; do PSQL $p -q -c "SELECT partdist.pg_raft_group_create($sid, $bmem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$sid "; done
+  for p in "${WORKERS[@]}"; do [[ "$p" == "$c" ]] && continue; PSQL $p -q -c "SELECT partdist.pg_raft_group_create($sid, $bmem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$sid "; done
   MADE_GROUPS+="$c:$sid "
   PSQL $M -q -c "SELECT partdist.replay_enable('$shell');" </dev/null >/dev/null
   st=""; for t in $(seq 1 40); do st=$(PSQL $c -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$sid" 2>/dev/null|tail -1); [[ "$st" == "leader" ]] && break; sleep 1; done

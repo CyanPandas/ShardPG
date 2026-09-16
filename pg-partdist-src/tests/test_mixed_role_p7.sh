@@ -8,8 +8,9 @@
 # 专门覆盖的一格。
 #
 # 拓扑（M = 混合角色节点）：
-#   分片 A：主在 M（原生真表，可读写）                A 组 {M, X1, X2}，M 当选
-#   分片 B：主在 C（≠M），从在 M（壳表，回放跟随 C）  B 组 {C, M, X3}，C 当选
+#   分片 A：主在 M（原生真表，可读写）                A 组 = 全部 worker，M 当选
+#   分片 B：主在 C（≠M），从在 M（壳表，回放跟随 C）  B 组 = 全部 worker，C 当选
+#   （成员集取全部 worker：3 worker 时即 {W1,W2,W3}，多数派 2 ⇒ 允许 M 这个从惰性滞后）
 #   —— M 因此同时：A 的 native_leader + B 的 replica
 #
 # 断言（对应本设计的四条核心命题）：
@@ -45,9 +46,18 @@ health_mark_start
 echo "========== [0] 前置：group0 收敛 + 测试模式 + 抬 election_timeout（规则 19） =========="
 leader=$(PSQL $COORD -Atc "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()")
 check "group0 有 leader" "$([[ -n "$leader" && "$leader" != "0" ]] && echo ok)" "ok"
+# ---- 拓扑自适应：动态读 worker 列表与 raft 节点号（不再假设 8 worker / port-5431）----
+WORKERS=($(PSQL $COORD -Atc "SELECT nodeport FROM pg_dist_node WHERE noderole='primary' AND groupid<>0 AND isactive ORDER BY nodeport"))
+NW=${#WORKERS[@]}
+check "至少 3 个 worker（3 成员组才有多数派 2，容得下一个从滞后）" "$([[ "$NW" -ge 3 ]] && echo ok)" "ok"
+declare -A NID
+for p in "${WORKERS[@]}"; do NID[$p]=$(PSQL $p -Atc "SHOW pg_raft.node_id" | tail -1); done
+# 本套件所有数据组的成员集 = 全部 worker（3 worker 时即 {W1,W2,W3}，多数派 2）
+ALLMEM="ARRAY[$(for p in "${WORKERS[@]}"; do printf '%s,' "${NID[$p]}"; done | sed 's/,$//')]"
+echo "  拓扑：${NW} 个 worker = ${WORKERS[*]}   组成员集=$ALLMEM"
 # 2 vCPU + 无 swap：建组后新 leader 在 tick 里同步做登记，饱和时十几秒不发心跳 ⇒ 主漂。
 # 临时把选举超时抬到 20s，EXIT 复原。判据/来源见规则 19。
-for p in 5433 5434 5435 5436 5437 5438 5439 5440 $COORD; do
+for p in "${WORKERS[@]}" $COORD; do
   PSQL $p -q -c "ALTER SYSTEM SET pg_raft.election_timeout_ms = 20000;" </dev/null >/dev/null
   PSQL $p -q -c "ALTER SYSTEM SET pg_partdist.replay_trust_local_segments = on;" </dev/null >/dev/null
   PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
@@ -64,7 +74,7 @@ cleanup() {
   # 从副本壳表在 M 上是本地表，本地删；打标分布表走协调者（规则 12）
   [[ -n "${M:-}" && -n "${BSHELL:-}" ]] && PSQL "$M" -q -c "SELECT partdist.replay_disable('$BSHELL'); SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS $BSHELL" </dev/null >/dev/null 2>&1 || true
   PSQL $COORD -q -c "DROP TABLE IF EXISTS mr_a; DROP TABLE IF EXISTS mr_b;" </dev/null >/dev/null 2>&1 || true
-  for p in 5433 5434 5435 5436 5437 5438 5439 5440 $COORD; do
+  for p in "${WORKERS[@]}" $COORD; do
     PSQL $p -q -c "ALTER SYSTEM RESET pg_raft.election_timeout_ms;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.replay_trust_local_segments;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null 2>&1
@@ -90,30 +100,26 @@ SIDA=$(PSQL $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='m
 M=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$SIDA" | tail -1)
 # B 的两个分片里，挑一个 placement 主 ≠ M 的做分片 B（保证 M 能当它的从）
 read SIDB C < <(PSQL $COORD -Atc "SELECT s.shardid, n.nodeport FROM pg_dist_shard s JOIN pg_dist_placement p ON p.shardid=s.shardid JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE s.logicalrelid='mr_b'::regclass AND n.nodeport <> $M ORDER BY s.shardid LIMIT 1" | tail -1 | tr '|' ' ')
-Mn=$((M-5431)); Cn=$((C-5431))
+Mn=${NID[$M]}; Cn=${NID[$C]}
 # 再挑 3 个别的 worker 当凑多数派的成员（排除 M、C、协调者）
-others=(); for p in 5433 5434 5435 5436 5437 5438 5439 5440; do [[ "$p" == "$M" || "$p" == "$C" ]] && continue; others+=("$p"); done
-X1=${others[0]}; X2=${others[1]}; X3=${others[2]}
-X1n=$((X1-5431)); X2n=$((X2-5431)); X3n=$((X3-5431))
 ATBL="mr_a_${SIDA}"; BTBL="mr_b_${SIDB}"; BSHELL="$BTBL"
-echo "  混合角色节点 M=:$M(node$Mn)  |  分片A=$SIDA 主在 M  |  分片B=$SIDB 主在 C=:$C(node$Cn)  |  凑多数派 X1..X3=:$X1 :$X2 :$X3"
+echo "  混合角色节点 M=:$M(node$Mn)  |  分片A=$SIDA 主在 M  |  分片B=$SIDB 主在 C=:$C(node$Cn)"
 check "M ≠ C（混合角色的前提：M 不能是 B 的主）" "$([[ -n "$M" && -n "$C" && "$M" != "$C" ]] && echo ok)" "ok"
-check "凑够 3 个额外 worker" "$([[ -n "$X3" ]] && echo ok)" "ok"
 
 echo "========== [2] 分片身份 + 建 A 组（M 主）+ 建 B 组（C 主）+ M 上供 B 的从 =========="
-for p in $M $C $X1 $X2 $X3; do PSQL $p -q -c "SELECT partdist.rebuild_shard_identity();" </dev/null >/dev/null; done
+for p in "${WORKERS[@]}"; do PSQL $p -q -c "SELECT partdist.rebuild_shard_identity();" </dev/null >/dev/null; done
 
-# ---- A 组：M 先建组抢当选（规则 4），X1/X2 只作 raft 成员凑多数派（不建壳表，A 的从不是本套件要验的） ----
-amem="ARRAY[$Mn,$X1n,$X2n]"
+# ---- A 组：M 先建组抢当选（规则 4）；其余 worker 只作 raft 成员凑多数派（不建壳表，A 的从不是本套件要验的）----
+amem="$ALLMEM"
 PSQL $M -q -c "SELECT partdist.pg_raft_group_create($SIDA, $amem);" </dev/null >/dev/null
 sleep 2
-for p in $X1 $X2; do PSQL $p -q -c "SELECT partdist.pg_raft_group_create($SIDA, $amem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$SIDA "; done
+for p in "${WORKERS[@]}"; do [[ "$p" == "$M" ]] && continue; PSQL $p -q -c "SELECT partdist.pg_raft_group_create($SIDA, $amem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$SIDA "; done
 MADE_GROUPS+="$M:$SIDA "
 sa=""; for t in $(seq 1 40); do sa=$(PSQL $M -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$SIDA" 2>/dev/null | tail -1); [[ "$sa" == "leader" ]] && break; sleep 1; done
 check "分片 A 组主落在 M（M 是 A 的主）" "$sa" "leader"
 
-# ---- B 组：C 先建组抢当选，M 作从副本、X3 凑多数派（3 成员 ⇒ 多数派 2，M 可惰性滞后，规则 17） ----
-bmem="ARRAY[$Cn,$Mn,$X3n]"
+# ---- B 组：C 先建组抢当选；M 作从副本，其余 worker 凑多数派（多数派 2 ⇒ M 可惰性滞后，规则 17）----
+bmem="$ALLMEM"
 # 先在 C 上登记 B 的 fileset，导出给 M 配对
 nrel=$(PSQL $C -Atc "SET citus.override_table_visibility=false; SELECT partdist.register_shard_fileset('$BTBL')" | tail -1)
 check "C 上登记 B 的 fileset（主堆+主键=2）" "$nrel" "2"
@@ -131,7 +137,7 @@ np=$(PSQL $M -Atc "SELECT partdist.replay_set_locmap('$BSHELL', ARRAY[$roles], A
 check "M 上 B 的从 locmap 配对（2 对）" "$np" "2"
 PSQL $C -q -c "SELECT partdist.pg_raft_group_create($SIDB, $bmem);" </dev/null >/dev/null
 sleep 2
-for p in $M $X3; do PSQL $p -q -c "SELECT partdist.pg_raft_group_create($SIDB, $bmem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$SIDB "; done
+for p in "${WORKERS[@]}"; do [[ "$p" == "$C" ]] && continue; PSQL $p -q -c "SELECT partdist.pg_raft_group_create($SIDB, $bmem);" </dev/null >/dev/null; MADE_GROUPS+="$p:$SIDB "; done
 MADE_GROUPS+="$C:$SIDB "
 PSQL $M -q -c "SELECT partdist.replay_enable('$BSHELL');" </dev/null >/dev/null
 sb=""; for t in $(seq 1 40); do sb=$(PSQL $C -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$SIDB" 2>/dev/null | tail -1); [[ "$sb" == "leader" ]] && break; sleep 1; done
