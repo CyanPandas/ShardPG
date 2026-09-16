@@ -335,15 +335,27 @@ do_verify() {
   PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
     "INSERT INTO reply_v6 SELECT g, 'r'||g FROM generate_series(1,3) g;" >/dev/null
   sleep 2
-  local fp_sql="SELECT partdist.get_partition_flush_lsn(oidv) || ':' || COALESCE(md5(string_agg(sub.h, ',' ORDER BY sub.plsn)),'') FROM (SELECT partdist.local_partition_for_shard(${gid}) AS oidv) o, LATERAL (SELECT g AS plsn, md5(r.data) AS h FROM generate_series(1, partdist.get_partition_flush_lsn(o.oidv)) g, LATERAL partdist.partwal_read_record(o.oidv, g) r) sub GROUP BY oidv"
+  # ★ 指纹必须在**三方共同的 plsn 区间**上算，不能各自按自己的 flush_lsn 取上界。
+  #   原写法先采 leader、再采 follower，两次采样之间后台发射器（D2 冻结账目同步
+  #   每 60s 一条 FREEZE_UPDATE、分叉自愈的基线、收尾 DROP 的 SHARD_DROP）随时会
+  #   多落一条并复制出去 —— follower 就比 leader 多一条，报成"指纹不等"。
+  #   实测：leader 9 条 / follower 10 条，而 1..9 与 1..10 两侧都逐条相同，纯属采样竞态。
+  local cnt_sql="SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${gid}))"
+  local nmin lead_n
+  nmin=$(PSQL "$pport" -Atc "$cnt_sql")
+  for port in "${fols[@]}"; do
+    local n; n=$(PSQL "$port" -Atc "$cnt_sql")
+    [[ -n "$n" && "$n" -lt "$nmin" ]] && nmin=$n
+  done
+  local fp_sql="SELECT COALESCE(md5(string_agg(md5(r.data), ',' ORDER BY g)),'') FROM generate_series(1, ${nmin:-0}) g, LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${gid}), g) r"
   local lead_fp fp k=0
-  lead_fp=$(PSQL "$pport" -Atc "$fp_sql")
   check "leader 侧有 parwal 记录(防两侧皆空的假阳性)" \
-    "$([[ -n "$lead_fp" && "$lead_fp" != 0:* ]] && echo ok || echo empty)" "ok"
+    "$([[ -n "$nmin" && "$nmin" -ge 1 ]] && echo ok || echo empty)" "ok"
+  lead_fp=$(PSQL "$pport" -Atc "$fp_sql")
   for port in "${fols[@]}"; do
     k=$((k + 1))
     fp=$(PSQL "$port" -Atc "$fp_sql")
-    check "follower${k}(:${port}) parwal 指纹 == leader" "$fp" "$lead_fp"
+    check "follower${k}(:${port}) parwal 指纹 == leader(共同区间 1..${nmin})" "$fp" "$lead_fp"
   done
   check "follower 壳表 0 行(只备份不回放)" \
     "$(PSQL "$f1" -Atc "SELECT count(*) FROM reply_v6_${gid}")" "0"
