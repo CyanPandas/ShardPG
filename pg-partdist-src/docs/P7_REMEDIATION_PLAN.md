@@ -137,6 +137,102 @@
 
 
 **T7.26 / T7.27 落地后的热路径回归（2026-09-13）**：改动落在每次 heap 写（`shard_stamp_xid` 里的背压钩子）、判活（`HeapTupleSatisfiesVacuumHorizon` 里的剪枝守卫）、事务中止（`PartWALAbort`）三条热路径，跑了 10 套回归：`shard_xid_p1` 45/0、`shard_pagecmp_p1` 49/0、`shard_clog_p2` 64/0、`tso_si_p3` 39/0、`shard_vacuum_p5` 180/0、`follower_replay_r1` 58/0、`replica_gate_p6` 33/0 —— **七套零 FAIL**。另三套红均为 **P7-E7（宿主机无 swap）主漂/环满假红**，按纪律单跑复核：`dtx_replay_tx1` 批 73/10、**单跑 83/0**（与 P7-E7 记录的 73/10→83/0 逐字吻合，已复核）、`txn_layer_r2` 批 51/1（:5433 raft 日志环满丢 3 > 额度 2）、`shard_vacuum_auto_p7` 批 61/1（心跳截断点受 GlobalSafeTs 限流、40s 窗口内 `commit-ts-too-new`）。背压只在单事务 4096 条记录以上触发，这三套的事务都远小于此，机理上排除本次改动。
+
+### 1.10 2026-09-16 4 节点（1c+3w）+ max_groups=64 环境下的复核
+
+用 `reproduce-env.sh N_WORKERS=3` 重建为 4 节点、`pg_raft.max_groups=64`，跑了主从架构
+新用例与 2.0 时代的 demo 套件。结论分三类：
+
+**一、架构命题成立（新用例）**
+`test_mixed_role_p7.sh` **29/0**：同一节点 M 同时是分片 A 的 `native_leader` 与分片 B 的
+`replica`；M 作主读写正常；往 A 写 250 行 + 改 100 行期间 B 的从副本主堆**字节不变**
+（同机多分片物理隔离）；往 B 的主写后 M 的从追平且与主逐字节一致。
+★ 最有说服力的一条是 [7] 的取证——同一节点上两套 xid 空间的**解析路径**不同：
+
+    A(oid=60669)  自家号 16217 ⇒ NONE          拿 B 的号 16922 查 ⇒ NONE
+    B从(oid=60699) 自家号 16922 ⇒ committed     拿 A 的号 16217 查 ⇒ not_replayed
+
+A 的号走本机原生语义、B-从的号走回放两跳（xid_map→gclog）拿到判决，互相拿对方的号
+查都查不出东西 —— 按各自 OID 编址，互不串线（规则 6）。
+
+**二、多主多从同样成立（纠正我先前的一个错误结论）**
+`test_multi_role_p7.sh`（M 同时持 2 个主 + 2 个从、4 组并存）**31/0**，日志零 ERROR。
+四重身份的取证（同一节点、四个不同本地 OID）：
+
+    A分片 102394(oid=60765) xmin=17081 ⇒ NONE        A分片 102397(oid=60772) xmin=17090 ⇒ NONE
+    B从   102395(oid=60787) xmin=18011 ⇒ committed   B从   102396(oid=60794) xmin=15769 ⇒ committed
+
+两个从各自追平到主的 307/307 并与主逐字节一致（掩码外）。
+
+我一度把它写成"2 vCPU 的容量上限"，**那是错的**，在此纠正：写入阶段的
+`record N 未达多数派` 与随后的主漂，真正的原因是 **A 组的 follower 没有本地分片站点**
+——数据组的 follower 必须先有壳表 + 分片身份 + locmap 才能落盘并 ack，光当"raft 成员"
+不行（follower 日志刷 `group N 在本节点没有对应分片，无法落盘`，提案恒 1/2 票）。
+给每个组都用产品入口 `partdist.provision_shard_replica()` 供好副本之后，写入一次全绿。
+与硬件无关。
+
+另外两个曾被怀疑的方向也已排除：① Citus 的 `multi_shard_modify_mode=sequential`
+不解决问题（串的是语句，提交时的多组复制仍同时发生）；②
+`another command is already in progress` 是 **Citus** 侧连接在 worker 报错后的残留状态，
+不是 pg_raft 的 peer 连接缺陷（pg_raft 两个有界 RPC 调用点都正确调了 `peer_conn_reset`）。
+
+仍然成立的一条真限制：一条事务**同时**给多个组做同步复制时，这些组的成员是同样那几台，
+A→B 与 B→A 的复制压在**同一条 peer 连接**上（`peer_conn` 是每节点一条、所有组共用的
+进程级 static），4 组并发提交实测会一起报 `未达多数派`。本用例因此把写入改成**定点写**
+（见下），验的是"多组并存"；"多组并发提交"是另一件事，单独记录，未解决。
+
+**二之补、夹具上踩到的一个硬事实：Citus 的落位不能靠"多建几张表"碰运气**
+单分片表**恒落第一个 worker**：建 9 张单分片表、连 `colocate_with=>'none'` 把共置组
+全拆开，9 张仍然全落 `:5433`，于是"建一堆再挑一张主在别处的"根本挑不出来
+（现象是 `NID[$C]: unbound variable` 崩在夹具里）。`citus_move_shard_placement()` 也走
+不通——产品**有意禁用**（T4.6/§9.2：打标集群上搬分片用原生快照读写 = 静默错读）。
+正解是**用分片数造拓扑**：
+* mixed：A 用单分片表（必落 W1 ⇒ M 定在 W1），B 用 2 分片表（两片必分两台），
+  取 B 里 placement ≠ M 的那片 ⇒ `M≠C` 是拓扑保证的。
+* multi：一张 `worker 数 ×2` 分片表，轮转后每台正好 2 片 ⇒ M 天然有 2 个主，
+  另两台各出 1 片当 2 个从。
+
+**二之补二、写入必须"定点"才只碰一个 raft 组**
+`INSERT ... SELECT generate_series` 会同时写到**全部**分片 ⇒ 进 DTX 决议路径找协调组，
+而兄弟分片没建 raft 组，实测报 `协调组 N 查不到现任 leader / partition_map 尚未追平`，
+**整条 INSERT 失败**、目标分片零行，后面取 `min(xmin)` 拿到 NULL 跟着塌
+（26/1 那个 FAIL 就是这么来的，之前误记成"副本读不到"）。
+Citus 对**多行 VALUES** 和 **`IN (常量列表)`** 会逐行剪枝，全落一片时直接路由成
+`Task Count: 1`（EXPLAIN 实测）；`INSERT ... SELECT` 不会（走
+`Custom Scan (Citus INSERT ... SELECT)`）。所以两个用例的写入一律拼 VALUES / IN 列表，
+按 `get_shard_id_for_distribution_column()` 先挑出只落目标分片的 id。
+
+**三、2.0 时代 demo 套件（10 项）在新配置下的结果**
+
+两个新用例跑绿**之后**又在同一配置上整套复跑了一遍（用例收尾会拆掉全部数据组、删掉夹具表，
+这一轮就是验"没留残渣"）。两轮结果一致：
+
+| # | 项目 | 首轮 | 复跑（两个用例绿之后） |
+|---|---|---|---|
+| 1 | 写入连续性 & 崩溃恢复 | 20✓/11✗ | 20✓/11✗ —— **陈旧期望**，非回归：它按 2.0 口径断言"插 3 行 = 3 条 parwal 记录"，而现在一行会产生堆记录 + 索引记录 + 提交 MARKER（实测 10 条）。索引/TOAST 与主堆走同一条捕获链是设计（FRD §5.2），期望值该更新 |
+| 2 | 分片自动初始化（含 37 项回归） | ✓ | **5/0** |
+| 3 | 多分布表隔离性 & 持久性 | 146/0 | **146/0** |
+| 4 | 崩溃恢复专项（A/B/C） | ✓ | **PASS** |
+| 5 | 批量 COPY 路径恢复 | 9/0 | **8/1** —— 唯一的 FAIL 是**性能阈值**（hook 开销 26.5% vs 阈值 <20%），功能项（COPY 恢复、37 项回归）全过。与 #9 同类的 2 vCPU 噪声，两轮之间只是计时波动 |
+| 6 | 跨段边界 LSN 连续性 | ✓ | **6/0** |
+| 7 | 段文件损坏恢复（C1–C4） | 44/0 | **44/0** |
+| 8 | Demux 高积压崩溃恢复（S1–S5） | ✓ | **29 PASS / 0 FAIL** |
+| 9 | 端到端延迟 p99 | ✗ 749 ms | ✗ **p99 489 ms / avg 23.7 ms**（阈值 10 / 5 ms）—— 32 并发 pgbench 压在 2 vCPU 上，与 memory `codex-highload-findings` 同源，非产品缺陷 |
+| 10 | 磁盘满 ENOSPC 容错恢复 | 12/0 | **12/0** |
+
+口径：**功能项 10 项里 9 项全绿**；两处不绿分别是"陈旧期望"（#1）与"硬件饱和的性能阈值"
+（#5 的第 4 项、#9），都不是产品缺陷。
+★ 一个会绊人的坑：`tests/perf_latency.sh` 是**宿主机侧**脚本，默认 `CONTAINER=pg-partdist-raft4-container`
+（旧 raft4 环境）。在本环境跑必须显式 `CONTAINER=pg-test-container`，否则报
+`container ... is not running`。其余 demo 脚本是**容器内**跑（它们用 `psql -h localhost`），
+在宿主机跑会全片报"协调者 :5432 连不上"。
+
+**四、顺带修掉的测试面缺陷**
+`reproduce-env.sh` V6 的 parwal 指纹断言**各自按自己的 flush_lsn 取上界**、且先采 leader
+后采 follower：两次采样之间后台发射器（D2 冻结账目同步、分叉自愈基线、收尾 SHARD_DROP）
+随时多落一条，就报"指纹不等"。实测 leader 9 条 / follower 10 条，而 1..9 与 1..10
+两侧逐条相同 —— 纯采样竞态。改为在**三方共同区间**上算，V1–V6 **20/0**。
+
 ---
 
 ## 2 批次分解

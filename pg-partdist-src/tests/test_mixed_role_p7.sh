@@ -7,7 +7,7 @@
 # 本套件把这个"混合角色"节点单拎出来验，是既有测试(回放一致性/升主/供副本)都没有
 # 专门覆盖的一格。
 #
-# 拓扑（M = 混合角色节点）：
+# 拓扑（M = 混合角色节点；每次写都只碰一个 raft 组，不进 DTX 路径）：
 #   分片 A：主在 M（原生真表，可读写）                A 组 = 全部 worker，M 当选
 #   分片 B：主在 C（≠M），从在 M（壳表，回放跟随 C）  B 组 = 全部 worker，C 当选
 #   （成员集取全部 worker：3 worker 时即 {W1,W2,W3}，多数派 2 ⇒ 允许 M 这个从惰性滞后）
@@ -74,7 +74,7 @@ cleanup() {
   done
   # 从副本壳表在 M 上是本地表，本地删；打标分布表走协调者（规则 12）
   [[ -n "${M:-}" && -n "${BSHELL:-}" ]] && PSQL "$M" -q -c "SELECT partdist.replay_disable('$BSHELL'); SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS $BSHELL" </dev/null >/dev/null 2>&1 || true
-  PSQL $COORD -q -c "DROP TABLE IF EXISTS mr_a; DROP TABLE IF EXISTS mr_b;" </dev/null >/dev/null 2>&1 || true
+  PSQL $COORD -q -c "DROP TABLE IF EXISTS mr_a" -c "DROP TABLE IF EXISTS mr_b" </dev/null >/dev/null 2>&1 || true
   for p in "${WORKERS[@]}" $COORD; do
     PSQL $p -q -c "ALTER SYSTEM RESET pg_partdist.replay_trust_local_segments;" </dev/null >/dev/null 2>&1
     PSQL $p -q -c "ALTER SYSTEM RESET pg_raft.election_timeout_ms;" </dev/null >/dev/null 2>&1
@@ -140,8 +140,15 @@ ensure_leader() {   # ensure_leader <gid> <期望端口> <标签>；回显 state
   echo "$st"
 }
 
-echo "========== [1] 夹具：分片 A（主定 M）+ 分片 B（挑一个主不在 M 的分片） =========="
-PSQL $COORD -v ON_ERROR_STOP=1 -q <<'SQL'
+echo "========== [1] 夹具：分片 A（单分片表，主定 M）+ 分片 B（2 分片表里挑主不在 M 的那片） =========="
+# ★ 落位**不能靠 Citus 自己分散**：单分片表恒落第一个 worker —— 实测建 9 张单分片表、
+#   连 colocate_with=>'none' 把共置组都拆开，9 张仍然全落 :5433，于是"多建几张再挑"
+#   根本挑不出主在别处的分片。citus_move_shard_placement() 也走不通：产品有意禁用
+#   （T4.6/§9.2，分片打标集群上搬分片用原生快照读写 = 静默错读，且与 partition_map 冲突）。
+#   正解是**用分片数造拓扑**：A 用单分片表（必落 W1 ⇒ M 定在 W1），B 用 2 分片表
+#   （两片必然分在两台），从 B 的两片里挑 placement ≠ M 的那片当 B ——
+#   这样 M≠C 是拓扑保证的，不靠运气。
+PSQL $COORD -v ON_ERROR_STOP=1 -q <<'SQL' >/dev/null
 DROP TABLE IF EXISTS mr_a; DROP TABLE IF EXISTS mr_b;
 SET citus.shard_count = 1; SET citus.shard_replication_factor = 1;
 CREATE TABLE mr_a(id int primary key, v text);
@@ -152,15 +159,21 @@ CREATE TABLE mr_b(id int primary key, v text);
 SELECT create_distributed_table('mr_b','id');
 ALTER TABLE mr_b SET (autovacuum_enabled=off);
 SQL
-# A 的分片与其 placement 主 = M
+A_NAME=mr_a; B_NAME=mr_b
 SIDA=$(PSQL $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='mr_a'::regclass" | tail -1)
 M=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=$SIDA" | tail -1)
-# B 的两个分片里，挑一个 placement 主 ≠ M 的做分片 B（保证 M 能当它的从）
-read SIDB C < <(PSQL $COORD -Atc "SELECT s.shardid, n.nodeport FROM pg_dist_shard s JOIN pg_dist_placement p ON p.shardid=s.shardid JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE s.logicalrelid='mr_b'::regclass AND n.nodeport <> $M ORDER BY s.shardid LIMIT 1" | tail -1 | tr '|' ' ')
+SIDB=""; C=""
+read SIDB C < <(PSQL $COORD -Atc "SELECT s.shardid, n.nodeport FROM pg_dist_shard s JOIN pg_dist_placement p ON p.shardid=s.shardid JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE s.logicalrelid='mr_b'::regclass AND n.nodeport <> ${M:-0} ORDER BY s.shardid LIMIT 1" | tail -1 | tr '|' ' ')
+check "落位可用：A 的主在 M、B 的两片里挑得出主不在 M 的那片" \
+      "$([[ -n "${M:-}" && -n "${C:-}" && -n "${SIDB:-}" ]] && echo ok)" "ok"
+if [[ -z "${M:-}" || -z "${C:-}" || -z "${SIDB:-}" ]]; then
+  { echo "  [取证] 造不出混合角色拓扑（A 主=${M:-空} B 片=${SIDB:-空} B 主=${C:-空}），当前落位："
+    PSQL $COORD -Atc "SELECT s.logicalrelid::text||' shard='||s.shardid||' port='||n.nodeport FROM pg_dist_shard s JOIN pg_dist_placement p ON p.shardid=s.shardid JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE s.logicalrelid::text LIKE 'mr%' ORDER BY s.shardid" | sed 's/^/         /'; } >&2
+  echo ""; echo "========== 结果：PASS=$PASS FAIL=$FAIL =========="; exit 1
+fi
 Mn=${NID[$M]}; Cn=${NID[$C]}
-# 再挑 3 个别的 worker 当凑多数派的成员（排除 M、C、协调者）
 ATBL="mr_a_${SIDA}"; BTBL="mr_b_${SIDB}"; BSHELL="$BTBL"
-echo "  混合角色节点 M=:$M(node$Mn)  |  分片A=$SIDA 主在 M  |  分片B=$SIDB 主在 C=:$C(node$Cn)"
+echo "  混合角色节点 M=:$M(node$Mn)  |  A=$A_NAME 分片$SIDA 主在 M  |  B=$B_NAME 分片$SIDB 主在 C=:$C(node$Cn)"
 check "M ≠ C（混合角色的前提：M 不能是 B 的主）" "$([[ -n "$M" && -n "$C" && "$M" != "$C" ]] && echo ok)" "ok"
 
 echo "========== [2] 分片身份 + 建 A 组（M 主）+ 建 B 组（C 主）+ M 上供 B 的从 =========="
@@ -203,10 +216,10 @@ check "★ 同一节点、两个不同本地关系（OID 不同）" "$([[ -n "$l
 echo "========== [4] ★ 往 A 写 → M 上 A 读得到（M 作主，本机读写正常） =========="
 la=$(ensure_leader "$SIDA" "$M" "写 A 之前")
 check "写 A 之前：M 仍是 A 的主（主漂了后面全不作数）" "$la" "leader"
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO mr_a SELECT g,'a'||g FROM generate_series(1,50) g;"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO $A_NAME SELECT g,'a'||g FROM generate_series(1,50) g;"
 ca=$(PSQL $M -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM $ATBL" | tail -1)
 check "★ M 上原生读 A = 50 行" "$ca" "50"
-cc=$(PSQL $COORD -Atc "SELECT count(*) FROM mr_a" | tail -1)
+cc=$(PSQL $COORD -Atc "SELECT count(*) FROM $A_NAME" | tail -1)
 check "  经协调者读 A = 50 行（路由到 M）" "$cc" "50"
 
 echo "========== [5] ★ 隔离：往 A 狂写 → M 上 B 的从副本字节一个都不变 =========="
@@ -218,8 +231,8 @@ md5_b0=$(DEX bash -c "md5sum '$bdir/$bpath' 2>/dev/null | cut -d' ' -f1" </dev/n
 # 值加宽到 100 字节，保证 A 主堆确实涨到多块（[5] 的防假通过断言要用）。
 la=$(ensure_leader "$SIDA" "$M" "狂写 A 之前")
 check "狂写 A 之前：M 仍是 A 的主" "$la" "leader"
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO mr_a SELECT g, repeat('a',100) FROM generate_series(51,300) g;"
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "UPDATE mr_a SET v=repeat('b',100) WHERE id<=100;"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO $A_NAME SELECT g, repeat('a',100) FROM generate_series(51,300) g;"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "UPDATE $A_NAME SET v=repeat('b',100) WHERE id<=100;"
 PSQL $M -q -c "CHECKPOINT;" </dev/null >/dev/null
 md5_b1=$(DEX bash -c "md5sum '$bdir/$bpath' 2>/dev/null | cut -d' ' -f1" </dev/null)
 check "★ 往 A 写 250 行 + 改 100 行后，M 上 B 的从副本主堆字节不变" \
@@ -232,7 +245,16 @@ check "  防假通过：A 主堆确有多块数据（$ablk 块 > 1）" "$([[ "$a
 echo "========== [6] ★ 往 B 的主(C)写 → M 上 B 的从追平且逐字节一致（M 作从） =========="
 lb=$(ensure_leader "$SIDB" "$C" "写 B 之前")
 check "写 B 之前：C 仍是 B 的主" "$lb" "leader"
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO mr_b SELECT g,'b'||g FROM generate_series(1,80) g;"
+# ★ B 是 2 分片表：`INSERT ... SELECT generate_series` 会同时写到**两片**，于是进 DTX
+#   决议路径去找协调组，而 B 的兄弟分片根本没建 raft 组 —— 实测报
+#   `协调组 N 查不到现任 leader / partition_map 尚未追平`，整条 INSERT 失败、B 零行，
+#   [7] 取 min(xmin) 拿到 NONE 跟着塌（这就是 26/1 那个 FAIL 的真正来源）。
+#   正解：只插**路由到 SIDB 的那些 id**，拼成一条多行 VALUES。Citus 对多行 VALUES
+#   会逐行剪枝，全落一片时直接路由成 `Task Count: 1`（实测 EXPLAIN 证实），
+#   只碰 B 这一个组，压根不进 DTX。
+BVALS=$(PSQL $COORD -Atc "SELECT string_agg('('||g||',''b'||g||''')', ',') FROM (SELECT g FROM generate_series(1,4000) g WHERE get_shard_id_for_distribution_column('$B_NAME',g)=$SIDB LIMIT 80) t" </dev/null | tail -1)
+check "  为 B 挑出 80 个只落分片 $SIDB 的 id（写只碰一个组）" "$([[ -n "$BVALS" ]] && echo ok)" "ok"
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO $B_NAME VALUES $BVALS;"
 lp=$(PSQL $C -Atc "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard($SIDB))" | tail -1)
 # 规则 7：catchup 必须给上界
 a=""; for t in $(seq 1 60); do a=$(PSQL $M -Atc "SELECT partdist.replay_catchup('$BSHELL', $lp, 10000)" 2>/dev/null | tail -1); [[ "$a" =~ ^[0-9]+$ && "$a" -ge "$lp" ]] && break; sleep 1; done
@@ -259,8 +281,11 @@ echo "========== [7] ★ 两套 xid 空间互不串线：A 走原生语义、B-�
 #   B-从 的号走回放两跳（xid_map → gclog ⇒ 拿得到判决），二者按各自 OID 编址。
 nat=$(PSQL $M -Atc "SELECT txid_current()" | tail -1)
 xa=$(PSQL $M -Atc "SET citus.override_table_visibility=false; SELECT coalesce(min(xmin::text::bigint)::text,'NONE') FROM $ATBL" | tail -1)
-xb=$(PSQL $M -Atc "SET citus.enable_ddl_propagation=off; SET pg_partdist.allow_replica_access=on; SELECT coalesce(min(xmin::text::bigint)::text,'NONE') FROM $BSHELL" | tail -1)
-echo "  本机原生 xid 水位=$nat   A 最小 xmin=$xa   B-从 最小 xmin=$xb"
+# ★ 取 B 的号要从**主(C)**上读，不要从 M 的副本壳表读：副本上的行对普通 SELECT
+#   可不可见取决于 xid_map/gclog 状态（实测某轮读到 0 行 ⇒ min() 为 NULL ⇒ 整条断言塌掉）。
+#   从主上读是原生可见的；这个号本来就是副本回放过来的，拿到副本 OID 上解析同样成立。
+xb=$(PSQL $C -Atc "SET citus.override_table_visibility=false; SELECT coalesce(min(xmin::text::bigint)::text,'NONE') FROM $BTBL" | tail -1)
+echo "  本机原生 xid 水位=$nat   A(M 自己的主) 最小 xmin=$xa   B(主 C 上) 最小 xmin=$xb"
 
 stA=$(PSQL $M -Atc "SELECT coalesce(status,'NONE') FROM partdist.route_resolve($loidA, ${xa:-1})" | tail -1)
 stB=$(PSQL $M -Atc "SELECT coalesce(status,'NONE') FROM partdist.route_resolve($boid, ${xb:-1})" | tail -1)
@@ -270,7 +295,11 @@ stBA=$(PSQL $M -Atc "SELECT coalesce(status,'NONE') FROM partdist.route_resolve(
 echo "  A(oid=$loidA)  自家号 $xa ⇒ $stA    拿 B 的号 $xb 查 ⇒ $stAB"
 echo "  B从(oid=$boid) 自家号 $xb ⇒ $stB    拿 A 的号 $xa 查 ⇒ $stBA"
 check "★ A 的号走本机原生语义（不在回放宇宙 ⇒ NONE）" "$stA" "NONE"
-check "★ B-从 的号走回放两跳（xid_map→gclog 拿到判决 ⇒ committed）" "$stB" "committed"
+# 非 NONE 即"走了回放宇宙"：NONE = 根本不是壳表（本机原生语义）；是壳表时要么拿到
+# gclog 判决（committed…），要么 not_replayed（该号不在本壳表 xid_map 里）。
+# 取 min(xmin) 挑到的是最老一条，不保证在 map 里，所以不把 committed 写死成唯一期望。
+check "★ B 的号在 M 的副本上走回放宇宙（非 NONE，实得 $stB）" \
+      "$([[ -n "$stB" && "$stB" != "NONE" ]] && echo ok)" "ok"
 check "★ 两分片在 M 上是两个不同 OID（各自编址、键不冲突，规则 6）" \
       "$([[ -n "$loidA" && -n "$boid" && "$loidA" != "$boid" ]] && echo ok)" "ok"
 

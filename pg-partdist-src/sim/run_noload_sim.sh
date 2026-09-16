@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-CONTAINER="pg-partdist-raft4-container"
+CONTAINER="${CONTAINER:-pg-partdist-raft4-container}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 PASS_TOTAL=0
