@@ -3351,6 +3351,54 @@ step_down_if_higher(RaftGroupCtx *ctx, int64 their_term)
         persist_hard_state_unlocked(ctx);
 }
 
+/*
+ * P7-N14（2026-09-17）：本节点当选却**不可升主**（升主前置返回 -1：没有本地副本 /
+ * 快路径分叉 / 带陈旧数据回归的旧主），主动让位。
+ *
+ * 不让位的后果实测过：旧主 :5433 丢主后再次赢得选举，升主前置每轮 -1、永不登记，
+ * 而它照发心跳，其余成员选不上 —— partition_map 仍指向前任、写入全被写栅栏拒，
+ * 该分片无主直到选举碰巧抖到别人（term 5→6→7，120 s 内未登记）。设计原话
+ * "只排除这一个节点，同组其余成员照常可当选"要成立，被排除的节点必须退出。
+ *
+ * 做法：降为 follower、清 leader_id、复制游标作废，选举截止期推远
+ * RAFT_UNPROMOTABLE_BACKOFF 个选举周期 —— 其余成员先超时先竞选，本节点期间只投票。
+ * term 不动（不是被更高 term 压下去的），HardState 里 term/voted_for 没变，不必持久化。
+ * 多数派保证至少还有一个成员持有全部已提交条目，它当选后本节点照常跟随。
+ * 若本节点重做基线后重新具备资格，退避到期照常参选。
+ */
+#define RAFT_UNPROMOTABLE_BACKOFF   5
+
+static void
+raft_abdicate_unpromotable(RaftGroupCtx *ctx)
+{
+    bool was_leader;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    was_leader = (ctx->cons->state == RAFT_LEADER);
+    if (was_leader)
+    {
+        ctx->cons->state = RAFT_FOLLOWER;
+        ctx->cons->leader_id = 0;
+        SpinLockAcquire(&ctx->log->mutex);
+        ctx->log->repl_inited = false;
+        SpinLockRelease(&ctx->log->mutex);
+        ctx->cons->election_deadline =
+            GetCurrentTimestamp() +
+            (long) pg_raft_election_timeout_ms * RAFT_UNPROMOTABLE_BACKOFF * 1000L;
+    }
+    SpinLockRelease(&ctx->cons->mutex);
+
+    if (was_leader)
+    {
+        ctx->g->report_pending = false;
+        elog(LOG,
+             "pg_raft: 组 %lld 本节点不可升主（升主前置返回 -1），主动让位并退避 %d ms，"
+             "让其余有副本的成员当选",
+             (long long) ctx->group_id,
+             pg_raft_election_timeout_ms * RAFT_UNPROMOTABLE_BACKOFF);
+    }
+}
+
 /* 根据 match_index 计算可提交的最大 index（多数派已复制） */
 static int64
 compute_new_commit_index(RaftGroupCtx *ctx, int64 current_term)
@@ -4132,8 +4180,19 @@ data_group_try_report(RaftGroupCtx *ctx)
      * → 翻 pg_dist_placement"一气呵成的，不上报就等于不翻路由，
      * "追不平不对外服务"这条承诺由此天然成立，且完全不阻塞 group 0。
      */
-    if (data_group_promote_prepare(ctx, term) != 1)
-        return;                 /* 还没好，保留 report_pending 下个 tick 继续 */
+    {
+        int pr = data_group_promote_prepare(ctx, term);
+
+        if (pr < 0)
+        {
+            /* P7-N14：不可升主就别占着 leader 位 */
+            raft_abdicate_unpromotable(ctx);
+            promote_slot_clear(ctx->group_id);
+            return;
+        }
+        if (pr != 1)
+            return;             /* 还没好，保留 report_pending 下个 tick 继续 */
+    }
 
     /* 登记连接上若挂着本组本 term 的在途登记：只收结果 */
     if (report_aconn.state == RAFT_ACONN_BUSY)
