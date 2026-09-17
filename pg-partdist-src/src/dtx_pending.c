@@ -25,6 +25,7 @@
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/guc.h"			/* P7-N12：GetConfigOption 读 pg_raft.node_id */
 #include "access/xact.h"
 
 #include <fcntl.h>
@@ -536,7 +537,7 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
  * 最典型的失败是**本节点已不是该分片的主**（切主后由恢复守护补判决，R-P4-9 的
  * 场景）——写栅栏会拒，这正是它该拒的：陈旧主不得再往流里写。
  */
-static void
+static bool
 dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
 	TransactionId	xid;
@@ -545,14 +546,15 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 	uint8			op;
 	int				i;
 	bool			appended = false;
+	bool			ok = true;
 
 	if (ent->nxids <= 0 || (verdict != 1 && verdict != 2))
-		return;
+		return true;
 
 	/* 被标记的是那笔 prepared 事务的本地 xid，不是当前语句的 */
 	xid = GxidLocalXid(ent->gxid);
 	if (!TransactionIdIsValid(xid))
-		return;
+		return true;
 
 	op = (verdict == 1) ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT;
 
@@ -603,21 +605,90 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		ed = CopyErrorData();
 		FlushErrorState();
 
+		/*
+		 * ★ P7-N12（2026-09-17）：这里原先只告警、调用方照样注销未决登记。
+		 * 后果不是"副本晚点拿到判决"，而是**永远拿不到**：注销 ⇒ 本节点回执
+		 * ⇒ 协调组收齐回执 FORGET 决议；本节点丢主后接任的新主手里只有
+		 * PREPARED，升主序列的 dtx_close_indoubt 四级全查不到 ⇒ 已提交的行
+		 * 在新主上永久不可见（跨组转账验收：切主后账户总额 24000→23998→23999，
+		 * 旧主日志正是 `判决标记未能复制给副本 … record 381 未达多数派`）。
+		 * 现在返回 false，由调用方**保留登记**——回执门（R-P4-5）随之关着，
+		 * 决议不会被遗忘，新主升主时问得到。
+		 */
 		ereport(WARNING,
 				(errmsg("pg_partdist: 判决标记未能复制给副本（gxid=%lld）：%s",
 						(long long) ent->gxid, ed->message),
-				 errdetail("本地分片 clog 判决已落账，正确性不受影响；"
-						   "副本要等下一次供给或重做基线才拿到这笔判决。"),
+				 errdetail("本地分片 clog 判决已落账；未决登记**保留**（挡住回执与决议 FORGET），"
+						   "清扫时重试复制；本节点若已不是该分片的主，待主权登记转到新主后自动注销。"),
 				 errhint("本节点若已不是该分片的主，这是写栅栏的正常拒绝。")));
 		FreeErrorData(ed);
+		ok = false;
 	}
 	PG_END_TRY();
 
 	if (payload != NULL)
 		pfree(payload);
+	return ok;
 }
 
-static void
+/*
+ * P7-N12：本节点对这笔登记的责任是否已经转走 —— 登记里每个分片的**当前主**
+ * （partition_map.primary_node）都不是本节点。
+ *
+ * 为什么这个判据够用：新主的升主序列在**登记 partition_map 之前**跑
+ * dtx_close_indoubt（pg_raft_promote_prepare_ex），而只要本登记还在，
+ * 回执就被挡住、决议就还在 ⇒ 新主那一步一定问得到判决并把闭合记录写进它的流
+ * （它是 leader，写得进）。partition_map 已经指向别人 = 那一步已经跑过。
+ * 任一分片查不到映射或仍指向本节点 ⇒ 不放行（宁可多留一轮）。
+ * 只在清扫（普通 backend、可开 SPI）里调用。
+ */
+static bool
+dtx_pending_responsibility_moved(const DtxPendingEntry *ent)
+{
+	const char *v = GetConfigOption("pg_raft.node_id", true, false);
+	int			me = (v != NULL) ? atoi(v) : 0;
+	bool		moved = true;
+	int			i;
+
+	if (me <= 0 || ent->nxids <= 0)
+		return false;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return false;
+	PG_TRY();
+	{
+		for (i = 0; i < ent->nxids && moved; i++)
+		{
+			char		q[256];
+			bool		isnull = true;
+			int32		pn = 0;
+
+			snprintf(q, sizeof(q),
+					 "SELECT pm.primary_node FROM partdist.shard_identity si "
+					 "  JOIN partdist.partition_map pm ON pm.partition_id = si.global_shard_id::oid "
+					 " WHERE si.local_oid = %u LIMIT 1",
+					 (unsigned) ent->pairs[2 * i]);
+			if (SPI_execute(q, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+				pn = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc, 1, &isnull));
+			if (isnull || pn <= 0 || pn == me)
+				moved = false;
+		}
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		moved = false;
+	}
+	PG_END_TRY();
+	SPI_finish();
+	return moved;
+}
+
+/*
+ * 学到判决：整笔（本节点全部 pairs）幂等落分片 clog；复制给副本成功才注销登记。
+ * 返回是否已注销（P7-N12：复制失败 ⇒ 登记保留，调用方按各自语境处置）。
+ */
+static bool
 dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
 	int			i;
@@ -628,9 +699,11 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 							verdict == 1, verdict == 1 ? cts : 0);
 
 	/* ★ T7.1（R-P6-15）：本节点刚落的这本账，要复制给副本 */
-	dtx_replicate_verdict(ent, verdict, cts);
+	if (!dtx_replicate_verdict(ent, verdict, cts))
+		return false;
 
 	DtxPendingFinalized(ent->gxid);
+	return true;
 }
 
 /* ---- 清扫（backend 语境） ---- */
@@ -661,8 +734,17 @@ DtxPendingSweep(void)
 		CHECK_FOR_INTERRUPTS();
 		if (verdict != 0)
 		{
-			dtx_pending_apply_verdict(&snap[i], verdict, cts);
-			ndone++;
+			if (dtx_pending_apply_verdict(&snap[i], verdict, cts))
+				ndone++;
+			else if (dtx_pending_responsibility_moved(&snap[i]))
+			{
+				/* P7-N12：本节点已不是这些分片的主，新主升主时已闭合 in-doubt */
+				elog(LOG, "pg_partdist: 未决登记 gxid=%lld 的判决未能由本节点复制，"
+					 "但分片主权已登记到别的节点，视为已交接，注销",
+					 (long long) snap[i].gxid);
+				DtxPendingFinalized(snap[i].gxid);
+				ndone++;
+			}
 			continue;
 		}
 
@@ -864,8 +946,8 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 	memo = reader_memo_get(gxid, true);
 	if (verdict == 1 || verdict == 2)
 	{
-		/* 学到即回写（幂等）+ 注销；memo 使同快照后续元组零 RPC */
-		dtx_pending_apply_verdict(&ent, verdict, cts);
+		/* 学到即回写（幂等）；复制成功才注销，否则留给清扫；memo 使同快照后续元组零 RPC */
+		(void) dtx_pending_apply_verdict(&ent, verdict, cts);
 		memo->verdict = verdict;
 		memo->cts = (verdict == 1) ? cts : 0;
 		*cts_out = memo->cts;
@@ -1004,7 +1086,7 @@ DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 
 	for (i = 0; i < nsnap; i++)
 	{
-		dtx_pending_apply_verdict(&snap[i], verdict, commit_ts);
+		(void) dtx_pending_apply_verdict(&snap[i], verdict, commit_ts);	/* 落账即算送达；复制失败由清扫接手 */
 		ndone++;
 	}
 	return ndone;
