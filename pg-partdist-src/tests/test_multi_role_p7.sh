@@ -162,11 +162,11 @@ for bl in "${B_LINES[@]}"; do BNAME_OF["${bl%%:*}"]=mr; done
 echo "  M=:$M(node$Mn)  |  A1=${A_SIDS[0]} A2=${A_SIDS[1]}(主都在 M)  |  B1=${B_LINES[0]} B2=${B_LINES[1]}(主各在别处)"
 
 # ---- 定点写：只碰一个分片 = 只碰一个 raft 组 ----
-# ★ 为什么必须定点：一条 `INSERT ... SELECT generate_series` 会同时写到**全部**分片，
-#   提交时要为多个 raft 组一起做同步复制 —— 而这些组的成员是同样那 3 台，
-#   A→B 与 B→A 的复制压在**同一条 peer 连接**上（pg_raft 的 peer_conn 是每节点一条、
-#   所有组共用的进程级 static），实测 4 个组同时报 `未达多数派` +
-#   `another command is already in progress`。
+# ★ 为什么定点：一条 `INSERT ... SELECT generate_series` 会写到**全部**分片，其中没建 raft 组的
+#   分片会让 DTX 找不到协调组（`协调组 N 查不到现任 leader`，整条 INSERT 失败）。本用例验的是
+#   "多组并存"，所以每条写只碰一个组，把跨组事务这个变量排除在外（跨组事务另行验收）。
+#   注：早先把 `未达多数派` + `another command is already in progress` 归因成"多组共用 peer 连接"，
+#   复核日志发现那几轮副本根本没供（见 P7_REMEDIATION_PLAN §1.10），归因撤回。
 #   Citus 对**多行 VALUES** 和 **IN(常量列表)** 会逐行剪枝，全落一片时直接路由成
 #   `Task Count: 1`（实测 EXPLAIN 证实）；而 `INSERT ... SELECT` 不会（走
 #   `Custom Scan (Citus INSERT ... SELECT)`）。所以写一律拼 VALUES / IN 列表。
