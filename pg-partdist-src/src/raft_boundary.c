@@ -35,6 +35,7 @@
 #include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"		/* GetConfigOption：读 pg_raft.node_id */
+#include "utils/memutils.h"	/* TopMemoryContext：P7-N4 稀疏索引 */
 #include "utils/pg_lsn.h"
 
 #include <fcntl.h>
@@ -279,10 +280,13 @@ PG_FUNCTION_INFO_V1(pg_partdist_partwal_truncate_to);
 /*
  * 在 pg_parwal/<partition_id>/ 的段文件里定位 partition_lsn == target 的记录。
  * 命中则填充 *out_rec 并把原始字节 palloc 到 *out_data，返回 true。
+ *
+ * 这是**全扫描**实现（列目录 → 段名排序 → 从第一段开头逐条读），单次 O(n)。
+ * P7-N4 之后它只作为 partwal_find_record 的兜底，见下方稀疏索引。
  */
 static bool
-partwal_find_record(Oid partition_id, uint64 target,
-					PartWALRecord *out_rec, char **out_data)
+partwal_find_record_scan(Oid partition_id, uint64 target,
+						 PartWALRecord *out_rec, char **out_data)
 {
 	char			dirpath[MAXPGPATH];
 	DIR			   *dir;
@@ -372,6 +376,359 @@ partwal_find_record(Oid partition_id, uint64 target,
 	}
 
 	return found;
+}
+
+/* ------------------------------------------------------------------ */
+/* P7-N4 / P7-N7：按 plsn 查记录的后端本地稀疏索引                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 上面的全扫描单次 O(n)，却有三个热调用方：
+ *   · 复制：leader 每复制一条记录要读两次（data_propose_one 取记录头、
+ *     data_entry_fetch_hex 取字节），follower 追加时查重再读一次 ⇒ 写满 n 条总代价 O(n²)。
+ *     2026-09-17 实测同一组吞吐从每秒二十多条掉到个位数，1500 行的跨组事务跑了 229 s；
+ *   · 升主前置的 dtx_close_indoubt：对 1..flush_lsn 每个 plsn 各读一次 ⇒ O(n²)，
+ *     1300 条记录要 51 s；
+ *   · 升主前置的快路径分叉检查：从尾部往回读 200 条，每条都从流开头扫起。
+ *   后两者叠加让升主前置跑到 69 s，是 P7-N4 活锁的成本面。
+ *
+ * 做法：每个 backend 为最近用过的若干分区各记一份稀疏索引 —— 段文件名列表 + 每隔
+ * PWIDX_STRIDE 条记录一个检查点 (plsn, 段, 偏移, 载荷长度)。查 target 时二分找
+ * plsn ≤ target 的最近检查点，**先回读该偏移处的记录头逐字段核对**，通过才从那里
+ * 往后顺序读（通常不超过 STRIDE 条就命中）；没有索引时从流开头读并顺手建索引。
+ *
+ * 正确性只依赖一条既有不变式：**同一分区流里记录按 plsn 严格递增排列，段文件名升序
+ * 即 plsn 升序**（全扫描"找到第一条就返回"同样依赖它）。追加者对 plsn ≤ 本地最大编号
+ * 的记录只做两件事：当重传丢弃，或先 TruncatePartWALTo(plsn-1) 再写
+ * （partwal_follower_append）—— 都不会在更小的编号前面插入。所以一个核对通过的检查点
+ * 之前不可能有 ≥ 它的编号，从它往后顺序读到的第一条 == target 的记录，就是全扫描会
+ * 返回的那一条；读到的永远是文件**此刻**的内容，不是缓存。
+ *
+ * 兜底：检查点核对不过（截断、段被删、文件被重写成别的内容）⇒ 丢掉该分区索引；
+ * 快路径没找到 ⇒ **一律退回全扫描**。最坏情况就是改动前的行为。索引只在本 backend
+ * 内有效（TopMemoryContext），不进共享内存，不需要任何跨进程失效通知。
+ */
+#define PWIDX_STRIDE		32
+#define PWIDX_MAX_PARTS		8
+#define PWIDX_MAX_POINTS	131072		/* ≈ 420 万条记录；满了不再加点，仍从最后一点往后读 */
+#define PWIDX_MAX_SEGS		256			/* 与全扫描一致 */
+#define PWIDX_SEGNAME_LEN	32
+
+typedef struct PwIdxPoint
+{
+	uint64		plsn;
+	off_t		off;
+	uint32		data_len;
+	int			seg;
+} PwIdxPoint;
+
+typedef struct PwIdx
+{
+	Oid			partition_id;	/* InvalidOid = 空槽 */
+	uint64		last_use;
+	int			nsegs;
+	char		segs[PWIDX_MAX_SEGS][PWIDX_SEGNAME_LEN];
+	int			npoints;
+	int			cap;
+	PwIdxPoint *points;			/* plsn 严格升序 */
+} PwIdx;
+
+static PwIdx pwidx_slots[PWIDX_MAX_PARTS];
+static uint64 pwidx_clock = 0;
+
+bool		partwal_record_index = true;	/* GUC pg_partdist.partwal_record_index */
+
+static void
+pwidx_drop(PwIdx *ix)
+{
+	if (ix->points != NULL)
+		pfree(ix->points);
+	memset(ix, 0, sizeof(PwIdx));
+}
+
+static int
+pwidx_segname_cmp(const void *a, const void *b)
+{
+	return strcmp((const char *) a, (const char *) b);
+}
+
+/* 列出分区目录下的段文件名（升序）。失败/为空返回 -1 / 0。 */
+static int
+pwidx_list_segs(Oid partition_id, char segs[][PWIDX_SEGNAME_LEN])
+{
+	char			dirpath[MAXPGPATH];
+	DIR			   *dir;
+	struct dirent  *de;
+	int				n = 0;
+
+	snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
+			 DataDir, PARTITION_WAL_DIR, partition_id);
+	dir = AllocateDir(dirpath);
+	if (dir == NULL)
+		return -1;
+	while ((de = ReadDir(dir, dirpath)) != NULL && n < PWIDX_MAX_SEGS)
+	{
+		if (IsXLogFileName(de->d_name))
+		{
+			strlcpy(segs[n], de->d_name, PWIDX_SEGNAME_LEN);
+			n++;
+		}
+	}
+	FreeDir(dir);
+	if (n > 1)
+		qsort(segs, n, PWIDX_SEGNAME_LEN, pwidx_segname_cmp);
+	return n;
+}
+
+/* 取（或新建并建段表）该分区的索引槽；新建时按 LRU 淘汰。 */
+static PwIdx *
+pwidx_get(Oid partition_id)
+{
+	PwIdx	   *victim = NULL;
+	int			i;
+
+	for (i = 0; i < PWIDX_MAX_PARTS; i++)
+	{
+		PwIdx	   *ix = &pwidx_slots[i];
+
+		if (ix->partition_id == partition_id)
+		{
+			ix->last_use = ++pwidx_clock;
+			return ix;
+		}
+		if (victim == NULL || ix->partition_id == InvalidOid ||
+			(victim->partition_id != InvalidOid && ix->last_use < victim->last_use))
+			victim = ix;
+	}
+
+	pwidx_drop(victim);
+	victim->nsegs = pwidx_list_segs(partition_id, victim->segs);
+	if (victim->nsegs <= 0)
+	{
+		memset(victim, 0, sizeof(PwIdx));
+		return NULL;
+	}
+	victim->partition_id = partition_id;
+	victim->last_use = ++pwidx_clock;
+	return victim;
+}
+
+static void
+pwidx_add_point(PwIdx *ix, uint64 plsn, int seg, off_t off, uint32 data_len)
+{
+	if (ix->npoints > 0 && plsn <= ix->points[ix->npoints - 1].plsn)
+		return;
+	if (ix->npoints >= PWIDX_MAX_POINTS)
+		return;
+	if (ix->npoints >= ix->cap)
+	{
+		int			ncap = (ix->cap == 0) ? 256 : ix->cap * 2;
+
+		if (ncap > PWIDX_MAX_POINTS)
+			ncap = PWIDX_MAX_POINTS;
+		if (ix->points == NULL)
+			ix->points = (PwIdxPoint *)
+				MemoryContextAlloc(TopMemoryContext, sizeof(PwIdxPoint) * ncap);
+		else
+			ix->points = (PwIdxPoint *)
+				repalloc(ix->points, sizeof(PwIdxPoint) * ncap);
+		ix->cap = ncap;
+	}
+	ix->points[ix->npoints].plsn = plsn;
+	ix->points[ix->npoints].seg = seg;
+	ix->points[ix->npoints].off = off;
+	ix->points[ix->npoints].data_len = data_len;
+	ix->npoints++;
+}
+
+/*
+ * 越过已知段表末尾时重新列目录：已知的段名必须原样是新列表的前缀，
+ * 否则（段被删/改名）返回 false，调用方丢弃索引。
+ */
+static bool
+pwidx_refresh_segs(PwIdx *ix)
+{
+	char		fresh[PWIDX_MAX_SEGS][PWIDX_SEGNAME_LEN];
+	int			n = pwidx_list_segs(ix->partition_id, fresh);
+	int			i;
+
+	if (n < ix->nsegs)
+		return false;
+	for (i = 0; i < ix->nsegs; i++)
+		if (strcmp(fresh[i], ix->segs[i]) != 0)
+			return false;
+	for (i = ix->nsegs; i < n; i++)
+		strlcpy(ix->segs[i], fresh[i], PWIDX_SEGNAME_LEN);
+	ix->nsegs = n;
+	return true;
+}
+
+/*
+ * 快路径。返回 1 = 命中（已填 out）；0 = 没找到（调用方退回全扫描）；
+ * -1 = 索引失效（已丢弃，调用方退回全扫描）。
+ */
+static int
+partwal_find_record_indexed(Oid partition_id, uint64 target,
+							PartWALRecord *out_rec, char **out_data)
+{
+	PwIdx	   *ix = pwidx_get(partition_id);
+	int			seg = 0;
+	off_t		off = 0;
+	bool		extend;
+	int			since;
+
+	if (ix == NULL)
+		return 0;
+
+	if (ix->npoints > 0)
+	{
+		int			lo = 0,
+					hi = ix->npoints - 1,
+					best = -1;
+
+		if (target < ix->points[0].plsn)
+			return 0;			/* 比流里最早一条还小：不存在，交全扫描确认 */
+		while (lo <= hi)
+		{
+			int			mid = (lo + hi) / 2;
+
+			if (ix->points[mid].plsn <= target)
+			{
+				best = mid;
+				lo = mid + 1;
+			}
+			else
+				hi = mid - 1;
+		}
+		seg = ix->points[best].seg;
+		off = ix->points[best].off;
+		/* 只有从最后一个检查点往后读时才顺手延长索引 */
+		extend = (best == ix->npoints - 1);
+		since = 0;
+
+		/* 核对检查点：该偏移处必须还是那一条记录 */
+		{
+			char		filepath[MAXPGPATH];
+			int			fd;
+			PartWALRecord rec;
+			bool		ok = false;
+
+			snprintf(filepath, MAXPGPATH, "%s/%s/%u/%s", DataDir,
+					 PARTITION_WAL_DIR, partition_id, ix->segs[seg]);
+			fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
+			if (fd >= 0)
+			{
+				if (lseek(fd, off, SEEK_SET) == off &&
+					read(fd, &rec, sizeof(PartWALRecord)) == (ssize_t) sizeof(PartWALRecord) &&
+					rec.magic == PARTWAL_MAGIC &&
+					rec.partition_id == partition_id &&
+					rec.partition_lsn == ix->points[best].plsn &&
+					rec.data_len == ix->points[best].data_len)
+					ok = true;
+				CloseTransientFile(fd);
+			}
+			if (!ok)
+			{
+				pwidx_drop(ix);
+				return -1;
+			}
+		}
+	}
+	else
+	{
+		extend = true;
+		since = PWIDX_STRIDE;	/* 流里第一条记录也记成检查点 */
+	}
+
+	for (;;)
+	{
+		char		filepath[MAXPGPATH];
+		int			fd;
+		PartWALRecord rec;
+
+		if (seg >= ix->nsegs && !pwidx_refresh_segs(ix))
+		{
+			pwidx_drop(ix);
+			return -1;
+		}
+		if (seg >= ix->nsegs)
+			return 0;			/* 读到流尾也没有 */
+
+		snprintf(filepath, MAXPGPATH, "%s/%s/%u/%s", DataDir,
+				 PARTITION_WAL_DIR, partition_id, ix->segs[seg]);
+		fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+		{
+			pwidx_drop(ix);
+			return -1;
+		}
+		if (off > 0 && lseek(fd, off, SEEK_SET) != off)
+		{
+			CloseTransientFile(fd);
+			pwidx_drop(ix);
+			return -1;
+		}
+
+		while (read(fd, &rec, sizeof(PartWALRecord)) == (ssize_t) sizeof(PartWALRecord))
+		{
+			off_t		rec_off = off;
+
+			if (rec.magic != PARTWAL_MAGIC)
+				break;			/* 与全扫描一致：本段到此为止 */
+			off += (off_t) sizeof(PartWALRecord) + (off_t) rec.data_len;
+
+			if (rec.partition_id == partition_id)
+			{
+				if (extend && ++since >= PWIDX_STRIDE)
+				{
+					pwidx_add_point(ix, rec.partition_lsn, seg, rec_off, rec.data_len);
+					since = 0;
+				}
+
+				if (rec.partition_lsn == target)
+				{
+					char	   *buf = NULL;
+
+					if (rec.data_len > 0)
+					{
+						buf = (char *) palloc(rec.data_len);
+						if (read(fd, buf, rec.data_len) != (ssize_t) rec.data_len)
+						{
+							pfree(buf);
+							CloseTransientFile(fd);
+							return 0;
+						}
+					}
+					CloseTransientFile(fd);
+					*out_rec = rec;
+					*out_data = buf;
+					return 1;
+				}
+				if (rec.partition_lsn > target)
+				{
+					CloseTransientFile(fd);
+					return 0;	/* 严格递增：后面不会再有 target */
+				}
+			}
+
+			if (rec.data_len > 0 &&
+				lseek(fd, (off_t) rec.data_len, SEEK_CUR) < 0)
+				break;
+		}
+		CloseTransientFile(fd);
+		seg++;
+		off = 0;
+	}
+}
+
+static bool
+partwal_find_record(Oid partition_id, uint64 target,
+					PartWALRecord *out_rec, char **out_data)
+{
+	if (partwal_record_index &&
+		partwal_find_record_indexed(partition_id, target, out_rec, out_data) == 1)
+		return true;
+	return partwal_find_record_scan(partition_id, target, out_rec, out_data);
 }
 
 Datum

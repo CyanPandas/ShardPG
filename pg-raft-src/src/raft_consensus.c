@@ -3626,290 +3626,460 @@ send_heartbeats(RaftGroupCtx *ctx)
 /* ---- 选举 ---- */
 
 /*
- * ───────────── P7-R5（2026-09-15）：登记控制面期间不能断心跳 ─────────────
+ * ───────────── P7-R5（2026-09-15）→ P7-N4（2026-09-17）：升主前置与登记不许阻塞 tick ─────────────
  *
- * 数据组新 leader 在 tick 里同步做"自连本节点跑升主前置 + 向 group0 leader 登记"，
- * 全程阻塞：自连要起一个新 backend（加载 Citus/partdist/raft），登记那条语句里是
- * 一次同步复制到全体节点的 group0 提案 + 协调者上的 apply（partition_map、
- * pg_dist_placement、交接）。CPU 饱和时（pg-test e2-medium 跑套件 idle 0–2%）
- * 当选→登记实测 10–14 s，而这段时间本节点**所有组一个心跳都不发**，
- * election_timeout=6000 的 follower 到点就把它推翻：txn_layer_r2 门禁 5 轮 4 轮
- * 建组后主漂移、第一笔写被判中止。
+ * 数据组新 leader 在 tick 里要做两件慢事：自连本节点跑升主前置（追平、推进 WAL 位点、闭合
+ * in-doubt、修分叉、认领），再向 group0 leader 登记（一次同步复制到全体节点的 group0 提案 +
+ * 协调者 apply）。
  *
- * 处置：两条语句改走**专用连接**（不与 peer_conn[] 共用 —— 等待期间要拿
- * peer_conn[] 继续发心跳，同一连接上不能挂两条在途查询），异步发送，每
- * heartbeat_ms 给本节点所有 leader 组发一轮心跳，并设上界（超时即重置连接、
- * 保留 pending 下个 tick 重来）。
+ * P7-R5 的做法是"异步发送 + 等待期间每 heartbeat_ms 发一轮心跳 + 上界（升主前置 slice+8000 ms、
+ * 登记 30 s），超时即 PQfinish、下个 tick 重来"。2026-09-17 跨组事务并发试跑证明这在长流上
+ * 会**活锁**：
+ *   ① 升主前置实测 69 s/次，远超 10 s 上界 —— 服务端每次都真的跑完了，结果却被丢掉，
+ *      下一轮从头再来，永远登记不上，路由一直指着旧主；
+ *   ② 超时路径直接 return，**不走截止期判断**，60 s 兜底永不触发；
+ *   ③ 超时只 PQfinish 不 PQcancel，服务端会话照跑，同组升主前置实测堆到 6 个，互相拖慢；
+ *   ④ 下一轮 PQconnectdb **阻塞**重连（新 backend 要加载 Citus/partdist/raft），堆满会话的
+ *      节点上要好几秒，期间一个心跳都不发 —— 本节点领导的其他组随之被推翻，连锁漂主。
+ *
+ * 现在改成**跨 tick 的非阻塞状态机**，tick 里对这两件事只做"看一眼、推一步"：
+ *   · 建连用 PQconnectStart/PQconnectPoll，套接字没就绪就留到下个 tick；
+ *   · 语句发出去后每个 tick 只 PQconsumeInput + PQisBusy，**结果一定被收下**，
+ *     不论它跑多久（有 5 分钟硬上界防服务端真的卡死，超了才 PQcancel 重来）；
+ *   · 在途操作绑定 (组, term)；每个 tick 先扫一遍，组不在了 / 不再是该 term 的 leader
+ *     ⇒ PQcancel 取消（别让一个已下台的节点把"认领分片"做完）；
+ *   · 同一 (组, term) 升主前置返回 1 之后记为"已准备"，登记没成功只重发登记，不再重跑前置；
+ *   · 截止期按 (组, term) 从首次发出算起，在每次拿到"还没追平"时判；
+ *     pg_raft.promote_catchup_deadline_ms = 0 表示**永不兜底**（原实现是立即放行，与 GUC
+ *     描述相反，P7-N6）；兜底改为调 pg_raft_promote_prepare_ex(..., force=true)：
+ *     仍尽力追一片，但不再以追平为前提，**其余升主步骤照做**（原兜底一步都没做）。
+ * 每条连接一次只挂一条在途语句，多个组要升主时自然轮流；tick 不再为它们等待，
+ * 心跳按正常 tick 节奏发。
  */
-#define RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS   (pg_raft_promote_catchup_slice_ms + 8000)
-#define RAFT_REPORT_EXEC_TIMEOUT_MS            30000
+#define RAFT_PROMOTE_INFLIGHT_MAX_MS   300000   /* 单次升主前置硬上界：防服务端真卡死 */
+#define RAFT_REPORT_EXEC_TIMEOUT_MS     30000   /* 单次登记上界 */
+#define RAFT_ACONN_CONNECT_TIMEOUT_MS   30000   /* 非阻塞建连上界 */
 
-static PGconn *self_conn = NULL;           /* 连回本节点（升主前置） */
-static PGconn *report_conn = NULL;         /* 连 group0 leader（登记） */
-static int     report_conn_node = 0;
+typedef enum
+{
+    RAFT_ACONN_IDLE = 0,        /* 无连接 */
+    RAFT_ACONN_CONNECTING,      /* PQconnectStart 之后、握手未完 */
+    RAFT_ACONN_READY,           /* 已连上、无在途语句 */
+    RAFT_ACONN_BUSY             /* 有在途语句 */
+} RaftAconnState;
+
+typedef enum
+{
+    RAFT_ACONN_PENDING = 0,
+    RAFT_ACONN_DONE,
+    RAFT_ACONN_BROKEN
+} RaftAconnPoll;
+
+typedef struct RaftAsyncConn
+{
+    const char *tag;                    /* 日志用 */
+    PGconn     *conn;
+    RaftAconnState state;
+    PostgresPollingStatusType poll;
+    TimestampTz started;                /* CONNECTING：发起建连；BUSY：发出语句 */
+    int         target_node;            /* 连到哪个节点（登记连接随 group0 leader 变） */
+    int64       owner_group;            /* BUSY 时：语句属于哪个组 */
+    int64       owner_term;             /* BUSY 时：发出时该组的 term */
+    PGresult   *first_res;              /* 已收到、尚未交给调用方的首个结果 */
+} RaftAsyncConn;
+
+static RaftAsyncConn promote_aconn = {"升主前置"};
+static RaftAsyncConn report_aconn = {"登记"};
 
 static void
-dedicated_conn_reset(PGconn **slot)
+aconn_reset(RaftAsyncConn *ac, bool cancel)
 {
-    if (*slot != NULL)
+    if (ac->conn != NULL)
     {
-        PQfinish(*slot);
-        *slot = NULL;
+        if (cancel && ac->state == RAFT_ACONN_BUSY)
+        {
+            PGcancel *cn = PQgetCancel(ac->conn);
+            char      errbuf[256];
+
+            if (cn != NULL)
+            {
+                (void) PQcancel(cn, errbuf, sizeof(errbuf));
+                PQfreeCancel(cn);
+            }
+        }
+        PQfinish(ac->conn);
     }
-}
-
-static PGconn *
-dedicated_conn_get(PGconn **slot, const char *host, int port)
-{
-    char conninfo[512];
-
-    if (*slot != NULL)
-    {
-        if (PQstatus(*slot) == CONNECTION_OK)
-            return *slot;
-        dedicated_conn_reset(slot);
-    }
-    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
-    *slot = PQconnectdb(conninfo);
-    if (PQstatus(*slot) != CONNECTION_OK)
-    {
-        elog(WARNING, "pg_raft: 专用连接 %s:%d 失败: %s", host, port,
-             PQerrorMessage(*slot));
-        dedicated_conn_reset(slot);
-        return NULL;
-    }
-    return *slot;
-}
-
-/* 给本节点当 leader 的每一个组发一轮心跳（等待长语句期间调） */
-static void
-heartbeat_all_leader_groups(void)
-{
-    int i;
-
-    for (i = 0; i < RAFT_MAX_GROUPS; i++)
-    {
-        RaftGroupState *g = &RaftGroups->groups[i];
-        RaftGroupCtx    ctx;
-        int             state;
-
-        if (!g->in_use)
-            continue;
-        ctx.group_id = g->group_id;
-        ctx.g = g;
-        ctx.cons = &g->cons;
-        ctx.log = &g->log;
-        if (!group_has_member(&ctx, pg_raft_node_id))
-            continue;
-        SpinLockAcquire(&ctx.cons->mutex);
-        state = ctx.cons->state;
-        SpinLockRelease(&ctx.cons->mutex);
-        if (state == RAFT_LEADER)
-            send_heartbeats(&ctx);
-    }
+    if (ac->first_res != NULL)
+        PQclear(ac->first_res);
+    ac->conn = NULL;
+    ac->state = RAFT_ACONN_IDLE;
+    ac->target_node = 0;
+    ac->owner_group = 0;
+    ac->owner_term = 0;
+    ac->first_res = NULL;
 }
 
 /*
- * 异步执行 + 等待期间照发心跳 + 上界。返回首个结果（调用方 PQclear）；
- * NULL = 超时/连接坏，调用方必须重置该连接（上面还挂着在途查询）。
+ * 推进建连。返回 1 = 可以发语句；0 = 还在握手（下个 tick 再推）；-1 = 失败（已重置）。
+ * 调用方保证当前不是 BUSY。绝不阻塞：只在套接字已就绪时调 PQconnectPoll。
  */
-static PGresult *
-pq_exec_heartbeating(PGconn *conn, const char *sql, int timeout_ms)
+static int
+aconn_ensure(RaftAsyncConn *ac, const char *host, int port, int target_node)
 {
-    TimestampTz start = GetCurrentTimestamp();
-    TimestampTz last_hb = start;
-    PGresult   *first = NULL;
-    PGresult   *r;
+    if (ac->state == RAFT_ACONN_READY)
+    {
+        if (ac->target_node == target_node && PQstatus(ac->conn) == CONNECTION_OK)
+            return 1;
+        aconn_reset(ac, false);
+    }
+    else if (ac->state == RAFT_ACONN_CONNECTING && ac->target_node != target_node)
+        aconn_reset(ac, false);     /* 握手途中目标换了（如 group0 换主）：重连新目标 */
 
-    if (!PQsendQuery(conn, sql))
-        return NULL;
+    if (ac->state == RAFT_ACONN_IDLE)
+    {
+        char conninfo[512];
+
+        pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+        ac->conn = PQconnectStart(conninfo);
+        if (ac->conn == NULL || PQstatus(ac->conn) == CONNECTION_BAD)
+        {
+            elog(WARNING, "pg_raft: %s专用连接 %s:%d 发起失败: %s", ac->tag, host, port,
+                 ac->conn ? PQerrorMessage(ac->conn) : "PQconnectStart 返回 NULL");
+            aconn_reset(ac, false);
+            return -1;
+        }
+        ac->state = RAFT_ACONN_CONNECTING;
+        ac->poll = PGRES_POLLING_WRITING;
+        ac->started = GetCurrentTimestamp();
+        ac->target_node = target_node;
+    }
 
     for (;;)
     {
-        while (PQisBusy(conn))
-        {
-            int             sock = PQsocket(conn);
-            fd_set          rf;
-            struct timeval  tv;
-            TimestampTz     now;
+        int            sock;
+        fd_set         rf, wf;
+        struct timeval tv;
 
-            if (sock < 0 ||
-                TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
-            {
-                if (first)
-                    PQclear(first);
-                return NULL;
-            }
-            FD_ZERO(&rf);
-            FD_SET(sock, &rf);
-            tv.tv_sec = 0;
-            tv.tv_usec = 100 * 1000;
-            (void) select(sock + 1, &rf, NULL, NULL, &tv);
-            CHECK_FOR_INTERRUPTS();
-            if (!PQconsumeInput(conn))
-            {
-                if (first)
-                    PQclear(first);
-                return NULL;
-            }
-            now = GetCurrentTimestamp();
-            if (TimestampDifferenceExceeds(last_hb, now, pg_raft_heartbeat_ms))
-            {
-                heartbeat_all_leader_groups();
-                last_hb = now;
-            }
+        if (ac->poll == PGRES_POLLING_OK)
+        {
+            ac->state = RAFT_ACONN_READY;
+            return 1;
         }
-        r = PQgetResult(conn);
+        sock = PQsocket(ac->conn);
+        if (ac->poll == PGRES_POLLING_FAILED || sock < 0)
+        {
+            elog(WARNING, "pg_raft: %s专用连接 %s:%d 失败: %s", ac->tag, host, port,
+                 PQerrorMessage(ac->conn));
+            aconn_reset(ac, false);
+            return -1;
+        }
+        FD_ZERO(&rf);
+        FD_ZERO(&wf);
+        if (ac->poll == PGRES_POLLING_READING)
+            FD_SET(sock, &rf);
+        else
+            FD_SET(sock, &wf);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        if (select(sock + 1, &rf, &wf, NULL, &tv) <= 0)
+            break;              /* 没就绪：留到下个 tick */
+        ac->poll = PQconnectPoll(ac->conn);
+    }
+
+    if (TimestampDifferenceExceeds(ac->started, GetCurrentTimestamp(),
+                                   RAFT_ACONN_CONNECT_TIMEOUT_MS))
+    {
+        elog(WARNING, "pg_raft: %s专用连接 %s:%d 握手超过 %d ms，放弃重连",
+             ac->tag, host, port, RAFT_ACONN_CONNECT_TIMEOUT_MS);
+        aconn_reset(ac, false);
+        return -1;
+    }
+    return 0;
+}
+
+static bool
+aconn_send(RaftAsyncConn *ac, const char *sql, int64 group_id, int64 term)
+{
+    if (!PQsendQuery(ac->conn, sql))
+    {
+        elog(WARNING, "pg_raft: %s发送失败(组 %lld): %s", ac->tag,
+             (long long) group_id, PQerrorMessage(ac->conn));
+        aconn_reset(ac, false);
+        return false;
+    }
+    ac->state = RAFT_ACONN_BUSY;
+    ac->started = GetCurrentTimestamp();
+    ac->owner_group = group_id;
+    ac->owner_term = term;
+    return true;
+}
+
+/*
+ * 非阻塞收结果。DONE 时 *out 为首个结果（可能是错误结果；也可能为 NULL = 没有结果），
+ * 调用方负责 PQclear；连接回到 READY。BROKEN 时连接已不可用，调用方须 aconn_reset。
+ */
+static RaftAconnPoll
+aconn_poll(RaftAsyncConn *ac, PGresult **out)
+{
+    *out = NULL;
+    if (!PQconsumeInput(ac->conn))
+        return RAFT_ACONN_BROKEN;
+    while (!PQisBusy(ac->conn))
+    {
+        PGresult *r = PQgetResult(ac->conn);
+
         if (r == NULL)
-            break;
-        if (first == NULL)
-            first = r;
+        {
+            *out = ac->first_res;
+            ac->first_res = NULL;
+            ac->state = RAFT_ACONN_READY;
+            ac->owner_group = 0;
+            ac->owner_term = 0;
+            return RAFT_ACONN_DONE;
+        }
+        if (ac->first_res == NULL)
+            ac->first_res = r;
         else
             PQclear(r);
     }
-    return first;
+    return RAFT_ACONN_PENDING;
+}
+
+/* 在途语句所属的组若已不在、或不再是发出时那个 term 的 leader ⇒ 取消 */
+static void
+aconn_sweep_one(RaftAsyncConn *ac)
+{
+    RaftGroupCtx ctx;
+    int          state;
+    int64        term;
+
+    if (ac->state != RAFT_ACONN_BUSY)
+        return;
+    if (!raft_group_ctx(ac->owner_group, &ctx))
+    {
+        elog(LOG, "pg_raft: 组 %lld 已不存在，取消在途%s", (long long) ac->owner_group, ac->tag);
+        aconn_reset(ac, true);
+        return;
+    }
+    SpinLockAcquire(&ctx.cons->mutex);
+    state = ctx.cons->state;
+    term = ctx.cons->current_term;
+    SpinLockRelease(&ctx.cons->mutex);
+    if (state != RAFT_LEADER || term != ac->owner_term)
+    {
+        elog(LOG, "pg_raft: 组 %lld 已不再是 term %lld 的 leader（现 term %lld），取消在途%s",
+             (long long) ac->owner_group, (long long) ac->owner_term, (long long) term, ac->tag);
+        aconn_reset(ac, true);
+    }
+}
+
+static void
+promote_async_sweep(void)
+{
+    aconn_sweep_one(&promote_aconn);
+    aconn_sweep_one(&report_aconn);
 }
 
 /*
- * data_group_promote_prepare — 上报前把本节点该分片"准备成主"。
- *
- * 做两件事（实现在 partdist.pg_raft_promote_prepare，见 pg_raft--1.0.sql）：
- * 把惰性回放追平到 Raft 已提交位点、闭合 in-doubt 分布式事务。
- *
- * 三个约束决定了它必须长这样：
- *   a) 本函数跑在 BGW tick 里，**没有 SPI**，只能走 libpq 自连接（与 DTX 参与
- *      登记、恢复守护跑 COMMIT PREPARED 同一手法）；
- *   b) tick 还要给其余各组发心跳，**不能久占** —— 所以每次只推进
- *      pg_raft.promote_catchup_slice_ms 毫秒，没追完返回 false，下个 tick 接着追。
- *      惰性回放平时一条 redo 都不做，升主时的积压可能很大，必须切片；
- *   c) 追不平就永不上报会让分片**永久无主**，比读到旧数据更糟。所以设
- *      pg_raft.promote_catchup_deadline_ms 兜底：超过它就带 WARNING 放行，
- *      把"可用性优先"这个取舍显式化，而不是让它静默发生。
- *
- * 截止期按 (group_id, 首次尝试时刻) 记在 BGW 进程本地 —— 单进程、组数有上限，
- * 不值得为它动共享内存结构。进程重启即重新计时，语义上等价于重新开始追平。
+ * 每个 (组, term) 的升主进度，BGW 进程本地（单进程、条数不超过 max_groups，
+ * 不值得动共享内存）。进程重启即重新计时，语义上等价于重新开始追平。
  */
-static bool
-data_group_promote_prepare(int64 group_id)
+typedef struct PromoteSlot
 {
-    typedef struct {
-        int64       group_id;
-        TimestampTz first_try;
-    } DeadlineSlot;
-    /*
-     * T7.23：组数上限运行期才知道，本地表改成首次使用时按 max_groups 分配
-     * （TopMemoryContext，进程内常驻，与原 static 数组生命周期相同）。
-     */
-    static DeadlineSlot *deadline_state = NULL;
-    static bool  deadline_init = false;
+    int64       group_id;       /* 0 = 空 */
+    int64       term;
+    TimestampTz first_try;      /* 本 term 首次发出升主前置；0 = 尚未发出 */
+    bool        prepared;       /* 本 term 升主前置已返回 1，只差登记 */
+    bool        force;          /* 已过截止期，下一轮走兜底 */
+} PromoteSlot;
 
-    PGconn      *conn;
-    PGresult    *res;
-    char         sql[256];
-    bool         ok = false;
-    int          verdict = 0;
+static PromoteSlot *promote_slots = NULL;
+static int          promote_nslots = 0;
+
+static PromoteSlot *
+promote_slot_get(int64 group_id, int64 term)
+{
     int          i;
-    int          slot = -1;
-    int          free_slot = -1;
-    TimestampTz  now = GetCurrentTimestamp();
+    PromoteSlot *free_slot = NULL;
 
-    if (!deadline_init)
+    if (promote_slots == NULL)
     {
-        deadline_state = (DeadlineSlot *)
+        promote_nslots = RAFT_MAX_GROUPS;
+        promote_slots = (PromoteSlot *)
             MemoryContextAllocZero(TopMemoryContext,
-                                   sizeof(DeadlineSlot) * (Size) RAFT_MAX_GROUPS);
-        deadline_init = true;
+                                   sizeof(PromoteSlot) * (Size) promote_nslots);
     }
-
-    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    for (i = 0; i < promote_nslots; i++)
     {
-        if (deadline_state[i].group_id == group_id)
+        PromoteSlot *ps = &promote_slots[i];
+
+        if (ps->group_id == group_id)
         {
-            slot = i;
-            break;
+            if (ps->term != term)
+            {
+                memset(ps, 0, sizeof(PromoteSlot));
+                ps->group_id = group_id;
+                ps->term = term;
+            }
+            return ps;
         }
-        if (free_slot < 0 && deadline_state[i].group_id == 0)
-            free_slot = i;
+        if (free_slot == NULL && ps->group_id == 0)
+            free_slot = ps;
     }
-    if (slot < 0 && free_slot >= 0)
+    /*
+     * 没有空槽：回收"组已不在、或本节点已不是该 term 的 leader"的槽。
+     * 正常路径里槽在登记成功 / 丢领导权时就清了；漏网的是"当选后、登记前组被删"
+     * —— 测试会反复建删组，不回收的话积满 max_groups 条之后升主就再也发不出去。
+     */
+    for (i = 0; free_slot == NULL && i < promote_nslots; i++)
     {
-        slot = free_slot;
-        deadline_state[slot].group_id = group_id;
-        deadline_state[slot].first_try = now;
+        PromoteSlot *ps = &promote_slots[i];
+        RaftGroupCtx gctx;
+        bool         stale = true;
+
+        if (raft_group_ctx(ps->group_id, &gctx))
+        {
+            SpinLockAcquire(&gctx.cons->mutex);
+            stale = !(gctx.cons->state == RAFT_LEADER && gctx.cons->current_term == ps->term);
+            SpinLockRelease(&gctx.cons->mutex);
+        }
+        if (stale)
+        {
+            memset(ps, 0, sizeof(PromoteSlot));
+            free_slot = ps;
+        }
+    }
+    if (free_slot != NULL)
+    {
+        free_slot->group_id = group_id;
+        free_slot->term = term;
+    }
+    return free_slot;
+}
+
+static void
+promote_slot_clear(int64 group_id)
+{
+    int i;
+
+    for (i = 0; promote_slots != NULL && i < promote_nslots; i++)
+        if (promote_slots[i].group_id == group_id)
+            memset(&promote_slots[i], 0, sizeof(PromoteSlot));
+}
+
+/*
+ * data_group_promote_prepare — 上报前把本节点该分片"准备成主"（非阻塞）。
+ *
+ * 做的事在 partdist.pg_raft_promote_prepare_ex（见 pg_raft--1.0.sql）：把惰性回放追平到 Raft
+ * 已提交位点、推进本地 WAL 位点、闭合 in-doubt 分布式事务、修分叉、认领无主 RUNNING。
+ * 本函数只管"发出去、收回来、判截止期"。
+ *
+ * 返回 1 = 本 term 已准备好（可以登记）；0 = 还没好（在途 / 排队 / 没追平）；
+ * -1 = 永不放行（没有本地副本 / 快路径分叉 / 收了 WAL 却没有回放槽位）。
+ */
+static int
+data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
+{
+    PromoteSlot *ps = promote_slot_get(ctx->group_id, term);
+    TimestampTz  now = GetCurrentTimestamp();
+    char         sql[256];
+    int          verdict = 0;
+
+    if (ps == NULL)
+        return 0;               /* 按 max_groups 分配，不会满；防御 */
+    if (ps->prepared)
+        return 1;
+
+    if (promote_aconn.state == RAFT_ACONN_BUSY)
+    {
+        PGresult     *res = NULL;
+        RaftAconnPoll pr;
+
+        if (promote_aconn.owner_group != ctx->group_id || promote_aconn.owner_term != term)
+            return 0;           /* 连接被别的组占着：排队 */
+
+        pr = aconn_poll(&promote_aconn, &res);
+        if (pr == RAFT_ACONN_PENDING)
+        {
+            if (TimestampDifferenceExceeds(promote_aconn.started, now,
+                                           RAFT_PROMOTE_INFLIGHT_MAX_MS))
+            {
+                elog(WARNING,
+                     "pg_raft: 组 %lld 单次升主前置已运行超过 %d ms，取消后重来",
+                     (long long) ctx->group_id, RAFT_PROMOTE_INFLIGHT_MAX_MS);
+                aconn_reset(&promote_aconn, true);
+            }
+            return 0;
+        }
+        if (pr == RAFT_ACONN_BROKEN)
+        {
+            elog(WARNING, "pg_raft: 升主前置连接失效(组 %lld): %s，下个 tick 重来",
+                 (long long) ctx->group_id, PQerrorMessage(promote_aconn.conn));
+            aconn_reset(&promote_aconn, false);
+            return 0;
+        }
+
+        if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+            verdict = atoi(PQgetvalue(res, 0, 0));
+        else
+            elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
+                 (long long) ctx->group_id,
+                 res != NULL ? PQresultErrorMessage(res) : "无结果");
+        if (res != NULL)
+            PQclear(res);
+
+        /*
+         * ★ verdict < 0 = 永不放行（DTX_2PC_DESIGN.md §9.5 第 6 步 b / R-P4-15 / R-P7-1）。
+         * 与"还没追平"不是一回事：追不平是暂时状态，可以兜底；分叉/无副本是已知事实，
+         * 放行等于让一个已知有问题的副本当主。清掉计时，交给重做基线后再参选。
+         */
+        if (verdict < 0)
+        {
+            ps->first_try = 0;
+            ps->force = false;
+            return -1;
+        }
+        if (verdict == 1)
+        {
+            if (ps->force)
+                elog(WARNING,
+                     "pg_raft: 组 %lld 升主前置超过 %d ms 仍未追平，已按可用性优先放行上报"
+                     "（跳过了追平要求，其余升主步骤已执行；该副本可能尚未追平，升主后读到的可能是旧数据）",
+                     (long long) ctx->group_id, pg_raft_promote_catchup_deadline_ms);
+            ps->prepared = true;
+            return 1;
+        }
+
+        /* verdict == 0：这一片没追平 */
+        if (!ps->force && pg_raft_promote_catchup_deadline_ms > 0 &&
+            ps->first_try != 0 &&
+            TimestampDifferenceExceeds(ps->first_try, now,
+                                       pg_raft_promote_catchup_deadline_ms))
+        {
+            ps->force = true;
+            elog(WARNING,
+                 "pg_raft: 组 %lld 升主前置超过 %d ms 仍未追平，转入兜底：下一轮不再以追平为前提",
+                 (long long) ctx->group_id, pg_raft_promote_catchup_deadline_ms);
+        }
+        /* 连接已回到 READY，本 tick 直接发下一轮 */
     }
 
-    /* P7-R5：专用缓存连接（不再每 tick 新起一个 backend）+ 等待期间照发心跳 */
-    conn = dedicated_conn_get(&self_conn, "127.0.0.1", PostPortNumber);
-    if (conn == NULL)
-    {
-        elog(WARNING, "pg_raft: 升主前置连回本节点失败");
-        return false;
-    }
+    if (promote_aconn.state == RAFT_ACONN_BUSY)
+        return 0;
+    if (aconn_ensure(&promote_aconn, "127.0.0.1", PostPortNumber, pg_raft_node_id) != 1)
+        return 0;
 
     snprintf(sql, sizeof(sql),
-             "SELECT partdist.pg_raft_promote_prepare(%lld, %d)",
-             (long long) group_id, pg_raft_promote_catchup_slice_ms);
-
-    res = pq_exec_heartbeating(conn, sql, RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS);
-    if (res == NULL)
-    {
-        elog(WARNING, "pg_raft: 升主前置超过 %d ms 未返回或连接失效(组 %lld)，下个 tick 重试",
-             RAFT_PROMOTE_PREPARE_EXEC_TIMEOUT_MS, (long long) group_id);
-        dedicated_conn_reset(&self_conn);
-        return false;
-    }
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
-        verdict = atoi(PQgetvalue(res, 0, 0));
-    else
-        elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
-             (long long) group_id, PQerrorMessage(conn));
-    PQclear(res);
-
-    ok = (verdict == 1);
-
-    /*
-     * ★ verdict < 0 = 检测到快路径分叉（DTX_2PC_DESIGN.md §9.5，第 6 步 b）。
-     *
-     * 与"还没追平"不是一回事：追不平是**暂时**状态，可以被 deadline 按
-     * 可用性优先放行；分叉是**已知事实** —— 本节点段流里有它自己写的 COMMIT
-     * 标记，而那笔事务在本地 CLOG 里并没有提交。放行等于让一个已知与组分叉的
-     * 副本当上主库，比"该分片暂时无主"坏得多。所以这里**清掉截止期计时并直接
-     * 返回**，绕过下面那段兜底逻辑，永不放行。
-     *
-     * 恢复手段是重做物理基线（惰性回放的 re-baseline 路径），完成后该分片
-     * 重新 replay_enable 即可再次参选 —— 那时段流与本地 CLOG 不再矛盾。
-     */
-    if (verdict < 0)
-    {
-        if (slot >= 0)
-            deadline_state[slot].group_id = 0;
-        return false;
-    }
-
-    if (ok)
-    {
-        if (slot >= 0)
-            deadline_state[slot].group_id = 0;   /* 释放，下次升主重新计时 */
-        return true;
-    }
-
-    if (slot >= 0 &&
-        TimestampDifferenceExceeds(deadline_state[slot].first_try, now,
-                                   pg_raft_promote_catchup_deadline_ms))
-    {
-        elog(WARNING,
-             "pg_raft: 组 %lld 升主前置超过 %d ms 仍未完成，按可用性优先放行上报"
-             "（该副本可能尚未追平，升主后读到的可能是旧数据）",
-             (long long) group_id, pg_raft_promote_catchup_deadline_ms);
-        deadline_state[slot].group_id = 0;
-        return true;
-    }
-
-    return false;
+             "SELECT partdist.pg_raft_promote_prepare_ex(%lld, %d, %s)",
+             (long long) ctx->group_id, pg_raft_promote_catchup_slice_ms,
+             ps->force ? "true" : "false");
+    if (aconn_send(&promote_aconn, sql, ctx->group_id, term) && ps->first_try == 0)
+        ps->first_try = now;
+    return 0;
 }
 
 /*
- * 数据组新任 leader 向控制面登记（切主重构的上报半程）。
+ * 数据组新任 leader 向控制面登记（切主重构的上报半程，非阻塞）。
  *
  * BGW tick 上下文无 SPI，投递走 libpq：向 group 0 当前 leader（常态是 master）
  * 调 partdist.pg_raft_report_data_leader(gid, self, term, secondaries)。返回
@@ -3931,8 +4101,9 @@ data_group_try_report(RaftGroupCtx *ctx)
     char         arrbuf[192];
     char         sql[384];
     int          off;
-    PGconn      *conn;
-    PGresult    *res;
+    PGresult    *res = NULL;
+    RaftAconnPoll pr;
+    int          cr;
 
     SpinLockAcquire(&ctx->cons->mutex);
     state = ctx->cons->state;
@@ -3941,6 +4112,7 @@ data_group_try_report(RaftGroupCtx *ctx)
     if (state != RAFT_LEADER)
     {
         ctx->g->report_pending = false;
+        promote_slot_clear(ctx->group_id);
         return;
     }
 
@@ -3960,8 +4132,75 @@ data_group_try_report(RaftGroupCtx *ctx)
      * → 翻 pg_dist_placement"一气呵成的，不上报就等于不翻路由，
      * "追不平不对外服务"这条承诺由此天然成立，且完全不阻塞 group 0。
      */
-    if (!data_group_promote_prepare(ctx->group_id))
-        return;                 /* 还没追平/闭合完，保留 report_pending 下个 tick 继续 */
+    if (data_group_promote_prepare(ctx, term) != 1)
+        return;                 /* 还没好，保留 report_pending 下个 tick 继续 */
+
+    /* 登记连接上若挂着本组本 term 的在途登记：只收结果 */
+    if (report_aconn.state == RAFT_ACONN_BUSY)
+    {
+        if (report_aconn.owner_group != ctx->group_id || report_aconn.owner_term != term)
+            return;             /* 别的组在登记：排队 */
+
+        for (i = 0; i < n_peers; i++)
+            if (peers[i].node_id == report_aconn.target_node)
+            {
+                slot = i;
+                break;
+            }
+
+        pr = aconn_poll(&report_aconn, &res);
+        if (pr == RAFT_ACONN_PENDING)
+        {
+            if (TimestampDifferenceExceeds(report_aconn.started, GetCurrentTimestamp(),
+                                           RAFT_REPORT_EXEC_TIMEOUT_MS))
+            {
+                elog(WARNING,
+                     "pg_raft: group %lld 向控制面(node %d)登记超过 %d ms 未返回，取消后重来",
+                     (long long) ctx->group_id, report_aconn.target_node,
+                     RAFT_REPORT_EXEC_TIMEOUT_MS);
+                aconn_reset(&report_aconn, true);
+                if (slot >= 0)
+                    peer_mark_result(&peers[slot], false);
+            }
+            return;
+        }
+        if (pr == RAFT_ACONN_BROKEN)
+        {
+            elog(WARNING, "pg_raft: group %lld 登记连接失效: %s，下个 tick 重试",
+                 (long long) ctx->group_id, PQerrorMessage(report_aconn.conn));
+            aconn_reset(&report_aconn, false);
+            if (slot >= 0)
+                peer_mark_result(&peers[slot], false);
+            return;
+        }
+        if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        {
+            long long v = atoll(PQgetvalue(res, 0, 0));
+
+            if (v != 0)
+            {
+                ctx->g->report_pending = false;
+                promote_slot_clear(ctx->group_id);
+                elog(LOG,
+                     "pg_raft: group %lld leader node %d term %lld 已向控制面(node %d)登记 (ret=%lld)",
+                     (long long) ctx->group_id, pg_raft_node_id,
+                     (long long) term, report_aconn.target_node, v);
+            }
+            if (slot >= 0)
+                peer_mark_result(&peers[slot], true);
+        }
+        else
+        {
+            elog(WARNING, "pg_raft: group %lld 登记执行失败: %s",
+                 (long long) ctx->group_id,
+                 res != NULL ? PQresultErrorMessage(res) : "无结果");
+            if (slot >= 0)
+                peer_mark_result(&peers[slot], false);
+        }
+        if (res != NULL)
+            PQclear(res);
+        return;
+    }
 
     /*
      * secondaries = 本组成员集去掉自己。成员集未知（hearsay 自动建组，members
@@ -4003,53 +4242,17 @@ data_group_try_report(RaftGroupCtx *ctx)
     if (peer_in_backoff(&peers[slot]))
         return;
 
-    /*
-     * P7-R5：登记走专用连接（group0 leader 换人就重连），异步等待期间给本节点
-     * 全部 leader 组发心跳。这条语句里是一次同步的 group0 提案 + 协调者 apply，
-     * 饱和机器上多秒；原先用 peer_conn[] 同步 PQexec，期间零心跳。
-     */
-    if (report_conn != NULL && report_conn_node != leader0)
-        dedicated_conn_reset(&report_conn);
-    conn = dedicated_conn_get(&report_conn, peers[slot].host, peers[slot].port);
-    if (conn == NULL)
+    cr = aconn_ensure(&report_aconn, peers[slot].host, peers[slot].port, leader0);
+    if (cr < 0)
     {
         peer_mark_result(&peers[slot], false);
         return;
     }
-    report_conn_node = leader0;
-
-    res = pq_exec_heartbeating(conn, sql, RAFT_REPORT_EXEC_TIMEOUT_MS);
-    if (res == NULL)
-    {
-        elog(WARNING,
-             "pg_raft: group %lld 向控制面(node %d)登记超过 %d ms 未返回或连接失效，下个 tick 重试",
-             (long long) ctx->group_id, leader0, RAFT_REPORT_EXEC_TIMEOUT_MS);
-        dedicated_conn_reset(&report_conn);
-        peer_mark_result(&peers[slot], false);
-        return;
-    }
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
-    {
-        long long v = atoll(PQgetvalue(res, 0, 0));
-
-        if (v != 0)
-        {
-            ctx->g->report_pending = false;
-            elog(LOG,
-                 "pg_raft: group %lld leader node %d term %lld 已向控制面(node %d)登记 (ret=%lld)",
-                 (long long) ctx->group_id, pg_raft_node_id,
-                 (long long) term, leader0, v);
-        }
-        peer_mark_result(&peers[slot], true);
-    }
-    else
-    {
-        if (PQstatus(conn) != CONNECTION_OK)
-            dedicated_conn_reset(&report_conn);
-        peer_mark_result(&peers[slot], false);
-    }
-    PQclear(res);
+    if (cr == 0)
+        return;                 /* 握手未完，下个 tick 再推 */
+    (void) aconn_send(&report_aconn, sql, ctx->group_id, term);
 }
+
 
 static void
 start_election(RaftGroupCtx *ctx)
@@ -4196,6 +4399,9 @@ pg_raft_consensus_tick(void)
     parse_peers();
     if (n_peers == 0)
         return;
+
+    /* P7-N4：先清掉已失主 / 已换 term 的组留下的在途升主前置与登记 */
+    promote_async_sweep();
 
     for (i = 0; i < RAFT_MAX_GROUPS; i++)
     {

@@ -155,6 +155,8 @@ extern bool  PartWALFreezeCheckDue(int interval_ms);
  * 就地 PartWALFlush(Invalid, false) —— 大事务不再能把环写爆。
  */
 extern int   partwal_ring_high_water;
+/* P7-N4/N7：按 plsn 查分区流记录时是否走后端本地稀疏索引（raft_boundary.c）；off = 原全扫描 */
+extern bool  partwal_record_index;
 extern void  PartWALBackpressure(void);
 
 /* 有新的分叉标记待修复（ShardMarkDiverged 调）；到期判定（心跳调，节点级限流） */

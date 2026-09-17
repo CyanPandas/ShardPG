@@ -23,6 +23,10 @@ SQLF="$T/../../pg-raft-src/sql/pg_raft--1.0.sql"
 PS() { local p=$1; shift; docker exec -i -u postgres -e PGOPTIONS="-c citus.enable_ddl_propagation=off" "$C" /work/pg-install/bin/psql -h /tmp -p "$p" -U postgres -d postgres -X -v ON_ERROR_STOP=1 "$@"; }
 MODPATH=$(sed -n "s/^module_pathname *= *'\(.*\)'.*/\1/p" "$T/../../pg-raft-src/pg_raft.control")
 [[ -n "$MODPATH" ]] || MODPATH='$libdir/pg_raft'
+# 节点端口从协调者的 pg_dist_node 动态取（2026-09-17：原先写死 5432–5440，1c+3w 环境上
+# 后 5 个端口全报失败、rc=1）。取不到时退回 9 节点默认。
+PORTS=$(PS 5432 -Atc "SELECT p FROM (SELECT 5432 AS p UNION SELECT nodeport FROM pg_dist_node WHERE noderole='primary') t ORDER BY p" </dev/null 2>/dev/null | tr '\n' ' ')
+[[ -n "${PORTS// /}" ]] || PORTS=$(seq 5432 5440 | tr '\n' ' ')
 
 extract_block() {   # 抽出 "CREATE OR REPLACE FUNCTION <name>(" 起、到下一个空行为止的块（含 COMMENT）
   awk -v n="$1" '
@@ -43,7 +47,7 @@ for fn in "$@"; do
   [[ -n "$blk" ]] || { echo "✗ SQL 文件里没有 $fn 的 CREATE OR REPLACE FUNCTION 块" >&2; rc=1; continue; }
   sig=$(sig_of "$fn")
   [[ -n "$sig" ]] || echo "  ⚠ $fn 无 COMMENT ON FUNCTION 行，跳过 ALTER EXTENSION（函数仍会创建，只是不入籍）" >&2
-  for p in $(seq 5432 5440); do
+  for p in $PORTS; do
     if printf 'SET search_path = partdist, pg_catalog;\n%s\n' "$blk" | PS "$p" -q >/dev/null 2>"/tmp/apply_pg_raft_sql.$p.err"; then
       mtag=""
       if [[ -n "$sig" ]]; then
@@ -63,10 +67,10 @@ done
 # 核对：SQL 文件里每个 C 函数在 9 节点上都点得到名
 missing=0
 for fn in $(grep -o "^CREATE OR REPLACE FUNCTION [a-z_0-9]*" "$SQLF" | awk '{print $NF}' | sort -u); do
-  for p in $(seq 5432 5440); do
+  for p in $PORTS; do
     n=$(PS "$p" -Atc "SELECT count(*) FROM pg_proc p JOIN pg_namespace s ON s.oid=p.pronamespace WHERE s.nspname='partdist' AND p.proname='$fn'" </dev/null 2>/dev/null)
     [[ "$n" =~ ^[1-9] ]] || { echo "  ✗ :$p 缺 partdist.$fn"; missing=$((missing+1)); }
   done
 done
-[[ $missing -eq 0 ]] && echo "核对：pg_raft--1.0.sql 全部函数在 9 节点上都点得到名" || rc=1
+[[ $missing -eq 0 ]] && echo "核对：pg_raft--1.0.sql 全部函数在全部节点上都点得到名" || rc=1
 exit $rc

@@ -617,6 +617,19 @@ _PG_init(void)
         0,
         NULL, NULL, NULL
     );
+    /* P7-N4/N7：分区流按 plsn 查记录的稀疏索引开关（逃生口 + 正确性对照用） */
+    DefineCustomBoolVariable(
+        "pg_partdist.partwal_record_index",
+        "按 plsn 查分区流记录时走后端本地稀疏索引（默认 on）。off = 每次从流开头全扫描。",
+        "复制取字节、follower 查重、升主前置的 in-doubt 扫描与分叉检查都按 plsn 查记录；"
+        "全扫描单次 O(n)，长流上整体退化成 O(n²)。索引检查点先核对记录头才用，"
+        "核对不过或没找到一律退回全扫描。关掉它只用于排障与正确性对照。",
+        &partwal_record_index,
+        true,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL
+    );
     DefineCustomBoolVariable(
         "pg_partdist.auto_repair_diverged",
         "心跳工作者自动对带分叉标记的分片重做物理基线（默认 on）。",

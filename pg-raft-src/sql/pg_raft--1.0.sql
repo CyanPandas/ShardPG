@@ -418,12 +418,13 @@ COMMENT ON FUNCTION pg_raft_group_reset() IS
 --
 -- 每次调用只推进最多 p_timeout_ms 毫秒（BGW tick 还要发心跳，不能久占），
 -- 没追平就返回 false 等下一 tick 继续 —— 分片切成小片，心跳不受影响。
-CREATE OR REPLACE FUNCTION pg_raft_promote_prepare(
+CREATE OR REPLACE FUNCTION pg_raft_promote_prepare_ex(
     p_group_id BIGINT,
-    p_timeout_ms INTEGER DEFAULT 2000)
+    p_timeout_ms INTEGER,
+    p_force BOOLEAN)
     RETURNS INTEGER
     LANGUAGE plpgsql VOLATILE
-AS $promo$
+AS $promox$
 DECLARE
     loid    OID;
     is_armed BOOLEAN;
@@ -459,7 +460,7 @@ BEGIN
                       '把副本建起来再参选。', p_group_id;
         RETURN -1;
     END IF;
-
+--
     -- ★ 第 6 步 b（§9.5）：快路径分叉的归队规则。
     --
     -- 必须排在 armed 判断**之前**：分叉的旧 leader 上，该分片是真表而不是
@@ -479,7 +480,7 @@ BEGIN
         END;
         RETURN -1;
     END IF;
-
+--
     SELECT s.armed, s.applied INTO is_armed, app
       FROM partdist.replay_status() s WHERE s.shard = loid;
     IF NOT FOUND OR is_armed IS NOT TRUE THEN
@@ -521,24 +522,31 @@ BEGIN
         -- 副本。分叉检查已在上面做过，这里放行是安全的。
         RETURN 1;
     END IF;
-
+--
     -- 追平上界取 Raft 已提交位点，绝不碰未提交条目（惰性回放的核心不变式）。
     bound := partdist.get_follower_applied_part_lsn(loid);
     IF bound IS NULL THEN bound := 0; END IF;
-
+--
+    -- ★ P7-N4/N6（2026-09-17）：p_force = BGW 判定已过 pg_raft.promote_catchup_deadline_ms。
+    --   兜底**仍尽力追一片**，但不再以追平为前提，并且**照做下面的全部升主步骤**。
+    --   原实现的兜底是：tick 拿到 0 就直接放行上报 —— 推进 WAL 位点、闭合 in-doubt、修分叉、
+    --   认领一步都没做（放行那一轮这里 RETURN 0 了）。可分叉/无副本的 -1 检查在上面，兜底绕不过去。
     IF bound > app THEN
         BEGIN
             got := partdist.replay_catchup(loid::regclass, bound, p_timeout_ms);
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'pg_raft: 升主追平 shard % (组 %) 失败: %',
                           loid, p_group_id, SQLERRM;
-            RETURN 0;
+            IF NOT p_force THEN
+                RETURN 0;
+            END IF;
+            got := NULL;
         END;
-        IF got IS NULL OR got < bound THEN
+        IF (got IS NULL OR got < bound) AND NOT p_force THEN
             RETURN 0;           -- 这一片没追完，下个 tick 接着追
         END IF;
     END IF;
-
+--
     -- ★★ T6.3b（解冻批次 #6）：推进本地 WAL 插入位点，越过 max_orig_lsn。
     --
     -- 必须排在追平**之后**（max_orig_lsn 这时才是终值），也必须排在下面任何
@@ -556,7 +564,7 @@ BEGIN
         RAISE WARNING 'pg_raft: 升主推进 WAL 插入位点 shard % (组 %) 失败: %',
                       loid, p_group_id, SQLERRM;
     END;
-
+--
     -- 追平之后才闭合 in-doubt：判决要按已回放到位的流来求，顺序不能反。
     -- 尽力而为 —— 闭合失败不该把一个已经追平的副本挡在升主之外，
     -- 恢复守护（dtx_recover_prepared）随后仍会周期性重试。
@@ -566,7 +574,7 @@ BEGIN
         RAISE WARNING 'pg_raft: 升主闭合 in-doubt shard % (组 %) 失败: %',
                       loid, p_group_id, SQLERRM;
     END;
-
+--
     -- ★ 批次 #9：升主顺带修一次分叉标记。
     --
     -- 分叉标记是复制挂钩失败时就地写下的（§13 约束 13 的检测面，批次 #8），
@@ -579,7 +587,7 @@ BEGIN
         RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
                       loid, p_group_id, SQLERRM;
     END;
-
+--
     -- ★★ T6.4（解冻批次 #6）：§6.6 第三支，切主认领。
     --
     -- 顺序要害：**必须排在 dtx_close_indoubt 之后**。认领的判据是"流里没有
@@ -597,10 +605,23 @@ BEGIN
         RAISE WARNING 'pg_raft: 升主认领无主 RUNNING shard % (组 %) 失败: %',
                       loid, p_group_id, SQLERRM;
     END;
-
+--
     RETURN 1;
 END
-$promo$;
+$promox$;
+
+COMMENT ON FUNCTION pg_raft_promote_prepare_ex(BIGINT, INTEGER, BOOLEAN) IS
+    '升主前置（P7-N4 起 BGW 调这个）。p_force=false 与 pg_raft_promote_prepare 相同：没追平返回 0。p_force=true 由 BGW 在超过 pg_raft.promote_catchup_deadline_ms 后传入：仍尽力追一片，但不再以追平为前提，推进 WAL 位点/闭合 in-doubt/修分叉/认领照做，然后返回 1（可用性优先放行）；分叉或无副本仍返回 -1，兜底绕不过。';
+
+CREATE OR REPLACE FUNCTION pg_raft_promote_prepare(
+    p_group_id BIGINT,
+    p_timeout_ms INTEGER DEFAULT 2000)
+    RETURNS INTEGER
+    LANGUAGE sql VOLATILE
+AS $promow$
+    -- P7-N4：逻辑搬进 pg_raft_promote_prepare_ex；保留原签名供运维与旧用例调用（不兜底）
+    SELECT partdist.pg_raft_promote_prepare_ex(p_group_id, p_timeout_ms, false);
+$promow$;
 
 COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
     '升主前置：先查快路径分叉，再确认"无槽位"不是"带陈旧数据的旧主回归"（R-P4-15），然后把本节点该分片的物理回放追平到 Raft 已提交位点；追平后依次推进本地 WAL 插入位点越过 max_orig_lsn（T6.3b，不做则升主后写入会在一次本地崩溃后被 lsn<=PageGetLSN 跳过而消失）、闭合 in-doubt 分布式事务、认领无主 RUNNING 改判 ABORTED（T6.4，§6.6 第三支）。后三步均尽力而为、失败只 WARNING 不挡升主。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=分叉或收到了却回放不了（永不放行，须重做物理基线）。';
