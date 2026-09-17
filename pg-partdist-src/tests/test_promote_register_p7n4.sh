@@ -108,11 +108,18 @@ pm=""; for t in $(seq 1 60); do
 done
 check "partition_map 在协调者上登记为 :$M" "$pm" "${NID[$M]}"
 
+# ★ 打标：[5] 要在新主上核对数据，只有打标分片升主后可读（未打标 = 遗留宇宙，FOLLOWER_REPLAY_DESIGN §14.2）。
+mk=$(Q $COORD "SELECT string_agg(split_part(status,' ',1), ',') FROM partdist.set_table_shard_mvcc('pl')")
+check "表 pl 打标登记（协调者一条命令，表还空着）" "$mk" "registered"
+check "  主 :$M 打标状态" "$(Q $M "SELECT partdist.shard_mvcc_status(partdist.local_partition_for_shard($SID))")" "registered=yes evidence=yes replica=no"
+
 echo "========== [2] 写出长分区流（$N_ROWS 行，分批单分片写） =========="
 t0=$(date +%s); b=0
 while [[ $b -lt $N_ROWS ]]; do
   e=$((b+50)); [[ $e -gt $N_ROWS ]] && e=$N_ROWS
-  PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO pl SELECT g, repeat('p',80) FROM generate_series($((b+1)),$e) g" </dev/null || break
+  # 打标表：用多行 VALUES（路由成单分片 1PC）。INSERT…SELECT 走协调者侧 2PC，不带 join 会在 PREPARE 被拒
+  vals=$(Q $COORD "SELECT string_agg('('||g||',repeat(''p'',80))', ',') FROM generate_series($((b+1)),$e) g")
+  PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO pl VALUES $vals" </dev/null || break
   b=$e
 done
 LOID_M=$(Q $M "SELECT partdist.local_partition_for_shard($SID)")
@@ -189,7 +196,8 @@ echo "  新主日志里本组的升主相关行："
 DEX bash -c "tail -n +$((LOGLINE_F+1)) '$LOGF' | grep -E 'group $SID .*(当选|登记)|升主前置.*$SID|组 $SID .*(升主|放行)' | cut -c1-200 | head -8" </dev/null | sed 's/^/    /'
 
 echo "========== [5] 切主后写入与数据完整性 =========="
-PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO pl SELECT g, 'after' FROM generate_series($((N_ROWS+1)),$((N_ROWS+10))) g" </dev/null
+vals=$(Q $COORD "SELECT string_agg('('||g||',''after'')', ',') FROM generate_series($((N_ROWS+1)),$((N_ROWS+10))) g")
+PSQL $COORD -v ON_ERROR_STOP=1 -q -c "INSERT INTO pl VALUES $vals" </dev/null
 check "切主后经协调者写 10 行成功，总行数" "$(Q $COORD 'SELECT count(*) FROM pl')" "$((N_ROWS+10))"
 check "★ 新主本地分片表行数与已提交行数一致" "$(Q $F "SET citus.override_table_visibility=false; SELECT count(*) FROM pl_$SID")" "$((N_ROWS+10))"
 check "★ 新主本地 'after' 行都在" "$(Q $F "SET citus.override_table_visibility=false; SELECT count(*) FROM pl_$SID WHERE v='after'")" "10"

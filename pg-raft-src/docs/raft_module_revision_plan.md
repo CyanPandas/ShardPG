@@ -62,6 +62,13 @@
 | 10 | 两份 FRD 已分叉 | 临时环境 16KB 旧版 vs 主仓库 28KB v2，P3 开工前须合并 | §11.5.2 #5、§12.4 #1 | ✅ **已解决**：主仓库 FRD 是唯一版本（本次已回填至与代码对齐） |
 | 11 | TSO 缺位 | `commit_ts` 先填本地时钟；全局快照一致性等 R3/TSO | 2PC 文档 §9.8 | ✅ **已做**：P3 交付 TSO（`tso.c` / `tso_client.c`）+ GlobalSafeTs 双通道/租约/栅栏。**但 TSO 单点无 HA 是 v1 显式裁定**（DESIGN §2.4），且 RPC 缺 schema 前缀是活缺陷（R-P6-20） |
 
+> **2026-09-17 状态（T7.35，`d9e792a`，在库）**：BGW 升主前置 / 向控制面登记由 P7-R5 的"同步等待 + 期间发心跳 + 10 s 上界"
+> 改为**跨 tick 非阻塞状态机**（`data_group_promote_prepare` / `data_group_try_report`：PQconnectStart/Poll、结果一定收下、
+> 在途绑定 (组, term) 失主即 PQcancel、同 term 已准备只重发登记）；新增 SQL `pg_raft_promote_prepare_ex(gid, slice, force)`，
+> 旧 `pg_raft_promote_prepare` 保留为包装；截止期 0 = 永不兜底、兜底照做其余升主步骤（P7-N6）。修的是 P7-N4 升主登记活锁：
+> `test_promote_register_p7n4.sh` 修复前 10/6、修复后 19/0。**未改共享结构体**（状态全在 BGW 进程本地），但仍按纪律 clean rebuild
+> 并整簇重启；切主类回归见 `P7_REMEDIATION_PLAN.md` §1.11。
+
 ### 0.3 为什么 `RAFT_MAX_GROUPS` 还卡在 32
 
 **根因是 shmem 定长预分配，不是算法限制**（代码在 `raft_consensus.c`）：
