@@ -8667,7 +8667,7 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
  * 三步（顺序是正确性的一部分，不能调换）：
  *   1) 逐参与节点读 partdist.dtx_local_participant(dtxid) 合并出**真实写集**
  *      —— 只读参与者返回空数组，天然被剔除（§8.3）；
- *   2) 写集 ≤ 1 组 ⇒ 快路径，不做决议直接返回（§3.4）；否则算
+ *   2) 写集 0 组 ⇒ 未写纳管分片，直接返回；≥ 1 组（含单组 2PC，P7-N10）都算
  *      coord_gsid = participants[dtxid % n]，并**先**把它下发到全部参与节点；
  *   3) 到协调组现任 leader 上调 partdist.dtx_decide() —— 该决议记录在协调组
  *      达多数派持久化即为**全局提交点**，返回 COMMIT 之后本函数才放行，
@@ -9154,13 +9154,21 @@ dtx_master_pre_record_commit(void)
     }
 
     /*
-     * 快路径（§3.4）：写集 ≤ 1 个分区组时不做决议。
-     * （下面 dtx_master_try_write_abort 的前置声明见文件上方。）
-     * 0 组 = 没写任何纳管分片（退化为接线前行为）；
-     * 1 组 = 该组自己的 quorum 已经覆盖本事务的全部数据，再走一轮决议没有
-     * 任何额外保证，只有额外延迟。
+     * 写集 0 组 = 没写任何纳管分片，退化为接线前行为（Citus 原生规则收尾）。
+     *
+     * ★ P7-N10（2026-09-17）：这里原本是 `nparts <= 1`，把"写集只有 1 组"也当
+     * §3.4 快路径直接返回。那条快路径说的是 **router 单分片 1PC**：根本没有
+     * PREPARE，本函数在上面的 pg_dist_transaction 探针处就已经退出了，走不到这里。
+     * 能走到这里的 1 组事务都是 **2PC 在用**（典型：协调者侧 INSERT…SELECT 只命中
+     * 一个分片；多分片 UPDATE 只有一个分片真改到行）—— 参与者已经 PREPARE、
+     * 分片 xid 记成 PREPARED、未决登记等着决议；COMMIT PREPARED 按 T4.5 不写终局。
+     * 不做决议 = 判决永远不来 = **提交成功的行在打标表上永久不可见**，且
+     * 恢复守护只看 pg_prepared_xacts，救不回来（协调者早就 COMMIT PREPARED 了）。
+     * "该组自己的 quorum 已覆盖全部数据"只说明字节持久了，可见性要的是
+     * 判决 + commit_ts，与组数无关。单组就按多组的退化情形照常下发协调组、
+     * 做决议、广播 —— 多一轮决议的代价只落在本来就在付 2PC 的事务上。
      */
-    if (nparts <= 1)
+    if (nparts == 0)
         return;
 
     qsort(parts, nparts, sizeof(int64), dtx_cmp_int64);
