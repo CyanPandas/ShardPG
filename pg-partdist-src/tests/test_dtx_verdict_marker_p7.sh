@@ -131,6 +131,8 @@ members_b="ARRAY[${pbnode}, ${f1node}, ${f2node}]"
 #      `dtx_local_participant` 靠 shard_identity 把本地 oid 翻成 gsid，翻不出来就
 #      登记空写集 ⇒ master 算出的写集只剩 1 个组 ⇒ 撞 §3.4 **快路径**
 #      （`nparts <= 1` 直接 return，不做决议）⇒ 判决永远不产生 ⇒ 行永久不可见。
+#      ★ 2026-09-17 P7-N10 已把那条 return 改成 `nparts == 0`：单组 2PC 也做决议。这里的
+#        建站要求仍然成立（B 不完整建站是另外两条约束），只是不再连带"判决不产生"。
 #   ② follower 必须有**壳表 + locmap**，B 也不例外。缺了就报
 #      `pg_raft: group … 在本节点没有对应分片，无法落盘` ⇒ 数据条目凑不到多数派
 #      ⇒ 写入直接失败（`record 1 未达多数派`）。

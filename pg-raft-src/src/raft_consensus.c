@@ -3368,10 +3368,80 @@ step_down_if_higher(RaftGroupCtx *ctx, int64 their_term)
  */
 #define RAFT_UNPROMOTABLE_BACKOFF   5
 
+/*
+ * ★ P7-N17（2026-09-17，N12 复现 run 4）：退避 5 个周期不够。2 vCPU 饱和时同步 RPC 把
+ * tick 拖到 6 s 以上，新主的心跳断档 ⇒ 让位的旧主一到退避期满就再次赢选举
+ * （它的日志最长）⇒ 升主前置再 -1 ⇒ 再让位 …… 每一轮都把真正的新主打回 follower、
+ * 其在途升主前置作废重来，180 s 内登记不上。
+ *
+ * 升主前置返回 -1 的三种情形（没有本地副本 / 快路径分叉 / 收了 WAL 却没有回放槽位）
+ * 都不会自己好起来，只有重做物理基线（provision_shard_replica ⇒ 回放槽位重新 armed）
+ * 才能恢复资格。所以：让位后记一个 BGW 本地标记，选举截止期到了先查槽位
+ * （一条 SPI，只在"曾让位 + 截止期已到"时才跑），没 armed 就只推后一个周期、只投票；
+ * armed 了清标记照常参选。5 个周期的退避仍保留，作为查询失败时的最小静默。
+ */
+static bool        *unpromotable_flag = NULL;      /* 按 RaftGroups->groups[] 下标；RAFT_MAX_GROUPS 是运行期值，与 promote_slots 同样惰性分配 */
+static TimestampTz *unpromotable_logged = NULL;
+
+static int
+group_slot_index(RaftGroupCtx *ctx)
+{
+    ptrdiff_t d = ctx->g - RaftGroups->groups;
+
+    if (unpromotable_flag == NULL)
+    {
+        unpromotable_flag = (bool *)
+            MemoryContextAllocZero(TopMemoryContext, sizeof(bool) * (Size) RAFT_MAX_GROUPS);
+        unpromotable_logged = (TimestampTz *)
+            MemoryContextAllocZero(TopMemoryContext, sizeof(TimestampTz) * (Size) RAFT_MAX_GROUPS);
+    }
+    return (d >= 0 && d < RAFT_MAX_GROUPS) ? (int) d : -1;
+}
+
+/* 曾因不可升主让位、且回放槽位仍未重新 armed ⇒ true（不参选） */
+static bool
+unpromotable_still(RaftGroupCtx *ctx)
+{
+    int   idx = group_slot_index(ctx);
+    bool  spi_owned = false;
+    bool  armed = false;
+    char  sql[256];
+
+    if (idx < 0 || !unpromotable_flag[idx])
+        return false;
+    if (!raft_persist_spi_begin(&spi_owned))
+        return true;            /* 查不了：保守，继续不参选 */
+    snprintf(sql, sizeof(sql),
+             "SELECT coalesce(bool_or(s.armed), false) FROM partdist.replay_status() s "
+             " WHERE s.shard = partdist.local_partition_for_shard(%lld::bigint)",
+             (long long) ctx->group_id);
+    if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+        armed = (!isnull && DatumGetBool(d));
+    }
+    raft_persist_spi_end(spi_owned);
+    if (armed)
+    {
+        unpromotable_flag[idx] = false;
+        unpromotable_logged[idx] = 0;
+        elog(LOG, "pg_raft: 组 %lld 本节点回放槽位已重新 armed（已重做基线），恢复参选资格",
+             (long long) ctx->group_id);
+        return false;
+    }
+    return true;
+}
+
 static void
 raft_abdicate_unpromotable(RaftGroupCtx *ctx)
 {
     bool was_leader;
+    int  idx = group_slot_index(ctx);
+
+    if (idx >= 0)
+        unpromotable_flag[idx] = true;
 
     SpinLockAcquire(&ctx->cons->mutex);
     was_leader = (ctx->cons->state == RAFT_LEADER);
@@ -3939,6 +4009,7 @@ typedef struct PromoteSlot
     TimestampTz first_try;      /* 本 term 首次发出升主前置；0 = 尚未发出 */
     bool        prepared;       /* 本 term 升主前置已返回 1，只差登记 */
     bool        force;          /* 已过截止期，下一轮走兜底 */
+    bool        queued_logged;  /* "连接被别的组占着"只报一次 */
 } PromoteSlot;
 
 static PromoteSlot *promote_slots = NULL;
@@ -4044,7 +4115,17 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
         RaftAconnPoll pr;
 
         if (promote_aconn.owner_group != ctx->group_id || promote_aconn.owner_term != term)
-            return 0;           /* 连接被别的组占着：排队 */
+        {
+            /* 连接被别的组占着：排队。run 4 里这条静默路径让人查了半天，报一次 */
+            if (!ps->queued_logged)
+            {
+                ps->queued_logged = true;
+                elog(LOG, "pg_raft: 组 %lld term %lld 升主前置排队：连接被组 %lld term %lld 占用",
+                     (long long) ctx->group_id, (long long) term,
+                     (long long) promote_aconn.owner_group, (long long) promote_aconn.owner_term);
+            }
+            return 0;
+        }
 
         pr = aconn_poll(&promote_aconn, &res);
         if (pr == RAFT_ACONN_PENDING)
@@ -4068,7 +4149,13 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
         }
 
         if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        {
             verdict = atoi(PQgetvalue(res, 0, 0));
+            elog(LOG, "pg_raft: 组 %lld term %lld 升主前置返回 %d（本次 %ld ms，本 term 首发至今 %ld ms）",
+                 (long long) ctx->group_id, (long long) term, verdict,
+                 (long) ((now - promote_aconn.started) / 1000),
+                 ps->first_try ? (long) ((now - ps->first_try) / 1000) : 0L);
+        }
         else
             elog(WARNING, "pg_raft: 升主前置执行失败(组 %lld): %s",
                  (long long) ctx->group_id,
@@ -4121,8 +4208,13 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
              "SELECT partdist.pg_raft_promote_prepare_ex(%lld, %d, %s)",
              (long long) ctx->group_id, pg_raft_promote_catchup_slice_ms,
              ps->force ? "true" : "false");
-    if (aconn_send(&promote_aconn, sql, ctx->group_id, term) && ps->first_try == 0)
-        ps->first_try = now;
+    if (aconn_send(&promote_aconn, sql, ctx->group_id, term))
+    {
+        if (ps->first_try == 0)
+            ps->first_try = now;
+        elog(LOG, "pg_raft: 组 %lld term %lld 升主前置已发出%s",
+             (long long) ctx->group_id, (long long) term, ps->force ? "（兜底 force）" : "");
+    }
     return 0;
 }
 
@@ -4440,7 +4532,26 @@ group_tick(RaftGroupCtx *ctx)
     }
 
     if (now >= deadline)
+    {
+        if (unpromotable_still(ctx))
+        {
+            int idx = group_slot_index(ctx);
+
+            /* P7-N17：不可升主且尚未重做基线，只推后一个周期、只投票 */
+            SpinLockAcquire(&ctx->cons->mutex);
+            reset_election_deadline_locked(ctx);
+            SpinLockRelease(&ctx->cons->mutex);
+            if (idx >= 0 && (unpromotable_logged[idx] == 0 ||
+                             TimestampDifferenceExceeds(unpromotable_logged[idx], now, 60000)))
+            {
+                unpromotable_logged[idx] = now;
+                elog(LOG, "pg_raft: 组 %lld 本节点不可升主且回放槽位未重新 armed，不参选（重做基线后自动恢复）",
+                     (long long) ctx->group_id);
+            }
+            return;
+        }
         start_election(ctx);
+    }
 }
 
 /*
@@ -4462,20 +4573,56 @@ pg_raft_consensus_tick(void)
     /* P7-N4：先清掉已失主 / 已换 term 的组留下的在途升主前置与登记 */
     promote_async_sweep();
 
-    for (i = 0; i < RAFT_MAX_GROUPS; i++)
     {
-        RaftGroupState *g = &RaftGroups->groups[i];
-        RaftGroupCtx    ctx;
+        /*
+         * ★ P7-N17 仪表：一次 tick 串行推进全部组，任何一个组的同步 RPC 被慢 peer
+         * 拖住，本节点作为 leader 的**所有组**心跳都断档。run 4 里 group 0 每 15 s
+         * 改选一次、数据组新主登记不上，日志里却没有任何一行能说明"tick 卡了多久"。
+         * 超过选举超时的一半就 WARNING（10 s 限流），并点名最慢的组。
+         */
+        TimestampTz t0 = GetCurrentTimestamp();
+        TimestampTz t_prev = t0;
+        long        slowest_ms = 0;
+        int64       slowest_gid = 0;
+        static TimestampTz last_stall_warn = 0;
+        long        total_ms;
 
-        if (!g->in_use)
-            continue;
+        for (i = 0; i < RAFT_MAX_GROUPS; i++)
+        {
+            RaftGroupState *g = &RaftGroups->groups[i];
+            RaftGroupCtx    ctx;
+            TimestampTz     t_now;
+            long            ms;
 
-        ctx.group_id = g->group_id;
-        ctx.g = g;
-        ctx.cons = &g->cons;
-        ctx.log = &g->log;
+            if (!g->in_use)
+                continue;
 
-        group_tick(&ctx);
+            ctx.group_id = g->group_id;
+            ctx.g = g;
+            ctx.cons = &g->cons;
+            ctx.log = &g->log;
+
+            group_tick(&ctx);
+
+            t_now = GetCurrentTimestamp();
+            ms = (long) ((t_now - t_prev) / 1000);
+            if (ms > slowest_ms)
+            {
+                slowest_ms = ms;
+                slowest_gid = g->group_id;
+            }
+            t_prev = t_now;
+        }
+        total_ms = (long) ((t_prev - t0) / 1000);
+        if (total_ms > pg_raft_election_timeout_ms / 2 &&
+            (last_stall_warn == 0 || TimestampDifferenceExceeds(last_stall_warn, t_prev, 10000)))
+        {
+            last_stall_warn = t_prev;
+            elog(WARNING,
+                 "pg_raft: 共识 tick 耗时 %ld ms（选举超时 %d ms）：最慢的组 %lld 占 %ld ms；"
+                 "期间本节点作为 leader 的各组心跳断档，follower 可能超时改选（P7-N17：同步 RPC 被慢 peer 拖住 / CPU 饱和）",
+                 total_ms, pg_raft_election_timeout_ms, (long long) slowest_gid, slowest_ms);
+        }
     }
 }
 
@@ -8612,6 +8759,10 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
     int            n = 0;
     int            i;
     long long     *dtxids = NULL;
+    int           *sverd = NULL;        /* 流内已有的闭合记录：1=COMMIT 2=ABORT 0=无 */
+    long long     *scts = NULL;         /* 流内闭合记录带的 commit_ts */
+    long long     *sxids = NULL;        /* 映射出的分片 xid；0 = 映射不到（遗留宇宙） */
+    long long     *hgx = NULL;          /* 该事务 PREPARE 记录的头部 gxid */
     int            closed = 0;
     int            unresolved = 0;
 
@@ -8619,44 +8770,78 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
         PG_RETURN_INT32(0);
     parse_peers();
 
-    /* 1) in-doubt 清单：PREPARE 可见、闭合（DECISION/COMMIT/ABORT）不可见 */
+    /*
+     * 1) in-doubt 清单 —— ★ P7-N12（之二，2026-09-17）改从**分片 clog** 出发。
+     *
+     * 原判据"流里有 DTX_PREPARE、无 DTX_COMMIT/ABORT"漏掉了一整类：升主序列此前只往流里
+     * 追加一条闭合记录，本节点的分片 clog 从不更新、回放侧也不认那条记录（分片 clog 只在
+     * 回放带分片 xid 的 MARKER 时落判决）。于是"流里已闭合、clog 仍 PREPARED"的事务永远
+     * 不可见，且再也不会被本函数看见（实测：3 个 PREPARED 残留，本函数只报 1 笔 in-doubt）。
+     *
+     * 现在：列出全部 DTX_PREPARE；按 DTX_PREPARE 与 PREPARE MARKER 共享的头部 gxid 把 dtxid
+     * 映射回分片 xid（partdist.partwal_prepare_sxid）；**分片 clog 仍 PREPARED 的一律处理**，
+     * 判决优先取流里已有的闭合记录（本地、权威、不用 RPC），没有才问决议。
+     * 映射不到分片 xid 的（遗留宇宙 / 未打标）沿用旧判据。
+     */
     if (!raft_persist_spi_begin(&spi_owned))
         PG_RETURN_INT32(0);
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "WITH recs AS ("
-        "  SELECT d.kind, d.dtxid"
+        "  SELECT g AS plsn, d.kind, d.dtxid, d.commit_ts"
         "    FROM generate_series(1, partdist.get_partition_flush_lsn(%u::oid)) g"
         "    LEFT JOIN LATERAL partdist.partwal_read_dtx_record(%u::oid, g) d ON true"
-        "   WHERE d.dtxid IS NOT NULL) "
-        "SELECT dtxid FROM recs WHERE kind = 1 "
-        "EXCEPT "
-        "SELECT dtxid FROM recs WHERE kind IN (2, 3, 4) "
-        "LIMIT 64",
-        (unsigned) partition_id, (unsigned) partition_id);
+        "   WHERE d.dtxid IS NOT NULL), "
+        "prep AS (SELECT DISTINCT dtxid FROM recs WHERE kind = 1), "
+        "cl AS (SELECT dtxid, max(CASE kind WHEN 3 THEN 1 WHEN 4 THEN 2 ELSE 0 END) AS v, "
+        "              max(CASE WHEN kind = 3 THEN commit_ts ELSE 0 END) AS cts "
+        "         FROM recs WHERE kind IN (3, 4) GROUP BY dtxid) "
+        "SELECT p.dtxid, coalesce(cl.v, 0), coalesce(cl.cts, 0), "
+        "       coalesce(m.sxid, 0), coalesce(m.hdr_gxid, 0) "
+        "  FROM prep p LEFT JOIN cl ON cl.dtxid = p.dtxid "
+        "  LEFT JOIN LATERAL partdist.partwal_prepare_sxid(%u::oid, p.dtxid, "
+        "                       partdist.get_partition_flush_lsn(%u::oid)) m ON true "
+        " WHERE (m.sxid IS NOT NULL AND partdist.shard_clog_status(%u::oid, m.sxid) = 1) "
+        "    OR (m.sxid IS NULL AND cl.v IS NULL) "
+        " LIMIT 64",
+        (unsigned) partition_id, (unsigned) partition_id,
+        (unsigned) partition_id, (unsigned) partition_id, (unsigned) partition_id);
     if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
     {
         MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
 
         n = (int) SPI_processed;
         dtxids = (long long *) palloc(sizeof(long long) * n);
+        sverd = (int *) palloc(sizeof(int) * n);
+        scts = (long long *) palloc(sizeof(long long) * n);
+        sxids = (long long *) palloc(sizeof(long long) * n);
+        hgx = (long long *) palloc(sizeof(long long) * n);
         for (i = 0; i < n; i++)
         {
-            char *v = SPI_getvalue(SPI_tuptable->vals[i],
-                                   SPI_tuptable->tupdesc, 1);
+            char *v;
 
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
             dtxids[i] = v ? atoll(v) : 0;
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+            sverd[i] = v ? atoi(v) : 0;
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+            scts[i] = v ? atoll(v) : 0;
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
+            sxids[i] = v ? atoll(v) : 0;
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5);
+            hgx[i] = v ? atoll(v) : 0;
         }
         MemoryContextSwitchTo(old);
     }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 
-    /* 2) 逐笔求决议、补标记 */
+    /* 2) 逐笔求决议、落分片 clog + 判决 MARKER、补闭合记录 */
     for (i = 0; i < n; i++)
     {
         long long reg_coord = 0;
-        int       verdict;
+        int       verdict = sverd[i];
+        int64     cts = (int64) scts[i];
 
         if (dtxids[i] <= 0)
             continue;
@@ -8681,29 +8866,82 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
             raft_persist_spi_end(spi_owned);
         }
 
-        verdict = dtx_resolve_verdict_anywhere((int64) dtxids[i], (int64) reg_coord);
+        /*
+         * 流里没有闭合记录，或有 COMMIT 却没带 commit_ts（旧格式）：先经
+         * partdist.dtx_inquire 问（拿得到 commit_ts），问不到再走四级寻址。
+         */
+        if ((verdict != 1 && verdict != 2) || (verdict == 1 && cts == 0))
+        {
+            int   iv = 0;
+            int64 ic = 0;
+
+            if (reg_coord > 0 && raft_persist_spi_begin(&spi_owned))
+            {
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "SELECT verdict, commit_ts FROM partdist.dtx_inquire(%lld, %lld)",
+                                 reg_coord, dtxids[i]);
+                if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+                {
+                    bool  n1, n2;
+                    Datum d1 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &n1);
+                    Datum d2 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &n2);
+
+                    if (!n1)
+                        iv = DatumGetInt32(d1);
+                    if (!n2)
+                        ic = DatumGetInt64(d2);
+                }
+                pfree(sql.data);
+                raft_persist_spi_end(spi_owned);
+            }
+            if (iv == 1 || iv == 2)
+            {
+                if (verdict != 1 && verdict != 2)
+                    verdict = iv;
+                if (verdict == 1 && cts == 0)
+                    cts = ic;
+            }
+            if (verdict != 1 && verdict != 2)
+                verdict = dtx_resolve_verdict_anywhere((int64) dtxids[i], (int64) reg_coord);
+        }
         if (verdict != 1 && verdict != 2)
         {
             unresolved++;
             continue;
         }
 
-        if (raft_persist_spi_begin(&spi_owned))
+        /* 分片 clog + 带分片 xid 的判决 MARKER（与 leader 侧 dtx_replicate_verdict 同构） */
+        if (sxids[i] > 0 && raft_persist_spi_begin(&spi_owned))
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.shard_verdict_apply(%u::oid, %lld::bigint, %lld::bigint, %s, %lld::bigint)",
+                             (unsigned) partition_id, sxids[i], hgx[i],
+                             (verdict == 1) ? "true" : "false", (long long) cts);
+            (void) SPI_execute(sql.data, false, 1);
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+        }
+
+        /* 流里还没有闭合记录才补一条（带 commit_ts，供后来者直接取） */
+        if (sverd[i] == 0 && raft_persist_spi_begin(&spi_owned))
         {
             initStringInfo(&sql);
             appendStringInfo(&sql,
                              "SELECT partdist.partwal_append_dtx_record("
-                             "%u::oid, %d, %lld::bigint, %lld::bigint)",
+                             "%u::oid, %d, %lld::bigint, %lld::bigint, %lld::bigint)",
                              (unsigned) partition_id,
                              (verdict == 1) ? 3 : 4,
-                             dtxids[i], reg_coord);
-            if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT)
-                closed++;
+                             dtxids[i], reg_coord, (long long) cts);
+            (void) SPI_execute(sql.data, false, 1);
             pfree(sql.data);
             raft_persist_spi_end(spi_owned);
         }
-        elog(LOG, "pg_raft: in-doubt 闭合：分区 %u dtxid=%lld → %s",
-             partition_id, dtxids[i], (verdict == 1) ? "COMMIT" : "ABORT");
+        closed++;
+        elog(LOG, "pg_raft: in-doubt 闭合：分区 %u dtxid=%lld → %s（分片 xid %lld，%s）",
+             partition_id, dtxids[i], (verdict == 1) ? "COMMIT" : "ABORT",
+             sxids[i], sxids[i] > 0 ? "已落分片 clog 并发判决 MARKER" : "映射不到分片 xid，只追加 DTX 记录");
     }
 
     if (unresolved > 0)

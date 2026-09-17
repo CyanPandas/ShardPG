@@ -537,6 +537,8 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
  * 最典型的失败是**本节点已不是该分片的主**（切主后由恢复守护补判决，R-P4-9 的
  * 场景）——写栅栏会拒，这正是它该拒的：陈旧主不得再往流里写。
  */
+static int replicate_fail_streak = 0;	/* 本 backend 连续复制失败次数（成功即清零） */
+
 static bool
 dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
@@ -596,6 +598,7 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		 */
 		if (appended)
 			PartWALFlush(InvalidXLogRecPtr, false);
+		replicate_fail_streak = 0;
 	}
 	PG_CATCH();
 	{
@@ -615,9 +618,11 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		 * 现在返回 false，由调用方**保留登记**——回执门（R-P4-5）随之关着，
 		 * 决议不会被遗忘，新主升主时问得到。
 		 */
-		ereport(WARNING,
-				(errmsg("pg_partdist: 判决标记未能复制给副本（gxid=%lld）：%s",
-						(long long) ent->gxid, ed->message),
+		/* 限流：登记保留后清扫每轮都会重试，失败时只有第 1、每第 50 次打 WARNING，其余 LOG */
+		replicate_fail_streak++;
+		ereport((replicate_fail_streak == 1 || replicate_fail_streak % 50 == 0) ? WARNING : LOG,
+				(errmsg("pg_partdist: 判决标记未能复制给副本（gxid=%lld，连续第 %d 次）：%s",
+						(long long) ent->gxid, replicate_fail_streak, ed->message),
 				 errdetail("本地分片 clog 判决已落账；未决登记**保留**（挡住回执与决议 FORGET），"
 						   "清扫时重试复制；本节点若已不是该分片的主，待主权登记转到新主后自动注销。"),
 				 errhint("本节点若已不是该分片的主，这是写栅栏的正常拒绝。")));

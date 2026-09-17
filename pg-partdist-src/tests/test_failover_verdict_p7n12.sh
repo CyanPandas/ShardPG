@@ -17,7 +17,10 @@
 set -u
 CONTAINER="${CONTAINER:-pg-test-container}"
 COORD=5432
-ACCT="${ACCT:-8}"; P="${P:-4}"; R="${R:-2}"; REG_LIMIT_S="${REG_LIMIT_S:-120}"; CONVERGE_S="${CONVERGE_S:-120}"
+ACCT="${ACCT:-8}"; P="${P:-4}"; R="${R:-2}"; REG_LIMIT_S="${REG_LIMIT_S:-180}"; CONVERGE_S="${CONVERGE_S:-120}"
+# ★ 本用例验的是判决守恒，不是 TSO 续租（P7-N11）。2 vCPU 上 4 会话跨组 2PC 会把续租栅栏（lease−lease/4=7.5 s）
+#   打得满屏失败、负载空转，把要验的现象淹掉；把租约抬到 60 s 压住噪声，收尾 RESET。
+TSO_LEASE_MS="${TSO_LEASE_MS:-60000}"
 PASS=0; FAIL=0
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
@@ -55,7 +58,7 @@ cleanup() {
   Q $COORD "DROP TABLE IF EXISTS fv" >/dev/null
   for sid in "${SIDS[@]}"; do for p in "${WORKERS[@]}"; do Q $p "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS fv_${sid}" >/dev/null; done; done
   for p in "${WORKERS[@]}"; do PSQL $p -q -c "SET citus.enable_ddl_propagation=off" -c "DROP FUNCTION IF EXISTS public.sclog_full(oid,bigint)" </dev/null >/dev/null 2>&1; done
-  for p in $COORD "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_partdist.tso_conninfo" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+  for p in $COORD "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_partdist.tso_conninfo" >/dev/null; Q $p "ALTER SYSTEM RESET pg_partdist.tso_lease_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
   Q $COORD "ALTER SYSTEM RESET pg_partdist.tso_master" >/dev/null; Q $COORD "SELECT pg_reload_conf()" >/dev/null
   rm -rf "$SP_DIR"
   echo "  [复原] prepared 已收、组已拆、表已删、TSO 已 RESET"
@@ -108,30 +111,43 @@ SET citus.enable_ddl_propagation TO off;
 CREATE OR REPLACE FUNCTION public.sclog_full(oid, bigint) RETURNS text AS '$libdir/pg_partdist','partdist_shard_clog_read_full' LANGUAGE C STRICT;
 SQL
 done
+# ★ 供副本期间把全体 worker 的选举超时抬到 15 s（心跳 1 s）：主发基线时心跳会断档（P7-N15），副本在基线
+#   "已截断本地文件、等 FPI 重建"的半程被选成主，就是一个索引/堆都是 0 字节的空壳主（P7-N16 现场，run 3）。
+#   这一段没有任何切主意图，抬超时没有副作用；build_group_on 每次会覆盖再 RESET，所以逐组设、收尾统一 RESET。
 for sid in "${SIDS[@]}"; do lp=${LEADER[$sid]}
   check "组 $sid 主落在 :$lp" "$(build_group_on $sid $lp "$ALLMEM")" "leader"
-  for p in "${WORKERS[@]}"; do [[ $p == $lp ]] && continue; r=$(PSQL $lp -Atc "SELECT partdist.provision_shard_replica(${sid}::bigint, ${NID[$p]})" </dev/null 2>&1 | tr '\n' ' '); check "  副本供到 :$p" "$([[ "$r" == shard=* ]] && echo ok)" "ok"; done
+  for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 15000" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+  for p in "${WORKERS[@]}"; do [[ $p == $lp ]] && continue; r=$(PSQL $lp -Atc "SELECT partdist.provision_shard_replica(${sid}::bigint, ${NID[$p]})" </dev/null 2>&1 | tr '\n' ' '); check "  副本供到 :$p" "$([[ "$r" == shard=* ]] && echo ok || echo "${r:0:100}")" "ok"; done
 done
-# ★ 供副本期间主可能漂走（发基线时心跳断，P7-N15 现场）：漂了就从新主把没供到的副本再供一遍
-for sid in "${SIDS[@]}"; do
-  cur=$(cur_leader $sid)
-  if [[ -n "$cur" && "$cur" != "${LEADER[$sid]}" ]]; then
-    echo "  组 $sid 供副本期间主从 :${LEADER[$sid]} 漂到 :$cur，从新主补供"
-    LEADER[$sid]=$cur
-    for p in "${WORKERS[@]}"; do [[ $p == $cur ]] && continue
-      armed=$(Q $p "SELECT count(*) FROM partdist.replay_status() s WHERE s.shard = partdist.local_partition_for_shard($sid) AND s.armed")
-      [[ "$armed" == 1 ]] && continue
-      r=$(PSQL $cur -Atc "SELECT partdist.provision_shard_replica(${sid}::bigint, ${NID[$p]})" </dev/null 2>&1 | tr '\n' ' '); check "  组 $sid 补供副本到 :$p" "$([[ "$r" == shard=* ]] && echo ok || echo "${r:0:80}")" "ok"
-    done
-  fi
+for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+# ★ 收敛等待跟着"当前主"走：供副本期间主可能漂走（P7-N15），run 3 里漂发生在守卫查完之后，
+#   等待还盯着旧主 60 s 白等。现在每轮都重认主，漂了就把没供到（未 armed）的副本从新主再供一遍。
+reprovision_from() {  # <sid> <当前主端口>
+  local sid=$1 cur=$2 p armed r
+  for p in "${WORKERS[@]}"; do [[ $p == $cur ]] && continue
+    armed=$(Q $p "SELECT count(*) FROM partdist.replay_status() s WHERE s.shard = partdist.local_partition_for_shard($sid) AND s.armed")
+    [[ "$armed" == 1 ]] && continue
+    r=$(PSQL $cur -Atc "SELECT partdist.provision_shard_replica(${sid}::bigint, ${NID[$p]})" </dev/null 2>&1 | tr '\n' ' '); check "  组 $sid 补供副本到 :$p" "$([[ "$r" == shard=* ]] && echo ok || echo "${r:0:100}")" "ok"
+  done
+}
+for sid in "${SIDS[@]}"; do ok=""
+  for t in $(seq 1 90); do
+    cur=$(cur_leader $sid)
+    if [[ -n "$cur" && "$cur" != "${LEADER[$sid]}" ]]; then
+      echo "  组 $sid 供副本期间主从 :${LEADER[$sid]} 漂到 :$cur，从新主补供"; LEADER[$sid]=$cur; reprovision_from $sid $cur
+    fi
+    lp=${LEADER[$sid]}
+    [[ "$(Q $lp "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$sid")" == "${NID[$lp]}" && "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$sid")" == "${NID[$lp]}" ]] && { ok=ok; break; }
+    sleep 1
+  done
+  check "组 $sid partition_map 两处收敛" "$ok" "ok"
 done
-for sid in "${SIDS[@]}"; do lp=${LEADER[$sid]}; ok=""; for t in $(seq 1 60); do [[ "$(Q $lp "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$sid")" == "${NID[$lp]}" && "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$sid")" == "${NID[$lp]}" ]] && { ok=ok; break; }; sleep 1; done; check "组 $sid partition_map 两处收敛" "$ok" "ok"; done
 mk=$(PSQL $COORD -Atc "SELECT count(*) FILTER (WHERE status LIKE 'registered%') FROM partdist.set_table_shard_mvcc('fv')" </dev/null 2>&1 | tail -1)
 check "打标登记 $NW 片" "$mk" "$NW"
 DEX rm -f "$CDIR/pg_tso_boot" </dev/null; DEX /work/pg-install/bin/pg_ctl -D "$CDIR" -m fast -l "$CDIR/pg.log" restart -w -t 60 </dev/null >/dev/null 2>&1
 up=""; for t in $(seq 1 40); do up=$(Q $COORD "SELECT 1"); [[ "$up" == 1 ]] && break; sleep 1; done; check "协调者重启就绪" "$up" "1"
 Q $COORD "ALTER SYSTEM SET pg_partdist.tso_master = on" >/dev/null
-for p in $COORD "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres'" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+for p in $COORD "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres'" >/dev/null; Q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = $TSO_LEASE_MS" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
 sleep 2; for p in "${WORKERS[@]}"; do Q $p "SELECT partdist.partdist_tso_client_start_ts()" >/dev/null; done; sleep 4
 tso=$(Q $COORD "SELECT partdist.partdist_tso_client_start_ts()"); check "TSO 取号可用（$tso）" "$([[ "$tso" =~ ^[0-9]+$ ]] && echo ok)" "ok"
 g0=""; for t in $(seq 1 30); do g0=$(Q $COORD "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()"); [[ "$g0" =~ ^[1-9] ]] && break; sleep 1; done; check "group0 有 leader" "$([[ "$g0" =~ ^[1-9] ]] && echo ok)" "ok"
@@ -155,7 +171,7 @@ bg_worker() {
   local nm=${#mine[@]}
   while [[ ! -f "$STOP_FILE" ]]; do
     out=$(transfer_one "${mine[$(( i % nm ))]}" "${mine[$(( (i+1) % nm ))]}"); i=$((i+1))
-    if [[ "$out" == txn_done ]]; then ok=$((ok+1)); else bad=$((bad+1)); echo "$out" >> "$f.err"; sleep 1; fi
+    if [[ "$out" == txn_done ]]; then ok=$((ok+1)); else bad=$((bad+1)); echo "$out" >> "$f.err"; sleep 3; fi   # 失败退避 3 s：别把 2 vCPU 空转打满
     echo "$ok $bad" > "$f"
   done
 }

@@ -251,6 +251,15 @@ master                          coord group Sc            其他参与组 Si
 
 判定：参与组数 ≤ 1 即快路径。**只读参与分片不计入**（§8.3）。
 
+> **★ 2026-09-17 修正（P7-N10，T7.36）**：上面这句只对 **1PC** 成立——router 单分片写没有
+> PREPARE，master 侧的决议挂钩在 pg_dist_transaction 探针处就退出了，从不走到算写集那一步。
+> 挂钩里原本还有一条 `nparts <= 1 ⇒ return`，把"**2PC 在用、写集只有 1 组**"（协调者侧
+> `INSERT…SELECT` 只命中一个分片；多分片 UPDATE 只有一个分片真改到行）也当快路径跳过：
+> 参与者已 PREPARE、分片 xid 记成 PREPARED、COMMIT PREPARED 按 T4.5 不写终局 ⇒ 判决永远
+> 不来 ⇒ **打标表上提交成功的行永久不可见**、无告警、恢复守护救不回。现改为写集 ≥ 1 组
+> 一律做决议（单组 = 多组的退化情形）。"该组 quorum 已覆盖全部数据"只说明字节持久，
+> 可见性要的是判决 + commit_ts。验收 `test_single_group_2pc_p7.sh` 修前 24/7、修后 31/0。
+
 ### 3.5 为什么参与者仍要写本地 prepare 记录（[B] 不能省）
 
 有一个自然的疑问：字节已经在 parwal 达多数派持久化了（[A] + quorum），
@@ -1113,6 +1122,23 @@ FRD §11 的六步收尾之后、该分片对外服务之前，必须插入：
 > 四级都落空 ⇒ **保持 in-doubt 不动**（决议可能在此刻不可达的协调组里，而我们
 > 不知道协调组是谁、也就无法把推定中止**写下来**）——与 §7 守护同一条纪律。
 > 剩给第 6 步的只是"插进升主序列 + 与追平回放合流的端到端验收"。
+
+> **★★ 2026-09-17 修正（P7-N12 之二）：in-doubt 的判据与落账都改了。**
+>
+> 缺陷：`dtx_close_indoubt` 原来的 in-doubt 判据是"流里有 DTX_PREPARE、没有 DTX_COMMIT/ABORT"，
+> 闭合动作只是往流里再追加一条 DTX_COMMIT/ABORT 记录。这条记录**谁也不认**：本节点的分片 clog
+> 从不据此更新，副本回放也只在带分片 xid 的终局 MARKER 时才 `ShardClogSetVerdict`。于是
+> "流里已闭合、分片 clog 仍 PREPARED"的事务在新主上永久不可见，且**再也不会被本函数看见**
+> （实测新主 3 个 PREPARED 残留、本函数只报 1 笔 in-doubt）—— 这就是切主后总额漂移的第二段机理
+> （第一段是复制失败注销登记，见 `dtx_pending.c`）。
+>
+> 现在：① 列全部 DTX_PREPARE；② 用 DTX_PREPARE 与紧随其后的 PREPARE MARKER **共享的头部 gxid**
+> 把 dtxid 映射回分片 xid（`partdist.partwal_prepare_sxid`）；③ **分片 clog 仍 PREPARED 的一律处理**，
+> 判决优先取流里已有的闭合记录（本地、权威、不用 RPC），没有才 `dtx_inquire` → 四级寻址；
+> ④ 落账走 `partdist.shard_verdict_apply`：本地分片 clog（start_ts 取 PREPARED 槽）+ 带分片 xid 的
+> 判决 MARKER 复制给副本 —— 与 leader 侧 `dtx_replicate_verdict` 同构；流里没有闭合记录才补一条
+> （带 commit_ts）。映射不到分片 xid 的（未打标 / 遗留宇宙）沿用旧判据。
+> 分片 clog 状态的正式 SQL 入口随之补上：`partdist.shard_clog_status(oid, sxid)` / `shard_clog_status_full`。
 
 **这一步不依赖 R2/R3**：它是**按事务粒度**求决议并写标记，不是元组粒度的可见性
 判定。所以 2PC **不新增**对 R3 的阻塞；同时它也**不解除**既有阻塞——

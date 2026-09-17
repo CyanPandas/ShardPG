@@ -802,6 +802,46 @@ CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
 ) RETURNS BIGINT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_append_dtx_record';
 
+-- P7-N12：分片 clog 状态的正式 SQL 入口（此前只有测试临时建的包装）。0=RUNNING 1=PREPARED 2=COMMITTED 3=ABORTED
+CREATE OR REPLACE FUNCTION shard_clog_status(p_shard OID, p_xid BIGINT)
+    RETURNS integer LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_read';
+
+COMMENT ON FUNCTION shard_clog_status(OID, BIGINT) IS
+    '读本节点分片 clog 里一个分片 xid 的状态：0=RUNNING（含空洞）1=PREPARED 2=COMMITTED 3=ABORTED。';
+
+CREATE OR REPLACE FUNCTION shard_clog_status_full(p_shard OID, p_xid BIGINT)
+    RETURNS text LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_read_full';
+
+COMMENT ON FUNCTION shard_clog_status_full(OID, BIGINT) IS
+    '读本节点分片 clog 槽的全文："st=<状态> sts=<start_ts> cts=<commit_ts>"。';
+
+-- P7-N12（之二）：升主节点把 in-doubt 决议映射回分片 xid 并落账（见 raft_boundary.c）
+CREATE OR REPLACE FUNCTION partwal_prepare_sxid(
+    p_partition_id OID,
+    p_dtxid BIGINT,
+    p_upto BIGINT,
+    OUT sxid BIGINT,
+    OUT hdr_gxid BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_prepare_sxid';
+
+COMMENT ON FUNCTION partwal_prepare_sxid(OID, BIGINT, BIGINT) IS
+    '按 dtxid 在本分区流（1..p_upto）里找 DTX_PREPARE 记录的头部 gxid，再取紧随其后同 gxid 的 PREPARE MARKER 尾块里的分片 xid。找不到返回 NULL。';
+
+CREATE OR REPLACE FUNCTION shard_verdict_apply(
+    p_partition_id OID,
+    p_sxid BIGINT,
+    p_hdr_gxid BIGINT,
+    p_committed BOOLEAN,
+    p_commit_ts BIGINT
+) RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_verdict_apply';
+
+COMMENT ON FUNCTION shard_verdict_apply(OID, BIGINT, BIGINT, BOOLEAN, BIGINT) IS
+    '把一笔 in-doubt 判决落进本地分片 clog（start_ts 取 PREPARED 槽），并追加带分片 xid 的判决 MARKER 复制给副本（与 leader 侧 dtx_replicate_verdict 同构）。本地已落账即返回，复制失败返回 false。';
+
 COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGINT, INTEGER, BIGINT[]) IS
     '在本节点该分区的 parwal 流追加一条 DTX 记录并 fsync，返回分配到的 partition_lsn。participants 仅 DECISION(kind=2) 记录携带。';
 

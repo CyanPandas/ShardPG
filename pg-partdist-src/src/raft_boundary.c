@@ -50,6 +50,7 @@
 #include "partition_wal_writer.h"
 #include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 #include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
+#include "shard_clog.h"			/* P7-N12：升主节点把 in-doubt 决议落进分片 clog */
 #include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
@@ -247,6 +248,161 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_VOID();
+}
+
+/* ------------------------------------------------------------------ */
+/* P7-N12（之二）— 升主节点把 in-doubt 决议映射回分片 xid 并落账          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 缺陷现场（2026-09-17 跨组转账 + 切主验收）：新主的升主序列跑 dtx_close_indoubt，
+ * 找到判决后只追加一条 DTX_COMMIT/ABORT 记录 —— 它既不写本节点的分片 clog，回放侧
+ * 也不认（分片 clog 只在回放**带分片 xid 的 MARKER** 时落判决，shard_replay.c）。
+ * 于是新主自己和它后面的副本对这笔事务永远停在 PREPARED：已提交的行不可见、
+ * 转账的一侧丢了（总额 24000→24002，最终主上 4 个 PREPARED 残留，复制失败告警 0 条）。
+ *
+ * 映射依据：参与者 PREPARE 时先追加 DTX_PREPARE(dtxid)，紧接着追加带分片 xid 尾的
+ * PREPARE MARKER（dtx_participant.c），两条记录的**头部 gxid 相同**（同一笔事务的
+ * 本地 xid）。按 dtxid 找到 DTX_PREPARE 的头部 gxid，再在其后找同 gxid 的 MARKER，
+ * 尾块里就是分片 xid。
+ */
+static bool partwal_find_record(Oid partition_id, uint64 target,
+								PartWALRecord *out_rec, char **out_data);
+
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_prepare_sxid);
+PG_FUNCTION_INFO_V1(pg_partdist_shard_verdict_apply);
+
+Datum
+pg_partdist_partwal_prepare_sxid(PG_FUNCTION_ARGS)
+{
+	Oid				partition_id = PG_GETARG_OID(0);
+	int64			dtxid = PG_GETARG_INT64(1);
+	int64			upto = PG_GETARG_INT64(2);
+	TupleDesc		tupdesc;
+	Datum			values[2];
+	bool			nulls[2];
+	HeapTuple		tuple;
+	uint64			p;
+	uint64			hit_plsn = 0;
+	GlobalTransactionId hdr_gxid = 0;
+	TransactionId	sxid = InvalidTransactionId;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR, (errmsg("partwal_prepare_sxid: 返回类型必须是 record")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	/* 1) 找 DTX_PREPARE(dtxid) 的头部 gxid */
+	for (p = 1; p <= (uint64) upto && hit_plsn == 0; p++)
+	{
+		PartWALRecord	rec;
+		char		   *data = NULL;
+
+		if (!partwal_find_record(partition_id, p, &rec, &data))
+			continue;
+		if ((rec.flags & PARTWAL_FLAG_DTX) != 0 && data != NULL &&
+			rec.data_len >= sizeof(DtxRecordPayload) &&
+			rec.info == DTX_PREPARE &&
+			((DtxRecordPayload *) data)->dtxid == (uint64) dtxid)
+		{
+			hit_plsn = p;
+			hdr_gxid = rec.gxid;
+		}
+		if (data != NULL)
+			pfree(data);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* 2) 其后 64 条内找同 gxid、带分片 xid 尾的 MARKER */
+	for (p = hit_plsn + 1; hit_plsn != 0 && p <= hit_plsn + 64 && p <= (uint64) upto &&
+		 !TransactionIdIsValid(sxid); p++)
+	{
+		PartWALRecord	rec;
+		char		   *data = NULL;
+
+		if (!partwal_find_record(partition_id, p, &rec, &data))
+			continue;
+		if ((rec.flags & PARTWAL_FLAG_MARKER) != 0 && rec.gxid == hdr_gxid &&
+			data != NULL && rec.data_len >= sizeof(TxnMarkerPayload))
+		{
+			TxnMarkerPayload *m = (TxnMarkerPayload *) data;
+			Size			  base = TxnMarkerPayloadSize(m->nsubxacts);
+
+			if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0 &&
+				rec.data_len >= base + sizeof(TransactionId))
+				memcpy(&sxid, data + base, sizeof(TransactionId));
+		}
+		if (data != NULL)
+			pfree(data);
+	}
+
+	memset(nulls, 0, sizeof(nulls));
+	if (!TransactionIdIsNormal(sxid))
+	{
+		nulls[0] = true;
+		nulls[1] = true;
+	}
+	values[0] = Int64GetDatum((int64) sxid);
+	values[1] = Int64GetDatum((int64) hdr_gxid);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
+ * shard_verdict_apply(partition_id, sxid, hdr_gxid, committed, commit_ts) → bool
+ *
+ * 与 leader 侧 dtx_pending.c 的 dtx_replicate_verdict 同构：先落本地分片 clog
+ * （start_ts 取 PREPARED 槽里的），再追加带分片 xid 的判决 MARKER 并 flush 一轮
+ * ——本节点此刻是该组 leader（升主序列），副本随流得到同一本账。
+ * 复制失败不上抛（本地账已落是底线），返回 false。
+ */
+Datum
+pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
+{
+	Oid				partition_id = PG_GETARG_OID(0);
+	TransactionId	sxid = (TransactionId) PG_GETARG_INT64(1);
+	GlobalTransactionId hdr_gxid = (GlobalTransactionId) PG_GETARG_INT64(2);
+	bool			committed = PG_GETARG_BOOL(3);
+	int64			cts = PG_GETARG_INT64(4);
+	ShardClogSlot	slot;
+	int64			sts = 0;
+	char		   *payload = NULL;
+	uint32			payload_len = 0;
+	bool			ok = false;
+
+	if (!OidIsValid(partition_id) || !TransactionIdIsNormal(sxid))
+		PG_RETURN_BOOL(false);
+
+	if (ShardClogReadSlot(partition_id, sxid, &slot))
+		sts = (int64) slot.start_ts;
+	ShardClogSetVerdict(partition_id, sxid, committed, committed ? cts : 0);
+
+	PG_TRY();
+	{
+		payload = PartWALBuildVerdictMarker(sts, committed ? cts : 0, &payload_len);
+		PartWALAppendMarkerForShardXid(partition_id, GxidLocalXid(hdr_gxid),
+									   committed ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT,
+									   payload, payload_len, sxid);
+		PartWALNoteTouchedPartition(partition_id);
+		PartWALFlush(InvalidXLogRecPtr, false);
+		ok = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(TopMemoryContext);
+		ed = CopyErrorData();
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pg_partdist: 升主闭合 in-doubt：分片 %u xid %u 判决已落本地 clog，"
+						"但判决标记未能复制给副本：%s",
+						partition_id, sxid, ed->message)));
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	if (payload != NULL)
+		pfree(payload);
+	PG_RETURN_BOOL(ok);
 }
 
 /* ------------------------------------------------------------------ */

@@ -262,8 +262,8 @@ declare -A ACC_SID
 ACC_COLS=()
 for sid in "${SIDS[@]}"; do
   ids=$(shard_ids $sid 700001 $ACCT)
-  # ★ 用多行 VALUES，不用 INSERT…SELECT：后者在全局事务里写单个分片会走 2PC，协调组判决走快路径
-  #   不产生，分片 clog 永远停在 RUNNING、行永久不可见（P7-N10，三跑实测；见 [9b]）
+  # 账户用多行 VALUES 插（1PC 单分片路由）。INSERT…SELECT 会走单组 2PC —— P7-N10 修复前那条路
+  #   判决不产生、行永久不可见（三跑实测），[9b] 专门验它
   vals=$(for a in ${ids//,/ }; do printf "(%s,'acct',1000)," "$a"; done | sed 's/,$//')
   out=$(gtx $sid "INSERT INTO cg(id, v, n) VALUES $vals;")
   [[ "$out" == txn_done ]] || echo "  账户插入失败（分片 $sid）：${out:0:160}"
@@ -386,13 +386,13 @@ NTO=$(DEX bash -c "tail -n +$((LOGL+1)) '$LOGF' | grep -c '升主前置超过 .*
 check "★ 新主日志无'升主前置…未返回或连接失效'（实得 $NTO）" "$NTO" "0"
 
 echo "========== [9b] ★ P7-N10：全局事务里写集只有一个分片、却走 2PC（INSERT…SELECT）的提交必须可见 =========="
-# 已知缺陷，修好之前这一条会红。放在最后、且只打在最后一个分片上，不干扰前面各段。
+# P7-N10 回归（2026-09-17 已修）。放在最后、且只打在最后一个分片上，不干扰前面各段。
 LS=${SIDS[$((NW-1))]}
 nids=$(shard_ids $LS 1500001 3)
 before_n10=$(Q $COORD "SELECT count(*) FROM cg WHERE v='n10'")
 out=$(gtx $LS "INSERT INTO cg(id, v, n) SELECT x, 'n10', 0 FROM unnest(ARRAY[$nids]) x;")
 check "  全局事务 INSERT…SELECT 报告提交成功" "$out" "txn_done"
-check "★ P7-N10：提交成功的 3 行在判决收敛后可见（已知缺陷：分片 clog 停在 RUNNING）" "$(converge $COORD "SELECT count(*) - $before_n10 FROM cg WHERE v='n10'" 3 30)" "3"
+check "★ P7-N10：提交成功的 3 行在判决收敛后可见（修复前分片 clog 永远停在 PREPARED）" "$(converge $COORD "SELECT count(*) - $before_n10 FROM cg WHERE v='n10'" 3 30)" "3"
 
 if [[ "$FAIL" -gt 0 ]]; then
   echo "  ---- [取证] 各节点逐分片 行数 / 账户数 / 余额和（本地读） ----"
