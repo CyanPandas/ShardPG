@@ -13,6 +13,7 @@
 #include "partwal_sync.h"
 #include "demux_worker.h"
 #include "shard_replay.h"
+#include "shard_fileset.h"   /* P7-N25：auto_reprovision_demoted GUC */
 #include "shard_vacuum.h"
 #include "global_mvcc.h"
 #include "dtx_participant.h"
@@ -410,6 +411,8 @@ UtilityMayChangeRelfilenode(Node *parsetree)
     }
 }
 
+static void PartDistMaybeInstallUsr2Backtrace(void);   /* P7-N21 取证，定义见下 */
+
 /*
  * partdist_process_utility — ProcessUtility_hook wrapper.
  *
@@ -431,6 +434,7 @@ partdist_process_utility(PlannedStmt *pstmt,
                           QueryCompletion *qc)
 {
     ShardFreezeNoteUserActivity();
+    PartDistMaybeInstallUsr2Backtrace();     /* P7-N21 取证，GUC 默认 off */
 
     /* Register COPY FROM target BEFORE the chain writes WAL */
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
@@ -558,6 +562,63 @@ partdist_segv_handler(int signum)
 }
 #endif
 
+/*
+ * ★ P7-N21 取证（2026-09-18）：给**活着但卡死**的后端要一份栈，不杀它。
+ *
+ * N21 的 DROP 在用户态纯 CPU 空转（/proc/<pid>/io 零读写）、cancel / statement_timeout
+ * 都不理；本环境没有 CAP_SYS_PTRACE、perf_event_paranoid=4、core 被 apport 吞，
+ * gdb/perf/core 三条路全断。于是用信号：`kill -USR2 <pid>`，处理器把栈写进 stderr
+ * （服务器日志），然后**原样返回**继续跑 —— 采几次样就知道它转在哪。
+ *
+ * 普通后端里 SIGUSR2 本就被 PostgresMain 设成 SIG_IGN（无人使用），占用它不影响任何
+ * 既有语义；且只能在 fork 之后逐后端装（postmaster 里装的会被 PostgresMain 覆盖），
+ * 所以挂在 ProcessUtility 钩子入口懒装。GUC 默认 off。
+ */
+bool        debug_sigusr2_backtrace = false;
+
+#ifdef HAVE_EXECINFO_H
+static void
+partdist_sigusr2_backtrace(SIGNAL_ARGS)
+{
+    int     save_errno = errno;
+    void   *frames[64];
+    int     n;
+    char    hdr[96];
+    int     len;
+
+    len = snprintf(hdr, sizeof(hdr), "pg_partdist: SIGUSR2 采样 pid %d 栈回溯：\n",
+                   (int) getpid());
+    if (len > 0)
+    {
+        ssize_t rc = write(STDERR_FILENO, hdr, (size_t) len);
+
+        (void) rc;
+    }
+    n = backtrace(frames, (int) lengthof(frames));
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    errno = save_errno;
+}
+#endif
+
+static void
+PartDistMaybeInstallUsr2Backtrace(void)
+{
+#ifdef HAVE_EXECINFO_H
+    static bool installed = false;
+
+    if (installed || !debug_sigusr2_backtrace)
+        return;
+    {
+        void   *warm[2];
+
+        /* 预热：backtrace 首次调用会 dlopen libgcc（malloc），不能留到信号处理器里 */
+        (void) backtrace(warm, 2);
+    }
+    pqsignal(SIGUSR2, partdist_sigusr2_backtrace);
+    installed = true;
+#endif
+}
+
 /* ---- module load ---- */
 
 void
@@ -631,6 +692,17 @@ _PG_init(void)
         NULL, NULL, NULL
     );
     DefineCustomBoolVariable(
+        "pg_partdist.auto_reprovision_demoted",
+        "新主登记后，前任主若没有回放槽位就自动给它重供物理基线让它归队（默认 on，P7-N25）。",
+        "没有它，被降级的原始 placement 主收着新主的流却无从回放，按 R-P4-15 永远不可升主，"
+        "只能人工 provision_shard_replica。关掉即退回修前行为。",
+        &partdist_auto_reprovision_demoted,
+        true,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
         "pg_partdist.auto_repair_diverged",
         "心跳工作者自动对带分叉标记的分片重做物理基线（默认 on）。",
         "标记来源：复制挂钩失败、重传内容不一致（R-P4-13）、捕获环溢出（P7-W2）。"
@@ -652,6 +724,16 @@ _PG_init(void)
         NULL, NULL, NULL
     );
 
+    DefineCustomBoolVariable(
+        "pg_partdist.debug_sigusr2_backtrace",
+        "对后端发 SIGUSR2 时把它当前的栈回溯打进服务器日志并继续运行（取证卡死用，默认 off）。",
+        "在 ProcessUtility 入口逐后端懒装；只影响装过之后的 DDL/utility 语句所在后端。",
+        &debug_sigusr2_backtrace,
+        false,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
     DefineCustomBoolVariable(
         "pg_partdist.debug_segv_backtrace",
         "崩溃（SIGSEGV/SIGBUS/SIGILL）时把栈回溯打进服务器日志。",

@@ -240,8 +240,22 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 				(errmsg("pg_partdist: 分片 %u（本地 OID %u）已接管为主，"
 						"解除副本读闸门；此后拒绝对它触发回放",
 						partition_id, loid)));
+
+		/*
+		 * ★ P7-N25：前任主若没有回放槽位（原始 placement 主从没当过副本），它从此收着本节点
+		 * 的流却无从回放、按 R-P4-15 永远不可升主。拉一个一次性工作者**逐个检查其余全部成员**，
+		 * 没有 armed 槽位的替它重供基线（不只查 old_primary：条目里的前任主可能滞后失真，P7-N27）。
+		 * 只在"确有前任"（非首次登记）时拉；自己重新登记自己（old == me）不管。
+		 */
+		if (old_primary_node > 0 && old_primary_node != me)
+			PartDistLaunchReprovision((int64) partition_id, 0);	/* 0 = 逐个检查全部其余成员 */
 	}
-	else if (old_primary_node == me)
+	/*
+	 * ★ P7-N27：不能只信条目里的 old_primary —— 它取自提案方的 partition_map，会滞后成 0
+	 * 或指向更早的主。真正要纠正的状态是"本节点还以为自己是主"，那就直接看本地的
+	 * 持久"已升主"标记：新主不是我、而我还标着已升主 ⇒ 我就是被取代的那个。
+	 */
+	else if (old_primary_node == me || ShardPromotedMarkRead(loid))
 	{
 		ShardReplicaSetPromoted(loid, false);
 		ereport(LOG,

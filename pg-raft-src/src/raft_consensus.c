@@ -4365,6 +4365,53 @@ data_group_try_report(RaftGroupCtx *ctx)
 }
 
 
+/*
+ * ★ P7-N26（2026-09-18）：当选即把本组的复制增量下界抬到**日志里最后一条数据条目**。
+ *
+ * last_data_plsn 是运行期游标，只在"本节点当 leader、propose 成功"时推进；它**不随
+ * 丢主清零**。于是一个当过主、又当回主的节点，拿着上一任期的旧值开写：
+ * replicate_group_upto 从 旧值+1 起把**前任主写的整段尾巴**（本节点早已作为 follower
+ * 收进日志）逐条重新 propose，每条一次同步往返，全程持着复制认领位 —— 此间所有写入
+ * 排队等认领位，超 60 s 即 `等待组 N 的复制认领位超过 60000 ms，prepare 失败`。
+ * 实测（N25 回归 [5]，组 102768）：A 在 term 3 把 B 在 term 2 写的 plsn 140–216 共 77 条
+ * 原样重提，fileset 交接广播卡了 110 s，协调者那笔 INSERT 失败。
+ *
+ * 那段尾巴已在本节点日志里，新 leader 的常规 AppendEntries（init_leader_replication 设好
+ * next_index）自会把它复制齐，不需要也不应该作为新条目再提一遍。只抬不降：环里找不到
+ * 数据条目（全被挤出窗口）时维持原值，退回修前行为（多提几条，正确性无损）。
+ * BGW 可调：纯共享内存，环内读取不走 SPI（与 replicate_group_upto 的回推同一写法）。
+ */
+static void
+data_group_refresh_last_plsn(RaftGroupCtx *ctx)
+{
+    int64   p;
+    int64   last = 0;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    for (p = ctx->log->last_log_index; p > 0 &&
+         p > ctx->log->last_log_index - RAFT_LOG_CAPACITY; p--)
+    {
+        RaftLogEntry e;
+
+        if (log_get_entry_locked(ctx, p, &e) &&
+            strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+        {
+            last = entry_partition_lsn(e.payload);
+            break;
+        }
+    }
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (last > ctx->g->last_data_plsn)
+    {
+        elog(LOG, "pg_raft: 组 %lld 当选后把复制下界从 plsn %lld 抬到 %lld"
+             "（前任写的尾巴已在本节点日志里，由常规 AppendEntries 复制，不再逐条重提）",
+             (long long) ctx->group_id, (long long) ctx->g->last_data_plsn,
+             (long long) last);
+        ctx->g->last_data_plsn = last;
+    }
+}
+
 static void
 start_election(RaftGroupCtx *ctx)
 {
@@ -4440,6 +4487,8 @@ start_election(RaftGroupCtx *ctx)
              votes, group_cluster_size(ctx));
         persist_hard_state_unlocked(ctx);
         init_leader_replication(ctx);
+        if (ctx->group_id != RAFT_CONTROL_GROUP)
+            data_group_refresh_last_plsn(ctx);
         send_heartbeats(ctx);
 
         /*

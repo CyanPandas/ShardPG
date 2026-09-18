@@ -498,6 +498,41 @@ EmitShardDropNotice(Oid shard_oid)
 }
 
 /*
+ * ★ P7-N28（2026-09-18）：带哨兵的 DROP 通知 —— 两个发射点共用。
+ *
+ * 缺陷：`ShardFilesetMaybeEmitUpdates`（每个会改 fileset 的 DDL 在 PRE_COMMIT 跑）遍历的是
+ * 共享内存里的分区清单，表没了就直接 EmitShardDropNotice，**不看哨兵**。而清单里的历史残留
+ * 分区永不移出，于是**每来一次 DDL，所有残留分片都重发一遍停流通知**：每条一次 CTRL 追加 +
+ * fsync + PartWALReplicateTouched（对本事务已触达的全部分区各复制一次，N 条通知就是 O(N²)
+ * 次复制挂钩调用）。实测 15 分钟里三台 worker 各发 700–1000 条，绝大多数给早已通知过的残留
+ * 分片；这些死分区的 parwal 段也因此一直在长（61673 的哨兵 07:34 就在了，11:27、15:16 仍重发）。
+ * 两次 P7-N21 卡死之前，卡住的 backend 都刚刷完这样一串。
+ *
+ * 只在调用方已确认"表没了"时调用（先 BuildShardFileSetEx 判没了再看哨兵），所以即便 OID
+ * 被新表复用、旧哨兵还在，也不会挡住新表的 fileset 变更。
+ */
+static bool
+EmitShardDropNoticeOnce(Oid shard_oid)
+{
+    char        sentinel[MAXPGPATH];
+    struct stat st;
+    int         fd;
+
+    ShardDropSentinelPath(shard_oid, sentinel, sizeof(sentinel));
+    if (stat(sentinel, &st) == 0)
+        return false;           /* 已经通知过了（见 ShardDropSentinelPath 的注释） */
+
+    /* 判据 + 发射都在 EmitShardDropNotice 的子事务里做 */
+    if (!EmitShardDropNotice(shard_oid))
+        return false;           /* 表还在 / 不归本节点 / 本节点不是该组 leader：下次再试 */
+
+    fd = OpenTransientFile(sentinel, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+    if (fd >= 0)
+        CloseTransientFile(fd);
+    return true;
+}
+
+/*
  * ShardFilesetEmitDropNotices —— T7.8：**COMMIT PREPARED 之后**的 DROP 扫一遍。
  *
  * ★ 为什么非要有这一支（2026-09-10 实测定位）：
@@ -561,9 +596,6 @@ ShardFilesetEmitDropNotices(bool force)
     {
         Oid           shard_oid;
         char         *endptr;
-        char          sentinel[MAXPGPATH];
-        struct stat   st;
-        int           fd;
 
         if (de->d_name[0] == '.')
             continue;
@@ -571,18 +603,7 @@ ShardFilesetEmitDropNotices(bool force)
         if (*endptr != '\0' || shard_oid == InvalidOid)
             continue;
 
-        /* 已经通知过了：不重发（见 ShardDropSentinelPath 的注释） */
-        ShardDropSentinelPath(shard_oid, sentinel, sizeof(sentinel));
-        if (stat(sentinel, &st) == 0)
-            continue;
-
-        /* 判据 + 发射都在 EmitShardDropNotice 的子事务里做 */
-        if (!EmitShardDropNotice(shard_oid))
-            continue;           /* 表还在 / 不归本节点 / 本节点不是该组 leader */
-
-        fd = OpenTransientFile(sentinel, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
-        if (fd >= 0)
-            CloseTransientFile(fd);
+        (void) EmitShardDropNoticeOnce(shard_oid);
     }
     FreeDir(dir);
 }
@@ -1406,7 +1427,7 @@ ShardFilesetMaybeEmitUpdates(void)
          */
         if (BuildShardFileSetEx(parts[p], &new_fs, new_relids) < 1)
         {
-            EmitShardDropNotice(parts[p]);
+            (void) EmitShardDropNoticeOnce(parts[p]);   /* P7-N28：通知过的不重发 */
             continue;
         }
 
@@ -1690,6 +1711,12 @@ SmgrRecordGetLocator(const char *record_data, uint32 record_len,
 
 #include "libpq-fe.h"
 #include "executor/spi.h"
+#include "postmaster/bgworker.h"   /* P7-N25：自动归队工作者 */
+#include "postmaster/postmaster.h" /* PostPortNumber */
+#include "storage/ipc.h"          /* proc_exit */
+#include "storage/latch.h"
+#include "tcop/tcopprot.h"         /* die */
+#include "utils/wait_event.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 
@@ -1777,6 +1804,24 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
         ereport(ERROR, (errmsg("provision_shard_replica: SPI_connect 失败")));
 
     initStringInfo(&q);
+
+    /*
+     * ★ P7-N25（2026-09-18）：同一分片的供给串行化。主权交接后自动归队的工作者
+     * （给被降级的旧主重供，见 partdist_reprovision_demoted）与人工 / 夹具发起的
+     * provision 可能撞在同一个分片上 —— 两次基线、两次配 locmap 交错，目标会被配成
+     * "游标按这一次的 base、文件按那一次的基线"。事务级咨询锁，本语句结束即释放；
+     * 后到的一方等前一方做完再完整重来一遍（多一次基线，结果一致）。
+     */
+    appendStringInfo(&q, "SELECT pg_advisory_xact_lock(%lld)",
+                     (long long) ((INT64CONST(0x50524F56) << 32) |
+                                  (gsid & INT64CONST(0xFFFFFFFF))));
+    if (SPI_execute(q.data, false, 1) != SPI_OK_SELECT)
+    {
+        SPI_finish();
+        ereport(ERROR, (errmsg("provision_shard_replica: 取分片 %lld 的供给锁失败",
+                               (long long) gsid)));
+    }
+    resetStringInfo(&q);
 
     /* ① 本节点必须**就是**这个分片的主，否则无从推送 */
     appendStringInfo(&q,
@@ -2049,6 +2094,327 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
 
     ret = cstring_to_text(summary);
     PG_RETURN_TEXT_P(ret);
+}
+
+/* ================================================================== */
+/* P7-N25：被降级的旧主自动归队（2026-09-18）                          */
+/* ================================================================== */
+
+/*
+ * 缺陷：原始 placement 主从没当过副本，没有回放槽位 / locmap。被新主登记降级后，
+ * 它照收新主的流却无从回放，按 R-P4-15 升主前置对它恒返回 -1（"收到分区 WAL 却
+ * 没有回放槽位 … 须重做物理基线后才能重新参选"）并主动让位 —— 而**没有任何路径
+ * 替它重做基线**。3 成员组第一次切主后只剩一个合格候选，第二次故障就可能整组无主。
+ *
+ * 修法：新主在"本节点被登记为主"的那次 apply 里拉起一个**一次性**动态后台工作者，
+ * 由它经 libpq 自连调 partdist.reprovision_demoted(gsid, 旧主)：
+ *   - 本节点已不是该组 leader ⇒ 'not_leader'，工作者退出（后来的主会拉起它自己的）；
+ *   - 旧主已有 armed 回放槽位（它本来就是由副本升上去的，交接后照常是副本）⇒
+ *     'not_needed'，什么都不做；
+ *   - 否则调 provision_shard_replica(gsid, 旧主) —— 截断它本地文件、按新主的基线重建、
+ *     配 locmap、arm，正是 R-P4-15 提示里要人手做的那件事。
+ *
+ * ★ 为什么不挂在 pg_raft 的 TopologyMonitor 周期自连上：那条路用**阻塞** PQexec，
+ *   跑在同一个 BGW 循环里、与 pg_raft_consensus_tick 串行；一次供给要发整片物理基线，
+ *   数秒起步，会让本节点当主的所有组心跳断档（P7-N17 的改选风暴）。独立工作者进程
+ *   阻塞多久都不碍 tick。
+ * ★ 为什么不在 apply 里当场做：apply 跑在控制面条目的应用路径上，长操作会拖住控制面。
+ */
+bool        partdist_auto_reprovision_demoted = true;   /* GUC，见 pg_partdist.c */
+
+typedef struct ReprovisionArgs
+{
+    int64   gsid;
+    int32   target;
+} ReprovisionArgs;
+
+/*
+ * 检查一个成员：有 armed 回放槽位 ⇒ "not_needed"；连不上 / 查不到 ⇒ "retry: …"；
+ * 否则 provision_shard_replica 替它重供 ⇒ "done: …"。返回调用方上下文里的串。
+ * 调用前本节点须已确认是该组 leader（provision 自己也会再查一遍）。
+ */
+static char *
+reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
+{
+    char        sql[256];
+    char       *host = NULL;
+    char       *portstr;
+    char        conninfo[256];
+    char        armed[16] = "";
+    PGconn     *conn;
+    PGresult   *res;
+    Datum       prov;
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return MemoryContextStrdup(caller_cxt, "retry: SPI_connect 失败");
+    snprintf(sql, sizeof(sql),
+             "SELECT hostname||':'||port FROM partdist.node_map WHERE node_id = %d", target);
+    host = prov_query_text(sql);
+    if (host != NULL)
+        host = MemoryContextStrdup(caller_cxt, host);
+    SPI_finish();
+    if (host == NULL)
+        return psprintf("retry: node_map 里没有节点 %d", target);
+
+    portstr = strchr(host, ':');
+    if (portstr != NULL)
+        *portstr++ = '\0';
+    snprintf(conninfo, sizeof(conninfo),
+             "host=%s port=%s dbname=postgres user=postgres connect_timeout=5 "
+             "application_name=pg_partdist_reprovision",
+             host, portstr ? portstr : "5432");
+
+    /* 目标此刻有没有 armed 回放槽位：有就本来是副本，交接后照常追，不必重供 */
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        char   *msg = psprintf("retry: 连不上节点 %d: %s", target, PQerrorMessage(conn));
+
+        PQfinish(conn);
+        return msg;
+    }
+    /*
+     * 健康副本 = armed 且回放不在 failed 态。P7-N32：armed 但 failed（典型是流内空洞，永久追不上）
+     * 的副本同样要重供 —— 否则它挂着一个坏槽位，升主前置对它恒 -1，这台等于从候选池里消失。
+     */
+    snprintf(sql, sizeof(sql),
+             "SELECT coalesce((SELECT armed AND state <> 'failed' FROM partdist.replay_status() "
+             "WHERE shard = partdist.local_partition_for_shard(%lld)), false)::text",
+             (long long) gsid);
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        strlcpy(armed, PQgetvalue(res, 0, 0), sizeof(armed));
+    else
+    {
+        char   *msg = psprintf("retry: 查节点 %d 的回放槽位失败: %s", target, PQerrorMessage(conn));
+
+        PQclear(res);
+        PQfinish(conn);
+        return msg;
+    }
+    PQclear(res);
+    PQfinish(conn);
+
+    if (strcmp(armed, "true") == 0)
+        return psprintf("not_needed(%d)", target);
+
+    ereport(LOG,
+            (errmsg("pg_partdist: 分片 %lld 的成员节点 %d 没有可用回放槽位（未 armed 或回放 failed），"
+                    "自动重供物理基线让它归队（P7-N25/N32）", (long long) gsid, target)));
+    prov = DirectFunctionCall2(partdist_provision_shard_replica,
+                               Int64GetDatum(gsid), Int32GetDatum(target));
+    return psprintf("done(%d): %s", target, text_to_cstring(DatumGetTextPP(prov)));
+}
+
+PG_FUNCTION_INFO_V1(partdist_reprovision_demoted);
+Datum
+partdist_reprovision_demoted(PG_FUNCTION_ARGS)
+{
+    int64           gsid = PG_GETARG_INT64(0);
+    int32           target = PG_GETARG_INT32(1);
+    MemoryContext   caller_cxt = CurrentMemoryContext;
+    char            sql[256];
+    char           *gstate;
+    char           *members = NULL;
+    StringInfoData  out;
+    bool            any_retry = false;
+    int             me = -1;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("reprovision_demoted() 限超级用户")));
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("reprovision_demoted: SPI_connect 失败")));
+    snprintf(sql, sizeof(sql),
+             "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id = %lld",
+             (long long) gsid);
+    gstate = prov_query_text(sql);
+    if (gstate == NULL || strcmp(gstate, "leader") != 0)
+    {
+        SPI_finish();
+        PG_RETURN_TEXT_P(cstring_to_text("not_leader"));
+    }
+    /*
+     * ★ P7-N30：raft leader 还不够，必须是**在册主**（本地"已升主"标记为真）才以本地数据
+     * 为准给别人发基线。工作者会重试约 5 分钟，期间领导权可能被抢走又抢回 —— 抢回来的
+     * 那一刻本节点可能正落后于流。
+     */
+    {
+        char   *lo;
+
+        snprintf(sql, sizeof(sql),
+                 "SELECT partdist.local_partition_for_shard(%lld)::text", (long long) gsid);
+        lo = prov_query_text(sql);
+        if (lo == NULL || !ShardPromotedMarkRead((Oid) strtoul(lo, NULL, 10)))
+        {
+            SPI_finish();
+            PG_RETURN_TEXT_P(cstring_to_text("not_leader（raft leader 但不是在册主）"));
+        }
+    }
+    /*
+     * target = 0：逐个检查该分区登记里的全部从副本（新主登记时上报的成员集去掉自己）。
+     * 不只查条目里的 old_primary —— 那个值取自提案方的 partition_map，会滞后成 0 或
+     * 指向更早的主（P7-N27）；逐个查 armed 槽位才是对真实状态的判定。
+     */
+    if (target <= 0)
+    {
+        char   *t;
+
+        snprintf(sql, sizeof(sql),
+                 "SELECT array_to_string(secondary_nodes, ',') FROM partdist.partition_map "
+                 "WHERE partition_id = %lld", (long long) gsid);
+        t = prov_query_text(sql);
+        if (t != NULL)
+            members = MemoryContextStrdup(caller_cxt, t);
+        t = prov_query_text("SELECT current_setting('pg_raft.node_id')");
+        if (t != NULL)
+            me = atoi(t);
+    }
+    SPI_finish();
+
+    initStringInfo(&out);
+    if (target > 0)
+    {
+        char   *r = reprovision_check_one(gsid, target, caller_cxt);
+
+        any_retry = (strncmp(r, "retry", 5) == 0);
+        appendStringInfoString(&out, r);
+    }
+    else if (members != NULL && members[0] != '\0')
+    {
+        char   *save = NULL;
+        char   *tok;
+
+        for (tok = strtok_r(members, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save))
+        {
+            int     node = atoi(tok);
+            char   *r;
+
+            if (node <= 0 || node == me)
+                continue;
+            r = reprovision_check_one(gsid, node, caller_cxt);
+            if (strncmp(r, "retry", 5) == 0)
+                any_retry = true;
+            appendStringInfo(&out, "%s%s", out.len > 0 ? "; " : "", r);
+        }
+    }
+    if (out.len == 0)
+        appendStringInfoString(&out, "not_needed(无从副本)");
+
+    if (any_retry)
+        PG_RETURN_TEXT_P(cstring_to_text(psprintf("retry: %s", out.data)));
+    PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+PGDLLEXPORT void PartDistReprovisionWorkerMain(Datum main_arg);
+
+void
+PartDistReprovisionWorkerMain(Datum main_arg)
+{
+    ReprovisionArgs a;
+    int             attempt;
+
+    (void) main_arg;
+    memcpy(&a, MyBgworkerEntry->bgw_extra, sizeof(a));
+    pqsignal(SIGTERM, die);
+    BackgroundWorkerUnblockSignals();
+    /* 新进程的 latch 可能已置位，不先复位的话首轮 WaitLatch 立即返回、5 s 延迟形同虚设（实测 0.2 s 就开供） */
+    ResetLatch(MyLatch);
+
+    /*
+     * 首轮先等 5 s：刚登记完的新主还在广播 fileset 交接、写冻结账目，
+     * 旧主那边也要先把"主权已交出"的 apply 做完、合上读闸门。
+     * 之后每 15 s 重试，最多约 5 分钟 —— 旧主可能正是因为崩溃才被换下，
+     * 要等它重启回来（[10] 崩溃恢复就是这种）。
+     */
+    for (attempt = 0; attempt < 21; attempt++)
+    {
+        char        conninfo[160];
+        char        qry[128];
+        PGconn     *conn;
+        PGresult   *res;
+        bool        finished = false;
+
+        (void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         attempt == 0 ? 5000L : 15000L, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        CHECK_FOR_INTERRUPTS();
+
+        snprintf(conninfo, sizeof(conninfo),
+                 "host=127.0.0.1 port=%d dbname=postgres user=postgres "
+                 "connect_timeout=5 application_name=pg_partdist_reprovision",
+                 PostPortNumber);
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            elog(LOG, "pg_partdist: 自动归队（分片 %lld → 节点 %d）自连失败，稍后重试: %s",
+                 (long long) a.gsid, a.target, PQerrorMessage(conn));
+            PQfinish(conn);
+            continue;
+        }
+        snprintf(qry, sizeof(qry), "SELECT partdist.reprovision_demoted(%lld, %d)",
+                 (long long) a.gsid, a.target);
+        res = PQexec(conn, qry);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+        {
+            const char *v = PQgetvalue(res, 0, 0);
+
+            finished = (strncmp(v, "retry", 5) != 0);
+            elog(LOG, "pg_partdist: 自动归队（分片 %lld → 节点 %d）第 %d 次：%s",
+                 (long long) a.gsid, a.target, attempt + 1, v);
+        }
+        else
+            elog(LOG, "pg_partdist: 自动归队（分片 %lld → 节点 %d）第 %d 次失败，稍后重试: %s",
+                 (long long) a.gsid, a.target, attempt + 1, PQerrorMessage(conn));
+        PQclear(res);
+        PQfinish(conn);
+        if (finished)
+            break;
+    }
+    proc_exit(0);
+}
+
+/*
+ * 在"本节点被登记为分片 gsid 的新主"那次 apply 里调用；target = 0 表示逐个检查全部从副本。
+ * 不抛错：拉不起工作者（槽位满）只留 WARNING —— 退化为修前行为，人手可补
+ * provision_shard_replica。
+ */
+void
+PartDistLaunchReprovision(int64 gsid, int32 target)
+{
+    BackgroundWorker        w;
+    BackgroundWorkerHandle *h;
+    ReprovisionArgs         a;
+
+    if (!partdist_auto_reprovision_demoted)
+        return;
+
+    memset(&w, 0, sizeof(w));
+    w.bgw_flags = BGWORKER_SHMEM_ACCESS;
+    w.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    w.bgw_restart_time = BGW_NEVER_RESTART;
+    snprintf(w.bgw_library_name, BGW_MAXLEN, "pg_partdist");
+    snprintf(w.bgw_function_name, BGW_MAXLEN, "PartDistReprovisionWorkerMain");
+    snprintf(w.bgw_name, BGW_MAXLEN, "pg_partdist reprovision %lld->%d",
+             (long long) gsid, target);
+    snprintf(w.bgw_type, BGW_MAXLEN, "pg_partdist reprovision");
+    a.gsid = gsid;
+    a.target = target;
+    memcpy(w.bgw_extra, &a, sizeof(a));
+
+    if (!RegisterDynamicBackgroundWorker(&w, &h))
+        ereport(WARNING,
+                (errmsg("pg_partdist: 拉不起自动归队工作者（分片 %lld → 节点 %d），"
+                        "后台工作者槽位已满", (long long) gsid, target),
+                 errhint("在当前主上手工执行 SELECT partdist.provision_shard_replica(%lld, %d)。",
+                         (long long) gsid, target)));
+    else
+        ereport(LOG,
+                (errmsg("pg_partdist: 已拉起自动归队工作者：分片 %lld（%s；没有 armed 回放槽位的成员"
+                        "重供基线，P7-N25）", (long long) gsid,
+                        target > 0 ? psprintf("节点 %d", target) : "逐个检查全部从副本")));
 }
 
 /* ================================================================== */
@@ -2362,6 +2728,20 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
         {
             nskipped++;
             appendStringInfo(&out, " quorum_wait:%u", shard);
+            continue;
+        }
+
+        /*
+         * ★ P7-N30（2026-09-18）：只有**在册主**（本地"已升主"持久标记为真）才能以本地数据为准
+         * 发全量基线。raft leader ≠ 在册主：刚当选、还没追平/没登记，或被取代后又抢回领导权的
+         * 旧主，本地数据都可能落后 —— 由它发基线就是让所有副本截断后按陈旧数据重建（实测丢了
+         * 60 行已提交数据）。跳过记为 skipped（PartWALNoteDivergedPending 保证之后再试），
+         * 等它真登记成主、标记置真后由心跳自动修复接手。
+         */
+        if (!ShardPromotedMarkRead(shard))
+        {
+            nskipped++;
+            appendStringInfo(&out, " not_primary:%u", shard);
             continue;
         }
 

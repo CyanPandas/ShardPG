@@ -438,6 +438,7 @@ DECLARE
     bound   BIGINT;
     got     BIGINT;
     ndiv    BIGINT;
+    caught_up BOOLEAN := true;   -- P7-N30：本次升主是否真的追平（兜底放行时为假）
 BEGIN
     -- 返回值三态：1 = 可以上报；0 = 还没好，稍后重试；**-1 = 分叉，永不上报**。
     -- 三态而不是布尔，是因为"还没追平"可以被 deadline 兜底放行（可用性优先），
@@ -556,6 +557,17 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'pg_raft: 升主追平 shard % (组 %) 失败: %',
                           loid, p_group_id, SQLERRM;
+            -- ★ P7-N32（2026-09-18，P0 丢数据）：流内空洞是**永久**性的——等多久都补不上，
+            --   兜底放行就是拿明知残缺的本地数据登记成主。实测（N25 回归）：原始主 A 重供后
+            --   空洞追不上，被切回、60 s 后 force 登记，协调者从此只读到 120 行（应为 180），
+            --   随后在册主 A 的心跳修复把这份残缺基线推给了健康的 B/C，丢失落地。
+            --   返回 -1 ⇒ BGW 主动让位（P7-N14），由追平了的成员当选；新主的自动归队
+            --   （P7-N25）会把回放 failed 的本节点重供基线。
+            IF SQLERRM LIKE '%流内空洞%' THEN
+                RAISE WARNING 'pg_raft: 分片 % (组 %) 回放流有空洞、永久追不上，拒绝升主'
+                              '（兜底也不放行：否则登记的是残缺数据，P7-N32）', loid, p_group_id;
+                RETURN -1;
+            END IF;
             IF NOT p_force THEN
                 RETURN 0;
             END IF;
@@ -563,6 +575,9 @@ BEGIN
         END;
         IF (got IS NULL OR got < bound) AND NOT p_force THEN
             RETURN 0;           -- 这一片没追完，下个 tick 接着追
+        END IF;
+        IF got IS NULL OR got < bound THEN
+            caught_up := false; -- 兜底放行：本地数据落后于流
         END IF;
     END IF;
 
@@ -612,12 +627,23 @@ BEGIN
     -- 修复动作是重做物理基线。此刻是个安全的自动触发点：追平刚做完、本节点
     -- 是组 leader（基线要走 raft 写路径）、且还没对外服务。
     -- 尽力而为：修不动不挡升主（多数派可能还没回来），标记留着下次再修。
-    BEGIN
-        PERFORM partdist.repair_diverged_shards();
-    EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
-                      loid, p_group_id, SQLERRM;
-    END;
+    -- ★ P7-N30（2026-09-18，P0 丢数据）：上面那句"追平刚做完"在兜底放行时**不成立**。
+    --   修复 = 以本地数据为准发全量物理基线、让其余副本截断重建；本地没追平时，那等于拿
+    --   陈旧数据覆盖健康副本。实测（N25 回归）：原始主 A 流内空洞追不上，当选后 60 s 兜底，
+    --   force 这一轮顺带修复发出基线（plsn 221），副本 C 截空后按 A 的 120 行重建；随后 C
+    --   当选登记，B 任期内写的 60 行已提交数据从此不可见。没追平就不修，标记留给当上
+    --   在册主之后的心跳自动修复（repair_diverged_shards 自己也只让在册主发基线）。
+    IF caught_up THEN
+        BEGIN
+            PERFORM partdist.repair_diverged_shards();
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+        END;
+    ELSE
+        RAISE LOG 'pg_raft: 分片 % (组 %) 兜底放行、本地未追平，跳过升主顺带的分叉修复'
+                  '（从落后数据发基线会覆盖健康副本，P7-N30）', loid, p_group_id;
+    END IF;
 --
     -- ★★ T6.4（解冻批次 #6）：§6.6 第三支，切主认领。
     --

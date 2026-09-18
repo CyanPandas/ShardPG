@@ -9,16 +9,16 @@
 # 修法：槽位 promoted_clean（升主置真；降级或 follower append 真正落下他人写的 DATA/MARKER 置假）+
 #   partdist.shard_promoted_selfheld(oid)；promote_prepare_ex 在 selfheld 为真时跳过那条注定失败的追平。
 #
-# 构造：先 replay_disable B 的槽位，再受控切到 B —— B 当选后升主前置 -1 主动让位、从不登记；
-#   随即受控切回 A。必须亲眼看到 B 当选过、且 A 夺回时 partition_map 未变、selfheld=t，才算构造成；
-#   3 次都没构造成只报不判。
+# 构造：[1] 末尾经 A 写一批并把 A 的 raft 已应用游标推过回放游标（合成 [9] 的 bound>app 前提，理由见该处）；
+#   再 replay_disable B 的槽位、受控切到 B —— B 当选后升主前置 -1 主动让位、从不登记；随即受控切回 A。
+#   必须亲眼看到 B 当选过、A 夺回时 partition_map 未变、selfheld=t、bound>app，才算构造成；3 次都没构造成只报不判。
 # 断言：A 以新任期（primary_term 增加）重新登记用时 < REG_LIMIT_S（默认 30 s，修前 ≥ 60 s）；
 #   A 日志出现"跳过追平"、没有"已升主，不再回放别人的流"；行数不变、可继续写。
 # 负向对照：把 promote_prepare_ex 换回修前版本后本用例必红（修复验收时实测一次）。
 set -u
 CONTAINER="${CONTAINER:-pg-test-container}"
 COORD=5432
-ROWS="${ROWS:-40}"; REG_LIMIT_S="${REG_LIMIT_S:-30}"; TRIES="${TRIES:-3}"
+ROWS="${ROWS:-40}"; ROWS2="${ROWS2:-30}"; REG_LIMIT_S="${REG_LIMIT_S:-30}"; TRIES="${TRIES:-3}"
 PASS=0; FAIL=0
 DEX()  { docker exec -i -u postgres "$CONTAINER" "$@"; }
 PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
@@ -99,6 +99,19 @@ check "受控切到 A" "$st" "leader"
 reg=""; for t in $(seq 1 90); do [[ "$(pm)" == "${NID[$A]} "* ]] && { reg=ok; break; }; sleep 2; done
 check "登记 A 为主（由副本升上来）" "$reg" "ok"
 check "A 已升主且干净（shard_promoted_selfheld）" "$(Q $A "SELECT partdist.shard_promoted_selfheld($(lo_of $A)::oid)")" "t"
+Q $COORD "INSERT INTO rn23 SELECT g, repeat('b', 120) FROM generate_series($((ROWS+1)), $((ROWS+ROWS2))) g" >/dev/null
+check "经 A 再写 $ROWS2 行（A 自写的尾巴）" "$(Q $COORD "SELECT count(*) FROM rn23")" "$((ROWS+ROWS2))"
+# ★ 合成 [9] 现场的前提：A 的 raft 已应用游标（bound = follower_applied_part_lsn）越过回放游标（app），
+#   且越过的那一截**全是 A 自己当主时写的**。[9] 里 :5434 正是这个状态（连续 16 次"已升主，不再回放别人的流"），
+#   但单组用例里两种自然构造都推不动它：leader 自写记录走 in_txn apply、不写这一列；中途当选者追加的 DTX
+#   也没推动（09-18 实测）。这里用产品函数 follower_set_applied_part_lsn（单调推进）把它推到 A 的 flush ——
+#   等价于"这些自写记录后来在 follower 身份下被 apply 了一遍"，正是 [9] 的成因推断。
+loA=$(lo_of $A); fA=$(Q $A "SELECT partdist.get_partition_flush_lsn($loA)")
+Q $A "SELECT partdist.follower_set_applied_part_lsn($loA, $fA)" >/dev/null
+bnd0=$(Q $A "SELECT partdist.get_follower_applied_part_lsn($loA)"); app0=$(Q $A "SELECT applied FROM partdist.replay_status() WHERE shard=$loA")
+echo "  合成后 A：bound=$bnd0 app=$app0 flush=$fA"
+check "合成前提：A 的 bound > app" "$([[ -n "$bnd0" && -n "$app0" && "$bnd0" -gt "$app0" ]] && echo ok)" "ok"
+check "合成前提：A 仍 selfheld（自写记录不经 follower append）" "$(Q $A "SELECT partdist.shard_promoted_selfheld($loA::oid)")" "t"
 
 echo "========== [2] 构造：B 当选但登记不了（槽位 disarm ⇒ 升主前置 -1 让位），随即切回 A =========="
 # ★ 确定性构造"中途当选、从未登记"的 B：先 replay_disable B 的槽位，B 赢选举后升主前置走
@@ -136,8 +149,7 @@ for try in $(seq 1 $TRIES); do
 done
 if [[ "$built" != ok ]]; then
   echo "  [只报] $TRIES 次都没构造出 N23 的完整前提（B 当选过且未登记、A 未降级夺回、selfheld=t、且 A 的 bound > app），本轮不判 N23"
-  echo "         —— 2026-09-18 实测：A 自己当主时写的记录在 leader 侧走 in_txn apply，不推 follower_applied；中途当选者追加的"
-  echo "            DTX 记录也没推动它。[9] 现场 bound>app 的来源未能在单组用例里复现，N23 修复目前是**逻辑修复、未经实测**。"
+  echo "         （前提由 [1] 末尾合成；这里没构造成通常是 B 当选/A 夺回的时机问题，看上面每次的明细）"
 else
   echo "========== [3] A 以新任期重新登记：不得空转到 60 s 兜底 =========="
   newreg=""; for t in $(seq 1 120); do c=$(pm); [[ "${c%% *}" == "${NID[$A]}" && "${c#* }" -gt "$term0" ]] && { newreg=ok; break; }; sleep 1; done
@@ -151,9 +163,9 @@ else
 fi
 
 echo "========== [4] 数据完整、可继续写 =========="
-check "行数不变" "$(Q $COORD "SELECT count(*) FROM rn23")" "$ROWS"
-Q $COORD "INSERT INTO rn23 VALUES ($((ROWS+1)), 'z')" >/dev/null
-check "经协调者再写一行" "$(Q $COORD "SELECT count(*) FROM rn23")" "$((ROWS+1))"
+check "行数不变" "$(Q $COORD "SELECT count(*) FROM rn23")" "$((ROWS+ROWS2))"
+Q $COORD "INSERT INTO rn23 VALUES ($((ROWS+ROWS2+1)), 'z')" >/dev/null
+check "经协调者再写一行" "$(Q $COORD "SELECT count(*) FROM rn23")" "$((ROWS+ROWS2+1))"
 
 echo "========== [5] 健康 =========="
 health_check_no_crash

@@ -314,6 +314,55 @@ pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
         return false;
 
     /*
+     * ★ P7-N27（2026-09-18）：提案里没带前任主时，用**本节点按日志序应用到此刻**的登记补上。
+     *
+     * 提案里的 old_primary_node 是 pg_raft_report_data_leader 在**当时的 group0 leader** 上读
+     * partition_map 得来的；而 group0 leader 的 apply 可以落后于 commit（实测 worker1/2 把
+     * A 的 term 1 登记与 B 的 term 2 登记在 76 s 后同一批 apply）。B 的上报恰好落在一个还没
+     * apply A 登记的 leader 上 ⇒ 条目里写着 old_primary=0。后果：旧主 A 的"主权已交出"分支
+     * 从不执行 —— 它本地一直以为自己是主（读闸门开着、拒绝回放），新主侧 P7-N25 的自动归队
+     * 也因为"没有前任主"不启动（N25 回归第 2 跑实测）。
+     *
+     * apply 在各成员上按同一日志序执行，此刻本地这一行**通常**就是上一条已生效的登记 ——
+     * 但见下面"只补缺不覆盖"的说明：它也会因为 apply 事务回滚而陈旧。
+     */
+    {
+        StringInfoData pre;
+        int            prev_primary = 0;
+
+        initStringInfo(&pre);
+        appendStringInfo(&pre,
+                         "SELECT primary_node FROM partdist.partition_map WHERE partition_id = %u",
+                         partition_id);
+        if (SPI_execute(pre.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            bool    pisnull;
+            Datum   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &pisnull);
+
+            if (!pisnull)
+                prev_primary = DatumGetInt32(d);
+        }
+        pfree(pre.data);
+
+        /*
+         * ★ 只**补缺**不**覆盖**（2026-09-18 二改）：首版无条件以本地行为准，最终回归里栽了——
+         * 本地行也会陈旧：apply 跑在承载它的 RPC 会话事务里，那个事务后来若 ERROR 回滚，
+         * partition_map 的 UPSERT 随之撤销，而 raft 的 last_applied（共享内存）已经推过去、
+         * 不会再 apply（P7-N29，实测 worker3 的 term 3 登记被回滚，之后读到的"上一条"是 term 2 的主）。
+         * 两个来源各有各的陈旧方式，谁都不能单独信；降级改由本地"已升主"持久标记兜底
+         * （raft_boundary.c），这里只在提案值缺失（0）时用本地行补一个。
+         */
+        if (old_primary_node <= 0 && prev_primary > 0)
+        {
+            elog(LOG,
+                 "pg_raft: partition %u 登记条目里没带前任主（提案方 partition_map 滞后），"
+                 "按本节点已应用的登记补为 %d",
+                 partition_id, prev_primary);
+            old_primary_node = prev_primary;
+        }
+    }
+
+    /*
      * 任期栅栏：只接受任期不回退的更新。数据组自治选举的任期单调递增，
      * 迟到的旧任期登记（或旧"控制面指定"通道的 term=0 提案）不能覆盖
      * 新任期的结果。栅栏放在 apply 里，group 0 各成员按同一日志序执行，

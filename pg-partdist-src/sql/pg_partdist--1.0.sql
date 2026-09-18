@@ -1294,6 +1294,12 @@ CREATE OR REPLACE FUNCTION provision_shard_replica(
 ) RETURNS TEXT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_provision_shard_replica';
 
+-- P7-N25：新主登记后由一次性工作者调用；也可人工调。在本节点（须是该组 leader）上判定前任主 p_target
+-- 有无 armed 回放槽位，没有就 provision_shard_replica(p_gsid, p_target)。返回 not_leader / not_needed / done: … / retry: …
+CREATE OR REPLACE FUNCTION reprovision_demoted(p_gsid BIGINT, p_target INTEGER)
+    RETURNS TEXT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_reprovision_demoted';
+
 COMMENT ON FUNCTION provision_shard_replica(BIGINT, INTEGER) IS
     '把「给分片 X 在节点 N 上建一个副本」做成一个入口：本地登记 fileset → 发物理基线（§13 约束 2 的静止点）→ 到目标节点建壳表、按该基线的 partition_lsn 配 locmap、arm 回放。此前 register_shard_fileset/replay_set_locmap/replay_enable 在产品代码里没有任何调用方，副本只能靠人手建。须在该分片的 leader 上、由超级用户调用。';
 

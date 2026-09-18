@@ -628,8 +628,8 @@ DestroyPartitionWALWriter(PartitionWALWriter *writer)
  * 的幂等去重（expected <= last 即跳过）反而会保留旧字节 —— 物理回放就会
  * 重放错误的内容。所以日志截断必须同步截断 parwal。
  *
- * 做法：定位第一条 partition_lsn > keep_upto_plsn 的记录的起始偏移，把该段
- * 文件 ftruncate 到这个偏移，删除其后的所有段文件，并回退 checkpoint。
+ * 做法：逐段逐记录剔除 partition_lsn > keep_upto_plsn 的记录（整段删 / 截尾 / 重写），
+ * 并回退 checkpoint。**不按段名顺序推断 plsn 顺序**，见函数体内 P7-N1 之二的说明。
  *
  * 返回是否真的截断了内容。
  */
@@ -637,16 +637,35 @@ bool
 TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
                   uint64 keep_upto_plsn)
 {
+    /*
+     * ★ P7-N1 之二（2026-09-18）：**不许按段文件名顺序推断 plsn 顺序**。
+     *
+     * 原实现把段文件按名字排序，找到"名字序里第一条 plsn > keep 的记录"，截断该段、
+     * 并把**名字排在后面的段整个删掉**。前提是"段名升序即 plsn 升序"——段名取自记录的
+     * orig_lsn 所在 pg_wal 段，而一个分区流里的记录可能来自**不同节点的 WAL 坐标系**：
+     * 被降级的原始主，自己当主时写的记录按**本机** LSN 落段，降级后收的新主记录按
+     * **新主** LSN 落段，两套坐标互不相干。实测（N25 回归，2026-09-18）：A 自己的旧记录和
+     * 一条孤儿（它降级后仍尝试发冻结账目、写下又被拒）在 …36 段，新主 B 发来的已提交
+     * 记录 141–147 在 …47 段；替换孤儿要截到 147 ⇒ 名字序里先在 …36 碰到孤儿 148 ⇒
+     * 截 …36、把 …47 整个删掉 ⇒ 已提交的 141–147 灰飞烟灭 ⇒ `流内空洞：期望 142，
+     * 下一条已存在的是 148`。空洞让该副本永远追不上（P7-N32 的起点）。
+     *
+     * 现在逐段、逐记录判：
+     *   · 段内没有 > keep 的记录 ⇒ 不动；
+     *   · 段内全是 > keep ⇒ 删；
+     *   · 段内 > keep 的记录都在尾部 ⇒ 截到第一条 > keep 处；
+     *   · 段内 > keep 之后还夹着 ≤ keep 的记录 ⇒ 只保留 ≤ keep 的记录**重写**该段。
+     * checkpoint 回退用的 last_kept_lsn 取**全体段里 plsn ≤ keep 的最大那条**的 orig_lsn，
+     * 同样不依赖段名顺序。残尾（magic 不对）照旧视为该段结束，不另做处理。
+     */
     char           dirpath[MAXPGPATH];
     DIR           *dir;
     struct dirent *de;
     char           segfiles[256][MAXPGPATH];
     int            nfiles = 0;
-    int            i, j;
+    int            i;
     bool           truncated = false;
-    bool           cut_found = false;
-    int            cut_file = -1;
-    off_t          cut_off = 0;
+    uint64         best_kept_plsn = 0;
     XLogRecPtr     last_kept_lsn = InvalidXLogRecPtr;
 
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
@@ -669,26 +688,16 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
     if (nfiles == 0)
         return false;
 
-    /* 段文件名升序即 partition_lsn 升序 */
-    for (i = 0; i < nfiles - 1; i++)
-        for (j = i + 1; j < nfiles; j++)
-            if (strcmp(segfiles[i], segfiles[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-
-                strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                strlcpy(segfiles[j], tmp,         MAXPGPATH);
-            }
-
-    /* 第一遍：找到切点（第一条 plsn > keep_upto 的记录的起始偏移） */
-    for (i = 0; i < nfiles && !cut_found; i++)
+    for (i = 0; i < nfiles; i++)
     {
         char          filepath[MAXPGPATH];
         int           fd;
         PartWALRecord rec;
         ssize_t       nb;
         off_t         off = 0;
+        off_t         first_bad = -1;   /* 段内第一条 > keep 的偏移 */
+        bool          mixed = false;     /* 其后还有 ≤ keep 的记录 */
+        bool          any_kept = false;
 
         snprintf(filepath, MAXPGPATH, "%s/%s", dirpath, segfiles[i]);
         fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
@@ -699,59 +708,55 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
                == (ssize_t) sizeof(PartWALRecord))
         {
             if (rec.magic != PARTWAL_MAGIC)
-                break;                  /* 尾部残record，就地当作切点 */
+                break;                  /* 残尾：本段到此为止 */
 
             if (rec.partition_lsn > keep_upto_plsn)
             {
-                cut_found = true;
-                cut_file  = i;
-                cut_off   = off;
-                break;
+                if (first_bad < 0)
+                    first_bad = off;
             }
-
-            /*
-             * ★ 非 WAL 记录（orig_lsn==0：DTX / 部分 CTRL）**不得**把
-             * last_kept_lsn 拉回 0 —— 它会经下面的 WritePartWALCheckpoint
-             * 写进 checkpoint 的 last_wal_lsn，而那是"当前段号"的持久化依据。
-             * 与写入侧 AppendPartWALRecordAt 里的同款守卫成对（见那里的注释）。
-             *
-             * 2PC 负载下这不是边角情况：PartDistDtxPrePrepareFinish 是在
-             * PartWALFlush **之后**追加 DTX 记录的，所以流尾常年是 orig_lsn=0
-             * 的记录，截断切点落在上面的概率很高。一旦落 0，后续记录会被写进
-             * 1 号段（段名序与 plsn 序倒置），且 DemuxCrashRecovery 会因
-             * scan_start 无效而整个跳过 WAL 重扫描。
-             */
-            if (rec.orig_lsn != InvalidXLogRecPtr)
-                last_kept_lsn = rec.orig_lsn;
+            else
+            {
+                any_kept = true;
+                if (first_bad >= 0)
+                    mixed = true;
+                if (rec.partition_lsn >= best_kept_plsn &&
+                    rec.orig_lsn != InvalidXLogRecPtr)
+                {
+                    best_kept_plsn = rec.partition_lsn;
+                    last_kept_lsn = rec.orig_lsn;
+                }
+            }
             off += (off_t) (sizeof(PartWALRecord) + rec.data_len);
             if (lseek(fd, off, SEEK_SET) != off)
                 break;
         }
-
         CloseTransientFile(fd);
-    }
 
-    if (!cut_found)
-        return false;                   /* 本地没有超出 keep_upto 的内容 */
+        if (first_bad < 0)
+            continue;                   /* 本段没有要丢的 */
 
-    /* 第二遍：截断切点所在文件，删除其后的段文件 */
-    for (i = cut_file; i < nfiles; i++)
-    {
-        char filepath[MAXPGPATH];
-
-        snprintf(filepath, MAXPGPATH, "%s/%s", dirpath, segfiles[i]);
-
-        if (i == cut_file && cut_off > 0)
+        if (!any_kept)
         {
-            int fd = OpenTransientFile(filepath, O_RDWR | PG_BINARY);
-
+            /* 全段都 > keep：整段删 */
+            if (unlink(filepath) == 0)
+                truncated = true;
+            else if (errno != ENOENT)
+                ereport(WARNING,
+                        (errcode_for_file_access(),
+                         errmsg("pg_partdist: 无法删除段文件 \"%s\": %m", filepath)));
+        }
+        else if (!mixed)
+        {
+            /* > keep 的都在尾部：截到第一条处 */
+            fd = OpenTransientFile(filepath, O_RDWR | PG_BINARY);
             if (fd >= 0)
             {
-                if (ftruncate(fd, cut_off) != 0)
+                if (ftruncate(fd, first_bad) != 0)
                     ereport(WARNING,
                             (errcode_for_file_access(),
                              errmsg("pg_partdist: 无法截断 \"%s\" 到 %lld: %m",
-                                    filepath, (long long) cut_off)));
+                                    filepath, (long long) first_bad)));
                 else
                 {
                     if (pg_fsync(fd) != 0)
@@ -766,14 +771,59 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
         }
         else
         {
-            /* 切点在段首（cut_off == 0）时该段整体删除 */
-            if (unlink(filepath) == 0)
+            /* > keep 之后还夹着 ≤ keep：只保留 ≤ keep 的记录重写本段 */
+            char    tmppath[MAXPGPATH];
+            int     in_fd;
+            int     out_fd;
+            bool    ok = true;
+
+            snprintf(tmppath, MAXPGPATH, "%s.trunc.tmp", filepath);
+            in_fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
+            out_fd = OpenTransientFile(tmppath, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+            if (in_fd < 0 || out_fd < 0)
+                ok = false;
+            while (ok && (nb = read(in_fd, &rec, sizeof(PartWALRecord)))
+                   == (ssize_t) sizeof(PartWALRecord))
+            {
+                char   *buf = NULL;
+
+                if (rec.magic != PARTWAL_MAGIC)
+                    break;
+                if (rec.data_len > 0)
+                {
+                    buf = palloc(rec.data_len);
+                    if (read(in_fd, buf, rec.data_len) != (ssize_t) rec.data_len)
+                    {
+                        pfree(buf);
+                        ok = false;
+                        break;
+                    }
+                }
+                if (rec.partition_lsn <= keep_upto_plsn)
+                {
+                    if (write(out_fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
+                        (rec.data_len > 0 &&
+                         write(out_fd, buf, rec.data_len) != (ssize_t) rec.data_len))
+                        ok = false;
+                }
+                if (buf != NULL)
+                    pfree(buf);
+            }
+            if (ok && pg_fsync(out_fd) != 0)
+                ok = false;
+            if (in_fd >= 0)
+                CloseTransientFile(in_fd);
+            if (out_fd >= 0)
+                CloseTransientFile(out_fd);
+            if (ok && durable_rename(tmppath, filepath, WARNING) == 0)
                 truncated = true;
-            else if (errno != ENOENT)
+            else
+            {
+                (void) unlink(tmppath);
                 ereport(WARNING,
-                        (errcode_for_file_access(),
-                         errmsg("pg_partdist: 无法删除段文件 \"%s\": %m",
-                                filepath)));
+                        (errmsg("pg_partdist: 重写段文件 \"%s\"（剔除 plsn > %llu）失败",
+                                filepath, (unsigned long long) keep_upto_plsn)));
+            }
         }
     }
 

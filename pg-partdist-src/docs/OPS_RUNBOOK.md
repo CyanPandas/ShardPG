@@ -285,10 +285,25 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
   `pg_raft_group_status()` 里该组 `state='leader'`，再等协调者 `partdist.partition_map.primary_node` 变成目标节点。
   ❌ **不要**再用"旧主 `pg_raft.heartbeat_ms` 调大 + 目标 `pg_raft.election_timeout_ms` 调小"——两个 GUC 作用于**节点上全部组**，
   实测一次把 6 个组全压到同一台，升主前置串行排队，目标组排不到号就丢主（P7-N24）。
-- **切主目标必须有 armed 回放槽位**：`SELECT armed FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(<gid>)`
-  为 `t`。**被降级的原始主没有**（P7-N25）：它收着新主的流却无从回放，升主前置恒 -1 让位。先在当前主上
-  `SELECT partdist.provision_shard_replica(<gid>, <该节点 node_id>)` 重供（供前按 §7.3 N15 抬选举超时），追平后再切。
+- **切主目标必须有 armed 回放槽位**：`SELECT armed FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(<gid>)` 为 `t`。
+  被降级的原始主本来没有（P7-N25）。**2026-09-18 起自动处理**：新主登记后会拉起一次性工作者（日志 `已拉起自动归队工作者`），
+  前任主没有槽位就替它重供基线（`自动归队 … 第 N 次：done: …`），通常几秒内完成；旧主宕机时每 15 s 重试约 5 分钟。
+  关掉：`pg_partdist.auto_reprovision_demoted = off`。自动路径失败或关掉时，人工在当前主上 `SELECT partdist.reprovision_demoted(<gid>, <node_id>)`
+  （会先判定要不要供）或直接 `provision_shard_replica(<gid>, <node_id>)`。
+- **P7-N26（已修）识别**：旧版本里切回一个当过主的节点后，写入报 `等待组 N 的复制认领位超过 60000 ms，prepare 失败`，持有者是新主上正在做
+  主权交接广播的 backend；该组 `partdist.raft_log` 新任期里出现与上一任期同 plsn 的大批 OP_PARWAL。新版本当选即打 `当选后把复制下界从 plsn X 抬到 Y`。
+- **P7-N27（已修）识别**：旧版本里 `apply partition primary … old_primary=0 new_primary=N` 出现在一个早已登记过主的分区上，且被取代的旧主日志里
+  没有 `主权已交给节点 N`——它本地仍以为自己是主。新版本 apply 时以本地上一条登记为准，打 `登记条目里的前任主=0 与…不一致，以后者为准`。
+- **P7-N32（已修）回放流有空洞的节点不再被兜底登记**：日志 `回放流有空洞、永久追不上，拒绝升主（兜底也不放行…）` + `主动让位`，由追平的成员当选；
+  新主登记后的自动归队会把"armed 但回放 failed"的成员重供基线（日志 `没有可用回放槽位（未 armed 或回放 failed）`）。旧版本的危险形态：切主后读到的行数变少、
+  某节点日志有 `升主前置超过 60000 ms 仍未追平，转入兜底` 且其回放报 `流内空洞`——那一刻登记的是残缺数据，须从健康副本重建。
+- **P7-N1 之二（已修）空洞成因**：旧版本在被降级的原始主上替换孤儿记录时按段名顺序截断，会删掉新主发来的已提交记录（`流内空洞：期望 N，下一条已存在的是 M`）。
+  新版本逐段逐记录截断；旧版本遇到此症状：在当前在册主上 `SELECT partdist.provision_shard_replica(<gid>, <该节点>)` 重供。
 - **P7-N21（未修）`DROP TABLE` 挂死且杀不掉**：`pg_stat_activity` 里 DROP 长时间 active、`wait_event` 为空、`pg_blocking_pids` 为空；`ps` 为 `Rs` 且 CPU 时间持续上涨，`/proc/<pid>/io` 的 syscr 不动（纯用户态死循环）。`pg_cancel_backend` / `pg_terminate_backend` / `statement_timeout` **全部无效**（循环不查中断）。唯一处置：`pg_ctl -D <datadir> -m immediate restart` 重启该节点（SIGQUIT 有效）。它会吃掉约 2/3 个 vCPU，2 vCPU 机器上会拖慢同机其余一切，发现即处置。
+  **取证（重启回收之前先做）**：须事先 `ALTER SYSTEM SET pg_partdist.debug_sigusr2_backtrace = on` + reload（处理器在 utility 语句入口逐后端懒装，
+  所以要在那条 DROP 开始**之前**就开着；pg-test 环境已常开）。卡住后 `docker exec -u postgres <容器> kill -USR2 <pid>` 采 2–3 次，每次日志里出现
+  `pg_partdist: SIGUSR2 采样 pid N 栈回溯：` 加一段 backtrace，进程继续跑；`xxx.so(+0xOFF)` 用 `gdb -batch -ex 'info symbol 0xOFF' <该 .so 路径>` 解析。
+  采完把栈贴进 P7-N21 再重启。
 - **识别 P7-N22（已修，旧版本才会见到）**：副本回放日志每 250 ms 一条 `追平失败: unexpected data beyond EOF in block N of relation …`，
   多见于"当过主又降回副本"的节点收到全量基线之后；或同类节点回放静默跳过页面、逐字节比对不一致。旧版本处置：重启该节点的回放 worker
   （整节点重启）后重供基线；升级到含 `ReplayForgetCachedSizes` 的版本即根除。

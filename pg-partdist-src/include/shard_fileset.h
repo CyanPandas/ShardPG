@@ -110,6 +110,9 @@ extern void ShardFilesetMaybeEmitUpdates(void);
  * 漏发；放在提交已成定局之后既补上了这一格，又避开了 ROLLBACK PREPARED 的窗口。
  */
 extern void ShardFilesetEmitDropNotices(bool force);
+/* P7-N25：新主登记后给没有回放槽位的前任主自动重供基线 */
+extern bool partdist_auto_reprovision_demoted;
+extern void PartDistLaunchReprovision(int64 gsid, int32 target);
 
 /* GUC：单次 fileset 变更最多把多少个块以 FPI 形式灌进流（超限只发通知） */
 extern int  fileset_inline_max_blocks;
