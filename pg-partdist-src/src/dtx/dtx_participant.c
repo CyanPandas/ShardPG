@@ -516,6 +516,100 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
                                              : XLOG_XACT_ABORT,
                                    fin_marker, fin_marker_len);
 
+        /*
+         * ★ P7-N13（2026-09-18）：ROLLBACK PREPARED 的终局标记要**带分片 xid**，
+         * 否则副本永远学不到这笔的 ABORT。
+         *
+         * 上面那条 fin_marker 由 PartWALBuildMarkerPayload 造，它按
+         * `ShardXidXactCount() > 0` 决定带不带分片 xid 尾 —— 而本钩子跑在
+         * **另一个事务**（COMMIT/ROLLBACK PREPARED 自己那个）里，计数恒 0，
+         * 于是发出去的是 24 字节旧格式。回放侧 `TransactionIdIsValid(sxid)` 为假 ⇒
+         * `ShardClogSetVerdict` 被跳过 ⇒ **主上 st=3、两个副本永远 st=1(PREPARED)**。
+         * 副本一旦升主，这笔就成了"找不到决议的 in-doubt"：协调组按 2PC 推定中止
+         * 压根没写决议行（实测 dtx_participant / dtx_decision 全网无行、流里只有
+         * DTX_PREPARE），四级寻址只认权威 COMMIT，于是安全地保持不动 —— 行永久不可见。
+         * 实测现场：gxid=281474976770860，PREPARE 标记 32 字节（带尾），
+         * 而 plsn 105 的 ABORT 标记只有 24 字节。
+         *
+         * COMMIT 方向不在这里补：它还缺第二个权威值 commit_ts（见 T7.1/R-P6-15 的
+         * 长注释），由未决登记通道的 dtx_replicate_verdict 落账。ABORT 没有这个问题
+         * （commit_ts 恒 0），可以就地补齐：按 dtxid 从流里把 PREPARE 标记的分片 xid
+         * 找回来（partwal_prepare_sxid），再走与 leader 侧同构的 shard_verdict_apply
+         * （落本地分片 clog + 追加带分片 xid 的判决标记复制给副本）。
+         * 复制失败不上抛（函数内部自己吞并返回 false），与既有语义一致。
+         */
+        if (!committed && dtxid != 0)
+        {
+            StringInfoData  vq;
+            TransactionId   sxid = InvalidTransactionId;
+            int64           hdr_gxid = 0;
+
+            initStringInfo(&vq);
+            appendStringInfo(&vq,
+                             "SELECT sxid, hdr_gxid FROM partdist.partwal_prepare_sxid("
+                             "%u::oid, %lld::bigint, "
+                             "partdist.get_partition_flush_lsn(%u::oid))",
+                             (unsigned) local_oid, (long long) dtxid,
+                             (unsigned) local_oid);
+            if (SPI_execute(vq.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                bool  n1,
+                      n2;
+                Datum d1 = SPI_getbinval(SPI_tuptable->vals[0],
+                                         SPI_tuptable->tupdesc, 1, &n1);
+                Datum d2 = SPI_getbinval(SPI_tuptable->vals[0],
+                                         SPI_tuptable->tupdesc, 2, &n2);
+
+                if (!n1)
+                    sxid = (TransactionId) DatumGetInt64(d1);
+                if (!n2)
+                    hdr_gxid = DatumGetInt64(d2);
+            }
+            pfree(vq.data);
+
+            /*
+             * ★ 只在该分片 xid **仍是 PREPARED（st=1）** 时才落 ABORT。
+             *
+             * shard_verdict_apply 是无条件覆写：槽位若已是 COMMITTED，覆成 ABORT
+             * 会把一笔已提交事务翻掉 —— 它插入的行消失、它 UPDATE 掉的旧版本复活，
+             * 实测总额 +1001、分片上冒出重复行（同一 id 两个可见版本）。
+             * N12 之二的 in-doubt 闭合本来就用 `shard_clog_status(...)=1` 过滤过，
+             * 这条补判决的路径漏了同一道闸。按 dtxid 回查 sxid 理论上唯一，但
+             * 只要有一次错配就是不可逆的数据损坏，闸门必须在。
+             */
+            if (TransactionIdIsNormal(sxid))
+            {
+                int st = -1;
+
+                initStringInfo(&vq);
+                appendStringInfo(&vq,
+                                 "SELECT partdist.shard_clog_status(%u::oid, %lld::bigint)",
+                                 (unsigned) local_oid, (long long) sxid);
+                if (SPI_execute(vq.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+                {
+                    bool  isnull;
+                    Datum d = SPI_getbinval(SPI_tuptable->vals[0],
+                                            SPI_tuptable->tupdesc, 1, &isnull);
+
+                    if (!isnull)
+                        st = DatumGetInt32(d);
+                }
+                pfree(vq.data);
+
+                if (st == 1)            /* TXN_PREPARED */
+                {
+                    initStringInfo(&vq);
+                    appendStringInfo(&vq,
+                                     "SELECT partdist.shard_verdict_apply("
+                                     "%u::oid, %lld::bigint, %lld::bigint, false, 0::bigint)",
+                                     (unsigned) local_oid, (long long) sxid,
+                                     (long long) hdr_gxid);
+                    (void) SPI_execute(vq.data, false, 1);
+                    pfree(vq.data);
+                }
+            }
+        }
+
         PartWALNoteTouchedPartition(local_oid);
     }
 
