@@ -3380,68 +3380,20 @@ step_down_if_higher(RaftGroupCtx *ctx, int64 their_term)
  * （一条 SPI，只在"曾让位 + 截止期已到"时才跑），没 armed 就只推后一个周期、只投票；
  * armed 了清标记照常参选。5 个周期的退避仍保留，作为查询失败时的最小静默。
  */
-static bool        *unpromotable_flag = NULL;      /* 按 RaftGroups->groups[] 下标；RAFT_MAX_GROUPS 是运行期值，与 promote_slots 同样惰性分配 */
-static TimestampTz *unpromotable_logged = NULL;
-
-static int
-group_slot_index(RaftGroupCtx *ctx)
-{
-    ptrdiff_t d = ctx->g - RaftGroups->groups;
-
-    if (unpromotable_flag == NULL)
-    {
-        unpromotable_flag = (bool *)
-            MemoryContextAllocZero(TopMemoryContext, sizeof(bool) * (Size) RAFT_MAX_GROUPS);
-        unpromotable_logged = (TimestampTz *)
-            MemoryContextAllocZero(TopMemoryContext, sizeof(TimestampTz) * (Size) RAFT_MAX_GROUPS);
-    }
-    return (d >= 0 && d < RAFT_MAX_GROUPS) ? (int) d : -1;
-}
-
-/* 曾因不可升主让位、且回放槽位仍未重新 armed ⇒ true（不参选） */
-static bool
-unpromotable_still(RaftGroupCtx *ctx)
-{
-    int   idx = group_slot_index(ctx);
-    bool  spi_owned = false;
-    bool  armed = false;
-    char  sql[256];
-
-    if (idx < 0 || !unpromotable_flag[idx])
-        return false;
-    if (!raft_persist_spi_begin(&spi_owned))
-        return true;            /* 查不了：保守，继续不参选 */
-    snprintf(sql, sizeof(sql),
-             "SELECT coalesce(bool_or(s.armed), false) FROM partdist.replay_status() s "
-             " WHERE s.shard = partdist.local_partition_for_shard(%lld::bigint)",
-             (long long) ctx->group_id);
-    if (SPI_execute(sql, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
-    {
-        bool  isnull;
-        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-
-        armed = (!isnull && DatumGetBool(d));
-    }
-    raft_persist_spi_end(spi_owned);
-    if (armed)
-    {
-        unpromotable_flag[idx] = false;
-        unpromotable_logged[idx] = 0;
-        elog(LOG, "pg_raft: 组 %lld 本节点回放槽位已重新 armed（已重做基线），恢复参选资格",
-             (long long) ctx->group_id);
-        return false;
-    }
-    return true;
-}
-
+/*
+ * ★ P7-N17 修正（2026-09-18）：撤掉"让位后查回放槽位再决定是否参选"的 SPI 检查。
+ *
+ * 原实现 unpromotable_still() 在 **BGW tick 里直接 SPI**（partdist.replay_status），
+ * 而 tick 没有活动事务：raft_persist_spi_begin → GetTransactionSnapshot() 在无事务
+ * 上下文里解引用事务状态，段错误，pg_raft 后台 worker 反复 signal 11（实测切主抖动期
+ * 每分钟崩一次）。而且它是**冗余**的 —— raft_abdicate_unpromotable 已经把 election_deadline
+ * 推远 5 个选举周期，退避期内根本不会走到 start_election，SPI 检查从不改变结果、只添崩溃面。
+ * 现回到 N14 纯时间退避：让位即推远截止期，到期照常参选；仍不可升主就再让位再退避。
+ */
 static void
 raft_abdicate_unpromotable(RaftGroupCtx *ctx)
 {
     bool was_leader;
-    int  idx = group_slot_index(ctx);
-
-    if (idx >= 0)
-        unpromotable_flag[idx] = true;
 
     SpinLockAcquire(&ctx->cons->mutex);
     was_leader = (ctx->cons->state == RAFT_LEADER);
@@ -4532,26 +4484,7 @@ group_tick(RaftGroupCtx *ctx)
     }
 
     if (now >= deadline)
-    {
-        if (unpromotable_still(ctx))
-        {
-            int idx = group_slot_index(ctx);
-
-            /* P7-N17：不可升主且尚未重做基线，只推后一个周期、只投票 */
-            SpinLockAcquire(&ctx->cons->mutex);
-            reset_election_deadline_locked(ctx);
-            SpinLockRelease(&ctx->cons->mutex);
-            if (idx >= 0 && (unpromotable_logged[idx] == 0 ||
-                             TimestampDifferenceExceeds(unpromotable_logged[idx], now, 60000)))
-            {
-                unpromotable_logged[idx] = now;
-                elog(LOG, "pg_raft: 组 %lld 本节点不可升主且回放槽位未重新 armed，不参选（重做基线后自动恢复）",
-                     (long long) ctx->group_id);
-            }
-            return;
-        }
         start_election(ctx);
-    }
 }
 
 /*
