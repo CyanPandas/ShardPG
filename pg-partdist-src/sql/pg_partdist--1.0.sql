@@ -803,6 +803,24 @@ CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_append_dtx_record';
 
 -- P7-N12：分片 clog 状态的正式 SQL 入口（此前只有测试临时建的包装）。0=RUNNING 1=PREPARED 2=COMMITTED 3=ABORTED
+-- P7-N16：该分片是否处在全量物理基线半程（收到 FULL_BASELINE 截空、未收到 BASELINE_END）。
+-- 升主前置据此拒绝放行"空壳主"（索引 0 字节、整片不可读）。
+-- P7-N18（之二）：升主前把 (from_plsn, upto_plsn] 这截已复制、可能未 apply 的流里出现过的
+-- 分片 xid 全部吸收进发号水位（DATA 记录的 xmin/xmax + MARKER 尾块），挡住新主重发旧号。
+CREATE OR REPLACE FUNCTION shard_absorb_tail_xids(p_shard OID, p_from BIGINT, p_upto BIGINT)
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_absorb_tail_xids';
+
+COMMENT ON FUNCTION shard_absorb_tail_xids(OID, BIGINT, BIGINT) IS
+    '扫 (p_from, p_upto] 的分区流，把 DATA/MARKER 里出现过的分片 xid 抬进发号水位；升主前置调用以防重号。';
+
+CREATE OR REPLACE FUNCTION shard_baseline_pending(p_shard OID)
+    RETURNS boolean LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_pending';
+
+COMMENT ON FUNCTION shard_baseline_pending(OID) IS
+    '收到 FULL_BASELINE（截空本地文件、等 FPI 重建）到收到匹配 BASELINE_END 之间返回真；升主前置见真即不放行。';
+
 CREATE OR REPLACE FUNCTION shard_clog_status(p_shard OID, p_xid BIGINT)
     RETURNS integer LANGUAGE c STRICT STABLE
     AS 'MODULE_PATHNAME', 'partdist_shard_clog_read';

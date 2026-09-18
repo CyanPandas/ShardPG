@@ -359,6 +359,15 @@ typedef struct ReplayShardSlot
      * 槽位加载时读回来。
      */
     Oid                toast_oid;
+
+    /*
+     * ★ P7-N16（2026-09-18）：全量物理基线的半程标记。收到 FULL_BASELINE（截空本地
+     * 全部文件、等 FPI 重建）时置真、记下那条的 partition_lsn；收到匹配的 BASELINE_END
+     * 时清零。升主前置见其为真即不放行（RETURN 0）——挡住"空壳主"。worker 单写、
+     * 其他进程只读；随 apply 在 ReplayCtl->lock 下发布，重启后由回放从持久游标重导。
+     */
+    bool               baseline_pending;
+    uint64             baseline_open_plsn;
 } ReplayShardSlot;
 
 typedef struct ReplayCtlData
@@ -419,6 +428,9 @@ extern bool ShardReplicaIsLocal(Oid relid);
 /* 批次 #7：raft 角色交接时置/撤"已升主"身份（闸门出口） */
 extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
 extern void ShardReplaySetArmed(Oid relid, bool armed);
+extern bool ShardReplayBaselinePending(Oid relid);   /* P7-N16 */
+struct DecodedXLogRecord;
+extern TransactionId ShardDataRecordShardXid(Oid shard_oid, const XLogRecord *record, const struct DecodedXLogRecord *decoded);  /* P7-N18 */
 
 /* GUC：显式放行副本壳表的本地访问（默认 off；运维取证时才开） */
 extern bool allow_replica_access;

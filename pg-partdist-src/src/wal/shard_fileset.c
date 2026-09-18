@@ -853,6 +853,19 @@ ShardBaselineEmit(Oid shard_oid)
     if (ShardRelIsMvcc(shard_oid))
         PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_SHARD_MVCC, NULL, 0);
 
+    /*
+     * ★ P7-N16（2026-09-18）：基线收尾。全部 FPI（及 clog/MVCC）都在流里之后，
+     * 追加一条 BASELINE_END，携带本条基线的 base_plsn。副本回放到它才把
+     * baseline_pending 清零 —— 在此之前它是"截了文件、FPI 未到齐"的空壳，不许升主。
+     */
+    {
+        PartWALCtrlBaselineEnd  bend;
+
+        bend.base_plsn = base_plsn;
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_BASELINE_END,
+                          (const char *) &bend, (uint32) sizeof(bend));
+    }
+
     ereport(LOG,
             (errmsg("pg_partdist: shard %u 物理基线已发射（%d 个成员，%llu 块，"
                     "base_part_lsn=%llu）",

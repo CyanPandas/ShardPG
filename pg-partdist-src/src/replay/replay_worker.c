@@ -328,6 +328,37 @@ ShardReplaySetArmed(Oid relid, bool armed)
     LWLockRelease(ReplayCtl->lock);
 }
 
+/*
+ * ShardReplayBaselinePending —— 该分片是否处在"全量物理基线半程"（收到 FULL_BASELINE
+ * 截空了本地文件、还没收到 BASELINE_END）。P7-N16：升主前置据此拒绝放行空壳主。
+ */
+bool
+ShardReplayBaselinePending(Oid relid)
+{
+    bool pending = false;
+    int  i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return false;
+
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            pending = ReplayCtl->slots[i].baseline_pending;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    return pending;
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_shard_baseline_pending);
+Datum
+pg_partdist_shard_baseline_pending(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_BOOL(ShardReplayBaselinePending(PG_GETARG_OID(0)));
+}
+
 void
 ShardReplicaAccessGate(Oid relid, const char *what)
 {

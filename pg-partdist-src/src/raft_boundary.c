@@ -42,6 +42,10 @@
 #include <unistd.h>
 
 #include "access/rmgr.h"
+#include "access/xlogreader.h"	/* P7-N18：解码 DATA 记录取分片 xid */
+#include "access/xlog_internal.h"	/* wal_segment_size */
+#include "access/xlogrecord.h"	/* XLogRecord / SizeOfXLogRecord */
+#include "miscadmin.h"			/* CHECK_FOR_INTERRUPTS */
 #include "catalog/pg_type.h"
 #include "utils/array.h"
 
@@ -51,6 +55,7 @@
 #include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 #include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
 #include "shard_clog.h"			/* P7-N12：升主节点把 in-doubt 决议落进分片 clog */
+#include "shard_xid.h"			/* P7-N18：follower append 时提前接住发号水位 */
 #include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
@@ -938,6 +943,117 @@ pg_partdist_partwal_read_record(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
+PG_FUNCTION_INFO_V1(pg_partdist_shard_absorb_tail_xids);
+
+/*
+ * shard_absorb_tail_xids(partition_id, from_plsn, upto_plsn) → int
+ *
+ * ★ P7-N18（2026-09-18，之二）：升主前把 (from_plsn, upto_plsn] 这截**已复制、可能
+ * 还没 apply** 的分区流里出现过的分片 xid 全部吸收进发号水位。
+ *
+ * 为什么需要它：MARKER 的发号水位 follower append 时已抬（见 follower_append_impl），
+ * 但**单分片 heap 写的分片 xid 盖在 DATA 记录的 xmin/xmax 上、只由回放侧 redo 时喂进影子**
+ * （ShardReplayNoteDataShardXid）。双重快切 + 可用性放行时新主 applied 远落后于 flush，
+ * 那截未 redo 的 DATA 尾巴里的分片 xid 既不在水位、也不在影子 ⇒ ClaimOnPromote 取
+ * Max(水位,影子) 仍偏小 ⇒ 新主重发旧宇宙用过的号 ⇒ 老元组"复活"成重复行（实测账户 700011
+ * 被复读、总额 +1006）。这里在升主前置里一次性把尾巴扫一遍、解码 DATA 记录取分片 xid，
+ * 连同 MARKER 尾块的发号水位，一并抬过 —— ClaimOnPromote 随后 [claim_wm, watermark)
+ * 把这些号里没有提交标记的改判 ABORTED（老元组保持不可见），发号也不再撞。
+ *
+ * 只扫 (from_plsn, upto] —— 调用方传 from = 本节点回放 applied 游标（其下的号 redo 时
+ * 已进影子），upto = flush。DATA 解码复用回放侧同一条路径（DecodeXLogRecord +
+ * ShardDataRecordShardXid）。返回吸收到的记录条数（诊断用）。
+ */
+Datum
+pg_partdist_shard_absorb_tail_xids(PG_FUNCTION_ARGS)
+{
+	Oid				partition_id = PG_GETARG_OID(0);
+	int64			from = PG_GETARG_INT64(1);
+	int64			upto = PG_GETARG_INT64(2);
+	uint64			p;
+	XLogReaderState *reader;
+	TransactionId	max_next = InvalidTransactionId;   /* 要保证的 next_xid 下界 */
+	int				n = 0;
+
+	if (upto <= 0)
+		PG_RETURN_INT32(0);
+	if (from < 0)
+		from = 0;
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL, XL_ROUTINE(), NULL);
+	if (reader == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("shard_absorb_tail_xids: 无法分配 XLogReader")));
+
+	for (p = (uint64) (from + 1); p <= (uint64) upto; p++)
+	{
+		PartWALRecord	rec;
+		char		   *data = NULL;
+		TransactionId	cand = InvalidTransactionId;
+
+		if (!partwal_find_record(partition_id, p, &rec, &data))
+			continue;
+
+		if ((rec.flags & PARTWAL_FLAG_MARKER) != 0 && data != NULL &&
+			rec.data_len >= sizeof(TxnMarkerPayload))
+		{
+			TxnMarkerPayload *m = (TxnMarkerPayload *) data;
+
+			if (rec.data_len >= (uint32) TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))
+			{
+				if ((m->flags & PARTWAL_MARKER_HAS_ALLOC_WM) != 0)
+					cand = (TransactionId) *TxnMarkerAllocWmPtr(m);        /* 已是 next_xid */
+				else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
+					cand = (TransactionId) (*TxnMarkerShardXidPtr(m) + 1);
+			}
+		}
+		else if (data != NULL &&
+				 (rec.flags & (PARTWAL_FLAG_MARKER | PARTWAL_FLAG_CTRL |
+							   PARTWAL_FLAG_DTX)) == 0 &&
+				 (rec.rmid == RM_HEAP_ID || rec.rmid == RM_HEAP2_ID) &&
+				 rec.data_len >= SizeOfXLogRecord)
+		{
+			XLogRecord *xrec = (XLogRecord *) data;
+
+			if (xrec->xl_tot_len == rec.data_len)
+			{
+				DecodedXLogRecord *dec;
+				char			  *err = NULL;
+
+				dec = (DecodedXLogRecord *)
+					palloc(DecodeXLogRecordRequiredSpace(xrec->xl_tot_len));
+				if (DecodeXLogRecord(reader, dec, xrec, rec.orig_lsn, &err))
+				{
+					TransactionId sx = ShardDataRecordShardXid(partition_id, xrec, dec);
+
+					if (TransactionIdIsNormal(sx))
+						cand = sx + 1;         /* 水位 = 已发号 + 1 */
+				}
+				pfree(dec);
+			}
+		}
+
+		if (data != NULL)
+			pfree(data);
+
+		if (TransactionIdIsNormal(cand) &&
+			(!TransactionIdIsValid(max_next) || cand > max_next))
+		{
+			max_next = cand;
+			n++;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	XLogReaderFree(reader);
+
+	if (TransactionIdIsNormal(max_next))
+		ShardXidRaiseAllocWatermark(partition_id, max_next);
+
+	PG_RETURN_INT32(n);
+}
+
 static Datum follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append);
 
 Datum
@@ -1121,6 +1237,53 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 									 (uint32) VARSIZE_ANY_EXHDR(data),
 									 (GlobalTransactionId) gxid,
 									 (uint8) flags);
+
+		/*
+		 * ★ P7-N18（2026-09-18，shardpg-test 线解冻）：**在 append 时就抬发号水位**。
+		 *
+		 * 缺陷：leader 把它的发号水位（HAS_ALLOC_WM）/分片 xid（HAS_SHARD_XID）盖在
+		 * MARKER 尾块里，但原来只有 redo 侧（shard_replay.c）读它抬水位。升主前置的追平
+		 * 上界只到本节点 applied_part_lsn（get_follower_applied_part_lsn）—— 2 vCPU 饱和、
+		 * in_txn_replication 跳过推进、或 p_force 兜底放行时，[applied+1, flush] 这截
+		 * **已复制、未 apply** 的尾巴里的分片 xid 没进水位；新主 ShardXidClaimOnPromote 取
+		 * Max(水位, 影子) 仍是陈旧值 ⇒ 重发旧主已用过、已提交的分片 xid ⇒ 分片 clog 撞号、
+		 * 判决落错事务 ⇒ 2PC 跨分片原子性破坏、切主后总额漂移（N18 正例 N12 run 5 +2）。
+		 *
+		 * 修法（候选①的落点）：这条记录此刻已按 leader 编号落盘、马上要 fsync 后 ack，
+		 * 与字节**同等持久**。就在这里把它尾块携带的发号水位接住 —— 未 apply 的尾巴由此
+		 * 一并覆盖，ClaimOnPromote 无需改动即正确。RaiseAllocWatermark 只增不减、幂等，
+		 * 只在真正抬高时才落盘（≈ 每个新分片 xid 一次，与 leader 发号同频），重传/去重路径
+		 * 上重复调用无副作用。锁序：本处持 PartWALCtl->lock，内部另取 ShardXidCtl->lock，
+		 * 无反向嵌套（发号路径取 ShardXidCtl 后即释放再写 parwal）。
+		 */
+		if ((flags & PARTWAL_FLAG_MARKER) != 0)
+		{
+			char   *mbody = VARDATA_ANY(data);
+			Size	mlen = VARSIZE_ANY_EXHDR(data);
+
+			if (mlen >= sizeof(TxnMarkerPayload))
+			{
+				TxnMarkerPayload *m = (TxnMarkerPayload *) mbody;
+
+				if (mlen >= TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))
+				{
+					if ((m->flags & PARTWAL_MARKER_HAS_ALLOC_WM) != 0)
+					{
+						TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
+
+						if (TransactionIdIsNormal(wm))
+							ShardXidRaiseAllocWatermark(partition_id, wm);
+					}
+					else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
+					{
+						TransactionId sx = (TransactionId) *TxnMarkerShardXidPtr(m);
+
+						if (TransactionIdIsNormal(sx))
+							ShardXidRaiseAllocWatermark(partition_id, sx + 1);
+					}
+				}
+			}
+		}
 
 		/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
 		FlushPartitionWALWriter(writer, true);

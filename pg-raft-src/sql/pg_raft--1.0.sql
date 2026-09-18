@@ -546,6 +546,18 @@ BEGIN
             RETURN 0;           -- 这一片没追完，下个 tick 接着追
         END IF;
     END IF;
+
+    -- ★ P7-N16（2026-09-18）：追平之后若该分片仍处在"全量物理基线半程"（收到
+    --   FULL_BASELINE 截空了本地文件、还没收到 BASELINE_END 把 FPI 灌完），本地就是
+    --   索引 0 字节的空壳，绝不能升主（升主即整片不可读、丢数据）。RETURN 0（不放行、
+    --   继续等/追）而不是 -1：FPI 已提交则追平会把它连同 BASELINE_END 一起 apply、
+    --   下一轮 pending 转假即放行；FPI 未提交则本就没有节点持有该数据，等待即正确。
+    --   force 兜底也不许绕过——空壳主比暂时无主坏得多。
+    IF partdist.shard_baseline_pending(loid) THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 全量物理基线未收尾（FPI 未到齐），暂不升主',
+                  loid, p_group_id;
+        RETURN 0;
+    END IF;
 --
     -- ★★ T6.3b（解冻批次 #6）：推进本地 WAL 插入位点，越过 max_orig_lsn。
     --
@@ -600,6 +612,22 @@ BEGIN
     -- 同样尽力而为：认领失败不挡升主，但留 WARNING。未认领的后果是那些
     -- 无主 RUNNING 继续挂着（未决即不可见，方向安全），下轮仍有机会。
     BEGIN
+        -- ★ P7-N18（之二）：认领之前先把"已复制、未 apply 的尾巴"里出现过的分片 xid 吸收进水位。
+        -- 双重快切 + 可用性放行时 applied 远落后于 flush，那截 DATA 记录的分片 xid 既不在水位、
+        -- 也不在影子（还没 redo）⇒ 不吸收就会重发旧号、老元组复活成重复行（N18 实测账户被复读）。
+        -- 从本节点回放 applied 游标扫到 flush；下界以下的号 redo 时已进影子。认领紧随其后，把这些
+        -- 号里没有提交标记的一并改判 ABORTED。
+        BEGIN
+            PERFORM partdist.shard_absorb_tail_xids(
+                        loid,
+                        LEAST(partdist.get_follower_applied_part_lsn(loid),
+                              coalesce((SELECT s.applied FROM partdist.replay_status() s
+                                          WHERE s.shard = loid), 0)),
+                        partdist.get_partition_flush_lsn(loid));
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主吸收尾巴分片 xid shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+        END;
         PERFORM partdist.shard_claim_on_promote(loid::oid);
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg_raft: 升主认领无主 RUNNING shard % (组 %) 失败: %',

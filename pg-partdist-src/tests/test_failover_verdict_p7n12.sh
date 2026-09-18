@@ -154,11 +154,17 @@ g0=""; for t in $(seq 1 30); do g0=$(Q $COORD "SELECT leader_node_id FROM partdi
 
 echo "========== [2] 账户：每分片 $ACCT 个、各 1000（VALUES 单分片写） =========="
 declare -A ACC_SID; ACC_COLS=()
+# ★ 账户插入期抬全体选举超时到 30 s：2 vCPU 饱和下建组后仍会漂主（N11/N15），漂在插入这一刻
+#   会让单分片写被"本节点不是该分区组的 leader"拒、该分片账户全缺（实测 24000→16000），
+#   把后面的守恒判据全带偏。插入是一次性、无切主意图，抬超时无副作用；插入完 [3] 前会重置。
+for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 30000" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
 for sid in "${SIDS[@]}"; do ids=$(shard_ids $sid 700001 $ACCT)
   vals=$(for a in ${ids//,/ }; do printf "(%s,'acct',1000)," "$a"; done | sed 's/,$//')
-  out=$(gtx $sid "INSERT INTO fv(id, v, n) VALUES $vals;"); [[ "$out" == txn_done ]] || echo "  账户插入失败：${out:0:160}"
+  out=""; for try in 1 2 3 4 5; do out=$(gtx $sid "INSERT INTO fv(id, v, n) VALUES $vals;"); [[ "$out" == txn_done ]] && break; sleep 2; done
+  [[ "$out" == txn_done ]] || echo "  账户插入失败（$sid，5 次重试后）：${out:0:160}"
   ACC_COLS+=("$ids"); for a in ${ids//,/ }; do ACC_SID[$a]=$sid; done
 done
+for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
 ACC_ALL=(); for i in $(seq 0 $((ACCT-1))); do for c in "${ACC_COLS[@]}"; do IFS=, read -ra col <<<"$c"; ACC_ALL+=("${col[$i]}"); done; done
 TOTAL0=$(converge $COORD "SELECT coalesce(sum(n),0) FROM fv WHERE v='acct'" $((1000*ACCT*NW)))
 check "初始总额" "$TOTAL0" "$((1000*ACCT*NW))"

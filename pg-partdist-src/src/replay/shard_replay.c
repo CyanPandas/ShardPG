@@ -715,9 +715,15 @@ ShardReplayOffnumPrecheck(ShardReplayCtx *ctx, XLogReaderState *reader,
  * 影子只是"见过的最大号 + 1"，多喂一条不会少发号，漏喂才会重发 —— 所以
  * 宁可多认。
  */
-static void
-ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
-                            const DecodedXLogRecord *decoded)
+/*
+ * ShardDataRecordShardXid — 从一条已解码的 heap DATA 记录里取出它盖到元组上的
+ * 分片 xid（取不到返回 InvalidTransactionId）。纯提取，无副作用；供 redo 侧
+ * （ShardReplayNoteDataShardXid）与升主前置的尾巴吸收（shard_absorb_tail_xids）
+ * 复用。shard_oid 只用于 DELETE/LOCK 的"在不在分片 xid 宇宙"判据。
+ */
+TransactionId
+ShardDataRecordShardXid(Oid shard_oid, const XLogRecord *record,
+                        const DecodedXLogRecord *decoded)
 {
     uint8           info = record->xl_info & ~XLR_INFO_MASK;
     uint8           op   = info & XLOG_HEAP_OPMASK;
@@ -726,7 +732,7 @@ ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
     TransactionId   sxid = InvalidTransactionId;
 
     if (main == NULL || len == 0)
-        return;
+        return InvalidTransactionId;
 
     if (record->xl_rmid == RM_HEAP_ID)
     {
@@ -745,12 +751,12 @@ ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
                 break;
             case XLOG_HEAP_DELETE:
                 if (len >= SizeOfHeapDelete &&
-                    TransactionIdIsValid(ShardXidAllocWatermark(ctx->shard_oid)))
+                    TransactionIdIsValid(ShardXidAllocWatermark(shard_oid)))
                     sxid = ((const xl_heap_delete *) main)->xmax;
                 break;
             case XLOG_HEAP_LOCK:
                 if (len >= SizeOfHeapLock &&
-                    TransactionIdIsValid(ShardXidAllocWatermark(ctx->shard_oid)))
+                    TransactionIdIsValid(ShardXidAllocWatermark(shard_oid)))
                     sxid = ((const xl_heap_lock *) main)->xmax;
                 break;
             default:
@@ -763,6 +769,16 @@ ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
             (((const xl_heap_multi_insert *) main)->flags & XLH_INSERT_SHARD_XID))
             memcpy(&sxid, main + len - sizeof(TransactionId), sizeof(TransactionId));
     }
+
+    return sxid;
+}
+
+/* redo 侧的薄封装：提取分片 xid，喂进影子发号水位。 */
+static void
+ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
+                            const DecodedXLogRecord *decoded)
+{
+    TransactionId sxid = ShardDataRecordShardXid(ctx->shard_oid, record, decoded);
 
     if (TransactionIdIsNormal(sxid))
     {
@@ -1760,6 +1776,56 @@ ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 }
 
 /*
+ * P7-N16：把 baseline_pending 写进/清出 shmem 槽（worker 单写、backend 只读）。
+ * shard_replay.c 本就直接持 ReplayCtl->lock 访问槽（见 freeze/alloc_wm 发布处）。
+ */
+static void
+ReplaySlotSetBaselinePending(Oid shard_oid, uint64 open_plsn)
+{
+    int i;
+
+    if (ReplayCtl == NULL)
+        return;
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *sl = &ReplayCtl->slots[i];
+
+        if (sl->shard_oid != shard_oid)
+            continue;
+        sl->baseline_pending   = true;
+        sl->baseline_open_plsn = open_plsn;
+        break;
+    }
+    LWLockRelease(ReplayCtl->lock);
+}
+
+static void
+ReplaySlotClearBaselineIf(Oid shard_oid, uint64 base_plsn)
+{
+    int i;
+
+    if (ReplayCtl == NULL)
+        return;
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    {
+        ReplayShardSlot *sl = &ReplayCtl->slots[i];
+
+        if (sl->shard_oid != shard_oid)
+            continue;
+        /* 只被收尾它自己那条（或更新的）基线的 END 清零，挡住迟到/错配的 END */
+        if (sl->baseline_pending && base_plsn >= sl->baseline_open_plsn)
+        {
+            sl->baseline_pending   = false;
+            sl->baseline_open_plsn = 0;
+        }
+        break;
+    }
+    LWLockRelease(ReplayCtl->lock);
+}
+
+/*
  * ApplyCtrlRecord — 应用一条控制记录。
  *
  * 返回 true = 已应用，调用方推进游标；false = 停在栅栏，游标原地不动。
@@ -1881,7 +1947,28 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         return true;
     }
 
-    if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
+    if (hdr->info == PARTWAL_CTRL_BASELINE_END)
+    {
+        const PartWALCtrlBaselineEnd *be;
+
+        if (hdr->data_len < sizeof(PartWALCtrlBaselineEnd))
+            ereport(ERROR,
+                    (errmsg("shard replay: shard %u @plsn %llu BASELINE_END "
+                            "载荷过短 (%u)", ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            hdr->data_len)));
+        be = (const PartWALCtrlBaselineEnd *) body;
+        ReplaySlotClearBaselineIf(ctx->shard_oid, be->base_plsn);
+        ereport(LOG,
+                (errmsg("pg_partdist replay: shard %u @plsn %llu 基线收尾"
+                        "（base_plsn=%llu），解除 baseline_pending，本副本可参与升主",
+                        ctx->shard_oid,
+                        (unsigned long long) hdr->partition_lsn,
+                        (unsigned long long) be->base_plsn)));
+        return true;
+    }
+
+        if (hdr->info != PARTWAL_CTRL_FILESET_UPDATE)
         ereport(ERROR,
                 (errmsg("shard replay: shard %u @plsn %llu 未知 CTRL opcode "
                         "0x%02X —— 拒绝静默跳过控制记录",
@@ -2054,12 +2141,17 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         }
 
         if (full_baseline)
+        {
+            /* ★ P7-N16：置半程标记；BASELINE_END 到达才解除，其间不许升主。 */
+            ReplaySlotSetBaselinePending(ctx->shard_oid,
+                                         (uint64) hdr->partition_lsn);
             ereport(LOG,
                     (errmsg("pg_partdist replay: shard %u @plsn %llu 收到全量"
                             "物理基线，已截断全部 %u 个本地文件，等待 FPI 重建",
                             ctx->shard_oid,
                             (unsigned long long) hdr->partition_lsn,
                             upd->nrels)));
+        }
     }
 
     /* 换表：整张 loc_map 重建（新旧文件号在同一临界区换完，§12） */

@@ -400,6 +400,24 @@ typedef struct TxnMarkerPayload
  */
 #define PARTWAL_CTRL_SHARD_MVCC      UINT8_C(0x06)
 
+/*
+ * PARTWAL_CTRL_BASELINE_END（0x07，P7-N16，2026-09-18）：全量物理基线的**收尾**。
+ *
+ * FULL_BASELINE 把副本全部本地文件截成 0 块、随后灌 FPI 重建；在"截了、FPI 未到齐"
+ * 的半程，副本看起来 armed 且 applied==commit（那批 FPI 尚未提交），升主前置四道判据全过
+ * ⇒ 放行升主 ⇒ 新主是索引 0 字节的空壳，整片不可读（N16）。本记录由 ShardBaselineEmit
+ * 在灌完全部 FPI（及 clog/MVCC）之后追加，携带它收尾的那条 FULL_BASELINE 的 base_plsn。
+ * 副本据此把 baseline_pending 清零；升主前置见 baseline_pending 为真即 RETURN 0（不放行、
+ * 继续追平）—— FPI 已提交则追平即清、随后放行；未提交则本就没有节点持有该数据，等待即正确。
+ * 载荷 = PartWALCtrlBaselineEnd{base_plsn}。
+ */
+#define PARTWAL_CTRL_BASELINE_END    UINT8_C(0x07)
+
+typedef struct PartWALCtrlBaselineEnd
+{
+    uint64      base_plsn;      /* 本条收尾的 FULL_BASELINE 那条 CTRL 的 partition_lsn */
+} PartWALCtrlBaselineEnd;
+
 typedef struct PartWALCtrlShardClog
 {
     uint32      first_sxid;     /* 本块第一个分片 xid                        */
