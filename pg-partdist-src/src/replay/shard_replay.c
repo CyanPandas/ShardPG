@@ -162,6 +162,36 @@ ShardReplayWriteLocMap(const ReplayLocMapFile *lm)
                  errmsg("pg_partdist: 无法就位 locmap \"%s\": %m", path)));
 }
 
+/*
+ * ★ P7-N22（2026-09-18）：丢掉本进程对该关系各 fork 的**块数缓存**。
+ *
+ * 回放 worker 进程级置了 InRecovery=true，于是 smgrnblocks() / DropRelationBuffers()
+ * 都改信 `smgr_cached_nblocks`（smgrnblocks_cached 只在 InRecovery 下生效）。这个
+ * 缓存成立的前提是"回放 worker 是这些文件的唯一写者"—— 而**节点当过该分片的主、
+ * 又被降回副本**时前提不成立：当主那段时间是普通 backend 在扩这些文件，只发扩展、
+ * 不发 smgr inval，worker 手里的块数是**当副本那会儿**的旧值（偏小）。
+ *
+ * 实测后果（扩展验收 [9]，组 102751 在 :5435）：FULL_BASELINE 截断时
+ * DropRelationBuffers 按旧块数只丢了 [0, 旧值) 的 buffer，当主时写出的第 1 块 buffer
+ * 仍留在共享缓冲区里、且是 valid；随后 FPI 重建要把关系扩到第 1 块，撞上这块 buffer ⇒
+ * `unexpected data beyond EOF in block 1 of relation base/5/62237`，回放每 250 ms 重试
+ * 一次永远失败 ⇒ 该组升主前置卡满 60 s 走兜底；同一 BGW 串行排队的别的组（102747）
+ * 一并被拖到失去领导权。handover 降级（交接一个字节都不截）之后的普通 redo 扩文件
+ * 也是同一机理。
+ *
+ * 置为 InvalidBlockNumber 后，下一次 smgrnblocks() 会 lseek 取真值并重新缓存，
+ * DropRelationBuffers 也就按真实块数丢 buffer。只动本进程的 SMgrRelation，零共享状态。
+ */
+static void
+ReplayForgetCachedSizes(const RelFileLocator *loc)
+{
+    SMgrRelation reln = smgropen(*loc, InvalidBackendId);
+    ForkNumber   f;
+
+    for (f = 0; f <= MAX_FORKNUM; f++)
+        reln->smgr_cached_nblocks[f] = InvalidBlockNumber;
+}
+
 bool
 ShardReplayLoadLocMap(ShardReplayCtx *ctx)
 {
@@ -204,6 +234,9 @@ ShardReplayLoadLocMap(ShardReplayCtx *ctx)
                 break;
         if (j == ctx->nlocal && ctx->nlocal < SHARD_FILESET_MAX_RELS)
             ctx->local_locs[ctx->nlocal++] = lm.pairs[i].local_loc;
+
+        /* ★ P7-N22：(重新)认领时本进程可能还抱着上一段副本期的旧块数 */
+        ReplayForgetCachedSizes(&lm.pairs[i].local_loc);
     }
 
     /*
@@ -1665,6 +1698,13 @@ ReplayTruncateLocalRel(const RelFileLocator *loc)
 
     smgrcreate(reln, MAIN_FORKNUM, true);
 
+    /*
+     * ★ P7-N22：先丢块数缓存再量。旧值偏小时 old_blocks 与 DropRelationBuffers
+     * 都会少算，当主时写出的尾部 buffer 留在共享缓冲区里，FPI 重建一扩就撞
+     * `unexpected data beyond EOF`（见 ReplayForgetCachedSizes）。
+     */
+    ReplayForgetCachedSizes(loc);
+
     for (f = 0; f <= MAX_FORKNUM; f++)
     {
         BlockNumber n;
@@ -2181,6 +2221,12 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                 break;
         if (j == ctx->nlocal && ctx->nlocal < SHARD_FILESET_MAX_RELS)
             ctx->local_locs[ctx->nlocal++] = lm.pairs[i].local_loc;
+
+        /*
+         * ★ P7-N22：主权交接（handover）一个字节都不截，此后的 redo 直接在
+         * "当主时由 backend 扩出来"的文件上继续扩 —— 块数缓存必须作废重量。
+         */
+        ReplayForgetCachedSizes(&lm.pairs[i].local_loc);
     }
 
     hash_destroy(ctx->loc_map);

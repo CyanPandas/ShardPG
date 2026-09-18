@@ -1085,6 +1085,7 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 	int64				gxid = PG_GETARG_INT64(6);
 	bytea			   *data = PG_GETARG_BYTEA_PP(7);
 	PartitionWALWriter *writer;
+	volatile bool		foreign_heap_rec = false;	/* P7-N23 */
 
 	/*
 	 * ★ 与其余段文件写入者互斥（见 AppendDtxRecord 里那段长注释）。
@@ -1228,15 +1229,23 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 		 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
 		 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
 		 */
-		(void) AppendPartWALRecordAt(writer,
-									 (uint64) partition_lsn,
-									 orig_lsn,
-									 (uint8) rmid,
-									 (uint8) info,
-									 VARDATA_ANY(data),
-									 (uint32) VARSIZE_ANY_EXHDR(data),
-									 (GlobalTransactionId) gxid,
-									 (uint8) flags);
+		/*
+		 * ★ P7-N23：返回值 = 是否真的落了字节（重传去重返回 false）。真落下的一条
+		 * DATA/MARKER 必然是**别的 leader** 写的 —— 本节点自己当主时的记录走 demux
+		 * 本地落盘，从不经这里。CTRL/DTX 不算：它们不改堆也不改提交状态，
+		 * dtx_close_indoubt 直接从流里读 DTX。
+		 */
+		if (AppendPartWALRecordAt(writer,
+								  (uint64) partition_lsn,
+								  orig_lsn,
+								  (uint8) rmid,
+								  (uint8) info,
+								  VARDATA_ANY(data),
+								  (uint32) VARSIZE_ANY_EXHDR(data),
+								  (GlobalTransactionId) gxid,
+								  (uint8) flags) &&
+			(flags & (PARTWAL_FLAG_CTRL | PARTWAL_FLAG_DTX)) == 0)
+			foreign_heap_rec = true;
 
 		/*
 		 * ★ P7-N18（2026-09-18，shardpg-test 线解冻）：**在 append 时就抬发号水位**。
@@ -1295,6 +1304,10 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 			LWLockRelease(PartWALCtl->lock);
 	}
 	PG_END_TRY();
+
+	/* 放掉 PartWALCtl->lock 之后再取 ReplayCtl->lock：不嵌套，零锁序风险 */
+	if (foreign_heap_rec)
+		ShardReplicaNoteForeignAppend(partition_id);
 
 	PG_RETURN_INT64(partition_lsn);
 }

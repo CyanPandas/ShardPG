@@ -317,6 +317,15 @@ typedef struct ReplayShardSlot
     bool    promoted;
 
     /*
+     * ★ P7-N23（2026-09-18）：「本进程生命期内升主以来，没收到过别人写的 DATA/MARKER」。
+     * 升主置真（ShardReplicaSetPromoted(true)）；降级、或 follower append 真正落下一条
+     * 他人写的 DATA/MARKER 即置假；重启后从盘上读回 promoted 时**不**恢复（保守：未知
+     * 当作不干净）。为真时 (applied, flush] 全是本节点自己当主时写的、早已在堆里，
+     * 再次当选升主可跳过那条注定失败的追平（已升主的槽位 replay_catchup 一律拒）。
+     */
+    bool    promoted_clean;
+
+    /*
      * locmap 代次：每次 replay_set_locmap() 重建配对就 +1。worker 拿它和
      * ctx 里那份比对，不同就重建 ctx —— 否则运维在结构栅栏之后补完结构、
      * 重跑了 replay_set_locmap()，worker 仍抱着内存里那张旧 loc_map，
@@ -427,6 +436,8 @@ extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
 extern bool ShardReplicaIsLocal(Oid relid);
 /* 批次 #7：raft 角色交接时置/撤"已升主"身份（闸门出口） */
 extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
+extern void ShardReplicaNoteForeignAppend(Oid relid);   /* P7-N23 */
+extern bool ShardReplicaPromotedSelfHeld(Oid relid);    /* P7-N23 */
 extern void ShardReplaySetArmed(Oid relid, bool armed);
 extern bool ShardReplayBaselinePending(Oid relid);   /* P7-N16 */
 struct DecodedXLogRecord;

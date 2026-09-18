@@ -821,6 +821,13 @@ CREATE OR REPLACE FUNCTION shard_baseline_pending(p_shard OID)
 COMMENT ON FUNCTION shard_baseline_pending(OID) IS
     '收到 FULL_BASELINE（截空本地文件、等 FPI 重建）到收到匹配 BASELINE_END 之间返回真；升主前置见真即不放行。';
 
+CREATE OR REPLACE FUNCTION shard_promoted_selfheld(p_shard OID)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_promoted_selfheld';
+
+COMMENT ON FUNCTION shard_promoted_selfheld(OID) IS
+    'P7-N23：本节点对该分片仍持「已升主」身份，且（本进程生命期内）升主以来没收到过他人写的 DATA/MARKER；为真时本地流未回放的尾巴全是自己当主时写的，再次升主可跳过追平。';
+
 CREATE OR REPLACE FUNCTION shard_clog_status(p_shard OID, p_xid BIGINT)
     RETURNS integer LANGUAGE c STRICT STABLE
     AS 'MODULE_PATHNAME', 'partdist_shard_clog_read';

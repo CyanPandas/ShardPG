@@ -254,6 +254,12 @@ CREATE OR REPLACE FUNCTION pg_raft_group_drop_internal(p_group_id bigint)
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_drop';
 
+-- 受控切主（2026-09-18）：本节点在下一个 tick 对**这一个组**发起选举，别的组不受影响。
+-- 取代"旧主 heartbeat_ms 调大 + 目标 election_timeout 调小"这种作用于全节点所有组的做法。
+CREATE OR REPLACE FUNCTION pg_raft_group_campaign(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_campaign';
+
 -- T7.20（P7-R1）：成员变更的**安全路径**。
 -- 在此之前唯一的办法是在每个节点上各自重调 pg_raft_group_create(gid, 新成员集) ——
 -- 那是没有协调的：变更期间不同节点持有不同成员集，同一个组因此有两套不相交的
@@ -531,6 +537,19 @@ BEGIN
     --   兜底**仍尽力追一片**，但不再以追平为前提，并且**照做下面的全部升主步骤**。
     --   原实现的兜底是：tick 拿到 0 就直接放行上报 —— 推进 WAL 位点、闭合 in-doubt、修分叉、
     --   认领一步都没做（放行那一轮这里 RETURN 0 了）。可分叉/无副本的 -1 检查在上面，兜底绕不过去。
+    -- ★ P7-N23（2026-09-18）：本节点仍是该分片"已升主"的前任主（主权没交出去——
+    --   中间当选的节点还没登记就丢了领导权），且升主以来没收到过他人写的 DATA/MARKER
+    --   ⇒ (app, bound] 全是本节点自己当主时写的、早已在堆里。已升主的槽位
+    --   replay_catchup 一律拒（"已升主，不再回放别人的流"），原逻辑在这里每轮 RETURN 0、
+    --   空转满 promote_catchup_deadline_ms（60 s）才走兜底 force——等待毫无收益，
+    --   却让该组 60 s 无主（扩展验收 [9] 第 2 轮实测）。收到过他人记录则照旧走追平/兜底。
+    IF bound > app AND partdist.shard_promoted_selfheld(loid) THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 本节点仍持已升主身份且未收到他人写的记录，'
+                  '(%, %] 均为本节点当主时自写、已在堆中，跳过追平',
+                  loid, p_group_id, app, bound;
+        app := bound;
+    END IF;
+
     IF bound > app THEN
         BEGIN
             got := partdist.replay_catchup(loid::regclass, bound, p_timeout_ms);

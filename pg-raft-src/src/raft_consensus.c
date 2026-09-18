@@ -146,6 +146,13 @@ typedef struct RaftConsensusShmem
     int          voted_for;
     int          leader_id;
     TimestampTz  election_deadline;
+    /*
+     * 受控切主（pg_raft_group_campaign）：下一个 tick 无条件发起一次选举，由 tick 读后清零。
+     * 不能只把 election_deadline 置到期：现任 leader 的下一次心跳（AE）会
+     * reset_election_deadline_locked() 把它推回去，而心跳与本节点 tick 同为 1 s 周期，
+     * 实测一次置位常被心跳抢先抹掉、选举根本没发起（N23 回归 [2] 首跑）。
+     */
+    bool         campaign_pending;
 } RaftConsensusShmem;
 
 typedef struct RaftLogEntry
@@ -325,6 +332,7 @@ PG_FUNCTION_INFO_V1(pg_raft_append_entries);
 PG_FUNCTION_INFO_V1(pg_raft_apply_committed);
 PG_FUNCTION_INFO_V1(pg_raft_group_create);
 PG_FUNCTION_INFO_V1(pg_raft_group_drop);
+PG_FUNCTION_INFO_V1(pg_raft_group_campaign);
 PG_FUNCTION_INFO_V1(pg_raft_group_reset);
 PG_FUNCTION_INFO_V1(pg_raft_group_status);
 PG_FUNCTION_INFO_V1(pg_raft_group_propose);
@@ -4451,6 +4459,7 @@ group_tick(RaftGroupCtx *ctx)
     int         state;
     TimestampTz deadline;
     TimestampTz now;
+    bool        campaign;
 
     /* 不是本组成员的节点不参与该组的选举/心跳 */
     if (!group_has_member(ctx, pg_raft_node_id))
@@ -4473,6 +4482,8 @@ group_tick(RaftGroupCtx *ctx)
         reset_election_deadline_locked(ctx);
         deadline = ctx->cons->election_deadline;
     }
+    campaign = ctx->cons->campaign_pending;
+    ctx->cons->campaign_pending = false;
     SpinLockRelease(&ctx->cons->mutex);
 
     if (state == RAFT_LEADER)
@@ -4483,7 +4494,7 @@ group_tick(RaftGroupCtx *ctx)
         return;
     }
 
-    if (now >= deadline)
+    if (campaign || now >= deadline)
         start_election(ctx);
 }
 
@@ -5655,6 +5666,51 @@ pg_raft_group_drop(PG_FUNCTION_ARGS)
     SpinLockRelease(&RaftGroups->mutex);
 
     PG_RETURN_BOOL(true);
+}
+
+/*
+ * pg_raft_group_campaign —— 受控切主：让**本节点**在下一个 tick 就对**这一个组**发起选举。
+ *
+ * ★ 2026-09-18（扩展验收 [9] 第 2 轮 FAIL 定因）：此前唯一的切主手段是节点级 GUC ——
+ *   旧主 heartbeat_ms 调到 60 s、目标 election_timeout 调到 300 ms。这两个旋钮都作用于
+ *   **节点上的全部组**：旧主当主的每个组一起断心跳，目标又以 300 ms 超时在 2 vCPU 抖动下
+ *   顺手抢走第三台的组。实测一次"切组 102747"把 6 个组全部压到 :5435，其升主前置在同一条
+ *   异步连接上串行排队，102747 排在一个卡满 60 s 的组后面，还没轮到就丢了领导权。
+ *
+ * 做法：给该组置 campaign_pending，本节点下一个 tick 无条件发起一次选举（一次性，tick 读后
+ * 清零；没选上由调用方再发）。不用"把选举截止期置到期"：现任 leader 的心跳会把它推回去。
+ * 投票规则不变（Raft 原样：更高任期 + 日志至少一样新即投），旧主收到更高任期的 RV 自行降为
+ * follower，别的组一概不受影响。本节点已是 leader、或不是该组成员时不做任何事。返回是否已置位。
+ */
+Datum
+pg_raft_group_campaign(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    RaftGroupCtx ctx;
+    bool         armed = false;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_BOOL(false);
+    if (group_id == RAFT_CONTROL_GROUP)
+        ereport(ERROR, (errmsg("pg_raft: 控制面组 0 不走受控切主")));
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_BOOL(false);
+    if (!group_has_member(&ctx, pg_raft_node_id))
+        PG_RETURN_BOOL(false);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    if (ctx.cons->state != RAFT_LEADER)
+    {
+        ctx.cons->campaign_pending = true;
+        armed = true;
+    }
+    SpinLockRelease(&ctx.cons->mutex);
+
+    if (armed)
+        ereport(LOG,
+                (errmsg("pg_raft: 组 %lld 受控切主：本节点 %d 下一个 tick 发起选举",
+                        (long long) group_id, pg_raft_node_id)));
+    PG_RETURN_BOOL(armed);
 }
 
 Datum

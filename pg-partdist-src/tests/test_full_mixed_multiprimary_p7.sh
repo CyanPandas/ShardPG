@@ -78,7 +78,8 @@ cleanup() {
   # ★ 真正的风险是 P7-N21：DROP 可能落进 pg_partdist 删表钩子里原地热自旋（active 几十分钟、
   #   pg_blocking_pids 为空、一个锁都没有、STAT=Rs 且 CPU 时间一直涨），且**该循环不查中断**，
   #   pg_terminate_backend 返回 t 也杀不掉，只能 pg_ctl -m immediate 重启该节点。
-  #   所以每条 DROP 都套 statement_timeout，钩子真卡住也不至于把清场拖死。
+  #   ⚠️ statement_timeout 也**拦不住**它（09-18 二次现场：带 30s 超时的 DROP 跑了 10 分钟，零 syscall 纯自旋）；
+  #   这里仍套着，只为防普通的锁等待。
   for s in "${SIDS_M[@]}" "${SIDS_N[@]}"; do for p in "${WORKERS[@]}"; do
     Q $p "SELECT partdist.replay_disable('fm_mvcc_${s}'::regclass)" >/dev/null 2>&1
     Q $p "SELECT partdist.replay_disable('fm_nat_${s}'::regclass)" >/dev/null 2>&1
@@ -89,7 +90,15 @@ cleanup() {
     Q $p "SET statement_timeout='20s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS fm_mvcc_${s}" >/dev/null 2>&1
     Q $p "SET statement_timeout='20s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS fm_nat_${s}" >/dev/null 2>&1
   done; done
-  for r in 1 2; do for p in "${WORKERS[@]}"; do Q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null; done; sleep 1; done
+  # 组还在时副本残壳被路由守卫拒（"分区主副本可能已切换"），拆组后在途 RPC 又会按 hearsay 把组再建出来 ——
+  # 拆组 / 删壳交替两轮（夹具规则 42；09-18 首次全绿那轮收尾就漏了 7 张残壳）
+  for r in 1 2; do
+    for p in "${WORKERS[@]}"; do Q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null; done; sleep 2
+    for s in "${SIDS_M[@]}" "${SIDS_N[@]}"; do for p in "${WORKERS[@]}"; do
+      Q $p "SET statement_timeout='20s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS fm_mvcc_${s}" >/dev/null 2>&1
+      Q $p "SET statement_timeout='20s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS fm_nat_${s}" >/dev/null 2>&1
+    done; done
+  done
   for p in $COORD "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_partdist.tso_conninfo" >/dev/null; Q $p "ALTER SYSTEM RESET pg_partdist.tso_lease_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
   Q $COORD "ALTER SYSTEM RESET pg_partdist.tso_master" >/dev/null; Q $COORD "SELECT pg_reload_conf()" >/dev/null
   echo "  [复原] prepared 已收、组已拆、表已删、TSO 已 RESET"
@@ -105,6 +114,20 @@ build_group_on() {
   echo "$st"
 }
 cur_leader() { local sid=$1 p; for p in "${WORKERS[@]}"; do [[ "$(Q $p "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$sid")" == leader ]] && { echo $p; return; }; done; echo ""; }
+# 受控切主（**只动这一个组**）：目标节点对该组发起选举（pg_raft_group_campaign），旧主见更高任期
+#   自行退位，别的组一概不受影响；没选上（日志不够新/分票）就每 5 s 再发一次。
+# ★ 取代旧手法"旧主 heartbeat_ms=60s + 目标 election_timeout=300ms"：那两个 GUC 作用于**节点上的
+#   全部组**，扩展验收 [9] 第 2 轮实测一次"切组 102747"把 6 个组全压到 :5435，升主前置在同一条
+#   异步连接上串行排队，102747 排在一个卡满 60 s 的组后面、还没轮到就丢了领导权 ⇒ 新主登记 FAIL。
+switch_to() { local gid=$1 target=$2 t st=""
+  for t in $(seq 1 120); do
+    st=$(Q $target "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$gid")
+    [[ "$st" == leader ]] && break
+    (( t % 5 == 1 )) && Q $target "SELECT partdist.pg_raft_group_campaign($gid)" >/dev/null
+    sleep 1
+  done
+  echo "$st"
+}
 shard_ids() { Q $COORD "SELECT string_agg(g::text, ',') FROM (SELECT g FROM generate_series($3, $3+300000) g WHERE get_shard_id_for_distribution_column('$1', g) = $2 LIMIT $4) t"; }
 # TX2 全栈跨组事务（join_info = gxid,start_ts,coord_gsid）
 gtx() {
@@ -119,31 +142,54 @@ SELECT 'txn_done';
 SQL
 }
 converge() { local port=$1 sql=$2 want=$3 max=${4:-60} t v="" p; for t in $(seq 1 $max); do v=$(Q $port "$sql"); [[ "$v" == "$want" ]] && { echo "$v"; return; }; for p in "${WORKERS[@]}"; do Q $p "SELECT partdist.dtx_pending_sweep()" >/dev/null; done; sleep 1; done; echo "$v"; }
-main_heap_md5() { local port=$1 rel=$2; DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $port -U postgres -d postgres -X -Atc \"SELECT pg_relation_filepath('$rel')\" </dev/null); md5sum '${DDIR[$port]}/'\$P 2>/dev/null | cut -d' ' -f1"; }
+main_heap_md5() { local port=$1 rel=$2; DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $port -U postgres -d postgres -X -qAtc \"SELECT pg_relation_filepath('$rel')\" </dev/null); md5sum '${DDIR[$port]}/'\$P 2>/dev/null | cut -d' ' -f1"; }
 # ★ 先把从副本同步到位再比：2 vCPU 建组期抢跑偏置会让某组副本基线半途而废（0 块，
 #   baseline_pending），或旧主降级后作为从尚未回追。0 块/pending 就从当前主重供一遍，再长追平。
-ensure_replica_synced() { local lp=$1 rp=$2 sid=$3 tbl=$4 lo tp bp sz a t
+# ★ 2026-09-18 补两条（修好 -q 取证后第一次真比时暴露）：
+#   ① **没有 armed 回放槽位也要重供**：被降级的原始主（从没当过副本）收了新主的流却无从回放，
+#      按 R-P4-15 设计须重供基线才重新是副本；不重供它永远追不上，逐字节比对必红。
+#   ② 追平判据用**回放游标** replay_status().applied，不是 raft 的 follower_partition_map.applied_part_lsn
+#      （后者只说明记录落了盘、不说明 redo 进了堆，拿它判"可以比字节了"会早比）。
+ensure_replica_synced() { local lp=$1 rp=$2 sid=$3 tbl=$4 lo tp bp sz a t armed
   lo=$(Q $rp "SELECT partdist.local_partition_for_shard($sid)")
-  sz=$(DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $rp -U postgres -d postgres -X -Atc \"SELECT pg_relation_filepath('${tbl}_${sid}')\" </dev/null); wc -c < '${DDIR[$rp]}/'\$P 2>/dev/null" </dev/null)
+  sz=$(DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $rp -U postgres -d postgres -X -qAtc \"SELECT pg_relation_filepath('${tbl}_${sid}')\" </dev/null); wc -c < '${DDIR[$rp]}/'\$P 2>/dev/null" </dev/null)
   bp=$(Q $rp "SELECT partdist.shard_baseline_pending($lo::oid)")
-  if [[ "${sz:-0}" == 0 || "$bp" == t ]]; then
+  armed=$(Q $rp "SELECT armed FROM partdist.replay_status() WHERE shard=$lo")
+  if [[ "${sz:-0}" == 0 || "$bp" == t || "$armed" != t ]]; then
     for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=30000" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
     PSQL $lp -Atc "SELECT partdist.provision_shard_replica(${sid}::bigint, ${NID[$rp]})" </dev/null >/dev/null 2>&1
     for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
   fi
   tp=$(Q $lp "SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard($sid))")
-  for t in $(seq 1 45); do a=$(Q $rp "SELECT applied_part_lsn FROM partdist.follower_partition_map WHERE partition_id=$lo"); [[ -n "$a" && -n "$tp" && "$a" -ge "$tp" ]] && break; Q $rp "SELECT partdist.replay_catchup(('${tbl}_'||$sid)::regclass,$tp)" >/dev/null 2>&1; sleep 1; done
+  for t in $(seq 1 60); do a=$(Q $rp "SELECT applied FROM partdist.replay_status() WHERE shard=$lo"); [[ -n "$a" && -n "$tp" && "$a" -ge "$tp" ]] && break; Q $rp "SELECT partdist.replay_catchup(('${tbl}_'||$sid)::regclass,$tp)" >/dev/null 2>&1; sleep 1; done
+}
+# 受控切主前：目标必须是"有 armed 回放槽位"的副本，否则按 R-P4-15 升主前置 -1、主动让位
+#   （被降级的原始主就是这种）。缺槽位就先从当前主给它重供基线并追平 —— 这是运维上的正规流程，
+#   不是绕过：R-P4-15 的提示原文就是"须重做物理基线后才能重新参选"。
+ensure_candidate() { local gid=$1 target=$2 tbl=$3 lp lo armed
+  lp=$(cur_leader $gid); [[ -z "$lp" || "$lp" == "$target" ]] && return
+  lo=$(Q $target "SELECT partdist.local_partition_for_shard($gid)")
+  armed=$(Q $target "SELECT armed FROM partdist.replay_status() WHERE shard=$lo")
+  [[ "$armed" == t ]] && return
+  echo "  [夹具] :$target 对组 $gid 没有 armed 回放槽位（被降级的原始主），先从当前主 :$lp 重供基线再切"
+  ensure_replica_synced $lp $target $gid $tbl
 }
 # 掩码外逐字节比对（主 vs 从）：hint bit / 空闲区会不同，走 pagecmp.py（同 test_mixed_role_p7）
-# 副本主堆字节数（0 = 基线没灌上，属环境漂移而非内容不一致）
+# 副本主堆字节数（0 = 基线没灌上，属环境漂移而非内容不一致；空串 = 没量到，夹具取证失败）
+# ★ 2026-09-18 教训：psql 必须带 -q。-c 里有 SET 时不带 -q 会先打印命令标签 "SET"，
+#   \$P 成了 "SET<换行>base/5/NNN" 两个词 ⇒ `wc -c < 路径` 报 ambiguous redirect ⇒ 取到空串 ⇒
+#   被当成"0 块"降级为只报 —— 扩展验收前 4 轮的 6 条"副本 0 块（2 vCPU 漂移）"全是这个假象，
+#   逐字节比对一次都没真做过。
 replica_heap_bytes() { local rp=$1 rel=$2
-  DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $rp -U postgres -d postgres -X -Atc \"SET citus.enable_ddl_propagation=off; SELECT pg_relation_filepath('$rel')\" </dev/null); wc -c < '${DDIR[$rp]}/'\$P 2>/dev/null" </dev/null
+  DEX bash -c "P=\$(/work/pg-install/bin/psql -h /tmp -p $rp -U postgres -d postgres -X -qAtc \"SET citus.enable_ddl_propagation=off; SELECT pg_relation_filepath('$rel')\" </dev/null); wc -c < '${DDIR[$rp]}/'\$P 2>/dev/null" </dev/null
 }
 # 比对并判定：副本 0 块 ⇒ 只报（2 vCPU 建组漂移，基线半途而废，见 N15/N11）；
 # 供上了却不一致 ⇒ 真 FAIL（那才是副本一致性回归）。
 cmp_or_note() { local lp=$1 rp=$2 rel=$3 tag=$4 sz c
   sz=$(replica_heap_bytes $rp "$rel")
-  if [[ "${sz:-0}" == 0 ]]; then
+  # 没量到 ≠ 0 块：取证失败必须判红，否则又是一条静默通过（feedback_test_harness_silent_pass）
+  if [[ -z "$sz" ]]; then check "$tag（取副本 :$rp 主堆文件大小）" "" "measured"; return; fi
+  if [[ "$sz" == 0 ]]; then
     echo "  [只报] $tag：从 :$rp 主堆 0 块（基线未灌上 = 2 vCPU 建组漂移 N15/N11），跳过逐字节比对"
     return
   fi
@@ -277,9 +323,8 @@ check "[5] 中途失败后借记一侧未单独生效" "$(converge $COORD "SELEC
 echo "========== [6] 受控切主：守恒 + 无 reissue 撞号 + 无 PREPARED 残留 + 副本重追平 =========="
 FS=${SIDS_M[0]}; OLD=$(cur_leader $FS); NEWL=""; for p in "${WORKERS[@]}"; do [[ $p != $OLD ]] && { NEWL=$p; break; }; done
 totb=$(converge $COORD "SELECT coalesce(sum(n),0) FROM fm_mvcc WHERE v IN ('m','x')" "$(Q $COORD "SELECT coalesce(sum(n),0) FROM fm_mvcc WHERE v IN ('m','x')")")
-for p in "${WORKERS[@]}"; do if [[ $p == $NEWL ]]; then Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=300" >/dev/null; elif [[ $p == $OLD ]]; then Q $p "ALTER SYSTEM SET pg_raft.heartbeat_ms=60000" >/dev/null; else Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=60000" >/dev/null; fi; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-st=""; for t in $(seq 1 120); do st=$(Q $NEWL "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$FS"); [[ "$st" == leader ]] && break; sleep 1; done
-for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.heartbeat_ms" >/dev/null; Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+ensure_candidate $FS $NEWL fm_mvcc
+st=$(switch_to $FS $NEWL)
 check ":$NEWL 当选组 $FS 新主" "$st" "leader"
 reg=""; for t in $(seq 1 90); do [[ "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$FS")" == "${NID[$NEWL]}" ]] && { reg=ok; break; }; sleep 2; done
 check "新主 180s 内登记" "$reg" "ok"; LEADER[$FS]=$NEWL
@@ -364,11 +409,8 @@ for round in 1 2; do
   for p in "${WORKERS[@]}"; do [[ $p != $old && "$been" != *" $p "* ]] && { nw=$p; break; }; done
   [[ -z "$nw" ]] && { echo "  第 $round 轮：无未当过主的节点，跳过"; break; }
   been+="$nw "
-  for p in "${WORKERS[@]}"; do if [[ $p == $nw ]]; then Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=300" >/dev/null
-    elif [[ $p == $old ]]; then Q $p "ALTER SYSTEM SET pg_raft.heartbeat_ms=60000" >/dev/null
-    else Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=60000" >/dev/null; fi; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-  st=""; for t in $(seq 1 120); do st=$(Q $nw "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$G9"); [[ "$st" == leader ]] && break; sleep 1; done
-  for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.heartbeat_ms" >/dev/null; Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+  ensure_candidate $G9 $nw fm_mvcc
+  st=$(switch_to $G9 $nw)
   check "  第 $round 轮：:$nw 当选组 $G9" "$st" "leader"
   reg=""; for t in $(seq 1 90); do [[ "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$G9")" == "${NID[$nw]}" ]] && { reg=ok; break; }; sleep 2; done
   check "  第 $round 轮：新主登记" "$reg" "ok"
@@ -404,11 +446,8 @@ check "[10] ★ 崩溃恢复后无重复行" "$(dup_rows)" "0"
 echo "========== [11] 切主后新主立即可读写 =========="
 G11=${SIDS_M[1]}; old11=$(cur_leader $G11); nw11=""
 for p in "${WORKERS[@]}"; do [[ $p != $old11 ]] && { nw11=$p; break; }; done
-for p in "${WORKERS[@]}"; do if [[ $p == $nw11 ]]; then Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=300" >/dev/null
-  elif [[ $p == $old11 ]]; then Q $p "ALTER SYSTEM SET pg_raft.heartbeat_ms=60000" >/dev/null
-  else Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms=60000" >/dev/null; fi; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-st11=""; for t in $(seq 1 120); do st11=$(Q $nw11 "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$G11"); [[ "$st11" == leader ]] && break; sleep 1; done
-for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.heartbeat_ms" >/dev/null; Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
+ensure_candidate $G11 $nw11 fm_mvcc
+st11=$(switch_to $G11 $nw11)
 check "[11] :$nw11 当选组 $G11 新主" "$st11" "leader"
 reg11=""; for t in $(seq 1 90); do [[ "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$G11")" == "${NID[$nw11]}" ]] && { reg11=ok; break; }; sleep 2; done
 check "[11] 新主登记（路由已翻）" "$reg11" "ok"

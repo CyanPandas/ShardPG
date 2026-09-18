@@ -291,6 +291,7 @@ ShardReplicaSetPromoted(Oid relid, bool promoted)
         if (ReplayCtl->slots[i].shard_oid == relid)
         {
             ReplayCtl->slots[i].promoted = promoted;
+            ReplayCtl->slots[i].promoted_clean = promoted;   /* P7-N23 */
             break;
         }
     LWLockRelease(ReplayCtl->lock);
@@ -357,6 +358,79 @@ Datum
 pg_partdist_shard_baseline_pending(PG_FUNCTION_ARGS)
 {
     PG_RETURN_BOOL(ShardReplayBaselinePending(PG_GETARG_OID(0)));
+}
+
+/*
+ * ★ P7-N23（2026-09-18）：follower append 真正落下一条**他人写的** DATA/MARKER 时调。
+ * 若该分片在本节点仍是"已升主"，说明有别的 leader 在本节点未交出主权期间产出了
+ * 数据/提交记录 —— (applied, flush] 不再全是自己写的，promoted_clean 置假。
+ *
+ * 常态（本节点是普通副本）只走一次共享锁扫描即返回，不升级排他锁。
+ */
+void
+ShardReplicaNoteForeignAppend(Oid relid)
+{
+    bool need = false;
+    int  i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            need = ReplayCtl->slots[i].promoted_clean;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    if (!need)
+        return;
+
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            ReplayCtl->slots[i].promoted_clean = false;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+
+    ereport(LOG,
+            (errmsg("pg_partdist: 分片 %u 在本节点仍持「已升主」身份时收到了他人写的"
+                    "数据/提交记录，本节点再次当选时须照常追平", relid)));
+}
+
+/*
+ * ★ P7-N23：本节点对该分片"已升主"、且升主以来没收到过他人写的 DATA/MARKER。
+ * 为真 ⇒ 本地流 (applied, flush] 全是自己当主时写的，堆里早已有；升主前置可跳过追平。
+ */
+bool
+ShardReplicaPromotedSelfHeld(Oid relid)
+{
+    bool held = false;
+    int  i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return false;
+
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            held = ReplayCtl->slots[i].promoted &&
+                   ReplayCtl->slots[i].promoted_clean;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    return held;
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_shard_promoted_selfheld);
+Datum
+pg_partdist_shard_promoted_selfheld(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_BOOL(ShardReplicaPromotedSelfHeld(PG_GETARG_OID(0)));
 }
 
 void
@@ -622,6 +696,8 @@ ReplaySlotLoadLocsLocked(ReplayShardSlot *s)
      * 不读盘就等于把升主这件事忘了。
      */
     s->promoted = ShardPromotedMarkRead(s->shard_oid);
+    if (!s->promoted)
+        s->promoted_clean = false;      /* P7-N23：盘上读回的"已升主"不算干净 */
 
     s->nlocs = 0;
     for (i = 0; i < lm.npairs; i++)

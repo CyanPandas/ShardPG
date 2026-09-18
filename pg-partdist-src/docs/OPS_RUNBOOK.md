@@ -279,6 +279,23 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
   **规避**：同 N15 —— 根本上不要让供给中的副本参选。
 - 其余（09-15 全量回归 18 条的分类、P7-N1 副本流内空洞等）见 `P7_REMEDIATION_PLAN.md` §1.11。
 
+### 7.4 受控切主 / 被降级的旧主（2026-09-18）
+
+- **受控切主只动一个组**：在目标节点上 `SELECT partdist.pg_raft_group_campaign(<group_id>);`，每 5 s 重发一次直到该节点
+  `pg_raft_group_status()` 里该组 `state='leader'`，再等协调者 `partdist.partition_map.primary_node` 变成目标节点。
+  ❌ **不要**再用"旧主 `pg_raft.heartbeat_ms` 调大 + 目标 `pg_raft.election_timeout_ms` 调小"——两个 GUC 作用于**节点上全部组**，
+  实测一次把 6 个组全压到同一台，升主前置串行排队，目标组排不到号就丢主（P7-N24）。
+- **切主目标必须有 armed 回放槽位**：`SELECT armed FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(<gid>)`
+  为 `t`。**被降级的原始主没有**（P7-N25）：它收着新主的流却无从回放，升主前置恒 -1 让位。先在当前主上
+  `SELECT partdist.provision_shard_replica(<gid>, <该节点 node_id>)` 重供（供前按 §7.3 N15 抬选举超时），追平后再切。
+- **P7-N21（未修）`DROP TABLE` 挂死且杀不掉**：`pg_stat_activity` 里 DROP 长时间 active、`wait_event` 为空、`pg_blocking_pids` 为空；`ps` 为 `Rs` 且 CPU 时间持续上涨，`/proc/<pid>/io` 的 syscr 不动（纯用户态死循环）。`pg_cancel_backend` / `pg_terminate_backend` / `statement_timeout` **全部无效**（循环不查中断）。唯一处置：`pg_ctl -D <datadir> -m immediate restart` 重启该节点（SIGQUIT 有效）。它会吃掉约 2/3 个 vCPU，2 vCPU 机器上会拖慢同机其余一切，发现即处置。
+- **识别 P7-N22（已修，旧版本才会见到）**：副本回放日志每 250 ms 一条 `追平失败: unexpected data beyond EOF in block N of relation …`，
+  多见于"当过主又降回副本"的节点收到全量基线之后；或同类节点回放静默跳过页面、逐字节比对不一致。旧版本处置：重启该节点的回放 worker
+  （整节点重启）后重供基线；升级到含 `ReplayForgetCachedSizes` 的版本即根除。
+- **识别 P7-N23（已修）**：前任主再次当选后日志连续出现 `升主追平 … 失败: replay_catchup: shard … 已升主，不再回放别人的流`，
+  60 s 后才 `兜底 force` 登记。新版本改为一条 LOG `本节点仍持已升主身份且未收到他人写的记录，… 跳过追平`，立即登记；
+  若它升主以来收到过他人写的数据/提交记录，则仍按原路追平/兜底（不放宽）。
+
 ## 8. 扩展升级（换 .so）的固定顺序
 
 1. `scripts/sync_build.sh`（带守卫：内容比对同步、头文件变了全量重编、导出符号核对）。
@@ -289,6 +306,10 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
 4. **重启之后**再跑 `scripts/refresh_extension_sql.sh`。反过来会报 `could not find function "…" in file pg_partdist.so`：
    重启前所有后端映射的还是旧 .so，新符号看不见；不依赖新符号的声明会先装进去，库处于"装了一半"。
 5. 验证：每个节点 `SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='partdist' AND p.proname IN (<新函数>)`。
+6. **pg_raft 的 SQL 不在第 4 步里**：`refresh_extension_sql.sh` 只对齐 pg_partdist 的函数面。pg_raft 新增/改动的函数要逐节点重放——
+   小函数用 `scripts/apply_pg_raft_sql.sh <函数名>`；**函数体含空行的大 plpgsql（如 `pg_raft_promote_prepare_ex`）** 该脚本只抽到首个空行，
+   须按 `CREATE OR REPLACE FUNCTION <名>(` 到 `$<tag>$;` 抽全块，`SET search_path=partdist; SET citus.enable_ddl_propagation=off;` 后逐节点执行，
+   新函数再 `ALTER EXTENSION pg_raft ADD FUNCTION …` 入籍。
 
 ## 附：文档与代码不一致清单（待回填）
 
