@@ -311,8 +311,43 @@ DTX 参与登记自连本节点报 `connection to server at "127.0.0.1", port 54
 | [9b] P7-N10 | ✗ 稳定复现 | |
 | [10] 健康 | 无崩溃；捕获环零覆盖；日志环丢弃 3 | |
 
+#### 1.11.1 P7-N18 根因固化（2026-09-18，`test_shard_xid_reissue_p7n18.sh`）
+
+N12 两段丢失机理修完后（`98dac27`），run 5（一组内连切两次）仍见 +2 漂移。独立深挖后定因：
+**"未追平就升主"窗口里的负载门控竞态**，四处代码对得上——
+
+1. **重号护栏取的是 applied、不是 flush**。`ShardXidClaimOnPromote`（`shard_xid.c:1229`）把新主发号起点置为
+   `Max(交接来的发号水位, 影子 next_hint)`。发号水位由 `replay_worker.c:510` 在 **apply 已提交条目**时
+   `ShardXidRaiseAllocWatermark` 抬；影子由 `shard_replay.c:719` `ShardReplayNoteDataShardXid` 在 redo 时喂。
+   两者都只覆盖本节点**已 apply**的分片 xid。
+2. **升主追平上界是本节点自己的 applied 游标**。`pg_raft_promote_prepare_ex`（`pg_raft--1.0.sql:512`）
+   `bound := get_follower_applied_part_lsn(loid)` = `follower_partition_map.applied_part_lsn`，
+   `replay_catchup(bound)` 只追到这里 —— 不是流里已复制到的字节（flush）。
+3. **applied 会落在 flush 后面**。follower 的 apply 跑在 `pg_raft_append_entries` backend 里，纯 2PC 负载下
+   `data_apply_advance` 的 `in_txn_replication` 分支**跳过**推进 `applied_part_lsn`（`raft_consensus.c:1326`，
+   为解 prepared 行锁死环，TX 期决策）；2 vCPU 饱和时 apply 本就滞后；availability 兜底（`p_force` 过
+   `promote_catchup_deadline_ms=60000`）更是整段跳过追平。⇒ 升主时水位是**陈旧值**。
+4. **重发 ⇒ 撞号 ⇒ 判决覆盖**。流里"已复制未 apply 的尾巴"带着旧主发过、已提交的 PREPARE MARKER 分片 xid，
+   没进水位/影子 ⇒ 新主 `next_xid`（`shard_xid.c:1143`）偏小 ⇒ 重发旧主已用过的分片 xid。分片 clog 以
+   分片 xid 为键（`shard_clog.c`），两笔不同事务（`start_ts` 不同）撞同一槽、判决互相覆盖；N12 之二的
+   in-doubt 闭合按 `dtxid→sxid`（`partwal_prepare_sxid`）落账时更会把判决写到新事务上 ⇒ 2PC 跨分片原子性
+   破坏、总额漂移。
+
+**为什么静默集群下复现不出来**（`test_shard_xid_reissue_p7n18.sh` run 1/2 实测 `flush_B == applied_B`，无尾巴）：
+不加负载时复制+apply 是亚毫秒级，早在目标选举超时（~1.5 s）之前就追平，尾巴不存在 ⇒ **单次干净切主不重号**
+（该用例 [A] 段全绿即此负向对照）。N18 是负载 + 未追平升主下的竞态，正例为 run 5（总额 +2、跨节点同
+分片 xid 不同 `start_ts`）。
+
+**修法候选（供决策）**：
+- **① 推荐 —— 护栏抬过"流里"而非 applied 的最大分片 xid**。`ShardXidClaimOnPromote`（或升主前置收尾）多扫一遍
+  本节点分片流里 `[applied+1, flush]` 的 PREPARE/DATA 记录，把水位/影子抬过其中最大的分片 xid，再放行发号。
+  正确性优先、不牺牲可用性（不阻塞升主，只保证不重号），改动集中在 `shard_xid.c` + 回放侧扫描，**触分片 xid 分配核心但外科式**。
+- ② 未追平不得对外发号：把发号资格绑定 `applied == committed`。可用性代价（未追平的新主不能立即服务打标分片写）。
+- ③ 分片 xid 高位嵌任期号，跨任期天然不撞。最彻底但改动面大（分配/clog/回放/可见性多处），回归成本高。
+- 三者都落在 raft/2PC **冻结模块**核心，动手前须经用户批准解冻范围（见 [[feedback_raft_module_frozen]]）。
+
 结论：**同节点多主多从布局下，跨组分布式事务的基本语义成立**（提交、回滚、失败原子性、副本物理一致）；
-**并发 + 切主时不成立**（P7-N11/N12/N13），另有一条与切主无关的静默丢数据（P7-N10）。优先级建议：N10 = N12 > N11 > N13。
+**并发 + 切主时不成立**（P7-N11/N12/N13），另有一条与切主无关的静默丢数据（P7-N10）。优先级建议：N10 = N12 > **N18** > N16 > N11 > N13（N10/N12/N14/N17 已修）。
 
 读码推断、尚未实测的风险（运维规程里已标 ⚠️）：副本侧分叉标记自动修不掉；分片 xid 持久化水位在累计 ~2^31 后重启被判损坏；
 带索引的打标表一次 HOT UPDATE 即卡住分片 vacuum；截止期计时槽在丢 leader 时不清零。
