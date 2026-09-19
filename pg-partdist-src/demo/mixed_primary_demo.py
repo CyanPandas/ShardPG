@@ -398,31 +398,46 @@ class Step:
 # ─────────────────────────── 后台读探针（切主 / 宕机时量读可用性） ───────────────────────────
 
 class BgReader:
+    """后台读探针。★ 用**常驻连接**，并让数据库自己报服务端耗时：
+    每读一次就起一个 docker exec + 新连接的话，测到的是"起进程 + 建连 + 查询"的总时间 ——
+    实测 docker exec 空载 ~300 ms、2 vCPU 饱和时 ~1.1 s（切主后旧主自动重供基线会把 CPU 吃满），
+    早先报过的"读用了 5.3 s"就是这个测量开销，数据库那侧那条读只用了几百毫秒。"""
+
     def __init__(self, probes):
         self.probes = probes          # [(标签, sql)]
-        self.samples = []             # (t, 标签, 状态, 毫秒, 报错)
+        self.samples = []             # (t, 标签, 状态, 服务端毫秒, 客户端毫秒, 报错)
         self.stop_ev = threading.Event()
         self.t0 = time.time()
+        self.sess = Session("bg", COORD)
         self.th = threading.Thread(target=self.loop, daemon=True)
         self.th.start()
 
     def loop(self):
         while not self.stop_ev.is_set():
             for label, sql in self.probes:
+                q2 = sql.rstrip(";").replace("SELECT count(*)",
+                     "SELECT count(*), round(extract(epoch from clock_timestamp() - statement_timestamp()) * 1000)", 1) + ";"
                 a = time.time()
-                rc, out, err = qraw(COORD, sql, timeout=30)
-                ms = int((time.time() - a) * 1000)
-                if rc == 0:
-                    st, msg = "ok", ""
+                out, done, _ = self.sess.run(q2, timeout=60)
+                cms = int((time.time() - a) * 1000)
+                if not done:
+                    self.samples.append((a - self.t0, label, "fail", None, cms, "60 s 未返回"))
+                    self.sess.close()
+                    continue
+                if has_error(out):
+                    msg = next((l for l in out.splitlines() if l.startswith("ERROR")), out.strip()[:160])
+                    st = "refused" if "副本壳表" in out else "fail"
+                    self.samples.append((a - self.t0, label, st, None, cms, msg))
                 else:
-                    msg = next((l for l in err.splitlines() if l.startswith("ERROR")), err.strip()[:160])
-                    st = "refused" if "副本壳表" in err else "fail"
-                self.samples.append((a - self.t0, label, st, ms, msg))
+                    rows = table_rows(out)
+                    sms = int(float(rows[0][1])) if rows and len(rows[0]) > 1 and rows[0][1] else None
+                    self.samples.append((a - self.t0, label, "ok", sms, cms, ""))
             self.stop_ev.wait(0.2)
 
     def stop(self):
         self.stop_ev.set()
-        self.th.join(timeout=40)
+        self.th.join(timeout=70)
+        self.sess.close()
 
     def summary(self):
         res = {}
@@ -432,9 +447,10 @@ class BgReader:
             res[label] = dict(
                 n=len(ss), ok=len(ss) - len(bad), fail=len(bad),
                 refused=sum(1 for s in bad if s[2] == "refused"),
-                window=(bad[-1][0] - bad[0][0] + bad[-1][3] / 1000.0) if bad else 0.0,
-                maxms=max((s[3] for s in ss), default=0),
-                msgs=list(dict.fromkeys(s[4][:120] for s in bad))[:2])
+                window=(bad[-1][0] - bad[0][0] + bad[-1][4] / 1000.0) if bad else 0.0,
+                maxms=max((s[3] for s in ss if s[3] is not None), default=0),
+                maxclient=max((s[4] for s in ss), default=0),
+                msgs=list(dict.fromkeys(s[5][:120] for s in bad))[:2])
         return res
 
 
@@ -828,7 +844,7 @@ class Demo:
         lines = []
         for label, d in summ.items():
             s = (f"  {label}：读 {d['n']} 次，成功 {d['ok']}，失败 {d['fail']}（其中副本闸门拒读 {d['refused']}）"
-                 f"，单次最长 {d['maxms']} ms")
+                 f"，服务端单次最长 {d['maxms']} ms（客户端往返最长 {d['maxclient']} ms）")
             if d["fail"]:
                 s += f"，不可用窗口约 {d['window']:.1f} s；报错示例：{d['msgs'][0]}"
             lines.append(s)
