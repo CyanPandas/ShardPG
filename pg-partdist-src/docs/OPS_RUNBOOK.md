@@ -299,11 +299,17 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
   某节点日志有 `升主前置超过 60000 ms 仍未追平，转入兜底` 且其回放报 `流内空洞`——那一刻登记的是残缺数据，须从健康副本重建。
 - **P7-N1 之二（已修）空洞成因**：旧版本在被降级的原始主上替换孤儿记录时按段名顺序截断，会删掉新主发来的已提交记录（`流内空洞：期望 N，下一条已存在的是 M`）。
   新版本逐段逐记录截断；旧版本遇到此症状：在当前在册主上 `SELECT partdist.provision_shard_replica(<gid>, <该节点>)` 重供。
-- **P7-N21（未修）`DROP TABLE` 挂死且杀不掉**：`pg_stat_activity` 里 DROP 长时间 active、`wait_event` 为空、`pg_blocking_pids` 为空；`ps` 为 `Rs` 且 CPU 时间持续上涨，`/proc/<pid>/io` 的 syscr 不动（纯用户态死循环）。`pg_cancel_backend` / `pg_terminate_backend` / `statement_timeout` **全部无效**（循环不查中断）。唯一处置：`pg_ctl -D <datadir> -m immediate restart` 重启该节点（SIGQUIT 有效）。它会吃掉约 2/3 个 vCPU，2 vCPU 机器上会拖慢同机其余一切，发现即处置。
-  **取证（重启回收之前先做）**：须事先 `ALTER SYSTEM SET pg_partdist.debug_sigusr2_backtrace = on` + reload（处理器在 utility 语句入口逐后端懒装，
-  所以要在那条 DROP 开始**之前**就开着；pg-test 环境已常开）。卡住后 `docker exec -u postgres <容器> kill -USR2 <pid>` 采 2–3 次，每次日志里出现
-  `pg_partdist: SIGUSR2 采样 pid N 栈回溯：` 加一段 backtrace，进程继续跑；`xxx.so(+0xOFF)` 用 `gdb -batch -ex 'info symbol 0xOFF' <该 .so 路径>` 解析。
-  采完把栈贴进 P7-N21 再重启。
+- **P7-N21（已修，2026-09-19）清场时 `DROP TABLE` 卡几分钟到几十分钟**：旧版本的形态是 DROP 长时间 active、`wait_event` 为空、CPU 高、杀不掉——
+  那不是自旋，是**被 hearsay 复活的空壳组**在提交路径上把整条分区流历史逐条重提（每条一次 RPC；`/proc/<pid>/io` 的 syscr 不计 socket 收发，所以看着像零 syscall）。
+  新版本拆组记墓碑（10 分钟内在途心跳 / 投票不会把它再建出来），且重提循环查中断。旧版本遇到：在**所有**成员上拆掉该组后再等它返回，或 `pg_ctl -m immediate restart` 该节点。
+  新版本拆过组的节点收到心跳时不再打 `创建 Raft 组 N`；要把组合法建回来就显式 `SELECT partdist.pg_raft_group_create(<gid>, <成员>)`（清墓碑）。
+  **通用取证工具仍保留**：`ALTER SYSTEM SET pg_partdist.debug_sigusr2_backtrace = on` + reload（在要取证的语句开始**之前**开），卡住后
+  `docker exec -u postgres <容器> kill -USR2 <pid>`，日志里出现 `pg_partdist: SIGUSR2 采样 pid N 栈回溯：`，进程继续跑；
+  `xxx.so(+0xOFF)` 用 `gdb -batch -ex 'info symbol 0xOFF' <该 .so 路径>` 解析。
+- **P7-N29（已修）控制面 apply 随事务回滚而丢失**：新版本回滚时打 WARNING `承载控制面 apply 的事务回滚，apply 游标从 X 退回 Y，这些条目将重新 apply`，属正常自愈。
+  旧版本的症状：某节点 `partdist.partition_map` 缺行 / 停在旧主，而 `pg_raft_group_status()` 的 group 0 applied 与其它节点相同——须重建该节点的控制面状态。
+- **P7-N31（已修）切主一瞬的拒读**：新版本切主时经协调者的读可能**多等最多 15 s**（等新主本地登记生效），不再报
+  `不允许在本节点上对副本壳表…执行查询`。若切主后仍持续拒读超过 15 s，说明新主本地登记没落地（看它的 `partition_map` 与 group 0 applied）。
 - **识别 P7-N22（已修，旧版本才会见到）**：副本回放日志每 250 ms 一条 `追平失败: unexpected data beyond EOF in block N of relation …`，
   多见于"当过主又降回副本"的节点收到全量基线之后；或同类节点回放静默跳过页面、逐字节比对不一致。旧版本处置：重启该节点的回放 worker
   （整节点重启）后重供基线；升级到含 `ReplayForgetCachedSizes` 的版本即根除。

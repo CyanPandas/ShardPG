@@ -275,6 +275,13 @@ typedef struct RaftGroupTable
     slock_t         mutex;              /* 仅保护注册表本身（in_use/group_id/members） */
     int             n_groups;
     int             max_groups;         /* T7.23：建表时的 pg_raft.max_groups，此后恒定 */
+    /*
+     * ★ P7-N21（2026-09-19）：显式拆过的组的墓碑。hearsay（收到对端 RV/AE 时按对端通告
+     * 自动建组）不许把墓碑里的组再建出来；显式 pg_raft_group_create 清墓碑。受 mutex 保护。
+     */
+    int64           tomb_gid[64];
+    TimestampTz     tomb_at[64];
+    int             tomb_next;
     RaftGroupState  groups[FLEXIBLE_ARRAY_MEMBER];
 } RaftGroupTable;
 
@@ -349,7 +356,7 @@ static bool candidate_log_is_up_to_date_locked(RaftGroupCtx *ctx,
 static void parse_peers(void);
 static bool raft_group_ctx(int64 group_id, RaftGroupCtx *ctx);
 static bool raft_group_ensure(int64 group_id, const int *members, int n_members,
-                              RaftGroupCtx *ctx);
+                              RaftGroupCtx *ctx, bool hearsay);
 static bool group_membership_known(RaftGroupCtx *ctx);
 static bool group_resolve_membership(RaftGroupCtx *ctx);
 static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
@@ -501,9 +508,36 @@ raft_group_ctx(int64 group_id, RaftGroupCtx *ctx)
  * 取得组；不存在则创建。Follower 从 leader 的 RPC 里第一次听说某个数据组时，
  * 也走这里自动建组。
  */
+/* P7-N21：拆组墓碑（见 raft_group_ensure） */
+static void
+raft_tombstone_add(int64 group_id)
+{
+    if (RaftGroups == NULL || group_id == RAFT_CONTROL_GROUP)
+        return;
+    SpinLockAcquire(&RaftGroups->mutex);
+    RaftGroups->tomb_gid[RaftGroups->tomb_next] = group_id;
+    RaftGroups->tomb_at[RaftGroups->tomb_next] = GetCurrentTimestamp();
+    RaftGroups->tomb_next = (RaftGroups->tomb_next + 1) % lengthof(RaftGroups->tomb_gid);
+    SpinLockRelease(&RaftGroups->mutex);
+}
+
+static void
+raft_tombstone_clear(int64 group_id)
+{
+    int i;
+
+    if (RaftGroups == NULL)
+        return;
+    SpinLockAcquire(&RaftGroups->mutex);
+    for (i = 0; i < lengthof(RaftGroups->tomb_gid); i++)
+        if (RaftGroups->tomb_gid[i] == group_id)
+            RaftGroups->tomb_gid[i] = 0;
+    SpinLockRelease(&RaftGroups->mutex);
+}
+
 static bool
 raft_group_ensure(int64 group_id, const int *members, int n_members,
-                  RaftGroupCtx *ctx)
+                  RaftGroupCtx *ctx, bool hearsay)
 {
     int i;
 
@@ -539,6 +573,37 @@ raft_group_ensure(int64 group_id, const int *members, int n_members,
         }
         return true;
     }
+
+    /*
+     * ★ P7-N21（2026-09-19）：刚被显式拆掉的组，不许 hearsay 再建出来。
+     *
+     * 拆组是节点本地动作，在途的 RV/AE 会在已拆的节点上把组按通告**再建一个空壳**：
+     * 日志为空、last_data_plsn = 0。实测（09-18 15:16）清场时 102756/102757 在三台上被
+     * 这样复活，:5434 当上这个"僵尸组"的 leader；同一时刻它正在 DROP 该组分片表的壳，
+     * 提交路径上的 DROP 通知要经该组复制 ⇒ replicate_group_upto 从 plsn 1 起把整条
+     * 分区流历史（800 条）逐条重提，领导权还在三台间来回抖，一条 DROP 卡了 13 分钟
+     * （更早一次 fm_* 表几千条历史，卡 56 分钟）—— 这就是 P7-N21。
+     * 显式建组（pg_raft_group_create）清墓碑，合法重建不受影响；墓碑 10 分钟后失效。
+     */
+    if (hearsay)
+    {
+        bool tomb = false;
+
+        SpinLockAcquire(&RaftGroups->mutex);
+        for (i = 0; i < lengthof(RaftGroups->tomb_gid); i++)
+            if (RaftGroups->tomb_gid[i] == group_id &&
+                !TimestampDifferenceExceeds(RaftGroups->tomb_at[i],
+                                            GetCurrentTimestamp(), 600 * 1000))
+            {
+                tomb = true;
+                break;
+            }
+        SpinLockRelease(&RaftGroups->mutex);
+        if (tomb)
+            return false;
+    }
+    else
+        raft_tombstone_clear(group_id);
 
     SpinLockAcquire(&RaftGroups->mutex);
     for (i = 0; i < RAFT_MAX_GROUPS; i++)
@@ -2140,7 +2205,7 @@ restore_groups_if_needed(void)
              tok = strtok_r(NULL, ",", &saveptr))
             members[n_members++] = atoi(tok);
 
-        if (raft_group_ensure(gid, members, n_members, &ctx))
+        if (raft_group_ensure(gid, members, n_members, &ctx, false))
         {
             /*
              * 注册表里可能是空成员集（历史行数据，或建组时成员集由
@@ -2367,6 +2432,89 @@ raft_apply_claim_release_on_exit(int code, Datum arg)
 
 static bool apply_exit_cb_registered = false;
 
+/*
+ * ★ P7-N29（2026-09-19）：控制面 apply 的游标跟着事务走。
+ *
+ * 控制面条目在 apply_one_entry_guarded 的**子事务**里写元数据表（partition_map 等），
+ * 子事务提交进的是**外层事务** —— 通常是承载这次 AppendEntries / 上报的 RPC 会话事务。
+ * 而 last_applied 推进的是共享内存、并立刻落 hardstate 文件，都不随事务回滚。外层事务
+ * 后来一 ERROR / 客户端断连 FATAL（实测：apply 里的主权交接广播等复制认领位 60 s，RPC
+ * 客户端早已超时断开，`FATAL: connection to client lost`），这次调用里 apply 过的条目的
+ * 元数据修改全部撤销，游标却已越过它们，永不重放 ⇒ 该节点的 partition_map 与日志永久分叉
+ * （worker3 读到的"上一条登记"停在 term 2，连带把 P7-N27 的首版修法带偏）。
+ *
+ * 做法：本事务第一次推进控制面游标时记下推进前的值与事务嵌套层；事务（或记录层及以上的
+ * 子事务）回滚时把游标退回去并重写 hardstate，让这些条目下次重新 apply。控制面 apply
+ * 按设计幂等（元数据表 UPSERT + 任期栅栏，见 apply_one_entry 的注释），重放无副作用之虞。
+ */
+static int64 ctrl_xact_applied_from = -1;   /* -1 = 本事务未推进过控制面游标 */
+static int   ctrl_xact_nest_level = 0;
+static bool  ctrl_xact_cb_registered = false;
+
+static void
+ctrl_apply_rewind(const char *why)
+{
+    RaftGroupCtx ctx;
+    int64        from = ctrl_xact_applied_from;
+    int64        cur;
+
+    ctrl_xact_applied_from = -1;
+    if (from < 0 || RaftGroups == NULL || !raft_group_ctx(RAFT_CONTROL_GROUP, &ctx))
+        return;
+
+    SpinLockAcquire(&ctx.log->mutex);
+    cur = ctx.log->last_applied;
+    if (cur > from)
+        ctx.log->last_applied = from;
+    SpinLockRelease(&ctx.log->mutex);
+
+    if (cur > from)
+    {
+        persist_hard_state_unlocked(&ctx);
+        elog(WARNING,
+             "pg_raft: 承载控制面 apply 的%s回滚，apply 游标从 %lld 退回 %lld，"
+             "这些条目将重新 apply（P7-N29：否则元数据被撤销而游标不退，永久分叉）",
+             why, (long long) cur, (long long) from);
+    }
+}
+
+static void
+ctrl_apply_xact_cb(XactEvent event, void *arg)
+{
+    (void) arg;
+    switch (event)
+    {
+        case XACT_EVENT_ABORT:
+        case XACT_EVENT_PARALLEL_ABORT:
+            ctrl_apply_rewind("事务");
+            break;
+        case XACT_EVENT_COMMIT:
+        case XACT_EVENT_PARALLEL_COMMIT:
+        case XACT_EVENT_PREPARE:
+            ctrl_xact_applied_from = -1;
+            break;
+        default:
+            break;
+    }
+}
+
+static void
+ctrl_apply_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
+                      SubTransactionId parentSubid, void *arg)
+{
+    (void) mySubid;
+    (void) parentSubid;
+    (void) arg;
+    if (ctrl_xact_applied_from < 0)
+        return;
+    if (event == SUBXACT_EVENT_ABORT_SUB &&
+        GetCurrentTransactionNestLevel() <= ctrl_xact_nest_level)
+        ctrl_apply_rewind("子事务");
+    else if (event == SUBXACT_EVENT_COMMIT_SUB &&
+             GetCurrentTransactionNestLevel() == ctrl_xact_nest_level)
+        ctrl_xact_nest_level--;     /* 效果并入父事务，从此跟父事务走 */
+}
+
 static void
 group_apply_pending(RaftGroupCtx *ctx)
 {
@@ -2380,6 +2528,12 @@ group_apply_pending(RaftGroupCtx *ctx)
     {
         before_shmem_exit(raft_apply_claim_release_on_exit, (Datum) 0);
         apply_exit_cb_registered = true;
+    }
+    if (!ctrl_xact_cb_registered)
+    {
+        RegisterXactCallback(ctrl_apply_xact_cb, NULL);
+        RegisterSubXactCallback(ctrl_apply_subxact_cb, NULL);
+        ctrl_xact_cb_registered = true;
     }
 
     /*
@@ -2592,7 +2746,16 @@ group_apply_pending(RaftGroupCtx *ctx)
         if (ctx->log->apply_owner_pid == MyProcPid)
             ctx->log->apply_owner_pid = 0;
         if (applied_ok && ctx->log->last_applied < batch_end)
+        {
+            /* P7-N29：记下本事务第一次推进前的控制面游标 */
+            if (ctx->group_id == RAFT_CONTROL_GROUP && ctrl_xact_applied_from < 0 &&
+                IsTransactionState())
+            {
+                ctrl_xact_applied_from = ctx->log->last_applied;
+                ctrl_xact_nest_level = GetCurrentTransactionNestLevel();
+            }
             ctx->log->last_applied = batch_end;
+        }
         SpinLockRelease(&ctx->log->mutex);
 
         if (!applied_ok)
@@ -5298,7 +5461,7 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
     parse_peers();
 
     /* follower 可能是第一次听说这个数据组：按 leader 的通告自动建组 */
-    if (!raft_group_ensure(group_id, NULL, 0, &ctx))
+    if (!raft_group_ensure(group_id, NULL, 0, &ctx, true))   /* hearsay */
     {
         if (entry_op)
             pfree(entry_op);
@@ -5526,7 +5689,7 @@ pg_raft_rpc(PG_FUNCTION_ARGS)
 
     parse_peers();
 
-    if (!raft_group_ensure((int64) in_group, NULL, 0, &ctx))
+    if (!raft_group_ensure((int64) in_group, NULL, 0, &ctx, true))   /* hearsay */
     {
         pfree(msg);
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
@@ -5680,7 +5843,7 @@ pg_raft_group_create(PG_FUNCTION_ARGS)
                                 pg_raft_coordinator_node_id, (long long) group_id)));
     }
 
-    if (!raft_group_ensure(group_id, members, n_members, &ctx))
+    if (!raft_group_ensure(group_id, members, n_members, &ctx, false))
         PG_RETURN_BOOL(false);
 
     PG_RETURN_BOOL(true);
@@ -5713,6 +5876,7 @@ pg_raft_group_drop(PG_FUNCTION_ARGS)
     ctx.g->in_use = false;
     RaftGroups->n_groups--;
     SpinLockRelease(&RaftGroups->mutex);
+    raft_tombstone_add(group_id);       /* P7-N21：不许 hearsay 马上把它再建出来 */
 
     PG_RETURN_BOOL(true);
 }
@@ -6701,13 +6865,21 @@ replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
 
     for (plsn = last + 1; plsn <= cur_plsn; plsn++)
     {
+        int64 idx;
+
+        /*
+         * P7-N21：历史补发可能很长（冷启动的组从 plsn 1 起逐条重提），每条都给取消/终止
+         * 一个响应点 —— 否则只能 immediate 重启回收。认领位由调用方的 PG_FINALLY 归还。
+         */
+        CHECK_FOR_INTERRUPTS();
+
         /*
          * group_propose 只在拿到多数派 ack 之后才返回 idx > 0，而 follower
          * 是**先 fsync 再 ack** 的（运输层加固 §11.5.1 #1/#3）——所以
          * "返回成功" 严格等价于 "该条目已在多数派持久化"。
          * prepare 路径靠它得到 prepared 语义；决议路径靠它得到**提交点**。
          */
-        int64 idx = data_propose_one(ctx, plsn);
+        idx = data_propose_one(ctx, plsn);
 
         if (idx <= 0)
             ereport(ERROR,
@@ -6880,6 +7052,7 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
         g->in_use = false;
         RaftGroups->n_groups--;
         SpinLockRelease(&RaftGroups->mutex);
+        raft_tombstone_add(ctx.group_id);   /* P7-N21 */
         dropped++;
     }
 

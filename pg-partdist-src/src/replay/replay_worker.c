@@ -292,6 +292,7 @@ ShardReplicaSetPromoted(Oid relid, bool promoted)
         {
             ReplayCtl->slots[i].promoted = promoted;
             ReplayCtl->slots[i].promoted_clean = promoted;   /* P7-N23 */
+            ReplayCtl->slots[i].promotion_pending_until = 0; /* P7-N31：交接已落地 */
             break;
         }
     LWLockRelease(ReplayCtl->lock);
@@ -433,6 +434,54 @@ pg_partdist_shard_promoted_selfheld(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(ShardReplicaPromotedSelfHeld(PG_GETARG_OID(0)));
 }
 
+/*
+ * ★ P7-N31：升主前置返回 1 时由 promote_prepare_ex 调，标"即将登记为主"15 s。
+ */
+void
+ShardReplicaMarkPromotionPending(Oid relid)
+{
+    int i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return;
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            ReplayCtl->slots[i].promotion_pending_until =
+                TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 15000);
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+}
+
+static bool
+ShardReplicaPromotionPending(Oid relid)
+{
+    TimestampTz until = 0;
+    int         i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return false;
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            until = ReplayCtl->slots[i].promotion_pending_until;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    return until != 0 && GetCurrentTimestamp() < until;
+}
+
+PG_FUNCTION_INFO_V1(pg_partdist_shard_mark_promotion_pending);
+Datum
+pg_partdist_shard_mark_promotion_pending(PG_FUNCTION_ARGS)
+{
+    ShardReplicaMarkPromotionPending(PG_GETARG_OID(0));
+    PG_RETURN_VOID();
+}
+
 void
 ShardReplicaAccessGate(Oid relid, const char *what)
 {
@@ -458,6 +507,20 @@ ShardReplicaAccessGate(Oid relid, const char *what)
      */
     if (!TransactionIdIsValid(ShardXidAllocWatermark(relid)))
         return;
+
+    /*
+     * ★ P7-N31（2026-09-19）：本节点刚过升主前置、登记正在路上时，协调者可能已先 apply、
+     * 把路由翻到这里，而本节点自己那份登记还没 apply —— 此刻拒读就是一次亚秒级的
+     * 切主读失败（N25 回归实测）。等本地 apply 把"已升主"置上（有 15 s 上限、可中断）；
+     * 等到了就放行，等不到（登记被栅栏挡下 / 别人当选）照旧拒。
+     */
+    while (ShardReplicaPromotionPending(relid))
+    {
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(20000L);
+        if (!ShardReplicaIsLocal(relid))
+            return;             /* 本地登记已 apply、已升主 */
+    }
 
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

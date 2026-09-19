@@ -326,6 +326,14 @@ typedef struct ReplayShardSlot
     bool    promoted_clean;
 
     /*
+     * ★ P7-N31（2026-09-19）：升主前置已返回 1、即将上报登记的截止时刻（0 = 无）。
+     * 登记生效时各节点**各自** apply：协调者先 apply 就先把路由翻到本节点，而本节点
+     * 自己那份登记还没 apply、读闸门还当它是副本 ⇒ 亚秒级拒读。闸门见到此标记会
+     * 等本地 apply 跟上（有上限），而不是立刻拒。ShardReplicaSetPromoted 清零。
+     */
+    TimestampTz promotion_pending_until;
+
+    /*
      * locmap 代次：每次 replay_set_locmap() 重建配对就 +1。worker 拿它和
      * ctx 里那份比对，不同就重建 ctx —— 否则运维在结构栅栏之后补完结构、
      * 重跑了 replay_set_locmap()，worker 仍抱着内存里那张旧 loc_map，
@@ -437,6 +445,7 @@ extern bool ShardReplicaIsLocal(Oid relid);
 /* 批次 #7：raft 角色交接时置/撤"已升主"身份（闸门出口） */
 extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
 extern void ShardReplicaNoteForeignAppend(Oid relid);   /* P7-N23 */
+extern void ShardReplicaMarkPromotionPending(Oid relid);   /* P7-N31 */
 extern bool ShardReplicaPromotedSelfHeld(Oid relid);    /* P7-N23 */
 extern void ShardReplaySetArmed(Oid relid, bool armed);
 extern bool ShardReplayBaselinePending(Oid relid);   /* P7-N16 */

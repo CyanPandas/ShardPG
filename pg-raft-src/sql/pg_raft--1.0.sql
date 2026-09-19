@@ -679,6 +679,12 @@ BEGIN
                       loid, p_group_id, SQLERRM;
     END;
 --
+    -- ★ P7-N31：即将上报登记。标记"升主在途"，让读闸门在本地登记 apply 之前等一等而不是拒读。
+    BEGIN
+        PERFORM partdist.shard_mark_promotion_pending(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
     RETURN 1;
 END
 $promox$;

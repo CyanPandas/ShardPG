@@ -821,6 +821,13 @@ CREATE OR REPLACE FUNCTION shard_baseline_pending(p_shard OID)
 COMMENT ON FUNCTION shard_baseline_pending(OID) IS
     '收到 FULL_BASELINE（截空本地文件、等 FPI 重建）到收到匹配 BASELINE_END 之间返回真；升主前置见真即不放行。';
 
+CREATE OR REPLACE FUNCTION shard_mark_promotion_pending(p_shard OID)
+    RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_mark_promotion_pending';
+
+COMMENT ON FUNCTION shard_mark_promotion_pending(OID) IS
+    'P7-N31：升主前置返回 1 时调，标记该分片"即将登记为主"15 s；读闸门见此标记会等本地登记 apply 跟上而不是立即拒读。';
+
 CREATE OR REPLACE FUNCTION shard_promoted_selfheld(p_shard OID)
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_shard_promoted_selfheld';
