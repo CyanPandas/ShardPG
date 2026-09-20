@@ -57,12 +57,18 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 ```
 
 ```text
-① 安装 demo 函数库（只装在协调者上）
-② 记下演示会改动的参数在各节点 postgresql.auto.conf 里的原样（stop 时原样还原）
-③ 打开 TSO（全局时间戳服务，跑在协调者上）：删 boot 标记 → 重启协调者 → tso_master=on → 各节点指向它
-④ 演示期间把 3 台 worker 的 Raft 选举超时放宽到 15 s（2 vCPU 上避免负载抖动误选主；stop 时还原）
-准备好了。打开会话：bash shardpg_demo.sh sql A（第二个窗口：bash shardpg_demo.sh sql B）；演示函数一览：SELECT * FROM demo.help();
+准备好了
 ```
+
+成功就只有这一行（约十几秒）。**出错时不会是这一行**，而是一条写明原因、带下一步怎么做的提示，例如：
+
+```text
+启动失败：上一次演示还没收尾（demo 模式还在）
+先执行：bash shardpg_demo.sh stop
+```
+
+想看它在背后做了什么（装函数库、记参数原样、开 TSO、放宽选举超时），加 `VERBOSE=1`：
+`ssh -t zhanhao@34.31.210.7 "VERBOSE=1 bash ~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh start"`
 
 然后在窗口 1 打开会话 A，**再开一个 PowerShell 窗口**打开会话 B：
 

@@ -18,7 +18,16 @@ DEMO_TABLES="${DEMO_TABLES:-account}"
 
 psqlc() { local port=$1; shift; docker exec -i -u postgres "$C" $BIN/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
 q()     { psqlc "$1" -qAtc "$2" </dev/null 2>/dev/null | tail -1; }
+qe()    { psqlc "$1" -qAtc "$2" </dev/null 2>&1 | tail -3; }   # 保留错误文本，报错时用
 say()   { printf '%s\n' "$*"; }
+step()  { [[ "${VERBOSE:-0}" == 1 ]] && printf '%s\n' "$*"; return 0; }   # 只有 VERBOSE=1 才打过程
+die()   { printf '启动失败：%s\n' "$1" >&2; [[ -n "${2:-}" ]] && printf '%s\n' "$2" >&2; exit 1; }
+taillog() {     # 某个节点起不来时，把它日志最后几行打出来
+    local p=$1 d
+    d=$(docker exec "$C" bash -c "ls -d /work/pg-cluster-data/*/ | while read x; do grep -q \"^port *= *$p\" \$x/postgresql.conf 2>/dev/null && echo \$x; done" 2>/dev/null | head -1)
+    [[ -z "$d" ]] && return 0
+    docker exec "$C" bash -c "tail -5 '$d/pg.log' 2>/dev/null" 2>/dev/null
+}
 
 workers() { q 5432 "SELECT string_agg(nodeport::text, ' ' ORDER BY nodeport) FROM pg_dist_node WHERE noderole='primary' AND groupid<>0 AND isactive"; }
 
@@ -28,53 +37,69 @@ ensure_up() {   # 有被演示停掉的 worker 就拉起来
         [[ "$(q $p 'SELECT 1')" == 1 ]] && continue
         d=$(docker exec "$C" bash -c "ls -d /work/pg-cluster-data/*/ | while read x; do grep -q \"^port *= *$p\" \$x/postgresql.conf 2>/dev/null && echo \$x; done" | head -1)
         [[ -z "$d" ]] && { [[ $p == 5432 ]] && d=/work/pg-cluster-data/coordinator || d="/work/pg-cluster-data/worker$((p - 5432))"; }
-        say "  拉起 :$p（$d）"
+        step "  拉起 :$p（$d）"
         docker exec -u postgres "$C" $BIN/pg_ctl start -D "$d" -l "$d/pg.log" -o "-p $p" -w -t 60 >/dev/null 2>&1
     done
 }
 
 cmd_start() {
-    docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null | grep -q true || { say "容器 $C 没在运行"; exit 1; }
+    docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null | grep -q true \
+        || die "容器 $C 没在运行" "先执行：docker start $C"
     ensure_up
+    local p down=""
+    for p in 5432 $(q 5432 "SELECT string_agg(nodeport::text, ' ' ORDER BY nodeport) FROM pg_dist_node WHERE noderole='primary' AND groupid<>0 AND isactive"); do
+        [[ "$(q $p 'SELECT 1')" == 1 ]] || down="$down :$p"
+    done
+    [[ -z "$down" ]] || die "这些节点没起来：$down" "$(for p in $down; do taillog "${p#:}"; done)"
+
     local W; W=$(workers)
-    [[ $(wc -w <<<"$W") -eq 3 ]] || { say "需要 1 协调者 + 3 worker，现在 worker 是：$W"; exit 1; }
+    [[ $(wc -w <<<"$W") -eq 3 ]] \
+        || die "需要 1 个协调者 + 3 个 worker，现在 worker 是「$W」" "（演示固定用 4 个节点）"
     if [[ "$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")" != 0 ]]; then
-        say "上一次演示还没 stop（demo 模式还在），先运行：bash $0 stop"; exit 1
+        die "上一次演示还没收尾（demo 模式还在）" "先执行：bash $0 stop"
     fi
-    local p ng=0 t
-    for p in $W; do ng=$((ng + $(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0"))); done
-    [[ $ng -eq 0 ]] || { say "worker 上还有 $ng 个数据 Raft 组（别的测试在用这套集群？），不能开始演示"; exit 1; }
+    local ng=0 t n
+    for p in $W; do
+        n=$(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0")
+        ng=$((ng + ${n:-0}))
+    done
+    [[ $ng -eq 0 ]] \
+        || die "worker 上还有 $ng 个数据 Raft 组（别的测试在用这套集群？）" "先清场再演示：bash $0 stop"
     for t in $DEMO_TABLES; do
         [[ "$(q 5432 "SELECT count(*) FROM pg_class WHERE relname='$t' AND relnamespace='public'::regnamespace")" == 0 ]] \
-            || { say "表 $t 已存在，不能开始演示"; exit 1; }
+            || die "表 $t 已存在" "先执行：bash $0 stop（或手工 DROP TABLE $t）"
     done
 
-    say "① 安装 demo 函数库（只装在协调者上）"
-    psqlc 5432 -q -v ON_ERROR_STOP=1 < "$HERE/shardpg_demo_functions.sql" >/dev/null || { say "安装失败"; exit 1; }
+    step "① 安装 demo 函数库（只装在协调者上）"
+    local out
+    out=$(psqlc 5432 -q -v ON_ERROR_STOP=1 < "$HERE/shardpg_demo_functions.sql" 2>&1 >/dev/null) \
+        || die "装 demo 函数库失败" "$(tail -5 <<<"$out")"
 
-    say "② 记下演示会改动的参数在各节点 postgresql.auto.conf 里的原样（stop 时原样还原）"
-    q 5432 "SELECT demo._save_gucs()" >/dev/null
+    step "② 记下演示会改动的参数在各节点 postgresql.auto.conf 里的原样（stop 时原样还原）"
+    out=$(qe 5432 "SELECT demo._save_gucs()")      # 返回 void：成功时无输出
+    [[ -z "${out//[[:space:]]/}" ]] || die "记录参数原样失败" "$out"
 
-    say "③ 打开 TSO（全局时间戳服务，跑在协调者上）：删 boot 标记 → 重启协调者 → tso_master=on → 各节点指向它"
+    step "③ 打开 TSO（全局时间戳服务，跑在协调者上）：删 boot 标记 → 重启协调者 → tso_master=on → 各节点指向它"
     local cd; cd=$(q 5432 "SHOW data_directory")
-    docker exec -u postgres "$C" rm -f "$cd/pg_tso_boot"
+    docker exec -u postgres "$C" rm -f "$cd/pg_tso_boot" 2>/dev/null
     docker exec -u postgres "$C" $BIN/pg_ctl -D "$cd" -m fast -l "$cd/pg.log" restart -w -t 60 >/dev/null 2>&1
     for t in $(seq 1 40); do [[ "$(q 5432 'SELECT 1')" == 1 ]] && break; sleep 1; done
+    [[ "$(q 5432 'SELECT 1')" == 1 ]] || die "协调者重启后没起来" "$(taillog 5432)"
     q 5432 "ALTER SYSTEM SET pg_partdist.tso_master = on" >/dev/null
     for p in 5432 $W; do
         q $p "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres'" >/dev/null
         q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = 60000" >/dev/null
         q $p "SELECT pg_reload_conf()" >/dev/null
     done
-    say "④ 演示期间把 3 台 worker 的 Raft 选举超时放宽到 15 s（2 vCPU 上避免负载抖动误选主；stop 时还原）"
+    step "④ 演示期间把 3 台 worker 的 Raft 选举超时放宽到 15 s（2 vCPU 上避免负载抖动误选主；stop 时还原）"
     for p in $W; do q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 15000" >/dev/null; q $p "SELECT pg_reload_conf()" >/dev/null; done
     sleep 2
     for p in $W; do q $p "SELECT partdist.partdist_tso_client_start_ts()" >/dev/null; done
     sleep 3
-    local ts; ts=$(q 5432 "SELECT partdist.partdist_tso_client_start_ts()")
-    [[ "$ts" =~ ^[0-9]+$ ]] || { say "TSO 取号失败"; exit 1; }
-    docker exec "$C" test -f /tmp/pagecmp.py || docker cp "$HERE/../tests/pagecmp.py" "$C":/tmp/pagecmp.py
-    say "准备好了。打开会话：bash $0 sql A（第二个窗口：bash $0 sql B）；演示函数一览：SELECT * FROM demo.help();"
+    local ts; ts=$(qe 5432 "SELECT partdist.partdist_tso_client_start_ts()")
+    [[ "$ts" =~ ^[0-9]+$ ]] || die "TSO 取号失败" "$ts"
+    docker exec "$C" test -f /tmp/pagecmp.py || docker cp "$HERE/../tests/pagecmp.py" "$C":/tmp/pagecmp.py >/dev/null 2>&1
+    say "准备好了"
 }
 
 cmd_sql() {
