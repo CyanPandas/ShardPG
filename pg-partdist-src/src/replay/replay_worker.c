@@ -171,6 +171,7 @@ ReplayShmemInit(void)
 /* ================================================================== */
 
 bool allow_replica_access = false;   /* GUC：见 shard_replay.h 的说明 */
+int  partdist_demoted_read_grace_ms = 10000;   /* P7-N33：降级后的读宽限（ms） */
 bool replica_prune_guard = true;     /* GUC：T7.26，见 shard_replay.h */
 
 /*
@@ -293,6 +294,7 @@ ShardReplicaSetPromoted(Oid relid, bool promoted)
             ReplayCtl->slots[i].promoted = promoted;
             ReplayCtl->slots[i].promoted_clean = promoted;   /* P7-N23 */
             ReplayCtl->slots[i].promotion_pending_until = 0; /* P7-N31：交接已落地 */
+            ReplayCtl->slots[i].demoted_read_until = 0;      /* P7-N33：角色又变了，宽限作废 */
             break;
         }
     LWLockRelease(ReplayCtl->lock);
@@ -455,6 +457,57 @@ ShardReplicaMarkPromotionPending(Oid relid)
     LWLockRelease(ReplayCtl->lock);
 }
 
+/*
+ * ★ P7-N33：本节点刚被降级 —— 记下宽限截止时刻与当时的回放游标。
+ * 宽限期内读闸门仍放行（数据还是交出主权那一刻的快照，见 shard_replay.h 的说明）。
+ */
+void
+ShardReplicaNoteDemoted(Oid relid)
+{
+    int i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL || partdist_demoted_read_grace_ms <= 0)
+        return;
+    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            ReplayCtl->slots[i].demoted_read_until =
+                TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+                                            partdist_demoted_read_grace_ms);
+            ReplayCtl->slots[i].demoted_applied = ReplayCtl->slots[i].applied;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+}
+
+/* 仍在降级宽限内、且本地一条都没回放过新主的流 */
+static bool
+ShardReplicaDemotedGrace(Oid relid)
+{
+    TimestampTz until = 0;
+    uint64      at_demote = 0;
+    uint64      now_applied = 0;
+    bool        found = false;
+    int         i;
+
+    if (!OidIsValid(relid) || ReplayCtl == NULL)
+        return false;
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == relid)
+        {
+            until = ReplayCtl->slots[i].demoted_read_until;
+            at_demote = ReplayCtl->slots[i].demoted_applied;
+            now_applied = ReplayCtl->slots[i].applied;
+            found = true;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    return found && until != 0 && GetCurrentTimestamp() < until &&
+        now_applied == at_demote;
+}
+
 static bool
 ShardReplicaPromotionPending(Oid relid)
 {
@@ -521,6 +574,15 @@ ShardReplicaAccessGate(Oid relid, const char *what)
         if (!ShardReplicaIsLocal(relid))
             return;             /* 本地登记已 apply、已升主 */
     }
+
+    /*
+     * ★ P7-N33（2026-09-20）：刚被降级、且本地还没回放过新主的流 —— 放行。
+     * 这一格的数据就是本节点交出主权那一刻的已提交状态；协调者的路由此刻多半还指着这里
+     * （各节点 apply 同一条登记先后差 0.2–1.9 s），拒读只是把这 1–2 s 的读全判死。
+     * 一旦回放推进（applied 变了）或宽限到期，立即恢复拒读。
+     */
+    if (ShardReplicaDemotedGrace(relid))
+        return;
 
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

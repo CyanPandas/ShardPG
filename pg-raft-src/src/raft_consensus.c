@@ -163,6 +163,9 @@ typedef struct RaftLogEntry
     char   payload[RAFT_PAYLOAD_MAX];
 } RaftLogEntry;
 
+/* ★ P7-N37：控制面条目 apply 连续失败多久之后才放弃（按老语义跳过） */
+#define RAFT_CTRL_APPLY_RETRY_MS 60000
+
 typedef struct RaftLogShmem
 {
     slock_t      mutex;
@@ -221,6 +224,24 @@ typedef struct RaftLogShmem
                                      * 见 RAFT_APPLYFAIL_*。apply 推不动时这是唯一
                                      * 线索 —— 三条 false 分支从日志上完全看不出
                                      * 区别，而它们的处置完全不同。 */
+
+    /*
+     * ★ P7-N37（2026-09-20）：控制面 apply 抛错后的重试账本。
+     *
+     * 原语义是"控制面条目 apply 抛错 ⇒ 当作已应用、游标照推"——一次**瞬时**
+     * 失败（锁超时、死锁、临时资源不足）就能让这个节点**永久**错过一条登记。
+     * 实测：协调者 apply OP_PARTITION_PRIMARY 撞上一把行锁、300 ms 锁超时，
+     * 这条"谁是主"就此丢失，它的路由从此指着旧主，直到该分片下一次切主。
+     * （P7-N34 那条"回滚后由下一次 AE 重做"的注释，在老语义下其实并不成立。）
+     *
+     * 现在：同一条目连续失败先保留游标重试，只有连续失败超过
+     * RAFT_CTRL_APPLY_RETRY_MS 才按老语义跳过 —— 真·毒条目仍然堵不死控制面，
+     * 瞬时故障不再静默丢登记。计数必须放共享内存：每次 AE RPC 是**不同的
+     * backend**，进程内静态变量每轮都归零，等于永不放弃。
+     */
+    int64        ctrl_fail_index;   /* 正在重试的控制面条目 index（0 = 无） */
+    int          ctrl_fail_count;   /* 它连续失败了几次 */
+    TimestampTz  ctrl_fail_since;   /* 第一次失败的时刻 */
 
     RaftLogEntry ring[RAFT_LOG_CAPACITY];
 } RaftLogShmem;
@@ -451,6 +472,9 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     g->log.quorum_drops = 0;
     g->log.last_drop_plsn = 0;
     g->log.last_apply_fail = RAFT_APPLYFAIL_NONE;
+    g->log.ctrl_fail_index = 0;
+    g->log.ctrl_fail_count = 0;
+    g->log.ctrl_fail_since = 0;
     memset(g->log.peer_last_ack, 0, sizeof(g->log.peer_last_ack));
     memset(g->log.peer_last_fail, 0, sizeof(g->log.peer_last_fail));
 
@@ -606,6 +630,30 @@ raft_group_ensure(int64 group_id, const int *members, int n_members,
         raft_tombstone_clear(group_id);
 
     SpinLockAcquire(&RaftGroups->mutex);
+
+    /*
+     * ★ P7-N36（2026-09-20）：**在锁内复查一次**。
+     *
+     * 上面那次"组在不在"的检查（raft_group_ctx）是**不持锁**的，而分配空槽在锁内 ——
+     * 两个后端同时为同一个 group_id 走到这里，就会各插一个槽位。节点重启时最容易撞上：
+     * 每个后端都会 restore_groups_if_needed()（groups_restored 是**每后端**静态量），
+     * 同时对端的 AE/RV 又按 hearsay 建组。实测 w2 重启后同一毫秒里两个后端各建了一次
+     * 组 102895（槽位 2 与槽位 4）。
+     *
+     * 后果不是"多占一个槽位"这么轻：多出来的那个槽是**独立的状态机**，它自己的选举
+     * 计时器一到就发起竞选、抬高任期，把该组真正的 leader 一次次逼下台（实测一个组的
+     * 任期被抬到 12，写入反复撞"本节点不是该分区组的 leader"）。
+     */
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        if (RaftGroups->groups[i].in_use &&
+            RaftGroups->groups[i].group_id == group_id)
+        {
+            SpinLockRelease(&RaftGroups->mutex);
+            return raft_group_ctx(group_id, ctx);    /* 别人刚建好，用它那个 */
+        }
+    }
+
     for (i = 0; i < RAFT_MAX_GROUPS; i++)
     {
         if (!RaftGroups->groups[i].in_use)
@@ -2021,20 +2069,39 @@ log_truncate_after_locked(RaftGroupCtx *ctx, int64 index)
  * 控制面（group 0）走 partdist 元数据表；数据组的 apply 在 P2 落地（平凡 apply：
  * 只落盘段文件 + 推进 applied_part_lsn），P1 阶段仅推进 last_applied 游标。
  */
+/* ★ P7-N34：本后端正在跑控制面 apply（见 replicate_claim 的等待上限） */
+static bool raft_in_control_apply = false;
+
 static bool
 apply_one_entry(RaftGroupCtx *ctx, const RaftLogEntry *e)
 {
     if (ctx->group_id == RAFT_CONTROL_GROUP)
     {
+        bool save_in_apply = raft_in_control_apply;
+
         /*
          * 控制面**保持组化前的语义：失败也推进游标**。这里刻意不做重试 ——
          * 控制面 apply 写的是幂等的 partdist 元数据表，而一条永久失败的
          * payload 若卡住游标，整个 failover 通道都会停摆，代价远大于漏一条。
          * 数据面相反：漏一条 redo 就是堆表分叉，所以下面必须重试。
          */
-        if (!pg_raft_apply_payload_sql(e->op_type, e->payload))
-            elog(WARNING, "pg_raft: 控制面条目 %s 应用失败，按原语义跳过",
-                 e->op_type);
+        /*
+         * ★ P7-N34：标出"正在跑控制面 apply" —— 这段里握着 partition_map 的行锁，
+         * 交接广播要等该分片的复制认领位；等不到时必须**快速放手**（回滚重做），
+         * 不能握着行锁等满 60 s 把写入一起拖死。标记只影响 replicate_claim 的等待上限。
+         */
+        raft_in_control_apply = true;
+        PG_TRY();
+        {
+            if (!pg_raft_apply_payload_sql(e->op_type, e->payload))
+                elog(WARNING, "pg_raft: 控制面条目 %s 应用失败，按原语义跳过",
+                     e->op_type);
+        }
+        PG_FINALLY();
+        {
+            raft_in_control_apply = save_in_apply;
+        }
+        PG_END_TRY();
         return true;
     }
     if (strcmp(e->op_type, RAFT_OP_PARWAL) == 0)
@@ -2371,6 +2438,18 @@ apply_one_entry_guarded(RaftGroupCtx *ctx, const RaftLogEntry *e)
     PG_TRY();
     {
         ok = apply_one_entry(ctx, e);
+        /* P7-N37：这条终于过去了，清掉重试账本（比较也放锁内，别在锁外读 int64） */
+        if (ok && ctx->group_id == RAFT_CONTROL_GROUP)
+        {
+            SpinLockAcquire(&ctx->log->mutex);
+            if (ctx->log->ctrl_fail_index == e->index)
+            {
+                ctx->log->ctrl_fail_index = 0;
+                ctx->log->ctrl_fail_count = 0;
+                ctx->log->ctrl_fail_since = 0;
+            }
+            SpinLockRelease(&ctx->log->mutex);
+        }
         ReleaseCurrentSubTransaction();
         MemoryContextSwitchTo(oldcxt);
         CurrentResourceOwner = oldowner;
@@ -2386,12 +2465,54 @@ apply_one_entry_guarded(RaftGroupCtx *ctx, const RaftLogEntry *e)
         MemoryContextSwitchTo(oldcxt);
         CurrentResourceOwner = oldowner;
 
-        ok = (ctx->group_id == RAFT_CONTROL_GROUP);
-        elog(WARNING,
-             "pg_raft: group %lld 的条目 %lld(%s) apply 抛错：%s —— %s",
-             (long long) ctx->group_id, (long long) e->index, e->op_type,
-             edata->message,
-             ok ? "控制面按既有语义跳过" : "数据面保留游标，下轮重试");
+        /*
+         * ★ P7-N37：控制面不再"一错就跳过"。同一条目先重试，连续失败超过
+         * RAFT_CTRL_APPLY_RETRY_MS 才跳过。
+         */
+        if (ctx->group_id == RAFT_CONTROL_GROUP)
+        {
+            TimestampTz now = GetCurrentTimestamp();
+            int         tries;
+            long        secs;
+            int         usecs;
+
+            SpinLockAcquire(&ctx->log->mutex);
+            if (ctx->log->ctrl_fail_index != e->index)
+            {
+                ctx->log->ctrl_fail_index = e->index;
+                ctx->log->ctrl_fail_count = 0;
+                ctx->log->ctrl_fail_since = now;
+            }
+            tries = ++ctx->log->ctrl_fail_count;
+            TimestampDifference(ctx->log->ctrl_fail_since, now, &secs, &usecs);
+            SpinLockRelease(&ctx->log->mutex);
+
+            ok = (secs * 1000 + usecs / 1000 >= RAFT_CTRL_APPLY_RETRY_MS);
+            elog(WARNING,
+                 "pg_raft: group 0 的条目 %lld(%s) apply 抛错：%s —— %s"
+                 "（第 %d 次，已持续 %ld s，P7-N37）",
+                 (long long) e->index, e->op_type, edata->message,
+                 ok ? "重试已超时，按既有语义跳过（本节点将永久错过这条登记）"
+                    : "保留游标，下轮重试",
+                 tries, secs);
+            if (ok)
+            {
+                SpinLockAcquire(&ctx->log->mutex);
+                ctx->log->ctrl_fail_index = 0;
+                ctx->log->ctrl_fail_count = 0;
+                ctx->log->ctrl_fail_since = 0;
+                SpinLockRelease(&ctx->log->mutex);
+            }
+        }
+        else
+        {
+            ok = false;
+            elog(WARNING,
+                 "pg_raft: group %lld 的条目 %lld(%s) apply 抛错：%s —— "
+                 "数据面保留游标，下轮重试",
+                 (long long) ctx->group_id, (long long) e->index, e->op_type,
+                 edata->message);
+        }
         FreeErrorData(edata);
     }
     PG_END_TRY();
@@ -5141,6 +5262,56 @@ group_propose(RaftGroupCtx *ctx, const char *op_type, const char *payload)
     return idx;
 }
 
+/*
+ * pg_raft_group_committed_plsn(group_id) → bigint
+ *
+ * ★ P7-N35（2026-09-20）：本节点 raft 日志里**已提交**的最大数据位点（OP_PARWAL 的 partition_lsn）。
+ *
+ * 升主追平的上界原本只取 follower_partition_map.applied_part_lsn —— 那是"本节点已经 apply 到哪"，
+ * 它由本节点自己的 apply 推进，CPU 忙、事务内复制跳过推进、或 apply 卡在某个锁上时都会落后。
+ * 落后的那一截里若有**提交标记**，升主就不回放它，随后认领把那个分片 xid 判成 ABORTED ——
+ * 已确认的提交消失。已提交的条目按定义是多数派持久化过的，回放它们不违反"不碰未提交条目"。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_committed_plsn);
+Datum
+pg_raft_group_committed_plsn(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    RaftGroupCtx ctx;
+    int64        idx;
+    int64        commit_idx;
+    int64        floor_idx;
+    int64        plsn = 0;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_INT64(0);
+
+    parse_peers();
+    restore_groups_if_needed();
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_INT64(0);
+
+    SpinLockAcquire(&ctx.log->mutex);
+    commit_idx = ctx.log->commit_index;
+    floor_idx = ctx.log->last_log_index - RAFT_LOG_CAPACITY + 1;
+    if (floor_idx < 1)
+        floor_idx = 1;
+    for (idx = commit_idx; idx >= floor_idx; idx--)
+    {
+        RaftLogEntry e;
+
+        if (log_get_entry_locked(&ctx, idx, &e) &&
+            strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+        {
+            plsn = entry_partition_lsn(e.payload);
+            break;
+        }
+    }
+    SpinLockRelease(&ctx.log->mutex);
+
+    PG_RETURN_INT64(plsn);
+}
+
 int64
 pg_raft_consensus_propose(const char *op_type, const char *payload)
 {
@@ -6726,11 +6897,63 @@ pg_raft_any_group_leader_local(void)
  * 这里扩到"每组的复制认领位"。二者都是短临界区、无嵌套取锁，安全。
  */
 #define RAFT_REPLICATE_CLAIM_TIMEOUT_MS  60000
+/*
+ * ★ P7-N34（2026-09-20）：控制面 apply 里等认领位要**短**。
+ *
+ * 控制面那条"登记为主"的 apply 跑在 AE 的 RPC 事务里：它先 UPSERT partition_map
+ * （握着那一行的行锁），再走 partwal_notify_primary_switch 发交接广播 —— 广播要复制，
+ * 于是在**握着行锁**的状态下等该分片的认领位。此刻若有写入先拿到认领位，两边就互等：
+ * 认领位是本扩展自己在 shmem 里的位，PG 的死锁检测看不见它，只能等超时。实测宕机切主后
+ * 新主上写入被卡到 60 s 超时，反复几轮共约 6 分钟不可写。
+ *
+ * 让 apply 这一侧先放手：等不到就快速失败，事务回滚（apply 游标由 P7-N29 退回），
+ * 下一次 AE 心跳自然重做，代价是几秒；而占着认领位的那笔写入立刻能走完。
+ */
+#define RAFT_REPLICATE_CLAIM_APPLY_MS    3000
+
+/*
+ * 本后端已持有的认领位（组 → 重入深度）。
+ *
+ * 认领位原本不可重入：持有者自己再申请一次会去等自己，直到 60 s 超时报错。
+ * 复制路径上会嵌套（基线/交接广播里再触发一次复制），事务 ERROR 后也可能留下
+ * "shmem 记着我、本后端却已经不在那段代码里"的残留。两种情形都不该等自己。
+ */
+#define RAFT_MAX_SELF_CLAIMS 8
+static struct { int64 gid; int depth; } raft_self_claims[RAFT_MAX_SELF_CLAIMS];
+
+static int *
+self_claim_depth(int64 group_id, bool create)
+{
+    int i;
+    int free_i = -1;
+
+    for (i = 0; i < RAFT_MAX_SELF_CLAIMS; i++)
+    {
+        if (raft_self_claims[i].depth > 0 && raft_self_claims[i].gid == group_id)
+            return &raft_self_claims[i].depth;
+        if (raft_self_claims[i].depth == 0 && free_i < 0)
+            free_i = i;
+    }
+    if (!create || free_i < 0)
+        return NULL;
+    raft_self_claims[free_i].gid = group_id;
+    raft_self_claims[free_i].depth = 0;
+    return &raft_self_claims[free_i].depth;
+}
 
 static void
 replicate_claim(RaftGroupCtx *ctx)
 {
     long waited_us = 0;
+    int  timeout_ms = raft_in_control_apply ? RAFT_REPLICATE_CLAIM_APPLY_MS
+                                            : RAFT_REPLICATE_CLAIM_TIMEOUT_MS;
+    int *depth = self_claim_depth(ctx->group_id, false);
+
+    if (depth != NULL)          /* 已经是自己持有：重入，不要等自己 */
+    {
+        (*depth)++;
+        return;
+    }
 
     for (;;)
     {
@@ -6745,11 +6968,24 @@ replicate_claim(RaftGroupCtx *ctx)
             got = true;
         }
         else
+        {
             holder = ctx->g->replicate_pid;
+            if (holder == MyProcPid)
+            {
+                /* shmem 记着我、本后端却没有在册深度 ⇒ 上一笔事务 ERROR 后的残留，收回继续用 */
+                ctx->g->replicate_in_progress = true;
+                got = true;
+            }
+        }
         SpinLockRelease(&RaftGroups->mutex);
 
         if (got)
+        {
+            depth = self_claim_depth(ctx->group_id, true);
+            if (depth != NULL)
+                *depth = 1;
             return;
+        }
 
         /* 持有者还活着吗？（出锁后做：BackendPidGetProc 会取 ProcArrayLock） */
         if (holder != 0 && holder != MyProcPid &&
@@ -6769,16 +7005,20 @@ replicate_claim(RaftGroupCtx *ctx)
                 elog(WARNING,
                      "pg_raft: 组 %lld 的复制认领位由已消失的 backend %d 持有，已回收",
                      (long long) ctx->group_id, holder);
+                depth = self_claim_depth(ctx->group_id, true);
+                if (depth != NULL)
+                    *depth = 1;
                 return;
             }
         }
 
-        if (waited_us >= RAFT_REPLICATE_CLAIM_TIMEOUT_MS * 1000L)
+        if (waited_us >= (long) timeout_ms * 1000L)
             ereport(ERROR,
                     (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-                     errmsg("pg_raft: 等待组 %lld 的复制认领位超过 %d ms，prepare 失败",
-                            (long long) ctx->group_id,
-                            RAFT_REPLICATE_CLAIM_TIMEOUT_MS),
+                     errmsg("pg_raft: 等待组 %lld 的复制认领位超过 %d ms，%s",
+                            (long long) ctx->group_id, timeout_ms,
+                            raft_in_control_apply ? "本次控制面 apply 放弃（回滚后由下一次 AE 重做，P7-N34）"
+                                                  : "prepare 失败"),
                      errdetail("持有者 backend %d 可能卡在对端 RPC 上。", holder)));
 
         CHECK_FOR_INTERRUPTS();
@@ -6795,9 +7035,16 @@ static bool
 replicate_try_claim(RaftGroupCtx *ctx)
 {
     bool got = false;
+    int *depth = self_claim_depth(ctx->group_id, false);
+
+    if (depth != NULL)          /* 已经是自己持有：重入（P7-N34） */
+    {
+        (*depth)++;
+        return true;
+    }
 
     SpinLockAcquire(&RaftGroups->mutex);
-    if (!ctx->g->replicate_in_progress)
+    if (!ctx->g->replicate_in_progress || ctx->g->replicate_pid == MyProcPid)
     {
         ctx->g->replicate_in_progress = true;
         ctx->g->replicate_pid = MyProcPid;
@@ -6805,12 +7052,30 @@ replicate_try_claim(RaftGroupCtx *ctx)
     }
     SpinLockRelease(&RaftGroups->mutex);
 
+    if (got)
+    {
+        depth = self_claim_depth(ctx->group_id, true);
+        if (depth != NULL)
+            *depth = 1;
+    }
     return got;
 }
 
 static void
 replicate_release(RaftGroupCtx *ctx)
 {
+    int *depth = self_claim_depth(ctx->group_id, false);
+
+    if (depth != NULL)
+    {
+        if (*depth > 1)         /* 嵌套：外层还要用，别真放（P7-N34） */
+        {
+            (*depth)--;
+            return;
+        }
+        *depth = 0;
+    }
+
     SpinLockAcquire(&RaftGroups->mutex);
     if (ctx->g->replicate_in_progress && ctx->g->replicate_pid == MyProcPid)
     {

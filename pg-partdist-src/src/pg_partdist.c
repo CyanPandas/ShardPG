@@ -691,6 +691,18 @@ _PG_init(void)
         0,
         NULL, NULL, NULL
     );
+    DefineCustomIntVariable(
+        "pg_partdist.demoted_read_grace_ms",
+        "刚被降级的主在这么多毫秒内仍放行本地读（默认 10000，0 = 关，P7-N33）。",
+        "同一条切主登记由各节点各自 apply，先后差 0.2–1.9 s：旧主先 apply 就先合上读闸门，"
+        "而协调者的路由还指着它 —— 这段时间经路由层来的读会被判死。宽限期内本地数据不会变"
+        "（写已被 raft 栅栏挡死），一旦开始回放新主的流立即恢复拒读。",
+        &partdist_demoted_read_grace_ms,
+        10000, 0, 600000,
+        PGC_SIGHUP,
+        GUC_UNIT_MS,
+        NULL, NULL, NULL
+    );
     DefineCustomBoolVariable(
         "pg_partdist.auto_reprovision_demoted",
         "新主登记后，前任主若没有回放槽位就自动给它重供物理基线让它归队（默认 on，P7-N25）。",

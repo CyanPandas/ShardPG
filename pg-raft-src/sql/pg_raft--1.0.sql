@@ -322,6 +322,16 @@ $fn$;
 
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
+-- ★ P7-N35：本节点 raft 日志里已提交的最大数据位点（OP_PARWAL 的 partition_lsn）。
+-- 升主追平的上界要取它与 applied_part_lsn 的大者：applied 是"本地 apply 到哪"，会落后，
+-- 落后的那截里若有提交标记，升主不回放它 ⇒ 认领把那笔已确认的提交判成 ABORTED。
+CREATE OR REPLACE FUNCTION pg_raft_group_committed_plsn(p_group_id bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_committed_plsn';
+
+COMMENT ON FUNCTION pg_raft_group_committed_plsn(bigint) IS
+    'P7-N35：本节点已提交的最大数据位点（OP_PARWAL partition_lsn）；升主追平上界用它兜住 applied_part_lsn 的滞后。';
+
 CREATE OR REPLACE FUNCTION pg_raft_group_flow_stats()
     RETURNS TABLE(
         group_id        bigint,
@@ -439,6 +449,9 @@ DECLARE
     got     BIGINT;
     ndiv    BIGINT;
     caught_up BOOLEAN := true;   -- P7-N30：本次升主是否真的追平（兜底放行时为假）
+    has_tail  BOOLEAN;           -- P7-N35：日志里还有上一任期继承来、尚未提交的尾巴
+    noop_idx  BIGINT;
+    cplsn     BIGINT;            -- P7-N35：raft 里已提交的最大数据位点
 BEGIN
     -- 返回值三态：1 = 可以上报；0 = 还没好，稍后重试；**-1 = 分叉，永不上报**。
     -- 三态而不是布尔，是因为"还没追平"可以被 deadline 兜底放行（可用性优先），
@@ -530,9 +543,55 @@ BEGIN
         RETURN 1;
     END IF;
 --
+    -- ★★ P7-N35（2026-09-20，P0：会丢已确认的提交）：先把上一任期继承来的尾巴**提交掉**，
+    --   再算追平上界。
+    --
+    --   缺陷链：旧主提交最后一笔时，数据与提交标记都已达多数派、客户端已收到成功；但从节点
+    --   要等旧主的**下一次心跳**才知道"这条已提交"。恰在这一拍里旧主宕机 ⇒ 新主日志里有这条
+    --   （Raft 领导人完备性保证），可它的"已知已提交位点"还停在前一条，于是下面的追平只追到
+    --   那里，提交标记不被回放；紧接着 ShardXidClaimOnPromote 按"流里没有提交标记 ⇒ 从未提交"
+    --   把这个分片 xid 改判 ABORTED —— **已确认的提交就此丢失**（实测：切主后那行先可见，
+    --   新主上第一次写触发认领后消失；新主流里 plsn 64 的提交标记带的正是那个 xid）。
+    --
+    --   修法用 Raft 的标准动作：新 leader 上任先提交一条**本任期**的空条目。它一提交，
+    --   上一任期的尾巴全部随之提交、被 apply，已知已提交位点自然推到尾巴末端，上界不再短。
+    --   "绝不回放未提交条目"这条不变式**没有放松** —— 是把它们变成已提交，而不是去读未提交的。
+    --   凑不齐多数派就 RETURN 0（下个 tick 重试），绝不带着短上界往下走去认领。
+    SELECT last_log_index > commit_index INTO has_tail
+      FROM partdist.pg_raft_group_status()
+     WHERE group_id = p_group_id
+     ORDER BY (state = 'leader') DESC LIMIT 1;
+    IF coalesce(has_tail, false) THEN
+        BEGIN
+            noop_idx := partdist.pg_raft_group_propose(p_group_id, 'OP_NOOP', '{}');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 提交本任期空条目失败: %', loid, p_group_id, SQLERRM;
+            noop_idx := 0;
+        END;
+        IF coalesce(noop_idx, 0) <= 0 THEN
+            IF NOT p_force THEN
+                RAISE LOG 'pg_raft: 分片 % (组 %) 本任期空条目还没提交（上一任期的尾巴尚未确认提交），'
+                          '本轮不升主，下个 tick 重试（P7-N35）', loid, p_group_id;
+                RETURN 0;
+            END IF;
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 本任期空条目提交不了，兜底放行 —— '
+                          '继承来的尾巴若含提交标记，可能被认领改判（P7-N35）', loid, p_group_id;
+        END IF;
+    END IF;
+
     -- 追平上界取 Raft 已提交位点，绝不碰未提交条目（惰性回放的核心不变式）。
     bound := partdist.get_follower_applied_part_lsn(loid);
     IF bound IS NULL THEN bound := 0; END IF;
+    -- ★ P7-N35 之二：applied_part_lsn 是"本地 apply 到哪"，会落后于"已提交到哪"
+    --   （CPU 忙、事务内复制跳过推进、apply 卡锁）。落后的那截里若有提交标记，
+    --   升主不回放它 ⇒ 认领把那笔**已确认的提交**判成 ABORTED。取两者的大者：
+    --   已提交的条目按定义已被多数派持久化，回放它们不违反"不碰未提交条目"。
+    cplsn := partdist.pg_raft_group_committed_plsn(p_group_id);
+    IF coalesce(cplsn, 0) > bound THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 追平上界按已提交位点抬高：applied=% → committed=%（P7-N35）',
+                  loid, p_group_id, bound, cplsn;
+        bound := cplsn;
+    END IF;
 --
     -- ★ P7-N4/N6（2026-09-17）：p_force = BGW 判定已过 pg_raft.promote_catchup_deadline_ms。
     --   兜底**仍尽力追一片**，但不再以追平为前提，并且**照做下面的全部升主步骤**。

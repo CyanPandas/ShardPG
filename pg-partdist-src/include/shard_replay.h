@@ -334,6 +334,22 @@ typedef struct ReplayShardSlot
     TimestampTz promotion_pending_until;
 
     /*
+     * ★ P7-N33（2026-09-20）：本节点刚被**降级**（主权交给别人）的宽限截止时刻（0 = 无），
+     * 以及降级那一刻的回放游标。
+     *
+     * 与 N31 是同一个窗口的另一半：同一条登记各节点各自 apply，先后差 0.2–1.9 s（实测）。
+     * 旧主先 apply 就先把读闸门合上，而协调者的路由还指向它 —— 这段时间里经路由层来的读
+     * 全部被拒（实测 1.9 s 窗口里撞上一次）。
+     *
+     * 宽限期内放行是安全的，判据是**本地数据没变**：降级后本节点的写被 raft 写栅栏挡死，
+     * 而它此刻的堆就是它交出主权那一刻的已提交状态；协调者的路由还没翻过去，新主也收不到
+     * 经路由层来的写。一旦本地开始回放新主的流（applied 前进），数据就不再是那一刻的快照，
+     * 立即恢复拒读。ShardReplicaSetPromoted / 回放推进都会让它失效。
+     */
+    TimestampTz demoted_read_until;
+    uint64      demoted_applied;
+
+    /*
      * locmap 代次：每次 replay_set_locmap() 重建配对就 +1。worker 拿它和
      * ctx 里那份比对，不同就重建 ctx —— 否则运维在结构栅栏之后补完结构、
      * 重跑了 replay_set_locmap()，worker 仍抱着内存里那张旧 loc_map，
@@ -446,6 +462,8 @@ extern bool ShardReplicaIsLocal(Oid relid);
 extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
 extern void ShardReplicaNoteForeignAppend(Oid relid);   /* P7-N23 */
 extern void ShardReplicaMarkPromotionPending(Oid relid);   /* P7-N31 */
+extern void ShardReplicaNoteDemoted(Oid relid);            /* P7-N33 */
+extern int  partdist_demoted_read_grace_ms;                /* P7-N33 GUC */
 extern bool ShardReplicaPromotedSelfHeld(Oid relid);    /* P7-N23 */
 extern void ShardReplaySetArmed(Oid relid, bool armed);
 extern bool ShardReplayBaselinePending(Oid relid);   /* P7-N16 */

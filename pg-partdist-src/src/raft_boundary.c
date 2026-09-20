@@ -258,6 +258,12 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 	else if (old_primary_node == me || ShardPromotedMarkRead(loid))
 	{
 		ShardReplicaSetPromoted(loid, false);
+		/*
+		 * ★ P7-N33：本节点刚交出主权，但协调者的路由多半还指着这里（同一条登记各节点
+		 * 各自 apply，先后差 0.2–1.9 s 实测）。给读留一个短宽限：期间本地数据不会变
+		 * （写已被 raft 栅栏挡死、也还没开始回放新主的流），读到的就是交权那一刻的已提交状态。
+		 */
+		ShardReplicaNoteDemoted(loid);
 		ereport(LOG,
 				(errmsg("pg_partdist: 分片 %u（本地 OID %u）主权已交给节点 %d，"
 						"本节点收回「已升主」身份，读闸门重新合上",
