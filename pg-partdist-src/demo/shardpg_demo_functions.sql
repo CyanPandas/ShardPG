@@ -1,7 +1,9 @@
 -- ============================================================================
 -- shardpg_demo_functions.sql —— ShardPG 演示用函数库（只用于演示）
 --
--- 只装在协调者（:5432）上、全部放在 demo 模式里；经 dblink 访问 3 台 worker。
+-- 只装在 master（:5432）上、全部放在 demo 模式里；经 dblink 访问 3 台 worker。
+-- 术语：master = 只做路由 + TSO 的那个节点（不放数据、不领导任何数据组）；
+--       「协调者」是**事务**的概念 —— 每个全局事务在自己的写集里选一个分片组当协调组（见 DTX_2PC_DESIGN §2.1）。
 -- 由 shardpg_demo.sh start 安装，shardpg_demo.sh stop 时 DROP SCHEMA demo CASCADE 整体删除。
 -- 不改动项目的任何文件、表结构或函数；对集群的临时改动（选举超时冻结等）都在函数内复位。
 --
@@ -9,7 +11,7 @@
 -- ============================================================================
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
-SET citus.enable_ddl_propagation = off;       -- 只建在协调者本地，不往 worker 传播
+SET citus.enable_ddl_propagation = off;       -- 只建在 master 本地，不往 worker 传播
 
 DROP SCHEMA IF EXISTS demo CASCADE;
 CREATE SCHEMA demo;
@@ -30,7 +32,7 @@ CREATE FUNCTION demo.conn(p_node text) RETURNS text LANGUAGE sql STABLE AS $$
       FROM demo.node WHERE name = p_node
 $$;
 
-INSERT INTO demo.node VALUES ('cn', 5432, current_setting('pg_raft.node_id')::int, '协调者',
+INSERT INTO demo.node VALUES ('master', 5432, current_setting('pg_raft.node_id')::int, 'master',
                               current_setting('data_directory'));
 INSERT INTO demo.node (name, port, kind)
 SELECT 'w' || row_number() OVER (ORDER BY nodeport), nodeport, 'worker'
@@ -143,7 +145,7 @@ CREATE FUNCTION demo.route_node(p_sid bigint) RETURNS text LANGUAGE sql STABLE A
      WHERE pl.shardid = p_sid
 $$;
 
--- 控制面登记（Raft 0 号组里的 partition_map，协调者本地这一份）
+-- 控制面登记（Raft 0 号组里的 partition_map，master 本地这一份）
 CREATE FUNCTION demo.reg(p_sid bigint) RETURNS text LANGUAGE sql STABLE AS $$
     SELECT demo.node_of_raft(primary_node) FROM partdist.partition_map WHERE partition_id = p_sid
 $$;
@@ -213,7 +215,9 @@ BEGIN
             --   ① 本节点没有这个分片的数据 ⇒ 升主前置 RETURN -1 ⇒ **主动让位**并退避 5 个选举周期；
             --   ② 看见了更高的任期（别人已经当选）⇒ 退位跟随。
             IF p_node IS NOT NULL AND p_sid IS NOT NULL THEN
-                hasdata := demo.pq(p_node, format('SELECT (partdist.local_partition_for_shard(%s) > 0)::text', p_sid));
+                -- 注意 coalesce：没有本地分片时 local_partition_for_shard 返回 NULL，
+                -- (NULL > 0) 是 NULL 不是 false，漏了它这条分支永远走不到。
+                hasdata := demo.pq(p_node, format('SELECT (coalesce(partdist.local_partition_for_shard(%s), 0) > 0)::text', p_sid));
                 IF hasdata = 'false' THEN
                     RETURN format('✗ 主动让位 → follower（任期 %s）：本节点没有这个分片的数据，升主前置拒绝升主，退避 5 个选举周期让给别人', n[2]);
                 END IF;
@@ -257,14 +261,14 @@ BEGIN
             term := (SELECT primary_term::text FROM partdist.partition_map WHERE partition_id = sid);
             k := sid || ':reg'; cur := coalesce(reg, '?') || '|' || coalesce(term, '?');
             IF (last ->> k) IS DISTINCT FROM cur THEN
-                RAISE NOTICE '% ms  %  cn  控制面登记（0 号组 partition_map）：%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
+                RAISE NOTICE '% ms  %  master  控制面登记（0 号组 partition_map）：%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
                     CASE WHEN reg IS NULL THEN '还没登记' ELSE format('主 = %s（登记任期 %s）', reg, term) END;
                 last := last || jsonb_build_object(k, cur);
             END IF;
             rt := demo.route_node(sid);
             k := sid || ':route';
             IF (last ->> k) IS DISTINCT FROM rt THEN
-                RAISE NOTICE '% ms  %  cn  Citus 路由：读写发往 % :%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
+                RAISE NOTICE '% ms  %  master  Citus 路由：读写发往 % :%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
                     rt, (SELECT port FROM demo.node WHERE name = rt);
                 last := last || jsonb_build_object(k, rt);
             END IF;
@@ -323,7 +327,7 @@ BEGIN
     LOOP
         ok := true; lag := NULL;
         FOR n IN SELECT name FROM demo.node ORDER BY port LOOP
-            v := CASE WHEN n = 'cn' THEN (SELECT commit_index || '|' || last_applied FROM partdist.pg_raft_group_status() WHERE group_id = 0)
+            v := CASE WHEN n = 'master' THEN (SELECT commit_index || '|' || last_applied FROM partdist.pg_raft_group_status() WHERE group_id = 0)
                       ELSE demo.pq(n, 'SELECT commit_index||''|''||last_applied FROM partdist.pg_raft_group_status() WHERE group_id = 0') END;
             CONTINUE WHEN v IS NULL;                -- 宕机的节点不等
             IF split_part(v, '|', 1) <> split_part(v, '|', 2) THEN
@@ -332,13 +336,13 @@ BEGIN
         END LOOP;
         IF ok THEN stable := stable + 1; ELSE stable := 0; END IF;
         IF stable >= 3 THEN
-            RAISE NOTICE '% ms  cn  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了', lpad(demo.ms(p_t0)::text, 6);
+            RAISE NOTICE '% ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了', lpad(demo.ms(p_t0)::text, 6);
             RETURN demo.ms(p_t0);
         END IF;
         i := i + 1;
-        IF i = 20 THEN RAISE NOTICE '% ms  cn  等控制面在各节点应用完：%', lpad(demo.ms(p_t0)::text, 6), lag; END IF;
+        IF i = 20 THEN RAISE NOTICE '% ms  master  等控制面在各节点应用完：%', lpad(demo.ms(p_t0)::text, 6), lag; END IF;
         IF demo.ms(p_t0) > p_timeout_s * 1000 THEN
-            RAISE NOTICE '% ms  cn  控制面还没在各节点应用完（%）', lpad(demo.ms(p_t0)::text, 6), lag;
+            RAISE NOTICE '% ms  master  控制面还没在各节点应用完（%）', lpad(demo.ms(p_t0)::text, 6), lag;
             RETURN -1;
         END IF;
         PERFORM pg_sleep(0.1);
@@ -380,7 +384,7 @@ LANGUAGE plpgsql AS $$
 DECLARE r record; s text;
 BEGIN
     FOR r IN SELECT * FROM demo.node ORDER BY port LOOP
-        s := CASE WHEN r.name = 'cn' THEN (SELECT state || '（任期 ' || current_term || '）' FROM partdist.pg_raft_group_status() WHERE group_id = 0)
+        s := CASE WHEN r.name = 'master' THEN (SELECT state || '（任期 ' || current_term || '）' FROM partdist.pg_raft_group_status() WHERE group_id = 0)
                   ELSE demo.pq(r.name, 'SELECT state||''（任期 ''||current_term||''）'' FROM partdist.pg_raft_group_status() WHERE group_id = 0') END;
         节点 := r.name; 端口 := r.port; 类型 := r.kind; raft节点号 := r.raft_id;
         状态 := CASE WHEN s IS NULL THEN '✗ 宕机' ELSE '在线' END;
@@ -574,7 +578,7 @@ BEGIN
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         分片 := demo.slabel(p_tbl, sid);
         层 := '① Citus 路由（pg_dist_placement）'; 节点 := demo.route_node(sid);
-        内容 := '经协调者的读写都发往 ' || 节点 || ' :' || (SELECT port FROM demo.node WHERE name = 节点);
+        内容 := '经 master 的读写都发往 ' || 节点 || ' :' || (SELECT port FROM demo.node WHERE name = 节点);
         RETURN NEXT;
         SELECT * INTO m FROM partdist.partition_map WHERE partition_id = sid;
         层 := '② 控制面登记（0 号组 partition_map）'; 节点 := demo.node_of_raft(m.primary_node);

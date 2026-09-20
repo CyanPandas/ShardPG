@@ -3,7 +3,7 @@
 
   把本文件拷到 Windows 上任意目录，然后：
     .\shardpg_demo.ps1 start        # 准备演示环境（装 demo 函数库、打开 TSO）
-    .\shardpg_demo.ps1 sql A        # 窗口 A：连协调者的交互式 psql，提示符 A>
+    .\shardpg_demo.ps1 sql A        # 窗口 A：连 master 的交互式 psql，提示符 A>
     .\shardpg_demo.ps1 sql B        # 窗口 B：另开一个 PowerShell 窗口运行（演示并发事务）
     .\shardpg_demo.ps1 stop         # 演示结束，恢复演示前的环境
 

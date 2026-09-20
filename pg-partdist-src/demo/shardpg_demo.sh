@@ -3,7 +3,7 @@
 # shardpg_demo.sh —— ShardPG 演示启动器（只用于演示，不改动项目任何文件）
 #
 #   bash shardpg_demo.sh start      准备演示环境：装 demo 函数库、记下将被改动的参数、打开 TSO
-#   bash shardpg_demo.sh sql A      打开会话 A（连协调者的交互式 psql，提示符 A>）
+#   bash shardpg_demo.sh sql A      打开会话 A（连 master 的交互式 psql，提示符 A>）
 #   bash shardpg_demo.sh sql B      打开会话 B（第二个窗口，演示并发事务）
 #   bash shardpg_demo.sh stop       演示结束：删表、拆组、删登记、参数还原、删 demo 函数库，恢复原环境
 #
@@ -57,7 +57,7 @@ cmd_start() {
 
     local W; W=$(workers)
     [[ $(wc -w <<<"$W") -eq 3 ]] \
-        || die "需要 1 个协调者 + 3 个 worker，现在 worker 是「$W」" "（演示固定用 4 个节点）"
+        || die "需要 1 个 master + 3 个 worker，现在 worker 是「$W」" "（演示固定用 4 个节点）"
     if [[ "$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")" != 0 ]]; then
         die "上一次演示还没收尾（demo 模式还在）" "先执行：bash $0 stop"
     fi
@@ -73,7 +73,7 @@ cmd_start() {
             || die "表 $t 已存在" "先执行：bash $0 stop（或手工 DROP TABLE $t）"
     done
 
-    step "① 安装 demo 函数库（只装在协调者上）"
+    step "① 安装 demo 函数库（只装在 master 上）"
     local out
     out=$(psqlc 5432 -q -v ON_ERROR_STOP=1 < "$HERE/shardpg_demo_functions.sql" 2>&1 >/dev/null) \
         || die "装 demo 函数库失败" "$(tail -5 <<<"$out")"
@@ -82,12 +82,12 @@ cmd_start() {
     out=$(qe 5432 "SELECT demo._save_gucs()")      # 返回 void：成功时无输出
     [[ -z "${out//[[:space:]]/}" ]] || die "记录参数原样失败" "$out"
 
-    step "③ 打开 TSO（全局时间戳服务，跑在协调者上）：删 boot 标记 → 重启协调者 → tso_master=on → 各节点指向它"
+    step "③ 打开 TSO（全局时间戳服务，跑在 master 上）：删 boot 标记 → 重启 master → tso_master=on → 各节点指向它"
     local cd; cd=$(q 5432 "SHOW data_directory")
     docker exec -u postgres "$C" rm -f "$cd/pg_tso_boot" 2>/dev/null
     docker exec -u postgres "$C" $BIN/pg_ctl -D "$cd" -m fast -l "$cd/pg.log" restart -w -t 60 >/dev/null 2>&1
     for t in $(seq 1 40); do [[ "$(q 5432 'SELECT 1')" == 1 ]] && break; sleep 1; done
-    [[ "$(q 5432 'SELECT 1')" == 1 ]] || die "协调者重启后没起来" "$(taillog 5432)"
+    [[ "$(q 5432 'SELECT 1')" == 1 ]] || die "master 重启后没起来" "$(taillog 5432)"
     q 5432 "ALTER SYSTEM SET pg_partdist.tso_master = on" >/dev/null
     for p in 5432 $W; do
         q $p "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres'" >/dev/null
