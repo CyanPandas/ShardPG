@@ -15,6 +15,9 @@ C="${CONTAINER:-pg-test-container}"
 BIN=/work/pg-install/bin
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_TABLES="${DEMO_TABLES:-account}"
+# 演示期间 worker 的 Raft 选举超时。产品默认 6000；这台 2 vCPU 机器上放宽到 15000,
+# 免得负载抖动（共识 tick 偶尔卡 5–9 s）误判主死、冒出多余的选举。想完全按产品默认跑：ELECTION_MS=6000
+ELECTION_MS="${ELECTION_MS:-15000}"
 
 psqlc() { local port=$1; shift; docker exec -i -u postgres "$C" $BIN/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
 q()     { psqlc "$1" -qAtc "$2" </dev/null 2>/dev/null | tail -1; }
@@ -91,8 +94,8 @@ cmd_start() {
         q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = 60000" >/dev/null
         q $p "SELECT pg_reload_conf()" >/dev/null
     done
-    step "④ 演示期间把 3 台 worker 的 Raft 选举超时放宽到 15 s（2 vCPU 上避免负载抖动误选主；stop 时还原）"
-    for p in $W; do q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 15000" >/dev/null; q $p "SELECT pg_reload_conf()" >/dev/null; done
+    step "④ 把 3 台 worker 的 Raft 选举超时设为 ${ELECTION_MS} ms（产品默认 6000；2 vCPU 上放宽避免误选主。stop 时还原）"
+    for p in $W; do q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = $ELECTION_MS" >/dev/null; q $p "SELECT pg_reload_conf()" >/dev/null; done
     sleep 2
     for p in $W; do q $p "SELECT partdist.partdist_tso_client_start_ts()" >/dev/null; done
     sleep 3

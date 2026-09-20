@@ -164,58 +164,103 @@ SELECT k AS 键, l.分片, l.当前主节点 FROM generate_series(1, 9) k, demo.
 (9 rows)
 ```
 
-### 第 3 步：每个分片自动建一个 Raft 组，并选出 leader（选主过程实时打出来）
+### 第 3 步：每个分片自动建一个 Raft 组，自发选主（全过程实时打出来）
 
-每个分片一个 Raft 组，成员 = 3 台 worker。数据此刻只在分片的 placement 节点上，所以由它发起竞选：
+每个分片一个 Raft 组，成员 = 3 台 worker。**这一步不做任何人工干预** —— 组建好之后三台各自倒计时，
 
-任期 0 → 它变成 candidate（任期 1）向另外两台要票 → 拿到多数票当选 leader → 另外两台认它为 leader；
+谁的选举超时先到点谁就发起竞选，和真实环境里一模一样。
 
-当选后它先做升主前置，再到控制面登记"我是这个分片的主"，最后 Citus 路由指向它。
+要留意的是：此刻数据只在分片原来那台上（S1→w1、S2→w2、S3→w3），另外两台手里是空的。
 
-**窗口 A**（耗时 29.7 s）：
+Raft 不知道谁有数据，**空的那台照样可能先当选**；但它当选后做升主前置时会发现自己没有这个分片的本地副本，
+
+于是拒绝升主（`RETURN -1`，日志 `拒绝升主：本节点没有该分片的本地副本`）、**主动让位并退避 5 个选举周期**，
+
+把机会让给别人 —— 直到有数据的那台当选，才会到控制面登记"我是这个分片的主"，Citus 路由随之指向它。
+
+**窗口 A**（耗时 20–95 s，取决于运气：下面这次三个分片都是第一轮就选中了有数据的那台）：
 
 ```sql
 SELECT * FROM demo.raft_elect('account');
 ```
 
 ```text
-NOTICE:  准备：3 台 worker 的选举超时临时冻结在 30 s —— 没有节点会自发竞选，只有被点名的节点发起（建组供副本结束后复位）
-NOTICE:  ────── S1（分片 102897）：数据在 w1 上，建组 [成员 w1 w2 w3]，由 w1 发起竞选 ──────
-NOTICE:     426 ms  S1  建好组：w1 follower/任期0，w2 follower/任期0，w3 follower/任期0；控制面登记 还没有；Citus 路由 → w1
-NOTICE:     444 ms  S1  w1  pg_raft_group_campaign：点名它发起竞选
-NOTICE:     750 ms  S1  w1  ★ 当选 leader（任期 1）
-NOTICE:     750 ms  S1  w2  follower（任期 1，还没认出 leader）
-NOTICE:     750 ms  S1  w3  follower（任期 1，还没认出 leader）
-NOTICE:     891 ms  S1  w2  follower：认 w1 为 leader（任期 1）
-NOTICE:     891 ms  S1  w3  follower：认 w1 为 leader（任期 1）
-NOTICE:    7450 ms  S1  cn  控制面登记（0 号组 partition_map）：主 = w1（登记任期 1）
-NOTICE:          （当选之后、登记之前的这段时间，新 leader 在做升主前置：追平日志、认领无主 xid，然后才上报控制面）
-NOTICE:  ────── S2（分片 102898）：数据在 w2 上，建组 [成员 w1 w2 w3]，由 w2 发起竞选 ──────
-NOTICE:     249 ms  S2  建好组：w1 follower/任期0，w2 follower/任期0，w3 follower/任期0；控制面登记 还没有；Citus 路由 → w2
-NOTICE:     266 ms  S2  w2  pg_raft_group_campaign：点名它发起竞选
-NOTICE:     900 ms  S2  w1  follower：认 w2 为 leader（任期 1）
-NOTICE:     900 ms  S2  w2  ★ 当选 leader（任期 1）
-NOTICE:     900 ms  S2  w3  follower（任期 1，还没认出 leader）
-NOTICE:     953 ms  S2  w3  follower：认 w2 为 leader（任期 1）
-NOTICE:   13103 ms  S2  cn  控制面登记（0 号组 partition_map）：主 = w2（登记任期 1）
-NOTICE:          （当选之后、登记之前的这段时间，新 leader 在做升主前置：追平日志、认领无主 xid，然后才上报控制面）
-NOTICE:  ────── S3（分片 102899）：数据在 w3 上，建组 [成员 w1 w2 w3]，由 w3 发起竞选 ──────
-NOTICE:     128 ms  S3  建好组：w1 follower/任期0，w2 follower/任期0，w3 follower/任期0；控制面登记 还没有；Citus 路由 → w3
-NOTICE:     146 ms  S3  w3  pg_raft_group_campaign：点名它发起竞选
-NOTICE:     435 ms  S3  w1  follower（任期 1，还没认出 leader）
-NOTICE:     435 ms  S3  w2  follower（任期 1，还没认出 leader）
-NOTICE:     435 ms  S3  w3  ★ 当选 leader（任期 1）
-NOTICE:     489 ms  S3  w1  follower：认 w3 为 leader（任期 1）
-NOTICE:     489 ms  S3  w2  follower：认 w3 为 leader（任期 1）
-NOTICE:    8027 ms  S3  cn  控制面登记（0 号组 partition_map）：主 = w3（登记任期 1）
-NOTICE:          （当选之后、登记之前的这段时间，新 leader 在做升主前置：追平日志、认领无主 xid，然后才上报控制面）
- 分片 | 分片号 | leader | followers | 任期 | 选主耗时_ms | 控制面登记的主 | citus路由 
---------+-----------+--------+-----------+--------+-----------------+-----------------------+-------------
- S1     |    102897 | w1     | w2, w3    | 1      |            7506 | w1                    | w1 :5433
- S2     |    102898 | w2     | w1, w3    | 1      |           13162 | w2                    | w2 :5434
- S3     |    102899 | w3     | w1, w2    | 1      |            8081 | w3                    | w3 :5435
+NOTICE:  在 3 台 worker 上把 3 个组都建出来（成员 = w1 w2 w3），然后**不做任何干预**，等它们自发选主
+NOTICE:  此刻数据的分布：S1→w1，S2→w2，S3→w3 —— 另外两台手里是空的
+NOTICE:  真实环境里就是这样：谁的选举超时（本演示 15 s）先到点谁就竞选，赢家是随机的。
+NOTICE:  若先当选的那台没有这个分片的数据，它的升主前置会拒绝（日志：拒绝升主：本节点没有该分片的本地副本），
+NOTICE:  然后主动让位、退避 5 个选举周期 —— 所以下面可能看到"当选又退位"，直到有数据的那台当选才会登记。
+NOTICE:     968 ms  组已建好，开始等自发竞选 ──────
+NOTICE:     969 ms  S1  w1  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S1  w2  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S1  w3  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S1  cn  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     969 ms  S1  cn  Citus 路由：读写发往 w1 :5433
+NOTICE:     969 ms  S2  w1  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S2  w2  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S2  w3  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S2  cn  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     969 ms  S2  cn  Citus 路由：读写发往 w2 :5434
+NOTICE:     969 ms  S3  w1  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S3  w2  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S3  w3  follower（任期 0，还没认出 leader）
+NOTICE:     969 ms  S3  cn  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     969 ms  S3  cn  Citus 路由：读写发往 w3 :5435
+NOTICE:   17735 ms  S1  w1  ★ 当选 leader（任期 1）
+NOTICE:   17735 ms  S1  w2  follower（任期 1，还没认出 leader）
+NOTICE:   17735 ms  S1  w3  follower（任期 1，还没认出 leader）
+NOTICE:   17804 ms  S1  w2  follower：认 w1 为 leader（任期 1）
+NOTICE:   17804 ms  S1  w3  follower：认 w1 为 leader（任期 1）
+NOTICE:   19505 ms  S3  w1  follower（任期 1，还没认出 leader）
+NOTICE:   19505 ms  S3  w2  follower（任期 1，还没认出 leader）
+NOTICE:   19505 ms  S3  w3  ★ 当选 leader（任期 1）
+NOTICE:   19564 ms  S3  w1  follower：认 w3 为 leader（任期 1）
+NOTICE:   19564 ms  S3  w2  follower：认 w3 为 leader（任期 1）
+NOTICE:   20755 ms  S2  w1  follower：认 w2 为 leader（任期 1）
+NOTICE:   20755 ms  S2  w2  ★ 当选 leader（任期 1）
+NOTICE:   20755 ms  S2  w3  follower（任期 1，还没认出 leader）
+NOTICE:   20817 ms  S2  w3  follower：认 w2 为 leader（任期 1）
+NOTICE:   21162 ms  S1  cn  控制面登记（0 号组 partition_map）：主 = w1（登记任期 1）
+NOTICE:   22462 ms  S3  cn  控制面登记（0 号组 partition_map）：主 = w3（登记任期 1）
+NOTICE:   23567 ms  S2  cn  控制面登记（0 号组 partition_map）：主 = w2（登记任期 1）
+NOTICE:   23636 ms  全部就位（含新 leader 的升主前置：追平日志、认领无主 xid，然后才上报控制面）
+ 分片 | 分片号 | 数据在 | leader | followers | 任期 | 选举轮次 | 控制面登记的主 | citus路由 
+--------+-----------+-----------+--------+-----------+--------+--------------+-----------------------+-------------
+ S1     |    102981 | w1        | w1     | w2, w3    | 1      |            1 | w1                    | w1 :5433
+ S2     |    102982 | w2        | w2     | w1, w3    | 1      |            1 | w2                    | w2 :5434
+ S3     |    102983 | w3        | w3     | w1, w2    | 1      |            1 | w3                    | w3 :5435
 (3 rows)
 ```
+
+> **换一次跑就可能不一样 —— 这正是它的真实之处。** 同一段脚本的另一次实跑里，S3 连着被两台**没有数据**的节点抢到又让位，
+> 第 4 轮才落到 w3（任期因此变成 4，整步耗时 94 s）：
+>
+> ```text
+>   NOTICE:   20958 ms  S3  w2  follower：认 w1 为 leader（任期 1）
+>   NOTICE:   20958 ms  S3  w3  follower：认 w1 为 leader（任期 1）
+>   NOTICE:   24364 ms  S3  w1  退位 → follower，跟随 ?（任期 1）
+>   NOTICE:   48195 ms  S3  w1  follower（任期 2，还没认出 leader）
+>   NOTICE:   48195 ms  S3  w2  ★ 当选 leader（任期 2）
+>   NOTICE:   48195 ms  S3  w3  follower（任期 2，还没认出 leader）
+>   NOTICE:   48378 ms  S3  w1  follower：认 w2 为 leader（任期 2）
+>   NOTICE:   48378 ms  S3  w3  follower：认 w2 为 leader（任期 2）
+>   NOTICE:   51697 ms  S3  w2  退位 → follower，跟随 ?（任期 2）
+>   NOTICE:   70444 ms  S3  w1  发起竞选 → candidate（任期 3，向其余成员要票）
+>   NOTICE:   70444 ms  S3  w2  follower（任期 3，还没认出 leader）
+>   NOTICE:   70444 ms  S3  w3  follower（任期 3，还没认出 leader）
+>   NOTICE:   70506 ms  S3  w1  ★ 当选 leader（任期 3）
+>   NOTICE:   70506 ms  S3  w2  follower：认 w1 为 leader（任期 3）
+>   NOTICE:   70506 ms  S3  w3  follower：认 w1 为 leader（任期 3）
+>   NOTICE:   73682 ms  S3  w1  退位 → follower，跟随 ?（任期 3）
+>   NOTICE:   90917 ms  S3  w1  follower（任期 4，还没认出 leader）
+>   NOTICE:   90917 ms  S3  w3  发起竞选 → candidate（任期 4，向其余成员要票）
+>   NOTICE:   90983 ms  S3  w1  follower：认 w3 为 leader（任期 4）
+>   NOTICE:   90983 ms  S3  w2  follower：认 w3 为 leader（任期 4）
+>   NOTICE:   90983 ms  S3  w3  ★ 当选 leader（任期 4）
+>   NOTICE:   94043 ms  S3  cn  控制面登记（0 号组 partition_map）：主 = w3（登记任期 4）
+> ```
+>
+> `选举轮次` 这一列就是看这个的：1 = 一次选中；大于 1 = 中间有没数据的节点当选后被拒、让了位。
 
 ### 第 4 步：供副本 → 最终的主和从
 
@@ -230,7 +275,6 @@ SELECT * FROM demo.raft_replicas('account');
 ```
 
 ```text
-NOTICE:  选举超时已复位到演示期间的 15 s
  分片 | 主 | 副本供到 | 基线游标 |                                   结果                                    
 --------+-----+--------------+--------------+-----------------------------------------------------------------------------
  S1     | w1  | w2           | 1            | 已供：物理基线进分区流 → w2 配对文件号、arm 回放槽位
@@ -1164,7 +1208,7 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 4. **第 10 步的“多数派不足丢弃”偶尔会是非零（比如 4），那不是分叉。** 建组后、供副本前，从节点上还没有分片表，主发的“冻结账目”提案凑不齐多数派被丢（流位点 1）；之后供副本的物理基线把它完整覆盖，并清掉分叉标记。供副本来得快就是 0（本教程这一轮就是 0）。
 5. **（这次实跑发现；已于 2026-09-20 修复 → P7-N36）节点重启时，同一个 Raft 组可能在它上面被建成 2 个槽位。** 重启后多个后端同时「按注册表恢复 / 按通告建组」，而建组的「先查有没有、再找空槽插入」不在同一把锁里；多出来的那个槽位会反复发起竞选，把该组的主一次次逼下台（实测一个组的任期从 2 被抬到 12，3 次重启里出现 2 次）。**修法**：进锁之后再复查一遍。回归 `tests/test_group_slot_dup_p7n36.sh`：连续 3 轮「整簇重启 + 8 个并发会话唤醒」，重复槽位 0、任期每轮只 +1。`demo.recover()` 里那道「发现 2 个槽位就再重启一次」的兜底保留着。
 6. **当选到登记之间有 5–10 s。** 那是新 leader 在做升主前置（追平日志、闭合 in-doubt、认领无主 xid），做完才上报控制面。
-7. **演示期间选举超时放宽到 15 s，所以宕机后大约 20 多秒才切完。** 默认是 6 s；但这台演示机只有 2 个 vCPU，两个会话并发跑跨分片 2PC 再加上逐字节比对的刷盘时，每个节点上那一个串行的共识 tick 偶尔一轮要卡 5–9 s（日志告警“共识 tick 耗时 9021 ms（选举超时 6000 ms）”），心跳断档超过 6 s 就会误选主。
+7. **演示期间选举超时放宽到 15 s，所以宕机后大约 20 多秒才切完。** 默认是 6 s；但这台演示机只有 2 个 vCPU，两个会话并发跑跨分片 2PC 再加上逐字节比对的刷盘时，每个节点上那一个串行的共识 tick 偶尔一轮要卡 5–9 s（日志告警“共识 tick 耗时 9021 ms（选举超时 6000 ms）”），心跳断档超过 6 s 就会误选主。 想完全按产品默认（6 s）跑：`ELECTION_MS=6000 bash shardpg_demo.sh start` —— 选主更快、更贴近真实，但这台机器上更容易冒出多余的选举。
 8. **自动归队只等约 5 分钟。** 新主拉起的“自动归队工作者”每 15 s 检查一次、约 5 分钟后退出；宕机节点停得更久，`demo.recover()` 会在等 45 s 没结果后手动触发一次重新供给（`partdist.reprovision_demoted`）。
 9. **别在演示中途重启协调者。** TSO 计数器在协调者内存里，重启后会拒绝发号（boot 防呆），要按 `start` 里的步骤重开。
 10. **中止事务留下的记录要等下一笔提交才复制到从。** 所以刚发生过中止（例如第 8 步被拒的跨分片写）的分片，在下一次提交之前做逐字节比对会不一致，`demo.compare()` 会注明原因。

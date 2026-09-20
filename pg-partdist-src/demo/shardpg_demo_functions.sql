@@ -172,7 +172,10 @@ $$;
 
 -- 演示期间的选举超时：15 s（start 设置、stop 还原）。2 vCPU 演示机上并发 2PC + 刷盘时，单线程的共识 tick
 -- 偶尔一轮卡 5–9 s（日志"共识 tick 耗时 … 选举超时 6000 ms"），默认 6 s 会误选主。
-CREATE FUNCTION demo.demo_election_ms() RETURNS int LANGUAGE sql IMMUTABLE AS $$ SELECT 15000 $$;
+-- 演示期间各 worker 实际生效的选举超时（start 设的值，可用 ELECTION_MS 改；产品默认是 6000）
+CREATE FUNCTION demo.demo_election_ms() RETURNS int LANGUAGE sql AS $$
+    SELECT coalesce(nullif(demo.pq((SELECT name FROM demo.node WHERE kind = 'worker' ORDER BY port LIMIT 1),
+                                   'SELECT current_setting(''pg_raft.election_timeout_ms'')'), ''), '15000')::int $$;
 
 -- 选举超时：冻结 / 复位（夹具手法，只在建组供副本期间用；复位 = 回到演示期间的 15 s）
 CREATE FUNCTION demo.set_election_timeout(p_ms int) RETURNS void LANGUAGE plpgsql AS $$
@@ -190,10 +193,11 @@ CREATE FUNCTION demo.ms(p_t0 timestamptz) RETURNS int LANGUAGE sql VOLATILE AS $
 $$;
 
 -- 一条状态变化 → 一句人话
-CREATE FUNCTION demo.describe(p_old text, p_new text) RETURNS text LANGUAGE plpgsql AS $$
+CREATE FUNCTION demo.describe(p_old text, p_new text, p_node text DEFAULT NULL, p_sid bigint DEFAULT NULL)
+RETURNS text LANGUAGE plpgsql AS $$
 DECLARE o text[] := string_to_array(coalesce(p_old, ''), '|');
         n text[] := string_to_array(p_new, '|');
-        ldr text;
+        ldr text; hasdata text;
 BEGIN
     IF p_new = 'down' THEN RETURN '✗ 连不上（节点宕机）'; END IF;
     IF p_new = '-' THEN RETURN '（本节点上还没有这个组）'; END IF;
@@ -204,7 +208,19 @@ BEGIN
     IF n[1] = 'leader' THEN RETURN format('★ 当选 leader（任期 %s）', n[2]); END IF;
     IF n[1] = 'candidate' THEN RETURN format('发起竞选 → candidate（任期 %s，向其余成员要票）', n[2]); END IF;
     IF n[1] = 'follower' THEN
-        IF o[1] = 'leader' THEN RETURN format('退位 → follower，跟随 %s（任期 %s）', coalesce(ldr, '?'), n[2]); END IF;
+        IF o[1] = 'leader' THEN
+            -- 当选之后又变回 follower，有两种原因，要分清楚：
+            --   ① 本节点没有这个分片的数据 ⇒ 升主前置 RETURN -1 ⇒ **主动让位**并退避 5 个选举周期；
+            --   ② 看见了更高的任期（别人已经当选）⇒ 退位跟随。
+            IF p_node IS NOT NULL AND p_sid IS NOT NULL THEN
+                hasdata := demo.pq(p_node, format('SELECT (partdist.local_partition_for_shard(%s) > 0)::text', p_sid));
+                IF hasdata = 'false' THEN
+                    RETURN format('✗ 主动让位 → follower（任期 %s）：本节点没有这个分片的数据，升主前置拒绝升主，退避 5 个选举周期让给别人', n[2]);
+                END IF;
+            END IF;
+            IF ldr IS NULL THEN RETURN format('退位 → follower（任期 %s，还没认出新 leader）', n[2]); END IF;
+            RETURN format('退位 → follower，跟随 %s（任期 %s）', ldr, n[2]);
+        END IF;
         IF ldr IS NULL THEN RETURN format('follower（任期 %s，还没认出 leader）', n[2]); END IF;
         IF p_old = 'down' THEN RETURN format('重新连上：follower，跟随 %s（任期 %s）', ldr, n[2]); END IF;
         RETURN format('follower：认 %s 为 leader（任期 %s）', ldr, n[2]);
@@ -232,7 +248,7 @@ BEGIN
                 sts := sts || (w || '=' || cur);
                 k := sid || ':' || w;
                 IF (last ->> k) IS DISTINCT FROM cur THEN
-                    RAISE NOTICE '% ms  %  %  %', lpad(t::text, 6), demo.slabel(p_tbl, sid), w, demo.describe(last ->> k, cur);
+                    RAISE NOTICE '% ms  %  %  %', lpad(t::text, 6), demo.slabel(p_tbl, sid), w, demo.describe(last ->> k, cur, w, sid);
                     last := last || jsonb_build_object(k, cur);
                 END IF;
                 IF split_part(cur, '|', 1) = 'leader' THEN lead := w; END IF;
@@ -405,42 +421,47 @@ BEGIN
     RETURN NEXT;
 END $$;
 
--- ④ 每个分片自动建一个 Raft 组（成员 = 3 台 worker），并选主 —— 选主过程实时打出来
+-- ④ 每个分片自动建一个 Raft 组（成员 = 3 台 worker）—— **不做任何人工干预**：
+--    建完组三台各自倒计时，谁先到点谁竞选，全过程实时打出来。
 CREATE FUNCTION demo.raft_elect(p_tbl regclass)
-RETURNS TABLE(分片 text, 分片号 bigint, leader text, followers text, 任期 text, 选主耗时_ms int, 控制面登记的主 text, citus路由 text)
+RETURNS TABLE(分片 text, 分片号 bigint, 数据在 text, leader text, followers text, 任期 text, 选举轮次 int, 控制面登记的主 text, citus路由 text)
 LANGUAGE plpgsql AS $$
-DECLARE sid bigint; want text; w text; t0 timestamptz; t int; tries int; base jsonb;
+DECLARE sid bigint; w text; t0 timestamptz; t int; sids bigint[]; holders text;
 BEGIN
     FOR w IN SELECT demo.workers() LOOP
         PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
     END LOOP;
     INSERT INTO demo.managed VALUES (p_tbl::text, demo.sids(p_tbl))
         ON CONFLICT (tbl) DO UPDATE SET shardids = EXCLUDED.shardids;
-    PERFORM demo.set_election_timeout(30000);
-    RAISE NOTICE '准备：3 台 worker 的选举超时临时冻结在 30 s —— 没有节点会自发竞选，只有被点名的节点发起（建组供副本结束后复位）';
-    FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
-        want := demo.route_node(sid);
-        RAISE NOTICE '────── %（分片 %）：数据在 % 上，建组 [成员 %]，由 % 发起竞选 ──────',
-            demo.slabel(p_tbl, sid), sid, want, (SELECT string_agg(name, ' ' ORDER BY port) FROM demo.node WHERE kind = 'worker'), want;
-        t0 := clock_timestamp();
+    sids := demo.sids(p_tbl);
+    holders := (SELECT string_agg(demo.slabel(p_tbl, x) || '→' || demo.route_node(x), '，' ORDER BY x) FROM unnest(sids) x);
+    t0 := clock_timestamp();
+    RAISE NOTICE '在 3 台 worker 上把 % 个组都建出来（成员 = %），然后**不做任何干预**，等它们自发选主',
+        cardinality(sids), (SELECT string_agg(name, ' ' ORDER BY port) FROM demo.node WHERE kind = 'worker');
+    RAISE NOTICE '此刻数据的分布：% —— 另外两台手里是空的',  holders;
+    RAISE NOTICE '真实环境里就是这样：谁的选举超时（本演示 % s）先到点谁就竞选，赢家是随机的。',
+        demo.demo_election_ms() / 1000;
+    RAISE NOTICE '若先当选的那台没有这个分片的数据，它的升主前置会拒绝（日志：拒绝升主：本节点没有该分片的本地副本），';
+    RAISE NOTICE '然后主动让位、退避 5 个选举周期 —— 所以下面可能看到"当选又退位"，直到有数据的那台当选才会登记。';
+    FOREACH sid IN ARRAY sids LOOP
         FOR w IN SELECT demo.workers() LOOP
             PERFORM demo.q(w, format('SELECT partdist.pg_raft_group_create(%s, %s)::text', sid, demo.members()));
         END LOOP;
-        base := demo.snap(p_tbl, ARRAY[sid], t0, '建好组');
-        tries := 0;
-        LOOP
-            tries := tries + 1;
-            PERFORM demo.q(want, format('SELECT partdist.pg_raft_group_campaign(%s)::text', sid));
-            RAISE NOTICE '% ms  %  %  pg_raft_group_campaign：点名它发起竞选', lpad(demo.ms(t0)::text, 6), demo.slabel(p_tbl, sid), want;
-            t := demo.watch(p_tbl, ARRAY[sid], want, 20 * tries, t0, base);
-            EXIT WHEN t >= 0 OR tries >= 3;
-        END LOOP;
-        RAISE NOTICE '        （当选之后、登记之前的这段时间，新 leader 在做升主前置：追平日志、认领无主 xid，然后才上报控制面）';
+    END LOOP;
+    RAISE NOTICE '% ms  组已建好，开始等自发竞选 ──────', lpad(demo.ms(t0)::text, 6);
+    -- p_want = NULL：不指定谁当选；稳定判据是"有 leader 且控制面已登记它、路由也指向它"，
+    -- 没数据的节点当选后登记不了，于是观察器会继续等到真正有资格的那台上位。
+    t := demo.watch(p_tbl, sids, NULL, 240, t0);
+    IF t < 0 THEN RAISE NOTICE '等待超时：到现在还没全部稳定（看上面的时间线）'; END IF;
+    RAISE NOTICE '% ms  全部就位（含新 leader 的升主前置：追平日志、认领无主 xid，然后才上报控制面）',
+        lpad(demo.ms(t0)::text, 6);
+    FOREACH sid IN ARRAY sids LOOP
         分片 := demo.slabel(p_tbl, sid); 分片号 := sid;
+        数据在 := demo.route_node(sid);
         leader := demo.leader(sid);
         followers := (SELECT string_agg(x, ', ') FROM demo.workers() x WHERE x IS DISTINCT FROM leader);
         任期 := split_part(demo.gstate(leader, sid), '|', 2);
-        选主耗时_ms := t;
+        选举轮次 := nullif(任期, '')::int;     -- 任期 N = 一共选了 N 轮（N>1 即有人当选后被拒、让位）
         控制面登记的主 := demo.reg(sid);
         citus路由 := demo.route_node(sid) || ' :' || (SELECT port FROM demo.node WHERE name = demo.route_node(sid));
         RETURN NEXT;
@@ -453,7 +474,6 @@ RETURNS TABLE(分片 text, 主 text, 副本供到 text, 基线游标 text, 结�
 LANGUAGE plpgsql AS $$
 DECLARE sid bigint; lp text; w text; r text; a text; t int;
 BEGIN
-    PERFORM demo.set_election_timeout(30000);
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         lp := demo.leader(sid);
         FOR w IN SELECT x FROM demo.workers() x WHERE x <> lp LOOP
@@ -480,8 +500,6 @@ BEGIN
             END IF;
         END LOOP;
     END LOOP;
-    PERFORM demo.set_election_timeout(NULL);
-    RAISE NOTICE '选举超时已复位到演示期间的 % s', demo.demo_election_ms() / 1000;
     -- 等控制面登记与各组主一致
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         FOR t IN 1..120 LOOP
