@@ -1,6 +1,6 @@
 # ShardPG 演示教程：4 个节点上的分片、Raft 与事务（只输入 SQL）
 
-> 本教程每一步都在 **2026-09-20** 的 `pg-test-container`（1 master + 3 worker，共 4 个节点）上**完整实跑过一遍**，下面每段 SQL 之后的输出就是那次实跑的原样输出（从建表到恢复环境共用时约 2 分 49 秒）。你的分片号、时间戳、事务号会不同，其余应当一致。
+> 本教程每一步都在 **2026-09-20** 的 `pg-test-container`（1 master + 3 worker，共 4 个节点）上**完整实跑过一遍**，下面每段 SQL 之后的输出就是那次实跑的原样输出（从建表到恢复环境共用时约 2 分 46 秒）。你的分片号、时间戳、事务号会不同，其余应当一致。
 
 ## 一、你的要求（梳理与润色）
 
@@ -103,10 +103,10 @@ SELECT * FROM demo.nodes();
 ```text
  节点 | 端口 | 类型 | raft节点号 | 状态 |     控制面0号组     
 --------+--------+--------+---------------+--------+--------------------------
- master |   5432 | master |             1 | 在线 | follower（任期 666）
- w1     |   5433 | worker |             2 | 在线 | follower（任期 666）
- w2     |   5434 | worker |             3 | 在线 | leader（任期 666）
- w3     |   5435 | worker |             4 | 在线 | follower（任期 666）
+ master |   5432 | master |             1 | 在线 | follower（任期 668）
+ w1     |   5433 | worker |             2 | 在线 | follower（任期 668）
+ w2     |   5434 | worker |             3 | 在线 | follower（任期 668）
+ w3     |   5435 | worker |             4 | 在线 | leader（任期 668）
 (4 rows)
 ```
 
@@ -141,9 +141,9 @@ SELECT * FROM demo.shards('account');
 ```text
  分片 | 分片号 | 所在节点 | 端口 |       哈希范围        | 行数 | worker上的表名 
 --------+-----------+--------------+--------+---------------------------+--------+--------------------
- S1     |    102987 | w1           |   5433 | [-2147483648, -715827884] |      0 | account_102987
- S2     |    102988 | w2           |   5434 | [-715827883, 715827881]   |      0 | account_102988
- S3     |    102989 | w3           |   5435 | [715827882, 2147483647]   |      0 | account_102989
+ S1     |    102990 | w1           |   5433 | [-2147483648, -715827884] |      0 | account_102990
+ S2     |    102991 | w2           |   5434 | [-715827883, 715827881]   |      0 | account_102991
+ S3     |    102992 | w3           |   5435 | [715827882, 2147483647]   |      0 | account_102992
 (3 rows)
 ```
 
@@ -182,7 +182,7 @@ SELECT k AS 键, l.分片, l.当前主节点 FROM generate_series(1, 9) k, demo.
 
 （结果表里的"选举轮次"= 任期：1 = 一次选中，>1 = 中间有人当选后被拒、让了位。）
 
-**窗口 A**（耗时 45.6 s）：
+**窗口 A**（耗时 54.8 s）：
 
 ```sql
 SELECT * FROM demo.raft_elect('account');
@@ -194,48 +194,55 @@ NOTICE:  此刻数据的分布：S1→w1，S2→w2，S3→w3 —— 另外两台
 NOTICE:  真实环境里就是这样：谁的选举超时（本演示 15 s）先到点谁就竞选，赢家是随机的。
 NOTICE:  若先当选的那台没有这个分片的数据，它的升主前置会拒绝（日志：拒绝升主：本节点没有该分片的本地副本），
 NOTICE:  然后主动让位、退避 5 个选举周期 —— 所以下面可能看到"当选又退位"，直到有数据的那台当选才会登记。
-NOTICE:     983 ms  组已建好，开始等自发竞选 ──────
-NOTICE:     984 ms  S1  w1  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S1  w2  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S1  w3  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S1  master  控制面登记（0 号组 partition_map）：还没登记
-NOTICE:     984 ms  S1  master  Citus 路由：读写发往 w1 :5433
-NOTICE:     984 ms  S2  w1  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S2  w2  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S2  w3  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S2  master  控制面登记（0 号组 partition_map）：还没登记
-NOTICE:     984 ms  S2  master  Citus 路由：读写发往 w2 :5434
-NOTICE:     984 ms  S3  w1  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S3  w2  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S3  w3  follower（任期 0，还没认出 leader）
-NOTICE:     984 ms  S3  master  控制面登记（0 号组 partition_map）：还没登记
-NOTICE:     984 ms  S3  master  Citus 路由：读写发往 w3 :5435
-NOTICE:   17444 ms  S1  w1  follower（任期 1，还没认出 leader）
-NOTICE:   17444 ms  S1  w3  发起竞选 → candidate（任期 1，向其余成员要票）
-NOTICE:   17505 ms  S1  w1  follower：认 w3 为 leader（任期 1）
-NOTICE:   17505 ms  S1  w2  follower：认 w3 为 leader（任期 1）
-NOTICE:   17505 ms  S1  w3  ★ 当选 leader（任期 1）
-NOTICE:   20743 ms  S1  w3  ✗ 主动让位 → follower（任期 1）：本节点没有这个分片的数据，升主前置拒绝升主，退避 5 个选举周期让给别人
-NOTICE:   21091 ms  S2  w1  follower：认 w2 为 leader（任期 1）
-NOTICE:   21091 ms  S2  w2  ★ 当选 leader（任期 1）
-NOTICE:   21091 ms  S2  w3  follower：认 w2 为 leader（任期 1）
-NOTICE:   26765 ms  S3  w1  follower：认 w3 为 leader（任期 1）
-NOTICE:   26765 ms  S3  w2  follower：认 w3 为 leader（任期 1）
-NOTICE:   26765 ms  S3  w3  ★ 当选 leader（任期 1）
-NOTICE:   33191 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 1）
-NOTICE:   33459 ms  S3  master  控制面登记（0 号组 partition_map）：主 = w3（登记任期 1）
-NOTICE:   37803 ms  S1  w1  ★ 当选 leader（任期 2）
-NOTICE:   37803 ms  S1  w2  follower（任期 2，还没认出 leader）
-NOTICE:   37803 ms  S1  w3  follower（任期 2，还没认出 leader）
-NOTICE:   37863 ms  S1  w2  follower：认 w1 为 leader（任期 2）
-NOTICE:   37863 ms  S1  w3  follower：认 w1 为 leader（任期 2）
-NOTICE:   45052 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 2）
-NOTICE:   45259 ms  全部就位（含新 leader 的升主前置：追平日志、认领无主 xid，然后才上报控制面）
- 分片 | 分片号 | 数据在 | leader | followers | 任期 | 选举轮次 | 控制面登记的主 | citus路由 
---------+-----------+-----------+--------+-----------+--------+--------------+-----------------------+-------------
- S1     |    102987 | w1        | w1     | w2, w3    | 2      |            2 | w1                    | w1 :5433
- S2     |    102988 | w2        | w2     | w1, w3    | 1      |            1 | w2                    | w2 :5434
- S3     |    102989 | w3        | w3     | w1, w2    | 1      |            1 | w3                    | w3 :5435
+NOTICE:     951 ms  组已建好，开始等自发竞选 ──────
+NOTICE:     955 ms  S1  w1  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S1  w2  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S1  w3  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S1  master  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     955 ms  S1  master  Citus 路由表：master 把读写发往 w1 :5433
+NOTICE:     955 ms  S2  w1  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S2  w2  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S2  w3  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S2  master  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     955 ms  S2  master  Citus 路由表：master 把读写发往 w2 :5434
+NOTICE:     955 ms  S3  w1  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S3  w2  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S3  w3  follower（任期 0，还没认出 leader）
+NOTICE:     955 ms  S3  master  控制面登记（0 号组 partition_map）：还没登记
+NOTICE:     955 ms  S3  master  Citus 路由表：master 把读写发往 w3 :5435
+NOTICE:   18517 ms  S3  w1  follower（任期 1，还没认出 leader）
+NOTICE:   18517 ms  S3  w2  发起竞选 → candidate（任期 1，向其余成员要票）
+NOTICE:   18589 ms  S3  w1  follower：认 w2 为 leader（任期 1）
+NOTICE:   18589 ms  S3  w2  ★ 当选 leader（任期 1）
+NOTICE:   18589 ms  S3  w3  follower：认 w2 为 leader（任期 1）
+NOTICE:   21275 ms  S2  w1  follower：认 w3 为 leader（任期 1）
+NOTICE:   21275 ms  S2  w2  follower：认 w3 为 leader（任期 1）
+NOTICE:   21275 ms  S2  w3  ★ 当选 leader（任期 1）
+NOTICE:   21908 ms  S1  w1  ★ 当选 leader（任期 1）
+NOTICE:   21908 ms  S1  w2  follower（任期 1，还没认出 leader）
+NOTICE:   21908 ms  S1  w3  follower（任期 1，还没认出 leader）
+NOTICE:   21969 ms  S1  w2  follower：认 w1 为 leader（任期 1）
+NOTICE:   21969 ms  S1  w3  follower：认 w1 为 leader（任期 1）
+NOTICE:   24632 ms  S2  w3  ✗ 主动让位 → follower（任期 1）：本节点没有这个分片的数据，升主前置拒绝升主，退避 5 个选举周期让给别人
+NOTICE:   26021 ms  S3  w2  ✗ 主动让位 → follower（任期 1）：本节点没有这个分片的数据，升主前置拒绝升主，退避 5 个选举周期让给别人
+NOTICE:   29057 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 1）
+NOTICE:   42153 ms  S2  w1  follower（任期 2，还没认出 leader）
+NOTICE:   42153 ms  S2  w2  ★ 当选 leader（任期 2）
+NOTICE:   42153 ms  S2  w3  follower（任期 2，还没认出 leader）
+NOTICE:   42211 ms  S2  w1  follower：认 w2 为 leader（任期 2）
+NOTICE:   42211 ms  S2  w3  follower：认 w2 为 leader（任期 2）
+NOTICE:   46249 ms  S3  w1  follower：认 w3 为 leader（任期 2）
+NOTICE:   46249 ms  S3  w2  follower（任期 2，还没认出 leader）
+NOTICE:   46249 ms  S3  w3  ★ 当选 leader（任期 2）
+NOTICE:   46307 ms  S3  w2  follower：认 w3 为 leader（任期 2）
+NOTICE:   50270 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 2）
+NOTICE:   54554 ms  S3  master  控制面登记（0 号组 partition_map）：主 = w3（登记任期 2）
+NOTICE:   54638 ms  全部就位（含新 leader 的升主前置：追平日志、认领无主 xid，然后才上报控制面）
+ 分片 | 分片号 | 数据在 | leader | followers | 任期 | 选举轮次 | 控制面登记的主 | master路由到 
+--------+-----------+-----------+--------+-----------+--------+--------------+-----------------------+-----------------
+ S1     |    102990 | w1        | w1     | w2, w3    | 1      |            1 | w1                    | w1 :5433
+ S2     |    102991 | w2        | w2     | w1, w3    | 2      |            2 | w2                    | w2 :5434
+ S3     |    102992 | w3        | w3     | w1, w2    | 2      |            2 | w3                    | w3 :5435
 (3 rows)
 ```
 
@@ -290,9 +297,9 @@ SELECT * FROM demo.raft_replicas('account');
  S1     | w1  | w2           | 1            | 已供：物理基线进分区流 → w2 配对文件号、arm 回放槽位
  S1     | w1  | w3           | 6            | 已供：物理基线进分区流 → w3 配对文件号、arm 回放槽位
  S2     | w2  | w1           | 1            | 已供：物理基线进分区流 → w1 配对文件号、arm 回放槽位
- S2     | w2  | w3           | 7            | 已供：物理基线进分区流 → w3 配对文件号、arm 回放槽位
- S3     | w3  | w1           | 2            | 已供：物理基线进分区流 → w1 配对文件号、arm 回放槽位
- S3     | w3  | w2           | 7            | 已供：物理基线进分区流 → w2 配对文件号、arm 回放槽位
+ S2     | w2  | w3           | 6            | 已供：物理基线进分区流 → w3 配对文件号、arm 回放槽位
+ S3     | w3  | w1           | 1            | 已供：物理基线进分区流 → w1 配对文件号、arm 回放槽位
+ S3     | w3  | w2           | 6            | 已供：物理基线进分区流 → w2 配对文件号、arm 回放槽位
 (6 rows)
 ```
 
@@ -305,15 +312,15 @@ SELECT * FROM demo.raft_groups('account');
 ```text
  分片 | 节点 |   角色   | 任期 | 认定的leader | 日志末尾 | 已提交 | 已应用 
 --------+--------+------------+--------+-----------------+--------------+-----------+-----------
- S1     | w1     | ★ leader |      2 | w1              |           10 |        10 |        10
- S1     | w2     | follower   |      2 | w1              |           10 |        10 |        10
- S1     | w3     | follower   |      2 | w1              |           10 |        10 |        10
- S2     | w1     | follower   |      1 | w2              |           11 |        11 |        11
- S2     | w2     | ★ leader |      1 | w2              |           11 |        11 |        11
- S2     | w3     | follower   |      1 | w2              |           11 |        11 |        11
- S3     | w1     | follower   |      1 | w3              |           11 |        10 |        10
- S3     | w2     | follower   |      1 | w3              |           11 |        10 |        10
- S3     | w3     | ★ leader |      1 | w3              |           11 |        11 |        11
+ S1     | w1     | ★ leader |      1 | w1              |           10 |        10 |        10
+ S1     | w2     | follower   |      1 | w1              |           10 |        10 |        10
+ S1     | w3     | follower   |      1 | w1              |           10 |        10 |        10
+ S2     | w1     | follower   |      2 | w2              |           10 |        10 |        10
+ S2     | w2     | ★ leader |      2 | w2              |           10 |        10 |        10
+ S2     | w3     | follower   |      2 | w2              |           10 |        10 |        10
+ S3     | w1     | follower   |      2 | w3              |           10 |         9 |         9
+ S3     | w2     | follower   |      2 | w3              |           10 |         9 |         9
+ S3     | w3     | ★ leader |      2 | w3              |           10 |        10 |        10
 (9 rows)
 ```
 
@@ -330,9 +337,9 @@ SELECT * FROM demo.roles('account');
 ```text
   节点  |            S1             |            S2             |            S3             |            小结             
 ----------+---------------------------+---------------------------+---------------------------+-------------------------------
- w1 :5433 | ★ leader（任期2）   | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 2 个 follower
- w2 :5434 | follower（回放到 0） | ★ leader（任期1）   | follower（回放到 0） | 1 个 leader + 2 个 follower
- w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 2 个 follower
+ w1 :5433 | ★ leader（任期1）   | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 2 个 follower
+ w2 :5434 | follower（回放到 0） | ★ leader（任期2）   | follower（回放到 0） | 1 个 leader + 2 个 follower
+ w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期2）   | 1 个 leader + 2 个 follower
 (3 rows)
 ```
 
@@ -340,7 +347,7 @@ SELECT * FROM demo.roles('account');
 
 打标之后，这张表的分片才走"分片级 xid + 分片级 clog + TSO 时间戳"的事务机制。
 
-**窗口 A**（耗时 2.5 s）：
+**窗口 A**（耗时 2.4 s）：
 
 ```sql
 SELECT * FROM partdist.set_table_shard_mvcc('account');
@@ -349,15 +356,15 @@ SELECT * FROM partdist.set_table_shard_mvcc('account');
 ```text
  shardid | node_port |                  status                   
 ---------+-----------+-------------------------------------------
-  102987 |      5433 | registered oid=367552 replica_notice=sent
-  102988 |      5434 | registered oid=252390 replica_notice=sent
-  102989 |      5435 | registered oid=81374 replica_notice=sent
+  102990 |      5433 | registered oid=367595 replica_notice=sent
+  102991 |      5434 | registered oid=260582 replica_notice=sent
+  102992 |      5435 | registered oid=81418 replica_notice=sent
 (3 rows)
 ```
 
 ### 第 7 步：路由信息
 
-三层：① Citus 路由表决定经 master 的读写发往哪个节点；② 控制面登记（0 号 Raft 组）记录每个分片的主从；
+三层：① master 上的 Citus 路由表决定这个分片的读写发给哪个节点（路由始终由 master 做，表里的「节点」列是「发给谁」）；② 控制面登记（0 号 Raft 组）记录每个分片的主从；
 
 ③ 每个节点本地知道自己对这个分片是主（写入被捕获进分区流）还是从（只收流）。
 
@@ -368,23 +375,23 @@ SELECT * FROM demo.routing('account');
 ```
 
 ```text
- 分片 |                       层                       | 节点 |                                              内容                                              
---------+-------------------------------------------------+--------+--------------------------------------------------------------------------------------------------
- S1     | ① Citus 路由（pg_dist_placement）         | w1     | 经 master 的读写都发往 w1 :5433
- S1     | ② 控制面登记（0 号组 partition_map） | w1     | 主 = w1，从 = w2,w3，登记任期 2
- S1     | ③ 节点本地（route_status）              | w1     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
- S1     | ③ 节点本地（route_status）              | w2     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S1     | ③ 节点本地（route_status）              | w3     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S2     | ① Citus 路由（pg_dist_placement）         | w2     | 经 master 的读写都发往 w2 :5434
- S2     | ② 控制面登记（0 号组 partition_map） | w2     | 主 = w2，从 = w1,w3，登记任期 1
- S2     | ③ 节点本地（route_status）              | w1     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S2     | ③ 节点本地（route_status）              | w2     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
- S2     | ③ 节点本地（route_status）              | w3     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S3     | ① Citus 路由（pg_dist_placement）         | w3     | 经 master 的读写都发往 w3 :5435
- S3     | ② 控制面登记（0 号组 partition_map） | w3     | 主 = w3，从 = w1,w2，登记任期 1
- S3     | ③ 节点本地（route_status）              | w1     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S3     | ③ 节点本地（route_status）              | w2     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
- S3     | ③ 节点本地（route_status）              | w3     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
+ 分片 |                            层                            | 节点 |                                                  内容                                                  
+--------+-----------------------------------------------------------+--------+----------------------------------------------------------------------------------------------------------
+ S1     | ① Citus 路由表（在 master 上）：发往 →      | w1     | master 把这个分片的读写都发往 w1 :5433（路由只由 master 做，这一列是"发给谁"）
+ S1     | ② 控制面登记（0 号组 partition_map）：主 → | w1     | 主 = w1，从 = w2,w3，登记任期 1
+ S1     | ③ 节点本地（route_status）                        | w1     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
+ S1     | ③ 节点本地（route_status）                        | w2     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S1     | ③ 节点本地（route_status）                        | w3     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S2     | ① Citus 路由表（在 master 上）：发往 →      | w2     | master 把这个分片的读写都发往 w2 :5434（路由只由 master 做，这一列是"发给谁"）
+ S2     | ② 控制面登记（0 号组 partition_map）：主 → | w2     | 主 = w2，从 = w1,w3，登记任期 2
+ S2     | ③ 节点本地（route_status）                        | w1     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S2     | ③ 节点本地（route_status）                        | w2     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
+ S2     | ③ 节点本地（route_status）                        | w3     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S3     | ① Citus 路由表（在 master 上）：发往 →      | w3     | master 把这个分片的读写都发往 w3 :5435（路由只由 master 做，这一列是"发给谁"）
+ S3     | ② 控制面登记（0 号组 partition_map）：主 → | w3     | 主 = w3，从 = w1,w2，登记任期 2
+ S3     | ③ 节点本地（route_status）                        | w1     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S3     | ③ 节点本地（route_status）                        | w2     | 从：只收流、不接受写；role=replica_or_plain captured=no members=4 xid_watermark=0
+ S3     | ③ 节点本地（route_status）                        | w3     | 主：写入被捕获进分区流；role=replica_or_plain captured=yes members=4 xid_watermark=0
 (15 rows)
 ```
 
@@ -423,7 +430,7 @@ another command is already in progress
 
 加入全局事务后跨分片插入：一条语句写 3 个分片。
 
-**窗口 A**（耗时 5.3 s）：
+**窗口 A**（耗时 4.7 s）：
 
 ```sql
 BEGIN;
@@ -437,7 +444,7 @@ COMMIT;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233473，start_ts = 18（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237569，start_ts = 18（本事务在所有分片上共用这一个快照）
 (1 row)
 
 INSERT 0 6
@@ -477,7 +484,7 @@ UPDATE 1
 DELETE 1
 ```
 
-**窗口 A**（耗时 3.0 s）：
+**窗口 A**（耗时 3.6 s）：
 
 ```sql
 BEGIN;
@@ -491,7 +498,7 @@ COMMIT;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233474，start_ts = 30（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237570，start_ts = 30（本事务在所有分片上共用这一个快照）
 (1 row)
 
 UPDATE 2
@@ -530,9 +537,9 @@ SELECT * FROM demo.xid('account');
 ```text
  分片 | 主节点 | 下一个分片xid |                      主的持久化水位                       | 主节点的原生xid | 各从学到的水位 
 --------+-----------+--------------------+------------------------------------------------------------------+-----------------------+-----------------------
- S1     | w1        |                  8 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                114716 | w2=8，w3=8
- S2     | w2        |                  6 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115314 | w1=6，w3=6
- S3     | w3        |                  6 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115833 | w1=6，w2=6
+ S1     | w1        |                  8 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                114996 | w2=8，w3=8
+ S2     | w2        |                  6 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115651 | w1=6，w3=6
+ S3     | w3        |                  6 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                116240 | w1=6，w2=6
 (3 rows)
 ```
 
@@ -587,14 +594,14 @@ SELECT * FROM demo.flow('account');
  分片 | 节点 |  角色  | 日志环深度 | 环容量 | 环满背压等待 | 环满丢弃 | 多数派不足丢弃 | 捕获环未消费 | 捕获环覆盖 | 写路径背压排空 
 --------+--------+----------+-----------------+-----------+--------------------+--------------+-----------------------+--------------------+-----------------+-----------------------
  S1     | w1     | leader   |               0 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
- S1     | w2     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
- S1     | w3     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
+ S1     | w2     | follower |               0 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
+ S1     | w3     | follower |               0 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
  S2     | w1     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
  S2     | w2     | leader   |               0 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
  S2     | w3     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
  S3     | w1     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
  S3     | w2     | follower |               1 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
- S3     | w3     | leader   |               0 |       128 |                  0 |            0 |                     2 |                  0 |               0 |                     0
+ S3     | w3     | leader   |               0 |       128 |                  0 |            0 |                     0 |                  0 |               0 |                     0
 (9 rows)
 ```
 
@@ -611,12 +618,12 @@ SELECT * FROM demo.replay('account');
 ```text
  分片 | 主 | 主的流位点 | 从 | 从已收到 | 从已回放 | 待回放 |  回放槽   
 --------+-----+-----------------+-----+--------------+--------------+-----------+--------------
- S1     | w1  |              34 | w2  |           33 |            0 |        33 | armed，idle
- S1     | w1  |              34 | w3  |           33 |            0 |        33 | armed，idle
+ S1     | w1  |              35 | w2  |           35 |            0 |        35 | armed，idle
+ S1     | w1  |              35 | w3  |           35 |            0 |        35 | armed，idle
  S2     | w2  |              31 | w1  |           30 |            0 |        30 | armed，idle
  S2     | w2  |              31 | w3  |           30 |            0 |        30 | armed，idle
- S3     | w3  |              32 | w1  |           31 |            0 |        31 | armed，idle
- S3     | w3  |              32 | w2  |           31 |            0 |        31 | armed，idle
+ S3     | w3  |              31 | w1  |           30 |            0 |        30 | armed，idle
+ S3     | w3  |              31 | w2  |           30 |            0 |        30 | armed，idle
 (6 rows)
 ```
 
@@ -629,12 +636,12 @@ SELECT * FROM demo.catchup('account');
 ```text
  分片 | 从 | 回放前 | 目标 | 回放后 | 耗时_ms 
 --------+-----+-----------+--------+-----------+-----------
- S1     | w2  |         0 |     34 |        34 |       295
- S1     | w3  |         0 |     34 |        34 |       241
- S2     | w1  |         0 |     31 |        31 |       246
- S2     | w3  |         0 |     31 |        31 |       196
- S3     | w1  |         0 |     32 |        32 |       283
- S3     | w2  |         0 |     32 |        32 |       192
+ S1     | w2  |         0 |     35 |        35 |       285
+ S1     | w3  |         0 |     35 |        35 |       162
+ S2     | w1  |         0 |     30 |        30 |       264
+ S2     | w3  |         0 |     31 |        31 |       244
+ S3     | w1  |         0 |     31 |        31 |       292
+ S3     | w2  |         0 |     31 |        31 |       438
 (6 rows)
 ```
 
@@ -647,18 +654,18 @@ SELECT * FROM demo.replay('account');
 ```text
  分片 | 主 | 主的流位点 | 从 | 从已收到 | 从已回放 | 待回放 |  回放槽   
 --------+-----+-----------------+-----+--------------+--------------+-----------+--------------
- S1     | w1  |              34 | w2  |           34 |           34 |         0 | armed，idle
- S1     | w1  |              34 | w3  |           34 |           34 |         0 | armed，idle
- S2     | w2  |              31 | w1  |           31 |           31 |         0 | armed，idle
+ S1     | w1  |              35 | w2  |           35 |           35 |         0 | armed，idle
+ S1     | w1  |              35 | w3  |           35 |           35 |         0 | armed，idle
+ S2     | w2  |              31 | w1  |           31 |           30 |         1 | armed，idle
  S2     | w2  |              31 | w3  |           31 |           31 |         0 | armed，idle
- S3     | w3  |              32 | w1  |           32 |           32 |         0 | armed，idle
- S3     | w3  |              32 | w2  |           32 |           32 |         0 | armed，idle
+ S3     | w3  |              31 | w1  |           31 |           31 |         0 | armed，idle
+ S3     | w3  |              31 | w2  |           31 |           31 |         0 | armed，idle
 (6 rows)
 ```
 
 追平之后，副本页面与主逐字节一致（按内核 heap_mask 口径）。
 
-**窗口 A**（耗时 3.2 s）：
+**窗口 A**（耗时 3.3 s）：
 
 ```sql
 SELECT * FROM demo.compare('account');
@@ -692,7 +699,7 @@ SELECT * FROM account ORDER BY id;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233475，start_ts = 38（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237571，start_ts = 38（本事务在所有分片上共用这一个快照）
 (1 row)
 
  id | owner | balance 
@@ -716,7 +723,7 @@ SELECT * FROM account ORDER BY id;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233476，start_ts = 39（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237572，start_ts = 39（本事务在所有分片上共用这一个快照）
 (1 row)
 
  id | owner | balance 
@@ -773,7 +780,7 @@ SELECT * FROM account ORDER BY id;
 
 幕 4：A 提交；B 在自己的事务里仍然看不见（快照隔离：B 的 start_ts 早于 A 的 commit_ts）。
 
-**窗口 A**（耗时 3.6 s）：
+**窗口 A**（耗时 4.7 s）：
 
 ```sql
 COMMIT;
@@ -801,7 +808,7 @@ SELECT * FROM account ORDER BY id;
 
 幕 5：B 跨分片删除 2 行并提交。
 
-**窗口 B**（耗时 3.7 s）：
+**窗口 B**（耗时 2.8 s）：
 
 ```sql
 DELETE FROM account WHERE id IN (1, 6);
@@ -846,7 +853,7 @@ UPDATE account SET balance = balance + 7 WHERE id IN (2, 11);
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233477，start_ts = 50（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237573，start_ts = 50（本事务在所有分片上共用这一个快照）
 (1 row)
 
 UPDATE 2
@@ -864,7 +871,7 @@ DELETE FROM account WHERE id = 2;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233478，start_ts = 51（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237574，start_ts = 51（本事务在所有分片上共用这一个快照）
 (1 row)
 ```
 
@@ -884,7 +891,7 @@ COMMIT
 
 ```text
 ERROR:  could not serialize access due to concurrent update
-DETAIL:  分片 81374 目标行的并发删改 commit_ts=52 ≥ 本事务 start_ts=51（first-committer-wins，设计 §4.4）。
+DETAIL:  分片 81418 目标行的并发删改 commit_ts=52 ≥ 本事务 start_ts=51（first-committer-wins，设计 §4.4）。
 HINT:  重试事务。
 CONTEXT:  while executing command on localhost:5435
 ```
@@ -926,7 +933,7 @@ NOTICE:  S3 当前的主是 w3，下面是它那本分片 clog（st：0 空/运�
 
 切完 w2 同时当两个分片的主，旧主 w1 被新主自动重新供给成副本；新主的分片 xid 接着旧主的号往下发。
 
-**窗口 A**（耗时 11.8 s）：
+**窗口 A**（耗时 10.3 s）：
 
 ```sql
 SELECT * FROM demo.switch_leader('account', 'S1', 'w2');
@@ -934,20 +941,21 @@ SELECT * FROM demo.switch_leader('account', 'S1', 'w2');
 
 ```text
 NOTICE:  切换前：S1 的主 = w1，下一个分片 xid = 10
-NOTICE:       7 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
-NOTICE:      13 ms  S1  切换前：w1 leader/任期2，w2 follower/任期2，w3 follower/任期2；控制面登记 w1；Citus 路由 → w1
-NOTICE:      30 ms  S1  w2  pg_raft_group_campaign：对 S1 的组发起竞选
-NOTICE:     768 ms  S1  w1  退位 → follower，跟随 w2（任期 3）
-NOTICE:     768 ms  S1  w2  ★ 当选 leader（任期 3）
-NOTICE:     768 ms  S1  w3  follower（任期 3，还没认出 leader）
-NOTICE:     963 ms  S1  w3  follower：认 w2 为 leader（任期 3）
-NOTICE:    5524 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 3）
-NOTICE:    5524 ms  S1  master  Citus 路由：读写发往 w2 :5434
-NOTICE:    6066 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
-NOTICE:   11773 ms  S1  w1  旧主被新主自动重新供给成副本（回放槽位 armed）
+NOTICE:       4 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
+NOTICE:       8 ms  S1  切换前：w1 leader/任期1，w2 follower/任期1，w3 follower/任期1；控制面登记 w1；master 把读写路由到 w1
+NOTICE:      17 ms  S1  w2  pg_raft_group_campaign：对 S1 的组发起竞选
+NOTICE:    1043 ms  S1  w1  退位 → follower（任期 2，还没认出新 leader）
+NOTICE:    1043 ms  S1  w2  ★ 当选 leader（任期 2）
+NOTICE:    1043 ms  S1  w3  follower（任期 2，还没认出 leader）
+NOTICE:    1110 ms  S1  w1  follower：认 w2 为 leader（任期 2）
+NOTICE:    1110 ms  S1  w3  follower：认 w2 为 leader（任期 2）
+NOTICE:    4277 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 2）
+NOTICE:    4277 ms  S1  master  Citus 路由表：master 把读写发往 w2 :5434
+NOTICE:    4762 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:   10312 ms  S1  w1  旧主被新主自动重新供给成副本（回放槽位 armed）
  分片 | 原来的主 | 新主 | 新任期 | 切换耗时_ms | 原主换下时的下一个分片xid | 新主接着发的下一个分片xid |                    原主重新成为副本                     
 --------+--------------+--------+-----------+-----------------+--------------------------------------+--------------------------------------+-----------------------------------------------------------------
- S1     | w1           | w2     | 3         |            5709 | 10                                   | 10                                   | 是：切换后 11771 ms 被新主自动重新供给（armed）
+ S1     | w1           | w2     | 2         |            4332 | 10                                   | 10                                   | 是：切换后 10312 ms 被新主自动重新供给（armed）
 (1 row)
 ```
 
@@ -960,13 +968,13 @@ SELECT * FROM demo.roles('account');
 ```text
   节点  |             S1             |             S2             |             S3             |            小结             
 ----------+----------------------------+----------------------------+----------------------------+-------------------------------
- w1 :5433 | follower（回放到 0）  | follower（回放到 31） | follower（回放到 32） | 0 个 leader + 3 个 follower
- w2 :5434 | ★ leader（任期3）    | ★ leader（任期1）    | follower（回放到 32） | 2 个 leader + 1 个 follower
- w3 :5435 | follower（回放到 34） | follower（回放到 31） | ★ leader（任期1）    | 1 个 leader + 2 个 follower
+ w1 :5433 | follower（回放到 0）  | follower（回放到 30） | follower（回放到 31） | 0 个 leader + 3 个 follower
+ w2 :5434 | ★ leader（任期2）    | ★ leader（任期2）    | follower（回放到 31） | 2 个 leader + 1 个 follower
+ w3 :5435 | follower（回放到 35） | follower（回放到 31） | ★ leader（任期2）    | 1 个 leader + 2 个 follower
 (3 rows)
 ```
 
-**窗口 A**（耗时 2.2 s）：
+**窗口 A**：
 
 ```sql
 INSERT INTO account VALUES (8, 'heidi', 800);
@@ -977,9 +985,9 @@ SELECT * FROM demo.xid('account');
 INSERT 0 1
  分片 | 主节点 | 下一个分片xid |                      主的持久化水位                       | 主节点的原生xid | 各从学到的水位 
 --------+-----------+--------------------+------------------------------------------------------------------+-----------------------+-----------------------
- S1     | w2        |                 11 | 4106（按 4096 一批落盘，崩溃后从批次上界续发） |                115377 | w1=4099，w3=11
- S2     | w2        |                  8 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115377 | w1=8，w3=8
- S3     | w3        |                  9 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115909 | w1=9，w2=9
+ S1     | w2        |                 11 | 4106（按 4096 一批落盘，崩溃后从批次上界续发） |                115713 | w1=4099，w3=11
+ S2     | w2        |                  8 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                115713 | w1=8，w3=8
+ S3     | w3        |                  9 | 4099（按 4096 一批落盘，崩溃后从批次上界续发） |                116317 | w1=9，w2=9
 (3 rows)
 ```
 
@@ -991,7 +999,7 @@ INSERT 0 1
 
 （停机前函数会先等副本确认最新一笔提交，原因见教程"已知问题"第 1 条。）
 
-**窗口 A**（耗时 37.5 s）：
+**窗口 A**（耗时 23.7 s）：
 
 ```sql
 SELECT * FROM demo.crash('account', 'w2');
@@ -999,29 +1007,29 @@ SELECT * FROM demo.crash('account', 'w2');
 
 ```text
 NOTICE:  宕机前：w2 是 S1、S2 的主；其余分片它只是从
-NOTICE:     428 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
-NOTICE:     435 ms  S1  宕机前：w1 follower/任期3，w2 leader/任期3，w3 follower/任期3；控制面登记 w2；Citus 路由 → w2
-NOTICE:     442 ms  S2  宕机前：w1 follower/任期1，w2 leader/任期1，w3 follower/任期1；控制面登记 w2；Citus 路由 → w2
-NOTICE:     450 ms  S3  宕机前：w1 follower/任期1，w2 follower/任期1，w3 leader/任期1；控制面登记 w3；Citus 路由 → w3
-NOTICE:     966 ms  w2  pg_ctl -m immediate stop：进程直接退出，不做 checkpoint（模拟断电）
-NOTICE:     967 ms  S1  w2  ✗ 连不上（节点宕机）
-NOTICE:     967 ms  S2  w2  ✗ 连不上（节点宕机）
-NOTICE:     967 ms  S3  w2  ✗ 连不上（节点宕机）
-NOTICE:   17453 ms  S2  w1  follower：认 w3 为 leader（任期 2）
-NOTICE:   17453 ms  S2  w3  ★ 当选 leader（任期 2）
-NOTICE:   24264 ms  S1  w1  发起竞选 → candidate（任期 4，向其余成员要票）
-NOTICE:   24653 ms  S1  w1  ★ 当选 leader（任期 4）
-NOTICE:   24653 ms  S1  w3  follower：认 w1 为 leader（任期 4）
-NOTICE:   28417 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w3（登记任期 2）
-NOTICE:   28417 ms  S2  master  Citus 路由：读写发往 w3 :5435
-NOTICE:   36735 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 4）
-NOTICE:   36735 ms  S1  master  Citus 路由：读写发往 w1 :5433
-NOTICE:   37267 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:      47 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
+NOTICE:      51 ms  S1  宕机前：w1 follower/任期2，w2 leader/任期2，w3 follower/任期2；控制面登记 w2；master 把读写路由到 w2
+NOTICE:      59 ms  S2  宕机前：w1 follower/任期2，w2 leader/任期2，w3 follower/任期2；控制面登记 w2；master 把读写路由到 w2
+NOTICE:      65 ms  S3  宕机前：w1 follower/任期2，w2 follower/任期2，w3 leader/任期2；控制面登记 w3；master 把读写路由到 w3
+NOTICE:     734 ms  w2  pg_ctl -m immediate stop：进程直接退出，不做 checkpoint（模拟断电）
+NOTICE:     734 ms  S1  w2  ✗ 连不上（节点宕机）
+NOTICE:     734 ms  S2  w2  ✗ 连不上（节点宕机）
+NOTICE:     734 ms  S3  w2  ✗ 连不上（节点宕机）
+NOTICE:   17577 ms  S2  w1  ★ 当选 leader（任期 3）
+NOTICE:   17577 ms  S2  w3  follower：认 w1 为 leader（任期 3）
+NOTICE:   19494 ms  S1  w1  follower（任期 3，还没认出 leader）
+NOTICE:   19494 ms  S1  w3  ★ 当选 leader（任期 3）
+NOTICE:   19560 ms  S1  w1  follower：认 w3 为 leader（任期 3）
+NOTICE:   21055 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 3）
+NOTICE:   21055 ms  S2  master  Citus 路由表：master 把读写发往 w1 :5433
+NOTICE:   23301 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w3（登记任期 3）
+NOTICE:   23301 ms  S1  master  Citus 路由表：master 把读写发往 w3 :5435
+NOTICE:   23574 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
  分片 | 宕机前的主 | 宕机后的主 | 任期 | 不可用时长_ms 
 --------+-----------------+-----------------+--------+--------------------
- S1     | w2              | w1              | 4      |              36900
- S2     | w2              | w3              | 2      |              36900
- S3     | w3              | w3              | 1      |                  0
+ S1     | w2              | w3              | 3      |              23359
+ S2     | w2              | w1              | 3      |              23359
+ S3     | w3              | w3              | 2      |                  0
 (3 rows)
 ```
 
@@ -1032,17 +1040,17 @@ SELECT * FROM demo.roles('account');
 ```
 
 ```text
-  节点  |             S1             |             S2             |             S3             |            小结             
-----------+----------------------------+----------------------------+----------------------------+-------------------------------
- w1 :5433 | ★ leader（任期4）    | follower（回放到 31） | follower（回放到 32） | 1 个 leader + 2 个 follower
- w2 :5434 | ✗ 宕机                 | ✗ 宕机                 | ✗ 宕机                 | 宕机
- w3 :5435 | follower（回放到 34） | ★ leader（任期2）    | ★ leader（任期1）    | 2 个 leader + 1 个 follower
+  节点  |            S1             |             S2             |             S3             |            小结             
+----------+---------------------------+----------------------------+----------------------------+-------------------------------
+ w1 :5433 | follower（回放到 0） | ★ leader（任期3）    | follower（回放到 31） | 1 个 leader + 2 个 follower
+ w2 :5434 | ✗ 宕机                | ✗ 宕机                 | ✗ 宕机                 | 宕机
+ w3 :5435 | ★ leader（任期3）   | follower（回放到 31） | ★ leader（任期2）    | 2 个 leader + 1 个 follower
 (3 rows)
 ```
 
 宕机期间照常读写（在 B 窗口）。
 
-**窗口 B**（耗时 2.7 s）：
+**窗口 B**：
 
 ```sql
 SELECT * FROM account ORDER BY id;
@@ -1065,7 +1073,7 @@ INSERT 0 1
 INSERT 0 1
 ```
 
-**窗口 B**（耗时 2.5 s）：
+**窗口 B**：
 
 ```sql
 BEGIN;
@@ -1078,7 +1086,7 @@ COMMIT;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 233479，start_ts = 63（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 237575，start_ts = 63（本事务在所有分片上共用这一个快照）
 (1 row)
 
 UPDATE 3
@@ -1087,32 +1095,33 @@ COMMIT
 
 把 w2 拉起来：它以 follower 身份回到 3 个组，原来当主的分片被新主自动重新供给成副本。
 
-**窗口 A**（耗时 12.8 s）：
+**窗口 A**（耗时 18.8 s）：
 
 ```sql
 SELECT * FROM demo.recover('account', 'w2');
 ```
 
 ```text
-NOTICE:      12 ms  S1  拉起前：w1 leader/任期4，w2 ✗宕机，w3 follower/任期4；控制面登记 w1；Citus 路由 → w1
-NOTICE:      21 ms  S2  拉起前：w1 follower/任期2，w2 ✗宕机，w3 leader/任期2；控制面登记 w3；Citus 路由 → w3
-NOTICE:      32 ms  S3  拉起前：w1 follower/任期1，w2 ✗宕机，w3 leader/任期1；控制面登记 w3；Citus 路由 → w3
-NOTICE:    2552 ms  w2  pg_ctl start：进程起来了，开始重新加入各个组
-NOTICE:    2553 ms  S1  w2  follower（任期 3，还没认出 leader）
-NOTICE:    2553 ms  S2  w2  follower（任期 0，还没认出 leader）
-NOTICE:    2553 ms  S3  w2  follower（任期 0，还没认出 leader）
-NOTICE:    2942 ms  S2  w2  follower（任期 1，还没认出 leader）
-NOTICE:    3018 ms  S2  w2  follower：认 w3 为 leader（任期 2）
-NOTICE:    3018 ms  S3  w2  follower：认 w3 为 leader（任期 1）
-NOTICE:    3245 ms  S1  w2  follower：认 w1 为 leader（任期 4）
-NOTICE:    3697 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
-NOTICE:    3702 ms  S1  w2  回放槽位 armed —— 已是 w1 的合格副本
-NOTICE:    3709 ms  S3  w2  回放槽位 armed —— 已是 w3 的合格副本
-NOTICE:   12741 ms  S2  w2  回放槽位 armed —— 已是 w3 的合格副本
+NOTICE:       5 ms  S1  拉起前：w1 follower/任期3，w2 ✗宕机，w3 leader/任期3；控制面登记 w3；master 把读写路由到 w3
+NOTICE:       9 ms  S2  拉起前：w1 leader/任期3，w2 ✗宕机，w3 follower/任期3；控制面登记 w1；master 把读写路由到 w1
+NOTICE:      12 ms  S3  拉起前：w1 follower/任期2，w2 ✗宕机，w3 leader/任期2；控制面登记 w3；master 把读写路由到 w3
+NOTICE:    1323 ms  w2  pg_ctl start：进程起来了，开始重新加入各个组
+NOTICE:    1323 ms  S1  w2  follower（任期 0，还没认出 leader）
+NOTICE:    1323 ms  S2  w2  follower（任期 0，还没认出 leader）
+NOTICE:    1323 ms  S3  w2  follower（任期 0，还没认出 leader）
+NOTICE:    1723 ms  S1  w2  follower（任期 2，还没认出 leader）
+NOTICE:    2024 ms  S2  w2  follower：认 w1 为 leader（任期 3）
+NOTICE:    2789 ms  S3  w2  follower（任期 2，还没认出 leader）
+NOTICE:    2908 ms  S1  w2  follower：认 w3 为 leader（任期 3）
+NOTICE:    2908 ms  S3  w2  follower：认 w3 为 leader（任期 2）
+NOTICE:    3189 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:    3195 ms  S1  w2  回放槽位 armed —— 已是 w3 的合格副本
+NOTICE:    3203 ms  S3  w2  回放槽位 armed —— 已是 w3 的合格副本
+NOTICE:   18742 ms  S2  w2  回放槽位 armed —— 已是 w1 的合格副本
  分片 | 当前的主 | 节点 | 在组里的角色 |    回放槽位     
 --------+--------------+--------+--------------------+---------------------
- S1     | w1           | w2     | follower           | armed，回放到 0
- S2     | w3           | w2     | follower           | armed，回放到 0
+ S1     | w3           | w2     | follower           | armed，回放到 0
+ S2     | w1           | w2     | follower           | armed，回放到 0
  S3     | w3           | w2     | follower           | armed，回放到 0
 (3 rows)
 ```
@@ -1124,15 +1133,15 @@ SELECT * FROM demo.roles('account');
 ```
 
 ```text
-  节点  |             S1             |             S2             |             S3             |            小结             
-----------+----------------------------+----------------------------+----------------------------+-------------------------------
- w1 :5433 | ★ leader（任期4）    | follower（回放到 31） | follower（回放到 32） | 1 个 leader + 2 个 follower
- w2 :5434 | follower（回放到 0）  | follower（回放到 0）  | follower（回放到 0）  | 0 个 leader + 3 个 follower
- w3 :5435 | follower（回放到 34） | ★ leader（任期2）    | ★ leader（任期1）    | 2 个 leader + 1 个 follower
+  节点  |            S1             |             S2             |             S3             |            小结             
+----------+---------------------------+----------------------------+----------------------------+-------------------------------
+ w1 :5433 | follower（回放到 0） | ★ leader（任期3）    | follower（回放到 31） | 1 个 leader + 2 个 follower
+ w2 :5434 | follower（回放到 0） | follower（回放到 0）  | follower（回放到 0）  | 0 个 leader + 3 个 follower
+ w3 :5435 | ★ leader（任期3）   | follower（回放到 31） | ★ leader（任期2）    | 2 个 leader + 1 个 follower
 (3 rows)
 ```
 
-**窗口 A**：
+**窗口 A**（耗时 2.2 s）：
 
 ```sql
 SELECT * FROM demo.catchup('account');
@@ -1141,16 +1150,16 @@ SELECT * FROM demo.catchup('account');
 ```text
  分片 | 从 | 回放前 | 目标 | 回放后 | 耗时_ms 
 --------+-----+-----------+--------+-----------+-----------
- S1     | w2  |         0 |     70 |        70 |       240
- S1     | w3  |        34 |     70 |        70 |       293
- S2     | w1  |        31 |     61 |        61 |       160
- S2     | w2  |         0 |     61 |        61 |       162
- S3     | w1  |        32 |     48 |        48 |        60
- S3     | w2  |         0 |     48 |        48 |       161
+ S1     | w1  |         0 |     73 |        73 |       270
+ S1     | w2  |         0 |     73 |        73 |       641
+ S2     | w2  |         0 |     62 |        62 |       242
+ S2     | w3  |        31 |     62 |        62 |       325
+ S3     | w1  |        31 |     47 |        47 |       438
+ S3     | w2  |         0 |     47 |        47 |       243
 (6 rows)
 ```
 
-**窗口 A**（耗时 3.6 s）：
+**窗口 A**（耗时 3.8 s）：
 
 ```sql
 SELECT * FROM demo.compare('account');
@@ -1159,10 +1168,10 @@ SELECT * FROM demo.compare('account');
 ```text
  分片 | 主 | 从 |       主堆        |    主键索引     
 --------+-----+-----+---------------------+---------------------
- S1     | w1  | w2  | ✓ 逐字节一致 | ✓ 逐字节一致
- S1     | w1  | w3  | ✓ 逐字节一致 | ✓ 逐字节一致
- S2     | w3  | w1  | ✓ 逐字节一致 | ✓ 逐字节一致
- S2     | w3  | w2  | ✓ 逐字节一致 | ✓ 逐字节一致
+ S1     | w3  | w1  | ✓ 逐字节一致 | ✓ 逐字节一致
+ S1     | w3  | w2  | ✓ 逐字节一致 | ✓ 逐字节一致
+ S2     | w1  | w2  | ✓ 逐字节一致 | ✓ 逐字节一致
+ S2     | w1  | w3  | ✓ 逐字节一致 | ✓ 逐字节一致
  S3     | w3  | w1  | ✓ 逐字节一致 | ✓ 逐字节一致
  S3     | w3  | w2  | ✓ 逐字节一致 | ✓ 逐字节一致
 (6 rows)
@@ -1198,8 +1207,8 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 
 ```text
 恢复演示前的环境
-  删表 account（分片 102987 102988 102989）
-  删控制面登记（partition_map）里演示分片的行：102987,102988,102989
+  删表 account（分片 102990 102991 102992）
+  删控制面登记（partition_map）里演示分片的行：102990,102991,102992
   16 项参数已按演示前的 postgresql.auto.conf 还原（TSO、选举超时）
   demo 函数库已删除
 完成：残留数据 Raft 组 0 个，残留演示表 0 张
@@ -1234,7 +1243,7 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
  demo.raft_replicas('表')             | 在各组的主上把副本供到其余两台 → 最终主从
  demo.raft_groups('表')               | 每台 worker 在各组里的角色、任期、日志位点
  demo.roles('表')                     | 同一节点上的混合角色（节点 × 分片）
- demo.routing('表')                   | 路由三层：Citus 路由 / 控制面登记 / 节点本地
+ demo.routing('表')                   | 路由三层：master 的 Citus 路由表 / 控制面登记 / 节点本地角色
  demo.flow('表')                      | 流控：Raft 日志环 + 分区流捕获环
  demo.global_txn()                     | 在 BEGIN 之后调用：加入全局事务（跨分片写必须）
  demo.xid('表')                       | 分片级 xid 分配器：每个分片的下一个号、水位、与原生 xid 对比

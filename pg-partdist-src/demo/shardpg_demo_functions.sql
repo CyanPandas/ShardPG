@@ -268,7 +268,7 @@ BEGIN
             rt := demo.route_node(sid);
             k := sid || ':route';
             IF (last ->> k) IS DISTINCT FROM rt THEN
-                RAISE NOTICE '% ms  %  master  Citus 路由：读写发往 % :%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
+                RAISE NOTICE '% ms  %  master  Citus 路由表：master 把读写发往 % :%', lpad(t::text, 6), demo.slabel(p_tbl, sid),
                     rt, (SELECT port FROM demo.node WHERE name = rt);
                 last := last || jsonb_build_object(k, rt);
             END IF;
@@ -313,7 +313,7 @@ BEGIN
         m := m || jsonb_build_object(sid || ':reg', coalesce(reg, '?') || '|' ||
                  coalesce((SELECT primary_term::text FROM partdist.partition_map WHERE partition_id = sid), '?'))
                || jsonb_build_object(sid || ':route', demo.route_node(sid));
-        RAISE NOTICE '% ms  %  %：%；控制面登记 %；Citus 路由 → %', lpad(demo.ms(p_t0)::text, 6), demo.slabel(p_tbl, sid), p_title,
+        RAISE NOTICE '% ms  %  %：%；控制面登记 %；master 把读写路由到 %', lpad(demo.ms(p_t0)::text, 6), demo.slabel(p_tbl, sid), p_title,
             line, coalesce(reg, '还没有'), demo.route_node(sid);
     END LOOP;
     RETURN m;
@@ -428,7 +428,7 @@ END $$;
 -- ④ 每个分片自动建一个 Raft 组（成员 = 3 台 worker）—— **不做任何人工干预**：
 --    建完组三台各自倒计时，谁先到点谁竞选，全过程实时打出来。
 CREATE FUNCTION demo.raft_elect(p_tbl regclass)
-RETURNS TABLE(分片 text, 分片号 bigint, 数据在 text, leader text, followers text, 任期 text, 选举轮次 int, 控制面登记的主 text, citus路由 text)
+RETURNS TABLE(分片 text, 分片号 bigint, 数据在 text, leader text, followers text, 任期 text, 选举轮次 int, 控制面登记的主 text, master路由到 text)
 LANGUAGE plpgsql AS $$
 DECLARE sid bigint; w text; t0 timestamptz; t int; sids bigint[]; holders text;
 BEGIN
@@ -467,7 +467,7 @@ BEGIN
         任期 := split_part(demo.gstate(leader, sid), '|', 2);
         选举轮次 := nullif(任期, '')::int;     -- 任期 N = 一共选了 N 轮（N>1 即有人当选后被拒、让位）
         控制面登记的主 := demo.reg(sid);
-        citus路由 := demo.route_node(sid) || ' :' || (SELECT port FROM demo.node WHERE name = demo.route_node(sid));
+        master路由到 := demo.route_node(sid) || ' :' || (SELECT port FROM demo.node WHERE name = demo.route_node(sid));
         RETURN NEXT;
     END LOOP;
 END $$;
@@ -577,11 +577,12 @@ DECLARE sid bigint; w text; v text; m record;
 BEGIN
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         分片 := demo.slabel(p_tbl, sid);
-        层 := '① Citus 路由（pg_dist_placement）'; 节点 := demo.route_node(sid);
-        内容 := '经 master 的读写都发往 ' || 节点 || ' :' || (SELECT port FROM demo.node WHERE name = 节点);
+        层 := '① Citus 路由表（在 master 上）：发往 →'; 节点 := demo.route_node(sid);
+        内容 := 'master 把这个分片的读写都发往 ' || 节点 || ' :' || (SELECT port FROM demo.node WHERE name = 节点)
+                || '（路由只由 master 做，这一列是"发给谁"）';
         RETURN NEXT;
         SELECT * INTO m FROM partdist.partition_map WHERE partition_id = sid;
-        层 := '② 控制面登记（0 号组 partition_map）'; 节点 := demo.node_of_raft(m.primary_node);
+        层 := '② 控制面登记（0 号组 partition_map）：主 →'; 节点 := demo.node_of_raft(m.primary_node);
         内容 := format('主 = %s，从 = %s，登记任期 %s', 节点,
                      (SELECT string_agg(demo.node_of_raft(x), ',') FROM unnest(m.secondary_nodes) x), m.primary_term);
         RETURN NEXT;
@@ -964,7 +965,7 @@ CREATE FUNCTION demo.help() RETURNS TABLE(函数 text, 作用 text) LANGUAGE sql
     ('demo.raft_replicas(''表'')',            '在各组的主上把副本供到其余两台 → 最终主从'),
     ('demo.raft_groups(''表'')',              '每台 worker 在各组里的角色、任期、日志位点'),
     ('demo.roles(''表'')',                    '同一节点上的混合角色（节点 × 分片）'),
-    ('demo.routing(''表'')',                  '路由三层：Citus 路由 / 控制面登记 / 节点本地'),
+    ('demo.routing(''表'')',                  '路由三层：master 的 Citus 路由表 / 控制面登记 / 节点本地角色'),
     ('demo.flow(''表'')',                     '流控：Raft 日志环 + 分区流捕获环'),
     ('demo.global_txn()',                     '在 BEGIN 之后调用：加入全局事务（跨分片写必须）'),
     ('demo.xid(''表'')',                      '分片级 xid 分配器：每个分片的下一个号、水位、与原生 xid 对比'),

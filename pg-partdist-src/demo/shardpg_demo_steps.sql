@@ -56,7 +56,7 @@ SELECT * FROM demo.roles('account');
 SELECT * FROM partdist.set_table_shard_mvcc('account');
 
 -- ════ 第 7 步：路由信息 ════
--- 三层：① Citus 路由表决定经 master 的读写发往哪个节点；② 控制面登记（0 号 Raft 组）记录每个分片的主从；
+-- 三层：① master 上的 Citus 路由表决定这个分片的读写发给哪个节点（路由始终由 master 做，表里的「节点」列是「发给谁」）；② 控制面登记（0 号 Raft 组）记录每个分片的主从；
 -- ③ 每个节点本地知道自己对这个分片是主（写入被捕获进分区流）还是从（只收流）。
 -- @A
 SELECT * FROM demo.routing('account');
