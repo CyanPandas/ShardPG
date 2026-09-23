@@ -166,6 +166,9 @@ typedef struct RaftLogEntry
 /* ★ P7-N37：控制面条目 apply 连续失败多久之后才放弃（按老语义跳过） */
 #define RAFT_CTRL_APPLY_RETRY_MS 60000
 
+/* ★ P7-N39：控制面补提本任期空条目的重试间隔 */
+#define RAFT_CTRL_NOOP_RETRY_MS  5000
+
 typedef struct RaftLogShmem
 {
     slock_t      mutex;
@@ -4052,6 +4055,8 @@ typedef struct RaftAsyncConn
 
 static RaftAsyncConn promote_aconn = {"升主前置"};
 static RaftAsyncConn report_aconn = {"登记"};
+/* ★ P7-N39：控制面新 leader 补提"本任期空条目"用的连接（tick 里不能做 SPI，走本机 libpq） */
+static RaftAsyncConn ctrl_noop_aconn = {"控制面空条目"};
 
 static void
 aconn_reset(RaftAsyncConn *ac, bool cancel)
@@ -4240,6 +4245,7 @@ promote_async_sweep(void)
 {
     aconn_sweep_one(&promote_aconn);
     aconn_sweep_one(&report_aconn);
+    aconn_sweep_one(&ctrl_noop_aconn);
 }
 
 /*
@@ -4785,6 +4791,99 @@ start_election(RaftGroupCtx *ctx)
     }
 }
 
+/*
+ * ★ P7-N39（2026-09-23）：控制面（0 号组）新 leader 补提一条**本任期空条目**。
+ *
+ * 缺陷：Raft 不允许 leader 直接提交前任任期的条目（只能靠提交一条本任期的条目把它们
+ * 顺带带上）。数据组在升主前置里已经这么做了（P7-N35），**控制面没有人做**。于是换了
+ * 任期之后，上一任期留下的尾巴会一直停在未提交、也就一直不 apply —— 那可能是一条
+ * OP_PARTITION_PRIMARY（"谁是这个分片的主"），意味着各节点的 partition_map 和路由
+ * 就此停在旧值，直到下一次有人往控制面写东西才被顺带带上。
+ *
+ * 实测（2026-09-23）：0 号组停在 last=1154 / commit=1153，1154 是任期 677 的
+ * OP_PARTITION_PRIMARY，而 leader 已经在任期 678；这个状态下 citus_add_node 的
+ * 控制面写入一直排在后面，整条命令挂死。手工 propose 一条 OP_NOOP 之后
+ * commit 立刻推到 1155、5 个节点全部 applied。
+ *
+ * 做法与登记/升主前置同源：tick 里没有 SPI，把 SQL 经本机 libpq 异步发出去，
+ * 收到结果再清状态；失败就下个 tick 重来（RAFT_CTRL_NOOP_RETRY_MS 限一下频率）。
+ * 只在"确有前任任期尾巴"时才发 —— 本任期自己的在途条目会自然提交，不用打扰。
+ */
+static void
+ctrl_commit_tail_noop(RaftGroupCtx *ctx)
+{
+    static TimestampTz last_try = 0;
+    TimestampTz now = GetCurrentTimestamp();
+    int64       last_idx, commit_idx, term, tail_term = 0;
+    bool        got_tail;
+    RaftLogEntry e;
+
+    if (ctrl_noop_aconn.state == RAFT_ACONN_BUSY)
+    {
+        PGresult     *res = NULL;
+        RaftAconnPoll pr = aconn_poll(&ctrl_noop_aconn, &res);
+
+        if (pr == RAFT_ACONN_PENDING)
+        {
+            if (TimestampDifferenceExceeds(ctrl_noop_aconn.started, now,
+                                           RAFT_PROMOTE_INFLIGHT_MAX_MS))
+            {
+                elog(WARNING, "pg_raft: 控制面空条目已发出超过 %d ms，取消后重来",
+                     RAFT_PROMOTE_INFLIGHT_MAX_MS);
+                aconn_reset(&ctrl_noop_aconn, true);
+            }
+            return;
+        }
+        if (pr == RAFT_ACONN_BROKEN)
+        {
+            elog(WARNING, "pg_raft: 控制面空条目连接失效：%s，下个 tick 重来",
+                 PQerrorMessage(ctrl_noop_aconn.conn));
+            aconn_reset(&ctrl_noop_aconn, false);
+            return;
+        }
+        if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+            elog(LOG, "pg_raft: 控制面本任期空条目已提交（idx=%s）——上一任期的尾巴随之提交（P7-N39）",
+                 PQgetvalue(res, 0, 0));
+        else
+            elog(WARNING, "pg_raft: 控制面空条目提交失败：%s",
+                 res != NULL ? PQresultErrorMessage(res) : "无结果");
+        if (res != NULL)
+            PQclear(res);
+        return;
+    }
+
+    SpinLockAcquire(&ctx->log->mutex);
+    last_idx = ctx->log->last_log_index;
+    commit_idx = ctx->log->commit_index;
+    got_tail = (last_idx > commit_idx) && log_get_entry_locked(ctx, last_idx, &e);
+    if (got_tail)
+        tail_term = e.term;
+    SpinLockRelease(&ctx->log->mutex);
+
+    if (last_idx <= commit_idx)
+        return;                 /* 没有尾巴 */
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    term = ctx->cons->current_term;
+    SpinLockRelease(&ctx->cons->mutex);
+
+    /* 尾巴是本任期自己刚写的 ⇒ 正常在途，别打扰；只管前任任期留下的 */
+    if (!got_tail || tail_term >= term)
+        return;
+    if (last_try != 0 && !TimestampDifferenceExceeds(last_try, now, RAFT_CTRL_NOOP_RETRY_MS))
+        return;
+    last_try = now;
+
+    if (aconn_ensure(&ctrl_noop_aconn, "127.0.0.1", PostPortNumber, pg_raft_node_id) != 1)
+        return;
+    if (aconn_send(&ctrl_noop_aconn,
+                   "SELECT partdist.pg_raft_group_propose(0, 'OP_NOOP', '{}')::text",
+                   RAFT_CONTROL_GROUP, term))
+        elog(LOG, "pg_raft: 控制面有上一任期(%lld)的尾巴未提交（idx %lld > commit %lld，本任期 %lld），"
+                  "补提一条本任期空条目（P7-N39）",
+             (long long) tail_term, (long long) last_idx, (long long) commit_idx, (long long) term);
+}
+
 /* 单组的一次状态机推进 */
 static void
 group_tick(RaftGroupCtx *ctx)
@@ -4824,6 +4923,8 @@ group_tick(RaftGroupCtx *ctx)
         send_heartbeats(ctx);
         if (ctx->group_id != RAFT_CONTROL_GROUP && ctx->g->report_pending)
             data_group_try_report(ctx);
+        else if (ctx->group_id == RAFT_CONTROL_GROUP)
+            ctrl_commit_tail_noop(ctx);     /* P7-N39 */
         return;
     }
 

@@ -423,6 +423,13 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
     if (!raft_spi_begin(&spi_owned))
         return false;
 
+    /* ★ P7-N39：空条目没有任何要落账的东西，apply 直接算成功（否则每提一条就打一行"应用失败"） */
+    if (strcmp(op_type, PG_RAFT_OP_NOOP) == 0)
+    {
+        raft_spi_end(spi_owned);
+        return true;
+    }
+
     if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
     {
         initStringInfo(&sql);

@@ -342,6 +342,15 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
   **代价要知道**：重试期间该节点的控制面游标停在这一条上，后面的 group 0 条目一起排队（最长 60 s 这个节点的登记是旧的）。
   这与数据面一直以来的语义一致（apply 不成功不推游标），换来的是"不再静默丢登记"。
 
+- **P7-N39（已修，2026-09-23）控制面停在上一任期的尾巴上**：旧版本的形态是 `partdist.pg_raft_group_status()` 里
+  group 0 长期 `last_log_index > commit_index`，而那条尾巴的 `term` 小于当前 `current_term`（查
+  `SELECT log_index, term, op_type, committed FROM partdist.raft_log WHERE group_id=0 ORDER BY log_index DESC LIMIT 5`）。
+  后果：那条登记（多半是 `OP_PARTITION_PRIMARY`）不 apply，各节点 partition_map 与路由停在旧值，且后续控制面写入
+  （包括 `citus_add_node`）全排在它后面 —— 实测整条命令挂死 5 分钟以上。
+  旧版本的人工解法：`SELECT partdist.pg_raft_group_propose(0, 'OP_NOOP', '{}');`（提一条本任期空条目，尾巴随之提交）。
+  新版本自动做这件事，日志为 `控制面有上一任期(N)的尾巴未提交（idx X > commit Y，本任期 M），补提一条本任期空条目（P7-N39）`
+  → `控制面本任期空条目已提交（idx=Z）`。两行之间正常在数秒内。
+
 ## 8. 扩展升级（换 .so）的固定顺序
 
 1. `scripts/sync_build.sh`（带守卫：内容比对同步、头文件变了全量重编、导出符号核对）。

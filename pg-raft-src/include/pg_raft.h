@@ -35,6 +35,9 @@ pg_raft_spi_end(bool must_finish)
 
 #define PG_RAFT_OP_NODE_STATUS       "OP_NODE_STATUS"
 #define PG_RAFT_OP_PARTITION_PRIMARY "OP_PARTITION_PRIMARY"
+/* ★ P7-N39：新 leader 上任提的**本任期空条目**（Raft 标准动作），没有任何副作用，
+ * 存在的唯一目的是把上一任期继承来的尾巴一起带上提交点。*/
+#define PG_RAFT_OP_NOOP              "OP_NOOP"
 
 #define PG_RAFT_MAX_HOSTNAME 256
 
