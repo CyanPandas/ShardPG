@@ -18,6 +18,9 @@ DEMO_TABLES="${DEMO_TABLES:-account}"
 # 演示期间 worker 的 Raft 选举超时。产品默认 6000；这台 2 vCPU 机器上放宽到 15000,
 # 免得负载抖动（共识 tick 偶尔卡 5–9 s）误判主死、冒出多余的选举。想完全按产品默认跑：ELECTION_MS=6000
 ELECTION_MS="${ELECTION_MS:-15000}"
+# TSO 租约：灌数那一批事务本身要跑几十秒，60 s 的租约会让快照被栅栏作废
+# （"分片快照被栅栏作废：本节点已 45000 ms 未能向 TSO 续租"）。演示期间放宽到 5 分钟。
+TSO_LEASE_MS="${TSO_LEASE_MS:-300000}"
 
 psqlc() { local port=$1; shift; docker exec -i -u postgres "$C" $BIN/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
 q()     { psqlc "$1" -qAtc "$2" </dev/null 2>/dev/null | tail -1; }
@@ -55,9 +58,9 @@ cmd_start() {
     done
     [[ -z "$down" ]] || die "这些节点没起来：$down" "$(for p in $down; do taillog "${p#:}"; done)"
 
-    local W; W=$(workers)
-    [[ $(wc -w <<<"$W") -eq 3 ]] \
-        || die "需要 1 个 master + 3 个 worker，现在 worker 是「$W」" "（演示固定用 4 个节点）"
+    local W NW; W=$(workers); NW=$(wc -w <<<"$W")
+    [[ $NW -ge 3 ]] \
+        || die "至少需要 3 台 worker，现在只有「$W」" "（演示按 1 master + N worker 自适应，推荐 4 台）"
     if [[ "$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")" != 0 ]]; then
         die "上一次演示还没收尾（demo 模式还在）" "先执行：bash $0 stop"
     fi
@@ -73,6 +76,9 @@ cmd_start() {
             || die "表 $t 已存在" "先执行：bash $0 stop（或手工 DROP TABLE $t）"
     done
 
+    # 有一部分 CREATE FUNCTION 会被 Citus 传播到 worker；worker 上若留着旧签名，
+    # 下次装库会报 "cannot change return type of existing function"。先清干净。
+    for p in $W; do q $p "SET citus.enable_ddl_propagation=off; DROP SCHEMA IF EXISTS demo CASCADE" >/dev/null; done
     step "① 安装 demo 函数库（只装在 master 上）"
     local out
     out=$(psqlc 5432 -q -v ON_ERROR_STOP=1 < "$HERE/shardpg_demo_functions.sql" 2>&1 >/dev/null) \
@@ -91,7 +97,7 @@ cmd_start() {
     q 5432 "ALTER SYSTEM SET pg_partdist.tso_master = on" >/dev/null
     for p in 5432 $W; do
         q $p "ALTER SYSTEM SET pg_partdist.tso_conninfo = 'host=/tmp port=5432 dbname=postgres user=postgres'" >/dev/null
-        q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = 60000" >/dev/null
+        q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = $TSO_LEASE_MS" >/dev/null
         q $p "SELECT pg_reload_conf()" >/dev/null
     done
     step "④ 把 3 台 worker 的 Raft 选举超时设为 ${ELECTION_MS} ms（产品默认 6000；2 vCPU 上放宽避免误选主。stop 时还原）"
@@ -102,6 +108,9 @@ cmd_start() {
     local ts; ts=$(qe 5432 "SELECT partdist.partdist_tso_client_start_ts()")
     [[ "$ts" =~ ^[0-9]+$ ]] || die "TSO 取号失败" "$ts"
     docker exec "$C" test -f /tmp/pagecmp.py || docker cp "$HERE/../tests/pagecmp.py" "$C":/tmp/pagecmp.py >/dev/null 2>&1
+    # 业务数据文件送进容器，演示里用 \i /tmp/demo_data.sql 读它
+    [[ -f "$HERE/demo_data.sql" ]] && docker cp "$HERE/demo_data.sql" "$C":/tmp/demo_data.sql >/dev/null 2>&1
+    docker exec -u postgres "$C" chmod 644 /tmp/demo_data.sql 2>/dev/null
     say "准备好了"
 }
 
@@ -146,7 +155,8 @@ cmd_stop() {
     fi
     say "  $(q 5432 "SELECT demo._restore_gucs()")（TSO、选举超时）"
     q 5432 "SET citus.enable_ddl_propagation = off; DROP SCHEMA demo CASCADE" >/dev/null
-    say "  demo 函数库已删除"
+    for p in $W; do q $p "SET citus.enable_ddl_propagation=off; DROP SCHEMA IF EXISTS demo CASCADE" >/dev/null; done
+    say "  demo 函数库已删除（master 与各 worker）"
     local ng=0 left
     for p in $W; do ng=$((ng + $(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0"))); done
     left=$(q 5432 "SELECT count(*) FROM pg_class WHERE relname IN ('$(sed "s/ /','/g" <<<"$DEMO_TABLES")') AND relnamespace='public'::regnamespace")

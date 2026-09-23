@@ -280,7 +280,12 @@ BEGIN
                 lead_id := (SELECT raft_id FROM demo.node WHERE name = lead);
                 FOREACH cur IN ARRAY sts LOOP
                     w := split_part(cur, '=', 1); n := string_to_array(split_part(cur, '=', 2), '|');
-                    IF w <> lead AND n[1] <> 'down' AND NOT (n[1] = 'follower' AND n[3] = lead_id::text) THEN
+                    -- '-' = 这个节点上压根没有这个组（副本因子小于 worker 数时的非成员），
+                    -- 它不该参与"大家是否都认同一个 leader"的判断（否则永远等不到稳定）。
+                    -- 同样跳过"任期 0、还没认出任何 leader"的空壳（非成员被 hearsay 建出来的那种）
+                    IF w <> lead AND n[1] <> 'down' AND n[1] <> '-'
+                       AND NOT (n[1] = 'follower' AND n[2] = '0' AND coalesce(n[3], '0') = '0')
+                       AND NOT (n[1] = 'follower' AND n[3] = lead_id::text) THEN
                         ok := false;
                     END IF;
                 END LOOP;
@@ -861,7 +866,7 @@ BEGIN
 END $$;
 
 -- ⑱ 模拟不可抗力宕机：pg_ctl -m immediate（不做 checkpoint，等同断电），看 Raft 自动选主
-CREATE FUNCTION demo.crash(p_tbl regclass, p_node text)
+CREATE FUNCTION demo.crash_node(p_tbl regclass, p_node text)
 RETURNS TABLE(分片 text, 宕机前的主 text, 宕机后的主 text, 任期 text, 不可用时长_ms int)
 LANGUAGE plpgsql AS $$
 DECLARE sid bigint; t0 timestamptz; t int; before jsonb := '{}'; d text; pgctl text := '/work/pg-install/bin/pg_ctl'; base jsonb;
@@ -889,7 +894,7 @@ BEGIN
 END $$;
 
 -- ⑲ 把宕机的节点拉起来：它以 follower 身份归队，原来当主的分片被新主自动重新供给
-CREATE FUNCTION demo.recover(p_tbl regclass, p_node text)
+CREATE FUNCTION demo.recover_node(p_tbl regclass, p_node text)
 RETURNS TABLE(分片 text, 当前的主 text, 节点 text, 在组里的角色 text, 回放槽位 text)
 LANGUAGE plpgsql AS $$
 DECLARE sid bigint; t0 timestamptz; t int; d text; i int; a text; done jsonb := '{}'; pending int;
@@ -924,7 +929,8 @@ BEGIN
     FOR i IN 1..480 LOOP
         IF i = 90 THEN      -- 45 s 还没 armed：新主那边的自动归队工作者可能已过期（它只等约 5 分钟），手动触发一次
             FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
-                CONTINUE WHEN demo.leader(sid) = p_node OR done ? sid::text;
+                CONTINUE WHEN demo.leader(sid) = p_node OR done ? sid::text
+                              OR NOT demo.is_member(sid, p_node);   -- 不是这个组的成员，本来就不该有副本
                 RAISE NOTICE '% ms  %  %  等了 45 s 还没 armed（新主的自动归队工作者只等约 5 分钟，节点停得更久就要手动触发）→ 在 % 上 reprovision_demoted',
                     lpad(demo.ms(t0)::text, 6), demo.slabel(p_tbl, sid), p_node, demo.leader(sid);
                 BEGIN
@@ -936,7 +942,8 @@ BEGIN
         END IF;
         pending := 0;
         FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
-            CONTINUE WHEN demo.leader(sid) = p_node OR done ? sid::text;
+            CONTINUE WHEN demo.leader(sid) = p_node OR done ? sid::text
+                          OR NOT demo.is_member(sid, p_node);
             a := demo.pq(p_node, format('SELECT coalesce((SELECT armed::text FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(%s)), ''none'')', sid));
             IF a = 'true' THEN
                 RAISE NOTICE '% ms  %  %  回放槽位 armed —— 已是 % 的合格副本', lpad(demo.ms(t0)::text, 6), demo.slabel(p_tbl, sid), p_node, demo.leader(sid);
@@ -948,6 +955,9 @@ BEGIN
     END LOOP;
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         分片 := demo.slabel(p_tbl, sid); 当前的主 := demo.leader(sid); 节点 := p_node;
+        IF NOT demo.is_member(sid, p_node) THEN      -- 副本因子小于 worker 数时，这台本来就不在这个组里
+            在组里的角色 := '不是成员'; 回放槽位 := '—'; RETURN NEXT; CONTINUE;
+        END IF;
         在组里的角色 := split_part(demo.gstate(p_node, sid), '|', 1);
         回放槽位 := CASE WHEN 当前的主 = p_node THEN '（它是主，没有回放槽）'
                         ELSE coalesce(demo.pq(p_node, format('SELECT CASE WHEN armed THEN ''armed，回放到 ''||applied ELSE ''未 armed'' END FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(%s)', sid)), '无回放槽（待重供）') END;
@@ -958,7 +968,7 @@ END $$;
 -- 函数一览
 CREATE FUNCTION demo.help() RETURNS TABLE(函数 text, 作用 text) LANGUAGE sql AS $$
     VALUES
-    ('demo.nodes()',                          '4 个节点：端口、类型、pg_raft 节点号、在线状态、控制面 0 号组角色'),
+    ('demo.nodes()',                          '各节点：端口、类型、pg_raft 节点号、在线状态、控制面 0 号组角色'),
     ('demo.shards(''表'')',                   '每个分片落在哪个节点、哈希范围、行数'),
     ('demo.locate(''表'', 键)',               '某个键落在哪个分片、当前由哪个节点服务'),
     ('demo.raft_elect(''表'')',               '每个分片建 Raft 组并选主（实时打出选主过程）'),
@@ -975,9 +985,177 @@ CREATE FUNCTION demo.help() RETURNS TABLE(函数 text, 作用 text) LANGUAGE sql
     ('demo.catchup(''表'')',                  '触发回放，让每个从追平'),
     ('demo.compare(''表'')',                  '副本与主逐字节比对'),
     ('demo.switch_leader(''表'', ''S1'', ''w2'')', '手动切换 leader（实时打出切主过程）'),
-    ('demo.crash(''表'', ''w2'')',            '模拟宕机（immediate stop），看 Raft 自动选主'),
-    ('demo.recover(''表'', ''w2'')',          '拉起宕机节点，看它归队、被自动重新供给')
+    ('demo.crash(''表'')',            '模拟宕机（immediate stop），看 Raft 自动选主'),
+    ('demo.recover(''表'')',          '拉起宕机节点，看它归队、被自动重新供给')
 $$;
 
 RESET citus.enable_ddl_propagation;
 SELECT '演示函数已安装（SELECT * FROM demo.help(); 查看）' AS 安装结果;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 新版演示（5 节点，按真实部署的逻辑走）用的三个函数
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- 某个分片的 Raft 组成员：以数据所在节点为起点，按端口顺序取 p_rf 台 worker。
+-- p_rf 为空 = 全部 worker（演示默认）；给定数字则取前 p_rf 台。
+CREATE FUNCTION demo.member_ids(p_sid bigint, p_rf int DEFAULT NULL) RETURNS int[]
+LANGUAGE sql STABLE AS $$
+    -- p_rf 为空 = 全部 worker（默认）。
+    -- ⚠ 实测：副本因子小于 worker 数时，组建好、副本还没供的那一刻组内没人有这个分片，
+    --   第一条 parwal 记录凑不齐多数派，provision_shard_replica 会直接报
+    --   "建壳表失败: record 1 未达多数派"。所以演示默认让每台 worker 都进组。
+    WITH w AS (SELECT name, port, raft_id, row_number() OVER (ORDER BY port) - 1 AS i,
+                      count(*) OVER () AS n FROM demo.node WHERE kind = 'worker'),
+         start AS (SELECT i FROM w WHERE name = demo.route_node(p_sid))
+    SELECT array_agg(raft_id ORDER BY ((i - (SELECT i FROM start) + n) % n))
+      FROM w WHERE ((i - (SELECT i FROM start) + n) % n) < coalesce(p_rf, (SELECT n FROM w LIMIT 1))
+$$;
+
+-- 同上，给 pg_raft_group_create 用的 SQL 字面量
+CREATE FUNCTION demo.members_sql(p_sid bigint, p_rf int DEFAULT NULL) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT 'ARRAY[' || array_to_string(demo.member_ids(p_sid, p_rf), ',') || ']'
+$$;
+
+-- 建组时把成员集记下来：切主之后"谁是成员"不变，不能再按当前主去推算
+CREATE TABLE demo.group_member(sid bigint, raft_id int, PRIMARY KEY (sid, raft_id));
+
+-- 某节点是不是这个分片组的成员（没登记过成员的组按"全体 worker"算，兼容旧流程）
+CREATE FUNCTION demo.is_member(p_sid bigint, p_node text) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM demo.group_member WHERE sid = p_sid) THEN true
+                ELSE EXISTS (SELECT 1 FROM demo.group_member g
+                              JOIN demo.node n ON n.raft_id = g.raft_id
+                             WHERE g.sid = p_sid AND n.name = p_node) END
+$$;
+
+-- ① 一条命令把表接入系统：每个分片建 Raft 组 → 自发选主 → 供副本 → 打标。
+--    过程只打关键行（选主细节在第 5/6 步看），最后给一张"每片主从 + 是否已接入"的表。
+CREATE FUNCTION demo.setup(p_tbl regclass, p_rf int DEFAULT NULL)
+RETURNS TABLE(分片 text, 数据在 text, leader text, 副本 text, 选举轮次 int, 事务系统 text)
+LANGUAGE plpgsql AS $$
+DECLARE v_sid bigint; w text; t0 timestamptz := clock_timestamp(); sids bigint[]; mem text; r record; n int;
+BEGIN
+    FOR w IN SELECT demo.workers() LOOP
+        PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
+    END LOOP;
+    sids := demo.sids(p_tbl);
+    INSERT INTO demo.managed VALUES (p_tbl::text, sids)
+        ON CONFLICT (tbl) DO UPDATE SET shardids = EXCLUDED.shardids;
+    RAISE NOTICE '① 每个分片建一个 Raft 组（成员 = % 台 worker），然后**不干预**，等它们自发选主',
+        coalesce(p_rf, (SELECT count(*)::int FROM demo.node WHERE kind = 'worker'));
+    FOREACH v_sid IN ARRAY sids LOOP
+        mem := demo.members_sql(v_sid, p_rf);
+        DELETE FROM demo.group_member g WHERE g.sid = v_sid;   -- 变量改名 v_sid：叫 sid 会和列名撞（plpgsql 默认 variable_conflict=error）
+        INSERT INTO demo.group_member(sid, raft_id)
+             SELECT v_sid, unnest(demo.member_ids(v_sid, p_rf));
+        -- 只在**组成员**上建组：在非成员上也建，会留下一个任期 0、永不参与的空壳组
+        FOR w IN SELECT n.name FROM demo.node n
+                  WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(v_sid, p_rf)) ORDER BY n.port LOOP
+            PERFORM demo.q(w, format('SELECT partdist.pg_raft_group_create(%s, %s)::text', v_sid, mem));
+        END LOOP;
+    END LOOP;
+    -- 等每个分片都选出主并登记（没有数据的成员当选会被升主前置拒绝、自动让位，见第 6 步）
+    FOR n IN 1..600 LOOP
+        EXIT WHEN (SELECT bool_and(demo.reg(x) IS NOT NULL AND demo.reg(x) = demo.leader(x)) FROM unnest(sids) x);
+        PERFORM pg_sleep(0.5);
+    END LOOP;
+    RAISE NOTICE '   选主完成（% s）：%', round(extract(epoch from clock_timestamp() - t0))::text,
+        (SELECT string_agg(demo.slabel(p_tbl, x) || '→' || coalesce(demo.leader(x), '?')
+                           || '（任期 ' || coalesce(split_part(demo.gstate(demo.leader(x), x), '|', 2), '?') || '）', '，' ORDER BY x)
+           FROM unnest(sids) x);
+    RAISE NOTICE '② 在每个组的主上把副本供到组内其余成员（物理基线进分区流）';
+    -- 用 demo.raft_replicas：它带一轮"没 armed 就从当前主再供一遍"的补供。
+    -- 必须有这一层 —— 建组后、副本还没供的那一刻，组里没人能落盘流里最早那条记录，
+    -- 第一次基线发射会报 "record 1 未达多数派"；补供时壳表已经在了，就过得去。
+    PERFORM count(*) FROM demo.raft_replicas(p_tbl);
+    RAISE NOTICE '③ 打标：接入分片级 xid + 分片级 clog + TSO 时间戳（必须在写入之前做，分片得是空的）';
+    PERFORM partdist.set_table_shard_mvcc(p_tbl);
+    RAISE NOTICE '   全部就位，用时 % s', round(extract(epoch from clock_timestamp() - t0))::text;
+    FOREACH v_sid IN ARRAY sids LOOP
+        分片 := demo.slabel(p_tbl, v_sid);
+        数据在 := demo.route_node(v_sid);
+        leader := demo.leader(v_sid);
+        副本 := (SELECT string_agg(n.name, ', ' ORDER BY n.port) FROM demo.node n
+                  WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(v_sid, p_rf))
+                    AND n.name IS DISTINCT FROM demo.leader(v_sid));
+        选举轮次 := nullif(split_part(demo.gstate(demo.leader(v_sid), v_sid), '|', 2), '')::int;
+        事务系统 := CASE WHEN demo.pq(demo.leader(v_sid),
+                        format('SELECT partdist.shard_mvcc_status(partdist.local_partition_for_shard(%s))', v_sid))
+                        LIKE '%registered=yes%' THEN '已接入' ELSE '未接入' END;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+-- ② 数据分布：灌完数据之后看"系统自己把它分到了哪几台"
+CREATE FUNCTION demo.distribution(p_tbl regclass)
+RETURNS TABLE(分片 text, 节点 text, 端口 int, 行数 bigint, 余额合计 bigint, 占比 text)
+LANGUAGE plpgsql AS $$
+DECLARE sid bigint; tot bigint; v text;
+BEGIN
+    EXECUTE format('SELECT count(*) FROM %s', p_tbl) INTO tot;
+    FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
+        分片 := demo.slabel(p_tbl, sid);
+        节点 := demo.route_node(sid);
+        端口 := (SELECT port FROM demo.node WHERE name = 节点);
+        v := demo.pq(节点, format('SELECT count(*)||''|''||coalesce(sum(balance),0) FROM %s_%s', p_tbl::text, sid));
+        行数 := split_part(v, '|', 1)::bigint;
+        余额合计 := split_part(v, '|', 2)::bigint;
+        占比 := CASE WHEN tot > 0 THEN round(100.0 * 行数 / tot, 1)::text || '%' ELSE '-' END;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+-- ─── 新版演示用的两参/单参重载：目标节点自己挑，不用演示者记谁是谁 ───
+
+-- 记一下被演示停掉的节点，recover 时不用再报名字
+CREATE TABLE demo.crashed(node text PRIMARY KEY, at timestamptz DEFAULT now());
+
+-- 切主：把某个分片的主切到**同组内**的另一台（按组成员顺序取下一个）
+CREATE FUNCTION demo.switch_leader(p_tbl regclass, p_shard text)
+RETURNS TABLE(分片 text, 原来的主 text, 新主 text, 新任期 text, 切换耗时_ms int, 旧主 text)
+LANGUAGE plpgsql AS $$
+DECLARE sid bigint; cur text; tgt text; r record;
+BEGIN
+    sid := (SELECT x FROM unnest(demo.sids(p_tbl)) x WHERE demo.slabel(p_tbl, x) = p_shard);
+    IF sid IS NULL THEN RAISE EXCEPTION '没有这个分片：%（看 demo.setup 的输出）', p_shard; END IF;
+    cur := demo.leader(sid);
+    tgt := (SELECT n.name FROM demo.node n
+             WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(sid))
+               AND n.name IS DISTINCT FROM cur ORDER BY n.port LIMIT 1);
+    RAISE NOTICE '把 % 的主从 % 切到 %（同组成员：%）', p_shard, cur, tgt,
+        (SELECT string_agg(name, ' ' ORDER BY port) FROM demo.node WHERE raft_id = ANY (demo.member_ids(sid)));
+    FOR r IN SELECT * FROM demo.switch_leader(p_tbl, p_shard, tgt) LOOP
+        分片 := r.分片; 原来的主 := r.原来的主; 新主 := r.新主; 新任期 := r.新任期;
+        切换耗时_ms := r.切换耗时_ms; 旧主 := r.原主重新成为副本;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+-- 宕机：停掉某个分片当前的主（不指定分片就取第一个分片）
+CREATE FUNCTION demo.crash(p_tbl regclass, p_shard text DEFAULT NULL)
+RETURNS TABLE(分片 text, 宕机前的主 text, 宕机后的主 text, 任期 text, 不可用时长_ms int)
+LANGUAGE plpgsql AS $$
+DECLARE sid bigint; victim text;
+BEGIN
+    sid := CASE WHEN p_shard IS NULL THEN (demo.sids(p_tbl))[1]
+                ELSE (SELECT x FROM unnest(demo.sids(p_tbl)) x WHERE demo.slabel(p_tbl, x) = p_shard) END;
+    IF sid IS NULL THEN RAISE EXCEPTION '没有这个分片：%', p_shard; END IF;
+    victim := demo.leader(sid);
+    RAISE NOTICE '停掉 %（它是 % 的主；它同时还是另外几个分片的从）', victim, demo.slabel(p_tbl, sid);
+    INSERT INTO demo.crashed(node) VALUES (victim) ON CONFLICT (node) DO UPDATE SET at = now();
+    RETURN QUERY SELECT * FROM demo.crash_node(p_tbl, victim);
+END $$;
+
+-- 归队：把上一次 demo.crash 停掉的那台拉起来
+CREATE FUNCTION demo.recover(p_tbl regclass)
+RETURNS TABLE(分片 text, 当前的主 text, 节点 text, 在组里的角色 text, 回放槽位 text)
+LANGUAGE plpgsql AS $$
+DECLARE n text;
+BEGIN
+    n := (SELECT node FROM demo.crashed ORDER BY at DESC LIMIT 1);
+    IF n IS NULL THEN RAISE EXCEPTION '没有记录到被停掉的节点（先跑 demo.crash）'; END IF;
+    RAISE NOTICE '把 % 拉起来', n;
+    DELETE FROM demo.crashed WHERE node = n;
+    RETURN QUERY SELECT * FROM demo.recover_node(p_tbl, n);
+END $$;
