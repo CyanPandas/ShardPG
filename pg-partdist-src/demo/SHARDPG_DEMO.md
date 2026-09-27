@@ -791,7 +791,13 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 8. **别在演示中途重启 master。** TSO 计数器在 master 内存里，重启后会留下 boot 标记并拒绝发号
    （fail-closed 防呆），要按 `start` 的步骤重开。
 
-9. **加节点不是一条命令。** 新 worker 除了 `citus_add_node`，还要：把它写进所有节点的 `pg_raft.peers`
+9. **反复跑演示要留意打标登记的残留。** 打标登记（`$PGDATA/pg_shard_xid/<oid>`，这个目录就是重启时的登记表）
+   上限 64 张/节点。修前 DROP 清不干净，跑十几轮演示就会攒满，然后 `demo.setup` 的第 ③ 步报
+   `打标登记表已满（上限 64 张）`（P7-N40，已于 2026-09-27 修）。若还遇到：在那台 worker 上
+   `SELECT partdist.shard_mvcc_gc_orphans();` 清掉"OID 已无对应表"的残留登记，再重跑本步。
+   `demo.setup` 现在会把打标失败当失败**直接报错**，不会再带着一半没接入的表往下走。
+
+10. **加节点不是一条命令。** 新 worker 除了 `citus_add_node`，还要：把它写进所有节点的 `pg_raft.peers`
    （PGC_POSTMASTER，要整簇重启）、在它上面建好扩展、并手工往 `partdist.node_map` 补一行真实地址
    （`OP_NODE_STATUS` 的 apply 只会写 `node<id>`/5432 这样的占位地址）。
 

@@ -33,6 +33,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "storage/fd.h"
+#include "utils/syscache.h"		/* P7-N40：孤儿登记 GC 判"表还在不在" */
 #include "access/xlog.h"			/* T7.22：GetXLogInsertRecPtr */
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -1873,6 +1874,42 @@ ShardLogicalFenceLsn(void)
  * T2.7：为登记表预创建水位文件（{0,0}，8 字节）——让 pg_shard_xid/ 目录
  * 在首写之前就承担"启动登记表"职责。已存在则不动（幂等）。
  */
+/*
+ * ★ P7-N40（2026-09-27）：本节点有没有这张表的水位文件。
+ *
+ * 为什么需要它：水位文件（= 启动登记表）与共享内存登记集合是**两份**东西，
+ * 而 DROP 时的清理此前只认集合（shard_oid_is_mvcc）。两者一旦不一致，
+ * 文件就永久残留 —— 而残留的文件下次启动又会被当成登记，于是这台节点的
+ * 登记表越用越满，最后"打标登记表已满（上限 64 张）"，再也打不了标。
+ */
+bool
+ShardMvccWatermarkFileExists(Oid relid)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", relid);
+	return stat(path, &st) == 0;
+}
+
+/* ★ P7-N40：登记集合还有位置吗（已在册也算有位置 —— 重复登记是幂等的） */
+bool
+ShardMvccSetHasRoom(Oid relid)
+{
+	int			i;
+	bool		room;
+
+	if (ShardXidCtl == NULL)
+		return false;
+	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+	room = (ShardXidCtl->mvcc_n < SHARD_XID_MAX_SLOTS);
+	for (i = 0; !room && i < ShardXidCtl->mvcc_n; i++)
+		if (ShardXidCtl->mvcc_set[i] == relid)
+			room = true;
+	LWLockRelease(ShardXidCtl->lock);
+	return room;
+}
+
 void
 ShardMvccEnsureWatermarkFile(Oid relid)
 {
@@ -2359,7 +2396,15 @@ ShardXidUtilityGuard(Node *parsetree)
 				RangeVar   *rv = makeRangeVarFromNameList((List *) lfirst(lc));
 				Oid			relid = RangeVarGetRelid(rv, NoLock, true);
 
-				if (OidIsValid(relid) && shard_oid_is_mvcc(cfg, relid))
+				/*
+				 * ★ P7-N40：判据必须**兼顾文件**。只认登记集合时，"有水位文件
+				 * 却没进集合"的那些（集合满了、或集合被摘过而文件还在）DROP
+				 * 之后文件就永久留着，而文件就是下次启动的登记表 —— 于是登记
+				 * 表只增不减，最终该节点再也打不了标。
+				 */
+				if (OidIsValid(relid) &&
+					(shard_oid_is_mvcc(cfg, relid) ||
+					 ShardMvccWatermarkFileExists(relid)))
 					ShardClogRememberDrop(relid);
 			}
 		}
@@ -2446,6 +2491,100 @@ partdist_set_shard_mvcc(PG_FUNCTION_ARGS)
  *
  * 不碰 partition_map.shard_mvcc 列（与 T7.4 同理：那是 group0 复制的控制面）。幂等。
  */
+/*
+ * partdist.shard_mvcc_gc_orphans() —— ★ P7-N40（2026-09-27）：清掉本节点的**孤儿登记**。
+ *
+ * 孤儿 = pg_shard_xid/<oid> 还在，但这个 OID 在 pg_class 里已经没有对应关系了。
+ * 它们的来路：DROP 时的清理判据此前只认共享内存登记集合，"有文件没进集合"的
+ * 那些（集合满了、或集合被摘过而文件还在）删表之后文件就留下来了；而这个目录
+ * 就是下次启动的登记表，于是登记只增不减，最后"打标登记表已满（上限 64 张）"。
+ *
+ * 清理走的是 DROP 提交时点同一条经过审计的路径（ShardClogGcDropped）：
+ * 删 pg_shard_clog/<oid> 目录、删水位文件、摘共享内存登记、还分配器槽位。
+ * 只删"pg_class 里查不到"的，OID 被复用成别的表时不动 —— 那种情况该由 DROP 清。
+ */
+PG_FUNCTION_INFO_V1(partdist_shard_mvcc_gc_orphans);
+Datum
+partdist_shard_mvcc_gc_orphans(PG_FUNCTION_ARGS)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	Oid			orphans[SHARD_XID_MAX_SLOTS * 4];
+	int			n = 0;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("shard_mvcc_gc_orphans 需要超级用户")));
+
+	dir = AllocateDir(SHARD_XID_DIR);
+	if (dir == NULL)
+		PG_RETURN_INT32(0);		/* 目录还没建：没什么可清 */
+	while ((de = ReadDir(dir, SHARD_XID_DIR)) != NULL)
+	{
+		unsigned int oid;
+		char		trail;
+		Oid			relid;
+
+		/* 与启动装载同款判据（ShardXidShmemInit）：只认纯 <oid> 文件名 */
+		if (sscanf(de->d_name, "%u%c", &oid, &trail) != 1 || oid == 0)
+			continue;
+		relid = (Oid) oid;
+		if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+			continue;			/* 表还在（可能是副本壳表）：不是孤儿 */
+		if (n < (int) lengthof(orphans))
+			orphans[n++] = relid;
+	}
+	FreeDir(dir);
+
+	/*
+	 * 再扫 pg_shard_clog/：判决目录可能比水位文件活得久（水位文件被删过、目录还在），
+	 * 同样只认纯 <oid> 名字 —— dtx_pending.jrnl 这类非数字名天然跳过。
+	 */
+	dir = AllocateDir(SHARD_CLOG_DIR);
+	while (dir != NULL && (de = ReadDir(dir, SHARD_CLOG_DIR)) != NULL)
+	{
+		unsigned int oid;
+		char		trail;
+		Oid			relid;
+		int			k;
+		bool		dup = false;
+
+		if (sscanf(de->d_name, "%u%c", &oid, &trail) != 1 || oid == 0)
+			continue;
+		relid = (Oid) oid;
+		if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+			continue;
+		for (k = 0; k < n; k++)
+			if (orphans[k] == relid)
+			{
+				dup = true;
+				break;
+			}
+		if (!dup && n < (int) lengthof(orphans))
+			orphans[n++] = relid;
+	}
+	if (dir != NULL)
+		FreeDir(dir);
+
+	/* 按 ShardClogGcDropped 的单批上限分批 —— 它一次只收 16 个 */
+	{
+		int			done = 0;
+
+		while (done < n)
+		{
+			int		batch = Min(n - done, SHARD_CLOG_PENDING_DROPS_MAX);
+
+			ShardClogGcDropped(orphans + done, batch);
+			done += batch;
+		}
+	}
+	if (n > 0)
+		ereport(LOG,
+				(errmsg("pg_partdist: 清掉 %d 个孤儿打标登记（OID 已无对应表，P7-N40）", n)));
+	PG_RETURN_INT32(n);
+}
+
 PG_FUNCTION_INFO_V1(partdist_shard_mvcc_register);
 Datum
 partdist_shard_mvcc_register(PG_FUNCTION_ARGS)
@@ -2521,7 +2660,17 @@ partdist_shard_mvcc_register(PG_FUNCTION_ARGS)
 						   "登记会让这些数据\"消失\"。"),
 				 errhint("在建表（含索引，打标后禁 CREATE INDEX）之后、写入数据之前登记。")));
 
-	/* ④ 登记 */
+	/*
+	 * ④ 登记。★ P7-N40：**先查容量**再建文件 —— 反过来的话，集合满时文件已经
+	 * 建出来、SetAdd 再抛错，这个文件就成了永久残留（下次启动还被当登记表）。
+	 */
+	if (!ShardMvccSetHasRoom(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("打标登记表已满（上限 %d 张）", SHARD_XID_MAX_SLOTS),
+				 errdetail("本节点 pg_shard_xid/ 目录就是启动时的登记表，它已经占满。"),
+				 errhint("表已经删了、登记还留着？跑 SELECT partdist.shard_mvcc_gc_orphans(); "
+						 "它会清掉 OID 已经没有对应表的那些残留登记。")));
 	ShardMvccEnsureWatermarkFile(relid);
 	ShardMvccSetAdd(relid);
 	ShardClogEnsureEvidence(relid);

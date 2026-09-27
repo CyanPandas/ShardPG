@@ -1035,6 +1035,7 @@ CREATE FUNCTION demo.setup(p_tbl regclass, p_rf int DEFAULT NULL)
 RETURNS TABLE(分片 text, 数据在 text, leader text, 副本 text, 选举轮次 int, 事务系统 text)
 LANGUAGE plpgsql AS $$
 DECLARE v_sid bigint; w text; t0 timestamptz := clock_timestamp(); sids bigint[]; mem text; r record; n int;
+        i int; bad int := 0; detail text := '';
 BEGIN
     FOR w IN SELECT demo.workers() LOOP
         PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
@@ -1070,7 +1071,27 @@ BEGIN
     -- 第一次基线发射会报 "record 1 未达多数派"；补供时壳表已经在了，就过得去。
     PERFORM count(*) FROM demo.raft_replicas(p_tbl);
     RAISE NOTICE '③ 打标：接入分片级 xid + 分片级 clog + TSO 时间戳（必须在写入之前做，分片得是空的）';
-    PERFORM partdist.set_table_shard_mvcc(p_tbl);
+    -- 这一步**必须把失败当失败**：原先直接 PERFORM，status 列被丢掉，
+    -- 某个分片没登记上也只在结果表里显示"未接入"，演示就带着一半没接入的表往下走了。
+    FOR i IN 1..2 LOOP
+        bad := 0; detail := '';
+        FOR r IN SELECT * FROM partdist.set_table_shard_mvcc(p_tbl) LOOP
+            IF r.status !~ '^(registered|already)' THEN
+                bad := bad + 1;
+                detail := detail || format('    分片 %s（:%s）：%s', r.shardid, r.node_port, r.status) || E'\n';
+            END IF;
+        END LOOP;
+        EXIT WHEN bad = 0;
+        IF i = 1 THEN
+            RAISE NOTICE '   有 % 个分片没登记上，重试一次（登记是幂等的）', bad;
+            PERFORM pg_sleep(1);
+        END IF;
+    END LOOP;
+    IF bad > 0 THEN
+        RAISE EXCEPTION E'打标失败 % 个分片，演示不能继续：\n%', bad, detail
+            USING HINT = '若是「打标登记表已满（上限 64 张）」：那台 worker 上有已删表留下的残留登记，'
+                         '跑 SELECT partdist.shard_mvcc_gc_orphans(); 清掉之后重跑本步。';
+    END IF;
     RAISE NOTICE '   全部就位，用时 % s', round(extract(epoch from clock_timestamp() - t0))::text;
     FOREACH v_sid IN ARRAY sids LOOP
         分片 := demo.slabel(p_tbl, v_sid);

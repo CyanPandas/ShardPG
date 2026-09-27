@@ -351,6 +351,16 @@ DEV PLAN 里"用户索引仍被禁、只有 TOAST 可达"的理由与现行"先�
   新版本自动做这件事，日志为 `控制面有上一任期(N)的尾巴未提交（idx X > commit Y，本任期 M），补提一条本任期空条目（P7-N39）`
   → `控制面本任期空条目已提交（idx=Z）`。两行之间正常在数秒内。
 
+- **P7-N40（已修，2026-09-27）打标登记只增不减 ⇒ 新表打不了标**：症状是
+  `set_table_shard_mvcc` 某些 placement 返回 `FAILED: ERROR: 打标登记表已满（上限 64 张）`，
+  表于是一半接入、一半没接入事务系统（**未接入的分片切主后数据不可信**，见 §5b / P7-N9）。
+  核对：`ls $PGDATA/pg_shard_xid | wc -l`（这个目录就是启动时的登记表，上限 64），
+  再抽查其中的 OID `SELECT relname FROM pg_class WHERE oid = <oid>` —— 查不到就是孤儿。
+  处置（新版本）：在那台 worker 上 `SELECT partdist.shard_mvcc_gc_orphans();`，返回清掉几个；
+  它扫 `pg_shard_xid/` 与 `pg_shard_clog/`，只删 OID 在 `pg_class` 里查不到的，走 DROP 同一条回收路径。
+  清完重跑 `set_table_shard_mvcc('<表>')`（幂等）即可。旧版本只能"移走水位文件 + 重启节点"。
+  ⚠️ 反复建删打标表的环境（演示、夹具）要留意这一项：修前每轮都会漏下登记，修后 DROP 会自己清。
+
 ## 8. 扩展升级（换 .so）的固定顺序
 
 1. `scripts/sync_build.sh`（带守卫：内容比对同步、头文件变了全量重编、导出符号核对）。

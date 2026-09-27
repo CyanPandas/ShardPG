@@ -164,6 +164,9 @@ extern void ShardClogAtAbort(void);		/* 丢弃挂起的删除 */
 extern int	ShardClogPendingDropList(const Oid **oids);
 /* T7.31：对一批已确定提交删除的打标表执行文件/集合/槽位回收（COMMIT PREPARED 回调用）。
  * 不 ERROR，删不掉只 WARNING —— 提交已成事实。 */
+/* 单批回收上限（也是单事务能 DROP 的打标表张数上限）；超了要分批调用 */
+#define SHARD_CLOG_PENDING_DROPS_MAX 16
+
 extern void ShardClogGcDropped(const Oid *oids, int n);
 
 #endif							/* SHARD_CLOG_H */

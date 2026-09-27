@@ -1426,6 +1426,15 @@ LANGUAGE C STRICT;
 
 -- T7.30（P7-V4）：按全局分片号在**本节点**登记打标（placement 上调用；副本壳表、非空表拒绝）。
 -- 分布表请用协调者上的 set_table_shard_mvcc(regclass)，它逐 placement 下发本函数。
+-- ★ P7-N40：清掉本节点的孤儿打标登记（pg_shard_xid/<oid> 还在、OID 已无对应表）。
+-- 返回清掉几个。孤儿的来路见 shard_xid.c 里的注释；DROP 判据已修，这个函数是给存量用的。
+CREATE OR REPLACE FUNCTION shard_mvcc_gc_orphans()
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_gc_orphans';
+
+COMMENT ON FUNCTION shard_mvcc_gc_orphans() IS
+    'P7-N40：清掉本节点 pg_shard_xid/ 里 OID 已无对应表的孤儿登记（连同 pg_shard_clog 目录、共享内存登记、分配器槽位）。';
+
 CREATE OR REPLACE FUNCTION shard_mvcc_register(p_shardid bigint)
 RETURNS text
 AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_register'

@@ -81,6 +81,9 @@ extern XLogRecPtr ShardLogicalFenceLsn(void);
 /* T7.7（R-P6-4）：DROP 提交时归还分配器槽位与影子。与 ShardMvccSetRemove 同源。 */
 extern void ShardXidSlotRelease(Oid relid);
 extern void ShardMvccEnsureWatermarkFile(Oid relid);
+/* ★ P7-N40：水位文件（= 启动登记表）是否存在 / 登记集合还有没有位置 */
+extern bool ShardMvccWatermarkFileExists(Oid relid);
+extern bool ShardMvccSetHasRoom(Oid relid);
 /* T7.30：本节点是否把这张表当打标表（GUC 白名单 ∪ 登记集合，与写/读路径同一谓词） */
 extern bool ShardRelIsMvcc(Oid relid);
 

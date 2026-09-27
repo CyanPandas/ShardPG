@@ -500,8 +500,6 @@ ShardClogXactRedo(int nxids, const uint32 *pairs, uint64 commit_ts,
 
 /* ================= DROP TABLE 提交时点 GC ================= */
 
-#define SHARD_CLOG_PENDING_DROPS_MAX 16
-
 static Oid	pending_drops[SHARD_CLOG_PENDING_DROPS_MAX];
 static int	pending_drops_n = 0;
 
@@ -561,7 +559,20 @@ ShardClogGcDropped(const Oid *oids, int n)
 	Oid			dropped[SHARD_CLOG_PENDING_DROPS_MAX];
 
 	/* 调用方可能传的就是 pending_drops 本身，先拷一份 */
-	n = Min(n, SHARD_CLOG_PENDING_DROPS_MAX);
+	if (n > SHARD_CLOG_PENDING_DROPS_MAX)
+	{
+		/*
+		 * ★ P7-N40（2026-09-27）：原来这里是 `n = Min(n, MAX)` —— 多出来的**静默
+		 * 丢弃**。从 DROP 路径进来不会超（ShardClogRememberDrop 会拦在 16 张），
+		 * 但别的调用方（shard_mvcc_gc_orphans 一次清几十个孤儿）一超就只清了前
+		 * 16 个、而调用方以为全清了。宁可出声：调用方自己分批。
+		 */
+		ereport(WARNING,
+				(errmsg("pg_partdist: 本次只回收 %d 个分片（收到 %d 个，单批上限 %d）",
+						SHARD_CLOG_PENDING_DROPS_MAX, n, SHARD_CLOG_PENDING_DROPS_MAX),
+				 errhint("调用方应按 %d 一批分次调用。", SHARD_CLOG_PENDING_DROPS_MAX)));
+		n = SHARD_CLOG_PENDING_DROPS_MAX;
+	}
 	memcpy(dropped, oids, (size_t) n * sizeof(Oid));
 
 	for (i = 0; i < n; i++)
