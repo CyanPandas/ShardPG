@@ -124,22 +124,53 @@ cmd_stop() {
     say "恢复演示前的环境"
     ensure_up
     local W; W=$(workers)
-    if [[ "$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")" == 0 ]]; then
-        say "  demo 模式不在（没 start 过，或已经 stop 过）"; return 0
-    fi
-    local p g t s sids="" tables
+    local p g t s sids="" tables have_demo killed=0 n
+    have_demo=$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")
+    [[ "$have_demo" == 1 ]] || say "  （demo 函数库不在：按缺省清单清理，参数做 RESET 兜底）"
+
+    # 回滚残留的 prepared 事务
     for p in 5432 $W; do
         for g in $(q $p "SELECT string_agg(gid, ' ') FROM pg_prepared_xacts"); do q $p "ROLLBACK PREPARED '$g'" >/dev/null; done
     done
-    tables=$(q 5432 "SELECT string_agg(DISTINCT t, ' ') FROM (SELECT tbl t FROM demo.managed UNION SELECT unnest(string_to_array('$DEMO_TABLES', ' '))) x
-                     WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = x.t AND relnamespace = 'public'::regnamespace)")
+
+    # 要清的表：函数库在就用它记的，不在就用缺省清单（DEMO_TABLES）
+    if [[ "$have_demo" == 1 ]]; then
+        tables=$(q 5432 "SELECT string_agg(DISTINCT t, ' ') FROM (SELECT tbl t FROM demo.managed UNION SELECT unnest(string_to_array('$DEMO_TABLES', ' '))) x
+                         WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = x.t AND relnamespace = 'public'::regnamespace)")
+    else
+        tables=$(q 5432 "SELECT string_agg(x, ' ') FROM unnest(string_to_array('$DEMO_TABLES', ' ')) x
+                         WHERE EXISTS (SELECT 1 FROM pg_class WHERE relname = x AND relnamespace = 'public'::regnamespace)")
+    fi
+
+    # ★ 先清挡路的会话：演示窗口里留着没结束的事务（BEGIN 之后没 COMMIT/ROLLBACK）会一直
+    #   持着演示表的锁，DROP TABLE 就卡在那儿超时 —— 实测一个 idle in transaction 的窗口
+    #   把 stop 的 DROP 拖到 120 s 超时，表留了下来、而后面的步骤照常跑完，于是 stop 报"完成"、
+    #   下次 start 却说"表 account 已存在"。
+    for t in $tables; do
+        n=$(q 5432 "SELECT count(pg_terminate_backend(l.pid)) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                     WHERE c.relname = '$t' AND l.pid <> pg_backend_pid()")
+        killed=$((killed + ${n:-0}))
+    done
+    for p in 5432 $W; do
+        n=$(q $p "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+                   WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'
+                     AND state = 'idle in transaction' AND now() - state_change > interval '30 seconds'")
+        killed=$((killed + ${n:-0}))
+    done
+    [[ ${killed:-0} -gt 0 ]] && say "  清掉 $killed 个挡路的会话（演示窗口里没结束的事务会锁住演示表）"
+
     for t in $tables; do
         s=$(q 5432 "SELECT string_agg(shardid::text, ' ') FROM pg_dist_shard WHERE logicalrelid = '$t'::regclass")
         sids="$sids $s"
         for p in $W; do for g in $s; do q $p "SELECT partdist.replay_disable('${t}_${g}'::regclass)" >/dev/null; done; done
         q 5432 "SET statement_timeout = '120s'; DROP TABLE IF EXISTS $t" >/dev/null
-        say "  删表 $t（分片 $s）"
+        if [[ "$(q 5432 "SELECT count(*) FROM pg_class WHERE relname='$t' AND relnamespace='public'::regnamespace")" == 0 ]]; then
+            say "  删表 $t（分片 $s）"
+        else
+            say "  ⚠ 表 $t 没删掉（120 s 超时）—— 见结尾提示"
+        fi
     done
+
     for s in 1 2; do     # 拆组 → 删副本残壳，两轮
         for p in $W; do q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null; done
         sleep 2
@@ -147,21 +178,59 @@ cmd_stop() {
             q $p "SET statement_timeout='30s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS ${t}_${g}" >/dev/null
         done; done; done
     done
-    sids="$sids $(q 5432 "SELECT string_agg(x::text, ' ') FROM demo.managed, unnest(shardids) x")"
+    # 兜底：按名字扫一遍各 worker 上剩下的分片/副本壳表（分片号对不上时也能清掉）
+    for t in $tables; do for p in $W; do
+        for g in $(q $p "SELECT string_agg(relname, ' ') FROM pg_class WHERE relname LIKE '${t}\_%' AND relkind='r'"); do
+            q $p "SELECT partdist.replay_disable('$g'::regclass)" >/dev/null
+            q $p "SET statement_timeout='30s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS $g" >/dev/null
+        done
+    done; done
+
+    [[ "$have_demo" == 1 ]] && sids="$sids $(q 5432 "SELECT string_agg(x::text, ' ') FROM demo.managed, unnest(shardids) x")"
     local ids; ids=$(tr -s ' ' '\n' <<<"$sids" | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
     if [[ -n "$ids" ]]; then
         for p in 5432 $W; do q $p "DELETE FROM partdist.partition_map WHERE partition_id IN ($ids)" >/dev/null; done
         say "  删控制面登记（partition_map）里演示分片的行：$ids"
     fi
-    say "  $(q 5432 "SELECT demo._restore_gucs()")（TSO、选举超时）"
-    q 5432 "SET citus.enable_ddl_propagation = off; DROP SCHEMA demo CASCADE" >/dev/null
+
+    if [[ "$have_demo" == 1 ]]; then
+        say "  $(q 5432 "SELECT demo._restore_gucs()")（TSO、选举超时）"
+        q 5432 "SET citus.enable_ddl_propagation = off; DROP SCHEMA demo CASCADE" >/dev/null
+    else
+        # 没有 saved_guc 可依：把演示会改的那几个 GUC 一律 RESET（演示前的常态就是"没有这几行"）
+        for p in 5432 $W; do
+            for g in pg_partdist.tso_master pg_partdist.tso_conninfo pg_partdist.tso_lease_ms pg_raft.election_timeout_ms; do
+                q $p "ALTER SYSTEM RESET $g" >/dev/null
+            done
+            q $p "SELECT pg_reload_conf()" >/dev/null
+        done
+        say "  参数已 RESET（TSO、选举超时）"
+    fi
     for p in $W; do q $p "SET citus.enable_ddl_propagation=off; DROP SCHEMA IF EXISTS demo CASCADE" >/dev/null; done
     say "  demo 函数库已删除（master 与各 worker）"
-    local ng=0 left
-    for p in $W; do ng=$((ng + $(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0"))); done
+
+    # P7-N40：把本轮演示留下的打标登记收干净（DROP 现在会自己清，这里是净场兜底）
+    local orph=0
+    for p in $W; do orph=$((orph + $(q $p "SELECT partdist.shard_mvcc_gc_orphans()"))); done
+    [[ $orph -gt 0 ]] && say "  清掉 $orph 个残留打标登记（pg_shard_xid）"
+
+    local ng=0 left shells=0
+    for p in $W; do
+        ng=$((ng + $(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0")))
+        for t in $tables; do shells=$((shells + $(q $p "SELECT count(*) FROM pg_class WHERE relname LIKE '${t}\_%' AND relkind='r'"))); done
+    done
     left=$(q 5432 "SELECT count(*) FROM pg_class WHERE relname IN ('$(sed "s/ /','/g" <<<"$DEMO_TABLES")') AND relnamespace='public'::regnamespace")
-    say "完成：残留数据 Raft 组 $ng 个，残留演示表 $left 张"
+    if [[ "$ng" == 0 && "$left" == 0 && "$shells" == 0 ]]; then
+        say "完成：已净场（0 个数据 Raft 组、0 张演示表、0 张分片壳表）"
+    else
+        say "⚠ 没清干净：数据 Raft 组 $ng 个、演示表 $left 张、分片壳表 $shells 张"
+        say "  多半是还有会话占着锁。看谁占着："
+        say "    SELECT pid, state, now()-state_change AS 闲了多久, query FROM pg_stat_activity WHERE state <> 'idle';"
+        say "  处理完再跑一次 bash $0 stop（幂等）。"
+        return 1
+    fi
 }
+
 
 case "${1:-}" in
     start) cmd_start ;;
