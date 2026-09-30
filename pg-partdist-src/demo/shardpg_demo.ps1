@@ -11,9 +11,10 @@
   也可以不用本文件，直接：ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh sql A"
 #>
 param(
-    [Parameter(Position = 0)][ValidateSet('start', 'sql', 'stop')][string]$Cmd = 'sql',
+    [Parameter(Position = 0)][ValidateSet('start', 'sql', 'stop', 'auto')][string]$Cmd = 'sql',
     [Parameter(Position = 1)][ValidateSet('A', 'B')][string]$Who = 'A',
-    [string]$Server = 'zhanhao@34.31.210.7'
+    [string]$Server = 'zhanhao@34.31.210.7',
+    [string]$AutoArgs = ''
 )
 
 # 中文输出不乱码：控制台与管道都用 UTF-8
@@ -23,6 +24,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $remote = '~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh'
 if ($Cmd -eq 'sql') {
     ssh -t $Server "bash $remote sql $Who"
+} elseif ($Cmd -eq 'auto') {
+    ssh -t $Server "bash $remote auto $AutoArgs"
 } else {
     ssh -t $Server "bash $remote $Cmd"
 }

@@ -982,9 +982,12 @@ CREATE FUNCTION demo.help() RETURNS TABLE(函数 text, 作用 text) LANGUAGE sql
     ('demo.clog(''表'', ''S1'')',             '分片级 clog：每个分片 xid 的判决、start_ts、commit_ts、写了哪些行'),
     ('demo.versions(''表'', ''S1'')',         '页面上的多版本：每个元组版本的 xmin/xmax 与判决'),
     ('demo.replay(''表'')',                   '惰性回放：从已收到 vs 已回放'),
+    ('demo.replicas(''表'')',                 '各分区的副本信息：主、副本、已收到/已回放/待回放'),
+    ('demo.distribution(''表'')',             '各分片的数据量（行数、余额、占比），直接读各 worker 上的分片表'),
+    ('demo.setup(''表'')',                    '一条命令：建组 → 自发选主 → 供副本 → 打标（start 已替你做好）'),
     ('demo.catchup(''表'')',                  '触发回放，让每个从追平'),
     ('demo.compare(''表'')',                  '副本与主逐字节比对'),
-    ('demo.switch_leader(''表'', ''S1'', ''w2'')', '手动切换 leader（实时打出切主过程）'),
+    ('demo.switch_leader(''表'', ''S1'')',    '手动切换 leader（同组内挑一台；实时打出切主过程）'),
     ('demo.crash(''表'')',            '模拟宕机（immediate stop），看 Raft 自动选主'),
     ('demo.recover(''表'')',          '拉起宕机节点，看它归队、被自动重新供给')
 $$;
@@ -1061,6 +1064,12 @@ BEGIN
         EXIT WHEN (SELECT bool_and(demo.reg(x) IS NOT NULL AND demo.reg(x) = demo.leader(x)) FROM unnest(sids) x);
         PERFORM pg_sleep(0.5);
     END LOOP;
+    IF NOT (SELECT bool_and(demo.reg(x) IS NOT NULL AND demo.reg(x) = demo.leader(x)) FROM unnest(sids) x) THEN
+        RAISE EXCEPTION '等了 300 s 仍有分片没选出主并登记：%',
+            (SELECT string_agg(demo.slabel(p_tbl, x) || '→leader=' || coalesce(demo.leader(x), '无')
+                               || '/登记=' || coalesce(demo.reg(x), '无'), '，' ORDER BY x) FROM unnest(sids) x)
+            USING HINT = '看各节点 pg.log 里的“当选 LEADER”和“升主前置”；清场后重试：bash shardpg_demo.sh stop';
+    END IF;
     RAISE NOTICE '   选主完成（% s）：%', round(extract(epoch from clock_timestamp() - t0))::text,
         (SELECT string_agg(demo.slabel(p_tbl, x) || '→' || coalesce(demo.leader(x), '?')
                            || '（任期 ' || coalesce(split_part(demo.gstate(demo.leader(x), x), '|', 2), '?') || '）', '，' ORDER BY x)
@@ -1180,3 +1189,10 @@ BEGIN
     DELETE FROM demo.crashed WHERE node = n;
     RETURN QUERY SELECT * FROM demo.recover_node(p_tbl, n);
 END $$;
+
+-- 各分区的副本信息：每个分片的主、有哪些副本、每个副本收到了多少日志、回放到哪（惰性回放：收下但先不 redo）
+CREATE FUNCTION demo.replicas(p_tbl regclass)
+RETURNS TABLE(分片 text, 主 text, 副本 text, 已收到 bigint, 已回放 bigint, 待回放 bigint, 状态 text)
+LANGUAGE sql AS $$
+    SELECT 分片, 主, 从, 从已收到, 从已回放, 待回放, 回放槽 FROM demo.replay(p_tbl)
+$$;

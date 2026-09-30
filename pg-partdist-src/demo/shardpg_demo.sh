@@ -2,10 +2,11 @@
 # ============================================================================
 # shardpg_demo.sh —— ShardPG 演示启动器（只用于演示，不改动项目任何文件）
 #
-#   bash shardpg_demo.sh start      准备演示环境：装 demo 函数库、记下将被改动的参数、打开 TSO
+#   bash shardpg_demo.sh start      准备演示环境：装函数库、开 TSO，并提前建好 account 表、建组选主供副本打标（演示从灌数据开始）
 #   bash shardpg_demo.sh sql A      打开会话 A（连 master 的交互式 psql，提示符 A>）
 #   bash shardpg_demo.sh sql B      打开会话 B（第二个窗口，演示并发事务）
 #   bash shardpg_demo.sh stop       演示结束：删表、拆组、删登记、参数还原、删 demo 函数库，恢复原环境
+#   bash shardpg_demo.sh auto       全自动演示：自己一条条敲 SQL（打出来给你看）并展示结果；选项见 shardpg_demo_auto.py -h
 #
 # 从 Windows 11 PowerShell：
 #   ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh sql A"
@@ -100,7 +101,7 @@ cmd_start() {
         q $p "ALTER SYSTEM SET pg_partdist.tso_lease_ms = $TSO_LEASE_MS" >/dev/null
         q $p "SELECT pg_reload_conf()" >/dev/null
     done
-    step "④ 把 3 台 worker 的 Raft 选举超时设为 ${ELECTION_MS} ms（产品默认 6000；2 vCPU 上放宽避免误选主。stop 时还原）"
+    step "④ 把各 worker 的 Raft 选举超时设为 ${ELECTION_MS} ms（产品默认 6000；2 vCPU 上放宽避免误选主。stop 时还原）"
     for p in $W; do q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = $ELECTION_MS" >/dev/null; q $p "SELECT pg_reload_conf()" >/dev/null; done
     sleep 2
     for p in $W; do q $p "SELECT partdist.partdist_tso_client_start_ts()" >/dev/null; done
@@ -111,6 +112,22 @@ cmd_start() {
     # 业务数据文件送进容器，演示里用 \i /tmp/demo_data.sql 读它
     [[ -f "$HERE/demo_data.sql" ]] && docker cp "$HERE/demo_data.sql" "$C":/tmp/demo_data.sql >/dev/null 2>&1
     docker exec -u postgres "$C" chmod 644 /tmp/demo_data.sql 2>/dev/null
+
+    # ⑤ 提前把 account 表建好并接入系统 —— 演示从“灌数据”开始，建表/建组/选主/供副本/打标都不在台前。
+    #    分片数 = worker 数（一台一片）。自发选主要等一会儿（几十秒到几分钟，取决于谁先到点），先说一声免得像卡住。
+    say "正在准备：建表 → 建组 → 自发选主 → 供副本 → 打标（约 2–5 分钟）…"
+    out=$(psqlc 5432 -q -v ON_ERROR_STOP=1 2>&1 <<SQL
+SET citus.shard_count = $NW;
+CREATE TABLE account (id int PRIMARY KEY, owner text NOT NULL, balance int NOT NULL DEFAULT 0)
+    WITH (autovacuum_enabled = off);
+SELECT create_distributed_table('account', 'id', colocate_with => 'none');
+SQL
+    ) || die "建 account 表失败" "$(tail -5 <<<"$out")"
+    out=$(psqlc 5432 -q -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FILTER (WHERE 事务系统 = '已接入') || '/' || count(*) FROM demo.setup('account')" 2>&1) \
+        || die "建组接入失败（建组 / 选主 / 供副本 / 打标其中一步没过）" "$(grep -E 'ERROR|DETAIL|HINT|WARNING' <<<"$out" | tail -8)"
+    [[ "$(tail -1 <<<"$out")" =~ ^([0-9]+)/([0-9]+)$ && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] \
+        || die "有分片没接入事务系统（已接入/总数 = $(tail -1 <<<"$out")）" "先 stop 清场再试；详情：bash $0 start 加 VERBOSE=1"
+    [[ "${VERBOSE:-0}" == 1 ]] && grep -E '^NOTICE' <<<"$out" | sed 's/^NOTICE:  //'
     say "准备好了"
 }
 
@@ -232,8 +249,14 @@ cmd_stop() {
 }
 
 
+cmd_auto() {     # 全自动演示：自己敲 SQL、自己看结果（SQL 逐字打出来，带提示符）
+    command -v python3 >/dev/null || { echo "需要 python3" >&2; exit 1; }
+    exec python3 "$HERE/shardpg_demo_auto.py" "$@"
+}
+
 case "${1:-}" in
     start) cmd_start ;;
+    auto)  shift; cmd_auto "$@" ;;
     sql)   shift; cmd_sql "$@" ;;
     stop)  cmd_stop ;;
     *)     sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//' ;;
