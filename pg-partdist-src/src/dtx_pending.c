@@ -378,7 +378,24 @@ DtxPendingCount(void)
  * 绝不 ERROR —— 这条路径服务读者与清扫，抛错会把只读语句炸掉。
  */
 static int
+dtx_inquire_core_ex(int64 coord_gsid, int64 dtxid, int64 *cts_out, bool *answered);
+
+static int
 dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
+{
+	bool		answered;
+
+	return dtx_inquire_core_ex(coord_gsid, dtxid, cts_out, &answered);
+}
+
+/*
+ * ★ P7-N52（之三，2026-10-04）：answered = 有没有哪个候选给出了**权威**答复。
+ * dtx_peek 在协调组 leader 上（排空 apply 之后）查无决议时现在返回一行 verdict=0
+ * —— 那是"确实还没决议"；所有候选都只给 0 行（连不上 / 非 leader 且转问也问不到）
+ * 则是"不知道"。返回值仍是 0/1/2（清扫等旧调用方语义不变）。
+ */
+static int
+dtx_inquire_core_ex(int64 coord_gsid, int64 dtxid, int64 *cts_out, bool *answered)
 {
 	char		sql[1024];
 #define DTX_INQ_MAX_CAND 8
@@ -390,6 +407,7 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 	bool		spi_ok = false;
 
 	*cts_out = 0;
+	*answered = false;
 
 	if (dtxid == 0)
 		return 0;
@@ -493,6 +511,7 @@ dtx_inquire_core(int64 coord_gsid, int64 dtxid, int64 *cts_out)
 		{
 			verdict = atoi(PQgetvalue(res, 0, 0));
 			*cts_out = strtoll(PQgetvalue(res, 0, 1), NULL, 10);
+			*answered = true;
 		}
 		PQclear(res);
 		PQfinish(conn);
@@ -853,6 +872,7 @@ typedef struct DtxReaderMemo
 	int			verdict;		/* 1/2 = 已学到（不可变）；0 = 仅失败标记 */
 	int64		cts;
 	uint64		fail_epoch;		/* 本事务纪元内问过且未果 → 不再重试 */
+	bool		noanswer;		/* 未果的原因是"没问到答案"（连接/超时/报错），不是"协调组答：未决" */
 } DtxReaderMemo;
 
 static HTAB *reader_memo = NULL;
@@ -889,6 +909,37 @@ reader_memo_get(int64 gxid, bool create)
 										 create ? HASH_ENTER : HASH_FIND, NULL);
 }
 
+/*
+ * 读者自连（本节点、短超时）。可见性挂钩里不能起 SPI，只能另开一个干净 backend。
+ */
+static PGconn *
+dtx_reader_selfconn(void)
+{
+	static PGconn *selfconn = NULL;
+
+	if (selfconn == NULL || PQstatus(selfconn) != CONNECTION_OK)
+	{
+		char		conninfo[256];
+
+		if (selfconn != NULL)
+		{
+			PQfinish(selfconn);
+			selfconn = NULL;
+		}
+		snprintf(conninfo, sizeof(conninfo),
+				 "host=/tmp port=%d dbname=postgres user=postgres "
+				 "connect_timeout=2 options='-c statement_timeout=5000'",
+				 PostPortNumber);
+		selfconn = PQconnectdb(conninfo);
+		if (PQstatus(selfconn) != CONNECTION_OK)
+		{
+			PQfinish(selfconn);
+			selfconn = NULL;
+		}
+	}
+	return selfconn;
+}
+
 int
 DtxReaderResolve(int64 gxid, int64 *cts_out)
 {
@@ -897,6 +948,7 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 	char		sql[192];
 	int			verdict = 0;
 	int64		cts = 0;
+	bool		noanswer = false;
 
 	*cts_out = 0;
 	if (gxid == 0)
@@ -909,10 +961,15 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 		return memo->verdict;
 	}
 	if (memo != NULL && memo->fail_epoch == xact_epoch)
-		return 0;				/* 本事务已问过未果——不重试（限流） */
+		return memo->noanswer ? 4 : 0;	/* 本事务已问过未果——不重试（限流） */
 
+	/*
+	 * ②：登记缺失。在执行 PREPARE 的节点上这意味着"决议必然未做"；但切主后的
+	 * **新主**上从来就没有这份登记（P7-N52），同样缺失却可能早已提交。
+	 * 返回 3 交调用方区分：快照读据此走就地 in-doubt 闭合，不再一律当未提交。
+	 */
 	if (!DtxPendingLookup(gxid, &ent))
-		return 0;				/* ②：登记缺失 ⇒ 决议必然未做 ⇒ 跳过 */
+		return 3;
 
 	/*
 	 * 经自连问询（partdist.dtx_inquire 在干净 backend 里做 SPI 寻址 +
@@ -920,38 +977,20 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 	 * 失败按未果处置并 memo 本事务不再重试。
 	 */
 	{
-		static PGconn *selfconn = NULL;
+		PGconn	   *conn = dtx_reader_selfconn();
 		PGresult   *res;
 
-		if (selfconn == NULL || PQstatus(selfconn) != CONNECTION_OK)
-		{
-			char		conninfo[256];
-
-			if (selfconn != NULL)
-			{
-				PQfinish(selfconn);
-				selfconn = NULL;
-			}
-			snprintf(conninfo, sizeof(conninfo),
-					 "host=/tmp port=%d dbname=postgres user=postgres "
-					 "connect_timeout=2 options='-c statement_timeout=2000'",
-					 PostPortNumber);
-			selfconn = PQconnectdb(conninfo);
-			if (PQstatus(selfconn) != CONNECTION_OK)
-			{
-				PQfinish(selfconn);
-				selfconn = NULL;
-			}
-		}
-		if (selfconn != NULL)
+		noanswer = true;
+		if (conn != NULL)
 		{
 			snprintf(sql, sizeof(sql),
 					 "SELECT verdict, commit_ts FROM partdist.dtx_inquire(%lld, %lld)",
 					 (long long) ent.coord_gsid, (long long) ent.dtxid);
-			res = PQexec(selfconn, sql);
+			res = PQexec(conn, sql);
 			if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
 			{
-				verdict = atoi(PQgetvalue(res, 0, 0));
+				noanswer = PQgetisnull(res, 0, 0);
+				verdict = noanswer ? 0 : atoi(PQgetvalue(res, 0, 0));
 				cts = strtoll(PQgetvalue(res, 0, 1), NULL, 10);
 			}
 			PQclear(res);
@@ -970,7 +1009,81 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 	}
 	memo->verdict = 0;
 	memo->fail_epoch = xact_epoch;
-	return 0;
+	memo->noanswer = noanswer;
+	/*
+	 * ★ P7-N52/N60：4 = 没问到答案（自连失败 / 语句超时 / 报错）。与 0（协调组答"未决"）
+	 * 分开：客户端已确认提交的事务，在协调组那里一定已有判决 —— 问不到只是这一次没问到，
+	 * 快照读据此报可重试错误，不能当未提交（实测：灌数提交返回后紧接着的读，问询
+	 * dtx_inquire 超时，256 行读成 255 行）。
+	 */
+	return noanswer ? 4 : 0;
+}
+
+/*
+ * ★ P7-N52：DtxReaderCloseOrphan — 快照读撞上"判决定不下来的 PREPARED"时的就地补救。
+ *
+ * 未决登记只在执行 PREPARE 的那台节点上；切主后新主上的 PREPARED 槽位没有登记，
+ * DtxReaderResolve 无从问起。这里经自连对该分片跑一次 partdist.dtx_close_indoubt
+ * （升主序列用的同一段代码：从流里映射 dtxid → 分片 xid、全网求决议、落分片 clog），
+ * 调用方随后重读槽位。每个分片每个事务纪元最多跑一次（限流：同一次读不反复闭合）。
+ * 返回 true = 闭合调用本身成功（不代表一定定下来了）。
+ */
+typedef struct DtxCloseMemo
+{
+	Oid			shard;
+	uint64		epoch;
+} DtxCloseMemo;
+
+static HTAB *close_memo = NULL;
+
+bool
+DtxReaderCloseOrphan(Oid shard)
+{
+	DtxCloseMemo *m;
+	bool		found;
+	PGconn	   *conn;
+	PGresult   *res;
+	char		sql[128];
+	bool		ok = false;
+
+	if (close_memo == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DtxCloseMemo);
+		ctl.hcxt = TopMemoryContext;
+		close_memo = hash_create("pg_partdist dtx close memo", 16, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	(void) reader_memo_get(0, false);	/* 确保纪元回调已挂 */
+	m = (DtxCloseMemo *) hash_search(close_memo, &shard, HASH_ENTER, &found);
+	if (found && m->epoch == xact_epoch)
+		return false;
+	m->epoch = xact_epoch;
+
+	conn = dtx_reader_selfconn();
+	if (conn == NULL)
+		return false;
+	snprintf(sql, sizeof(sql), "SELECT partdist.dtx_close_indoubt(%u::oid)",
+			 (unsigned) shard);
+	res = PQexec(conn, sql);
+	ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
+	PQclear(res);
+
+	/* 闭合可能刚学到判决：清掉本纪元的失败标记，让后续元组能再问一次 */
+	if (ok && reader_memo != NULL)
+	{
+		HASH_SEQ_STATUS hs;
+		DtxReaderMemo *rm;
+
+		hash_seq_init(&hs, reader_memo);
+		while ((rm = (DtxReaderMemo *) hash_seq_search(&hs)) != NULL)
+			if (rm->verdict == 0)
+				rm->fail_epoch = 0;
+	}
+	return ok;
 }
 
 /* ---- T4.5②：决议主动广播（推送通道；拉取仍是兜底真相源） ---- */
@@ -1171,10 +1284,15 @@ partdist_dtx_inquire(PG_FUNCTION_ARGS)
 	int64		coord_gsid = PG_GETARG_INT64(0);
 	int64		dtxid = PG_GETARG_INT64(1);
 	int64		cts = 0;
-	int			verdict = dtx_inquire_core(coord_gsid, dtxid, &cts);
+	bool		answered = false;
+	int			verdict = dtx_inquire_core_ex(coord_gsid, dtxid, &cts, &answered);
 	TupleDesc	tupdesc;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
+
+	/* P7-N52：没有任何权威答复 ⇒ verdict 为 NULL（读者据此报可重试错误，而不是当未提交） */
+	if (verdict == 0 && !answered)
+		nulls[0] = true;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "partdist_dtx_inquire: 需要复合返回类型");

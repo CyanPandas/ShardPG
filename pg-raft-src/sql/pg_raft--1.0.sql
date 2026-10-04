@@ -122,6 +122,11 @@ CREATE OR REPLACE FUNCTION pg_raft_report_data_leader(
 ) RETURNS bigint LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader';
 
+-- ★ P7-N58：批量登记。p_items = '[[组, 新主节点, 任期, [从副本...]], ...]'
+CREATE OR REPLACE FUNCTION pg_raft_report_data_leader_batch(p_items text)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader_batch';
+
 -- ------------------------------------------------------------------
 -- DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）
 -- ------------------------------------------------------------------
@@ -666,7 +671,18 @@ BEGIN
     --   继续等/追）而不是 -1：FPI 已提交则追平会把它连同 BASELINE_END 一起 apply、
     --   下一轮 pending 转假即放行；FPI 未提交则本就没有节点持有该数据，等待即正确。
     --   force 兜底也不许绕过——空壳主比暂时无主坏得多。
+    --
+    -- ★ P7-N63（2026-10-04）：过了追平截止期（p_force）仍未收尾 ⇒ 返回 -1 让位。
+    --   上面"FPI 未提交则本就没有节点持有该数据"不成立的情形：供副本**中途**本节点被断电，
+    --   基线流断了，而前任主手里有完整数据 —— 本节点等多久都等不来 FPI，却赢了选举、
+    --   占着 leader 不让（实测组 106976 占了 10 分钟，路由停在前任主上，读写全被拒）。
+    --   让位后由有完整数据的成员当选；截止期内仍返回 0 等待（保留 N16 的原意）。
     IF partdist.shard_baseline_pending(loid) THEN
+        IF p_force THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 全量物理基线过了追平截止期仍未收尾，'
+                          '本节点让位（P7-N63）', loid, p_group_id;
+            RETURN -1;
+        END IF;
         RAISE LOG 'pg_raft: 分片 % (组 %) 全量物理基线未收尾（FPI 未到齐），暂不升主',
                   loid, p_group_id;
         RETURN 0;

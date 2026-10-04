@@ -25,7 +25,7 @@ case "$PROFILE" in
          EXTRA_FUNCS="";                            PREP="约 2–5 分钟";   NAME="演示一（4 个分片）"
          LAUNCH="shardpg_demo.sh" ;;
     128) TBL=wallet;  NSHARD=128; DATA=demo128_data.sql; STEPS=shardpg_demo128_steps.sql
-         EXTRA_FUNCS=shardpg_demo128_functions.sql; PREP="约 30–40 分钟"; NAME="演示二（128 个分区组）"
+         EXTRA_FUNCS=shardpg_demo128_functions.sql; PREP="约 15–20 分钟"; NAME="演示二（128 个分区组）"
          LAUNCH="shardpg_demo128.sh" ;;
     *)   echo "DEMO_PROFILE 只能是 4 或 128" >&2; exit 2 ;;
 esac

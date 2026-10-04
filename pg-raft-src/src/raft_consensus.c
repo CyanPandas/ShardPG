@@ -325,6 +325,19 @@ typedef struct RaftGroupState
      * 漂到 23）。收到数据条目且本地已有分片时清掉。只在 tick 里读、在 RPC 后端里写，布尔量无需加锁。
      */
     bool                no_local_shard;
+    /*
+     * ★ P7-N46 根因（2026-10-04）：SQL 日志要从哪个 index 起按环重写（0 = 不需要）。
+     * 写 raft_log 行的事务（AppendEntries RPC / 提案会话）后来回滚时，行随之撤销，
+     * 环里的条目却还在 ⇒ SQL 日志出洞。回滚回调在这里记下最小受影响 index，
+     * 下一个有 SPI 的落盘点（persist_log_entry_sql）按环把那一段补写回去。
+     */
+    int64               repersist_from;
+    /*
+     * ★ P7-N62（2026-10-04）：本组最近一次以 leader 身份跑 tick 的时刻（0 = 本次启动以来没当过）。
+     * 供 partdist 的读闸门判"本机此刻（或刚刚）是不是该组 leader"：被断电后重新拉起的旧主
+     * 本地还带着持久的"已升主"标记，路由若仍指着它，它会拿断电前的旧数据回答读。
+     */
+    TimestampTz         leader_seen_at;
     RaftConsensusShmem  cons;
     RaftLogShmem        log;
 } RaftGroupState;
@@ -1821,6 +1834,8 @@ raft_log_table_ready(void)
                         true, 1) == SPI_OK_SELECT && SPI_processed > 0);
 }
 
+static void logtrack_note(int64 group_id, int64 index);   /* P7-N46，定义见下 */
+
 static void
 delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
 {
@@ -1839,6 +1854,7 @@ delete_log_entry_sql(RaftGroupCtx *ctx, int64 index)
         return;
     }
 
+    logtrack_note(ctx->group_id, index);    /* P7-N46：删行回滚会让旧行复活 */
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "DELETE FROM partdist.raft_log "
@@ -1875,6 +1891,7 @@ delete_log_entries_after_sql(RaftGroupCtx *ctx, int64 index)
         return;
     }
 
+    logtrack_note(ctx->group_id, index + 1);    /* P7-N46：删行回滚会让旧行复活 */
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "DELETE FROM partdist.raft_log "
@@ -2232,6 +2249,178 @@ raft_config_persist(RaftGroupCtx *ctx, const char *payload)
     return true;
 }
 
+/*
+ * ★ P7-N46 根因：本后端当前事务里动过哪些组的 raft_log 行（组 → 最小 index）。
+ * 事务 / 子事务回滚时交给共享内存的 repersist_from；提交时清空。
+ */
+#define RAFT_LOGTRACK_MAX 16
+static int64 logtrack_gid[RAFT_LOGTRACK_MAX];
+static int64 logtrack_min[RAFT_LOGTRACK_MAX];
+static int   logtrack_n = 0;
+static bool  logtrack_overflow = false;
+static bool  logtrack_cb_registered = false;
+
+static void
+logtrack_flush_to_shmem(void)
+{
+    int i;
+    int k;
+
+    if (RaftGroups == NULL)
+        return;
+    for (k = 0; k < RAFT_MAX_GROUPS; k++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[k];
+        int64           from = 0;
+
+        if (!g->in_use)
+            continue;
+        if (logtrack_overflow)
+            from = 1;           /* 记不下了：整组按环重写（只重写环里还在的那段） */
+        else
+            for (i = 0; i < logtrack_n; i++)
+                if (logtrack_gid[i] == g->group_id &&
+                    (from == 0 || logtrack_min[i] < from))
+                    from = logtrack_min[i];
+        if (from <= 0)
+            continue;
+        SpinLockAcquire(&g->log.mutex);
+        if (g->repersist_from == 0 || from < g->repersist_from)
+            g->repersist_from = from;
+        if (g->sql_marked_upto > from - 1)
+            g->sql_marked_upto = from - 1;  /* committed 标记也一起撤销了 */
+        SpinLockRelease(&g->log.mutex);
+    }
+}
+
+static void
+logtrack_xact_cb(XactEvent event, void *arg)
+{
+    if (logtrack_n == 0 && !logtrack_overflow)
+        return;
+    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+        logtrack_flush_to_shmem();
+    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT ||
+        event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+        event == XACT_EVENT_PREPARE)
+    {
+        logtrack_n = 0;
+        logtrack_overflow = false;
+    }
+}
+
+static void
+logtrack_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
+                    SubTransactionId parentSubid, void *arg)
+{
+    /* 子事务回滚同样撤销其中写的行。不区分是哪一层写的：多重写一段是无害的 */
+    if (event == SUBXACT_EVENT_ABORT_SUB && (logtrack_n > 0 || logtrack_overflow))
+        logtrack_flush_to_shmem();
+}
+
+static void
+logtrack_note(int64 group_id, int64 index)
+{
+    int i;
+
+    if (!logtrack_cb_registered)
+    {
+        RegisterXactCallback(logtrack_xact_cb, NULL);
+        RegisterSubXactCallback(logtrack_subxact_cb, NULL);
+        logtrack_cb_registered = true;
+    }
+    if (index <= 0)
+        index = 1;
+    for (i = 0; i < logtrack_n; i++)
+        if (logtrack_gid[i] == group_id)
+        {
+            if (index < logtrack_min[i])
+                logtrack_min[i] = index;
+            return;
+        }
+    if (logtrack_n >= RAFT_LOGTRACK_MAX)
+    {
+        logtrack_overflow = true;
+        return;
+    }
+    logtrack_gid[logtrack_n] = group_id;
+    logtrack_min[logtrack_n] = index;
+    logtrack_n++;
+}
+
+/*
+ * 按环把 [repersist_from, last_log_index] 补写回 raft_log，并删掉 last_log_index 之后
+ * 被回滚"复活"的旧行。环窗口之外的那段已经无从补起（与修前一致，靠 N46 自愈的快照兜底）。
+ * 调用方已持 SPI。
+ */
+static void
+repersist_from_ring(RaftGroupCtx *ctx)
+{
+    int64          from;
+    int64          last;
+    int64          floor_idx;
+    int64          commit;
+    int64          idx;
+    int64          orig;
+    int            n = 0;
+    StringInfoData sql;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    from = ctx->g->repersist_from;
+    last = ctx->log->last_log_index;
+    commit = ctx->log->commit_index;
+    floor_idx = last - RAFT_LOG_CAPACITY + 1;
+    if (floor_idx <= ctx->log->base_index)
+        floor_idx = ctx->log->base_index + 1;
+    SpinLockRelease(&ctx->log->mutex);
+    if (from <= 0)
+        return;
+    orig = from;
+    if (from < floor_idx)
+        from = floor_idx;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "DELETE FROM partdist.raft_log WHERE group_id = %lld AND log_index > %lld",
+                     (long long) ctx->group_id, (long long) last);
+    (void) SPI_execute(sql.data, false, 0);
+
+    for (idx = from; idx <= last; idx++)
+    {
+        RaftLogEntry e;
+        bool         got;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        got = log_get_entry_locked(ctx, idx, &e);
+        SpinLockRelease(&ctx->log->mutex);
+        if (!got)
+            continue;
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.raft_log "
+                         "(group_id, log_index, term, op_type, payload, committed) "
+                         "VALUES (%lld, %lld, %lld, %s, %s::jsonb, %s) "
+                         "ON CONFLICT (group_id, log_index) DO UPDATE SET "
+                         "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
+                         "payload = EXCLUDED.payload, committed = EXCLUDED.committed",
+                         (long long) ctx->group_id, (long long) idx, (long long) e.term,
+                         quote_literal_cstr(e.op_type), quote_literal_cstr(e.payload),
+                         idx <= commit ? "true" : "false");
+        (void) SPI_execute(sql.data, false, 0);
+        n++;
+    }
+    pfree(sql.data);
+
+    /* 本次补写自己也可能回滚 —— 先登记，回滚时回调会把标记重新立起来 */
+    logtrack_note(ctx->group_id, from);
+    SpinLockAcquire(&ctx->log->mutex);
+    if (ctx->g->repersist_from == orig)
+        ctx->g->repersist_from = 0;     /* 期间又有更早的标记立起来就留着，下次再补 */
+    SpinLockRelease(&ctx->log->mutex);
+    elog(LOG, "pg_raft: group %lld SQL 日志按环补写 %lld..%lld 共 %d 条（此前承载它们的事务回滚，P7-N46）",
+         (long long) ctx->group_id, (long long) from, (long long) last, n);
+}
+
 static void
 persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
                       const char *op_type, const char *payload, bool committed)
@@ -2247,6 +2436,10 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
         raft_persist_spi_end(spi_owned);
         return;
     }
+
+    if (ctx->g->repersist_from > 0)
+        repersist_from_ring(ctx);
+    logtrack_note(ctx->group_id, index);
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
@@ -5028,6 +5221,122 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
 }
 
 /*
+ * ★ P7-N58：收集本节点上"升主前置已完成、仍待登记、仍是同一任期 leader"的其他组，
+ * 拼成批量登记的项（不含 self）。最多 RAFT_REPORT_PIGGYBACK_MAX 个 —— 批条目要装进
+ * 768 字节的环条目。返回收集到的个数；items 总是初始化过，由调用方 pfree。
+ */
+#define RAFT_REPORT_PIGGYBACK_MAX 12
+
+/*
+ * 每条登记连接上在途批次捎带了哪些组（不含连接的 owner 组本身）。只在该连接仍 BUSY
+ * 且 owner 与记录一致时有效 —— 连接被重置 / 复用后记录自然作废，不用到处挂钩清理。
+ */
+static int64 batch_owner_gid[RAFT_ACONN_POOL];
+static int64 batch_owner_term[RAFT_ACONN_POOL];
+static int   batch_n[RAFT_ACONN_POOL];
+static int64 batch_gid[RAFT_ACONN_POOL][RAFT_REPORT_PIGGYBACK_MAX];
+static int64 batch_term[RAFT_ACONN_POOL][RAFT_REPORT_PIGGYBACK_MAX];
+
+static bool
+batch_slot_valid(int k)
+{
+    return batch_n[k] > 0 &&
+        report_pool[k].state == RAFT_ACONN_BUSY &&
+        report_pool[k].owner_group == batch_owner_gid[k] &&
+        report_pool[k].owner_term == batch_owner_term[k];
+}
+
+/* 该组（该任期）是否正被别的在途批次捎带着 */
+static bool
+group_in_inflight_batch(int64 gid, int64 term)
+{
+    int k;
+    int j;
+
+    for (k = 0; k < RAFT_ACONN_POOL; k++)
+    {
+        if (!batch_slot_valid(k))
+            continue;
+        for (j = 0; j < batch_n[k]; j++)
+            if (batch_gid[k][j] == gid && batch_term[k][j] == term)
+                return true;
+    }
+    return false;
+}
+
+/* 批次已提交：被捎带的组若仍在同一任期当 leader，就地清掉待登记 */
+static void
+batch_mark_registered(int k)
+{
+    int j;
+
+    for (j = 0; j < batch_n[k]; j++)
+    {
+        RaftGroupCtx c;
+        int          st;
+        int64        t;
+
+        if (!raft_group_ctx(batch_gid[k][j], &c))
+            continue;
+        SpinLockAcquire(&c.cons->mutex);
+        st = c.cons->state;
+        t = c.cons->current_term;
+        SpinLockRelease(&c.cons->mutex);
+        if (st == RAFT_LEADER && t == batch_term[k][j] && c.g->report_pending)
+        {
+            c.g->report_pending = false;
+            promote_slot_clear(batch_gid[k][j]);
+        }
+    }
+    batch_n[k] = 0;
+}
+
+static int
+report_collect_piggyback(int64 self_gid, StringInfo items, int64 *gids, int64 *terms)
+{
+    int i;
+    int n = 0;
+
+    initStringInfo(items);
+    for (i = 0; promote_slots != NULL && i < promote_nslots &&
+                n < RAFT_REPORT_PIGGYBACK_MAX; i++)
+    {
+        PromoteSlot *ps = &promote_slots[i];
+        RaftGroupCtx c;
+        int          st;
+        int64        t;
+        int          k;
+        int          m = 0;
+
+        if (ps->group_id == 0 || ps->group_id == self_gid || !ps->prepared)
+            continue;
+        if (group_in_inflight_batch(ps->group_id, ps->term))
+            continue;           /* 已经被别的在途批次带着 */
+        if (!raft_group_ctx(ps->group_id, &c) || !c.g->report_pending)
+            continue;
+        SpinLockAcquire(&c.cons->mutex);
+        st = c.cons->state;
+        t = c.cons->current_term;
+        SpinLockRelease(&c.cons->mutex);
+        if (st != RAFT_LEADER || t != ps->term)
+            continue;
+        if (c.g->n_members <= 0)
+            continue;           /* 成员集未知的走单条入口（退化规则在那边） */
+
+        appendStringInfo(items, "%s[%lld,%d,%lld,[", n ? "," : "",
+                         (long long) ps->group_id, pg_raft_node_id, (long long) t);
+        for (k = 0; k < c.g->n_members; k++)
+            if (c.g->members[k] != pg_raft_node_id)
+                appendStringInfo(items, "%s%d", m++ ? "," : "", c.g->members[k]);
+        appendStringInfoString(items, "]]");
+        gids[n] = ps->group_id;
+        terms[n] = t;
+        n++;
+    }
+    return n;
+}
+
+/*
  * 数据组新任 leader 向控制面登记（切主重构的上报半程，非阻塞）。
  *
  * BGW tick 上下文无 SPI，投递走 libpq：向 group 0 当前 leader（常态是 master）
@@ -5049,7 +5358,10 @@ data_group_try_report(RaftGroupCtx *ctx)
     int          i;
     int          slot = -1;
     char         arrbuf[192];
-    char         sql[384];
+    char         sql[1024];
+    int64        pb_gid[RAFT_REPORT_PIGGYBACK_MAX];
+    int64        pb_term[RAFT_REPORT_PIGGYBACK_MAX];
+    int          n_pb = 0;
     int          off;
     PGresult    *res = NULL;
     RaftAconnPoll pr;
@@ -5095,6 +5407,10 @@ data_group_try_report(RaftGroupCtx *ctx)
         if (pr != 1)
             return;             /* 还没好，保留 report_pending 下个 tick 继续 */
     }
+
+    /* P7-N58：本组正被别的在途批次捎带着 ⇒ 等那一批的结果，别再自己另提一遍 */
+    if (group_in_inflight_batch(ctx->group_id, term))
+        return;
 
     /* P7-N54：从登记连接池挑一条；全被别的组占着就排队 */
     ra = aconn_pick(report_pool, ctx->group_id, term);
@@ -5145,6 +5461,13 @@ data_group_try_report(RaftGroupCtx *ctx)
 
             if (v != 0)
             {
+                int bk = (int) (ra - report_pool);
+
+                /* P7-N58：批次已提交（或全部无需登记）⇒ 被捎带的组一并清掉待登记 */
+                if (bk >= 0 && bk < RAFT_ACONN_POOL && batch_n[bk] > 0 &&
+                    batch_owner_gid[bk] == ctx->group_id &&
+                    batch_owner_term[bk] == term)
+                    batch_mark_registered(bk);
                 ctx->g->report_pending = false;
                 promote_slot_clear(ctx->group_id);
                 elog(LOG,
@@ -5196,6 +5519,37 @@ data_group_try_report(RaftGroupCtx *ctx)
              "SELECT partdist.pg_raft_report_data_leader(%lld, %d, %lld, %s)",
              (long long) ctx->group_id, pg_raft_node_id, (long long) term, arrbuf);
 
+    /*
+     * ★ P7-N58：捎带。本节点上还有别的组升主前置已完成、只差登记 ⇒ 合成一次批量登记
+     * （master 侧合成一条控制面条目）。被捎带的组照样留着 report_pending，下个 tick
+     * 自己再报一次时 master 按任期栅栏直接回 -1（一次 SPI 查询，不进日志）。
+     */
+    {
+        StringInfoData items;
+        int            extra;
+
+        extra = report_collect_piggyback(ctx->group_id, &items, pb_gid, pb_term);
+        n_pb = extra;
+
+        if (extra > 0)
+        {
+            char one[256];
+            int  k;
+
+            /* 本组放第一项（批条目装不下时先保本组） */
+            snprintf(one, sizeof(one), "[%lld,%d,%lld,[", (long long) ctx->group_id,
+                     pg_raft_node_id, (long long) term);
+            for (k = 0; k < n_sec; k++)
+                snprintf(one + strlen(one), sizeof(one) - strlen(one), "%s%d",
+                         k ? "," : "", sec[k]);
+            strlcat(one, "]]", sizeof(one));
+            snprintf(sql, sizeof(sql),
+                     "SELECT partdist.pg_raft_report_data_leader_batch('[%s,%s]')",
+                     one, items.data);
+        }
+        pfree(items.data);
+    }
+
     for (i = 0; i < n_peers; i++)
         if (peers[i].node_id == leader0)
         {
@@ -5216,7 +5570,19 @@ data_group_try_report(RaftGroupCtx *ctx)
     }
     if (cr == 0)
         return;                 /* 握手未完，下个 tick 再推 */
-    (void) aconn_send(ra, sql, ctx->group_id, term);
+    batch_n[(int) (ra - report_pool)] = 0;     /* 这条连接上的旧批次记录作废 */
+    if (aconn_send(ra, sql, ctx->group_id, term) && n_pb > 0)
+    {
+        int bk = (int) (ra - report_pool);
+
+        batch_owner_gid[bk] = ctx->group_id;
+        batch_owner_term[bk] = term;
+        memcpy(batch_gid[bk], pb_gid, sizeof(int64) * n_pb);
+        memcpy(batch_term[bk], pb_term, sizeof(int64) * n_pb);
+        batch_n[bk] = n_pb;
+        elog(LOG, "pg_raft: group %lld 登记捎带本节点另外 %d 个待登记的组（P7-N58）",
+             (long long) ctx->group_id, n_pb);
+    }
 }
 
 
@@ -5541,6 +5907,7 @@ group_tick(RaftGroupCtx *ctx)
 
     if (state == RAFT_LEADER)
     {
+        ctx->g->leader_seen_at = now;   /* P7-N62 */
         send_heartbeats(ctx);
         if (ctx->group_id != RAFT_CONTROL_GROUP && ctx->g->report_pending)
             data_group_try_report(ctx);
@@ -8465,6 +8832,74 @@ pg_raft_any_group_leader_local(void)
 }
 
 /*
+ * ★ P7-N47：本节点上某数据组此刻的角色与任期（纯共享内存）。
+ * 返回 false = 本节点没有这个组的状态（未加载 / 不是成员），调用方别据此下结论。
+ */
+static bool raft_role_restoring = false;   /* 防重入：灌注册表的 SPI 查询本身也会开表 */
+
+bool
+pg_raft_data_group_role(int64 group_id, bool *is_leader, int64 *term,
+                        TimestampTz *leader_seen_at)
+{
+    int i;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL || group_id <= 0)
+        return false;
+    for (i = 0; i < RAFT_MAX_GROUPS; i++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[i];
+
+        if (!g->in_use || g->group_id != group_id)
+            continue;
+        SpinLockAcquire(&g->cons.mutex);
+        *is_leader = (g->cons.state == RAFT_LEADER);
+        *term = g->cons.current_term;
+        SpinLockRelease(&g->cons.mutex);
+        if (leader_seen_at)
+            *leader_seen_at = g->leader_seen_at;
+        return true;
+    }
+
+    /*
+     * 没找到：重启后组注册表是各后端首次走 SQL 路径时惰性灌回共享内存的。读闸门恰恰
+     * 要管"刚拉起"这个窗口，所以本后端还没灌过就就地灌一次再查（需要事务 + SPI）。
+     */
+    if (!groups_restored && IsTransactionState() && !raft_role_restoring)
+    {
+        bool found;
+
+        raft_role_restoring = true;
+        PG_TRY();
+        {
+            parse_peers();
+            restore_groups_if_needed();
+        }
+        PG_FINALLY();
+        {
+            raft_role_restoring = false;
+        }
+        PG_END_TRY();
+        found = false;
+        for (i = 0; i < RAFT_MAX_GROUPS && !found; i++)
+        {
+            RaftGroupState *g = &RaftGroups->groups[i];
+
+            if (!g->in_use || g->group_id != group_id)
+                continue;
+            SpinLockAcquire(&g->cons.mutex);
+            *is_leader = (g->cons.state == RAFT_LEADER);
+            *term = g->cons.current_term;
+            SpinLockRelease(&g->cons.mutex);
+            if (leader_seen_at)
+                *leader_seen_at = g->leader_seen_at;
+            found = true;
+        }
+        return found;
+    }
+    return false;
+}
+
+/*
  * 本组 prepare 复制的串行化（DTX_2PC_DESIGN.md §9.1）。
  *
  * 为什么需要：让路窗口修复之后，并发 backend 不再各自提前返回，而是**都会**
@@ -9956,7 +10391,7 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
                         if (PQstatus(pc) == CONNECTION_OK)
                         {
                             snprintf(pqry, sizeof(pqry),
-                                     "SELECT commit_ts FROM partdist.dtx_peek(%lld, %lld)",
+                                     "SELECT commit_ts FROM partdist.dtx_peek(%lld, %lld) WHERE verdict IN (1, 2)",
                                      (long long) coord_gsid, (long long) dtxid);
                             pres = PQexec(pc, pqry);
                             if (PQresultStatus(pres) == PGRES_TUPLES_OK &&

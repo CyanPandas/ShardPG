@@ -535,11 +535,78 @@ pg_partdist_shard_mark_promotion_pending(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/*
+ * ★ P7-N62（2026-10-04）：已升主（或普通）分片的 leader 闸门。
+ *
+ * 被断电后重新拉起的旧主，本地还带着持久的"已升主"标记，副本读闸门对它是开的；
+ * 而它原来当主的分片，新主若还没登记上路由（登记风暴 / 控制面落后，N58），master
+ * 仍把读发到这里 —— 它就拿断电前的旧数据作答。实测（N52 回归第 2 轮）：:5433 拉起后
+ * 第一次读总额少 20（一笔红包事务里两个 +10 不见了）。
+ *
+ * 判据只问 pg_raft 本机此刻的角色（经 rendezvous variable，两扩展无编译期依赖）：
+ * 本机是该组 leader，或 3 s 内还是（兼容 P7-N33：正常切主时旧主在路由切走前的 1–2 s
+ * 仍可读交权那一刻的状态）⇒ 放行；否则报可重试错误。pg_raft 不认识这个组（没走 raft
+ * 的表）或没加载 ⇒ 放行，保持原行为。
+ */
+typedef bool (*RaftGroupRoleFn) (int64 group_id, bool *is_leader, int64 *term,
+                                 TimestampTz *leader_seen_at);
+
+#define SHARD_LEADER_GATE_GRACE_MS 3000
+
+static void
+ShardLeaderGate(Oid relid, const char *what)
+{
+    static RaftGroupRoleFn role_fn = NULL;
+    char       *relname;
+    char       *us;
+    int64       gid;
+    bool        is_leader = false;
+    int64       term = 0;
+    TimestampTz seen = 0;
+
+    if (role_fn == NULL)
+    {
+        void **rv = find_rendezvous_variable("pg_raft_data_group_role_fn");
+
+        role_fn = (RaftGroupRoleFn) *rv;
+        if (role_fn == NULL)
+            return;
+    }
+    if (!TransactionIdIsValid(ShardXidAllocWatermark(relid)))
+        return;                 /* 只管分片 xid 宇宙（与副本闸门同一判据） */
+    relname = get_rel_name(relid);
+    if (!IsCitusShardName(relname))
+        return;
+    us = strrchr(relname, '_');
+    gid = strtoll(us + 1, NULL, 10);
+    if (gid <= 0 || !role_fn(gid, &is_leader, &term, &seen))
+        return;
+    if (is_leader)
+        return;
+    if (seen != 0 &&
+        !TimestampDifferenceExceeds(seen, GetCurrentTimestamp(),
+                                    SHARD_LEADER_GATE_GRACE_MS))
+        return;
+
+    ereport(ERROR,
+            (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+             errmsg("本节点此刻不是分片 %lld 的主（Raft 组任期 %lld），不能在这里%s",
+                    (long long) gid, (long long) term, what),
+             errdetail("本地数据可能落后于现任主（例如本节点断电后刚被拉起，"
+                       "而路由还没切到新主）。"),
+             errhint("稍后重试本事务：路由会在新主登记后切过去（P7-N62）。")));
+}
+
 void
 ShardReplicaAccessGate(Oid relid, const char *what)
 {
-    if (allow_replica_access || !ShardReplicaIsLocal(relid))
+    if (allow_replica_access)
         return;
+    if (!ShardReplicaIsLocal(relid))
+    {
+        ShardLeaderGate(relid, what);
+        return;
+    }
 
     /*
      * ★ 只拦**分片 xid 宇宙**里的副本（T6.5 同款判据：本分片有没有分配器水位）。

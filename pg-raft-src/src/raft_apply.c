@@ -376,7 +376,9 @@ pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
                      "primary_node = EXCLUDED.primary_node, "
                      "secondary_nodes = EXCLUDED.secondary_nodes, "
                      "primary_term = EXCLUDED.primary_term, updated_at = now() "
-                     "WHERE partition_map.primary_term <= EXCLUDED.primary_term",
+                     "WHERE partition_map.primary_term <= EXCLUDED.primary_term "
+                     "  AND NOT (partition_map.primary_node = EXCLUDED.primary_node AND "
+                     "           partition_map.primary_term = EXCLUDED.primary_term)",
                      partition_id, primary_node,
                      quote_literal_cstr(secondaries_array_literal),
                      (long long) primary_term);
@@ -394,18 +396,47 @@ pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
              partition_id, old_primary_node, primary_node,
              (long long) primary_term, switch_partition_lsn,
              switch_orig_lsn ? switch_orig_lsn : "0/0");
-        raft_notify_primary_switch(partition_id,
-                                   old_primary_node,
-                                   primary_node,
-                                   switch_orig_lsn);
+        /*
+         * ★ P7-N47（2026-10-04）：过期登记只落元数据，不做主权交接。
+         *
+         * 落后节点补 apply 一条旧的「本节点是主」登记时，交接（升主、经该组广播 fileset）
+         * 会因为本节点此刻已不是该组 leader 而 ERROR ⇒ 整个 apply 事务回滚 ⇒ 游标退回 ⇒
+         * 下一轮再 apply 同一条，死循环（实测 :5435 卡在 2190）。判据只看本地共享内存：
+         * 本节点有该组状态、且已不是 leader 或任期已越过登记任期 ⇒ 这条登记已被取代，
+         * 后续条目会把真正的现任登记带过来。查不到本组状态时照旧交接（不据此下结论）。
+         */
+        {
+            bool    stale_for_me = false;
+
+            if (primary_node == pg_raft_node_id && primary_term > 0)
+            {
+                bool    is_leader = false;
+                int64   cur_term = 0;
+
+                if (pg_raft_data_group_role((int64) partition_id, &is_leader, &cur_term, NULL) &&
+                    (!is_leader || cur_term > primary_term))
+                    stale_for_me = true;
+            }
+            if (stale_for_me)
+                elog(LOG,
+                     "pg_raft: partition %u 的登记（主=本节点 %d，任期 %lld）已过期 —— "
+                     "本节点此刻不是该组任期内的 leader，只落元数据、不做升主交接（P7-N47）",
+                     partition_id, primary_node, (long long) primary_term);
+            else
+                raft_notify_primary_switch(partition_id,
+                                           old_primary_node,
+                                           primary_node,
+                                           switch_orig_lsn);
+        }
         raft_update_citus_placement(partition_id, primary_node);
         raft_invalidate_cache();
         raft_save_metadata_snapshot();
     }
     else if (ok)
-        elog(LOG,
-             "pg_raft: partition %u 主副本更新被任期栅栏拦下 (提案任期 %lld 落后于已登记任期)",
-             partition_id, (long long) primary_term);
+        elog(DEBUG1,
+             "pg_raft: partition %u 登记（主 %d，任期 %lld）未生效：已登记任期更新，"
+             "或与本地已生效的登记完全相同（重复条目不再重做交接，P7-N58）",
+             partition_id, primary_node, (long long) primary_term);
     raft_spi_end(spi_owned);
     return ok;
 }
@@ -443,6 +474,67 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         ret = SPI_execute(sql.data, false, 0);
         ok = (ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
         pfree(sql.data);
+    }
+    else if (strcmp(op_type, PG_RAFT_OP_PARTITION_PRIMARY_BATCH) == 0)
+    {
+        /*
+         * ★ P7-N58：批量登记 —— 逐项走与单条完全相同的 apply（任期栅栏 / 主权交接 / 拨路由）。
+         * 任一项失败整条按失败处理（与单条同语义：由控制面 apply 重试 / 放弃逻辑兜着），
+         * 已成功的项重做是幂等的（栅栏是 <=）。
+         */
+        int      n = 0;
+        int      i;
+        Oid     *pids = NULL;
+        int     *prims = NULL;
+        int64   *terms = NULL;
+        int     *olds = NULL;
+        char   **secs = NULL;
+
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT (e->>0)::oid, (e->>1)::int, (e->>2)::bigint, "
+                         "       COALESCE((e->>3)::int, 0), "
+                         "       COALESCE((SELECT array_agg(t::int)::text "
+                         "                 FROM jsonb_array_elements_text(e->4) t), '{}') "
+                         "  FROM jsonb_array_elements((%s::jsonb)->'pp') e",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, true, 0);
+        pfree(sql.data);
+        if (ret == SPI_OK_SELECT)
+        {
+            MemoryContext old_ctx = MemoryContextSwitchTo(caller_ctx);
+
+            n = (int) SPI_processed;
+            if (n > 0)
+            {
+                pids = palloc(sizeof(Oid) * n);
+                prims = palloc(sizeof(int) * n);
+                terms = palloc(sizeof(int64) * n);
+                olds = palloc(sizeof(int) * n);
+                secs = palloc(sizeof(char *) * n);
+            }
+            for (i = 0; i < n; i++)
+            {
+                bool  isnull;
+                char *v;
+
+                pids[i] = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+                prims[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+                terms[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull));
+                olds[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4, &isnull));
+                v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5);
+                secs[i] = pstrdup(v ? v : "{}");
+            }
+            MemoryContextSwitchTo(old_ctx);
+            ok = true;
+        }
+        raft_spi_end(spi_owned);
+        spi_owned = false;
+
+        for (i = 0; ok && i < n; i++)
+            ok = pg_raft_apply_partition_primary(pids[i], prims[i], secs[i],
+                                                 olds[i], 0, "0/0", terms[i]);
+        return ok;
     }
     else if (strcmp(op_type, PG_RAFT_OP_PARTITION_PRIMARY) == 0)
     {

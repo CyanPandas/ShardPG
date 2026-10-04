@@ -113,8 +113,23 @@ typedef enum SxidState
 } SxidState;
 
 static SxidState
+shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
+				   int64 *cts_out, bool strict);
+
+static SxidState
 shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				int64 *cts_out)
+{
+	return shard_xid_state_ex(shard, sxid, native_xid, cts_out, false);
+}
+
+/*
+ * strict = true：快照读（sv_satisfies_mvcc）。判决定不下来的 PREPARED 不许
+ * 静默当"未提交"——见下面 TXN_PREPARED 分支里 P7-N52 的说明。
+ */
+static SxidState
+shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
+				   int64 *cts_out, bool strict)
 {
 	ShardCommitKey key;
 	ShardCommitEntry *e;
@@ -242,6 +257,64 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 						ce->status = (uint8) TXN_ABORTED;
 						ce->commit_ts = 0;
 						return SXID_ABORTED;
+					}
+
+					/*
+					 * ★ P7-N52（2026-10-04）：判决定不下来时，快照读**不许**按"未提交"处理。
+					 *
+					 * 这笔事务的 start_ts 不晚于本读者，它可能已经以更早的 commit_ts 提交了 ——
+					 * 当作不可见，就是在一个快照里看见同一笔分布式事务在一部分分区提交、
+					 * 另一部分没提交（实测：切主窗口里红包事务的总额读成 −10/−60/+50，
+					 * 叠加回放页面带过来的 xmin 已提交提示位，还会读到同一行的新旧两个版本，
+					 * 257/256 行）。定不下来的最常见原因是**升主的副本上没有未决登记**
+					 * （登记只在原来执行 PREPARE 的节点上），"登记缺失 ⇒ 决议必然未做"在新主上不成立。
+					 * 只管 vd == 3（本机无登记）与 vd == 4（有登记但没问到答案，如问询超时 ——
+					 * 实测灌数提交返回后紧接着的读因此少一行，P7-N60 的"256 读成 255"）。
+					 * 协调组明确答"未决"（vd == 0）的是正常进行中的两阶段提交，照旧按未提交处理，
+					 * 不能让并发读因此报错。
+					 * 做法：vd == 3 先就地跑一次本分片的 in-doubt 闭合（升主序列用的同一段代码，
+					 * 全网求决议、落分片 clog），再读一次槽位；vd == 4 报可重试的串行化错误
+					 * （协调组在，重试大概率问得到）—— 宁可让客户端重试，也不给出不一致的结果。
+					 * 剪枝 / 清理 / 等锁路径不走这里（strict=false）。
+					 */
+					if (strict && (vd == 3 || vd == 4))
+					{
+						ShardClogSlot slot2;
+
+						if (vd == 3)
+						{
+							/* 本事务里该分片的闭合可能已经跑过（限流）——照样重读槽位 */
+							(void) DtxReaderCloseOrphan(shard);
+							(void) ShardClogReadSlot(shard, sxid, &slot2);
+							if ((TxnStatus) slot2.status == TXN_COMMITTED ||
+								(TxnStatus) slot2.status == TXN_ABORTED)
+							{
+								ce = verdict_cache_search(&key, HASH_ENTER);
+								ce->status = (uint8) slot2.status;
+								ce->commit_ts = (int64) slot2.commit_ts;
+								if (cts_out)
+									*cts_out = (int64) slot2.commit_ts;
+								return ((TxnStatus) slot2.status == TXN_COMMITTED)
+									? SXID_COMMITTED : SXID_ABORTED;
+							}
+						}
+						/*
+						 * 闭合跑过、全网仍找不到判决 ⇒ 按"未决"处理（不可见），与协调组明确答
+						 * "未决"同一语义。不能一直报错：没下发过协调组的事务（master 在决议前就
+						 * 失败了）谁都无权写推定中止，会永远停在这里 —— 实测断电回归里一笔这样的
+						 * 事务让该分片的读连续报错数分钟。残留风险：判决存在但此刻全网都问不到
+						 * （协调组多数派不可达 / 成员 apply 落后），这一次读按未提交处理。
+						 */
+						if (vd == 3)
+							return SXID_RUNNING;
+						ereport(ERROR,
+								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+								 errmsg("分片 %u 上有一笔分布式事务（gxid %lld）的判决暂时无法确定，"
+										"本次读取给不出一致的结果", shard,
+										(long long) slot.global_xid),
+								 errdetail("这笔事务在本分片上还是 PREPARED，协调组的决议没取到（%s）。",
+										   "问询协调组没有答复"),
+								 errhint("稍后重试本事务（P7-N52）。")));
 					}
 				}
 				return SXID_RUNNING;
@@ -466,7 +539,7 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	 */
 	my_ts = TsoGetStartTs();
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
+	switch (shard_xid_state_ex(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts, true))
 	{
 		case SXID_MY_OWN:
 			/* 本命令开始之后才插入的行不可见（cid 近似，见文件头） */
@@ -497,7 +570,7 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, &cts))
+	switch (shard_xid_state_ex(shard, HeapTupleHeaderGetRawXmax(tuple), NULL, &cts, true))
 	{
 		case SXID_MY_OWN:
 			/* 本命令开始之后才删除 ⇒ 本命令仍看得见 */

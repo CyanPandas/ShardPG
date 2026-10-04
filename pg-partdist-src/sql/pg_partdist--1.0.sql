@@ -1596,7 +1596,14 @@ BEGIN
     -- 不写推定中止。拉到即幂等补进本地表，下次无需再远程问。
     v_verdict := partdist.pg_raft_group_peer_decision(p_coord_gsid, p_dtxid);
     IF v_verdict IS NULL OR v_verdict NOT IN (1, 2) THEN
-        RETURN;                 -- 无从判定：返回 0 行
+        -- ★ P7-N52（之三）：leader 排空 apply 后本地与组内都查无决议 ⇒ 这是**权威的"未决"**，
+        --   返回一行 verdict=0；非 leader 仍返回 0 行（"不知道"）。问询方据此区分
+        --   "确实还没决议"（读者按未提交）与"没问到"（读者报可重试错误）。
+        IF v_is_leader THEN
+            verdict := 0; commit_ts := 0;
+            RETURN NEXT;
+        END IF;
+        RETURN;
     END IF;
 
     -- ★ R-P4-16（2026-08-17，修的是 R-P4-13 绕行自身的缺陷）：
@@ -1624,7 +1631,7 @@ END
 $fn$;
 
 COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
-    '只读决议窥视（T4.5）：本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14）并另起语句补读 commit_ts（R-P4-16）；COMMIT 判决缺有效 commit_ts 时宁可返回 0 行，绝不写推定中止、绝不答半个判决。';
+    '只读决议窥视（T4.5）：leader 查无决议时返回一行 verdict=0（权威未决，P7-N52），非 leader 问不到返回 0 行；本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14）并另起语句补读 commit_ts（R-P4-16）；COMMIT 判决缺有效 commit_ts 时宁可返回 0 行，绝不写推定中止、绝不答半个判决。';
 
 -- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
 -- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。

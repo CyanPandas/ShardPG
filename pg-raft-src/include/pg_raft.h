@@ -35,6 +35,9 @@ pg_raft_spi_end(bool must_finish)
 
 #define PG_RAFT_OP_NODE_STATUS       "OP_NODE_STATUS"
 #define PG_RAFT_OP_PARTITION_PRIMARY "OP_PARTITION_PRIMARY"
+/* ★ P7-N58：多个数据组的新主登记合成一条控制面条目
+ * payload = {"pp":[[分区, 新主, 任期, 前任主, [从副本...]], ...]} —— 紧凑格式，环里一条只有 768 字节 */
+#define PG_RAFT_OP_PARTITION_PRIMARY_BATCH "OP_PARTITION_PRIMARY_BATCH"
 /* ★ P7-N39：新 leader 上任提的**本任期空条目**（Raft 标准动作），没有任何副作用，
  * 存在的唯一目的是把上一任期继承来的尾巴一起带上提交点。*/
 #define PG_RAFT_OP_NOOP              "OP_NOOP"
@@ -84,6 +87,8 @@ extern int  pg_raft_catchup_interval_ms;
 /* 控制面日志压缩阈值（条），0=关；压缩点之前只能靠 InstallSnapshot 追平 */
 extern int  pg_raft_compact_threshold;
 extern bool pg_raft_any_group_leader_local(void);
+extern bool pg_raft_data_group_role(int64 group_id, bool *is_leader, int64 *term,
+                                    TimestampTz *leader_seen_at);
 
 /* DTX-2PC（DTX_2PC_DESIGN.md §9.3）：master 侧驱动 + 参与者自治登记 */
 extern bool pg_raft_dtx_2pc_enabled;

@@ -67,6 +67,7 @@ PG_FUNCTION_INFO_V1(pg_raft_propose_partition_primary);
 PG_FUNCTION_INFO_V1(pg_raft_apply_payload);
 PG_FUNCTION_INFO_V1(pg_raft_force_probe);
 PG_FUNCTION_INFO_V1(pg_raft_report_data_leader);
+PG_FUNCTION_INFO_V1(pg_raft_report_data_leader_batch);
 
 void
 pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t len)
@@ -1028,6 +1029,17 @@ register_topology_worker(void)
 void
 _PG_init(void)
 {
+    /*
+     * ★ P7-N62：导出"本机某数据组此刻的角色"给 pg_partdist 的读闸门。经 rendezvous
+     * variable 传递（与 partdist 导出给 pg_raft 的几个出口同一模式），两扩展无编译期依赖。
+     * 每个进程加载本库时都设一次（postmaster 预加载后 fork 继承）。
+     */
+    {
+        void **rv = find_rendezvous_variable("pg_raft_data_group_role_fn");
+
+        *rv = (void *) pg_raft_data_group_role;
+    }
+
     /* POSTMASTER GUC 只能在 shared_preload 阶段注册；CREATE EXTENSION 会再次加载 .so */
     if (process_shared_preload_libraries_in_progress)
     {
@@ -1432,6 +1444,126 @@ pg_raft_report_data_leader(PG_FUNCTION_ARGS)
     if (idx > 0)
         elog(LOG, "pg_raft: 登记数据组 %lld 新主 node=%d term=%lld (group0 idx=%lld)",
              (long long) group_id, leader_node, (long long) term, (long long) idx);
+    PG_RETURN_INT64(idx);
+}
+
+/*
+ * ★ P7-N58（2026-10-04）：批量登记入口。
+ *
+ * 登记风暴（一台 worker 一口气当选几十个组：建 128 组、或别的节点宕机后接手）下，逐组各提一条
+ * 控制面条目，每条都是一次全簇同步复制 + 全节点 apply；这台 2 vCPU 的机器上控制面大约每秒
+ * 两三条，排在后面的组十几分钟才登记上路由（期间 master 的路由还指着旧主 —— P7-N60），
+ * 30 s 一超时取消重来又把队伍拉得更长。
+ *
+ * 这里把一批登记合成**一条** OP_PARTITION_PRIMARY_BATCH：每一项照单条入口过同样的任期栅栏
+ * （旧任期迟到、同任期重复的都不进日志），剩下的合在一起提。apply 端逐项走与单条完全相同的
+ * pg_raft_apply_partition_primary（栅栏、交接、拨路由），语义不变，只是一次复制顶一批。
+ *
+ * 返回：>0 = 批条目的 group 0 index；-1 = 全部无需登记；0 = 本节点不是 group 0 leader。
+ */
+Datum
+pg_raft_report_data_leader_batch(PG_FUNCTION_ARGS)
+{
+    char          *items = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    StringInfoData sql;
+    StringInfoData payload;
+    int            ret;
+    int            n = 0;
+    int            i;
+    bool           spi_owned;
+    int64          idx;
+    int64         *gids = NULL;
+    int           *nodes = NULL;
+    int64         *terms = NULL;
+    int           *olds = NULL;
+    char         **secs = NULL;
+    MemoryContext  caller = CurrentMemoryContext;
+
+    if (!pg_raft_is_leader_local())
+        PG_RETURN_INT64(0);
+    if (!pg_raft_spi_begin(&spi_owned))
+        PG_RETURN_INT64(0);
+
+    /*
+     * 解析 + 任期栅栏一次 SQL 做完：与单条入口同一判据
+     * （已登记任期更新，或同任期同主 ⇒ 无需登记）；协调节点不能当数据主。
+     */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT (e->>0)::bigint, (e->>1)::int, (e->>2)::bigint, "
+        "       COALESCE(m.primary_node, 0), "
+        "       COALESCE((SELECT string_agg(t, ',') FROM jsonb_array_elements_text(e->3) t "
+        "                  WHERE t::int <> (e->>1)::int AND t::int <> %d), '') "
+        "  FROM jsonb_array_elements(%s::jsonb) e "
+        "  LEFT JOIN partdist.partition_map m ON m.partition_id = (e->>0)::oid "
+        " WHERE (e->>2)::bigint > 0 AND (e->>1)::int <> %d "
+        "   AND NOT (COALESCE(m.primary_term, 0) > (e->>2)::bigint OR "
+        "            (COALESCE(m.primary_term, 0) = (e->>2)::bigint AND m.primary_node = (e->>1)::int))",
+        pg_raft_coordinator_node_id > 0 ? pg_raft_coordinator_node_id : -1,
+        quote_literal_cstr(items),
+        pg_raft_coordinator_node_id > 0 ? pg_raft_coordinator_node_id : -1);
+    ret = SPI_execute(sql.data, true, 0);
+    pfree(sql.data);
+    if (ret == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(caller);
+
+        n = (int) SPI_processed;
+        gids = palloc(sizeof(int64) * n);
+        nodes = palloc(sizeof(int) * n);
+        terms = palloc(sizeof(int64) * n);
+        olds = palloc(sizeof(int) * n);
+        secs = palloc(sizeof(char *) * n);
+        for (i = 0; i < n; i++)
+        {
+            bool  isnull;
+            char *v;
+
+            gids[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+            nodes[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+            terms[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull));
+            olds[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4, &isnull));
+            v = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5);
+            secs[i] = pstrdup(v ? v : "");
+        }
+        MemoryContextSwitchTo(old);
+    }
+    pg_raft_spi_end(spi_owned);
+    pfree(items);
+
+    if (n == 0)
+        PG_RETURN_INT64(-1);
+
+    /* 装不下的留给它们自己下一轮再报（环条目上限 768 字节） */
+    initStringInfo(&payload);
+    appendStringInfoString(&payload, "{\"pp\":[");
+    for (i = 0; i < n; i++)
+    {
+        char one[160];
+        int  len = snprintf(one, sizeof(one), "%s[%lld,%d,%lld,%d,[%s]]",
+                            i ? "," : "", (long long) gids[i], nodes[i],
+                            (long long) terms[i], olds[i], secs[i]);
+
+        /*
+         * 装不下就整批拒绝（不能截断：上报方按"批次已提交"把捎带的组都当成登记完了，
+         * 截掉的那几个会永远登记不上）。上报方每批最多 13 项，正常装得下。
+         */
+        if (payload.len + len + 4 > 720)
+            ereport(ERROR,
+                    (errmsg("pg_raft: 批量登记 %d 项装不进一条控制面条目（已到第 %d 项）",
+                            n, i + 1)));
+        appendStringInfoString(&payload, one);
+    }
+    appendStringInfoString(&payload, "]}");
+
+    idx = pg_raft_consensus_propose(PG_RAFT_OP_PARTITION_PRIMARY_BATCH, payload.data);
+    if (idx <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: raft propose failed (not leader, no quorum, or log full)")));
+    elog(LOG, "pg_raft: 批量登记 %d 个数据组新主 (group0 idx=%lld)：%s",
+         i, (long long) idx, payload.data);
+    pfree(payload.data);
     PG_RETURN_INT64(idx);
 }
 

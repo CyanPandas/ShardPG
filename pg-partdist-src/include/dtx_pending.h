@@ -56,6 +56,7 @@ extern int	DtxPendingSweep(void);
  * 返回 0=无从判定（不可见处置） 1=COMMIT（*cts_out 有效） 2=ABORT。
  */
 extern int	DtxReaderResolve(int64 gxid, int64 *cts_out);
+extern bool DtxReaderCloseOrphan(Oid shard);
 
 /* 心跳工作者用：自连触发一轮清扫（无 DB 语境，纯 libpq） */
 extern void DtxPendingSelfTriggerSweep(void);
