@@ -420,6 +420,35 @@ dtx_inquire_core_ex(int64 coord_gsid, int64 dtxid, int64 *cts_out, bool *answere
 	 */
 	if (SPI_connect() != SPI_OK_CONNECT)
 		return 0;
+
+	/*
+	 * ★ P7-N68（2026-10-05）：本机有这笔事务的参与登记、协调组号却为空 ⇒ **权威的
+	 * "还没决议"**。master 严格"先把协调组号下发到全部参与者、全部成功才取
+	 * commit_ts 并决议"（任一下发失败 dtx_remote_scalar 即 ERROR、本事务中止）；决议的 commit_ts 必然晚于此刻
+	 * 读者的快照，按不可见处理正确。原来这里因为一个候选都没有而算作"没问到"，读者
+	 * 报可重试错误 —— master 在决议前就失败的孤儿 PREPARED（断电时很常见）要等 Citus
+	 * 恢复回滚才消失，期间碰到同一行的读写全部失败（实测回归里转账连续 30 次失败）。
+	 */
+	if (coord_gsid <= 0)
+	{
+		snprintf(sql, sizeof(sql),
+				 "SELECT bool_and(coord_gsid IS NULL) FROM partdist.dtx_participant "
+				 " WHERE dtxid = %lld", (long long) dtxid);
+		if (SPI_execute(sql, true, 0) == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			bool		isnull;
+			Datum		d = SPI_getbinval(SPI_tuptable->vals[0],
+										  SPI_tuptable->tupdesc, 1, &isnull);
+
+			if (!isnull && DatumGetBool(d))
+			{
+				SPI_finish();
+				*answered = true;
+				return 0;
+			}
+		}
+	}
+
 	/*
 	 * ★ 2026-08-17（R-P4-14）：候选是**协调组全部成员**（primary +
 	 * secondary_nodes），不再只认 partition_map.primary_node。
@@ -1032,12 +1061,13 @@ typedef struct DtxCloseMemo
 {
 	Oid			shard;
 	uint64		epoch;
+	bool		complete;		/* 本纪元那次闭合时全部数据节点可达（P7-N52 之四） */
 } DtxCloseMemo;
 
 static HTAB *close_memo = NULL;
 
 bool
-DtxReaderCloseOrphan(Oid shard)
+DtxReaderCloseOrphan(Oid shard, bool *search_complete)
 {
 	DtxCloseMemo *m;
 	bool		found;
@@ -1058,18 +1088,32 @@ DtxReaderCloseOrphan(Oid shard)
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 	(void) reader_memo_get(0, false);	/* 确保纪元回调已挂 */
+	*search_complete = false;
 	m = (DtxCloseMemo *) hash_search(close_memo, &shard, HASH_ENTER, &found);
 	if (found && m->epoch == xact_epoch)
+	{
+		*search_complete = m->complete;
 		return false;
+	}
 	m->epoch = xact_epoch;
+	m->complete = false;
 
 	conn = dtx_reader_selfconn();
 	if (conn == NULL)
 		return false;
-	snprintf(sql, sizeof(sql), "SELECT partdist.dtx_close_indoubt(%u::oid)",
+	/*
+	 * ★ P7-N52（之四）：可达性要在闭合**之后**量 —— 闭合期间问过的节点此刻仍可达，
+	 * 才能说"全网都问到了"。
+	 */
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist.dtx_close_indoubt(%u::oid), "
+			 "partdist.pg_raft_all_data_peers_reachable()",
 			 (unsigned) shard);
 	res = PQexec(conn, sql);
-	ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
+	ok = (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1);
+	if (ok)
+		m->complete = (strcmp(PQgetvalue(res, 0, 1), "t") == 0);
+	*search_complete = m->complete;
 	PQclear(res);
 
 	/* 闭合可能刚学到判决：清掉本纪元的失败标记，让后续元组能再问一次 */

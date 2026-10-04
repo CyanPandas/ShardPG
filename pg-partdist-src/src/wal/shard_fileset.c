@@ -2165,7 +2165,7 @@ typedef struct ReprovisionArgs
 static char *
 reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
 {
-    char        sql[256];
+    char        sql[512];
     char       *host = NULL;
     char       *portstr;
     char        conninfo[256];
@@ -2203,11 +2203,19 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
         return msg;
     }
     /*
+     * ★ P7-N64：还要本地副本不**持久**残缺（索引 0 字节且没有在途基线标记 —— 典型是
+     * 供副本中途断电、重启后丢了内存里的半程标记）。**在途基线不算**：首版把在途也算进来，
+     * 新主一上任就给正在收基线的成员再发一次全量基线、把它截空重来，基线永远收不了尾，
+     * 回归里"基线未收尾"从 0 次涨到 159 次、换主拖到数分钟（2026-10-05 撤回）。
+     *
      * 健康副本 = armed 且回放不在 failed 态。P7-N32：armed 但 failed（典型是流内空洞，永久追不上）
      * 的副本同样要重供 —— 否则它挂着一个坏槽位，升主前置对它恒 -1，这台等于从候选池里消失。
      */
     snprintf(sql, sizeof(sql),
-             "SELECT coalesce((SELECT armed AND state <> 'failed' FROM partdist.replay_status() "
+             "SELECT coalesce((SELECT armed AND state <> 'failed' "
+             "                    AND (partdist.shard_baseline_pending(shard) "
+             "                         OR NOT partdist.shard_local_copy_broken(shard)) "
+             "                 FROM partdist.replay_status() "
              "WHERE shard = partdist.local_partition_for_shard(%lld)), false)::text",
              (long long) gsid);
     res = PQexec(conn, sql);
@@ -2764,6 +2772,14 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
     struct dirent  *de;
     StringInfoData  out;
     int             nrepaired = 0, nskipped = 0, nstale = 0;
+    /*
+     * ★ P7-N66（2026-10-05）：可选参数 = 只修这一个分片。升主前置原先调无参版本，
+     * 替本节点**所有**带分叉标记的分片发基线 —— 每发一次都要抢那个组的复制认领位、
+     * 凑那个组的多数派；断电后一台节点同时升主十几个组时，这就把互不相干的组串成了
+     * 等待链（实测组 107401 的升主前置等了 5 分钟被取消，期间该分片读写全不可用）。
+     * 别的分片的分叉照旧由心跳工作者的自动修复（无参版本）处理。
+     */
+    Oid             only = (PG_NARGS() > 0 && !PG_ARGISNULL(0)) ? PG_GETARG_OID(0) : InvalidOid;
 
     if (!superuser())
         ereport(ERROR,
@@ -2784,6 +2800,8 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
         if (de->d_name[0] < '0' || de->d_name[0] > '9')
             continue;
         shard = (Oid) strtoul(de->d_name, NULL, 10);
+        if (OidIsValid(only) && shard != only)
+            continue;
         reason = ShardDivergedReason(shard);
         if (reason == NULL)
             continue;
@@ -2929,6 +2947,19 @@ PartDistRoutePromoteEx(Oid shard_oid, bool emit_handover)
     if (!OidIsValid(shard_oid))
         return;
 
+    /*
+     * ★ P7-N61（2026-10-05）：**先继承打标身份（原 ③），再置"已升主"（①）**。
+     * 反过来的话，两步之间读闸门已按"已升主"放行，可见性却还认不出这是打标表、
+     * 退回原生规则拿别的节点发的分片 xid 查本机 clog（N61 的同一缺陷的另一个入口）。
+     */
+    if (ShardClogDirExists(shard_oid))
+    {
+        ShardMvccEnsureWatermarkFile(shard_oid);
+        ShardMvccSetAdd(shard_oid);
+        elog(LOG, "pg_partdist: 分片 %u 升主时继承打标身份（pg_shard_clog 存在）",
+             shard_oid);
+    }
+
     /* ① 角色 */
     ShardReplicaSetPromoted(shard_oid, true);
 
@@ -2957,13 +2988,7 @@ PartDistRoutePromoteEx(Oid shard_oid, bool emit_handover)
      * 不做的事：不碰 `partition_map.shard_mvcc` 真相列。那是控制面的事，
      * 由 group0 复制；这里只负责"本节点认得出自己手上这张表是打标表"。
      */
-    if (ShardClogDirExists(shard_oid))
-    {
-        ShardMvccEnsureWatermarkFile(shard_oid);
-        ShardMvccSetAdd(shard_oid);
-        elog(LOG, "pg_partdist: 分片 %u 升主时继承打标身份（pg_shard_clog 存在）",
-             shard_oid);
-    }
+    /* ③ 已挪到 ① 之前（P7-N61），见上 */
 
     /*
      * ④ **文件号交接**（T7.3 / R-P6-16，2026-09-09 补）。

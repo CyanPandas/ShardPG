@@ -273,18 +273,20 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 					 * 协调组明确答"未决"（vd == 0）的是正常进行中的两阶段提交，照旧按未提交处理，
 					 * 不能让并发读因此报错。
 					 * 做法：vd == 3 先就地跑一次本分片的 in-doubt 闭合（升主序列用的同一段代码，
-					 * 全网求决议、落分片 clog），再读一次槽位；vd == 4 报可重试的串行化错误
+					 * 全网求决议、落分片 clog），再读一次槽位，仍找不到时只有全部数据节点可达
+					 * 才按未决处理、否则报错（之四）；vd == 4 报可重试的串行化错误
 					 * （协调组在，重试大概率问得到）—— 宁可让客户端重试，也不给出不一致的结果。
 					 * 剪枝 / 清理 / 等锁路径不走这里（strict=false）。
 					 */
 					if (strict && (vd == 3 || vd == 4))
 					{
 						ShardClogSlot slot2;
+						bool		search_complete = false;
 
 						if (vd == 3)
 						{
 							/* 本事务里该分片的闭合可能已经跑过（限流）——照样重读槽位 */
-							(void) DtxReaderCloseOrphan(shard);
+							(void) DtxReaderCloseOrphan(shard, &search_complete);
 							(void) ShardClogReadSlot(shard, sxid, &slot2);
 							if ((TxnStatus) slot2.status == TXN_COMMITTED ||
 								(TxnStatus) slot2.status == TXN_ABORTED)
@@ -305,7 +307,15 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 						 * 事务让该分片的读连续报错数分钟。残留风险：判决存在但此刻全网都问不到
 						 * （协调组多数派不可达 / 成员 apply 落后），这一次读按未提交处理。
 						 */
-						if (vd == 3)
+						/*
+						 * ★ P7-N52（之四，2026-10-05）：只有"全部数据节点都问到了"才能这么判。
+						 * 协调组 leader 写下 COMMIT 决议、客户端已收到提交成功后随即断电时，
+						 * follower 持有那条记录却还没 apply，新 leader 选出之前全网都查不到 ——
+						 * 那台断电的节点此刻必然不可达。按未提交处理就是同一快照里部分可见。
+						 * 有节点不可达 ⇒ 报可重试错误；代价是节点宕机期间，永远没决议的孤儿
+						 * 事务所在分片的读会报错，直到节点回来（或孤儿被闭合）。
+						 */
+						if (vd == 3 && search_complete)
 							return SXID_RUNNING;
 						ereport(ERROR,
 								(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -313,7 +323,8 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 										"本次读取给不出一致的结果", shard,
 										(long long) slot.global_xid),
 								 errdetail("这笔事务在本分片上还是 PREPARED，协调组的决议没取到（%s）。",
-										   "问询协调组没有答复"),
+										   vd == 3 ? "本机没有未决登记，就地闭合时有数据节点不可达"
+										   : "问询协调组没有答复"),
 								 errhint("稍后重试本事务（P7-N52）。")));
 					}
 				}

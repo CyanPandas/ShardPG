@@ -29,6 +29,7 @@
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
 #include "shard_xid.h"                 /* T5.4b-2：vacuum 水位落盘 */
+#include "shard_clog.h"                /* P7-N61：ShardClogDirExists */
 
 #include "access/heapam.h"              /* heap_inplace_update */
 #include "access/relation.h"
@@ -625,7 +626,19 @@ ShardReplicaAccessGate(Oid relid, const char *what)
      * 进而写本地 WAL —— 对遗留副本**依然存在**。但那是 T6.3c 之前就有的状况，
      * 收窄并没有让它变差；而遗留副本本就是要退役的一支。
      */
-    if (!TransactionIdIsValid(ShardXidAllocWatermark(relid)))
+    /*
+     * ★ P7-N61（2026-10-05）：没有分配器水位 ≠ 遗留副本。
+     *
+     * 打标分片的副本壳表在**升主之前**本地也没有水位（升主时才由 PartDistRoutePromoteEx
+     * 按 pg_shard_clog 证据继承）。旧判据把它当"遗留副本"放行，读随后在可见性里查不到
+     * 打标身份、xid_map 里也没有这些分片 xid ⇒ 退回 PG 原生规则，**拿别的节点发的分片 xid
+     * 去查本机原生 clog** —— 结果近乎随机。实测：master 把路由切到新 leader、而新 leader
+     * 自己还没 apply 那条登记的 2 秒窗口里，一次读把该分片流里一笔**被中止的灌数 INSERT**
+     * 的 20 行判成已提交，与现行数据一起读出（256 读成 276）。
+     * 证据目录 pg_shard_clog/<oid> 只在流里带过分片 xid 时才建，它在 ⇔ 打标分片。
+     */
+    if (!TransactionIdIsValid(ShardXidAllocWatermark(relid)) &&
+        !ShardClogDirExists(relid))
         return;
 
     /*

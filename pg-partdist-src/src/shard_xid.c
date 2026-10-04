@@ -1268,6 +1268,41 @@ ShardXidClaimOnPromote(Oid shard)
 		break;
 	}
 
+	/*
+	 * ★ P7-N67（2026-10-05，P0 读不一致）：新主的发号起点再抬到"批次边界 + 一个批次"。
+	 *
+	 * 2026-09-06 那次改动让 MARKER 交接旧主的真实 next_xid（不再宽一个批次），理由是
+	 * "字节没入流的号，旧主一旦降级/重做基线，那些元组就不存在于本分片的宇宙里"。
+	 * 前提不成立：主权交接时旧主的文件**一个字节都不截**（T7.3），它降级后带着自己
+	 * 本地**中止尝试**留下的元组继续当 follower、回放新主的流。新主从流里学到的号
+	 * 只到最后一条入流 MARKER，于是把旧主本地已经用过的号再发一遍；旧主回放到新主
+	 * "该号已提交"的标记时，自己那几个中止尝试的幽灵元组随之复活。
+	 * 实测（N52 回归，组 107431 在两个节点之间换主 5 次）：节点 4 任期 5 里红包转账
+	 * 连续失败 30 次，本地留下 xmin 4115…4152 的元组；节点 2 任期 6 从 4120 起发号；
+	 * 节点 4 任期 7 重新升主后，4120/4121 的幽灵元组与真版本同时可见，256 行读成 264 行。
+	 *
+	 * 旧主本地发出去而没入流的号，不会越过它的持久批次水位太远 —— 跳到"已知最大号
+	 * 向上取整到批次边界、再加一个批次"，就盖住旧主自最后一条入流记录以来至少一整批
+	 * （4096 个）号。跳号无害（DEV PLAN T1.2 的裁定）；代价是每次升主每个分片最多
+	 * 跳过两批号，32 位号空间足够。下面的认领区间随之扩大，把这段号在本节点 clog 里
+	 * 一并判 ABORTED（本来就没有任何已提交的事务用过它们）。
+	 */
+	/* 幂等：刚跳过、此后一个号都没发（next == 水位且落在批次边界）就不再跳 —— 升主前置会重试 */
+	if (!(slot->next_xid == slot->watermark && slot->watermark % SHARD_XID_BATCH == 0))
+	{
+		TransactionId base = Max(slot->watermark, slot->next_xid);
+		TransactionId safe = ((base + SHARD_XID_BATCH - 1) / SHARD_XID_BATCH + 1) * SHARD_XID_BATCH;
+
+		if (safe > slot->watermark)
+		{
+			shard_xid_persist_watermark(shard, safe, slot->claim_wm,
+										slot->trunc_before, slot->vacuum_xid);
+			slot->watermark = safe;
+		}
+		if (slot->next_xid < safe)
+			slot->next_xid = safe;
+	}
+
 	from = slot->claim_wm;
 	to = slot->watermark;
 

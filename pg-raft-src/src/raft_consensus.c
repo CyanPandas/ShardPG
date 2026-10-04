@@ -11263,6 +11263,104 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
  * 补写的标记本轮不主动复制（升主语境下本节点即将成为 leader，随后的
  * propose/心跳会带出去）。
  */
+/*
+ * partdist.pg_raft_all_data_peers_reachable() → bool
+ *
+ * ★ P7-N52（之四，2026-10-05）：全部数据节点（除 master）此刻是否都连得上、能执行语句。
+ *
+ * 读者在"本机无未决登记、就地闭合后全网仍找不到判决"时据此决定能不能按"未决"处理。
+ * 找不到判决不等于没有判决：协调组 leader 刚写下 COMMIT 决议（客户端已收到提交成功）
+ * 就断电，follower 已持有那条记录却还没 apply 进 dtx_decision，选出新 leader 之前全网
+ * 都查不到 —— 而那台断电的节点此刻必然连不上。所以：全部可达 ⇒ 查不到即未决；
+ * 有节点不可达 ⇒ 结论不可信，读者报可重试错误。
+ */
+/*
+ * partdist.pg_raft_group_leader_settled(group_id) → bool
+ *
+ * ★ P7-N65（2026-10-05）：本节点是该组 leader，且**已经提交过本任期的条目**、apply 也追到了
+ * 提交点 —— 只有这时它说"我这里没有某条决议"才算数（Raft 的 ReadIndex 前提）。
+ *
+ * 新 leader 刚上任时，前任期留下的条目（可能正是一条已被客户端确认的 COMMIT 决议）还没
+ * 提交、也就没被任何节点 apply；它要等升主前置补提本任期空条目（N35）才顺带提交 ——
+ * 升主前置要排队、要追平，实测这个窗口长达 5 分钟。窗口里 dtx_peek 回答"未决"，读者就把
+ * 已提交的事务当成未提交，同一快照部分可见（总额少 160）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_leader_settled);
+
+Datum
+pg_raft_group_leader_settled(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    RaftGroupCtx ctx;
+    int          state;
+    int64        term;
+    int64        commit_idx;
+    int64        applied;
+    int64        cterm = -1;
+    RaftLogEntry e;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        PG_RETURN_BOOL(false);
+    parse_peers();
+    restore_groups_if_needed();
+    if (!raft_group_ctx(group_id, &ctx))
+        PG_RETURN_BOOL(false);
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    state = ctx.cons->state;
+    term = ctx.cons->current_term;
+    SpinLockRelease(&ctx.cons->mutex);
+    if (state != RAFT_LEADER)
+        PG_RETURN_BOOL(false);
+
+    SpinLockAcquire(&ctx.log->mutex);
+    commit_idx = ctx.log->commit_index;
+    applied = ctx.log->last_applied;
+    if (commit_idx > 0 && log_get_entry_locked(&ctx, commit_idx, &e))
+        cterm = e.term;
+    SpinLockRelease(&ctx.log->mutex);
+
+    PG_RETURN_BOOL(cterm == term && applied >= commit_idx);
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_all_data_peers_reachable);
+
+Datum
+pg_raft_all_data_peers_reachable(PG_FUNCTION_ARGS)
+{
+    int i;
+
+    if (!pg_raft_raft_enabled)
+        PG_RETURN_BOOL(true);
+    parse_peers();
+    for (i = 0; i < n_peers; i++)
+    {
+        char      conninfo[256];
+        PGconn   *conn;
+        PGresult *res;
+        bool      ok;
+
+        if (peers[i].node_id == pg_raft_node_id ||
+            peers[i].node_id == pg_raft_coordinator_node_id)
+            continue;
+        pg_raft_format_conninfo(peers[i].host, peers[i].port,
+                                conninfo, sizeof(conninfo));
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            PQfinish(conn);
+            PG_RETURN_BOOL(false);
+        }
+        res = PQexec(conn, "SELECT 1");
+        ok = (PQresultStatus(res) == PGRES_TUPLES_OK);
+        PQclear(res);
+        PQfinish(conn);
+        if (!ok)
+            PG_RETURN_BOOL(false);
+    }
+    PG_RETURN_BOOL(true);
+}
+
 PG_FUNCTION_INFO_V1(pg_raft_dtx_close_indoubt);
 
 Datum
@@ -11996,6 +12094,11 @@ dtx_master_pre_record_commit(void)
                  "SELECT partdist.dtx_note_coord(%lld, %lld)",
                  (long long) dtxid, (long long) coord_gsid);
         r = dtx_remote_scalar(nodes[i].host, nodes[i].port, qry);
+        /*
+         * ★ P7-N68 注：下发失败时 dtx_remote_scalar 直接 ERROR（本事务随之中止、不会走到决议），
+         * dtx_note_coord 也恒返回整数 —— "先下发到全部参与者、再决议"是严格成立的。参与者本地
+         * "有登记、协调组号为空"因此是权威的"还没决议"（dtx_inquire_core 据此答复）。
+         */
         if (r != NULL)
             pfree(r);
     }

@@ -199,6 +199,16 @@ CREATE OR REPLACE FUNCTION dtx_close_indoubt(
 ) RETURNS integer LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_close_indoubt';
 
+-- ★ P7-N65：本节点是该组 leader 且已提交过本任期条目、apply 追到提交点（dtx_peek 权威未决的前提）
+CREATE OR REPLACE FUNCTION pg_raft_group_leader_settled(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_leader_settled';
+
+-- ★ P7-N52（之四）：全部数据节点此刻是否都可达（读者判"找不到判决 ⇒ 未决"的前提）
+CREATE OR REPLACE FUNCTION pg_raft_all_data_peers_reachable()
+    RETURNS boolean LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_all_data_peers_reachable';
+
 COMMENT ON FUNCTION dtx_close_indoubt(oid) IS
     '对本节点该分区的 parwal 流做 in-doubt 闭合：找出有 DTX_PREPARE 而无闭合记录的 dtxid，按 登记协调组 → 本地决议索引 → 广播 peers → citus 前缀规则 的顺序全网求决议，找到即补写 DTX_COMMIT/ABORT 标记。找不到的保持 in-doubt（NOTICE 报数）。返回闭合数。升主序列在追平之后、对外服务之前调用。';
 
@@ -677,6 +687,13 @@ BEGIN
     --   基线流断了，而前任主手里有完整数据 —— 本节点等多久都等不来 FPI，却赢了选举、
     --   占着 leader 不让（实测组 106976 占了 10 分钟，路由停在前任主上，读写全被拒）。
     --   让位后由有完整数据的成员当选；截止期内仍返回 0 等待（保留 N16 的原意）。
+    -- ★ P7-N64：先看磁盘事实。索引文件 0 字节 = 基线没灌完（重启会丢掉内存里的半程标记），
+    --   等多久都不会好 —— 不等截止期，直接 -1 让位，由完整的成员当选、新主重供本节点。
+    IF NOT partdist.shard_baseline_pending(loid) AND partdist.shard_local_copy_broken(loid) THEN
+        RAISE WARNING 'pg_raft: 分片 % (组 %) 本地副本残缺（索引文件 0 字节，基线未灌完），'
+                      '拒绝升主并让位（P7-N64）', loid, p_group_id;
+        RETURN -1;
+    END IF;
     IF partdist.shard_baseline_pending(loid) THEN
         IF p_force THEN
             RAISE WARNING 'pg_raft: 分片 % (组 %) 全量物理基线过了追平截止期仍未收尾，'
@@ -730,7 +747,8 @@ BEGIN
     --   在册主之后的心跳自动修复（repair_diverged_shards 自己也只让在册主发基线）。
     IF caught_up THEN
         BEGIN
-            PERFORM partdist.repair_diverged_shards();
+            -- ★ P7-N66：只修本分片；别的分片交给心跳自动修复，不让升主互相串等
+            PERFORM partdist.repair_diverged_shards(loid::oid);
         EXCEPTION WHEN OTHERS THEN
             RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
                           loid, p_group_id, SQLERRM;

@@ -825,6 +825,19 @@ CREATE OR REPLACE FUNCTION shard_baseline_pending(p_shard OID)
     RETURNS boolean LANGUAGE c STRICT STABLE
     AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_pending';
 
+-- ★ P7-N64（2026-10-05）：本地这份分片副本是否残缺（不可升主、需要重供）。
+-- "基线半程"标记只在共享内存里，节点重启就丢 —— 实测供副本中途被断电的成员重启后
+-- 标记没了，升主前置放行，堆和主键都是 0 字节的空壳当上了主。这里补一条**磁盘事实**：
+-- 分片任何一个索引文件是 0 字节（btree / hash / gin 都至少有一个元页）⇒ 基线没灌完。
+CREATE OR REPLACE FUNCTION shard_local_copy_broken(p_shard OID)
+    RETURNS boolean LANGUAGE sql STABLE
+AS $fn$
+    SELECT partdist.shard_baseline_pending(p_shard)
+        OR EXISTS (SELECT 1 FROM pg_catalog.pg_index i
+                    WHERE i.indrelid = p_shard
+                      AND pg_catalog.pg_relation_size(i.indexrelid) = 0)
+$fn$;
+
 COMMENT ON FUNCTION shard_baseline_pending(OID) IS
     '收到 FULL_BASELINE（截空本地文件、等 FPI 重建）到收到匹配 BASELINE_END 之间返回真；升主前置见真即不放行。';
 
@@ -1289,6 +1302,11 @@ CREATE OR REPLACE FUNCTION repair_diverged_shards()
     RETURNS TEXT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';
 
+-- ★ P7-N66：只修指定分片（升主前置用，避免一个组的升主替别的组发基线、串成跨组等待链）
+CREATE OR REPLACE FUNCTION repair_diverged_shards(p_only OID)
+    RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';
+
 COMMENT ON FUNCTION repair_diverged_shards() IS
     '把「见到分叉标记就重做基线」从逐个分片手工变成一次调用：扫 pg_parwal 下所有带标记的分片，对本节点能发基线的那些重发（基线成功自动清标），发不出去的（多半不是组 leader / 多数派没恢复）保留标记并计入 skipped。限超级用户。升主路径也会顺带跑一次。';
 
@@ -1599,7 +1617,9 @@ BEGIN
         -- ★ P7-N52（之三）：leader 排空 apply 后本地与组内都查无决议 ⇒ 这是**权威的"未决"**，
         --   返回一行 verdict=0；非 leader 仍返回 0 行（"不知道"）。问询方据此区分
         --   "确实还没决议"（读者按未提交）与"没问到"（读者报可重试错误）。
-        IF v_is_leader THEN
+        -- ★ P7-N65（2026-10-05）：leader 还没提交过本任期的条目时，前任期留下的决议
+        --   可能还在它日志的未提交尾巴里、谁都没 apply —— 这时说"没有"不算数，答"不知道"。
+        IF v_is_leader AND partdist.pg_raft_group_leader_settled(p_coord_gsid) THEN
             verdict := 0; commit_ts := 0;
             RETURN NEXT;
         END IF;
