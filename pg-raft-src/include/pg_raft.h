@@ -51,6 +51,8 @@ typedef struct RaftLeaderShmem
 extern int  pg_raft_node_id;
 extern int  pg_raft_max_groups;          /* T7.23（P7-R2）：组表大小 */
 extern int  pg_raft_probe_interval_ms;
+extern int  pg_raft_self_connect_timeout_s;   /* P7-N8：连回本节点的建连超时 */
+extern int  pg_raft_replicate_batch_max;      /* P7-N41：group commit 每批记录上限（1 = 逐条） */
 extern int  pg_raft_probe_fail_threshold;
 extern int  pg_raft_leader_lease_ms;
 /* 协调节点(master)：group 0 leader 优先落于此节点；且不得作为数据组成员。0=不指定 */

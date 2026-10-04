@@ -32,6 +32,152 @@
 #include "utils/memutils.h"
 
 /* ================================================================== */
+/* P7-N41 group commit：批内延迟 fsync                                  */
+/* ================================================================== */
+
+/*
+ * follower 收一批 AppendEntries（pg_raft_append_entries_batch）时，每条记录各走一次
+ * partwal_follower_append：原来每条都"写字节 + fsync 段文件 + 写 checkpoint + fsync"。
+ * 批内打开延迟模式后：
+ *   · 字节照写（进 OS 缓存），段文件 fsync 与 checkpoint 落盘推迟；
+ *   · 本 backend 内"checkpoint 现在是多少"由这张表回答（ReadPartWALCheckpoint 先查它），
+ *     下一条记录的写入器据此播种，编号照样连续；
+ *   · PartWALDeferSyncEnd：每个分区把碰过的段文件各 fsync 一次，再把 checkpoint 持久化。
+ * 盘上的 checkpoint 只在字节 fsync 之后才前移 —— 崩在批中间，盘上状态与"这批没收到"一致
+ * （尾部多出的未 ack 字节与原逐条路径崩在 write 与 fsync 之间是同一种情形）。
+ * 只在 backend 本地；事务结束（提交或中止）一律清空，见 PartWALDeferSyncReset。
+ */
+#define PARTWAL_DEFER_MAX_PARTS 16
+#define PARTWAL_DEFER_MAX_SEGS  8
+
+typedef struct PartWALDeferEnt
+{
+    Oid             partition_id;
+    RelFileNumber   relfilenode;
+    XLogRecPtr      last_wal_lsn;
+    uint64          last_part_lsn;
+    int             nsegs;
+    XLogSegNo       segs[PARTWAL_DEFER_MAX_SEGS];
+} PartWALDeferEnt;
+
+bool PartWALDeferSync = false;
+static PartWALDeferEnt defer_ents[PARTWAL_DEFER_MAX_PARTS];
+static int  n_defer_ents = 0;
+
+static PartWALDeferEnt *
+defer_find(Oid partition_id)
+{
+    int i;
+
+    for (i = 0; i < n_defer_ents; i++)
+        if (defer_ents[i].partition_id == partition_id)
+            return &defer_ents[i];
+    return NULL;
+}
+
+/* 记下一次被推迟的 fsync；表满 / 段太多返回 false（调用方当场 fsync） */
+static bool
+defer_note(PartitionWALWriter *w)
+{
+    PartWALDeferEnt *e = defer_find(w->partition_id);
+    int              i;
+
+    if (e == NULL)
+    {
+        if (n_defer_ents >= PARTWAL_DEFER_MAX_PARTS)
+            return false;
+        e = &defer_ents[n_defer_ents++];
+        memset(e, 0, sizeof(*e));
+        e->partition_id = w->partition_id;
+    }
+    for (i = 0; i < e->nsegs; i++)
+        if (e->segs[i] == w->current_segno)
+            break;
+    if (i == e->nsegs)
+    {
+        if (e->nsegs >= PARTWAL_DEFER_MAX_SEGS)
+            return false;
+        e->segs[e->nsegs++] = w->current_segno;
+    }
+    e->relfilenode = w->relfilenode;
+    e->last_wal_lsn = w->last_wal_lsn;
+    e->last_part_lsn = w->last_partition_lsn;
+    return true;
+}
+
+static void
+defer_sync_ent(PartWALDeferEnt *e)
+{
+    int i;
+
+    for (i = 0; i < e->nsegs; i++)
+    {
+        char   *rel = GetPartitionWALPath(e->partition_id, e->segs[i]);
+        char    abspath[MAXPGPATH];
+        int     fd;
+
+        snprintf(abspath, MAXPGPATH, "%s/%s", DataDir, rel);
+        pfree(rel);
+        fd = open(abspath, O_WRONLY, 0);
+        if (fd < 0)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: 批量落盘：打不开段文件 \"%s\": %m", abspath)));
+        if (pg_fsync(fd) != 0)
+        {
+            close(fd);
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: 批量落盘：fsync \"%s\" 失败: %m", abspath)));
+        }
+        close(fd);
+    }
+    WritePartWALCheckpoint(e->partition_id, e->relfilenode,
+                           e->last_wal_lsn, e->last_part_lsn);
+}
+
+void
+PartWALDeferSyncBegin(void)
+{
+    n_defer_ents = 0;
+    PartWALDeferSync = true;
+}
+
+/* 返回 fsync 过的分区数；任何 fsync 失败 ERROR */
+int
+PartWALDeferSyncEnd(void)
+{
+    int i;
+    int n = n_defer_ents;
+
+    PartWALDeferSync = false;
+    for (i = 0; i < n_defer_ents; i++)
+        defer_sync_ent(&defer_ents[i]);
+    n_defer_ents = 0;
+    return n;
+}
+
+/* 某分区要被别的路径（截断）直接改盘上状态之前，先把它的推迟部分落实 */
+void
+PartWALDeferSyncPartition(Oid partition_id)
+{
+    PartWALDeferEnt *e;
+
+    if (n_defer_ents == 0 || (e = defer_find(partition_id)) == NULL)
+        return;
+    defer_sync_ent(e);
+    *e = defer_ents[--n_defer_ents];
+}
+
+/* 事务结束（提交 / 中止）：丢弃延迟状态（未 ack，盘上 checkpoint 未前移，无害） */
+void
+PartWALDeferSyncReset(void)
+{
+    PartWALDeferSync = false;
+    n_defer_ents = 0;
+}
+
+/* ================================================================== */
 /* Checkpoint file I/O                                                  */
 /* ================================================================== */
 
@@ -105,6 +251,22 @@ ReadPartWALCheckpoint(Oid partition_id, PartWALCheckpointFile *out)
     int     fd;
     ssize_t nb;
 
+    /* P7-N41：批内延迟模式下，本 backend 看到的是尚未落盘的最新 checkpoint */
+    if (n_defer_ents > 0)
+    {
+        int i;
+
+        for (i = 0; i < n_defer_ents; i++)
+            if (defer_ents[i].partition_id == partition_id)
+            {
+                out->magic = PARTWAL_CHECKPOINT_MAGIC;
+                out->relfilenode = defer_ents[i].relfilenode;
+                out->last_wal_lsn = defer_ents[i].last_wal_lsn;
+                out->last_part_lsn = defer_ents[i].last_part_lsn;
+                return true;
+            }
+    }
+
     snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
              DataDir, PARTITION_WAL_DIR, partition_id,
              PARTWAL_CHECKPOINT_FILENAME);
@@ -123,6 +285,7 @@ ReadPartWALCheckpoint(Oid partition_id, PartWALCheckpointFile *out)
 
     return true;
 }
+
 
 /* ================================================================== */
 /* Segment file helpers                                                 */
@@ -143,6 +306,12 @@ OpenWriterSegment(PartitionWALWriter *writer, XLogSegNo segno)
 
     if (writer->fd >= 0)
     {
+        /* P7-N41：批内延迟模式下换段，旧段的字节当场 fsync（延迟表只记当前段） */
+        if (PartWALDeferSync && pg_fsync(writer->fd) != 0)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: fsync failed for partition %u WAL: %m",
+                            writer->partition_id)));
         close(writer->fd);
         writer->fd = -1;
     }
@@ -364,6 +533,10 @@ FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync)
         ptr       += written;
         remaining -= (int) written;
     }
+
+    /* P7-N41：批内延迟 —— 记账后由 PartWALDeferSyncEnd 统一 fsync + 落 checkpoint */
+    if (with_fsync && PartWALDeferSync && defer_note(writer))
+        with_fsync = false;
 
     if (with_fsync)
     {
@@ -667,6 +840,9 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
     bool           truncated = false;
     uint64         best_kept_plsn = 0;
     XLogRecPtr     last_kept_lsn = InvalidXLogRecPtr;
+
+    /* P7-N41：截断要按盘上状态算，先把本分区批内推迟的 fsync / checkpoint 落实 */
+    PartWALDeferSyncPartition(partition_id);
 
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);

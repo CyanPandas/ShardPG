@@ -10,6 +10,8 @@
 
 int  pg_raft_node_id = 1;
 int  pg_raft_probe_interval_ms = 3000;
+int  pg_raft_self_connect_timeout_s = 10;   /* P7-N8 */
+int  pg_raft_replicate_batch_max = 32;      /* P7-N41 */
 int  pg_raft_probe_fail_threshold = 2;
 int  pg_raft_leader_lease_ms = 10000;
 int  pg_raft_coordinator_node_id = 1;

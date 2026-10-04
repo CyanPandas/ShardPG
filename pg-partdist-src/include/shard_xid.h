@@ -28,10 +28,21 @@
 #define SHARD_XID_BATCH			4096
 
 /* 共享内存固定槽位数（P1 够用；P2 换 DSA/dshash，见 DEV PLAN T1.2） */
-#define SHARD_XID_MAX_SLOTS		64
+/*
+ * ★ 2026-10-03：64 → 256。每节点能当多少个**打标分片的主**（分配器槽位 + 登记集合同尺寸）。
+ * 128 组 / 4 台时每台平时 32 个，宕机切主后会叠到 40+；槽位只有几十字节。
+ */
+#define SHARD_XID_MAX_SLOTS		256
 
 /* 单事务最多触达的分片数（后端本地映射的上限） */
-#define SHARD_XID_MAX_PER_XACT	16
+/*
+ * 2026-10-03：16 → 256。原来一笔事务在一个节点上最多碰 16 个分片打标表，
+ * 128 分区组时一笔跨分区事务在每台 worker 上就要碰 ~32 个分片（实测
+ * "单事务触达的分片数超过上限 16"，演示二灌数据整笔失败）。一个节点承载的
+ * 数据组不会超过 pg_raft.max_groups（演示集群 192），256 足够；DTX 未决登记表
+ * （DTX_PENDING_MAX × 2 × 本值 × 4 字节 ≈ 256 KB 共享内存）随之放大。
+ */
+#define SHARD_XID_MAX_PER_XACT	256
 
 /* T4.6：门控是否开着（GUC 白名单非空 或 有 partition_map 登记） */
 extern bool ShardGatingActive(void);

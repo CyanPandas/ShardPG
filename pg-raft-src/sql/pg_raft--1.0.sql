@@ -235,6 +235,26 @@ CREATE OR REPLACE FUNCTION pg_raft_append_entries(
 COMMENT ON FUNCTION pg_raft_append_entries IS
     'Raft AppendEntries RPC：向 follower 复制日志条目或发送心跳。';
 
+-- P7-N41（2026-10-03）：心跳按对端合并。req = "gid term prev_idx prev_term commit;..."，
+-- 回执每组一行 "gid term ok"。BGW tick 每个对端只发这一条，替代逐组逐对端的 AppendEntries 心跳。
+CREATE OR REPLACE FUNCTION pg_raft_heartbeat_multi(p_leader_id integer, p_req text)
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_heartbeat_multi';
+
+COMMENT ON FUNCTION pg_raft_heartbeat_multi(integer, text) IS
+    'P7-N41 合并心跳：一条 RPC 携带本节点作为 leader 的全部组对该 follower 的心跳。';
+
+-- P7-N41（2026-10-03）：数据组 group commit 的接收端 —— 一批连续 OP_PARWAL 条目，全批落盘后一次 fsync 再 ack。
+CREATE OR REPLACE FUNCTION pg_raft_append_entries_batch(
+    p_term bigint, p_leader_id integer, p_prev_log_index bigint, p_prev_log_term bigint,
+    p_leader_commit bigint, p_group_id bigint, p_entry_index bigint[], p_entry_term bigint,
+    p_entry_payload text[], p_entry_data_hex text[])
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_append_entries_batch';
+
+COMMENT ON FUNCTION pg_raft_append_entries_batch(bigint, integer, bigint, bigint, bigint, bigint, bigint[], bigint, text[], text[]) IS
+    'P7-N41 批量 AppendEntries：数据组一批 parwal 记录一条 RPC、对端一次 fsync。';
+
 CREATE OR REPLACE FUNCTION pg_raft_apply_committed()
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_apply_committed';

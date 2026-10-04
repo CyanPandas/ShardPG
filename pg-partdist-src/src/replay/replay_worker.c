@@ -1720,28 +1720,62 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
     if (ReplayCtl == NULL)
         ereport(ERROR, (errmsg("replay_reclaim_stale: 回放共享内存未初始化")));
 
-    /* ---- 1) 释放槽位：关系已不存在、且无人认领 ---- */
-    LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
-    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+    /*
+     * ---- 1) 释放槽位：关系已不存在、且无人认领 ----
+     *
+     * ★ P7-N55（2026-10-03）：**不许持着 ReplayCtl->lock 查 pg_class**。
+     * 原来在排他锁里逐个 SearchSysCacheExists1(RELOID)：syscache 不命中就要读 pg_class 的页
+     * （buffer 内容锁）；而任何正在扫 pg_class 的后端是**持着 buffer 内容锁**进可见性挂钩
+     * ShardReplayProtectedRel 去拿 ReplayCtl->lock 共享锁的（那边的锁序是"buffer → ReplayCtl"，
+     * 见该函数注释）—— 两边各持一把、各等一把，LWLock 不做死锁检测，整台节点冻死：
+     * 128 分区组建组时实测 w4 上 300 个后端全卡在 LWLockAcquire、SIGTERM 都杀不掉、连接打满。
+     * 改成：共享锁下抄出候选 → 放锁查目录 → 排他锁下按"槽位没变"复核后释放。
+     */
     {
-        ReplayShardSlot *s = &ReplayCtl->slots[i];
+        Oid     cand[REPLAY_MAX_SHARDS];
+        int     cslot[REPLAY_MAX_SHARDS];
+        bool    gone[REPLAY_MAX_SHARDS];
+        int     nc = 0;
+        int     k;
 
-        if (s->shard_oid == InvalidOid)
-            continue;
-        if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
-            continue;                   /* 有活着的 worker 认领着，不动 */
-        if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(s->shard_oid)))
-            continue;                   /* 关系还在 */
+        LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+        for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        {
+            ReplayShardSlot *s = &ReplayCtl->slots[i];
 
-        ereport(LOG,
-                (errmsg("pg_partdist replay: 回收陈旧槽位 shard %u（关系已不存在）",
-                        s->shard_oid)));
-        memset(s, 0, sizeof(ReplayShardSlot));
-        nslots++;
+            if (s->shard_oid == InvalidOid)
+                continue;
+            if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
+                continue;               /* 有活着的 worker 认领着，不动 */
+            cand[nc] = s->shard_oid;
+            cslot[nc] = i;
+            nc++;
+        }
+        LWLockRelease(ReplayCtl->lock);
+
+        for (k = 0; k < nc; k++)        /* 锁外查目录 */
+            gone[k] = !SearchSysCacheExists1(RELOID, ObjectIdGetDatum(cand[k]));
+
+        LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+        for (k = 0; k < nc; k++)
+        {
+            ReplayShardSlot *s = &ReplayCtl->slots[cslot[k]];
+
+            if (!gone[k] || s->shard_oid != cand[k])
+                continue;               /* 关系还在 / 槽位已换人 */
+            if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
+                continue;               /* 期间被认领了 */
+
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: 回收陈旧槽位 shard %u（关系已不存在）",
+                            s->shard_oid)));
+            memset(s, 0, sizeof(ReplayShardSlot));
+            nslots++;
+        }
+        if (nslots > 0)
+            ReplayRecountReplicasLocked();
+        LWLockRelease(ReplayCtl->lock);
     }
-    if (nslots > 0)
-        ReplayRecountReplicasLocked();
-    LWLockRelease(ReplayCtl->lock);
 
     /* ---- 2) 删目录：关系已不存在、且过了宽限期 ---- */
     snprintf(dirpath, MAXPGPATH, "%s/%s", DataDir, PARTITION_WAL_DIR);

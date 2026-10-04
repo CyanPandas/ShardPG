@@ -272,7 +272,12 @@ typedef uint64 (*ShardReplayCatchUpFn) (Oid shard_oid, uint64 bound,
 /* 共享内存：认领槽位 + 副本文件豁免哈希（补丁 0002 的判据）           */
 /* ------------------------------------------------------------------ */
 
-#define REPLAY_MAX_SHARDS 64
+/*
+ * ★ 2026-10-03：64 → 256。每节点能当多少个分片的**副本**。128 个分片组、副本因子 3、
+ * 4 台 worker 时每台正好 64 个副本 —— 顶格，切一次主（旧主变副本）就溢出。槽位很小
+ * （几十字节），回放由一个工作者池服务（pg_partdist.replay_workers），槽多不加进程。
+ */
+#define REPLAY_MAX_SHARDS 256
 
 /* replay_enable（= armed）的持久化标记文件（pg_parwal/<oid>/ 下） */
 #define REPLAY_ENABLED_FILENAME "replay_enabled"

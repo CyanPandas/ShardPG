@@ -11,6 +11,7 @@
 #include "write_router.h"
 #include "partition_wal.h"
 #include "partwal_sync.h"
+#include "partition_wal_writer.h"	/* P7-N41：PartWALDeferSyncReset */
 #include "demux_worker.h"
 #include "shard_replay.h"
 #include "shard_fileset.h"   /* P7-N25：auto_reprovision_demoted GUC */
@@ -142,6 +143,12 @@ PartWALXactCallback(XactEvent event, void *arg)
 {
     TimeLineID  tli;
     XLogRecPtr  flush_now;
+
+    /* P7-N41：批内延迟 fsync 是单个 RPC 事务内的状态，事务一结束就丢弃 */
+    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT ||
+        event == XACT_EVENT_PARALLEL_ABORT || event == XACT_EVENT_PARALLEL_COMMIT ||
+        event == XACT_EVENT_PREPARE)
+        PartWALDeferSyncReset();
 
     switch (event)
     {

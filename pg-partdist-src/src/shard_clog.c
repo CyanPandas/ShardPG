@@ -500,8 +500,16 @@ ShardClogXactRedo(int nxids, const uint32 *pairs, uint64 commit_ts,
 
 /* ================= DROP TABLE 提交时点 GC ================= */
 
-static Oid	pending_drops[SHARD_CLOG_PENDING_DROPS_MAX];
+/*
+ * ★ 2026-10-03：原来是 `static Oid pending_drops[16]`，单事务 DROP 超过 16 张打标表就
+ * ERROR「单事务最多 DROP 16 张分片打标表」。这个 16 不是任何格式上的限制 —— 2PC 记录本来
+ * 就是变长的（ndrops * sizeof(Oid)）—— 只是进程内数组定长。分片一多就撞：一张 128 分片的
+ * 表铺在 4 台 worker 上，Citus 在每台 worker 的**一个**事务里删掉它的 32 个分片。
+ * 改成按需增长（TopMemoryContext，事务结束复位；容量保留复用）。
+ */
+static Oid *pending_drops = NULL;
 static int	pending_drops_n = 0;
+static int	pending_drops_cap = 0;
 
 void
 ShardClogRememberDrop(Oid shard)
@@ -512,12 +520,15 @@ ShardClogRememberDrop(Oid shard)
 		if (pending_drops[i] == shard)
 			return;
 
-	if (pending_drops_n >= SHARD_CLOG_PENDING_DROPS_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("pg_partdist: 单事务最多 DROP %d 张分片打标表",
-						SHARD_CLOG_PENDING_DROPS_MAX)));
+	if (pending_drops_n >= pending_drops_cap)
+	{
+		int			newcap = pending_drops_cap > 0 ? pending_drops_cap * 2 : 32;
 
+		pending_drops = pending_drops == NULL
+			? (Oid *) MemoryContextAlloc(TopMemoryContext, newcap * sizeof(Oid))
+			: (Oid *) repalloc(pending_drops, newcap * sizeof(Oid));
+		pending_drops_cap = newcap;
+	}
 	pending_drops[pending_drops_n++] = shard;
 }
 
@@ -558,20 +569,18 @@ ShardClogGcDropped(const Oid *oids, int n)
 	int			i;
 	Oid			dropped[SHARD_CLOG_PENDING_DROPS_MAX];
 
-	/* 调用方可能传的就是 pending_drops 本身，先拷一份 */
+	/*
+	 * 调用方可能传的就是 pending_drops 本身（回收过程中会摘共享内存登记、可能触发
+	 * 别的路径），所以分批拷进局部缓冲再动手。★ 2026-10-03：原来超过 16 个时截断
+	 * （P7-N40 时改成了出声截断）；现在 pending_drops 不再有上限，这里就**分批全收**。
+	 */
 	if (n > SHARD_CLOG_PENDING_DROPS_MAX)
 	{
-		/*
-		 * ★ P7-N40（2026-09-27）：原来这里是 `n = Min(n, MAX)` —— 多出来的**静默
-		 * 丢弃**。从 DROP 路径进来不会超（ShardClogRememberDrop 会拦在 16 张），
-		 * 但别的调用方（shard_mvcc_gc_orphans 一次清几十个孤儿）一超就只清了前
-		 * 16 个、而调用方以为全清了。宁可出声：调用方自己分批。
-		 */
-		ereport(WARNING,
-				(errmsg("pg_partdist: 本次只回收 %d 个分片（收到 %d 个，单批上限 %d）",
-						SHARD_CLOG_PENDING_DROPS_MAX, n, SHARD_CLOG_PENDING_DROPS_MAX),
-				 errhint("调用方应按 %d 一批分次调用。", SHARD_CLOG_PENDING_DROPS_MAX)));
-		n = SHARD_CLOG_PENDING_DROPS_MAX;
+		int			done;
+
+		for (done = 0; done < n; done += SHARD_CLOG_PENDING_DROPS_MAX)
+			ShardClogGcDropped(oids + done, Min(n - done, SHARD_CLOG_PENDING_DROPS_MAX));
+		return;
 	}
 	memcpy(dropped, oids, (size_t) n * sizeof(Oid));
 

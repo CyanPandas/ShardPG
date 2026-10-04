@@ -105,6 +105,17 @@ extern bool TruncatePartWALTo(Oid partition_id,
 extern void FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync);
 
 /*
+ * P7-N41 group commit：follower 收一批 AppendEntries 时批内延迟 fsync（backend 本地）。
+ * Begin 打开；End 对碰过的段各 fsync 一次并持久化 checkpoint（失败 ERROR）；
+ * SyncPartition 让某分区提前落实（截断前用）；Reset 在事务结束时丢弃状态。
+ */
+extern bool PartWALDeferSync;
+extern void PartWALDeferSyncBegin(void);
+extern int  PartWALDeferSyncEnd(void);
+extern void PartWALDeferSyncPartition(Oid partition_id);
+extern void PartWALDeferSyncReset(void);
+
+/*
  * WritePartWALCheckpoint — write the checkpoint file for a partition.
  * Called after flushing to record last_wal_lsn and last_part_lsn for
  * crash recovery.

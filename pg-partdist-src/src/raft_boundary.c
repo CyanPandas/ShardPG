@@ -393,6 +393,7 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 	char		   *payload = NULL;
 	uint32			payload_len = 0;
 	bool			ok = false;
+	int				touched_before;
 
 	if (!OidIsValid(partition_id) || !TransactionIdIsNormal(sxid))
 		PG_RETURN_BOOL(false);
@@ -400,6 +401,7 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 	if (ShardClogReadSlot(partition_id, sxid, &slot))
 		sts = (int64) slot.start_ts;
 	ShardClogSetVerdict(partition_id, sxid, committed, committed ? cts : 0);
+	touched_before = PartWALTouchedCount();
 
 	PG_TRY();
 	{
@@ -418,6 +420,7 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(TopMemoryContext);
 		ed = CopyErrorData();
 		FlushErrorState();
+		PartWALTouchedTruncate(touched_before);    /* P7-N51：别让调用方的提交点再复制它 */
 		ereport(WARNING,
 				(errmsg("pg_partdist: 升主闭合 in-doubt：分片 %u xid %u 判决已落本地 clog，"
 						"但判决标记未能复制给副本：%s",
@@ -455,6 +458,26 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_read_record);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_follower_append);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_follower_append_fresh);
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_defer_sync_begin);
+PG_FUNCTION_INFO_V1(pg_partdist_partwal_defer_sync_end);
+
+/*
+ * P7-N41 group commit：pg_raft 的批量 AppendEntries 接收端在批前/批后调这一对。
+ * begin 之后本事务里的 partwal_follower_append* 只写字节不 fsync；end 对碰过的段
+ * 各 fsync 一次、持久化 checkpoint（失败 ERROR），返回涉及的分区数。
+ */
+Datum
+pg_partdist_partwal_defer_sync_begin(PG_FUNCTION_ARGS)
+{
+	PartWALDeferSyncBegin();
+	PG_RETURN_BOOL(true);
+}
+
+Datum
+pg_partdist_partwal_defer_sync_end(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(PartWALDeferSyncEnd());
+}
 PG_FUNCTION_INFO_V1(pg_partdist_follower_set_applied_part_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_truncate_to);
 

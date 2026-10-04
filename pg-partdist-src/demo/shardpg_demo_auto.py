@@ -33,6 +33,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONTAINER = os.environ.get("CONTAINER", "pg-test-container")
 PSQL = "/work/pg-install/bin/psql"
 LAUNCHER = os.path.join(HERE, "shardpg_demo.sh")
+# 两套演示共用启动器（DEMO_PROFILE=4 / 128，由 shardpg_demo.sh / shardpg_demo128.sh 传进来）
+PROFILE = os.environ.get("DEMO_PROFILE", "4")
+LAUNCH_NAME = "shardpg_demo128.sh" if PROFILE == "128" else "shardpg_demo.sh"
+DEMO_TITLE = ("演示二：128 个分区组上的分布式事务" if PROFILE == "128"
+              else "演示一：4 个分片的一张业务表")
 DEFAULT_STEPS = os.path.join(HERE, "shardpg_demo_steps.sql")
 
 SPEED = {"fast": (0.003, 0.4), "normal": (0.014, 1.6), "slow": (0.035, 3.0)}   # (每字符秒, 语句间停顿秒)
@@ -303,8 +308,8 @@ def play(steps, term, sessions, first_step, rec):
 
 
 def run_launcher(cmd, term, label, log):
-    """跑 shardpg_demo.sh start/stop，输出实时转出来并记下来"""
-    term.line(term.c("2;37", f"$ bash shardpg_demo.sh {cmd}"))
+    """跑启动器的 start/stop，输出实时转出来并记下来"""
+    term.line(term.c("2;37", f"$ bash {LAUNCH_NAME} {cmd}"))
     p = subprocess.Popen(["bash", LAUNCHER, cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding="utf-8", errors="replace", bufsize=1)
     for ln in p.stdout:
@@ -349,7 +354,7 @@ def main():
     rc = 0
     interrupted = False
     try:
-        term.banner("ShardPG 全自动演示  ·  5 个节点：1 个 master + 4 个 worker")
+        term.banner(f"ShardPG 全自动演示 · {DEMO_TITLE} · 5 个节点：1 master + 4 worker")
         term.line(term.c("2;37", "  下面每一行都是自动“敲”出来的 SQL：A> 是窗口 A，B> 是窗口 B；-- 开头的是旁白。"))
         if not args.no_prepare:
             term.line()
@@ -375,11 +380,11 @@ def main():
         json.dump(rec, open(args.record, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
     if interrupted:
-        term.line("环境保留着；要恢复请运行：bash shardpg_demo.sh stop")
+        term.line(f"环境保留着；要恢复请运行：bash {LAUNCH_NAME} stop")
         return rc
     term.banner("演示结束")
     if args.keep:
-        term.line("环境保留着（--keep）；要恢复请运行：bash shardpg_demo.sh stop")
+        term.line(f"环境保留着（--keep）；要恢复请运行：bash {LAUNCH_NAME} stop")
         return rc
     log = []
     rc2 = run_launcher("stop", term, "恢复环境", log)

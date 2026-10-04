@@ -124,6 +124,17 @@ pg_raft_self_trigger_catchup(void)
     else if (PQntuples(res) > 0 && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
         elog(LOG, "pg_raft: 后台追平通道补发 %s 条", PQgetvalue(res, 0, 0));
     PQclear(res);
+
+    /*
+     * P7-N53（2026-10-03）：顺带做一次路由对账（partition_map → pg_dist_placement）。
+     * 主权登记 apply 时漏拨的（控制面快照安装那一刻实测漏过）在这里补上；函数不存在（老版本 SQL）就忽略。
+     */
+    res = PQexec(conn, "SELECT CASE WHEN to_regprocedure('partdist.reconcile_routing()') IS NULL THEN 0 "
+                       "ELSE partdist.reconcile_routing() END");
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
+        strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+        elog(LOG, "pg_raft: 路由对账补拨 %s 个分片", PQgetvalue(res, 0, 0));
+    PQclear(res);
     PQfinish(conn);
 }
 

@@ -5,6 +5,7 @@
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "postmaster/postmaster.h"	/* PostPortNumber（P7-N8 判自连） */
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -103,9 +104,24 @@ pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t l
             port = 5435;
     }
 
-    snprintf(conninfo, len,
-             "host=%s port=%d dbname=postgres user=postgres connect_timeout=1",
-             host, port);
+    /*
+     * ★ P7-N8（2026-10-03 修）：连**自己**和连**别人**用不同的建连超时。
+     *
+     * 连别人（探活、RPC）要快速判死，1 s 合理。连自己（DTX 参与登记、恢复守护跑
+     * COMMIT PREPARED、拓扑监视器的本机调用）**不可能是对端死了** —— 超时只会在
+     * 本机负载高时发生，而这里一超时就是整条分布式事务被中止（"参与登记失败，中止
+     * prepare"）。实测：建一张 128 分片的表，Citus 每台 worker 开十几条并行连接、各自
+     * 2PC，每个 PREPARE 都要连回本机登记一次，2 vCPU 上 1 s 被打穿，整条 DDL 失败。
+     * 单机多端口拓扑里所有节点都是 127.0.0.1，所以"是不是自己"要看端口。
+     */
+    {
+        bool    is_self = (port == PostPortNumber) &&
+                          (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0);
+
+        snprintf(conninfo, len,
+                 "host=%s port=%d dbname=postgres user=postgres connect_timeout=%d",
+                 host, port, is_self ? pg_raft_self_connect_timeout_s : 1);
+    }
 }
 
 static NodeProbeEntry *
@@ -1051,6 +1067,22 @@ _PG_init(void)
                             "日志环满时等待 apply 追上的上限（毫秒）；0 = 不等，直接丢提案。",
                             "数据组丢提案会让副本与 leader 永久分叉，默认应保持 > 0。",
                             &pg_raft_propose_wait_ms, 10000, 0, 600000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.self_connect_timeout_s",
+                            "Connect timeout (seconds) for libpq connections back to this node.",
+                            "P7-N8: self-connections (DTX participant registration, recovery) cannot "
+                            "fail because the peer is down, only because this node is busy; a short "
+                            "timeout aborts whole distributed transactions under load.",
+                            &pg_raft_self_connect_timeout_s, 10, 1, 300,
+                            PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.replicate_batch_max",
+                            "Max parwal records replicated per data-group AppendEntries batch (group commit).",
+                            "P7-N41: records queued behind the replication claim are shipped in one "
+                            "multi-entry AppendEntries to all members concurrently, and each follower "
+                            "fsyncs once per batch. 1 = legacy one-record-per-round path.",
+                            &pg_raft_replicate_batch_max, 32, 1, 100,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.probe_interval_ms",

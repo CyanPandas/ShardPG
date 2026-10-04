@@ -549,6 +549,7 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 	int				i;
 	bool			appended = false;
 	bool			ok = true;
+	int				touched_before;
 
 	if (ent->nxids <= 0 || (verdict != 1 && verdict != 2))
 		return true;
@@ -559,6 +560,7 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		return true;
 
 	op = (verdict == 1) ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT;
+	touched_before = PartWALTouchedCount();
 
 	PG_TRY();
 	{
@@ -607,6 +609,14 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		MemoryContextSwitchTo(TopMemoryContext);
 		ed = CopyErrorData();
 		FlushErrorState();
+
+		/*
+		 * ★ P7-N51（2026-10-03）：撤回本次登进 touched 表的分区。不撤的话，调用方（常常是
+		 * 一条只读查询的可见性挂钩在闭合 in-doubt）自己的提交点 flush 会再复制一遍它、
+		 * 照样被写栅栏拒 ⇒ **只读 SELECT 报错**（演示二断电后实测：w1 丢了组 104517 的主，
+		 * 之后对 wallet 的每一次查询都 ERROR）。标记字节留在本地流里当孤儿，清扫时重试。
+		 */
+		PartWALTouchedTruncate(touched_before);
 
 		/*
 		 * ★ P7-N12（2026-09-17）：这里原先只告警、调用方照样注销未决登记。

@@ -73,6 +73,7 @@ typedef struct PartWALSlot
  * One lock covers both the ring buffer and the relfilenode hash.
  */
 #define PARTWAL_LOST_MAX 16
+#define PARTWAL_REPROV_QUEUE_MAX 256
 
 typedef struct PartWALCtlData
 {
@@ -102,10 +103,29 @@ typedef struct PartWALCtlData
     bool           diverged_pending;
     TimestampTz    repair_last_try;
 
+    /*
+     * 2026-10-03：自动归队（重供副本）请求的等待队列。一台 worker 宕机再回来，
+     * 新主们要为它重供几十个分片（128 组时 32 个），每个都拉一个一次性工作者；
+     * max_worker_processes 不够时原来直接丢掉（WARNING 让人手补），实测 28 个分片
+     * 永远没重供上。现在拉不起就排队：在跑的归队工作者做完自己那个就接着从队列取，
+     * 心跳工作者看到队列非空也会再拉一个。
+     */
+    int            reprov_n;
+    int            reprov_active;   /* 正在跑的归队工作者数（并发上限见 PartDistLaunchReprovision） */
+    int64          reprov_gsid[PARTWAL_REPROV_QUEUE_MAX];
+    int32          reprov_target[PARTWAL_REPROV_QUEUE_MAX];
+
     PartWALSlot    slots[PARTWAL_BUFFER_SLOTS];
 } PartWALCtlData;
 
 extern PGDLLIMPORT PartWALCtlData *PartWALCtl;
+
+/* 自动归队请求队列（见 PartWALCtlData.reprov_*） */
+extern bool PartWALReprovQueuePush(int64 gsid, int32 target);
+extern bool PartWALReprovQueuePop(int64 *gsid, int32 *target);
+extern int  PartWALReprovQueueLen(void);
+extern bool PartWALReprovTryBegin(int max_active);   /* 未到上限则 active++ 并返回 true */
+extern void PartWALReprovEnd(void);                  /* active-- */
 
 /* ------------------------------------------------------------------ */
 /* Shared-memory lifecycle                                              */
@@ -271,6 +291,9 @@ extern void  PartWALEndTxn(void);
  *   记录（如 DTX_PREPARE 标记）、需要再复制一轮"的路径使用。
  */
 extern int   PartWALCopyTouched(Oid *out, int max);
+/* P7-N43：尽力而为 CTRL 发射失败后撤回 touched 登记；发射期间复制失败不打分叉标记 */
+extern void PartWALTouchedTruncate(int n);
+extern void PartWALSetBestEffortCtrl(bool on);
 extern int   PartWALTouchedCount(void);
 extern void  PartWALNoteTouchedPartition(Oid partition_id);
 

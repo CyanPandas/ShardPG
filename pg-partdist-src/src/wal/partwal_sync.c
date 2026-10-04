@@ -224,6 +224,29 @@ PartWALCopyTouched(Oid *out, int max)
     return n;
 }
 
+/*
+ * P7-N43：尽力而为的 CTRL 发射（冻结账目）失败后，把它这次登进 touched 表的分区撤掉。
+ * 不撤的话：同一事务里后面每一次发射都会先去复制这个坏分区、跟着失败；
+ * 而事务提交点的 flush 还会再复制一遍它，把**调用方自己的事务**报错中止
+ * （实测一条只读 SELECT 因此在提交点 ERROR）。撤掉后那条 CTRL 字节留在流里当孤儿，
+ * 下次该分区有复制时随区间一起送走（与 leader 侧失败回滚"字节留作孤儿"同一约定）。
+ */
+void
+PartWALTouchedTruncate(int n)
+{
+    if (n >= 0 && n < partwal_my_ntouched)
+        partwal_my_ntouched = n;
+}
+
+/* P7-N43：尽力而为的 CTRL 发射期间，复制失败不打"分叉"标记（没有物理截断，不会分叉） */
+static bool partwal_ctrl_best_effort = false;
+
+void
+PartWALSetBestEffortCtrl(bool on)
+{
+    partwal_ctrl_best_effort = on;
+}
+
 void
 PartWALNoteTouchedPartition(Oid partition_id)
 {
@@ -270,6 +293,8 @@ PartWALSyncShmemInit(void)
         PartWALCtl->ring_overwrites   = 0;
         PartWALCtl->backpressure_flushes = 0;
         PartWALCtl->nlost             = 0;
+        PartWALCtl->reprov_n          = 0;    /* 2026-10-03：自动归队等待队列 */
+        PartWALCtl->reprov_active     = 0;
         PartWALCtl->lost_overflow     = false;
         PartWALCtl->diverged_pending  = true;   /* 重启前留下的分叉标记也要修 */
         PartWALCtl->repair_last_try   = 0;
@@ -1220,8 +1245,14 @@ PartWALReplicateTouched(void)
         }
         PG_CATCH();
         {
-            ShardMarkDiverged(part, "复制挂钩失败：本事务已中止，但 leader 侧的"
-                              "物理截断不随回滚撤销，副本可能已分叉（§13 约束 13）");
+            /*
+             * P7-N43：冻结账目这类尽力而为的 CTRL 发射不带物理截断，复制失败不会分叉；
+             * 原来照样打分叉标记 ⇒ 心跳工作者自动 repair_diverged_shards() 重做物理基线 ——
+             * 128 组建组期间组主一漂，每个分区每分钟都被误判一次，平白多出成批的重供。
+             */
+            if (!partwal_ctrl_best_effort)
+                ShardMarkDiverged(part, "复制挂钩失败：本事务已中止，但 leader 侧的"
+                                  "物理截断不随回滚撤销，副本可能已分叉（§13 约束 13）");
             PG_RE_THROW();
         }
         PG_END_TRY();
@@ -1341,6 +1372,89 @@ PartWALDivergedRepairDue(int interval_ms)
     }
     LWLockRelease(PartWALCtl->lock);
     return due;
+}
+
+/* 自动归队请求排队（去重）；队列满返回 false */
+bool
+PartWALReprovQueuePush(int64 gsid, int32 target)
+{
+    int  i;
+    bool ok = false;
+
+    if (PartWALCtl == NULL)
+        return false;
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    for (i = 0; i < PartWALCtl->reprov_n; i++)
+        if (PartWALCtl->reprov_gsid[i] == gsid && PartWALCtl->reprov_target[i] == target)
+            break;
+    if (i < PartWALCtl->reprov_n)
+        ok = true;              /* 已在队里 */
+    else if (PartWALCtl->reprov_n < PARTWAL_REPROV_QUEUE_MAX)
+    {
+        PartWALCtl->reprov_gsid[PartWALCtl->reprov_n] = gsid;
+        PartWALCtl->reprov_target[PartWALCtl->reprov_n] = target;
+        PartWALCtl->reprov_n++;
+        ok = true;
+    }
+    LWLockRelease(PartWALCtl->lock);
+    return ok;
+}
+
+bool
+PartWALReprovQueuePop(int64 *gsid, int32 *target)
+{
+    bool got = false;
+
+    if (PartWALCtl == NULL)
+        return false;
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    if (PartWALCtl->reprov_n > 0)
+    {
+        *gsid = PartWALCtl->reprov_gsid[0];
+        *target = PartWALCtl->reprov_target[0];
+        PartWALCtl->reprov_n--;
+        memmove(&PartWALCtl->reprov_gsid[0], &PartWALCtl->reprov_gsid[1],
+                sizeof(int64) * PartWALCtl->reprov_n);
+        memmove(&PartWALCtl->reprov_target[0], &PartWALCtl->reprov_target[1],
+                sizeof(int32) * PartWALCtl->reprov_n);
+        got = true;
+    }
+    LWLockRelease(PartWALCtl->lock);
+    return got;
+}
+
+bool
+PartWALReprovTryBegin(int max_active)
+{
+    bool ok = false;
+
+    if (PartWALCtl == NULL)
+        return true;
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    if (PartWALCtl->reprov_active < max_active)
+    {
+        PartWALCtl->reprov_active++;
+        ok = true;
+    }
+    LWLockRelease(PartWALCtl->lock);
+    return ok;
+}
+
+void
+PartWALReprovEnd(void)
+{
+    if (PartWALCtl == NULL)
+        return;
+    LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+    if (PartWALCtl->reprov_active > 0)
+        PartWALCtl->reprov_active--;
+    LWLockRelease(PartWALCtl->lock);
+}
+
+int
+PartWALReprovQueueLen(void)
+{
+    return PartWALCtl != NULL ? PartWALCtl->reprov_n : 0;
 }
 
 /* 观测面：partdist.partwal_ring_stats() */

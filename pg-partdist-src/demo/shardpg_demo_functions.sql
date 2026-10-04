@@ -545,7 +545,7 @@ END $$;
 
 -- ⑦ 同一节点上的混合角色一览（行 = 节点，列 = 分片）
 CREATE FUNCTION demo.roles(p_tbl regclass)
-RETURNS TABLE(节点 text, "S1" text, "S2" text, "S3" text, 小结 text)
+RETURNS TABLE(节点 text, "S1" text, "S2" text, "S3" text, "S4" text, 小结 text)
 LANGUAGE plpgsql AS $$
 DECLARE w text; sid bigint; v text; f text[]; cells text[]; nl int; nf int; i int;
 BEGIN
@@ -557,6 +557,7 @@ BEGIN
                                    'coalesce((SELECT armed::text||''/''||applied FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(%1$s)), ''''), '
                                    '(SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id = %1$s))', sid));
             IF v IS NULL THEN cells := cells || '✗ 宕机'::text; CONTINUE; END IF;
+            IF NOT demo.is_member(sid, w) THEN cells := cells || '·（不在组内）'::text; CONTINUE; END IF;
             f := string_to_array(v, '|');
             IF f[4]::int > 1 THEN cells := cells || format('⚠ 重复槽位（%s）', f[1]); nf := nf + 1;
             ELSIF f[1] = 'leader' THEN cells := cells || format('★ leader（任期%s）', f[2]); nl := nl + 1;
@@ -568,7 +569,7 @@ BEGIN
             ELSE cells := cells || f[1]; END IF;
         END LOOP;
         节点 := w || ' :' || (SELECT port FROM demo.node WHERE name = w);
-        "S1" := cells[1]; "S2" := cells[2]; "S3" := cells[3];
+        "S1" := cells[1]; "S2" := cells[2]; "S3" := cells[3]; "S4" := cells[4];
         小结 := CASE WHEN cells[1] = '✗ 宕机' THEN '宕机' ELSE format('%s 个 leader + %s 个 follower', nl, nf) END;
         RETURN NEXT;
     END LOOP;
@@ -659,7 +660,7 @@ BEGIN
         主的持久化水位 := split_part(v, '|', 2) || '（按 4096 一批落盘，崩溃后从批次上界续发）';
         主节点的原生xid := split_part(v, '|', 3)::bigint;
         reps := NULL;
-        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp LOOP
+        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp AND demo.is_member(sid, x) LOOP
             v := demo.pq(w, format('SELECT coalesce(substring(partdist.route_status(partdist.local_partition_for_shard(%s)) from ''xid_watermark=([0-9]+)''), ''?'')', sid));
             reps := concat_ws('，', reps, w || '=' || coalesce(v, '宕机'));
         END LOOP;
@@ -741,7 +742,7 @@ BEGIN
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         lp := demo.leader(sid);
         tip := demo.pq(lp, format('SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(%s))::text', sid))::bigint;
-        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp LOOP
+        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp AND demo.is_member(sid, x) LOOP
             v := demo.pq(w, format('SELECT concat_ws(''|'', partdist.get_follower_applied_part_lsn(partdist.local_partition_for_shard(%1$s)), '
                                    'coalesce((SELECT applied::text||''|''||armed::text||''|''||state FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(%1$s)), ''||''))', sid));
             分片 := demo.slabel(p_tbl, sid); 主 := lp; 主的流位点 := tip; 从 := w;
@@ -766,7 +767,7 @@ BEGIN
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         lp := demo.leader(sid);
         tip := demo.pq(lp, format('SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(%s))::text', sid))::bigint;
-        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp LOOP
+        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp AND demo.is_member(sid, x) LOOP
             分片 := demo.slabel(p_tbl, sid); 从 := w;
             回放前 := demo.pq(w, format('SELECT applied::text FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(%s)', sid))::bigint;
             IF 回放前 IS NULL THEN 目标 := NULL; 回放后 := NULL; 耗时_ms := NULL; RETURN NEXT; CONTINUE; END IF;
@@ -797,7 +798,7 @@ BEGIN
     END LOOP;
     FOREACH sid IN ARRAY demo.sids(p_tbl) LOOP
         lp := demo.leader(sid); rel := p_tbl::text || '_' || sid;
-        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp LOOP
+        FOR w IN SELECT x FROM demo.workers() x WHERE x IS DISTINCT FROM lp AND demo.is_member(sid, x) LOOP
             分片 := demo.slabel(p_tbl, sid); 主 := lp; 从 := w;
             IF demo.pq(w, 'SELECT 1::text') IS NULL THEN 主堆 := '✗ 宕机'; 主键索引 := '✗ 宕机'; RETURN NEXT; CONTINUE; END IF;
             tail_gap := demo.pq(lp, format('SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(%s))::text', sid))::bigint
@@ -984,7 +985,7 @@ CREATE FUNCTION demo.help() RETURNS TABLE(函数 text, 作用 text) LANGUAGE sql
     ('demo.replay(''表'')',                   '惰性回放：从已收到 vs 已回放'),
     ('demo.replicas(''表'')',                 '各分区的副本信息：主、副本、已收到/已回放/待回放'),
     ('demo.distribution(''表'')',             '各分片的数据量（行数、余额、占比），直接读各 worker 上的分片表'),
-    ('demo.setup(''表'')',                    '一条命令：建组 → 自发选主 → 供副本 → 打标（start 已替你做好）'),
+    ('demo.setup(''表'')',                    '一条命令：建组（副本因子 3）→ 选主 → 供副本 → 打标（start 已替你做好）'),
     ('demo.catchup(''表'')',                  '触发回放，让每个从追平'),
     ('demo.compare(''表'')',                  '副本与主逐字节比对'),
     ('demo.switch_leader(''表'', ''S1'')',    '手动切换 leader（同组内挑一台；实时打出切主过程）'),
@@ -999,19 +1000,27 @@ SELECT '演示函数已安装（SELECT * FROM demo.help(); 查看）' AS 安装�
 -- 新版演示（5 节点，按真实部署的逻辑走）用的三个函数
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- 建组时把成员集记下来：切主之后"谁是成员"不变，不能再按当前主去推算
+CREATE TABLE demo.group_member(sid bigint, raft_id int, PRIMARY KEY (sid, raft_id));
+
 -- 某个分片的 Raft 组成员：以数据所在节点为起点，按端口顺序取 p_rf 台 worker。
 -- p_rf 为空 = 全部 worker（演示默认）；给定数字则取前 p_rf 台。
 CREATE FUNCTION demo.member_ids(p_sid bigint, p_rf int DEFAULT NULL) RETURNS int[]
 LANGUAGE sql STABLE AS $$
-    -- p_rf 为空 = 全部 worker（默认）。
-    -- ⚠ 实测：副本因子小于 worker 数时，组建好、副本还没供的那一刻组内没人有这个分片，
-    --   第一条 parwal 记录凑不齐多数派，provision_shard_replica 会直接报
-    --   "建壳表失败: record 1 未达多数派"。所以演示默认让每台 worker 都进组。
+    -- 建过组的分片：成员集以建组时登记的为准（demo.group_member）。
+    -- 没登记过：以数据所在节点为起点按端口轮转取 p_rf 台（p_rf 为空 = 3 台，不足 3 台取全部）。
+    -- 2026-10-03：副本因子不再等于 worker 数 —— 组多了以后每组都放满所有 worker 开销太大，
+    --   也不符合实际；建组改走产品的 raft_replicate_table_shards_bulk（它解决了"组建好、副本
+    --   还没供的那一刻凑不齐多数派"的问题：placement 先当选、副本再入组、逐个供）。
+    SELECT CASE WHEN p_rf IS NULL AND EXISTS (SELECT 1 FROM demo.group_member g WHERE g.sid = p_sid)
+                THEN (SELECT array_agg(raft_id ORDER BY raft_id) FROM demo.group_member g WHERE g.sid = p_sid)
+                ELSE (
     WITH w AS (SELECT name, port, raft_id, row_number() OVER (ORDER BY port) - 1 AS i,
                       count(*) OVER () AS n FROM demo.node WHERE kind = 'worker'),
          start AS (SELECT i FROM w WHERE name = demo.route_node(p_sid))
     SELECT array_agg(raft_id ORDER BY ((i - (SELECT i FROM start) + n) % n))
-      FROM w WHERE ((i - (SELECT i FROM start) + n) % n) < coalesce(p_rf, (SELECT n FROM w LIMIT 1))
+      FROM w WHERE ((i - (SELECT i FROM start) + n) % n) < least(coalesce(p_rf, 3), (SELECT n FROM w LIMIT 1))
+                ) END
 $$;
 
 -- 同上，给 pg_raft_group_create 用的 SQL 字面量
@@ -1020,8 +1029,6 @@ LANGUAGE sql STABLE AS $$
     SELECT 'ARRAY[' || array_to_string(demo.member_ids(p_sid, p_rf), ',') || ']'
 $$;
 
--- 建组时把成员集记下来：切主之后"谁是成员"不变，不能再按当前主去推算
-CREATE TABLE demo.group_member(sid bigint, raft_id int, PRIMARY KEY (sid, raft_id));
 
 -- 某节点是不是这个分片组的成员（没登记过成员的组按"全体 worker"算，兼容旧流程）
 CREATE FUNCTION demo.is_member(p_sid bigint, p_node text) RETURNS boolean
@@ -1037,8 +1044,8 @@ $$;
 CREATE FUNCTION demo.setup(p_tbl regclass, p_rf int DEFAULT NULL)
 RETURNS TABLE(分片 text, 数据在 text, leader text, 副本 text, 选举轮次 int, 事务系统 text)
 LANGUAGE plpgsql AS $$
-DECLARE v_sid bigint; w text; t0 timestamptz := clock_timestamp(); sids bigint[]; mem text; r record; n int;
-        i int; bad int := 0; detail text := '';
+DECLARE v_sid bigint; w text; t0 timestamptz := clock_timestamp(); sids bigint[]; r record;
+        i int; bad int := 0; detail text := ''; v_rf int; todo bigint[]; failed bigint[];
 BEGIN
     FOR w IN SELECT demo.workers() LOOP
         PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
@@ -1046,44 +1053,48 @@ BEGIN
     sids := demo.sids(p_tbl);
     INSERT INTO demo.managed VALUES (p_tbl::text, sids)
         ON CONFLICT (tbl) DO UPDATE SET shardids = EXCLUDED.shardids;
-    RAISE NOTICE '① 每个分片建一个 Raft 组（成员 = % 台 worker），然后**不干预**，等它们自发选主',
-        coalesce(p_rf, (SELECT count(*)::int FROM demo.node WHERE kind = 'worker'));
-    FOREACH v_sid IN ARRAY sids LOOP
-        mem := demo.members_sql(v_sid, p_rf);
-        DELETE FROM demo.group_member g WHERE g.sid = v_sid;   -- 变量改名 v_sid：叫 sid 会和列名撞（plpgsql 默认 variable_conflict=error）
-        INSERT INTO demo.group_member(sid, raft_id)
-             SELECT v_sid, unnest(demo.member_ids(v_sid, p_rf));
-        -- 只在**组成员**上建组：在非成员上也建，会留下一个任期 0、永不参与的空壳组
-        FOR w IN SELECT n.name FROM demo.node n
-                  WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(v_sid, p_rf)) ORDER BY n.port LOOP
-            PERFORM demo.q(w, format('SELECT partdist.pg_raft_group_create(%s, %s)::text', v_sid, mem));
+    v_rf := least(coalesce(p_rf, 3), (SELECT count(*)::int FROM demo.node WHERE kind = 'worker'));
+    todo := sids;
+    RAISE NOTICE '① 每个分片建一个 Raft 组（副本因子 %：1 主 + % 副本，成员按数据所在节点轮转取），选主、供副本',
+        v_rf, v_rf - 1;
+    -- 产品函数：placement 先建组当选 → 副本入组 → 等主 → leader 逐个 provision_shard_replica；
+    -- 各 worker 并行。逐分片返回 leader 端口与副本端口，成员集照此登记。
+    -- 分批接入（每批 32 个分片）：上百个分片一次全上会把控制面打满（登记风暴，见 P7-N58）。
+    -- 没过的分片（多半是建组时被没数据的成员抢先当选、或组主刚换还没登记）单独再跑，最多 3 轮。
+    FOR i IN 1..4 LOOP
+        bad := 0; detail := ''; failed := '{}';
+        FOR r IN SELECT b.* FROM generate_series(0, (coalesce(array_length(todo, 1), 0) - 1) / 32) wv(k),
+                        LATERAL partdist.raft_replicate_table_shards_bulk(p_tbl, v_rf - 1, 180, 3,
+                                    (todo)[wv.k * 32 + 1 : wv.k * 32 + 32]) b LOOP
+            IF r.status <> 'ok' THEN
+                bad := bad + 1;
+                failed := failed || r.shardid;
+                detail := detail || format('    分片 %s：%s', r.shardid, left(r.status, 200)) || E'\n';
+            END IF;
+            DELETE FROM demo.group_member g WHERE g.sid = r.shardid;
+            INSERT INTO demo.group_member(sid, raft_id)
+                 SELECT r.shardid, n.raft_id FROM demo.node n
+                  WHERE n.kind = 'worker' AND n.port = ANY (r.replica_ports || r.leader_port);
         END LOOP;
+        EXIT WHEN bad = 0;
+        RAISE NOTICE '   % 个分片没接好，单独再跑一轮（第 % 轮）', bad, i;
+        todo := failed;
     END LOOP;
-    -- 等每个分片都选出主并登记（没有数据的成员当选会被升主前置拒绝、自动让位，见第 6 步）
-    FOR n IN 1..600 LOOP
-        EXIT WHEN (SELECT bool_and(demo.reg(x) IS NOT NULL AND demo.reg(x) = demo.leader(x)) FROM unnest(sids) x);
-        PERFORM pg_sleep(0.5);
-    END LOOP;
-    IF NOT (SELECT bool_and(demo.reg(x) IS NOT NULL AND demo.reg(x) = demo.leader(x)) FROM unnest(sids) x) THEN
-        RAISE EXCEPTION '等了 300 s 仍有分片没选出主并登记：%',
-            (SELECT string_agg(demo.slabel(p_tbl, x) || '→leader=' || coalesce(demo.leader(x), '无')
-                               || '/登记=' || coalesce(demo.reg(x), '无'), '，' ORDER BY x) FROM unnest(sids) x)
-            USING HINT = '看各节点 pg.log 里的“当选 LEADER”和“升主前置”；清场后重试：bash shardpg_demo.sh stop';
+    IF bad > 0 THEN
+        RAISE EXCEPTION E'建组 / 供副本失败 % 个分片：\n%', bad, detail
+            USING HINT = '清场后重试：bash shardpg_demo.sh stop';
     END IF;
-    RAISE NOTICE '   选主完成（% s）：%', round(extract(epoch from clock_timestamp() - t0))::text,
-        (SELECT string_agg(demo.slabel(p_tbl, x) || '→' || coalesce(demo.leader(x), '?')
-                           || '（任期 ' || coalesce(split_part(demo.gstate(demo.leader(x), x), '|', 2), '?') || '）', '，' ORDER BY x)
-           FROM unnest(sids) x);
-    RAISE NOTICE '② 在每个组的主上把副本供到组内其余成员（物理基线进分区流）';
-    -- 用 demo.raft_replicas：它带一轮"没 armed 就从当前主再供一遍"的补供。
-    -- 必须有这一层 —— 建组后、副本还没供的那一刻，组里没人能落盘流里最早那条记录，
-    -- 第一次基线发射会报 "record 1 未达多数派"；补供时壳表已经在了，就过得去。
-    PERFORM count(*) FROM demo.raft_replicas(p_tbl);
-    RAISE NOTICE '③ 打标：接入分片级 xid + 分片级 clog + TSO 时间戳（必须在写入之前做，分片得是空的）';
+    RAISE NOTICE '   建组 + 供副本完成（% s）：%', round(extract(epoch from clock_timestamp() - t0))::text,
+        (SELECT string_agg(demo.slabel(p_tbl, x) || '→主 ' || coalesce(demo.leader(x), '?'), '，' ORDER BY x) FROM unnest(sids) x);
+    RAISE NOTICE '② 打标：接入分片级 xid + 分片级 clog + TSO 时间戳（必须在写入之前做，分片得是空的）';
     -- 这一步**必须把失败当失败**：原先直接 PERFORM，status 列被丢掉，
     -- 某个分片没登记上也只在结果表里显示"未接入"，演示就带着一半没接入的表往下走了。
-    FOR i IN 1..2 LOOP
+    -- 打标在 Citus placement（= 路由指向的那台）上做。组主刚漂移、路由还没跟过去时，
+    -- placement 那台已经是副本壳表，会报"打标只在 placement 上登记"——等路由跟上再试（幂等）。
+    -- 128 个分区组时实测有这种窗口，所以重试到 90 s。
+    FOR i IN 1..30 LOOP
         bad := 0; detail := '';
+        PERFORM partdist.reconcile_routing();     -- 路由先对齐控制面登记（漏拨的补上）
         FOR r IN SELECT * FROM partdist.set_table_shard_mvcc(p_tbl) LOOP
             IF r.status !~ '^(registered|already)' THEN
                 bad := bad + 1;
@@ -1091,10 +1102,10 @@ BEGIN
             END IF;
         END LOOP;
         EXIT WHEN bad = 0;
-        IF i = 1 THEN
-            RAISE NOTICE '   有 % 个分片没登记上，重试一次（登记是幂等的）', bad;
-            PERFORM pg_sleep(1);
+        IF i = 1 OR i % 10 = 0 THEN
+            RAISE NOTICE '   有 % 个分片没登记上（多半是组主刚换、路由还没跟上），稍后重试（登记是幂等的）', bad;
         END IF;
+        PERFORM pg_sleep(3);
     END LOOP;
     IF bad > 0 THEN
         RAISE EXCEPTION E'打标失败 % 个分片，演示不能继续：\n%', bad, detail
@@ -1107,7 +1118,7 @@ BEGIN
         数据在 := demo.route_node(v_sid);
         leader := demo.leader(v_sid);
         副本 := (SELECT string_agg(n.name, ', ' ORDER BY n.port) FROM demo.node n
-                  WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(v_sid, p_rf))
+                  WHERE n.kind = 'worker' AND n.raft_id = ANY (demo.member_ids(v_sid))
                     AND n.name IS DISTINCT FROM demo.leader(v_sid));
         选举轮次 := nullif(split_part(demo.gstate(demo.leader(v_sid), v_sid), '|', 2), '')::int;
         事务系统 := CASE WHEN demo.pq(demo.leader(v_sid),

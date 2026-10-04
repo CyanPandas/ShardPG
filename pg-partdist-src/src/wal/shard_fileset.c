@@ -927,6 +927,7 @@ typedef struct ShardFreezeFile
 
 /* GUC：两次冻结账目检查之间的最小间隔；0 = 每个事务都查（测试用） */
 int freeze_sync_interval_ms = 60000;
+#define SHARD_FREEZE_EMIT_BUDGET_MS 500     /* P7-N43：每轮发射的时间预算 */
 
 /*
  * 本 backend 是否执行过用户语句 —— 冻结发射器的白名单开关。
@@ -1176,6 +1177,7 @@ ShardFreezeEmitOne(Oid shard_oid)
     PartWALCtrlFreezeUpdate *payload;
     uint32                   payload_len;
     MemoryContext            oldcxt;
+    int                      touched_before;
 
     /* 只走 syscache —— 见 BuildShardFreeze 头部关于"提交回调里不许取锁"的说明 */
     n = BuildShardFreeze(shard_oid, cur);
@@ -1206,14 +1208,20 @@ ShardFreezeEmitOne(Oid shard_oid)
      * 失败时**不更新基线**，于是下一次检查会重发；等领导权回来自然补上。
      */
     oldcxt = CurrentMemoryContext;      /* 必须在 PG_TRY 之前存 */
+    touched_before = PartWALTouchedCount();
+    PartWALSetBestEffortCtrl(true);
     PG_TRY();
     {
         PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FREEZE_UPDATE,
                           (const char *) payload, payload_len);
+        PartWALSetBestEffortCtrl(false);
     }
     PG_CATCH();
     {
         ErrorData *ed;
+
+        PartWALSetBestEffortCtrl(false);
+        PartWALTouchedTruncate(touched_before);    /* P7-N43：别让坏分区连累后续发射与本事务提交 */
 
         /*
          * 先切回进 PG_TRY 之前的上下文再 CopyErrorData —— 它断言
@@ -1369,15 +1377,36 @@ ShardFreezeMaybeEmitUpdates(void)
 
     nparts = PartWALSyncListPartitions(parts, lengthof(parts));
 
-    for (p = 0; p < nparts; p++)
+    /*
+     * ★ P7-N43（2026-10-03，128 分区组实测）：本轮发射有**时间预算**，从随机位置起轮转。
+     *
+     * 这一轮是挂在**某个普通事务的提交点**上跑的。原来一口气把本节点全部分区过一遍：
+     * 128 组时每台 ~100 个分区，新建的分区头一次全都要发射，而每一次发射都是一次
+     * 同步 Raft 复制 —— 组主刚漂走就报错（快），组正在供副本、复制认领位被占着就要
+     * 等满 60 s。实测一条只读的 SELECT pg_raft_group_status() 在提交点被扣了 25 分钟以上。
+     * 账目是慢变量：超出预算的分区留到下一轮（间隔 freeze_sync_interval_ms）；起点随机，
+     * 免得排在前面的那几个分区每轮都把预算吃光、后面的永远轮不到。
+     * 剩余风险：单次发射本身若撞上被占着的认领位，仍可能等到 60 s（一分钟至多一个事务）。
+     */
     {
-        ShardFileSet probe;
+        TimestampTz t0 = GetCurrentTimestamp();
+        int         start = nparts > 0 ? (int) (random() % nparts) : 0;
+        int         k;
 
-        /* 没有持久化 fileset 的分区不归本节点维护（follower 侧天然为空） */
-        if (!LoadShardFileSet(parts[p], &probe))
-            continue;
+        for (k = 0; k < nparts; k++)
+        {
+            ShardFileSet probe;
 
-        (void) ShardFreezeEmitOne(parts[p]);
+            p = (start + k) % nparts;
+            if (k > 0 && TimestampDifferenceExceeds(t0, GetCurrentTimestamp(), SHARD_FREEZE_EMIT_BUDGET_MS))
+                break;
+
+            /* 没有持久化 fileset 的分区不归本节点维护（follower 侧天然为空） */
+            if (!LoadShardFileSet(parts[p], &probe))
+                continue;
+
+            (void) ShardFreezeEmitOne(parts[p]);
+        }
     }
 }
 
@@ -2310,11 +2339,20 @@ partdist_reprovision_demoted(PG_FUNCTION_ARGS)
 
 PGDLLEXPORT void PartDistReprovisionWorkerMain(Datum main_arg);
 
+static void reprovision_one(ReprovisionArgs a);
+
+#define PARTDIST_REPROV_MAX_ACTIVE 2    /* 每节点同时跑的归队工作者上限 */
+
+static void
+reprov_worker_exit(int code, Datum arg)
+{
+    PartWALReprovEnd();
+}
+
 void
 PartDistReprovisionWorkerMain(Datum main_arg)
 {
     ReprovisionArgs a;
-    int             attempt;
 
     (void) main_arg;
     memcpy(&a, MyBgworkerEntry->bgw_extra, sizeof(a));
@@ -2322,6 +2360,27 @@ PartDistReprovisionWorkerMain(Datum main_arg)
     BackgroundWorkerUnblockSignals();
     /* 新进程的 latch 可能已置位，不先复位的话首轮 WaitLatch 立即返回、5 s 延迟形同虚设（实测 0.2 s 就开供） */
     ResetLatch(MyLatch);
+
+    before_shmem_exit(reprov_worker_exit, (Datum) 0);  /* 名额在退出时还回去 */
+    reprovision_one(a);
+
+    /*
+     * 2026-10-03：做完自己那个，接着把排队的请求做掉（拉工作者时槽位满了就排队，
+     * 见 PartDistLaunchReprovision）。一个节点同时只需要少数几个归队工作者。
+     */
+    while (PartWALReprovQueuePop(&a.gsid, &a.target))
+    {
+        elog(LOG, "pg_partdist: 自动归队工作者接手排队的请求：分片 %lld → 节点 %d",
+             (long long) a.gsid, a.target);
+        reprovision_one(a);
+    }
+    proc_exit(0);
+}
+
+static void
+reprovision_one(ReprovisionArgs a)
+{
+    int             attempt;
 
     /*
      * 首轮先等 5 s：刚登记完的新主还在广播 fileset 交接、写冻结账目，
@@ -2373,12 +2432,11 @@ PartDistReprovisionWorkerMain(Datum main_arg)
         if (finished)
             break;
     }
-    proc_exit(0);
 }
 
 /*
  * 在"本节点被登记为分片 gsid 的新主"那次 apply 里调用；target = 0 表示逐个检查全部从副本。
- * 不抛错：拉不起工作者（槽位满）只留 WARNING —— 退化为修前行为，人手可补
+ * 不抛错：拉不起工作者（槽位满）就排队（2026-10-03），队列也满了才 WARNING 让人手补
  * provision_shard_replica。
  */
 void
@@ -2390,6 +2448,27 @@ PartDistLaunchReprovision(int64 gsid, int32 target)
 
     if (!partdist_auto_reprovision_demoted)
         return;
+
+    /*
+     * 2026-10-03：同时跑的归队工作者有上限。一台 worker 断电回来要重供几十个分片，
+     * 一口气全拉起来（演示二实测十几个并发物理基线）会把各节点 CPU 吃满，心跳送不到，
+     * 刚回来的节点超时竞选、抢走一批组的主（见 P7-N50）。超出上限的排队，
+     * 由在跑的工作者做完自己那个接着取。
+     */
+    if (!PartWALReprovTryBegin(PARTDIST_REPROV_MAX_ACTIVE))
+    {
+        if (PartWALReprovQueuePush(gsid, target))
+            ereport(LOG,
+                    (errmsg("pg_partdist: 自动归队请求（分片 %lld → 节点 %d）排队：已有 %d 个归队工作者在跑",
+                            (long long) gsid, target, PARTDIST_REPROV_MAX_ACTIVE)));
+        else
+            ereport(WARNING,
+                    (errmsg("pg_partdist: 自动归队等待队列已满，分片 %lld → 节点 %d 的请求丢弃",
+                            (long long) gsid, target),
+                     errhint("在当前主上手工执行 SELECT partdist.provision_shard_replica(%lld, %d)。",
+                             (long long) gsid, target)));
+        return;
+    }
 
     memset(&w, 0, sizeof(w));
     w.bgw_flags = BGWORKER_SHMEM_ACCESS;
@@ -2405,11 +2484,20 @@ PartDistLaunchReprovision(int64 gsid, int32 target)
     memcpy(w.bgw_extra, &a, sizeof(a));
 
     if (!RegisterDynamicBackgroundWorker(&w, &h))
-        ereport(WARNING,
-                (errmsg("pg_partdist: 拉不起自动归队工作者（分片 %lld → 节点 %d），"
-                        "后台工作者槽位已满", (long long) gsid, target),
-                 errhint("在当前主上手工执行 SELECT partdist.provision_shard_replica(%lld, %d)。",
-                         (long long) gsid, target)));
+    {
+        PartWALReprovEnd();     /* 没拉起来：名额还回去 */
+        /* 2026-10-03：槽位满了就排队，由在跑的归队工作者或心跳工作者接手 */
+        if (PartWALReprovQueuePush(gsid, target))
+            ereport(LOG,
+                    (errmsg("pg_partdist: 后台工作者槽位已满，自动归队请求（分片 %lld → 节点 %d）已排队",
+                            (long long) gsid, target)));
+        else
+            ereport(WARNING,
+                    (errmsg("pg_partdist: 拉不起自动归队工作者（分片 %lld → 节点 %d），"
+                            "后台工作者槽位已满且等待队列已满", (long long) gsid, target),
+                     errhint("在当前主上手工执行 SELECT partdist.provision_shard_replica(%lld, %d)。",
+                             (long long) gsid, target)));
+    }
     else
         ereport(LOG,
                 (errmsg("pg_partdist: 已拉起自动归队工作者：分片 %lld（%s；没有 armed 回放槽位的成员"

@@ -773,6 +773,13 @@ CREATE OR REPLACE FUNCTION partwal_follower_append_fresh(
 ) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append_fresh';
 
+-- P7-N41（2026-10-03）：group commit —— follower 收一批 AppendEntries 时批内只写不 fsync，
+-- 批尾 end 一次 fsync 碰过的段并持久化 checkpoint（失败报错 ⇒ 不 ack）。
+CREATE OR REPLACE FUNCTION partwal_defer_sync_begin() RETURNS boolean
+    LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'pg_partdist_partwal_defer_sync_begin';
+CREATE OR REPLACE FUNCTION partwal_defer_sync_end() RETURNS integer
+    LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'pg_partdist_partwal_defer_sync_end';
+
 -- Raft 日志截断时同步截断 parwal：被截断条目的字节若滞留，切主后新 leader
 -- 会把不同记录写到同一个 partition_lsn 上，幂等去重反而会保留错误内容。
 CREATE OR REPLACE FUNCTION partwal_truncate_to(
@@ -1852,6 +1859,324 @@ BEGIN
     END LOOP;
 END;
 $fn$;
+-- ------------------------------------------------------------------
+-- ★ 2026-10-03：raft_replicate_table_shards 的并行版（上百个分片组用）
+-- ------------------------------------------------------------------
+-- raft_replicate_table_shards 逐分片串行：每片"建组 → 领先 3 s → 副本入组 → 等当选 →
+-- 逐个供副本"，实测约 28 s/片，128 个分片就是一个小时。本函数沿用同一套已验证的顺序与
+-- 同一条成员轮转规则（placement 之后按 groupid 轮转挑 p_replicas 个），但**所有分片一起推进**：
+--
+--   ⓪ 各 worker 重建分片身份（并行）；
+--   ① 每台 worker 一条命令，把它当 placement 的那些组一次建完（4 台并行）；
+--   ② 等 3 s（placement 领先），再每台一条命令让它当副本的那些组入组（并行）；
+--   ③ 轮询各 worker 的组状态，等每个分片的 placement 当选；超时没落到 placement 的
+--      分片拆组重来（最多 p_rounds 轮）—— 与原函数同一处置；
+--   ④ 供副本：每台 leader 一轮发一个 provision_shard_replica，4 台并行（同一台上仍串行，
+--      避免同一 leader 上多个基线互相抢复制认领位）；失败的最后再补供一遍。
+--
+-- 每个 provision 仍是独立事务（与原函数一致）。返回每个分片一行状态。
+DROP FUNCTION IF EXISTS raft_replicate_table_shards_bulk(regclass, integer, integer, integer);
+-- p_shards：只处理这些分片（NULL = 全部）。2026-10-04：上百个分片一次全上会把控制面打满
+-- （登记风暴，P7-N58），调用方可以按批（如每批 32 个）分几次调。
+CREATE OR REPLACE FUNCTION raft_replicate_table_shards_bulk(
+    p_table    regclass,
+    p_replicas integer DEFAULT 2,
+    p_elect_timeout_s integer DEFAULT 180,
+    p_rounds   integer DEFAULT 3,
+    p_shards   bigint[] DEFAULT NULL
+) RETURNS TABLE(shardid bigint, leader_port integer, replica_ports integer[], status text)
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    w           record;
+    v_hosts     text[]    := '{}';
+    v_ports     integer[] := '{}';
+    v_nids      integer[] := '{}';
+    v_n         integer;
+    v_cmds      text[];
+    v_h         text[];
+    v_p         integer[];
+    v_i         integer;
+    v_k         integer;
+    v_round     integer;
+    v_t0        timestamptz;
+    v_last_note timestamptz;
+    v_total     integer;
+    v_done      integer;
+    v_pending   integer;
+    v_res_cmd   text;
+    v_armed     integer;
+    r           record;
+BEGIN
+    IF p_replicas < 1 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: p_replicas 必须 >= 1';
+    END IF;
+
+    -- ⓪ worker 清单与 raft 节点号
+    FOR w IN SELECT n.nodename, n.nodeport FROM pg_catalog.pg_dist_node n
+              WHERE n.noderole = 'primary' AND n.groupid <> 0 AND n.isactive ORDER BY n.groupid
+    LOOP
+        v_hosts := v_hosts || w.nodename::text;
+        v_ports := v_ports || w.nodeport;
+    END LOOP;
+    v_n := coalesce(array_length(v_ports, 1), 0);
+    IF p_replicas > v_n - 1 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: 要 % 个副本，但除 placement 外只有 % 个 worker',
+            p_replicas, v_n - 1;
+    END IF;
+    v_cmds := array_fill('SHOW pg_raft.node_id'::text, ARRAY[v_n]);
+    FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+        IF NOT r.success OR r.result !~ '^[0-9]+$' THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards_bulk: 取不到 %:% 的 pg_raft.node_id（%）',
+                r.node_name, r.node_port, r.result;
+        END IF;
+        v_nids[array_position(v_ports, r.node_port)] := r.result::integer;
+    END LOOP;
+    v_cmds := array_fill('SELECT partdist.rebuild_shard_identity()::text'::text, ARRAY[v_n]);
+    FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+        IF NOT r.success THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards_bulk: %:% 上重建分片身份失败（%）',
+                r.node_name, r.node_port, r.result;
+        END IF;
+    END LOOP;
+
+    -- 每个分片：placement 下标、成员（raft 节点号）、副本下标
+    DROP TABLE IF EXISTS pg_temp._rtsb;
+    CREATE TEMP TABLE _rtsb (sid bigint PRIMARY KEY, pidx int, members int[], ridx int[],
+                             elected bool DEFAULT false, prov_ok int DEFAULT 0, st text);
+    INSERT INTO _rtsb (sid, pidx, members, ridx)
+    SELECT s.shardid, x.pidx,
+           ARRAY[v_nids[x.pidx]] || ARRAY(SELECT v_nids[((x.pidx - 1 + k) % v_n) + 1] FROM generate_series(1, p_replicas) k ORDER BY k),
+           ARRAY(SELECT ((x.pidx - 1 + k) % v_n) + 1 FROM generate_series(1, p_replicas) k ORDER BY k)
+      FROM pg_catalog.pg_dist_shard s
+      JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+      JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+      CROSS JOIN LATERAL (SELECT array_position(v_ports, n.nodeport) AS pidx) x
+     WHERE s.logicalrelid = p_table
+       AND (p_shards IS NULL OR s.shardid = ANY (p_shards));
+    SELECT count(*) INTO v_total FROM _rtsb;
+    IF v_total = 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: % 没有任何分片', p_table;
+    END IF;
+    UPDATE _rtsb SET st = 'placement 节点不在 worker 列表里' WHERE pidx IS NULL;
+
+    FOR v_round IN 1..p_rounds LOOP
+        -- ① placement 建组（每台一条批量命令，并行）
+        v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+        FOR v_i IN 1..v_n LOOP
+            SELECT 'SELECT count(*) FILTER (WHERE partdist.pg_raft_group_create(g, m))::text FROM (VALUES '
+                   || string_agg(format('(%s::bigint, %L::integer[])', sid, members), ',') || ') v(g, m)'
+              INTO v_res_cmd FROM _rtsb WHERE pidx = v_i AND NOT elected AND st IS NULL;
+            IF v_res_cmd IS NOT NULL THEN
+                v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+            END IF;
+        END LOOP;
+        EXIT WHEN coalesce(array_length(v_cmds, 1), 0) = 0;
+        PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+        PERFORM pg_catalog.pg_sleep(1);
+
+        -- ③ 等 placement 当选（轮询各 worker 的 leader 组清单）
+        v_t0 := clock_timestamp(); v_last_note := v_t0;
+        LOOP
+            v_cmds := array_fill('SELECT coalesce(string_agg(group_id::text, '',''), '''') FROM partdist.pg_raft_group_status() WHERE state = ''leader'' AND group_id <> 0'::text, ARRAY[v_n]);
+            FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+                IF r.success AND r.result <> '' THEN
+                    UPDATE _rtsb SET elected = true
+                     WHERE NOT elected AND pidx = array_position(v_ports, r.node_port)
+                       AND sid = ANY (string_to_array(r.result, ',')::bigint[]);
+                END IF;
+            END LOOP;
+            SELECT count(*) FILTER (WHERE elected) INTO v_done FROM _rtsb;
+            EXIT WHEN v_done + (SELECT count(*) FROM _rtsb WHERE st IS NOT NULL AND NOT elected) >= v_total;
+            EXIT WHEN clock_timestamp() - v_t0 > make_interval(secs => p_elect_timeout_s);
+            IF clock_timestamp() - v_last_note > interval '10 seconds' THEN
+                RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 轮，已有 %/% 个分片由 placement 当选', v_round, v_done, v_total;
+                v_last_note := clock_timestamp();
+            END IF;
+            PERFORM pg_catalog.pg_sleep(2);
+        END LOOP;
+        SELECT count(*) INTO v_pending FROM _rtsb WHERE NOT elected AND st IS NULL;
+        EXIT WHEN v_pending = 0;
+        RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 轮结束仍有 % 个分片的主没落在 placement，拆组重来', v_round, v_pending;
+        -- 拆这些组（在全部成员上），下一轮重建
+        v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+        FOR v_i IN 1..v_n LOOP
+            SELECT 'SELECT count(partdist.pg_raft_group_drop(g))::text FROM unnest(ARRAY['
+                   || string_agg(sid::text, ',') || ']::bigint[]) g'
+              INTO v_res_cmd FROM _rtsb WHERE NOT elected AND st IS NULL AND (pidx = v_i OR v_i = ANY (ridx));
+            IF v_res_cmd IS NOT NULL THEN
+                v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+            END IF;
+        END LOOP;
+        IF coalesce(array_length(v_cmds, 1), 0) > 0 THEN
+            PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+        END IF;
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+    UPDATE _rtsb SET st = format('%s 轮后组主仍未落在 placement', p_rounds) WHERE NOT elected AND st IS NULL;
+
+    -- ② 副本入组（每台一条批量命令，并行）—— **在 placement 当选之后**才做。
+    --    2026-10-03：原来建完 placement 组 sleep 3 s 就入组；选举超时 15 s 时 placement 还没来得及竞选，
+    --    已知成员集的副本可能先超时、先当选（它没有数据），之后要靠升主前置 -1 让位 —— 每节点的升主前置
+    --    是串行的，几十个组排队一百多秒，供副本那一步正撞上"主在没数据的成员上"（实测 32 个分片失败）。
+    --    入组之前副本那边只有 hearsay 建出的组：照常投票、但成员集未知不会主动竞选。
+    v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+    FOR v_i IN 1..v_n LOOP
+        SELECT 'SELECT count(*) FILTER (WHERE partdist.pg_raft_group_create(g, m))::text FROM (VALUES '
+               || string_agg(format('(%s::bigint, %L::integer[])', sid, members), ',') || ') v(g, m)'
+          INTO v_res_cmd FROM _rtsb WHERE v_i = ANY (ridx) AND elected AND st IS NULL;
+        IF v_res_cmd IS NOT NULL THEN
+            v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+        END IF;
+    END LOOP;
+    IF coalesce(array_length(v_cmds, 1), 0) > 0 THEN
+        PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+    END IF;
+
+
+    -- ④ 供副本。每一遍先**重新读**每个组当前的主、以及哪些成员已经有 armed 的回放槽位，
+    --    只给"不是当前主、又还没 armed"的成员供，从**当前主**发起：
+    --    CPU 饱和时组主可能在建组之后漂到别的成员（2026-10-03 实测 128 组时 44 个分片因此失败，
+    --    "provision_shard_replica: 本节点不是分片的主"）。当选的成员一定持有数据（没有数据的成员
+    --    当选会被升主前置拒绝并让位），所以从它供是对的；被替下来的原主同样要重新供成副本。
+    --    第 k 轮每台 leader 发它的第 k 个（各台并行，同台串行），最多 p_rounds 遍。
+    DROP TABLE IF EXISTS pg_temp._rtsb_prov;
+    CREATE TEMP TABLE _rtsb_prov (sid bigint, lidx int, target int, seq int, result text, ok bool DEFAULT false);
+    ALTER TABLE _rtsb ADD COLUMN lidx int;
+    ALTER TABLE _rtsb ADD COLUMN armed int[] DEFAULT '{}';
+    ALTER TABLE _rtsb ADD COLUMN prov_err text;
+    -- 时间预算按"有没有进展"算：p_elect_timeout_s * 5 秒内没有任何一个副本新 armed 才放弃
+    -- （组主刚换时要等它向控制面登记完才能供；128 组的登记风暴里登记本身可能排十几分钟，见 P7-N58）
+    -- （128 组在 2 vCPU 上供 256 个副本要十来分钟，按总时长算会在进行中途收手）。
+    v_t0 := clock_timestamp();
+    v_armed := -1;
+    FOR v_round IN 1..1000 LOOP
+        EXIT WHEN clock_timestamp() - v_t0 > make_interval(secs => p_elect_timeout_s * 5);
+        -- 当前主（下标）
+        UPDATE _rtsb SET lidx = NULL;
+        v_cmds := array_fill('SELECT coalesce(string_agg(group_id::text, '',''), '''') FROM partdist.pg_raft_group_status() WHERE state = ''leader'' AND group_id <> 0'::text, ARRAY[v_n]);
+        FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+            IF r.success AND r.result <> '' THEN
+                UPDATE _rtsb SET lidx = array_position(v_ports, r.node_port)
+                 WHERE sid = ANY (string_to_array(r.result, ',')::bigint[]);
+            END IF;
+        END LOOP;
+        -- 已 armed 的副本（raft 节点号）；有新增就重置进展计时
+        UPDATE _rtsb SET armed = '{}';
+        v_cmds := array_fill('SELECT coalesce(string_agg(partdist.global_id_for_partition(shard)::text, '',''), '''') FROM partdist.replay_status() WHERE armed'::text, ARRAY[v_n]);
+        FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+            IF r.success AND r.result <> '' THEN
+                UPDATE _rtsb SET armed = armed || v_nids[array_position(v_ports, r.node_port)]
+                 WHERE sid = ANY (string_to_array(r.result, ',')::bigint[]);
+            END IF;
+        END LOOP;
+
+        IF (SELECT coalesce(sum(cardinality(armed)), 0) FROM _rtsb) > v_armed THEN
+            v_armed := (SELECT coalesce(sum(cardinality(armed)), 0) FROM _rtsb);
+            v_t0 := clock_timestamp();
+        END IF;
+        TRUNCATE _rtsb_prov;
+        -- 只从**有数据**的主发起：placement 本身，或回放槽位已 armed 的成员。没数据的成员当选（入组那一刻
+        -- 它的"最近一次收到 leader 心跳"被清零，预选拦不住）会在升主前置里让位，这一遍先跳过、等它让位。
+        INSERT INTO _rtsb_prov (sid, lidx, target)
+        SELECT b.sid, b.lidx, m
+          FROM _rtsb b CROSS JOIN LATERAL unnest(b.members) m
+         WHERE b.elected AND b.st IS NULL AND b.lidx IS NOT NULL
+           AND (b.lidx = b.pidx OR v_nids[b.lidx] = ANY (b.armed)
+                OR EXISTS (SELECT 1 FROM partdist.partition_map pm      -- 已登记 = 升主前置验过有数据
+                            WHERE pm.partition_id = b.sid AND pm.primary_node = v_nids[b.lidx]))
+           AND m <> v_nids[b.lidx] AND NOT (m = ANY (b.armed));
+        IF NOT EXISTS (SELECT 1 FROM _rtsb_prov) THEN
+            -- 没有可发的：要么全部供完，要么剩下的都在等"没数据的主"让位
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM _rtsb b CROSS JOIN LATERAL unnest(b.members) m
+                 WHERE b.elected AND b.st IS NULL
+                   AND (b.lidx IS NULL OR m <> v_nids[b.lidx]) AND NOT (m = ANY (b.armed)));
+            PERFORM pg_catalog.pg_sleep(5);
+            CONTINUE;
+        END IF;
+        IF v_round > 1 THEN
+            RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 遍补供 % 个副本（含组主漂移后从新主重供）',
+                v_round, (SELECT count(*) FROM _rtsb_prov);
+        END IF;
+        UPDATE _rtsb_prov q SET seq = x.rn
+          FROM (SELECT sid, target, row_number() OVER (PARTITION BY lidx ORDER BY sid, target) rn FROM _rtsb_prov) x
+         WHERE q.sid = x.sid AND q.target = x.target;
+
+        FOR v_k IN 1..coalesce((SELECT max(seq) FROM _rtsb_prov), 0) LOOP
+            v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+            FOR r IN SELECT sid, lidx, target FROM _rtsb_prov WHERE seq = v_k LOOP
+                v_cmds := v_cmds || format('SELECT partdist.provision_shard_replica(%s::bigint, %s)', r.sid, r.target);
+                v_h := v_h || v_hosts[r.lidx]; v_p := v_p || v_ports[r.lidx];
+            END LOOP;
+            CONTINUE WHEN coalesce(array_length(v_cmds, 1), 0) = 0;
+            FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true) LOOP
+                -- 同一台一轮只有一条，用端口对回去
+                UPDATE _rtsb_prov SET result = r.result, ok = (r.success AND r.result LIKE 'shard=%')
+                 WHERE seq = v_k AND lidx = array_position(v_ports, r.node_port);
+            END LOOP;
+        END LOOP;
+        UPDATE _rtsb b SET prov_err = (SELECT string_agg(format(':%s→节点%s %s', v_ports[q.lidx], q.target, left(q.result, 120)), '；')
+                                         FROM _rtsb_prov q WHERE q.sid = b.sid AND NOT q.ok);
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM _rtsb_prov WHERE NOT ok);
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+
+    FOR r IN SELECT b.* FROM _rtsb b ORDER BY b.sid LOOP
+        shardid := r.sid;
+        leader_port := v_ports[coalesce(r.lidx, r.pidx)];
+        replica_ports := ARRAY(SELECT v_ports[array_position(v_nids, m)] FROM unnest(r.members) m
+                                WHERE m <> v_nids[coalesce(r.lidx, r.pidx)]);
+        status := coalesce(r.st,
+                           CASE WHEN r.lidx IS NULL THEN '组当前无主'
+                                WHEN EXISTS (SELECT 1 FROM unnest(r.members) m
+                                              WHERE m <> v_nids[r.lidx] AND NOT (m = ANY (r.armed)))
+                                     AND NOT (r.lidx = r.pidx OR v_nids[r.lidx] = ANY (r.armed)
+                                              OR EXISTS (SELECT 1 FROM partdist.partition_map pm
+                                                          WHERE pm.partition_id = r.sid AND pm.primary_node = v_nids[r.lidx]))
+                                     THEN '组主落在没有数据的成员上，等它让位超时'
+                                WHEN EXISTS (SELECT 1 FROM _rtsb_prov q WHERE q.sid = r.sid AND NOT q.ok)
+                                     THEN '供副本失败：' || coalesce(r.prov_err, '?')
+                                ELSE 'ok' END);
+        RETURN NEXT;
+    END LOOP;
+END
+$fn$;
+
+-- 2026-10-03（P7-N53）：路由对账。把 Citus 路由（pg_dist_placement）拨到控制面登记（partition_map）的主上。
+-- 正常情况下每条主权登记 apply 时就拨了；但控制面快照安装那一刻偶有漏拨（实测 128 组建组时 2 个分片
+-- 漏拨、之后再无人纠正：打标打到了已经是副本壳表的旧节点上）。由 topology monitor 每轮追平时顺带调用。
+CREATE OR REPLACE FUNCTION reconcile_routing() RETURNS integer
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE n integer := 0;
+BEGIN
+    IF to_regclass('pg_catalog.pg_dist_placement') IS NULL THEN
+        RETURN 0;
+    END IF;
+    WITH fix AS (
+        UPDATE pg_catalog.pg_dist_placement p SET groupid = dn.groupid
+          FROM partdist.partition_map pm, partdist.node_map m, pg_catalog.pg_dist_node dn
+         WHERE pm.partition_id = p.shardid AND m.node_id = pm.primary_node
+           AND dn.nodeport = m.port AND dn.noderole = 'primary'
+           AND p.groupid <> dn.groupid
+           AND (SELECT count(*) FROM pg_catalog.pg_dist_placement q WHERE q.shardid = p.shardid) = 1
+        RETURNING p.shardid, dn.nodeport)
+    SELECT count(*) INTO n FROM fix;
+    IF n > 0 THEN
+        RAISE LOG 'pg_partdist: 路由对账把 % 个分片的 pg_dist_placement 拨到了控制面登记的主上', n;
+    END IF;
+    RETURN n;
+END
+$fn$;
+
+COMMENT ON FUNCTION raft_replicate_table_shards_bulk(regclass, integer, integer, integer, bigint[]) IS
+    '2026-10-03：raft_replicate_table_shards 的并行版 —— 同样的顺序与成员轮转（副本因子 = 1 + p_replicas），'
+    '所有分片一起推进：建组/入组每台一条批量命令、4 台并行；供副本每台 leader 一轮一个、4 台并行。'
+    '上百个分片组时用它（串行版约 28 s/片）。';
+
 
 COMMENT ON FUNCTION raft_replicate_table_shards(regclass, integer, integer) IS
     'T7.23/P7-R2：在协调者上一条命令给分布表的全部分片建 Raft 组并供副本。顺序固化为「placement 先建组并当选 → 副本入组 → leader 逐个 provision_shard_replica」；逐分片返回状态，单个失败不拖累其余。';

@@ -1,13 +1,13 @@
 # ShardPG 演示教程：5 个节点上的一张业务表（只输入 SQL）
 
-> 本教程每一步都在 **2026-09-30** 的 `pg-test-container`（1 master + 4 worker，共 5 个节点）上**完整实跑过一遍**，下面每段 SQL 之后的输出就是那次实跑的原样输出（灌数据到宕机归队共用时约 7 分 37 秒）。你的分片号、时间戳、事务号会不同，其余应当一致。
+> 本教程每一步都在 **2026-10-03** 的 `pg-test-container`（1 master + 4 worker，共 5 个节点）上**完整实跑过一遍**，下面每段 SQL 之后的输出就是那次实跑的原样输出（灌数据到宕机归队共用时约 2 分 58 秒）。你的分片号、时间戳、事务号会不同，其余应当一致。
 
 ## 一、你的要求（梳理与润色）
 
 在 Windows 11 PowerShell 终端里做一场 ShardPG 的现场演示，按**真实业务的顺序**走，只看功能体现、不铺细节：
 
 1. **规模**：5 个节点 —— 1 个 master（只做路由 + TSO）+ 4 个 worker。
-2. **前面全部提前做好**：建表（4 个分片，一台 worker 一片）、每个分片建 Raft 组并**自发选主**、供副本、打标接入事务系统 —— 这些都放进 `start`，**不在台前展示**；`start` 成功后只显示“准备好了”。
+2. **前面全部提前做好**：建表（4 个分片，一台 worker 一片）、每个分片建 Raft 组（**副本因子 3**：1 主 + 2 副本，不是每台都存一份）、选主、供副本、打标接入事务系统 —— 这些都放进 `start`，**不在台前展示**；`start` 成功后只显示“准备好了”。
 3. **演示从灌数据开始**：业务数据放在文件里，一条 `\i` 读进去；灌完查一次各分片的数据，再看各分区的副本信息。
 4. **并发事务**：两个窗口同时做跨分片的读写 —— 快照隔离、写写冲突、总额守恒。
 5. **切主**：手动把某个分片的主切走，看 master 的路由自动跟过去、数据照读。
@@ -30,8 +30,9 @@
 | `gen_demo_data.py` | 重新生成上面这份数据：`python3 gen_demo_data.py <行数> demo_data.sql` |
 | `shardpg_demo_steps_full.sql` | 上一版的 14 步详细脚本（流控、分片 xid/clog、惰性回放、逐字节比对），要看细节时用 |
 | `SHARDPG_DEMO.md` | 本教程 |
+| `shardpg_demo128.sh` 等 | **演示二**：128 个分区组上的分布式事务，见 `SHARDPG_DEMO128.md`；与本演示共用集群，**两套互斥，换演示前先 stop** |
 
-`start` 对集群做的临时改动只有：在 master 上建 `demo` 模式（函数库 + dblink）、打开 TSO（会重启一次 master）、把 4 台 worker 的 Raft 选举超时从 6 s 放宽到 15 s、TSO 租约从 60 s 放宽到 5 分钟（见“已知问题”第 6、7 条），把 `demo_data.sql` 拷进容器的 /tmp，然后**提前建好 `account` 表并接入系统**（建组 → 自发选主 → 供副本 → 打标；选主本身不做任何干预，谁的选举超时先到点谁竞选）。`stop` 把它们全部撤掉，并按演示前各节点 `postgresql.auto.conf` 的原样还原参数；实测还原后与演示前的环境快照逐项一致。
+`start` 对集群做的临时改动只有：在 master 上建 `demo` 模式（函数库 + dblink）、打开 TSO（会重启一次 master）、把 4 台 worker 的 Raft 选举超时从 6 s 放宽到 15 s、TSO 租约从 60 s 放宽到 5 分钟（见“已知问题”第 6、7 条），把 `demo_data.sql` 拷进容器的 /tmp，然后**提前建好 `account` 表并接入系统**（建组 → 选主 → 供副本 → 打标；建组走产品函数 `raft_replicate_table_shards_bulk`，副本因子 3，成员按数据所在节点轮转）。`stop` 把它们全部撤掉，并按演示前各节点 `postgresql.auto.conf` 的原样还原参数；实测还原后与演示前的环境快照逐项一致。
 
 > **术语（按本项目的设计口径，见 `docs/DTX_2PC_DESIGN.md` §2.1/§2.3）**：
 > **master** 就是 :5432 那个节点 —— 只做**路由**和 **TSO**，不放分片数据、不领导任何数据组；所有读写都经它路由。
@@ -48,13 +49,13 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 ```
 
 ```text
-正在准备：建表 → 建组 → 自发选主 → 供副本 → 打标（约 2–5 分钟）…
+演示一（4 个分片） 正在准备：建表（4 个分片）→ 建组（副本因子 3）→ 选主 → 供副本 → 打标（约 2–5 分钟）…
 准备好了
 ```
 
-`start` 先打一行“正在准备：建表 → 建组 → 自发选主 → 供副本 → 打标（约 2–5 分钟）…”，成功后再打“准备好了”。这几分钟它在替你把**台前不展示的部分**做完：
-建 `account` 表（4 个分片，一台 worker 一片）、每个分片建一个 Raft 组并**自发选主**（不干预，谁的选举超时先到点谁竞选；
-没有数据的成员先当选会被升主前置拒绝、主动让位，所以有时要多绕几轮）、把副本供到组内其余成员、打标接入事务系统。
+`start` 先打一行“演示一（4 个分片） 正在准备：建表（4 个分片）→ 建组（副本因子 3）→ 选主 → 供副本 → 打标（约 2–5 分钟）…”，成功后再打“准备好了”。这几分钟它在替你把**台前不展示的部分**做完：
+建 `account` 表（4 个分片，一台 worker 一片）、每个分片建一个 Raft 组（**副本因子 3**：数据所在那台 + 按端口轮转的另外两台，
+第四台不在这个组里）、等数据所在那台当选、把副本供到组内另外两台、打标接入事务系统。
 
 **出错时不会是“准备好了”**，而是一条写明原因、带下一步怎么做的提示，例如：
 
@@ -95,40 +96,6 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 
 PowerShell 里也可以：`.\shardpg_demo.ps1 auto`，传选项用 `-AutoArgs '--no-prepare --keep --speed slow'`。
 
-开头的样子（真实输出，SQL 是逐字打出来的）：
-
-```text
-══════════════════════════════════════════════════════════════════════════════
-  ShardPG 全自动演示  ·  5 个节点：1 个 master + 4 个 worker
-══════════════════════════════════════════════════════════════════════════════
-  下面每一行都是自动“敲”出来的 SQL：A> 是窗口 A，B> 是窗口 B；-- 开头的是旁白。
-
-$ bash shardpg_demo.sh start
-正在准备：建表 → 建组 → 自发选主 → 供副本 → 打标（约 2–5 分钟）…
-准备好了
-
-══════════════════════════════════════════════════════════════════════════════
-  第 1 步：灌业务数据
-══════════════════════════════════════════════════════════════════════════════
-
--- 数据在 demo_data.sql 里（500 个账户，分 10 批，每批一个全局事务），一条命令读进来。
--- 慢是设计使然：打标表的每条记录都要 propose 给该分片的 Raft 组、等多数派落盘（约 2 行/秒）。
-A> \i /tmp/demo_data.sql
-Timing is on.
-BEGIN
-Time: 5.445 ms
-                                                 global_txn                                                  
--------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286721，start_ts = 22（本事务在所有分片上共用这一个快照）
-(1 row)
-
-Time: 202.227 ms
-INSERT 0 50
-Time: 986.881 ms
-COMMIT
-...（后面 9 批同样，共约 5 分钟，此处省略）
-```
-
 ## 四、演示步骤（全部是 SQL）
 
 带 `NOTICE:` 的行是函数执行过程中**实时**打出来的时间线（毫秒是从本步开始计时），最后的表格是结果。
@@ -139,7 +106,7 @@ COMMIT
 
 慢是设计使然：打标表的每条记录都要 propose 给该分片的 Raft 组、等多数派落盘（约 2 行/秒）。
 
-**窗口 A**（耗时 336.5 s）：
+**窗口 A**（耗时 81.9 s）：
 
 ```sql
 \i /tmp/demo_data.sql
@@ -148,125 +115,125 @@ COMMIT
 ```text
 Timing is on.
 BEGIN
-Time: 5.445 ms
+Time: 1.765 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286721，start_ts = 22（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311297，start_ts = 18（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 202.227 ms
+Time: 74.617 ms
 INSERT 0 50
-Time: 986.881 ms
+Time: 448.734 ms
 COMMIT
-Time: 30253.544 ms (00:30.254)
+Time: 9298.797 ms (00:09.299)
 BEGIN
-Time: 0.077 ms
+Time: 0.155 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286722，start_ts = 28（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311298，start_ts = 24（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 0.600 ms
+Time: 3.466 ms
 INSERT 0 50
-Time: 44.128 ms
+Time: 22.263 ms
 COMMIT
-Time: 28773.933 ms (00:28.774)
+Time: 7007.509 ms (00:07.008)
 BEGIN
-Time: 0.660 ms
+Time: 0.161 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286723，start_ts = 34（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311299，start_ts = 30（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 1.081 ms
+Time: 2.926 ms
 INSERT 0 50
-Time: 145.298 ms
+Time: 175.348 ms
 COMMIT
-Time: 32066.494 ms (00:32.066)
+Time: 6776.823 ms (00:06.777)
 BEGIN
-Time: 1.557 ms
+Time: 0.141 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286724，start_ts = 40（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311300，start_ts = 36（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 15.622 ms
+Time: 2.404 ms
 INSERT 0 50
-Time: 211.189 ms
+Time: 32.815 ms
 COMMIT
-Time: 30527.396 ms (00:30.527)
+Time: 6648.478 ms (00:06.648)
 BEGIN
-Time: 0.392 ms
+Time: 0.119 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286725，start_ts = 46（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311301，start_ts = 42（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 1.469 ms
+Time: 0.534 ms
 INSERT 0 50
-Time: 26.853 ms
+Time: 7.825 ms
 COMMIT
-Time: 27458.136 ms (00:27.458)
+Time: 5560.538 ms (00:05.561)
 BEGIN
-Time: 0.171 ms
+Time: 0.242 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286726，start_ts = 52（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311302，start_ts = 48（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 0.968 ms
+Time: 0.691 ms
 INSERT 0 50
-Time: 22.909 ms
+Time: 26.948 ms
 COMMIT
-Time: 27189.683 ms (00:27.190)
+Time: 6753.183 ms (00:06.753)
 BEGIN
-Time: 0.604 ms
+Time: 0.082 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286727，start_ts = 58（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311303，start_ts = 54（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 1.321 ms
+Time: 0.483 ms
 INSERT 0 50
-Time: 24.424 ms
+Time: 166.682 ms
 COMMIT
-Time: 30703.532 ms (00:30.704)
+Time: 14505.251 ms (00:14.505)
 BEGIN
-Time: 0.331 ms
+Time: 0.099 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286728，start_ts = 64（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311304，start_ts = 60（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 2.620 ms
+Time: 5.755 ms
 INSERT 0 50
-Time: 53.270 ms
+Time: 14.598 ms
 COMMIT
-Time: 33521.334 ms (00:33.521)
+Time: 6295.428 ms (00:06.295)
 BEGIN
-Time: 8.796 ms
+Time: 0.140 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286729，start_ts = 70（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311305，start_ts = 66（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 6.154 ms
+Time: 6.031 ms
 INSERT 0 50
-Time: 184.547 ms
+Time: 176.688 ms
 COMMIT
-Time: 30516.027 ms (00:30.516)
+Time: 9237.148 ms (00:09.237)
 BEGIN
-Time: 2.053 ms
+Time: 0.097 ms
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286730，start_ts = 76（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311306，start_ts = 72（本事务在所有分片上共用这一个快照）
 (1 row)
 
-Time: 2.113 ms
+Time: 0.532 ms
 INSERT 0 50
-Time: 29.292 ms
+Time: 11.745 ms
 COMMIT
-Time: 62420.112 ms (01:02.420)
+Time: 6809.092 ms (00:06.809)
 Timing is off.
 ```
 
@@ -274,7 +241,7 @@ Timing is off.
 
 建表时就是 4 个分片，Citus 按哈希把每个键落到其中一个；下面直接读各 worker 上的分片表。
 
-**窗口 A**（耗时 8.7 s）：
+**窗口 A**（耗时 5.7 s）：
 
 ```sql
 SELECT * FROM demo.distribution('account');
@@ -305,7 +272,9 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 
 ### 第 3 步：各分区的副本信息
 
-每个分片 1 个主 + 3 个副本（分布在其余三台）。副本经 Raft 把主的分区流收下落盘，
+副本因子 3：每个分片 1 个主 + 2 个副本，放在按数据所在节点轮转的另外两台上（第四台不在这个组里，
+
+每台 worker 只存 3/4 的分片，不是每台都存全部）。副本经 Raft 把主的分区流收下落盘，
 
 但不马上 redo（惰性回放）：“已收到”是收下的日志位点，“已回放”是真正 redo 到哪，差值就是待回放。
 
@@ -318,26 +287,22 @@ SELECT * FROM demo.replicas('account');
 ```text
  分片 | 主 | 副本 | 已收到 | 已回放 | 待回放 |    状态    
 --------+-----+--------+-----------+-----------+-----------+--------------
- S1     | w1  | w2     |       309 |         0 |       309 | armed，idle
- S1     | w1  | w3     |       309 |         0 |       309 | armed，idle
- S1     | w1  | w4     |       309 |         0 |       309 | armed，idle
- S2     | w2  | w1     |       347 |         0 |       347 | armed，idle
- S2     | w2  | w3     |       347 |         0 |       347 | armed，idle
- S2     | w2  | w4     |       347 |         0 |       347 | armed，idle
- S3     | w3  | w1     |       309 |         0 |       309 | armed，idle
- S3     | w3  | w2     |       309 |         0 |       309 | armed，idle
- S3     | w3  | w4     |       309 |         0 |       309 | armed，idle
- S4     | w4  | w1     |       326 |         0 |       326 | armed，idle
- S4     | w4  | w2     |       326 |         0 |       326 | armed，idle
- S4     | w4  | w3     |       326 |         0 |       326 | armed，idle
-(12 rows)
+ S1     | w1  | w2     |       302 |         0 |       302 | armed，idle
+ S1     | w1  | w3     |       302 |         0 |       302 | armed，idle
+ S2     | w2  | w3     |       339 |         0 |       339 | armed，idle
+ S2     | w2  | w4     |       339 |         0 |       339 | armed，idle
+ S3     | w3  | w1     |       301 |         0 |       301 | armed，idle
+ S3     | w3  | w4     |       301 |         0 |       301 | armed，idle
+ S4     | w4  | w1     |       314 |         0 |       314 | armed，idle
+ S4     | w4  | w2     |       314 |         0 |       314 | armed，idle
+(8 rows)
 ```
 
 ### 第 4 步：并发事务
 
 幕 1：A、B 各开一个全局事务，各看一眼总额。
 
-**窗口 A**：
+**窗口 A**（耗时 2.5 s）：
 
 ```sql
 BEGIN;
@@ -349,7 +314,7 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286731，start_ts = 94（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311307，start_ts = 90（本事务在所有分片上共用这一个快照）
 (1 row)
 
  账户数 | 余额总和 
@@ -358,7 +323,7 @@ BEGIN
 (1 row)
 ```
 
-**窗口 B**（耗时 2.1 s）：
+**窗口 B**（耗时 2.8 s）：
 
 ```sql
 BEGIN;
@@ -370,7 +335,7 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286732，start_ts = 95（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311308，start_ts = 91（本事务在所有分片上共用这一个快照）
 (1 row)
 
  账户数 | 余额总和 
@@ -381,7 +346,7 @@ BEGIN
 
 幕 2：A 做一笔跨分片转账（两个账户在不同节点上），钱从一边到另一边，总额不变。
 
-**窗口 A**：
+**窗口 A**（耗时 2.9 s）：
 
 ```sql
 UPDATE account SET balance = balance - 300 WHERE id = 1;
@@ -417,7 +382,7 @@ SELECT id, owner, balance FROM account WHERE id IN (1, 2) ORDER BY id;
 
 幕 4：A 提交；B 在自己的事务里仍然看不见（B 的 start_ts 早于 A 的 commit_ts）。
 
-**窗口 A**（耗时 6.5 s）：
+**窗口 A**：
 
 ```sql
 COMMIT;
@@ -427,7 +392,7 @@ COMMIT;
 COMMIT
 ```
 
-**窗口 B**（耗时 4.5 s）：
+**窗口 B**：
 
 ```sql
 SELECT id, owner, balance FROM account WHERE id IN (1, 2) ORDER BY id;
@@ -453,7 +418,7 @@ COMMIT
 
 幕 5：写写冲突 —— A 改 id=3 不提交，B 也去改它，B 被挡住。
 
-**窗口 A**：
+**窗口 A**（耗时 2.2 s）：
 
 ```sql
 BEGIN;
@@ -465,7 +430,7 @@ UPDATE account SET balance = balance + 7 WHERE id = 3;
 BEGIN
                                                  global_txn                                                  
 -------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286733，start_ts = 99（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311309，start_ts = 95（本事务在所有分片上共用这一个快照）
 (1 row)
 
 UPDATE 1
@@ -481,9 +446,9 @@ UPDATE account SET balance = balance - 7 WHERE id = 3;
 
 ```text
 BEGIN
-                                                  global_txn                                                  
---------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286734，start_ts = 100（本事务在所有分片上共用这一个快照）
+                                                 global_txn                                                  
+-------------------------------------------------------------------------------------------------------------
+ 已加入全局事务：gxid = 311310，start_ts = 96（本事务在所有分片上共用这一个快照）
 (1 row)
 ```
 
@@ -503,7 +468,7 @@ COMMIT
 
 ```text
 ERROR:  could not serialize access due to concurrent update
-DETAIL:  分片 309897 目标行的并发删改 commit_ts=101 ≥ 本事务 start_ts=100（first-committer-wins，设计 §4.4）。
+DETAIL:  分片 395412 目标行的并发删改 commit_ts=97 ≥ 本事务 start_ts=96（first-committer-wins，设计 §4.4）。
 HINT:  重试事务。
 CONTEXT:  while executing command on localhost:5434
 ```
@@ -539,32 +504,29 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 
 数据照读、总额不变。
 
-**窗口 A**（耗时 21.8 s）：
+**窗口 A**（耗时 10.7 s）：
 
 ```sql
 SELECT * FROM demo.switch_leader('account', 'S1');
 ```
 
 ```text
-NOTICE:  把 S1 的主从 w1 切到 w2（同组成员：w1 w2 w3 w4）
+NOTICE:  把 S1 的主从 w1 切到 w2（同组成员：w1 w2 w3）
 NOTICE:  切换前：S1 的主 = w1，下一个分片 xid = 14
-NOTICE:      19 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
-NOTICE:      33 ms  S1  切换前：w1 leader/任期4，w2 follower/任期4，w3 follower/任期4，w4 follower/任期4；控制面登记 w1；master 把读写路由到 w1
-NOTICE:     189 ms  S1  w2  pg_raft_group_campaign：对 S1 的组发起竞选
-NOTICE:     271 ms  S1  w1  退位 → follower（任期 5，还没认出新 leader）
-NOTICE:     271 ms  S1  w2  ★ 当选 leader（任期 5）
-NOTICE:     271 ms  S1  w3  follower（任期 5，还没认出 leader）
-NOTICE:     271 ms  S1  w4  follower（任期 5，还没认出 leader）
-NOTICE:     412 ms  S1  w1  follower：认 w2 为 leader（任期 5）
-NOTICE:     471 ms  S1  w3  follower：认 w2 为 leader（任期 5）
-NOTICE:     471 ms  S1  w4  follower：认 w2 为 leader（任期 5）
-NOTICE:   11767 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 5）
-NOTICE:   11767 ms  S1  master  Citus 路由表：master 把读写发往 w2 :5434
-NOTICE:   12280 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
-NOTICE:   21506 ms  S1  w1  旧主被新主自动重新供给成副本（回放槽位 armed）
- 分片 | 原来的主 | 新主 | 新任期 | 切换耗时_ms |                             旧主                              
---------+--------------+--------+-----------+-----------------+-----------------------------------------------------------------
- S1     | w1           | w2     | 5         |           12000 | 是：切换后 21505 ms 被新主自动重新供给（armed）
+NOTICE:       7 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
+NOTICE:      13 ms  S1  切换前：w1 leader/任期1，w2 follower/任期1，w3 follower/任期1，w4 无组；控制面登记 w1；master 把读写路由到 w1
+NOTICE:      28 ms  S1  w2  pg_raft_group_campaign：对 S1 的组发起竞选
+NOTICE:    1063 ms  S1  w2  发起竞选 → candidate（任期 2，向其余成员要票）
+NOTICE:    1132 ms  S1  w1  退位 → follower，跟随 w2（任期 2）
+NOTICE:    1132 ms  S1  w2  ★ 当选 leader（任期 2）
+NOTICE:    1132 ms  S1  w3  follower：认 w2 为 leader（任期 2）
+NOTICE:    3868 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w2（登记任期 2）
+NOTICE:    3868 ms  S1  master  Citus 路由表：master 把读写发往 w2 :5434
+NOTICE:    4262 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:    9896 ms  S1  w1  旧主被新主自动重新供给成副本（回放槽位 armed）
+ 分片 | 原来的主 | 新主 | 新任期 | 切换耗时_ms |                             旧主                             
+--------+--------------+--------+-----------+-----------------+----------------------------------------------------------------
+ S1     | w1           | w2     | 2         |            3932 | 是：切换后 9896 ms 被新主自动重新供给（armed）
 (1 row)
 ```
 
@@ -575,12 +537,12 @@ SELECT * FROM demo.roles('account');
 ```
 
 ```text
-  节点  |            S1             |            S2             |            S3             |            小结             
-----------+---------------------------+---------------------------+---------------------------+-------------------------------
- w1 :5433 | follower（回放到 0） | follower（回放到 0） | follower（回放到 0） | 0 个 leader + 4 个 follower
- w2 :5434 | ★ leader（任期5）   | ★ leader（任期1）   | follower（回放到 0） | 2 个 leader + 2 个 follower
- w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 3 个 follower
- w4 :5436 | follower（回放到 0） | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 3 个 follower
+  节点  |            S1             |            S2             |            S3             |            S4             |            小结             
+----------+---------------------------+---------------------------+---------------------------+---------------------------+-------------------------------
+ w1 :5433 | follower（回放到 0） | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | 0 个 leader + 3 个 follower
+ w2 :5434 | ★ leader（任期2）   | ★ leader（任期1）   | ·（不在组内）      | follower（回放到 0） | 2 个 leader + 1 个 follower
+ w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | ·（不在组内）      | 1 个 leader + 2 个 follower
+ w4 :5436 | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 2 个 follower
 (4 rows)
 ```
 
@@ -603,7 +565,7 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 
 该分片的组超时、自发选主；没有这个分片数据的成员即使当选也会主动让位。
 
-**窗口 A**（耗时 38.7 s）：
+**窗口 A**（耗时 22.1 s）：
 
 ```sql
 SELECT * FROM demo.crash('account');
@@ -612,34 +574,33 @@ SELECT * FROM demo.crash('account');
 ```text
 NOTICE:  停掉 w2（它是 S1 的主；它同时还是另外几个分片的从）
 NOTICE:  宕机前：w2 是 S1、S2 的主；其余分片它只是从
-NOTICE:    2773 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
-NOTICE:    2783 ms  S1  宕机前：w1 follower/任期5，w2 leader/任期5，w3 follower/任期5，w4 follower/任期5；控制面登记 w2；master 把读写路由到 w2
-NOTICE:    2798 ms  S2  宕机前：w1 follower/任期1，w2 leader/任期1，w3 follower/任期1，w4 follower/任期1；控制面登记 w2；master 把读写路由到 w2
-NOTICE:    2808 ms  S3  宕机前：w1 follower/任期1，w2 follower/任期1，w3 leader/任期1，w4 follower/任期1；控制面登记 w3；master 把读写路由到 w3
-NOTICE:    2820 ms  S4  宕机前：w1 follower/任期2，w2 follower/任期2，w3 follower/任期2，w4 leader/任期2；控制面登记 w4；master 把读写路由到 w4
-NOTICE:    3587 ms  w2  pg_ctl -m immediate stop：进程直接退出，不做 checkpoint（模拟断电）
-NOTICE:    3592 ms  S1  w2  ✗ 连不上（节点宕机）
-NOTICE:    3592 ms  S2  w2  ✗ 连不上（节点宕机）
-NOTICE:    3592 ms  S3  w2  ✗ 连不上（节点宕机）
-NOTICE:    3592 ms  S4  w2  ✗ 连不上（节点宕机）
-NOTICE:   17983 ms  S1  w1  ★ 当选 leader（任期 6）
-NOTICE:   17983 ms  S1  w3  follower：认 w1 为 leader（任期 6）
-NOTICE:   17983 ms  S1  w4  follower：认 w1 为 leader（任期 6）
-NOTICE:   21734 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 6）
-NOTICE:   21734 ms  S1  master  Citus 路由表：master 把读写发往 w1 :5433
-NOTICE:   27001 ms  S2  w4  发起竞选 → candidate（任期 2，向其余成员要票）
-NOTICE:   27093 ms  S2  w1  follower：认 w4 为 leader（任期 2）
-NOTICE:   27093 ms  S2  w3  follower：认 w4 为 leader（任期 2）
-NOTICE:   27093 ms  S2  w4  ★ 当选 leader（任期 2）
-NOTICE:   37602 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w4（登记任期 2）
-NOTICE:   37602 ms  S2  master  Citus 路由表：master 把读写发往 w4 :5436
-NOTICE:   38105 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:      46 ms  副本都已确认最新提交（各从的 Raft 提交位点 = 主的日志末尾）
+NOTICE:      62 ms  S1  宕机前：w1 follower/任期2，w2 leader/任期2，w3 follower/任期2，w4 无组；控制面登记 w2；master 把读写路由到 w2
+NOTICE:      69 ms  S2  宕机前：w1 无组，w2 leader/任期1，w3 follower/任期1，w4 follower/任期1；控制面登记 w2；master 把读写路由到 w2
+NOTICE:      74 ms  S3  宕机前：w1 follower/任期1，w2 无组，w3 leader/任期1，w4 follower/任期1；控制面登记 w3；master 把读写路由到 w3
+NOTICE:      78 ms  S4  宕机前：w1 follower/任期1，w2 follower/任期1，w3 无组，w4 leader/任期1；控制面登记 w4；master 把读写路由到 w4
+NOTICE:     779 ms  w2  pg_ctl -m immediate stop：进程直接退出，不做 checkpoint（模拟断电）
+NOTICE:     779 ms  S1  w2  ✗ 连不上（节点宕机）
+NOTICE:     779 ms  S2  w2  ✗ 连不上（节点宕机）
+NOTICE:     779 ms  S3  w2  ✗ 连不上（节点宕机）
+NOTICE:     779 ms  S4  w2  ✗ 连不上（节点宕机）
+NOTICE:   17485 ms  S2  w3  发起竞选 → candidate（任期 2，向其余成员要票）
+NOTICE:   17485 ms  S2  w4  follower（任期 2，还没认出 leader）
+NOTICE:   17557 ms  S2  w3  ★ 当选 leader（任期 2）
+NOTICE:   17557 ms  S2  w4  follower：认 w3 为 leader（任期 2）
+NOTICE:   17804 ms  S1  w1  ★ 当选 leader（任期 3）
+NOTICE:   17804 ms  S1  w3  follower：认 w1 为 leader（任期 3）
+NOTICE:   20044 ms  S2  master  控制面登记（0 号组 partition_map）：主 = w3（登记任期 2）
+NOTICE:   20044 ms  S2  master  Citus 路由表：master 把读写发往 w3 :5435
+NOTICE:   20735 ms  S1  master  控制面登记（0 号组 partition_map）：主 = w1（登记任期 3）
+NOTICE:   20735 ms  S1  master  Citus 路由表：master 把读写发往 w1 :5433
+NOTICE:   21029 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
  分片 | 宕机前的主 | 宕机后的主 | 任期 | 不可用时长_ms 
 --------+-----------------+-----------------+--------+--------------------
- S1     | w2              | w1              | 6      |              37798
- S2     | w2              | w4              | 2      |              37798
+ S1     | w2              | w1              | 3      |              20806
+ S2     | w2              | w3              | 2      |              20806
  S3     | w3              | w3              | 1      |                  0
- S4     | w4              | w4              | 2      |                  0
+ S4     | w4              | w4              | 1      |                  0
 (4 rows)
 ```
 
@@ -650,12 +611,12 @@ SELECT * FROM demo.roles('account');
 ```
 
 ```text
-  节点  |            S1             |            S2             |            S3             |            小结             
-----------+---------------------------+---------------------------+---------------------------+-------------------------------
- w1 :5433 | ★ leader（任期6）   | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 3 个 follower
- w2 :5434 | ✗ 宕机                | ✗ 宕机                | ✗ 宕机                | 宕机
- w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 3 个 follower
- w4 :5436 | follower（回放到 0） | ★ leader（任期2）   | follower（回放到 0） | 2 个 leader + 2 个 follower
+  节点  |            S1             |            S2             |            S3             |            S4             |            小结             
+----------+---------------------------+---------------------------+---------------------------+---------------------------+-------------------------------
+ w1 :5433 | ★ leader（任期3）   | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 2 个 follower
+ w2 :5434 | ✗ 宕机                | ✗ 宕机                | ✗ 宕机                | ✗ 宕机                | 宕机
+ w3 :5435 | follower（回放到 0） | ★ leader（任期2）   | ★ leader（任期1）   | ·（不在组内）      | 2 个 leader + 1 个 follower
+ w4 :5436 | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 2 个 follower
 (4 rows)
 ```
 
@@ -674,7 +635,7 @@ SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
 (1 row)
 ```
 
-**窗口 B**（耗时 6.5 s）：
+**窗口 B**（耗时 4.0 s）：
 
 ```sql
 BEGIN;
@@ -687,7 +648,7 @@ COMMIT;
 BEGIN
                                                   global_txn                                                  
 --------------------------------------------------------------------------------------------------------------
- 已加入全局事务：gxid = 286735，start_ts = 115（本事务在所有分片上共用这一个快照）
+ 已加入全局事务：gxid = 311311，start_ts = 111（本事务在所有分片上共用这一个快照）
 (1 row)
 
 UPDATE 3
@@ -696,7 +657,7 @@ COMMIT
 
 把节点拉起来：它以 follower 身份归队，原来当主的分片被新主自动重新供给成副本。
 
-**窗口 A**（耗时 17.5 s）：
+**窗口 A**（耗时 18.5 s）：
 
 ```sql
 SELECT * FROM demo.recover('account');
@@ -704,29 +665,29 @@ SELECT * FROM demo.recover('account');
 
 ```text
 NOTICE:  把 w2 拉起来
-NOTICE:       5 ms  S1  拉起前：w1 leader/任期6，w2 ✗宕机，w3 follower/任期6，w4 follower/任期6；控制面登记 w1；master 把读写路由到 w1
-NOTICE:      11 ms  S2  拉起前：w1 follower/任期2，w2 ✗宕机，w3 follower/任期2，w4 leader/任期2；控制面登记 w4；master 把读写路由到 w4
+NOTICE:       6 ms  S1  拉起前：w1 leader/任期3，w2 ✗宕机，w3 follower/任期3，w4 无组；控制面登记 w1；master 把读写路由到 w1
+NOTICE:      10 ms  S2  拉起前：w1 无组，w2 ✗宕机，w3 leader/任期2，w4 follower/任期2；控制面登记 w3；master 把读写路由到 w3
 NOTICE:      15 ms  S3  拉起前：w1 follower/任期1，w2 ✗宕机，w3 leader/任期1，w4 follower/任期1；控制面登记 w3；master 把读写路由到 w3
-NOTICE:      19 ms  S4  拉起前：w1 follower/任期2，w2 ✗宕机，w3 follower/任期2，w4 leader/任期2；控制面登记 w4；master 把读写路由到 w4
-NOTICE:    2310 ms  w2  pg_ctl start：进程起来了，开始重新加入各个组
-NOTICE:    2311 ms  S1  w2  follower（任期 5，还没认出 leader）
-NOTICE:    2311 ms  S2  w2  follower（任期 1，还没认出 leader）
-NOTICE:    2311 ms  S3  w2  follower（任期 1，还没认出 leader）
-NOTICE:    2311 ms  S4  w2  follower（任期 0，还没认出 leader）
-NOTICE:    3466 ms  S1  w2  follower：认 w1 为 leader（任期 6）
-NOTICE:    3466 ms  S2  w2  follower：认 w4 为 leader（任期 2）
-NOTICE:    3466 ms  S3  w2  follower：认 w3 为 leader（任期 1）
-NOTICE:    3574 ms  S4  w2  follower：认 w4 为 leader（任期 2）
-NOTICE:    4577 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
-NOTICE:    4726 ms  S1  w2  回放槽位 armed —— 已是 w1 的合格副本
-NOTICE:    5028 ms  S3  w2  回放槽位 armed —— 已是 w3 的合格副本
-NOTICE:    5077 ms  S4  w2  回放槽位 armed —— 已是 w4 的合格副本
-NOTICE:   17071 ms  S2  w2  回放槽位 armed —— 已是 w4 的合格副本
+NOTICE:      20 ms  S4  拉起前：w1 follower/任期1，w2 ✗宕机，w3 无组，w4 leader/任期1；控制面登记 w4；master 把读写路由到 w4
+NOTICE:     961 ms  w2  pg_ctl start：进程起来了，开始重新加入各个组
+NOTICE:     962 ms  S1  w2  follower（任期 2，还没认出 leader）
+NOTICE:     962 ms  S2  w2  follower（任期 0，还没认出 leader）
+NOTICE:     962 ms  S3  w2  （本节点上还没有这个组）
+NOTICE:     962 ms  S4  w2  follower（任期 0，还没认出 leader）
+NOTICE:    1456 ms  S2  w2  follower（任期 1，还没认出 leader）
+NOTICE:    1533 ms  S2  w2  follower：认 w3 为 leader（任期 2）
+NOTICE:    1533 ms  S4  w2  follower（任期 1，还没认出 leader）
+NOTICE:    1706 ms  S4  w2  follower：认 w4 为 leader（任期 1）
+NOTICE:    1779 ms  S1  w2  follower：认 w1 为 leader（任期 3）
+NOTICE:    2326 ms  master  控制面（0 号组）在各节点都已应用完 —— 可以接着读写了
+NOTICE:    2487 ms  S1  w2  回放槽位 armed —— 已是 w1 的合格副本
+NOTICE:    2506 ms  S4  w2  回放槽位 armed —— 已是 w4 的合格副本
+NOTICE:   17561 ms  S2  w2  回放槽位 armed —— 已是 w3 的合格副本
  分片 | 当前的主 | 节点 | 在组里的角色 |    回放槽位     
 --------+--------------+--------+--------------------+---------------------
  S1     | w1           | w2     | follower           | armed，回放到 0
- S2     | w4           | w2     | follower           | armed，回放到 0
- S3     | w3           | w2     | follower           | armed，回放到 0
+ S2     | w3           | w2     | follower           | armed，回放到 0
+ S3     | w3           | w2     | 不是成员       | —
  S4     | w4           | w2     | follower           | armed，回放到 0
 (4 rows)
 ```
@@ -738,16 +699,16 @@ SELECT * FROM demo.roles('account');
 ```
 
 ```text
-  节点  |            S1             |            S2             |            S3             |            小结             
-----------+---------------------------+---------------------------+---------------------------+-------------------------------
- w1 :5433 | ★ leader（任期6）   | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 3 个 follower
- w2 :5434 | follower（回放到 0） | follower（回放到 0） | follower（回放到 0） | 0 个 leader + 4 个 follower
- w3 :5435 | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 3 个 follower
- w4 :5436 | follower（回放到 0） | ★ leader（任期2）   | follower（回放到 0） | 2 个 leader + 2 个 follower
+  节点  |            S1             |            S2             |            S3             |            S4             |            小结             
+----------+---------------------------+---------------------------+---------------------------+---------------------------+-------------------------------
+ w1 :5433 | ★ leader（任期3）   | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | 1 个 leader + 2 个 follower
+ w2 :5434 | follower（回放到 0） | follower（回放到 0） | ·（不在组内）      | follower（回放到 0） | 0 个 leader + 3 个 follower
+ w3 :5435 | follower（回放到 0） | ★ leader（任期2）   | ★ leader（任期1）   | ·（不在组内）      | 2 个 leader + 1 个 follower
+ w4 :5436 | ·（不在组内）      | follower（回放到 0） | follower（回放到 0） | ★ leader（任期1）   | 1 个 leader + 2 个 follower
 (4 rows)
 ```
 
-**窗口 A**：
+**窗口 A**（耗时 2.0 s）：
 
 ```sql
 SELECT count(*) AS 账户数, sum(balance) AS 余额总和 FROM account;
@@ -770,11 +731,11 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
 
 ```text
 恢复演示前的环境
-  删表 account（分片 103169 103170 103171 103172）
-  删控制面登记（partition_map）里演示分片的行：103169,103170,103171,103172
+  删表 account
+  删控制面登记（partition_map）里演示分片的行：4 个分片
   20 项参数已按演示前的 postgresql.auto.conf 还原（TSO、选举超时）
   demo 函数库已删除（master 与各 worker）
-  清掉 8 个残留打标登记（pg_shard_xid）
+  清掉 5 个残留打标登记（pg_shard_xid）
 完成：已净场（0 个数据 Raft 组、0 张演示表、0 张分片壳表）
 ```
 
@@ -794,13 +755,12 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
    `rebalance_table_shards`、`citus_move_shard_placement` 都在产品的集群级禁用清单里（它们会亲手搬分片数据，
    绕过物理回放与 raft 放置）。所以演示是"建表时就 4 分片，数据按哈希自动落到 4 台"，这也是真实 Citus 部署的做法。
 
-4. **`start` 里的自发选主要等几十秒到几分钟。** 组刚建好时数据只在一台上，另外几台是空的；Raft 不知道谁有数据，
-   空的那台照样可能先当选 —— 它做升主前置时发现自己没有这个分片的副本，于是拒绝升主、主动让位并退避
-   5 个选举周期，直到有数据的那台当选。这一步的用时是随机的（每次不一样），`start` 的“约 2–5 分钟”主要就花在这里。
+4. **`start` 里的选主要等几十秒。** 组刚建好时数据只在一台上：建组顺序是"数据所在那台先建组当选、另外两台再入组"，
+   另外两台在入组之前不会主动竞选；已知自己没有数据的成员也不再竞选（P7-N57）。`start` 的“约 2–5 分钟”主要花在选主等待与供副本上。
 
-5. **组成员 = 全部 worker（副本因子等于节点数）。** 试过把副本因子调成 3，会在供副本时踩
-   `provision_shard_replica: 建壳表失败: record 1 未达多数派` —— 组建好、副本还没供的那一刻，
-   组内没有任何一台能落盘流里最早那条记录。演示因此让每台 worker 都进组。
+5. **副本因子 3，不等于 worker 数。** 建组走产品函数 `raft_replicate_table_shards_bulk(表, 2)`（2 个副本）：
+   数据所在那台先当选、副本再入组、从**当前**组主逐个供副本（组主中途换了也跟着走）。
+   早先演示让每台 worker 都进组，是因为自写的建组流程在"组建好、副本还没供"那一刻凑不齐多数派；产品函数没有这个问题。
 
 6. **TSO 租约演示期间放宽到 5 分钟**（`TSO_LEASE_MS`）。默认 60 s 时，几十秒的灌数批次会撞上
    "分片快照被栅栏作废：本节点已 45000 ms 未能向 TSO 续租"，整批白做。
@@ -841,7 +801,7 @@ ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardp
  demo.replay('表')              | 惰性回放：从已收到 vs 已回放
  demo.replicas('表')            | 各分区的副本信息：主、副本、已收到/已回放/待回放
  demo.distribution('表')        | 各分片的数据量（行数、余额、占比），直接读各 worker 上的分片表
- demo.setup('表')               | 一条命令：建组 → 自发选主 → 供副本 → 打标（start 已替你做好）
+ demo.setup('表')               | 一条命令：建组（副本因子 3）→ 选主 → 供副本 → 打标（start 已替你做好）
  demo.catchup('表')             | 触发回放，让每个从追平
  demo.compare('表')             | 副本与主逐字节比对
  demo.switch_leader('表', 'S1') | 手动切换 leader（同组内挑一台；实时打出切主过程）

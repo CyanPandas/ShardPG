@@ -6,6 +6,8 @@
     .\shardpg_demo.ps1 sql A        # 窗口 A：连 master 的交互式 psql，提示符 A>
     .\shardpg_demo.ps1 sql B        # 窗口 B：另开一个 PowerShell 窗口运行（演示并发事务）
     .\shardpg_demo.ps1 stop         # 演示结束，恢复演示前的环境
+  演示二（128 个分区组）：每条命令后加 -Demo 2，例如 .\shardpg_demo.ps1 start -Demo 2
+  两套演示互斥：换演示前先 stop（哪一套的 stop 都能清掉两套的表）。
 
   如果提示"禁止运行脚本"，先执行一次：Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
   也可以不用本文件，直接：ssh -t zhanhao@34.31.210.7 "bash ~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh sql A"
@@ -14,14 +16,15 @@ param(
     [Parameter(Position = 0)][ValidateSet('start', 'sql', 'stop', 'auto')][string]$Cmd = 'sql',
     [Parameter(Position = 1)][ValidateSet('A', 'B')][string]$Who = 'A',
     [string]$Server = 'zhanhao@34.31.210.7',
-    [string]$AutoArgs = ''
+    [string]$AutoArgs = '',
+    [ValidateSet('1', '2')][string]$Demo = '1'
 )
 
 # 中文输出不乱码：控制台与管道都用 UTF-8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$remote = '~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh'
+$remote = if ($Demo -eq '2') { '~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo128.sh' } else { '~/shardpg-test-work/pg-partdist-src/demo/shardpg_demo.sh' }
 if ($Cmd -eq 'sql') {
     ssh -t $Server "bash $remote sql $Who"
 } elseif ($Cmd -eq 'auto') {

@@ -20,6 +20,7 @@
 
 #include "tso.h"
 #include "partwal_sync.h"
+#include "shard_fileset.h"		/* 2026-10-03：PartDistLaunchReprovision（归队请求排队后的重拉） */
 #include "global_mvcc.h"
 #include "shard_xid.h"
 #include "shard_vacuum.h"
@@ -698,6 +699,19 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		if (shard_auto_repair_diverged &&
 			PartWALDivergedRepairDue(shard_auto_repair_interval_s * 1000))
 			ShardDivergedSelfTriggerRepair();
+
+		/*
+		 * 2026-10-03：自动归队请求排着队（拉工作者时槽位满了）——取一个出来再拉一次；
+		 * 拉得起来的那个工作者做完会接着清队列，拉不起来它会重新排回去。
+		 */
+		if (PartWALReprovQueueLen() > 0)
+		{
+			int64		qg;
+			int32		qt;
+
+			if (PartWALReprovQueuePop(&qg, &qt))
+				PartDistLaunchReprovision(qg, qt);
+		}
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
