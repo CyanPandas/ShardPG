@@ -32,6 +32,7 @@
 #include "shard_clog.h"	/* U-P5-1：分片 clog 由流重建 */
 #include "shard_xid.h"
 
+#include "utils/guc.h"            /* P7-N69：GetConfigOption */
 #include "utils/pg_crc.h"        /* R-P4-20：redo 前校验记录 CRC */
 #include "access/clog.h"            /* ExtendCLOG（§13 约束 4） */
 #include "access/commit_ts.h"       /* ExtendCommitTs */
@@ -1866,6 +1867,24 @@ ReplaySlotClearBaselineIf(Oid shard_oid, uint64 base_plsn)
 }
 
 /*
+ * ★ P7-N69：这条全量基线是不是冲着本节点来的。reserved = 0 ⇒ 全体（旧记录 / 修分叉）；
+ * 否则只有 raft 节点号等于它的副本才截断重建。
+ */
+static bool
+ReplayFullBaselineForMe(const PartWALCtrlFilesetUpdate *upd)
+{
+    const char *v;
+
+    if ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) == 0)
+        return false;
+    if (upd->reserved == 0)
+        return true;
+    v = GetConfigOption("pg_raft.node_id", true, false);
+    /* 取不到本节点编号时按"是目标"处理 —— 宁可多截一次（旧语义），也不漏截真正的目标 */
+    return (v == NULL || atoi(v) <= 0 || atoi(v) == (int) upd->reserved);
+}
+
+/*
  * ApplyCtrlRecord — 应用一条控制记录。
  *
  * 返回 true = 已应用，调用方推进游标；false = 停在栅栏，游标原地不动。
@@ -2114,7 +2133,7 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      */
     /* T7.3：主权交接不改起效游标 —— 配对换的是文件号，不是"从哪起有效" */
     lm.base_part_lsn =
-        ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0)
+        ReplayFullBaselineForMe(upd)
             ? hdr->partition_lsn
             : ctx->base_part_lsn;
 
@@ -2148,7 +2167,7 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
      * 文件号没变的（哈希里查得到）内容仍然有效，一个字节都不要动。
      */
     {
-        bool full_baseline = ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0);
+        bool full_baseline = ReplayFullBaselineForMe(upd);   /* P7-N69：定向基线只截目标 */
         bool handover     = ((upd->flags & PARTWAL_FSUPD_PRIMARY_HANDOVER) != 0);
 
         /*
@@ -2160,6 +2179,14 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
          * FPI**。照截就是把副本清空后等一批永远不会来的记录 —— 那不是修复，
          * 是把 R-P6-16 换成一个更坏的缺陷。
          */
+        if ((upd->flags & PARTWAL_FSUPD_FULL_BASELINE) != 0 && !full_baseline)
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: shard %u @plsn %llu 收到定向物理基线（目标节点 %u），"
+                            "本节点不是目标：不截断、照常回放其后的 FPI（P7-N69）",
+                            ctx->shard_oid,
+                            (unsigned long long) hdr->partition_lsn,
+                            (unsigned) upd->reserved)));
+
         for (i = 0; !handover && i < upd->nrels; i++)
         {
             bool found;

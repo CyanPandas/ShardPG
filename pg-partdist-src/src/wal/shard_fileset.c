@@ -777,6 +777,24 @@ EmitFilesetUpdate(Oid shard_oid, const ShardFileSet *old_fs,
 uint64
 ShardBaselineEmit(Oid shard_oid)
 {
+    return ShardBaselineEmitEx(shard_oid, 0);
+}
+
+/*
+ * ★ P7-N69（2026-10-05）：定向基线。target_node > 0 ⇒ 只有该 raft 节点截断重建，
+ * 其余 follower 跳过截断（FPI 照常回放 —— 健康副本与 leader 页面逐字节一致，覆盖不改内容）。
+ *
+ * 缺陷：全量基线的 CTRL 写进**组共享的分区流**，每个 follower 回放到它都立刻把本地文件
+ * 截空、等 FPI 重建。"给某个成员重供"（N25/N32/N64）走的就是这条路 —— 发基线的 leader
+ * 若在 FPI 发完之前断电，原本健康的 follower 也全停在半截空壳上，组里只剩断电的那台
+ * 有完整数据（实测组 107477：worker3 为节点 2 重供后被断电，worker2/worker4 都成了
+ * "基线未收尾"、轮流当选又让位，读写不可用直到 worker3 回来）。
+ * 目标成员本来就是坏的，它自己停在半截不损失任何冗余。
+ * target_node = 0 维持旧语义（修分叉：不知道哪个副本缺了记录，只能全体重做）。
+ */
+uint64
+ShardBaselineEmitEx(Oid shard_oid, int32 target_node)
+{
     ShardFileSet    fs;
     Oid             relids[SHARD_FILESET_MAX_RELS];
     PartWALCtrlFilesetUpdate *payload;
@@ -828,7 +846,8 @@ ShardBaselineEmit(Oid shard_oid)
     payload = palloc0(payload_len);
     payload->nrels    = (uint32) nrels;
     payload->flags    = PARTWAL_FSUPD_FULL_BASELINE;
-    payload->reserved = 0;
+    /* P7-N69：保留字段承载目标节点（0 = 全体，旧记录恒为 0，语义不变） */
+    payload->reserved = (uint16) ((target_node > 0 && target_node <= PG_UINT16_MAX) ? target_node : 0);
     memcpy(PartWALCtrlFilesetRels(payload), fs.rels,
            (size_t) nrels * sizeof(ShardFileSetRel));
 
@@ -889,17 +908,21 @@ ShardBaselineEmit(Oid shard_oid)
 
     ereport(LOG,
             (errmsg("pg_partdist: shard %u 物理基线已发射（%d 个成员，%llu 块，"
-                    "base_part_lsn=%llu）",
+                    "base_part_lsn=%llu，目标=%s）",
                     shard_oid, nrels, (unsigned long long) total_blocks,
-                    (unsigned long long) base_plsn)));
+                    (unsigned long long) base_plsn,
+                    target_node > 0 ? psprintf("节点 %d", target_node) : "全体")));
 
     /*
      * ★ 批次 #8：基线发完就把分叉标记清掉 —— 重做物理基线**就是**§13 约束 13
      * 的修复动作（FULL_BASELINE 会让 follower 先截断全部成员再重灌），
      * 没有必要再让运维手工去清一次。清标只发生在这里和 provision（它也发基线），
      * 手工入口 shard_clear_divergence() 是给"确认过没事"的取证场景留的。
+     *
+     * P7-N69：定向基线只修了目标成员，别的副本是否缺记录不得而知 —— 不清标。
      */
-    ShardClearDiverged(shard_oid);
+    if (target_node <= 0)
+        ShardClearDiverged(shard_oid);
 
     return base_plsn;
 }
@@ -2030,7 +2053,8 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
     initStringInfo(&q);
     appendStringInfo(&q,
                      "SET citus.override_table_visibility=false; "
-                     "SELECT partdist.shard_baseline_emit(%u::regclass)::text", loid);
+                     "SELECT partdist.shard_baseline_emit(%u::regclass, %d)::text",
+                     loid, target);   /* P7-N69：定向基线，只有目标节点截断重建 */
     { char *t = prov_query_text(q.data); base = t ? strtoull(t, NULL, 10) : 0; }
 
     /* 成员清单在基线之后读：成员集与基线同源 */

@@ -131,6 +131,7 @@ extern int  fileset_baseline_chunk_blocks;   /* T7.21（P7-R3）：流式基线�
  * 此前只有前半句，locmap 从不配对起点游标。
  */
 extern uint64 ShardBaselineEmit(Oid shard_oid);
+extern uint64 ShardBaselineEmitEx(Oid shard_oid, int32 target_node);
 
 /* ------------------------------------------------------------------ */
 /* §13 约束 5：冻结账目同步（D2）                                      */

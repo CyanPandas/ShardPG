@@ -1110,6 +1110,12 @@ CREATE OR REPLACE FUNCTION shard_baseline_emit(p_shard REGCLASS)
     LANGUAGE c STRICT
     AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_emit';
 
+-- ★ P7-N69：定向基线 —— 只有 p_target_node 截断重建，其余 follower 照常回放 FPI、不截断
+CREATE OR REPLACE FUNCTION shard_baseline_emit(p_shard REGCLASS, p_target_node INTEGER)
+    RETURNS BIGINT
+    LANGUAGE c STRICT
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_emit';
+
 COMMENT ON FUNCTION shard_baseline_emit(REGCLASS) IS
     '发射该 shard 的全量物理基线（整页 FPI 进本分区流），返回基线起点 partition_lsn。三个消费者：副本初始配对、快路径分叉修复、永久分叉修复。只在 leader 上调用；块数超过 pg_partdist.fileset_inline_max_blocks 时显式报错而不静默降级。';
 

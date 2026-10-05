@@ -2022,9 +2022,10 @@ Datum
 pg_partdist_shard_baseline_emit(PG_FUNCTION_ARGS)
 {
     Oid     relid = PG_GETARG_OID(0);
+    int32   target = (PG_NARGS() > 1 && !PG_ARGISNULL(1)) ? PG_GETARG_INT32(1) : 0;  /* P7-N69 */
     uint64  base_plsn;
 
-    base_plsn = ShardBaselineEmit(relid);
+    base_plsn = ShardBaselineEmitEx(relid, target);
 
     PG_RETURN_INT64((int64) base_plsn);
 }
