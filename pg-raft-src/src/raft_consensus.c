@@ -5178,10 +5178,10 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
         }
         if (verdict == 1)
         {
+            /* P7-N70：兜底轮也只有真正追平才返回 1（追不平不放行），这里不再是"跳过追平" */
             if (ps->force)
-                elog(WARNING,
-                     "pg_raft: 组 %lld 升主前置超过 %d ms 仍未追平，已按可用性优先放行上报"
-                     "（跳过了追平要求，其余升主步骤已执行；该副本可能尚未追平，升主后读到的可能是旧数据）",
+                elog(LOG,
+                     "pg_raft: 组 %lld 升主前置超过截止期 %d ms 后追平完成，上报登记（P7-N70）",
                      (long long) ctx->group_id, pg_raft_promote_catchup_deadline_ms);
             ps->prepared = true;
             return 1;
@@ -5195,7 +5195,7 @@ data_group_promote_prepare(RaftGroupCtx *ctx, int64 term)
         {
             ps->force = true;
             elog(WARNING,
-                 "pg_raft: 组 %lld 升主前置超过 %d ms 仍未追平，转入兜底：下一轮不再以追平为前提",
+                 "pg_raft: 组 %lld 升主前置超过 %d ms 仍未追平，转入兜底：继续追平，追平毫无进展则让位（P7-N70：追不平不放行）",
                  (long long) ctx->group_id, pg_raft_promote_catchup_deadline_ms);
         }
         /* 连接已回到 READY，本 tick 直接发下一轮 */

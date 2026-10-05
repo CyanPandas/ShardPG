@@ -280,6 +280,25 @@ ShardReplicaIsLocal(Oid relid)
  * —— 跑到这里时**选举已经赢下**，本节点就是该分片的 raft leader，
  * 剩下的只是把路由登记出去。此时它已不是任何人的副本。
  */
+bool
+ReplaySlotPromoted(Oid shard_oid)
+{
+    int  i;
+    bool promoted = false;
+
+    if (!OidIsValid(shard_oid) || ReplayCtl == NULL)
+        return false;
+    LWLockAcquire(ReplayCtl->lock, LW_SHARED);
+    for (i = 0; i < REPLAY_MAX_SHARDS; i++)
+        if (ReplayCtl->slots[i].shard_oid == shard_oid)
+        {
+            promoted = ReplayCtl->slots[i].promoted;
+            break;
+        }
+    LWLockRelease(ReplayCtl->lock);
+    return promoted;
+}
+
 void
 ShardReplicaSetPromoted(Oid relid, bool promoted)
 {
@@ -1624,6 +1643,29 @@ ReplayWorkerMain(Datum arg)
             Assert(s->claimed_by == MyProcPid);
 
             bound = s->target_plsn;
+
+            /*
+             * ★ P7-N70（2026-10-05）：已升主的分片不许再回放 —— 在**动作**上拦。
+             *
+             * replay_catchup 只在"发起请求"那一刻查已升主；请求若在升主之前发出（候选者的升主前置
+             * 一直在请求追平），回放进程稍后才处理它时分片已经是主了。实测：升主后 4 秒回放进程
+             * 照样认领、从 50528 追到 50623，把旧主的整页镜像盖到新主正在用的页上，升主后刚提交的
+             * 一笔写入（分片 xid 32768 在 clog 里是已提交）元组整个消失。
+             * 已升主 ⇒ 撤掉这个目标、回到休眠，一条都不放。
+             */
+            if (bound > ctxs[i]->applied_part_lsn && ReplaySlotPromoted(s->shard_oid))
+            {
+                LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                s->target_plsn = ctxs[i]->applied_part_lsn;
+                s->state = REPLAY_IDLE;
+                LWLockRelease(ReplayCtl->lock);
+                ereport(LOG,
+                        (errmsg("pg_partdist replay: shard %u 已升主，撤销挂着的追平目标 %llu（停在 %llu），"
+                                "不再回放别人的流（P7-N70）",
+                                s->shard_oid, (unsigned long long) bound,
+                                (unsigned long long) ctxs[i]->applied_part_lsn)));
+                bound = ctxs[i]->applied_part_lsn;
+            }
             if (bound > ctxs[i]->applied_part_lsn)
             {
                 MemoryContext old = MemoryContextSwitchTo(work_cxt);

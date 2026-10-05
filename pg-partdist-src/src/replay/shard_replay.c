@@ -2660,6 +2660,18 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
         uint64          expected = ctx->applied_part_lsn + 1;
         ParwalIndexEnt *ent = NULL;
 
+        /*
+         * ★ P7-N70：回放途中分片升主了 ⇒ 立即停手。每 64 条查一次（共享锁读一个布尔，
+         * 代价可忽略）；停在一条记录的边界上，已应用的部分完整。
+         */
+        if ((expected & 63) == 0 && ReplaySlotPromoted(ctx->shard_oid))
+        {
+            ereport(LOG,
+                    (errmsg("pg_partdist replay: shard %u 回放到 %llu 时已升主，停止回放（P7-N70）",
+                            ctx->shard_oid, (unsigned long long) ctx->applied_part_lsn)));
+            break;
+        }
+
         /* 有序索引上顺序推进；跳过重复 plsn（重传去重的残留） */
         while (pos < idx.nents && idx.ents[pos].plsn < expected)
             pos++;

@@ -482,6 +482,7 @@ DECLARE
     app     BIGINT;
     bound   BIGINT;
     got     BIGINT;
+    cur_app BIGINT;              -- P7-N70：这一片追完之后的实际回放进度
     ndiv    BIGINT;
     caught_up BOOLEAN := true;   -- P7-N30：本次升主是否真的追平（兜底放行时为假）
     has_tail  BOOLEAN;           -- P7-N35：日志里还有上一任期继承来、尚未提交的尾巴
@@ -604,13 +605,11 @@ BEGIN
             noop_idx := 0;
         END;
         IF coalesce(noop_idx, 0) <= 0 THEN
-            IF NOT p_force THEN
-                RAISE LOG 'pg_raft: 分片 % (组 %) 本任期空条目还没提交（上一任期的尾巴尚未确认提交），'
-                          '本轮不升主，下个 tick 重试（P7-N35）', loid, p_group_id;
-                RETURN 0;
-            END IF;
-            RAISE WARNING 'pg_raft: 分片 % (组 %) 本任期空条目提交不了，兜底放行 —— '
-                          '继承来的尾巴若含提交标记，可能被认领改判（P7-N35）', loid, p_group_id;
+            -- ★ P7-N70（2026-10-05）：兜底也不放行。原来 p_force 时这里"兜底放行"，注释自己就写着
+            --   "继承来的尾巴若含提交标记，可能被认领改判" —— 那就是丢已确认的提交（N35 的同一机制）。
+            RAISE LOG 'pg_raft: 分片 % (组 %) 本任期空条目还没提交（上一任期的尾巴尚未确认提交），'
+                      '本轮不升主，下个 tick 重试（P7-N35/N70：兜底也不放行）', loid, p_group_id;
+            RETURN 0;
         END IF;
     END IF;
 
@@ -662,16 +661,30 @@ BEGIN
                               '（兜底也不放行：否则登记的是残缺数据，P7-N32）', loid, p_group_id;
                 RETURN -1;
             END IF;
-            IF NOT p_force THEN
-                RETURN 0;
-            END IF;
             got := NULL;
         END;
-        IF (got IS NULL OR got < bound) AND NOT p_force THEN
-            RETURN 0;           -- 这一片没追完，下个 tick 接着追
-        END IF;
         IF got IS NULL OR got < bound THEN
-            caught_up := false; -- 兜底放行：本地数据落后于流
+            -- ★ P7-N70（2026-10-05，P0 丢数据）：**追不平就不放行**，兜底轮也一样。
+            --
+            --   原兜底（N4/N6）过了截止期就以"可用性优先"放行：追平没完成也照常认领、上报、对外服务。
+            --   确定性复现（截止期 1 ms + 冻结候选者回放进程）：①没回放的尾巴里那笔**已确认提交**
+            --   读不到（读不一致）；②认领把它的分片 xid 当无主 RUNNING 改判；③升主后回放仍在跑，
+            --   把旧主的整页镜像盖到新主正在用的页上 —— 旧主尾巴里的提交（51 号 = 515151）和升主后
+            --   新写入的提交（17 号 = 171717，分片 xid 32768 在 clog 里是已提交、元组却已不存在）
+            --   都永久丢失。惰性回放让副本积压整个任期的流，生产规模下追平超过 60 s 是常态。
+            --
+            --   现在：没追平一律返回 0，下个 tick 接着追（BGW 保持 leader，后台回放也在继续）；
+            --   兜底轮里这一片**毫无进展**（回放卡死：结构栅栏、回放进程异常等）才返回 -1 让位，
+            --   让别的成员去试 —— 不让一个永远追不上的节点死占 leader。
+            --   另一种取舍（保留放行但跳过认领、拒绝写入直到追平）记在 P7 文档 N70，留待后续。
+            -- 进度按回放槽位的实际 applied 量（超时是以异常抛出的，got 那时为 NULL，不能拿它判）
+            SELECT s.applied INTO cur_app FROM partdist.replay_status() s WHERE s.shard = loid;
+            IF p_force AND coalesce(cur_app, 0) <= coalesce(app, 0) THEN
+                RAISE WARNING 'pg_raft: 分片 % (组 %) 过了追平截止期、这一片毫无进展（applied=% → %，目标=%），'
+                              '本节点让位（P7-N70：追不平不放行）', loid, p_group_id, app, cur_app, bound;
+                RETURN -1;
+            END IF;
+            RETURN 0;           -- 这一片没追完，下个 tick 接着追（兜底轮也不放行）
         END IF;
     END IF;
 

@@ -463,6 +463,8 @@ extern bool PartDistFlushExemptHook(const RelFileLocator *rlocator);
  * 以及 438 基线路径完全不受影响）。
  */
 extern bool ShardReplicaIsLocal(Oid relid);
+/* P7-N70：本节点上该分片的回放槽位是否已置"已升主"（已升主就不许再回放别人的流） */
+extern bool ReplaySlotPromoted(Oid shard_oid);
 /* 批次 #7：raft 角色交接时置/撤"已升主"身份（闸门出口） */
 extern void ShardReplicaSetPromoted(Oid relid, bool promoted);
 extern void ShardReplicaNoteForeignAppend(Oid relid);   /* P7-N23 */
