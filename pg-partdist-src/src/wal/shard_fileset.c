@@ -1771,6 +1771,7 @@ SmgrRecordGetLocator(const char *record_data, uint32 record_len,
 #include "utils/wait_event.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
+#include "common/file_perm.h"   /* P7-N73：pg_dir_create_mode */
 
 /* 取一列文本，取不到返回 NULL（palloc 在调用方的上下文里） */
 static char *
@@ -2116,10 +2117,16 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
                      "SELECT partdist.replay_set_locmap('%s', ARRAY[%s], ARRAY[%s], "
                      "ARRAY[%s]::oid[], ARRAY[%s]::oid[], ARRAY[%s]::oid[], %llu::bigint); "
                      "SELECT partdist.replay_enable('%s'); "
-                     "SELECT partdist.shard_xid_raise_watermark('%s'::regclass::oid, %llu);",
+                     "SELECT partdist.shard_xid_raise_watermark('%s'::regclass::oid, %llu); "
+                     /*
+                      * ★ P7-N72：起效游标已指向这条定向基线，旧堆注定被截断重建 ——
+                      * 本地分叉标记在此刻作废（不等惰性回放真跑到那条基线；否则修复日志
+                      * 每轮都列它、以后每次换主自动归队还会再重供一遍）。
+                      */
+                     "SELECT partdist.shard_clear_divergence('%s'::regclass::oid);",
                      shard_tbl, roles, ords, spcs, dbs, rels,
                      (unsigned long long) base, shard_tbl,
-                     shard_tbl, (unsigned long long) lead_wm);
+                     shard_tbl, (unsigned long long) lead_wm, shard_tbl);
     resetStringInfo(&q);
     appendStringInfo(&q,
                      "shard=%lld target_node=%d table=%s base=%llu xid_wm=%llu members=%s",
@@ -2227,6 +2234,12 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
         return msg;
     }
     /*
+     * ★ P7-N72（2026-10-05）：还要不带分叉标记。标记打在**当时的 leader** 上（复制挂钩失败、
+     * 本地堆有没进流的物理改动）；它一旦被取代、降为 follower，本地堆就和新主的流对不上，
+     * 而它自己的自动修复只在当主时才发基线 —— 永远修不了，组里悄悄只剩两份可信副本
+     * （实测 9 个标记、最老的挂了 20 多分钟）。新主在这里把它当坏副本，定向重供；
+     * 目标成员回放到发给自己的全量基线时清掉本地标记（shard_replay.c）。
+     *
      * ★ P7-N64：还要本地副本不**持久**残缺（索引 0 字节且没有在途基线标记 —— 典型是
      * 供副本中途断电、重启后丢了内存里的半程标记）。**在途基线不算**：首版把在途也算进来，
      * 新主一上任就给正在收基线的成员再发一次全量基线、把它截空重来，基线永远收不了尾，
@@ -2239,6 +2252,7 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
              "SELECT coalesce((SELECT armed AND state <> 'failed' "
              "                    AND (partdist.shard_baseline_pending(shard) "
              "                         OR NOT partdist.shard_local_copy_broken(shard)) "
+             "                    AND partdist.shard_divergence(shard) IS NULL "
              "                 FROM partdist.replay_status() "
              "WHERE shard = partdist.local_partition_for_shard(%lld)), false)::text",
              (long long) gsid);
@@ -2710,6 +2724,21 @@ ShardPromotedMarkWrite(Oid shard_oid, bool promoted)
         return;
     }
 
+    /*
+     * ★ P7-N73（2026-10-05）：目录可能还不存在 —— pg_parwal/<oid>/ 要等这个分片第一次落分区 WAL
+     * 才建，而原始 placement 主"首次登记为主"就在那之前。原来直接 open 失败、只打一条 WARNING，
+     * 之后再没人补写：原始主都没有持久的"已升主"记号，分叉自动修复永远判它"不是在册主"
+     * （演示二一轮里每台 worker 600–1300 条告警，原始主上的分叉标记永远修不了）。先建目录。
+     */
+    {
+        char dir[MAXPGPATH];
+
+        snprintf(dir, MAXPGPATH, "%s/%s/%u", DataDir, PARTITION_WAL_DIR, shard_oid);
+        if (pg_mkdir_p(dir, pg_dir_create_mode) != 0 && errno != EEXIST)
+            ereport(WARNING,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: 无法建目录 \"%s\": %m", dir)));
+    }
     fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
     if (fd < 0)
     {
@@ -2854,6 +2883,13 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
          *   是该组 leader 且多数派最近有应答才发；否则记 quorum_wait 留待下一轮
          *   （计入 skipped，心跳按间隔重试）。
          */
+        /* P7-N72：先判在册主 —— follower 上 quorum_alive 恒假，原来会被误标成 quorum_wait */
+        if (!ShardPromotedMarkRead(shard))
+        {
+            nskipped++;
+            appendStringInfo(&out, " not_primary:%u", shard);
+            continue;
+        }
         if (!shard_group_quorum_alive(shard))
         {
             nskipped++;
@@ -2868,12 +2904,6 @@ partdist_repair_diverged_shards(PG_FUNCTION_ARGS)
          * 60 行已提交数据）。跳过记为 skipped（PartWALNoteDivergedPending 保证之后再试），
          * 等它真登记成主、标记置真后由心跳自动修复接手。
          */
-        if (!ShardPromotedMarkRead(shard))
-        {
-            nskipped++;
-            appendStringInfo(&out, " not_primary:%u", shard);
-            continue;
-        }
 
         /*
          * ★ T7.27：每个分片包一层**子事务**。原先是裸 PG_TRY + FlushErrorState 之后

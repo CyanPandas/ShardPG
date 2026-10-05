@@ -4940,6 +4940,8 @@ aconn_sweep_one(RaftAsyncConn *ac)
     }
 }
 
+static void report_sweep_orphan(int k);     /* P7-N71，定义在批量登记处 */
+
 static void
 promote_async_sweep(void)
 {
@@ -4949,6 +4951,7 @@ promote_async_sweep(void)
     {
         aconn_sweep_one(&promote_pool[i]);
         aconn_sweep_one(&report_pool[i]);
+        report_sweep_orphan(i);     /* P7-N71 */
     }
     aconn_sweep_one(&ctrl_noop_aconn);
 }
@@ -5240,10 +5243,52 @@ static int64 batch_term[RAFT_ACONN_POOL][RAFT_REPORT_PIGGYBACK_MAX];
 static bool
 batch_slot_valid(int k)
 {
+    /*
+     * ★ P7-N71：在途超过两倍登记超时的批次不再算数 —— 正常情况下主人的 tick 30 s 就会
+     * 取消重来；超过这个时长只能是没人来收结果了，别让被捎带的组为它干等。
+     */
     return batch_n[k] > 0 &&
         report_pool[k].state == RAFT_ACONN_BUSY &&
         report_pool[k].owner_group == batch_owner_gid[k] &&
-        report_pool[k].owner_term == batch_owner_term[k];
+        report_pool[k].owner_term == batch_owner_term[k] &&
+        !TimestampDifferenceExceeds(report_pool[k].started, GetCurrentTimestamp(),
+                                    2 * RAFT_REPORT_EXEC_TIMEOUT_MS);
+}
+
+/* 该组（该任期）自己是不是某条登记连接上在途语句的主人 */
+static bool
+group_owns_inflight_report(int64 gid, int64 term)
+{
+    int k;
+
+    for (k = 0; k < RAFT_ACONN_POOL; k++)
+        if (report_pool[k].state == RAFT_ACONN_BUSY &&
+            report_pool[k].owner_group == gid && report_pool[k].owner_term == term)
+            return true;
+    return false;
+}
+
+/*
+ * ★ P7-N71（2026-10-05）：登记连接上的在途语句，主人已经不需要登记了（被别的批次捎带着
+ * 登记完、report_pending 已清）⇒ 主人的 tick 再也不会来收这条连接的结果，连接永远 BUSY，
+ * 上面记着的批次也永远"有效"，被它捎带的组一直以为"正被在途批次带着"而不自己报 ——
+ * 实测组 107661 因此 15 分钟以上登记不上，读写全被闸门挡住。
+ * 取消这条连接、作废批次记录；被捎带的组保持待登记，自己重报（重复提案由任期栅栏挡掉）。
+ */
+static void
+report_sweep_orphan(int k)
+{
+    RaftAsyncConn *ra = &report_pool[k];
+    RaftGroupCtx   c;
+
+    if (ra->state != RAFT_ACONN_BUSY)
+        return;
+    if (raft_group_ctx(ra->owner_group, &c) && c.g->report_pending)
+        return;                 /* 主人还在等结果，交给它自己收 */
+    elog(LOG, "pg_raft: 组 %lld 已登记完成，取消它挂在登记连接上的在途语句（被捎带的 %d 个组改为自己重报，P7-N71）",
+         (long long) ra->owner_group, batch_n[k]);
+    batch_n[k] = 0;
+    aconn_reset(ra, true);
 }
 
 /* 该组（该任期）是否正被别的在途批次捎带着 */
@@ -5312,6 +5357,8 @@ report_collect_piggyback(int64 self_gid, StringInfo items, int64 *gids, int64 *t
             continue;
         if (group_in_inflight_batch(ps->group_id, ps->term))
             continue;           /* 已经被别的在途批次带着 */
+        if (group_owns_inflight_report(ps->group_id, ps->term))
+            continue;           /* P7-N71：它自己有在途登记，结果得由它自己来收 */
         if (!raft_group_ctx(ps->group_id, &c) || !c.g->report_pending)
             continue;
         SpinLockAcquire(&c.cons->mutex);

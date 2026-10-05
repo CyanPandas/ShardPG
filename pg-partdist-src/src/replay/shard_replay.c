@@ -2209,6 +2209,11 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 
         if (full_baseline)
         {
+            /*
+             * ★ P7-N72：本地分叉标记随基线作废 —— 截断重建之后本地堆以新主为准，
+             * 旧主时代"本地有没进流的物理改动"这件事已不存在。
+             */
+            ShardClearDiverged(ctx->shard_oid);
             /* ★ P7-N16：置半程标记；BASELINE_END 到达才解除，其间不许升主。 */
             ReplaySlotSetBaselinePending(ctx->shard_oid,
                                          (uint64) hdr->partition_lsn);
