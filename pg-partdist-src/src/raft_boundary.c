@@ -493,45 +493,21 @@ partwal_find_record_scan(Oid partition_id, uint64 target,
 						 PartWALRecord *out_rec, char **out_data)
 {
 	char			dirpath[MAXPGPATH];
-	DIR			   *dir;
-	struct dirent  *de;
-	char			segfiles[256][MAXPGPATH];
+	PartWALSegName *segfiles;
 	int				nfiles = 0;
-	int				i,
-					j;
+	int				i;
 	bool			found = false;
 
 	snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
 			 DataDir, PARTITION_WAL_DIR, partition_id);
 
-	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-		return false;
-
-	while ((de = ReadDir(dir, dirpath)) != NULL && nfiles < 256)
-	{
-		if (IsXLogFileName(de->d_name))
-		{
-			strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-			nfiles++;
-		}
-	}
-	FreeDir(dir);
-
+	/*
+	 * 段文件名升序即 partition_lsn 升序。2026-10-12：全部段 —— 原来只列前 256 个
+	 * （readdir 顺序还不保证），记录在第 257 段时这里答"没有这条记录"，文件其实好好的。
+	 */
+	segfiles = PartWALListSegments(partition_id, &nfiles);
 	if (nfiles == 0)
 		return false;
-
-	/* 段文件名升序即 partition_lsn 升序 */
-	for (i = 0; i < nfiles - 1; i++)
-		for (j = i + 1; j < nfiles; j++)
-			if (strcmp(segfiles[i], segfiles[j]) > 0)
-			{
-				char		tmp[MAXPGPATH];
-
-				strlcpy(tmp, segfiles[i], MAXPGPATH);
-				strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-				strlcpy(segfiles[j], tmp, MAXPGPATH);
-			}
 
 	for (i = 0; i < nfiles && !found; i++)
 	{
@@ -615,8 +591,7 @@ partwal_find_record_scan(Oid partition_id, uint64 target,
 #define PWIDX_STRIDE		32
 #define PWIDX_MAX_PARTS		8
 #define PWIDX_MAX_POINTS	131072		/* ≈ 420 万条记录；满了不再加点，仍从最后一点往后读 */
-#define PWIDX_MAX_SEGS		256			/* 与全扫描一致 */
-#define PWIDX_SEGNAME_LEN	32
+/* 2026-10-12：段表不再有 256 段上限（PartWALListSegments），原来过了 256 段的记录快慢两条路都找不到 */
 
 typedef struct PwIdxPoint
 {
@@ -631,7 +606,7 @@ typedef struct PwIdx
 	Oid			partition_id;	/* InvalidOid = 空槽 */
 	uint64		last_use;
 	int			nsegs;
-	char		segs[PWIDX_MAX_SEGS][PWIDX_SEGNAME_LEN];
+	PartWALSegName *segs;		/* TopMemoryContext，升序 */
 	int			npoints;
 	int			cap;
 	PwIdxPoint *points;			/* plsn 严格升序 */
@@ -647,40 +622,20 @@ pwidx_drop(PwIdx *ix)
 {
 	if (ix->points != NULL)
 		pfree(ix->points);
+	if (ix->segs != NULL)
+		pfree(ix->segs);
 	memset(ix, 0, sizeof(PwIdx));
 }
 
+/* 列出分区目录下的全部段文件名（升序），数组分配在 TopMemoryContext。为空返回 0、*out = NULL。 */
 static int
-pwidx_segname_cmp(const void *a, const void *b)
+pwidx_list_segs(Oid partition_id, PartWALSegName **out)
 {
-	return strcmp((const char *) a, (const char *) b);
-}
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	int			n = 0;
 
-/* 列出分区目录下的段文件名（升序）。失败/为空返回 -1 / 0。 */
-static int
-pwidx_list_segs(Oid partition_id, char segs[][PWIDX_SEGNAME_LEN])
-{
-	char			dirpath[MAXPGPATH];
-	DIR			   *dir;
-	struct dirent  *de;
-	int				n = 0;
-
-	snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
-			 DataDir, PARTITION_WAL_DIR, partition_id);
-	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-		return -1;
-	while ((de = ReadDir(dir, dirpath)) != NULL && n < PWIDX_MAX_SEGS)
-	{
-		if (IsXLogFileName(de->d_name))
-		{
-			strlcpy(segs[n], de->d_name, PWIDX_SEGNAME_LEN);
-			n++;
-		}
-	}
-	FreeDir(dir);
-	if (n > 1)
-		qsort(segs, n, PWIDX_SEGNAME_LEN, pwidx_segname_cmp);
+	*out = PartWALListSegments(partition_id, &n);
+	MemoryContextSwitchTo(old);
 	return n;
 }
 
@@ -706,10 +661,10 @@ pwidx_get(Oid partition_id)
 	}
 
 	pwidx_drop(victim);
-	victim->nsegs = pwidx_list_segs(partition_id, victim->segs);
+	victim->nsegs = pwidx_list_segs(partition_id, &victim->segs);
 	if (victim->nsegs <= 0)
 	{
-		memset(victim, 0, sizeof(PwIdx));
+		pwidx_drop(victim);
 		return NULL;
 	}
 	victim->partition_id = partition_id;
@@ -752,17 +707,26 @@ pwidx_add_point(PwIdx *ix, uint64 plsn, int seg, off_t off, uint32 data_len)
 static bool
 pwidx_refresh_segs(PwIdx *ix)
 {
-	char		fresh[PWIDX_MAX_SEGS][PWIDX_SEGNAME_LEN];
-	int			n = pwidx_list_segs(ix->partition_id, fresh);
+	PartWALSegName *fresh;
+	int			n = pwidx_list_segs(ix->partition_id, &fresh);
 	int			i;
 
 	if (n < ix->nsegs)
+	{
+		if (fresh != NULL)
+			pfree(fresh);
 		return false;
+	}
 	for (i = 0; i < ix->nsegs; i++)
 		if (strcmp(fresh[i], ix->segs[i]) != 0)
+		{
+			pfree(fresh);
 			return false;
-	for (i = ix->nsegs; i < n; i++)
-		strlcpy(ix->segs[i], fresh[i], PWIDX_SEGNAME_LEN);
+		}
+	/* 已知段表是新列表的前缀：整张换成新列表 */
+	if (ix->segs != NULL)
+		pfree(ix->segs);
+	ix->segs = fresh;
 	ix->nsegs = n;
 	return true;
 }

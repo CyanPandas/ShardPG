@@ -29,10 +29,14 @@ PORTS=$(PS 5432 -Atc "SELECT p FROM (SELECT 5432 AS p UNION SELECT nodeport FROM
 [[ -n "${PORTS// /}" ]] || PORTS=$(seq 5432 5440 | tr '\n' ' ')
 
 extract_block() {   # 抽出 "CREATE OR REPLACE FUNCTION <name>(" 起、到下一个空行为止的块（含 COMMENT）
+  # 2026-10-12：plpgsql 函数体里有空行，原来"到第一个空行为止"把函数体截在半截
+  # （unterminated dollar-quoted string）。遇到 $tag$ 开头的函数体就一直读到收尾的 $tag$ 之后再按空行收。
   awk -v n="$1" '
     $0 ~ ("^CREATE OR REPLACE FUNCTION " n "\\(") { inb=1 }
+    inb && tag == "" && match($0, /\$[A-Za-z_]*\$/) { tag = substr($0, RSTART, RLENGTH); seen = 0 }
+    inb && tag != "" { line = $0; while ((i = index(line, tag)) > 0) { seen++; line = substr(line, i + length(tag)) } }
     inb { print }
-    inb && /^$/ { exit }
+    inb && /^$/ && (tag == "" || seen >= 2) { exit }
   ' "$SQLF" | sed "s|'MODULE_PATHNAME'|'${MODPATH}'|"
 }
 sig_of() {   # $1=函数名；从**整个 SQL 文件**取 "name(argtypes)" 给 ALTER EXTENSION 用。

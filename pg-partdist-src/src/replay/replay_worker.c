@@ -399,6 +399,15 @@ ShardReplicaNoteForeignAppend(Oid relid)
     if (!OidIsValid(relid) || ReplayCtl == NULL)
         return;
 
+    /*
+     * ★ 2026-10-12：盘上也记一笔（没有回放槽位的原始 placement 主只能靠它）。
+     * 下面那个 promoted_clean 在槽位里、只活在本进程生命期；原始主压根没有槽位，
+     * 升主前置对它只能按 R-P4-15 一刀切拒绝 —— 即便它从没交出主权、收到的全是自己写的记录。
+     * 有了这个记号，"仍持已升主记号且没有 foreign 记号"在无槽位时也能判（见 ShardReplicaPromotedSelfHeld）。
+     */
+    if (ShardPromotedMarkRead(relid))
+        ShardForeignMarkWrite(relid, true);
+
     LWLockAcquire(ReplayCtl->lock, LW_SHARED);
     for (i = 0; i < REPLAY_MAX_SHARDS; i++)
         if (ReplayCtl->slots[i].shard_oid == relid)
@@ -432,6 +441,7 @@ bool
 ShardReplicaPromotedSelfHeld(Oid relid)
 {
     bool held = false;
+    bool found = false;
     int  i;
 
     if (!OidIsValid(relid) || ReplayCtl == NULL)
@@ -441,11 +451,21 @@ ShardReplicaPromotedSelfHeld(Oid relid)
     for (i = 0; i < REPLAY_MAX_SHARDS; i++)
         if (ReplayCtl->slots[i].shard_oid == relid)
         {
+            found = true;
             held = ReplayCtl->slots[i].promoted &&
                    ReplayCtl->slots[i].promoted_clean;
             break;
         }
     LWLockRelease(ReplayCtl->lock);
+
+    /*
+     * ★ 2026-10-12：没有回放槽位（原始 placement 主）时按盘上记号判：仍持"已升主"记号、
+     * 且升主以来没有落过他人写的 DATA/MARKER（foreign 记号，见 ShardReplicaNoteForeignAppend）。
+     * 主权一旦交出，切主 apply 会删掉已升主记号（raft_boundary.c），这里就是假 ——
+     * R-P4-15 那种"崩溃后带着陈旧数据回来的旧主"照旧被拒。
+     */
+    if (!found)
+        held = ShardPromotedMarkRead(relid) && !ShardForeignMarkRead(relid);
     return held;
 }
 
@@ -1821,7 +1841,7 @@ PG_FUNCTION_INFO_V1(pg_partdist_replay_status);
  * 三条安全约束：
  *   a) **必须跑在有目录访问的 backend 里**（launcher 只有 SHMEM_ACCESS，
  *      查不了 pg_class，所以这件事做不进 launcher）；
- *   b) **被认领的槽位一律不动** —— worker 可能正在其上回放；
+ *   b) **不直接清别人认领着的槽位** —— worker 可能正在其上回放；先撤 armed 让它自己放手再清；
  *   c) **宽限期**：只删 mtime 早于 grace_secs 的目录。目录是在第一条记录落盘时
  *      创建的、彼时关系必然存在，所以窗口很窄；宽限期是廉价保险，
  *      免得撞上"关系刚建、尚未对本会话可见"这类边角。
@@ -1852,12 +1872,23 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
      * 见该函数注释）—— 两边各持一把、各等一把，LWLock 不做死锁检测，整台节点冻死：
      * 128 分区组建组时实测 w4 上 300 个后端全卡在 LWLockAcquire、SIGTERM 都杀不掉、连接打满。
      * 改成：共享锁下抄出候选 → 放锁查目录 → 排他锁下按"槽位没变"复核后释放。
+     *
+     * ★ 2026-10-12：**被活着的回放进程认领着的陈旧槽位也要能收回来**。
+     * 回放进程一圈就把所有 armed 槽位认领下来、空闲时也不放（惰性：认领≠在回放），
+     * 只有 armed=false 才释放。原来这里把"有活人认领"一律跳过 ⇒ 回放进程不重启，
+     * 已 DROP 的副本壳表的槽位就永远收不回：演示二每跑一遍 start 每台涨 ~64 个，
+     * 第三遍把 256 个占满，建组卡在 provision_shard_replica"回放槽位已满"里重试一个半小时。
+     * 不能直接 memset 别人认领的槽位（回放进程失败路径分两次持锁回写槽位，夹在中间清掉
+     * 会写进换了主人的槽位），所以走回放进程自己的释放路径：关系已不存在的 → 先撤 armed，
+     * 等它下一圈放掉认领（最多等两个 naptime 再加 1 s），放掉了再清；没等到的下次再收。
      */
     {
         Oid     cand[REPLAY_MAX_SHARDS];
         int     cslot[REPLAY_MAX_SHARDS];
         bool    gone[REPLAY_MAX_SHARDS];
+        bool    pending[REPLAY_MAX_SHARDS];
         int     nc = 0;
+        int     npending = 0;
         int     k;
 
         LWLockAcquire(ReplayCtl->lock, LW_SHARED);
@@ -1867,8 +1898,6 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
 
             if (s->shard_oid == InvalidOid)
                 continue;
-            if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
-                continue;               /* 有活着的 worker 认领着，不动 */
             cand[nc] = s->shard_oid;
             cslot[nc] = i;
             nc++;
@@ -1876,7 +1905,10 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
         LWLockRelease(ReplayCtl->lock);
 
         for (k = 0; k < nc; k++)        /* 锁外查目录 */
+        {
             gone[k] = !SearchSysCacheExists1(RELOID, ObjectIdGetDatum(cand[k]));
+            pending[k] = false;
+        }
 
         LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
         for (k = 0; k < nc; k++)
@@ -1886,7 +1918,12 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
             if (!gone[k] || s->shard_oid != cand[k])
                 continue;               /* 关系还在 / 槽位已换人 */
             if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
-                continue;               /* 期间被认领了 */
+            {
+                s->armed = false;       /* 让认领它的回放进程下一圈自己放手 */
+                pending[k] = true;
+                npending++;
+                continue;
+            }
 
             ereport(LOG,
                     (errmsg("pg_partdist replay: 回收陈旧槽位 shard %u（关系已不存在）",
@@ -1897,6 +1934,54 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
         if (nslots > 0)
             ReplayRecountReplicasLocked();
         LWLockRelease(ReplayCtl->lock);
+
+        if (npending > 0)
+        {
+            long waited = 0;
+            long limit = 2L * replay_naptime_ms + 1000;
+
+            while (npending > 0 && waited <= limit)
+            {
+                int freed_now = 0;
+
+                pg_usleep(100 * 1000L);
+                waited += 100;
+                CHECK_FOR_INTERRUPTS();
+
+                LWLockAcquire(ReplayCtl->lock, LW_EXCLUSIVE);
+                for (k = 0; k < nc; k++)
+                {
+                    ReplayShardSlot *s = &ReplayCtl->slots[cslot[k]];
+
+                    if (!pending[k])
+                        continue;
+                    if (s->shard_oid != cand[k])
+                    {
+                        pending[k] = false;     /* 槽位已换人（不该发生，保守放过） */
+                        npending--;
+                        continue;
+                    }
+                    if (s->claimed_by != 0 && kill(s->claimed_by, 0) == 0)
+                        continue;               /* 还没放手 */
+
+                    ereport(LOG,
+                            (errmsg("pg_partdist replay: 回收陈旧槽位 shard %u（关系已不存在，"
+                                    "回放进程已放手）", s->shard_oid)));
+                    memset(s, 0, sizeof(ReplayShardSlot));
+                    pending[k] = false;
+                    npending--;
+                    freed_now++;
+                }
+                if (freed_now > 0)
+                    ReplayRecountReplicasLocked();
+                LWLockRelease(ReplayCtl->lock);
+                nslots += freed_now;
+            }
+            if (npending > 0)
+                ereport(LOG,
+                        (errmsg("pg_partdist replay: %d 个陈旧槽位的回放进程还没放手，下次回收再清",
+                                npending)));
+        }
     }
 
     /* ---- 2) 删目录：关系已不存在、且过了宽限期 ---- */

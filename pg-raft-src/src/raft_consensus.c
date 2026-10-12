@@ -434,6 +434,7 @@ static bool group_resolve_membership(RaftGroupCtx *ctx);
 static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
+static bool data_entry_present_locally(RaftGroupCtx *ctx, const char *payload);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
                              const char *data_hex, bool fresh_append);
 static int64 group_local_partition(RaftGroupCtx *ctx);
@@ -1254,6 +1255,101 @@ data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn)
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
     return hex;
+}
+
+/*
+ * ★ 2026-10-12：follower 侧 —— leader 发来"只有头、没有字节"的数据条目（leader 本地 pg_parwal 里
+ * 那条记录没了，见 replicate_to_peer）时，看本节点自己的流里是不是**已经有这条**：同一个
+ * partition_lsn、头部（orig_lsn / rmid / info / flags / gxid）逐项相同 ⇒ 字节早已在本地落盘，
+ * 可以收下条目并 ack（"多数派 ack == 多数派字节已持久化"不变）。否则 false（不收、不 ack）。
+ *
+ * 实测（演示二 P059）：条目 31..35 是原始主 w3 自己当主时写的、已提交；w1/w4 的日志里有、
+ * 本地流里的字节却被半程的全量基线截掉了；w3 的日志被回滚掉了这几条、字节却都在。
+ * 原来 leader 取不到字节就只发心跳，w3 永远追不上、整组无主。
+ */
+/* 2026-10-12：本节点流里最后一条已落盘记录的 partition_lsn（-1 = 查不到） */
+static int64
+data_local_flush_plsn(RaftGroupCtx *ctx)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int64          local_oid = group_local_partition(ctx);
+    int64          v = -1;
+
+    if (local_oid <= 0 || !raft_persist_spi_begin(&spi_owned))
+        return -1;
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "SELECT partdist.get_partition_flush_lsn(%u::oid)", (unsigned) local_oid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+        if (!isnull)
+            v = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return v;
+}
+
+static bool
+data_entry_present_locally(RaftGroupCtx *ctx, const char *payload)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    bool           same = false;
+    int64          local_oid;
+    int64          plsn = entry_partition_lsn(payload);
+    char           orig_lsn[64];
+    long long      gxid = 0;
+    int            rmid = 0;
+    int            info = 0;
+    int            flags = 0;
+    const char    *p;
+
+    local_oid = group_local_partition(ctx);
+    if (local_oid <= 0 || plsn <= 0)
+        return false;
+
+    orig_lsn[0] = '\0';
+    p = strstr(payload, "\"orig_lsn\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " \"%63[^\"]\"", orig_lsn);
+    if (orig_lsn[0] == '\0')
+        strlcpy(orig_lsn, "0/0", sizeof(orig_lsn));
+    p = strstr(payload, "\"rmid\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %d", &rmid);
+    p = strstr(payload, "\"info\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %d", &info);
+    p = strstr(payload, "\"flags\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %d", &flags);
+    p = strstr(payload, "\"gxid\"");
+    if (p != NULL && (p = strchr(p, ':')) != NULL)
+        (void) sscanf(p + 1, " %lld", &gxid);
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return false;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT (r.orig_lsn = '%s'::pg_lsn AND r.rmid = %d AND r.info = %d "
+                     "        AND r.flags = %d AND r.gxid = %lld)::text "
+                     "FROM partdist.partwal_read_record(%u::oid, %lld) r",
+                     orig_lsn, rmid, info, flags, gxid,
+                     (unsigned) local_oid, (long long) plsn);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+        same = !isnull && strcmp(TextDatumGetCString(d), "true") == 0;
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return same;
 }
 
 /*
@@ -4331,9 +4427,12 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
             has_entry = false;
         else
         {
+            /*
+             * 2026-10-12：本地取不到字节也照发（只带头）。原来降级为心跳 —— 字节被截掉的 leader
+             * 永远追不平别人，哪怕对方流里本来就有这条（P059）。对方没有同一条就不收不 ack，
+             * 与原来一样不推进；有就收下（见 data_entry_present_locally）。
+             */
             data_hex = data_entry_fetch_hex(ctx, entry_partition_lsn(entry.payload));
-            if (data_hex == NULL)
-                has_entry = false;
         }
     }
 
@@ -6594,6 +6693,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
     int64        cfg_commit = 0;         /* T7.20：提交点快照，用于成员变更定案 */
     bool         fresh_append = false;   /* T7.24：本条是否落在本地日志末尾之后 */
     int64        conflict_plsn = -1;
+    bool         data_preexisting = false;  /* 2026-10-12：不带字节的数据条目、本地已有同一条 */
 
     *success = 0;
     restore_hard_state_if_needed(ctx);
@@ -6665,6 +6765,51 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                  (long long) ctx->group_id, (long long) entry_idx);
         }
         return true;
+    }
+
+    /*
+     * 2026-10-12：leader 发来的数据条目不带字节（它本地那条没了，见 data_entry_present_locally）。
+     * 本节点流里已有同一条才收；没有就像上面一样**拒在 append 之前**，日志与提交点都不动。
+     */
+    if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0 && entry_data_hex == NULL)
+    {
+        if (!data_entry_present_locally(ctx, entry_payload))
+        {
+            elog(LOG, "pg_raft: group %lld 数据条目 idx=%lld 没带字节、本节点流里也没有同一条，不收不 ack",
+                 (long long) ctx->group_id, (long long) entry_idx);
+            return true;
+        }
+        data_preexisting = true;
+    }
+
+    /*
+     * 2026-10-12：带字节的数据条目，若落盘会在本地流里留空洞（编号 > 本地末尾 + 1），
+     * **拒在 append 之前**（干净地回 ok=0），而不是让 partwal_follower_append 抛 ERROR。
+     * ERROR 会让整条 RPC 失败，leader 当成"对端不通"原地重发同一条、永不回退；
+     * 干净的拒绝才会让 leader 按 Raft 回退 next_index，把空洞那几条（连字节）补发过来。
+     * 实测（演示二 P059）：w1/w4 日志里有 31..35、流里字节只到 29，此后每条新数据都"出现空洞"，
+     * 两个副本永远 ack 不了，新主连重供基线都提交不了。
+     */
+    if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0 && entry_data_hex != NULL)
+    {
+        int64 eplsn = entry_partition_lsn(entry_payload);
+        int64 flushed = eplsn > 1 ? data_local_flush_plsn(ctx) : -1;
+
+        if (flushed >= 0 && eplsn > flushed + 1)
+        {
+            static TimestampTz last_gap_note = 0;
+
+            if (last_gap_note == 0 ||
+                TimestampDifferenceExceeds(last_gap_note, GetCurrentTimestamp(), 10000))
+            {
+                last_gap_note = GetCurrentTimestamp();
+                elog(LOG, "pg_raft: group %lld 数据条目 idx=%lld 的 plsn=%lld 会在本地流里留空洞（本地只到 %lld），"
+                     "拒收让 leader 回退补发",
+                     (long long) ctx->group_id, (long long) entry_idx,
+                     (long long) eplsn, (long long) flushed);
+            }
+            return true;
+        }
     }
 
     SpinLockAcquire(&ctx->log->mutex);
@@ -6818,7 +6963,15 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      * 数据组：**先把字节落盘 fsync，再 ack**。落盘失败就不 ack，leader 便无法
      * 把这条计入多数派，从而保证"已提交 == 多数派已持久化"。
      */
-    if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0)
+    /* 2026-10-12：字节本来就在本地 —— 但若刚才的冲突截断把它截掉了，就不能 ack */
+    if (data_preexisting && conflict_plsn > 0 &&
+        conflict_plsn <= entry_partition_lsn(entry_payload))
+    {
+        elog(LOG, "pg_raft: group %lld 数据条目 idx=%lld 的本地字节被冲突截断截掉了，这一轮不 ack",
+             (long long) ctx->group_id, (long long) entry_idx);
+        return true;
+    }
+    if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0 && !data_preexisting)
     {
         if (!data_entry_store(ctx, entry_payload, entry_data_hex, fresh_append))
         {
@@ -7333,6 +7486,30 @@ pg_raft_rpc(PG_FUNCTION_ARGS)
 
     restore_hard_state_if_needed(&ctx);
 
+    /*
+     * ★ 2026-10-12（安全性）：投票之前先把持久日志灌回内存。
+     *
+     * 重启后数据组的日志环是空的，要等某条有 SPI 的路径（AppendEntries、提案……）才从
+     * partdist.raft_log 灌回来；投票路径原来只恢复 HardState、不恢复日志 ——
+     * 于是刚重启的节点拿"空日志"去比候选人的日志新旧，**谁来都投**。实测（演示二 P059 整簇重启后）：
+     * 日志只有 30 条的候选人拿到了日志有 35 条（31..35 已提交）的成员的票，当选后用新任期条目
+     * 把那几条**已提交**的条目截掉重写 —— 违反 Raft 的 Leader Completeness。
+     * 灌不回来（SPI 拿不到等）就不投：拒投只影响活性（下一轮再来），投错是安全性事故。
+     */
+    restore_persistent_log_if_needed(&ctx);
+    if (!ctx.g->log_restored &&
+        (strcmp(type, "RV") == 0 || strcmp(type, "PV") == 0))
+    {
+        SpinLockAcquire(&ctx.cons->mutex);
+        my_term = ctx.cons->current_term;
+        SpinLockRelease(&ctx.cons->mutex);
+        elog(LOG, "pg_raft: 组 %lld 本节点日志尚未从持久层灌回，暂不应答 %s（节点 %d）",
+             in_group, type, in_node);
+        pfree(msg);
+        snprintf(out, sizeof(out), "%ld 0", (long) my_term);
+        PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+
     /* P7-N50：预选 —— 只回答"会不会投"，不改任何状态（任期、投票、计时器都不动） */
     if (strcmp(type, "PV") == 0)
     {
@@ -7843,11 +8020,33 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
  * ack 过了，match_index 看起来很健康。应答/失败的时刻由 replicate_to_peer 记
  * （心跳也走它），一个心跳周期内就能判出停机的 follower。
  */
+static bool group_quorum_alive_excl(int64 gid, int exclude_node);
+
 PG_FUNCTION_INFO_V1(pg_raft_group_quorum_alive);
 Datum
 pg_raft_group_quorum_alive(PG_FUNCTION_ARGS)
 {
-    int64        gid = PG_GETARG_INT64(0);
+    PG_RETURN_BOOL(group_quorum_alive_excl(PG_GETARG_INT64(0), 0));
+}
+
+/*
+ * pg_raft_group_quorum_alive_excl(group_id, exclude_node) → boolean（2026-10-12）
+ *
+ * 同上，但**不把 exclude_node 算作存活**。给自动归队用：给某个成员重供基线时，基线条目
+ * 要靠"除它以外"的成员凑多数派（它正被截空重建，指望不上）。凑不齐还硬发，基线提案一直
+ * 拿不到票，期间独占该组的复制认领位，用户写入全部排队直到超时（实测 commit_survives_failover_p7n35：
+ * 4 成员组一台宕机一台被锁，新主上任即给第四台重供，写入卡 60 s 报"等待复制认领位超时"）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_quorum_alive_excl);
+Datum
+pg_raft_group_quorum_alive_excl(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_BOOL(group_quorum_alive_excl(PG_GETARG_INT64(0), PG_GETARG_INT32(1)));
+}
+
+static bool
+group_quorum_alive_excl(int64 gid, int exclude_node)
+{
     RaftGroupCtx ctx;
     TimestampTz  acks[RAFT_MAX_PEERS];
     TimestampTz  fails[RAFT_MAX_PEERS];
@@ -7858,16 +8057,16 @@ pg_raft_group_quorum_alive(PG_FUNCTION_ARGS)
     int          i;
 
     if (!pg_raft_raft_enabled || RaftGroups == NULL)
-        PG_RETURN_BOOL(false);
+        return false;
     parse_peers();
     if (!raft_group_ctx(gid, &ctx))
-        PG_RETURN_BOOL(false);
+        return false;
 
     SpinLockAcquire(&ctx.cons->mutex);
     state = ctx.cons->state;
     SpinLockRelease(&ctx.cons->mutex);
     if (state != RAFT_LEADER)
-        PG_RETURN_BOOL(false);
+        return false;
 
     majority = cluster_majority(&ctx);
     SpinLockAcquire(&ctx.log->mutex);
@@ -7877,7 +8076,8 @@ pg_raft_group_quorum_alive(PG_FUNCTION_ARGS)
 
     for (i = 0; i < n_peers && i < RAFT_MAX_PEERS; i++)
     {
-        if (peers[i].node_id == pg_raft_node_id || !peer_in_group(&ctx, i))
+        if (peers[i].node_id == pg_raft_node_id || !peer_in_group(&ctx, i) ||
+            peers[i].node_id == exclude_node)
             continue;
         /* 最近一次应答晚于最近一次失败，且应答不算太久（2 个选举超时） */
         if (acks[i] != 0 && acks[i] > fails[i] &&
@@ -7885,7 +8085,7 @@ pg_raft_group_quorum_alive(PG_FUNCTION_ARGS)
                                         2 * pg_raft_election_timeout_ms))
             alive++;
     }
-    PG_RETURN_BOOL(alive >= majority);
+    return alive >= majority;
 }
 
 PG_FUNCTION_INFO_V1(pg_raft_group_flow_stats);

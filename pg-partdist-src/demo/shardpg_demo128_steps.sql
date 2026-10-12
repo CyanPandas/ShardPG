@@ -22,6 +22,7 @@
 -- 每个分区只有 3 份（副本因子 3），不是每台都存一份。
 -- @A
 SELECT * FROM demo.cluster('wallet');
+-- 128 个分区组逐个列出：分区标签 P001…P128 ↔ Citus 分片号一一对应；主、两个副本、Raft 任期。
 -- @A
 SELECT * FROM demo.groups('wallet');
 
@@ -42,6 +43,9 @@ SELECT * FROM demo.cluster('wallet');
 -- 用户 7 给用户 200 转 100 元。两个钱包在不同分区、主在不同的 worker 上。
 -- @A
 SELECT * FROM demo.locate('wallet', 7, 200);
+-- 转账前的余额：
+-- @A
+SELECT id, owner, balance FROM wallet WHERE id IN (7, 200) ORDER BY id;
 -- @A
 BEGIN;
 SELECT demo.global_txn();
@@ -51,12 +55,16 @@ COMMIT;
 -- 这笔事务的两阶段提交账本：两个参与分区组，其中一个当协调组。
 -- @A
 SELECT * FROM demo.last_txn('wallet');
+-- 转账后的余额：用户 7 少 100，用户 200 多 100。
 -- @A
 SELECT id, owner, balance FROM wallet WHERE id IN (7, 200) ORDER BY id;
 
 -- ════ 第 4 步：一笔事务涉及 16 个分区 ════
 -- 平台红包账户（256 号）给 16 个用户各发 10 元：一笔事务，17 个钱包，分布在十几个分区组上。
 -- 要么全发出去，要么一个都不发；总额守恒。
+-- 发红包前：红包账户和这 16 个用户的余额。
+-- @A
+SELECT id, owner, balance FROM wallet WHERE id = 256 OR id BETWEEN 1 AND 16 ORDER BY id;
 -- @A
 BEGIN;
 SELECT demo.global_txn();
@@ -65,6 +73,9 @@ UPDATE wallet SET balance = balance + 10 WHERE id BETWEEN 1 AND 16;
 COMMIT;
 -- @A
 SELECT * FROM demo.last_txn('wallet');
+-- 发红包后：红包账户少 160，16 个用户各多 10。
+-- @A
+SELECT id, owner, balance FROM wallet WHERE id = 256 OR id BETWEEN 1 AND 16 ORDER BY id;
 -- @A
 SELECT * FROM demo.ledger('wallet');
 
@@ -93,7 +104,31 @@ ROLLBACK;
 -- @A
 SELECT * FROM demo.ledger('wallet');
 
--- ════ 第 6 步：一台 worker 断电 ════
+-- ════ 第 6 步：手动切主 ════
+-- 运维主动把用户 7 所在分区组（P035）的主切到同组另一台副本上（比如要下线原来那台做维护）。
+-- 过程实时打出来：目标副本发起竞选 → 当选 → 控制面登记 → master 路由跟过去 → 旧主被新主重新供成副本。
+-- @A
+SELECT * FROM demo.locate('wallet', 7);
+-- @A
+SELECT * FROM demo.switch_group('wallet', 'P035');
+-- 切完以后：该组的主换了台、任期 +1。
+-- @A
+SELECT * FROM demo.groups('wallet') WHERE 分区 = 'P035';
+-- 业务照常：用户 7 再给用户 200 转 30 元，写入落到新主上；余额与总额都对得上。
+-- @A
+SELECT id, owner, balance FROM wallet WHERE id IN (7, 200) ORDER BY id;
+-- @A
+BEGIN;
+SELECT demo.global_txn();
+UPDATE wallet SET balance = balance - 30 WHERE id = 7;
+UPDATE wallet SET balance = balance + 30 WHERE id = 200;
+COMMIT;
+-- @A
+SELECT id, owner, balance FROM wallet WHERE id IN (7, 200) ORDER BY id;
+-- @A
+SELECT * FROM demo.ledger('wallet');
+
+-- ════ 第 7 步：一台 worker 断电 ════
 -- 直接停掉 w2（immediate：不做 checkpoint，等同断电）。它当主的那三十来个分区组，
 -- 各自在剩下的两个成员里重新选主、登记到 master 的路由；其余分区不受影响。
 -- @A

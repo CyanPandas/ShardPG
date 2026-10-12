@@ -1338,6 +1338,14 @@ CREATE OR REPLACE FUNCTION reprovision_demoted(p_gsid BIGINT, p_target INTEGER)
     RETURNS TEXT LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_reprovision_demoted';
 
+-- 2026-10-12：自动归队的兜底扫尾。pg_raft maintenance 进程每 60 s 经常驻连接调一次。
+CREATE OR REPLACE FUNCTION reprovision_sweep()
+    RETURNS INTEGER LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_reprovision_sweep';
+
+COMMENT ON FUNCTION reprovision_sweep() IS
+    '对本节点此刻是 leader 且持已升主记号的数据组，逐对端批量核对成员副本是否健康（armed、未 failed、不残缺、无分叉），连续两轮不健康的排自动重供。补的是归队请求撞 not_leader 被丢、此后再没人替它重供的洞。返回本轮排上的重供数。';
+
 COMMENT ON FUNCTION provision_shard_replica(BIGINT, INTEGER) IS
     '把「给分片 X 在节点 N 上建一个副本」做成一个入口：本地登记 fileset → 发物理基线（§13 约束 2 的静止点）→ 到目标节点建壳表、按该基线的 partition_lsn 配 locmap、arm 回放。此前 register_shard_fileset/replay_set_locmap/replay_enable 在产品代码里没有任何调用方，副本只能靠人手建。须在该分片的 leader 上、由超级用户调用。';
 

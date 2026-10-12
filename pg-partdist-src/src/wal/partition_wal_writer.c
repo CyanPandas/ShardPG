@@ -368,44 +368,19 @@ GetLastWrittenPartitionLSN(Oid partition_id)
      * Scan all segment files.
      */
     {
-        char           dirpath[MAXPGPATH];
-        DIR           *dir;
-        struct dirent *de;
-        char           segfiles[256][MAXPGPATH];
-        int            nfiles = 0;
-        int            i, j;
-        uint64         max_lsn = 0;
+        char            dirpath[MAXPGPATH];
+        PartWALSegName *segfiles;
+        int             nfiles = 0;
+        int             i;
+        uint64          max_lsn = 0;
 
         snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
                  DataDir, PARTITION_WAL_DIR, partition_id);
 
-        dir = opendir(dirpath);
-        if (dir == NULL)
-            return 0;
-
-        while ((de = readdir(dir)) != NULL && nfiles < 256)
-        {
-            if (IsXLogFileName(de->d_name))
-            {
-                strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-                nfiles++;
-            }
-        }
-        closedir(dir);
-
+        /* 2026-10-12：全部段、升序（原来最多 256 段，之后的段被漏掉） */
+        segfiles = PartWALListSegments(partition_id, &nfiles);
         if (nfiles == 0)
             return 0;
-
-        /* Sort ascending */
-        for (i = 0; i < nfiles - 1; i++)
-            for (j = i + 1; j < nfiles; j++)
-                if (strcmp(segfiles[i], segfiles[j]) > 0)
-                {
-                    char tmp[MAXPGPATH];
-                    strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                    strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                    strlcpy(segfiles[j], tmp,         MAXPGPATH);
-                }
 
         for (i = 0; i < nfiles; i++)
         {
@@ -832,9 +807,7 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
      * 同样不依赖段名顺序。残尾（magic 不对）照旧视为该段结束，不另做处理。
      */
     char           dirpath[MAXPGPATH];
-    DIR           *dir;
-    struct dirent *de;
-    char           segfiles[256][MAXPGPATH];
+    PartWALSegName *segfiles;
     int            nfiles = 0;
     int            i;
     bool           truncated = false;
@@ -847,20 +820,8 @@ TruncatePartWALTo(Oid partition_id, RelFileNumber relfilenode,
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
 
-    dir = AllocateDir(dirpath);
-    if (dir == NULL)
-        return false;
-
-    while ((de = ReadDir(dir, dirpath)) != NULL && nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-        {
-            strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-            nfiles++;
-        }
-    }
-    FreeDir(dir);
-
+    /* 2026-10-12：全部段、升序（原来最多 256 段且不排序，第 257 段起的记录截不到） */
+    segfiles = PartWALListSegments(partition_id, &nfiles);
     if (nfiles == 0)
         return false;
 

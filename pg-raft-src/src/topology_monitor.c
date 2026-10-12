@@ -142,8 +142,6 @@ void
 pg_raft_topology_monitor_main(Datum main_arg)
 {
     TimestampTz last_probe = 0;
-    TimestampTz last_dtx_recover = 0;
-    TimestampTz last_catchup = 0;
 
     (void) main_arg;
 
@@ -161,6 +159,18 @@ pg_raft_topology_monitor_main(Datum main_arg)
     elog(LOG, "pg_raft: topology monitor started (node_id=%d, raft=%s)",
          pg_raft_node_id, pg_raft_raft_enabled ? "on" : "off");
 
+    /*
+     * ★ 2026-10-12：本进程**只推进共识 tick**（选举计时 / 心跳 / 复制），不再做任何阻塞的自连 SQL。
+     *
+     * 原来探测、后台追平（pg_raft_catchup）、DTX 恢复守护都在这个循环里用阻塞的
+     * PQconnectdb + PQexec 跑。演示二断电的 w2 拉起后，pg_raft_catchup 要给它补几十个组、
+     * 一跑十几二十秒；CPU 打满时连自连握手都要几秒。这期间 tick 不转，本节点当主的
+     * **所有**组都断心跳 —— follower 15 s 超时、预选也通过（它确实没收到心跳），
+     * 于是整片改选；每次换主又给旧主排物理基线，CPU 更满，切主风暴自我放大，
+     * 最后还把重供打断在半截、留下无主的组（P059）。
+     * 这三件事挪到独立的 pg_raft maintenance 进程（pg_raft_maintenance_main），
+     * 阻塞多久都不碍心跳。非 Raft 开发模式下没有那个进程，探测仍在这里做。
+     */
     for (;;)
     {
         long wait_ms = pg_raft_raft_enabled
@@ -191,13 +201,119 @@ pg_raft_topology_monitor_main(Datum main_arg)
         }
         else
         {
-            /* 非 Raft 开发模式：维持 node 1 的本地 lease。 */
+            TimestampTz now = GetCurrentTimestamp();
+
+            /* 非 Raft 开发模式：维持 node 1 的本地 lease；探测仍在本进程做（没有 maintenance 进程）。 */
             pg_raft_try_acquire_leader();
+            if (pg_raft_is_leader_local() &&
+                (last_probe == 0 || now - last_probe >= pg_raft_probe_interval_ms * 1000L))
+            {
+                pg_raft_self_trigger_probe();
+                last_probe = now;
+            }
         }
+    }
+}
+
+/*
+ * pg_raft maintenance —— 2026-10-12 从 topology monitor 拆出来的"慢活"进程。
+ *
+ * 跑的是原来夹在共识 tick 之间的三件阻塞自连 SQL：控制面探测（本节点是 group0 leader 时）、
+ * 后台追平 + 路由对账（本节点当着任何组的主时）、DTX 恢复守护（每个节点）。
+ * 节流间隔与原来相同；它们自己慢多久都只拖本进程，不拖心跳。
+ * 与 topology monitor 一起注册（见 pg_raft.c register_topology_worker）；Raft 关着时空转。
+ */
+PGDLLEXPORT void pg_raft_maintenance_main(Datum main_arg);
+
+/*
+ * ★ 2026-10-12：自动归队扫尾（partdist.reprovision_sweep）。用**常驻**连接调：扫尾要"连续两轮
+ * 不健康才重供"，上一轮的结果记在那个后端里。连接坏了就丢掉重建（只是从头记，最多晚一轮）；
+ * 函数还没装（老版本 SQL）就什么都不做。
+ */
+static PGconn *sweep_conn = NULL;
+
+static void
+pg_raft_self_trigger_reprovision_sweep(void)
+{
+    PGresult *res;
+
+    if (sweep_conn != NULL && PQstatus(sweep_conn) != CONNECTION_OK)
+    {
+        PQfinish(sweep_conn);
+        sweep_conn = NULL;
+    }
+    if (sweep_conn == NULL)
+    {
+        char conninfo[256];
+
+        pg_raft_format_conninfo("127.0.0.1", PostPortNumber, conninfo, sizeof(conninfo));
+        sweep_conn = PQconnectdb(conninfo);
+        if (PQstatus(sweep_conn) != CONNECTION_OK)
+        {
+            elog(DEBUG1, "pg_raft: 归队扫尾自连接失败: %s", PQerrorMessage(sweep_conn));
+            PQfinish(sweep_conn);
+            sweep_conn = NULL;
+            return;
+        }
+    }
+    res = PQexec(sweep_conn,
+                 "SELECT CASE WHEN to_regprocedure('partdist.reprovision_sweep()') IS NULL THEN 0 "
+                 "ELSE partdist.reprovision_sweep() END");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        elog(LOG, "pg_raft: 归队扫尾执行失败: %s", PQerrorMessage(sweep_conn));
+        PQfinish(sweep_conn);
+        sweep_conn = NULL;
+    }
+    else if (PQntuples(res) > 0 && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+        elog(LOG, "pg_raft: 归队扫尾排上 %s 个重供", PQgetvalue(res, 0, 0));
+    PQclear(res);
+}
+
+
+void
+pg_raft_maintenance_main(Datum main_arg)
+{
+    TimestampTz last_probe = 0;
+    TimestampTz last_dtx_recover = 0;
+    TimestampTz last_catchup = 0;
+    TimestampTz last_sweep = 0;
+
+    (void) main_arg;
+
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
+    BackgroundWorkerUnblockSignals();
+    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+
+    elog(LOG, "pg_raft: maintenance worker started (node_id=%d)", pg_raft_node_id);
+
+    for (;;)
+    {
+        /*
+         * 固定 1 s 一圈，不跟 pg_raft.heartbeat_ms 走：心跳间隔会被调大（测试里调到 60 s 造"提交后不再有
+         * 心跳推送已提交"的窗口），那时本进程的追平 / 路由对账 / DTX 恢复也跟着一分钟才转一圈。
+         * 各项自己的节流间隔在下面。
+         */
+        (void) WaitLatch(MyLatch,
+                         WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         1000L,
+                         PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+
+        CHECK_FOR_INTERRUPTS();
+
+        if (ConfigReloadPending)
+        {
+            ConfigReloadPending = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
+
+        if (!pg_raft_raft_enabled)
+            continue;
 
         /*
          * 仅当本节点是 Leader 才触发控制面探测。探测较重（查 node_map + 连各
-         * 节点），按 probe_interval_ms 节流，避免每个心跳 tick 都执行。
+         * 节点），按 probe_interval_ms 节流。
          */
         if (pg_raft_is_leader_local())
         {
@@ -215,8 +331,7 @@ pg_raft_topology_monitor_main(Datum main_arg)
          * 后台追平通道：按 catchup_interval_ms 节流。只有本节点确实是某个组的
          * leader 时才开连接 —— 否则每个节点每 5 秒空转一次自连接。
          */
-        if (pg_raft_raft_enabled && pg_raft_catchup_interval_ms > 0 &&
-            pg_raft_any_group_leader_local())
+        if (pg_raft_catchup_interval_ms > 0 && pg_raft_any_group_leader_local())
         {
             TimestampTz now = GetCurrentTimestamp();
 
@@ -224,13 +339,24 @@ pg_raft_topology_monitor_main(Datum main_arg)
                 now - last_catchup >= pg_raft_catchup_interval_ms * 1000L)
             {
                 pg_raft_self_trigger_catchup();
-                last_catchup = now;
+                last_catchup = GetCurrentTimestamp();
+            }
+        }
+
+        /* 自动归队扫尾：本节点当着任何组的主时，每 60 s 一轮（见 pg_raft_self_trigger_reprovision_sweep） */
+        if (pg_raft_any_group_leader_local())
+        {
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_sweep == 0 || now - last_sweep >= 60 * 1000000L)
+            {
+                pg_raft_self_trigger_reprovision_sweep();
+                last_sweep = GetCurrentTimestamp();
             }
         }
 
         /* DTX-2PC 恢复守护：按 dtx_recover_interval_ms 节流，每个节点都跑 */
-        if (pg_raft_raft_enabled && pg_raft_dtx_2pc_enabled &&
-            pg_raft_dtx_recover_interval_ms > 0)
+        if (pg_raft_dtx_2pc_enabled && pg_raft_dtx_recover_interval_ms > 0)
         {
             TimestampTz now = GetCurrentTimestamp();
 
@@ -238,7 +364,7 @@ pg_raft_topology_monitor_main(Datum main_arg)
                 now - last_dtx_recover >= pg_raft_dtx_recover_interval_ms * 1000L)
             {
                 pg_raft_self_trigger_dtx_recover();
-                last_dtx_recover = now;
+                last_dtx_recover = GetCurrentTimestamp();
             }
         }
     }

@@ -179,6 +179,8 @@ extern void  ShardClearDiverged(Oid shard_oid);
 /* 批次 #9："本节点已是该分片的主"的持久记号（重启后闸门要认得） */
 extern void  ShardPromotedMarkWrite(Oid shard_oid, bool promoted);
 extern bool  ShardPromotedMarkRead(Oid shard_oid);
+extern void  ShardForeignMarkWrite(Oid shard_oid, bool on);     /* 2026-10-12 */
+extern bool  ShardForeignMarkRead(Oid shard_oid);
 
 /* FRD §11 步骤 5：升主的角色切换（角色 + 捕获登记 + 打标身份 + 文件号交接广播） */
 extern void  PartDistRoutePromote(Oid shard_oid);

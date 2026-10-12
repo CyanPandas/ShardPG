@@ -520,41 +520,17 @@ pg_partdist_count_parwal_records(PG_FUNCTION_ARGS)
 {
     Oid           partition_id = PG_GETARG_OID(0);
     char          dirpath[MAXPGPATH];
-    DIR          *dir;
-    struct dirent *de;
     int64         total   = 0;
     bool          stopped = false;
-    char          segfiles[256][MAXPGPATH];
+    PartWALSegName *segfiles;
     int           nfiles  = 0;
-    int           i, j;
+    int           i;
 
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
 
-    dir = opendir(dirpath);
-    if (dir == NULL)
-        PG_RETURN_INT64(0);
-
-    while ((de = readdir(dir)) != NULL && nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-        {
-            strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-            nfiles++;
-        }
-    }
-    closedir(dir);
-
-    /* Sort ascending */
-    for (i = 0; i < nfiles - 1; i++)
-        for (j = i + 1; j < nfiles; j++)
-            if (strcmp(segfiles[i], segfiles[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-                strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                strlcpy(segfiles[j], tmp,         MAXPGPATH);
-            }
+    /* 2026-10-12：全部段、升序（原来最多 256 段，之后的段被漏掉） */
+    segfiles = PartWALListSegments(partition_id, &nfiles);
 
     for (i = 0; i < nfiles && !stopped; i++)
     {
@@ -737,11 +713,9 @@ pg_partdist_read_all_headers(PG_FUNCTION_ARGS)
     Tuplestorestate *tupstore;
     MemoryContext   old_cxt;
     char            dirpath[MAXPGPATH];
-    DIR            *dir;
-    struct dirent  *de;
-    char            segfiles[256][MAXPGPATH];
+    PartWALSegName *segfiles;
     int             nfiles = 0;
-    int             i, j;
+    int             i;
 
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
         ereport(ERROR,
@@ -767,29 +741,10 @@ pg_partdist_read_all_headers(PG_FUNCTION_ARGS)
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
 
-    dir = opendir(dirpath);
-    if (dir == NULL)
+    /* 2026-10-12：全部段、升序（原来最多 256 段，之后的段被漏掉） */
+    segfiles = PartWALListSegments(partition_id, &nfiles);
+    if (segfiles == NULL)
         PG_RETURN_NULL();
-
-    while ((de = readdir(dir)) != NULL && nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-        {
-            strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-            nfiles++;
-        }
-    }
-    closedir(dir);
-
-    for (i = 0; i < nfiles - 1; i++)
-        for (j = i + 1; j < nfiles; j++)
-            if (strcmp(segfiles[i], segfiles[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-                strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                strlcpy(segfiles[j], tmp,         MAXPGPATH);
-            }
 
     for (i = 0; i < nfiles; i++)
     {

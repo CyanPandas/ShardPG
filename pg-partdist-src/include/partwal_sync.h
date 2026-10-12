@@ -124,6 +124,7 @@ extern PGDLLIMPORT PartWALCtlData *PartWALCtl;
 extern bool PartWALReprovQueuePush(int64 gsid, int32 target);
 extern bool PartWALReprovQueuePop(int64 *gsid, int32 *target);
 extern int  PartWALReprovQueueLen(void);
+extern int  PartWALReprovActive(void);                  /* 2026-10-12 */
 extern bool PartWALReprovTryBegin(int max_active);   /* 未到上限则 active++ 并返回 true */
 extern void PartWALReprovEnd(void);                  /* active-- */
 

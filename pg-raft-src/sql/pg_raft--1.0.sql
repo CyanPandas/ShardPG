@@ -394,6 +394,13 @@ COMMENT ON FUNCTION pg_raft_group_quorum_alive(bigint) IS
 '时为 true。partdist.repair_diverged_shards() 据此决定此刻发不发物理基线（多数派缺失时'
 '发必败，且每次被拒两次提案）。';
 
+CREATE OR REPLACE FUNCTION pg_raft_group_quorum_alive_excl(p_group_id bigint, p_exclude_node integer)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_quorum_alive_excl';
+
+COMMENT ON FUNCTION pg_raft_group_quorum_alive_excl(bigint, integer) IS
+    '2026-10-12：同 pg_raft_group_quorum_alive，但不把 p_exclude_node 算作存活。自动归队给某成员重供基线前用：除它以外凑不齐多数派就先不发（否则基线提案拿不到票、独占复制认领位挡住写入）。';
+
 COMMENT ON FUNCTION pg_raft_group_status() IS
     '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
     'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'
@@ -566,6 +573,17 @@ BEGIN
         --
         -- 可用性：只排除这一个节点，同组其余带 locmap 的正常副本照常可当选。
         bound := partdist.get_follower_applied_part_lsn(loid);
+        -- ★ 2026-10-12：例外 —— 本节点**从没交出主权**（仍持"已升主"记号，切主 apply 会删它），
+        --   且升主以来没落过他人写的 DATA/MARKER（foreign 记号）。那它收到的分区 WAL 全是
+        --   自己当主时写的、早就在堆里，堆不落后，可以再当主。
+        --   实测（演示二 P059）：原始 placement 主 w3 在给两个副本发全量基线的半程被改选
+        --   拉下台，两个副本都成了索引 0 字节的残缺副本、拒绝升主；w3 自己又按这条一刀切被拒 ——
+        --   三个成员全拒，整组永久无主、数据不可读写。
+        IF coalesce(bound, 0) > 0 AND partdist.shard_promoted_selfheld(loid) THEN
+            RAISE LOG 'pg_raft: 分片 % (组 %) 无回放槽位但本节点从未交出主权、收到的分区 WAL '
+                      '（到位点 %）全是自己当主时写的，放行再次升主', loid, p_group_id, bound;
+            RETURN 1;
+        END IF;
         IF coalesce(bound, 0) > 0 THEN
             RAISE WARNING 'pg_raft: 分片 % (组 %) 拒绝升主：本节点已收到分区 WAL 到位点 %，'
                           '却没有回放槽位（这些记录一条都没 redo 进堆），堆数据必然落后。'

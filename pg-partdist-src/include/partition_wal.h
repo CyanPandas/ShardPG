@@ -51,6 +51,16 @@ extern char *GetPartitionWALPath(Oid partition_id, XLogSegNo segno);
  */
 extern void  CleanupPartitionWAL(Oid partition_id, XLogRecPtr keepPtr);
 
+/*
+ * 2026-10-12：列出 pg_parwal/<partition_id>/ 下**全部**段文件名，按名升序（= partition_lsn 升序）。
+ * 不设上限 —— 原来九处各自 `nfiles < 256` 截断，段数过了 256 时后面的段被静默漏掉，
+ * 记录明明在第 257 段的文件里，读取接口却答"没有这条记录"。
+ * 返回 palloc（当前内存上下文）的数组，*nfiles 置数量；目录不存在或没有段返回 NULL、*nfiles = 0。
+ */
+#define PARTWAL_SEGNAME_LEN 32
+typedef char PartWALSegName[PARTWAL_SEGNAME_LEN];
+extern PartWALSegName *PartWALListSegments(Oid partition_id, int *nfiles);
+
 /* ------------------------------------------------------------------ */
 /* Citus shard detection                                               */
 /* ------------------------------------------------------------------ */

@@ -1457,6 +1457,13 @@ PartWALReprovQueueLen(void)
     return PartWALCtl != NULL ? PartWALCtl->reprov_n : 0;
 }
 
+/* 2026-10-12：正在跑的归队工作者数（reprovision_sweep 据此避让在途的重供） */
+int
+PartWALReprovActive(void)
+{
+    return PartWALCtl != NULL ? PartWALCtl->reprov_active : 0;
+}
+
 /* 观测面：partdist.partwal_ring_stats() */
 PG_FUNCTION_INFO_V1(partdist_partwal_ring_stats);
 Datum

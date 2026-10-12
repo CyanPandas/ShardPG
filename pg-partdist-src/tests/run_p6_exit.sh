@@ -42,12 +42,17 @@ set -u
 C="${CONTAINER:-pg-test-container}"
 T="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT_DIR:-/tmp/p6_exit_$(date +%Y%m%d-%H%M%S)}"
-PORTS="$(seq 5432 5440)"
 COORD_PORT=5432
 mkdir -p "$OUT"
 
 DEX() { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$C" "$@"; }
 PS()  { local p=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$p" -U postgres -d postgres -X "$@"; }
+# ★ 2026-10-12：节点端口从协调者的 pg_dist_node 动态取（与 apply_pg_raft_sql.sh 同法）。
+#   原来写死 5432–5440：本容器 09-16 起是 1c+4w，净场里对 5437–5440 的探测恒为空 ⇒
+#   wait_groups_settled 永远判"未收敛"，**每一套都记 BLOCKED**；GUC 复位也恒报 24 次失败。
+#   取不到（协调者没起来）时退回 9 节点默认。
+PORTS=$(PS "$COORD_PORT" -Atc "SELECT p FROM (SELECT $COORD_PORT AS p UNION SELECT nodeport FROM pg_dist_node WHERE noderole='primary') t ORDER BY p" </dev/null 2>/dev/null | tr '\n' ' ')
+[[ -n "${PORTS// /}" ]] || PORTS="$(seq 5432 5440)"
 
 # ── 套件清单：名字 超时秒 出身 ────────────────────────────────────
 # 出身只是注释，用来在结果里看出"哪一代的东西红了"。

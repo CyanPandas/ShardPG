@@ -2273,6 +2273,29 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
     if (strcmp(armed, "true") == 0)
         return psprintf("not_needed(%d)", target);
 
+    /*
+     * ★ 2026-10-12：除目标以外凑不齐多数派就先不重供，回 retry（归队工作者 15 s 后再来）。
+     * 基线条目要靠"除目标以外"的成员拿多数派（目标正被截空重建）；凑不齐还硬发，基线提案一直
+     * 拿不到票、期间独占该组复制认领位，用户写入全部排队到超时
+     * （实测 commit_survives_failover_p7n35：4 成员组一台宕机一台被锁，写入卡 60 s）。
+     * pg_raft 还没有这个函数（老版本 SQL）时照旧放行。
+     */
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        char   *q;
+
+        snprintf(sql, sizeof(sql),
+                 "SELECT CASE WHEN to_regprocedure('partdist.pg_raft_group_quorum_alive_excl(bigint,integer)') IS NULL "
+                 "THEN 'true' ELSE partdist.pg_raft_group_quorum_alive_excl(%lld, %d)::text END",
+                 (long long) gsid, target);
+        q = prov_query_text(sql);
+        q = (q != NULL) ? MemoryContextStrdup(caller_cxt, q) : NULL;
+        SPI_finish();
+        if (q != NULL && strcmp(q, "false") == 0)
+            return psprintf("retry: 除节点 %d 以外存活成员不足多数派，暂不重供（否则基线拿不到票、占着复制认领位挡写入）",
+                            target);
+    }
+
     ereport(LOG,
             (errmsg("pg_partdist: 分片 %lld 的成员节点 %d 没有可用回放槽位（未 armed 或回放 failed），"
                     "自动重供物理基线让它归队（P7-N25/N32）", (long long) gsid, target)));
@@ -2288,7 +2311,7 @@ partdist_reprovision_demoted(PG_FUNCTION_ARGS)
     int64           gsid = PG_GETARG_INT64(0);
     int32           target = PG_GETARG_INT32(1);
     MemoryContext   caller_cxt = CurrentMemoryContext;
-    char            sql[256];
+    char            sql[512];
     char           *gstate;
     char           *members = NULL;
     StringInfoData  out;
@@ -2337,9 +2360,17 @@ partdist_reprovision_demoted(PG_FUNCTION_ARGS)
     {
         char   *t;
 
+        /*
+         * ★ 2026-10-12：成员集取 **Raft 组的真实成员（raft_group.members）∪ 登记里的从副本**。
+         * 只取 secondary_nodes 时，它是新主登记时上报的那份，**不含刚被拉下来的旧主** ——
+         * 而最需要重供的恰恰是旧主（原始 placement 主从没有回放槽位）。实测（演示二）
+         * 组 108423 新主上任后逐个检查只查了节点 5，旧主节点 4 从没被查，待重新供给永远挂着。
+         */
         snprintf(sql, sizeof(sql),
-                 "SELECT array_to_string(secondary_nodes, ',') FROM partdist.partition_map "
-                 "WHERE partition_id = %lld", (long long) gsid);
+                 "SELECT array_to_string(ARRAY(SELECT DISTINCT x FROM unnest("
+                 "coalesce((SELECT secondary_nodes FROM partdist.partition_map WHERE partition_id = %lld), '{}'::int[]) || "
+                 "coalesce((SELECT members FROM partdist.raft_group WHERE group_id = %lld), '{}'::int[])) x "
+                 "ORDER BY x), ',')", (long long) gsid, (long long) gsid);
         t = prov_query_text(sql);
         if (t != NULL)
             members = MemoryContextStrdup(caller_cxt, t);
@@ -2381,6 +2412,205 @@ partdist_reprovision_demoted(PG_FUNCTION_ARGS)
     if (any_retry)
         PG_RETURN_TEXT_P(cstring_to_text(psprintf("retry: %s", out.data)));
     PG_RETURN_TEXT_P(cstring_to_text(out.data));
+}
+
+/*
+ * ★ 2026-10-12：partdist.reprovision_sweep() —— 自动归队的兜底扫尾。
+ *
+ * 归队原来只在"本节点被登记为新主"那一次 apply 里拉一个工作者；工作者遇到
+ * "本节点已不是 leader"（not_leader）就算完事、请求丢弃，此后**再没有任何路径**会替
+ * 那个成员重供。演示二断电恢复后的切主风暴里，排着队的请求大批撞 not_leader 被丢，
+ * 最后当上主的那台又没轮到（或成员集漏了旧主），待重新供给永远不归零。
+ *
+ * 做法：对本节点**此刻是 leader 且持已升主记号**的每个数据组，取成员（Raft 组成员 ∪ 登记从副本）
+ * 去掉自己，按对端节点分批：每台对端**一条连接、一条查询**问清它在这些组上的副本是否健康
+ * （判据与 reprovision_check_one 相同：armed、回放不 failed、本地副本不持久残缺或基线在途、无分叉标记）。
+ * 不健康的 (组, 成员) 要**连续两次扫尾都不健康**才重供 —— 建组时的首次供副本、刚拉起的归队工作者
+ * 都可能正处在"还没 armed、基线标记也还没立"的那一小段，单看一次会重复供给、把在途基线截掉重来。
+ * 本节点还有归队工作者在跑或在排队时整轮跳过（同理）。
+ *
+ * 状态（上一轮的不健康集合）放在本后端的 TopMemoryContext：调用方（pg_raft maintenance 进程）
+ * 用一条常驻连接周期性调用。后端换了只是从头记，最多晚一轮。
+ * 返回本轮拉起（或排队）的重供数。
+ */
+typedef struct SweepSeen
+{
+    int64   gsid;
+    int32   node;
+} SweepSeen;
+
+static SweepSeen *sweep_prev = NULL;
+static int        sweep_prev_n = 0;
+
+static bool
+sweep_prev_has(int64 gsid, int32 node)
+{
+    int i;
+
+    for (i = 0; i < sweep_prev_n; i++)
+        if (sweep_prev[i].gsid == gsid && sweep_prev[i].node == node)
+            return true;
+    return false;
+}
+
+PG_FUNCTION_INFO_V1(partdist_reprovision_sweep);
+Datum
+partdist_reprovision_sweep(PG_FUNCTION_ARGS)
+{
+    MemoryContext   caller_cxt = CurrentMemoryContext;
+    int             n = 0;
+    int64          *gs = NULL;
+    int32          *nodes = NULL;
+    char          **hosts = NULL;
+    char          **ports = NULL;
+    SweepSeen      *bad = NULL;
+    int             nbad = 0;
+    int             launched = 0;
+    int             i;
+
+    if (!superuser())
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("reprovision_sweep() 限超级用户")));
+    if (!partdist_auto_reprovision_demoted)
+        PG_RETURN_INT32(0);
+    if (PartWALReprovActive() > 0 || PartWALReprovQueueLen() > 0)
+        PG_RETURN_INT32(0);     /* 在途重供：这一轮不判（避免与它重复供给） */
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("reprovision_sweep: SPI_connect 失败")));
+    if (SPI_execute(
+            "SELECT s.group_id, m.node_id, n.hostname, n.port::text, "
+            "       partdist.local_partition_for_shard(s.group_id)::text "
+            "  FROM partdist.pg_raft_group_status() s "
+            "  CROSS JOIN LATERAL (SELECT DISTINCT x AS node_id FROM unnest("
+            "        coalesce((SELECT secondary_nodes FROM partdist.partition_map WHERE partition_id = s.group_id), '{}'::int[]) || "
+            "        coalesce((SELECT members FROM partdist.raft_group WHERE group_id = s.group_id), '{}'::int[])) x) m "
+            "  JOIN partdist.node_map n ON n.node_id = m.node_id "
+            " WHERE s.group_id <> 0 AND s.state = 'leader' "
+            "   AND m.node_id <> current_setting('pg_raft.node_id')::int "
+            " ORDER BY m.node_id, s.group_id", true, 0) == SPI_OK_SELECT &&
+        SPI_processed > 0)
+    {
+        MemoryContext old = MemoryContextSwitchTo(caller_cxt);
+
+        gs = palloc(sizeof(int64) * SPI_processed);
+        nodes = palloc(sizeof(int32) * SPI_processed);
+        hosts = palloc(sizeof(char *) * SPI_processed);
+        ports = palloc(sizeof(char *) * SPI_processed);
+        for (i = 0; i < (int) SPI_processed; i++)
+        {
+            HeapTuple   tup = SPI_tuptable->vals[i];
+            TupleDesc   td = SPI_tuptable->tupdesc;
+            char       *g = SPI_getvalue(tup, td, 1);
+            char       *nd = SPI_getvalue(tup, td, 2);
+            char       *h = SPI_getvalue(tup, td, 3);
+            char       *pt = SPI_getvalue(tup, td, 4);
+            char       *lo = SPI_getvalue(tup, td, 5);
+
+            if (g == NULL || nd == NULL || h == NULL || pt == NULL || lo == NULL)
+                continue;
+            /* 只替在册主做：raft leader 但不是在册主（P7-N30）的组不以本地数据为准发基线 */
+            if (!ShardPromotedMarkRead((Oid) strtoul(lo, NULL, 10)))
+                continue;
+            gs[n] = strtoll(g, NULL, 10);
+            nodes[n] = atoi(nd);
+            hosts[n] = pstrdup(h);
+            ports[n] = pstrdup(pt);
+            n++;
+        }
+        MemoryContextSwitchTo(old);
+    }
+    SPI_finish();
+
+    if (n > 0)
+        bad = palloc(sizeof(SweepSeen) * n);
+
+    /* 按对端节点分批：结果已按 node_id 排序，同一节点连续 */
+    for (i = 0; i < n;)
+    {
+        int             j = i;
+        StringInfoData  q;
+        char            conninfo[256];
+        PGconn         *conn;
+        PGresult       *res;
+
+        while (j < n && nodes[j] == nodes[i])
+            j++;
+
+        initStringInfo(&q);
+        appendStringInfoString(&q,
+            "SELECT g FROM unnest(ARRAY[");
+        {
+            int k;
+
+            for (k = i; k < j; k++)
+                appendStringInfo(&q, "%s%lld", k > i ? "," : "", (long long) gs[k]);
+        }
+        appendStringInfoString(&q,
+            "]::bigint[]) g WHERE NOT coalesce((SELECT armed AND state <> 'failed' "
+            "  AND (partdist.shard_baseline_pending(shard) OR NOT partdist.shard_local_copy_broken(shard)) "
+            "  AND partdist.shard_divergence(shard) IS NULL "
+            "  FROM partdist.replay_status() WHERE shard = partdist.local_partition_for_shard(g)), false)");
+
+        snprintf(conninfo, sizeof(conninfo),
+                 "host=%s port=%s dbname=postgres user=postgres connect_timeout=5 "
+                 "application_name=pg_partdist_reprovision_sweep",
+                 hosts[i], ports[i]);
+        conn = PQconnectdb(conninfo);
+        if (PQstatus(conn) == CONNECTION_OK)
+        {
+            res = PQexec(conn, q.data);
+            if (PQresultStatus(res) == PGRES_TUPLES_OK)
+            {
+                int r;
+
+                for (r = 0; r < PQntuples(res); r++)
+                {
+                    bad[nbad].gsid = strtoll(PQgetvalue(res, r, 0), NULL, 10);
+                    bad[nbad].node = nodes[i];
+                    nbad++;
+                }
+            }
+            else
+                elog(LOG, "pg_partdist: 归队扫尾查节点 %d 失败: %s", nodes[i], PQerrorMessage(conn));
+            PQclear(res);
+        }
+        /* 连不上（宕机中）：这一轮不判它，拉起来后下一轮再看 */
+        PQfinish(conn);
+        pfree(q.data);
+        i = j;
+    }
+
+    /* 连续两轮都不健康才重供 */
+    for (i = 0; i < nbad; i++)
+    {
+        if (!sweep_prev_has(bad[i].gsid, bad[i].node))
+            continue;
+        ereport(LOG,
+                (errmsg("pg_partdist: 归队扫尾：分片 %lld 的成员节点 %d 连续两轮没有可用副本，排重供",
+                        (long long) bad[i].gsid, bad[i].node)));
+        PartDistLaunchReprovision(bad[i].gsid, bad[i].node);
+        launched++;
+    }
+
+    /* 记下本轮的不健康集合；已经排了重供的不再记（下一轮若仍不健康，重新从头数两轮） */
+    {
+        MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+        SweepSeen    *keep = nbad > 0 ? palloc(sizeof(SweepSeen) * nbad) : NULL;
+        int           nk = 0;
+
+        for (i = 0; i < nbad; i++)
+            if (!sweep_prev_has(bad[i].gsid, bad[i].node))
+                keep[nk++] = bad[i];
+        if (sweep_prev != NULL)
+            pfree(sweep_prev);
+        sweep_prev = keep;
+        sweep_prev_n = nk;
+        MemoryContextSwitchTo(old);
+    }
+
+    PG_RETURN_INT32(launched);
 }
 
 PGDLLEXPORT void PartDistReprovisionWorkerMain(Datum main_arg);
@@ -2557,6 +2787,7 @@ PartDistLaunchReprovision(int64 gsid, int32 target)
 
 #define SHARD_DIVERGED_FILENAME "diverged"
 #define SHARD_PROMOTED_FILENAME "promoted"
+#define SHARD_FOREIGN_FILENAME  "foreign"     /* 2026-10-12，见 ShardForeignMarkWrite */
 
 /*
  * §13 约束 13 的机制，读原文才看清它比"提案被静默丢弃"微妙得多：
@@ -2739,6 +2970,9 @@ ShardPromotedMarkWrite(Oid shard_oid, bool promoted)
                     (errcode_for_file_access(),
                      errmsg("pg_partdist: 无法建目录 \"%s\": %m", dir)));
     }
+    /* 2026-10-12：重新（或首次）当上主 ⇒ 之前记的"他人写过记录"作废 */
+    ShardForeignMarkWrite(shard_oid, false);
+
     fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
     if (fd < 0)
     {
@@ -2753,6 +2987,64 @@ ShardPromotedMarkWrite(Oid shard_oid, bool promoted)
                  errmsg("pg_partdist: 升主记号 \"%s\" 写入不完整: %m", path)));
     (void) pg_fsync(fd);
     CloseTransientFile(fd);
+}
+
+/*
+ * ★ 2026-10-12：foreign 记号 —— 本节点持"已升主"记号期间，follower append 落下过**他人写的**
+ * DATA/MARKER。与已升主记号同目录、同样持久：没有回放槽位的原始 placement 主靠它判断
+ * "我收到的记录是不是全是自己写的"（ShardReplicaPromotedSelfHeld 的无槽位分支）。
+ * 重新当上主（ShardPromotedMarkWrite(true)）时清掉。
+ */
+void
+ShardForeignMarkWrite(Oid shard_oid, bool on)
+{
+    char    path[MAXPGPATH];
+    int     fd;
+
+    if (!OidIsValid(shard_oid))
+        return;
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FOREIGN_FILENAME);
+    if (!on)
+    {
+        if (unlink(path) != 0 && errno != ENOENT)
+            ereport(WARNING,
+                    (errcode_for_file_access(),
+                     errmsg("pg_partdist: foreign 记号 \"%s\" 删除失败: %m", path)));
+        return;
+    }
+    if (ShardForeignMarkRead(shard_oid))
+        return;
+    fd = OpenTransientFile(path, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
+    if (fd < 0)
+    {
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: 无法写 foreign 记号 \"%s\": %m", path)));
+        return;
+    }
+    if (write(fd, "1\n", 2) != 2)
+        ereport(WARNING,
+                (errcode_for_file_access(),
+                 errmsg("pg_partdist: foreign 记号 \"%s\" 写入不完整: %m", path)));
+    (void) pg_fsync(fd);
+    CloseTransientFile(fd);
+    ereport(LOG,
+            (errmsg("pg_partdist: 分片 %u 在本节点仍持「已升主」记号时落下了他人写的数据/提交记录，"
+                    "记 foreign 记号（无回放槽位时据此拒绝跳过追平）", shard_oid)));
+}
+
+bool
+ShardForeignMarkRead(Oid shard_oid)
+{
+    char        path[MAXPGPATH];
+    struct stat st;
+
+    if (!OidIsValid(shard_oid))
+        return false;
+    snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
+             DataDir, PARTITION_WAL_DIR, shard_oid, SHARD_FOREIGN_FILENAME);
+    return (stat(path, &st) == 0);
 }
 
 bool

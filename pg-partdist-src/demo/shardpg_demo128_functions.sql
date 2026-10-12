@@ -11,6 +11,13 @@ CREATE FUNCTION demo.plabel(p_tbl regclass, p_sid bigint) RETURNS text LANGUAGE 
     SELECT 'P' || lpad(array_position(demo.sids(p_tbl), p_sid)::text, 3, '0')
 $$;
 
+-- 演示一的公共函数（切主过程的实时时间线 demo.watch / demo.snap）按 demo.slabel 打标签；
+-- 这里换成 P001…P128，让切主时间线和 demo.groups 用同一套名字。demo.sid 取标签第 2 位起的数字，
+-- 'P001' 照样解析成第 1 个分片，不用改。
+CREATE OR REPLACE FUNCTION demo.slabel(p_tbl regclass, p_sid bigint) RETURNS text LANGUAGE sql STABLE AS $$
+    SELECT demo.plabel(p_tbl, p_sid)
+$$;
+
 -- 各 worker 上全部数据组的状态（每台一条查询；宕机的节点没有行）
 CREATE FUNCTION demo.gall()
 RETURNS TABLE(node text, sid bigint, state text, term bigint)
@@ -68,8 +75,8 @@ BEGIN
       FROM demo.node n WHERE n.kind = 'worker' ORDER BY n.port;
 END $$;
 
--- ② 分区组一览（默认前 8 个；p_all = true 列全部 128 个）
-CREATE FUNCTION demo.groups(p_tbl regclass, p_limit int DEFAULT 8)
+-- ② 分区组一览（默认列全部 128 个；只看前几个：demo.groups('wallet', 8)）
+CREATE FUNCTION demo.groups(p_tbl regclass, p_limit int DEFAULT 128)
 RETURNS TABLE(分区 text, 分片号 bigint, 主 text, 副本 text, 任期 bigint)
 LANGUAGE sql AS $$
     SELECT 分区, sid, coalesce(主, '（选主中）'), 副本, 任期 FROM demo.ginfo(p_tbl) ORDER BY 分区 LIMIT p_limit
@@ -223,6 +230,40 @@ BEGIN
           FROM demo.ginfo(p_tbl) g
          WHERE w = ANY (string_to_array(g.副本, ','));
         待重新供给 := 应有副本 - 已就绪;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+-- ⑧ 手动切主：把某个分区组的主切到同组里另一台**副本已就绪**（回放槽位 armed）的成员。
+--    p_to 不给就自动挑。过程（竞选 → 当选 → 控制面登记 → master 路由跟过去 → 旧主被新主重新供成副本）
+--    由演示一的 demo.switch_leader 实时打出来；这里只负责按 P 标签找组、挑目标。
+CREATE FUNCTION demo.switch_group(p_tbl regclass, p_part text, p_to text DEFAULT NULL)
+RETURNS TABLE(分区 text, 原来的主 text, 新主 text, 新任期 text, 切换耗时_ms int, 原主 text)
+LANGUAGE plpgsql AS $$
+DECLARE v_sid bigint; cur text; tgt text := p_to; w text; r record;
+BEGIN
+    v_sid := (SELECT g.sid FROM demo.ginfo(p_tbl) g WHERE g.分区 = upper(p_part));
+    IF v_sid IS NULL THEN RAISE EXCEPTION '没有这个分区：%（P001…P128，见 demo.groups）', p_part; END IF;
+    cur := demo.leader(v_sid);
+    IF cur IS NULL THEN RAISE EXCEPTION '% 此刻没有主（正在选主），稍后再试', p_part; END IF;
+    IF tgt IS NULL THEN
+        FOR w IN SELECT n.name FROM demo.group_member m JOIN demo.node n ON n.raft_id = m.raft_id
+                  WHERE m.sid = v_sid AND n.name <> cur ORDER BY n.port LOOP
+            IF demo.pq(w, format('SELECT coalesce((SELECT armed::text FROM partdist.replay_status() '
+                                 'WHERE shard = partdist.local_partition_for_shard(%s)), ''none'')', v_sid)) = 'true' THEN
+                tgt := w; EXIT;
+            END IF;
+        END LOOP;
+        IF tgt IS NULL THEN
+            RAISE EXCEPTION '% 的其余成员都还没有就绪的副本（armed 回放槽位），不能切过去', p_part;
+        END IF;
+    END IF;
+    RAISE NOTICE '把 % 的主从 % 切到 %（同组成员：%）', upper(p_part), cur, tgt,
+        (SELECT string_agg(n.name, ' ' ORDER BY n.port) FROM demo.group_member m JOIN demo.node n ON n.raft_id = m.raft_id
+          WHERE m.sid = v_sid);
+    FOR r IN SELECT * FROM demo.switch_leader(p_tbl, upper(p_part), tgt) LOOP
+        分区 := r.分片; 原来的主 := r.原来的主; 新主 := r.新主; 新任期 := r.新任期;
+        切换耗时_ms := r.切换耗时_ms; 原主 := r.原主重新成为副本;
         RETURN NEXT;
     END LOOP;
 END $$;

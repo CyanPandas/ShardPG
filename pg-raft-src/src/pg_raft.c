@@ -1024,6 +1024,14 @@ register_topology_worker(void)
     worker.bgw_notify_pid = 0;
 
     RegisterBackgroundWorker(&worker);
+
+    /*
+     * 2026-10-12：探测 / 后台追平 / DTX 恢复守护这三件阻塞自连 SQL 挪到独立进程，
+     * 不再夹在共识 tick 之间拖断心跳（见 topology_monitor.c pg_raft_maintenance_main）。
+     */
+    snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_raft_maintenance_main");
+    snprintf(worker.bgw_name, BGW_MAXLEN, "pg_raft maintenance");
+    RegisterBackgroundWorker(&worker);
 }
 
 void

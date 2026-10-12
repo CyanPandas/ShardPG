@@ -207,7 +207,7 @@ cmd_stop() {
     done
     for s in 1 2; do     # 关回放槽 → 拆组，两轮（拆组期间在途的通告可能把组又建回来）
         for p in $W; do
-            q $p "SELECT count(partdist.replay_disable(c.oid)) FROM pg_class c WHERE c.relkind = 'r' AND c.relname ~ '$re'" >/dev/null &
+            q $p "SET citus.override_table_visibility = false; SELECT count(partdist.replay_disable(c.oid)) FROM pg_class c WHERE c.relkind = 'r' AND c.relname ~ '$re'" >/dev/null &
         done; wait
         for p in $W; do
             q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null &
@@ -232,7 +232,7 @@ cmd_stop() {
     done
     # 各 worker 上剩下的分片表 / 副本壳表（副本是本地表，不随 Citus 删表一起走）
     for p in $W; do
-        psqlc $p -qAt -c "SET citus.enable_ddl_propagation = off" -c "SET statement_timeout = '120s'" \
+        psqlc $p -qAt -c "SET citus.enable_ddl_propagation = off" -c "SET statement_timeout = '120s'" -c "SET citus.override_table_visibility = false" \
             -c "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT relname FROM pg_class WHERE relkind = 'r' AND relname ~ '$re' LOOP EXECUTE format('DROP TABLE IF EXISTS %I', r.relname); END LOOP; END \$\$" </dev/null >/dev/null 2>&1 &
     done; wait
     for p in $W; do      # 兜底：再拆一次在途通告建回来的组
@@ -273,7 +273,7 @@ cmd_stop() {
     local ng=0 left shells=0
     for p in $W; do
         ng=$((ng + $(q $p "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id<>0")))
-        shells=$((shells + $(q $p "SELECT count(*) FROM pg_class WHERE relkind='r' AND relname ~ '$re'")))
+        shells=$((shells + $(q $p "SET citus.override_table_visibility = false; SELECT count(*) FROM pg_class WHERE relkind='r' AND relname ~ '$re'")))
     done
     left=$(q 5432 "SELECT count(*) FROM pg_class WHERE relname IN ('$(sed "s/ /','/g" <<<"$DEMO_TABLES")') AND relnamespace='public'::regnamespace")
     if [[ "$ng" == 0 && "$left" == 0 && "$shells" == 0 ]]; then

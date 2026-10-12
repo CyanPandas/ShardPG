@@ -2301,7 +2301,7 @@ typedef struct ParwalIndexEnt
 typedef struct ParwalIndex
 {
     int             nfiles;
-    char            files[256][MAXPGPATH];
+    PartWALSegName *files;          /* 2026-10-12：全部段（原来是 files[256]，之后的段被漏掉） */
     int             nents;
     int             cap;
     ParwalIndexEnt *ents;
@@ -2326,9 +2326,7 @@ static void
 BuildParwalIndex(ShardReplayCtx *ctx, uint64 from_plsn, ParwalIndex *idx)
 {
     char           dirpath[MAXPGPATH];
-    DIR           *dir;
-    struct dirent *de;
-    int            i, j;
+    int            i;
 
     idx->nfiles = 0;
     idx->nents  = 0;
@@ -2338,28 +2336,8 @@ BuildParwalIndex(ShardReplayCtx *ctx, uint64 from_plsn, ParwalIndex *idx)
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, ctx->shard_oid);
 
-    dir = AllocateDir(dirpath);
-    if (dir == NULL)
-        return;
-
-    while ((de = ReadDir(dir, dirpath)) != NULL && idx->nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-            strlcpy(idx->files[idx->nfiles++], de->d_name, MAXPGPATH);
-    }
-    FreeDir(dir);
-
-    /* 文件名升序 */
-    for (i = 0; i < idx->nfiles - 1; i++)
-        for (j = i + 1; j < idx->nfiles; j++)
-            if (strcmp(idx->files[i], idx->files[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-
-                strlcpy(tmp,           idx->files[i], MAXPGPATH);
-                strlcpy(idx->files[i], idx->files[j], MAXPGPATH);
-                strlcpy(idx->files[j], tmp,           MAXPGPATH);
-            }
+    /* 文件名升序；2026-10-12 起不设 256 段上限 */
+    idx->files = PartWALListSegments(ctx->shard_oid, &idx->nfiles);
 
     for (i = 0; i < idx->nfiles; i++)
     {
@@ -2833,6 +2811,8 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
     if (body != NULL)
         pfree(body);
     pfree(idx.ents);
+    if (idx.files != NULL)
+        pfree(idx.files);
 
     /* 每轮收尾：落一次 checkpoint（若有进展） */
     ShardReplayDoCheckpoint(ctx);

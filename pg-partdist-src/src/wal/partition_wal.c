@@ -203,6 +203,48 @@ GetPartitionWALPath(Oid partition_id, XLogSegNo segno)
     return result;
 }
 
+static int
+partwal_segname_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *) a, (const char *) b);
+}
+
+PartWALSegName *
+PartWALListSegments(Oid partition_id, int *nfiles)
+{
+    char            dirpath[MAXPGPATH];
+    DIR            *dir;
+    struct dirent  *de;
+    PartWALSegName *segs = NULL;
+    int             n = 0;
+    int             cap = 0;
+
+    *nfiles = 0;
+    snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
+             DataDir, PARTITION_WAL_DIR, partition_id);
+    dir = AllocateDir(dirpath);
+    if (dir == NULL)
+        return NULL;
+    while ((de = ReadDir(dir, dirpath)) != NULL)
+    {
+        if (!IsXLogFileName(de->d_name))
+            continue;
+        if (n == cap)
+        {
+            cap = cap == 0 ? 64 : cap * 2;
+            segs = segs == NULL ? palloc(sizeof(PartWALSegName) * cap)
+                                : repalloc(segs, sizeof(PartWALSegName) * cap);
+        }
+        strlcpy(segs[n], de->d_name, PARTWAL_SEGNAME_LEN);
+        n++;
+    }
+    FreeDir(dir);
+    if (n > 1)
+        qsort(segs, n, sizeof(PartWALSegName), partwal_segname_cmp);
+    *nfiles = n;
+    return segs;
+}
+
 void
 CleanupPartitionWAL(Oid partition_id, XLogRecPtr keepPtr)
 {
@@ -747,11 +789,9 @@ pg_partdist_check_partition_wal(PG_FUNCTION_ARGS)
     Tuplestorestate *tupstore;
     MemoryContext   old_cxt;
     char            dirpath[MAXPGPATH];
-    DIR            *dir;
-    struct dirent  *de;
-    char            segfiles[256][MAXPGPATH];
+    PartWALSegName *segfiles;
     int             nfiles = 0;
-    int             i, j;
+    int             i;
 
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
         ereport(ERROR,
@@ -778,30 +818,10 @@ pg_partdist_check_partition_wal(PG_FUNCTION_ARGS)
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
 
-    dir = opendir(dirpath);
-    if (dir == NULL)
+    /* 2026-10-12：全部段、升序（原来最多 256 段，之后的段被漏掉） */
+    segfiles = PartWALListSegments(partition_id, &nfiles);
+    if (segfiles == NULL)
         PG_RETURN_NULL();
-
-    while ((de = readdir(dir)) != NULL && nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-        {
-            strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-            nfiles++;
-        }
-    }
-    closedir(dir);
-
-    /* Sort ascending */
-    for (i = 0; i < nfiles - 1; i++)
-        for (j = i + 1; j < nfiles; j++)
-            if (strcmp(segfiles[i], segfiles[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-                strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                strlcpy(segfiles[j], tmp,         MAXPGPATH);
-            }
 
     for (i = 0; i < nfiles; i++)
     {
@@ -860,40 +880,19 @@ pg_partdist_verify_partition_wal(PG_FUNCTION_ARGS)
 {
     Oid           partition_id  = PG_GETARG_OID(0);
     char          dirpath[MAXPGPATH];
-    DIR          *dir;
-    struct dirent *de;
     uint64        expected_lsn  = 1;
     bool          valid         = true;
-    char          segfiles[256][MAXPGPATH];
+    PartWALSegName *segfiles;
     int           nfiles        = 0;
-    int           i, j;
+    int           i;
 
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
 
-    dir = opendir(dirpath);
-    if (dir == NULL)
+    /* 2026-10-12：全部段、升序（原来最多 256 段，之后的段被漏掉） */
+    segfiles = PartWALListSegments(partition_id, &nfiles);
+    if (segfiles == NULL)
         PG_RETURN_BOOL(true);
-
-    while ((de = readdir(dir)) != NULL && nfiles < 256)
-    {
-        if (IsXLogFileName(de->d_name))
-        {
-            strlcpy(segfiles[nfiles], de->d_name, MAXPGPATH);
-            nfiles++;
-        }
-    }
-    closedir(dir);
-
-    for (i = 0; i < nfiles - 1; i++)
-        for (j = i + 1; j < nfiles; j++)
-            if (strcmp(segfiles[i], segfiles[j]) > 0)
-            {
-                char tmp[MAXPGPATH];
-                strlcpy(tmp,         segfiles[i], MAXPGPATH);
-                strlcpy(segfiles[i], segfiles[j], MAXPGPATH);
-                strlcpy(segfiles[j], tmp,         MAXPGPATH);
-            }
 
     for (i = 0; i < nfiles && valid; i++)
     {
