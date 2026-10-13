@@ -25,7 +25,11 @@ case "$PROFILE" in
          EXTRA_FUNCS="";                            PREP="约 2–5 分钟";   NAME="演示一（4 个分片）"
          LAUNCH="shardpg_demo.sh" ;;
     128) TBL=wallet;  NSHARD=128; DATA=demo128_data.sql; STEPS=shardpg_demo128_steps.sql
-         EXTRA_FUNCS=shardpg_demo128_functions.sql; PREP="约 15–20 分钟"; NAME="演示二（128 个分区组）"
+         EXTRA_FUNCS=shardpg_demo128_functions.sql; NAME="演示二（128 个分区组）"
+         # 2026-10-12：准备阶段另灌 BULK_ROWS 个钱包（id 257 起；台前第 1 步只现场灌 1–256 号）。
+         # 这台 2 vCPU 机器上走全局事务 + Raft 复制约 20 行/秒（5000 行一批约 4 分钟），十万行约 80 分钟。
+         BULK_ROWS="${BULK_ROWS:-100000}"; BULK_BATCH="${BULK_BATCH:-5000}"
+         PREP="约 15–20 分钟"; [[ "$BULK_ROWS" -gt 0 ]] && PREP="约 15–20 分钟，另灌 ${BULK_ROWS} 行约 $(( BULK_ROWS / 1250 )) 分钟"
          LAUNCH="shardpg_demo128.sh" ;;
     *)   echo "DEMO_PROFILE 只能是 4 或 128" >&2; exit 2 ;;
 esac
@@ -148,7 +152,75 @@ SQL
     [[ "$(tail -1 <<<"$out")" =~ ^([0-9]+)/([0-9]+)$ && "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] \
         || die "有分片没接入事务系统（已接入/总数 = $(tail -1 <<<"$out")）" "先 stop 清场再试；详情：bash $0 start 加 VERBOSE=1"
     [[ "${VERBOSE:-0}" == 1 ]] && grep -E '^NOTICE' <<<"$out" | sed 's/^NOTICE:  //'
+    [[ "${BULK_ROWS:-0}" -gt 0 ]] && bulk_load
+    # 2026-10-13：建组/供副本的后台尾巴（回放追平、重供扫尾、控制面应用）还会把 2 vCPU 压满一阵子。
+    #   这时马上开演，提交后的读要当场问协调组判决、问询超时就报"判决暂时无法确定"（实测第 4 步撞上过）。
+    #   等 1 分钟负载降到 QUIET_LOAD 以下再报"准备好了"（最多等 QUIET_WAIT 秒）。
+    local quiet_load="${QUIET_LOAD:-1.5}" quiet_wait="${QUIET_WAIT:-600}" waited=0 ld
+    while (( waited < quiet_wait )); do
+        ld=$(docker exec "$C" cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+        awk "BEGIN{exit !($ld < $quiet_load)}" && break
+        (( waited == 0 )) && say "  等后台收尾、机器负载降下来（当前 1 分钟负载 $ld，降到 $quiet_load 以下再开演）…"
+        sleep 10; waited=$((waited + 10))
+    done
+    q 5432 "SELECT demo.settle()" >/dev/null
     say "准备好了"
+}
+
+# 2026-10-12：演示二准备阶段批量灌数（BULK_ROWS 行、每 BULK_BATCH 行一个全局事务）。
+#   · 走的就是台前那条路：demo.global_txn() 加入全局事务 → 分布式写 → 各分区组 Raft 复制 + 两阶段提交；
+#   · Citus 串行下发（每节点一条连接）：默认并行时一笔上千行的事务能把 2 vCPU 压到 load 30+，
+#     worker 连 TSO 都续不上租、提案凑不齐多数派，整笔回滚（实测 1000 行并行失败、串行 111 s 成功）；
+#   · 每批前等负载降下来；按 id 范围数行数判断这一批是否已完整 —— 可重跑、失败整批重试（全局事务原子）；
+#   · 城市 / 余额由 hashint4 / hashint8 算出：确定性、不溢出。
+bulk_load() {
+    local lo=257 hi n=0 nb i try t0 t1 got want l out done_ok
+    nb=$(( (BULK_ROWS + BULK_BATCH - 1) / BULK_BATCH ))
+    say "  灌数：另灌 ${BULK_ROWS} 个钱包（id ${lo}–$(( lo + BULK_ROWS - 1 ))，${nb} 批，每批一个全局事务）"
+    t0=$(date +%s)
+    for (( i = 1; i <= nb; i++ )); do
+        hi=$(( lo + BULK_BATCH - 1 )); (( hi > 256 + BULK_ROWS )) && hi=$(( 256 + BULK_ROWS ))
+        want=$(( hi - lo + 1 ))
+        done_ok=0
+        got=$(q 5432 "SELECT count(*) FROM $TBL WHERE id BETWEEN $lo AND $hi")
+        if [[ "$got" == "$want" ]]; then
+            say "    第 ${i}/${nb} 批 [${lo}, ${hi}] 已在（跳过）"; done_ok=1
+        fi
+        for (( try = 1; try <= 3 && done_ok == 0; try++ )); do
+            for l in $(seq 1 12); do        # 等负载降下来（最多 2 分钟）
+                awk "BEGIN{exit !($(docker exec "$C" cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0) < 4)}" && break
+                sleep 10
+            done
+            t1=$(date +%s)
+            if out=$(psqlc 5432 -q -At -v ON_ERROR_STOP=1 2>&1 <<SQL
+SET citus.multi_shard_modify_mode TO 'sequential';
+SET citus.max_adaptive_executor_pool_size TO 1;
+BEGIN;
+SELECT demo.global_txn();
+INSERT INTO $TBL SELECT g, (ARRAY['北京','上海','广州','深圳','杭州','成都','武汉','西安'])[1 + abs(hashint4(g)::bigint) % 8] || lpad(g::text, 6, '0'),
+       100 + abs(hashint8(g::bigint)::bigint) % 9900
+  FROM generate_series($lo, $hi) g;
+COMMIT;
+SQL
+            ); then
+                say "    第 ${i}/${nb} 批 [${lo}, ${hi}] 用时 $(( $(date +%s) - t1 )) s"
+                done_ok=1           # COMMIT 返回成功即已提交（不要立刻回头数：判决应用有异步尾巴，刚提交时快照读可能还看不全）
+            elif grep -q 'duplicate key' <<<"$out"; then
+                say "    第 ${i}/${nb} 批 [${lo}, ${hi}] 已经提交过（主键冲突，本次整批回滚），稍后核对"
+                done_ok=1
+            else
+                say "    第 ${i}/${nb} 批 [${lo}, ${hi}] 第 ${try} 次失败（整批已回滚，稍后重试）：$(grep -E 'ERROR' <<<"$out" | tail -1 | cut -c1-120)"
+            fi
+        done
+        for l in $(seq 1 12); do            # 核对：允许判决应用的异步尾巴（最多 60 s）
+            got=$(q 5432 "SELECT count(*) FROM $TBL WHERE id BETWEEN $lo AND $hi")
+            [[ "$got" == "$want" ]] && break
+            sleep 5
+        done
+        [[ "$got" == "$want" ]] || die "灌数第 ${i} 批 [${lo}, ${hi}] 没灌成（现有 ${got}/${want} 行）" "续灌：bash $HERE/$LAUNCH bulk（已完整的批会跳过），或调小 BULK_BATCH"
+        n=$(( n + want )); lo=$(( hi + 1 ))
+    done
+    say "  灌数完成：${n} 行，用时 $(( ($(date +%s) - t0) / 60 )) 分钟"
 }
 
 cmd_sql() {
@@ -231,10 +303,29 @@ cmd_stop() {
         fi
     done
     # 各 worker 上剩下的分片表 / 副本壳表（副本是本地表，不随 Citus 删表一起走）
-    for p in $W; do
-        psqlc $p -qAt -c "SET citus.enable_ddl_propagation = off" -c "SET statement_timeout = '120s'" -c "SET citus.override_table_visibility = false" \
-            -c "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT relname FROM pg_class WHERE relkind = 'r' AND relname ~ '$re' LOOP EXECUTE format('DROP TABLE IF EXISTS %I', r.relname); END LOOP; END \$\$" </dev/null >/dev/null 2>&1 &
-    done; wait
+    # 2026-10-13：逐张删、每张自成子事务，删不掉的跳过、下一轮再试（最多 5 轮）。
+    #   原来整台一个 DO 块 = 一个事务：拆组刚做完时，某张壳表的 DROP 通知会撞上
+    #   "本地写入被拒：本节点不是该分区组的 leader"而报 ERROR，整块回滚 ——
+    #   实测 :5433 上 63 张壳表一张没删，stop 报"没清干净"。过几秒再删就过了。
+    local round left_shells
+    for round in 1 2 3 4 5; do
+        for p in $W; do
+            psqlc $p -qAt -c "SET citus.enable_ddl_propagation = off" -c "SET statement_timeout = '120s'" -c "SET citus.override_table_visibility = false" \
+                -c "DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT relname FROM pg_class WHERE relkind = 'r' AND relname ~ '$re' LOOP
+                      BEGIN EXECUTE format('DROP TABLE IF EXISTS %I', r.relname); EXCEPTION WHEN OTHERS THEN NULL; END;
+                    END LOOP; END \$\$" </dev/null >/dev/null 2>&1 &
+        done; wait
+        left_shells=0
+        for p in $W; do
+            left_shells=$((left_shells + $(q $p "SET citus.override_table_visibility = false; SELECT count(*) FROM pg_class WHERE relkind='r' AND relname ~ '$re'")))
+        done
+        [[ $left_shells -eq 0 ]] && break
+        step "  还剩 $left_shells 张分片壳表没删掉（拆组的尾巴），5 s 后再删一轮"
+        for p in $W; do
+            q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null
+        done
+        sleep 5
+    done
     for p in $W; do      # 兜底：再拆一次在途通告建回来的组
         q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null &
     done; wait
@@ -299,5 +390,8 @@ case "${1:-}" in
     auto)  shift; cmd_auto "$@" ;;
     sql)   shift; cmd_sql "$@" ;;
     stop)  cmd_stop ;;
+    bulk)  [[ "${BULK_ROWS:-0}" -gt 0 ]] || die "只有演示二有准备阶段灌数（bash shardpg_demo128.sh bulk）"
+           [[ "$(q 5432 "SELECT count(*) FROM pg_namespace WHERE nspname='demo'")" == 1 ]] || die "环境还没准备（先 start）"
+           bulk_load ;;
     *)     sed -n '3,12p' "$HERE/$LAUNCH" | sed 's/^# \{0,1\}//' ;;
 esac

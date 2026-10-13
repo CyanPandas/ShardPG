@@ -3,6 +3,8 @@
 # shardpg_demo128.sh —— ShardPG 演示二：128 个分区组上的分布式事务（只用于演示，不改动项目任何文件）
 #
 #   bash shardpg_demo128.sh start      准备：建 wallet 表（128 个分片）→ 每片一个 Raft 组（副本因子 3）→ 选主 → 供副本 → 打标
+#                                      → 另灌 10 万个钱包（BULK_ROWS=100000，每 BULK_BATCH=5000 行一个全局事务，约 80 分钟；BULK_ROWS=0 不灌）
+#   bash shardpg_demo128.sh bulk       续灌（start 里的灌数中断了就用它；已完整的批跳过）
 #   bash shardpg_demo128.sh sql A      打开会话 A（连 master 的交互式 psql，提示符 A>）
 #   bash shardpg_demo128.sh sql B      打开会话 B（第二个窗口，演示并发事务）
 #   bash shardpg_demo128.sh stop       演示结束：拆组、删表、删登记、参数还原，恢复原环境

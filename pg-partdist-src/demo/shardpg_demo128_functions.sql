@@ -238,7 +238,8 @@ END $$;
 --    p_to 不给就自动挑。过程（竞选 → 当选 → 控制面登记 → master 路由跟过去 → 旧主被新主重新供成副本）
 --    由演示一的 demo.switch_leader 实时打出来；这里只负责按 P 标签找组、挑目标。
 CREATE FUNCTION demo.switch_group(p_tbl regclass, p_part text, p_to text DEFAULT NULL)
-RETURNS TABLE(分区 text, 原来的主 text, 新主 text, 新任期 text, 切换耗时_ms int, 原主 text)
+RETURNS TABLE(分区 text, 原来的主 text, 新主 text, 新任期 text, 切换耗时_ms int,
+              旧主换下时的下一个分片xid text, 新主接着发的下一个分片xid text, 原主 text)
 LANGUAGE plpgsql AS $$
 DECLARE v_sid bigint; cur text; tgt text := p_to; w text; r record;
 BEGIN
@@ -264,8 +265,78 @@ BEGIN
     FOR r IN SELECT * FROM demo.switch_leader(p_tbl, upper(p_part), tgt) LOOP
         分区 := r.分片; 原来的主 := r.原来的主; 新主 := r.新主; 新任期 := r.新任期;
         切换耗时_ms := r.切换耗时_ms; 原主 := r.原主重新成为副本;
+        旧主换下时的下一个分片xid := r.原主换下时的下一个分片xid;
+        新主接着发的下一个分片xid := r.新主接着发的下一个分片xid;
         RETURN NEXT;
     END LOOP;
+END $$;
+
+-- 分片 xid 发号状态（第 6 步切主前后对照）：一个分区组的每个成员各一行。
+--   只有主在发号，所以两列都只在主上显示（副本上是"—"）：
+--   下一个分片xid：主接下来要发的号；已预留上界：主按批（4096 个一批）预留并写进 Raft 日志的发号上界。
+--   新主不知道旧主在预留范围内实际发到了哪儿，所以从旧主的预留上界之后的下一批接着发 —— 号往前跳，绝不重号。
+CREATE FUNCTION demo.part_xid(p_tbl regclass, p_part text)
+RETURNS TABLE(分区 text, 节点 text, 角色 text, 任期 text, 下一个分片xid text, 已预留上界 text)
+LANGUAGE plpgsql AS $$
+DECLARE v_sid bigint; w text; st text; v text;
+BEGIN
+    v_sid := (SELECT g.sid FROM demo.ginfo(p_tbl) g WHERE g.分区 = upper(p_part));
+    IF v_sid IS NULL THEN RAISE EXCEPTION '没有这个分区：%（P001…P128，见 demo.groups）', p_part; END IF;
+    FOR w IN SELECT n.name FROM demo.group_member m JOIN demo.node n ON n.raft_id = m.raft_id
+              WHERE m.sid = v_sid ORDER BY n.port LOOP
+        分区 := upper(p_part); 节点 := w;
+        st := demo.gstate(w, v_sid);
+        角色 := CASE split_part(coalesce(st, ''), '|', 1) WHEN 'leader' THEN '主' WHEN 'follower' THEN '副本'
+                    WHEN '' THEN '连不上' ELSE split_part(st, '|', 1) END;
+        任期 := nullif(split_part(coalesce(st, ''), '|', 2), '');
+        下一个分片xid := '—'; 已预留上界 := '—';
+        IF 角色 = '主' THEN
+            下一个分片xid := coalesce(demo.pq(w, format(
+                'SELECT partdist.shard_xid_next(partdist.local_partition_for_shard(%s)::oid)::text', v_sid)), '?');
+            已预留上界 := coalesce(demo.pq(w, format(
+                'SELECT substring(partdist.route_status(partdist.local_partition_for_shard(%s)) from ''xid_watermark=([0-9]+)'')', v_sid)), '?');
+        END IF;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+-- 某个分区的分片 clog：只列真正写过行的分片 xid（从该分区当前主的页面元组头 xmin/xmax 里收集），
+-- 最新的 p_limit 笔。两阶段提交的判决（COMMITTED + commit_ts）是异步落到各参与分区 clog 里的：
+-- 先进本节点的"待应用判决"队列，后台约每半分钟清扫一次（实测刚 COMMIT 完 30–40 s 内这里还是 PREPARED；
+-- 这期间别的事务来读，会当场向协调组问判决，所以可见性不受影响）。
+-- 这里看到还有 PREPARED 时，先在主上手动触发一次同一个清扫（partdist.dtx_pending_sweep()），再等落定（最多 p_wait 秒）。
+CREATE FUNCTION demo.part_clog(p_tbl regclass, p_part text, p_limit int DEFAULT 3, p_wait int DEFAULT 15)
+RETURNS TABLE(分区 text, 分片xid bigint, 判决 text, start_ts bigint, commit_ts bigint, 写入的行 text, 删改的行 text)
+LANGUAGE plpgsql AS $$
+DECLARE v_sid bigint; lp text; rel text; q text; i int; pending int;
+BEGIN
+    v_sid := (SELECT g.sid FROM demo.ginfo(p_tbl) g WHERE g.分区 = upper(p_part));
+    IF v_sid IS NULL THEN RAISE EXCEPTION '没有这个分区：%（P001…P128，见 demo.groups）', p_part; END IF;
+    lp := demo.leader(v_sid);
+    IF lp IS NULL THEN RAISE EXCEPTION '% 此刻没有主（正在选主），稍后再试', p_part; END IF;
+    rel := p_tbl::text || '_' || v_sid;
+    q := format($q$
+        WITH v AS (%1$s), x AS (SELECT xmin AS xid FROM v UNION SELECT xmax FROM v WHERE xmax <> 0
+                               ORDER BY 1 DESC LIMIT %3$s)
+        SELECT x.xid, partdist.shard_clog_status_full(partdist.local_partition_for_shard(%2$s)::oid, x.xid),
+               (SELECT string_agg(id::text, ',' ORDER BY id) FROM v WHERE v.xmin = x.xid),
+               (SELECT string_agg(id::text, ',' ORDER BY id) FROM v WHERE v.xmax = x.xid)
+          FROM x ORDER BY 1 DESC $q$, demo.page_versions_sql(rel), v_sid, p_limit);
+    FOR i IN 1..greatest(p_wait * 2, 1) LOOP
+        SELECT count(*) INTO pending FROM demo.dblink(demo.conn(lp), q) AS t(xid bigint, st text, ins text, del text)
+         WHERE t.st !~ 'st=[23]';
+        EXIT WHEN pending = 0;
+        PERFORM demo.pq(lp, 'SELECT partdist.dtx_pending_sweep()::text');
+        PERFORM pg_sleep(0.5);
+    END LOOP;
+    RAISE NOTICE '% 当前的主是 %（st：1 PREPARED 2 COMMITTED 3 ABORTED）', upper(p_part), lp;
+    RETURN QUERY
+        SELECT upper(p_part), t.xid,
+               CASE substring(t.st from 'st=([0-9]+)') WHEN '0' THEN '0 运行中' WHEN '1' THEN '1 PREPARED'
+                    WHEN '2' THEN '2 COMMITTED' WHEN '3' THEN '3 ABORTED' ELSE t.st END,
+               substring(t.st from 'sts=([0-9]+)')::bigint, substring(t.st from 'cts=([0-9]+)')::bigint, t.ins, t.del
+          FROM demo.dblink(demo.conn(lp), q) AS t(xid bigint, st text, ins text, del text)
+         ORDER BY t.xid DESC;
 END $$;
 
 -- 总账：账户数、余额总和（守恒检查）

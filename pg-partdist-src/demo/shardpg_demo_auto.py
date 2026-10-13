@@ -43,6 +43,12 @@ DEFAULT_STEPS = os.path.join(HERE, "shardpg_demo_steps.sql")
 SPEED = {"fast": (0.003, 0.4), "normal": (0.014, 1.6), "slow": (0.035, 3.0)}   # (每字符秒, 语句间停顿秒)
 STMT_TIMEOUT = 1800        # 单条语句最长等多久（灌数据要几分钟）
 BLOCKED_WAIT = 4           # "-- @B &" 的语句等这么久还没返回，就当它被挡住了
+# 2026-10-13：读到"判决暂时无法确定"时，事务外的读按报错的 HINT「稍后重试」，最多这么多次。
+#   实测：刚 COMMIT 完紧接着读，偶尔（机器忙时更常见）读路径向协调组问判决拿不到答复，持续十几秒后自愈；
+#   产品侧同 P7-N52 一族，未定因。重试前顺手 demo.settle() 触发一次待应用判决清扫。
+INDOUBT_MARK = "判决暂时无法确定"
+INDOUBT_RETRIES = 6
+INDOUBT_SLEEP = 5
 
 
 # ───────────────────────────── 终端输出 ─────────────────────────────
@@ -95,6 +101,7 @@ class Session:
         self.q = queue.Queue()
         self.seq = 0
         self.pending = None      # 被挡住、还没返回的语句的结束标记
+        self.in_txn = False      # 是否在 BEGIN … COMMIT/ROLLBACK 之间（按敲进去的语句粗略跟踪）
 
     def spawn(self):
         # ★ stderr 必须在容器里并进 stdout：docker exec（无 -t）把两个流分开复用传输，二者先后没有保证，
@@ -106,6 +113,7 @@ class Session:
                                      stderr=subprocess.STDOUT, bufsize=0)
         self.q = queue.Queue()
         self.pending = None
+        self.in_txn = False
         threading.Thread(target=self._reader, args=(self.proc, self.q), daemon=True).start()
 
     @staticmethod
@@ -156,6 +164,11 @@ class Session:
         if not body.lstrip().startswith("\\") and not body.endswith(";"):
             body += ";"
         self.proc.stdin.write((body + "\n\\echo " + marker + "\n").encode("utf-8"))
+        kw = body.lstrip().split(None, 1)[0].upper().rstrip(";") if body.strip() else ""
+        if kw in ("BEGIN", "START"):
+            self.in_txn = True
+        elif kw in ("COMMIT", "ROLLBACK", "END", "ABORT"):
+            self.in_txn = False
         return marker
 
     def wait(self, marker, timeout, emit):
@@ -299,12 +312,40 @@ def play(steps, term, sessions, first_step, rec):
                     if done is None:
                         term.line(term.c("1;31", f"-- （会话 {b['sess']} 的连接断了）"))
                         break
+                    # 事务外的读撞上"判决暂时无法确定"：补判后按提示重试（事务内报错整笔已中止，不能重试）
+                    tries = 0
+                    while (done is True and not sess.in_txn and tries < INDOUBT_RETRIES
+                           and any(INDOUBT_MARK in o for o in out)):
+                        tries += 1
+                        term.line(term.c("2;37", f"-- （刚提交那笔的判决还没落到这个分片上，向协调组问询也没拿到答复 —— "
+                                                 f"按提示 {INDOUBT_SLEEP} s 后重试，第 {tries} 次）"))
+                        settle()        # 顺手触发一次待应用判决清扫（能落定的先落定）
+                        term.sleep(INDOUBT_SLEEP)
+                        for i, ln in enumerate(lines):
+                            prompt = f"{b['sess']}> " if i == 0 else f"{b['sess']}…> "
+                            term.w(term.c(color, prompt))
+                            term.type_text(ln)
+                            term.line()
+                        marker = sess.send(stmt)
+                        out, done = sess.wait(marker, STMT_TIMEOUT, emit)
+                        outs += out
                     term.sleep(term.pause)
             rec_step["blocks"].append({
                 "sess": b["sess"], "mode": b["mode"], "sql": b["sql"], "narr": b["narr"],
                 "out": "\n".join(outs).rstrip("\n"), "secs": round(time.time() - t0, 1), "done": True})
         rec["steps"].append(rec_step)
     rec["total"] = round(time.time() - t_all)
+
+
+def settle():
+    """在 master 上跑 demo.settle()（各 worker 触发一次待应用判决清扫），返回它的一行结果"""
+    try:
+        r = subprocess.run(["docker", "exec", "-i", "-u", "postgres", CONTAINER, PSQL, "-h", "/tmp", "-p", "5432",
+                            "-U", "postgres", "-d", "postgres", "-X", "-qAt", "-c", "SELECT demo.settle()"],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+        return r.stdout.decode("utf-8", "replace").strip().splitlines()[-1] if r.stdout.strip() else ""
+    except Exception:
+        return ""
 
 
 def run_launcher(cmd, term, label, log):

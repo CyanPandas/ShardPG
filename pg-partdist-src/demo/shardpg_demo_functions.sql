@@ -644,6 +644,19 @@ BEGIN
     RETURN format('已加入全局事务：gxid = %s，start_ts = %s（本事务在所有分片上共用这一个快照）', g, ts);
 END $$;
 
+-- 补判：两阶段提交的判决是异步落进各参与分片 clog 的（后台约半分钟清扫一次"待应用判决"队列）。
+-- 落定之前来读的事务要当场向协调组问判决；机器很忙时这个问询会超时，读就报
+-- "判决暂时无法确定……稍后重试"。这里在每台 worker 上手动触发一次同一个清扫，然后重试那条读即可。
+CREATE FUNCTION demo.settle() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE w text; v text; n int := 0; bad text := '';
+BEGIN
+    FOR w IN SELECT demo.workers() LOOP
+        v := demo.pq(w, 'SELECT partdist.dtx_pending_sweep()::text');
+        IF v IS NULL THEN bad := bad || ' ' || w; ELSE n := n + v::int; END IF;
+    END LOOP;
+    RETURN format('补判：落定 %s 笔待应用判决', n) || CASE WHEN bad <> '' THEN '（连不上：' || bad || '）' ELSE '' END;
+END $$;
+
 -- ⑪ 分片级 xid 分配器：每个分片自己发号，与节点原生 xid 无关
 CREATE FUNCTION demo.xid(p_tbl regclass)
 RETURNS TABLE(分片 text, 主节点 text, 下一个分片xid bigint, 主的持久化水位 text, 主节点的原生xid bigint, 各从学到的水位 text)
