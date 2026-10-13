@@ -130,25 +130,75 @@ pending_find_locked(int64 gxid)
 	return NULL;
 }
 
-static void
+/* pending_insert_locked 的结果（自旋锁里不能 elog，告警由调用方放锁后打） */
+#define PENDING_INS_OK			0
+#define PENDING_INS_FULL		1	/* 登记表满，整条没登上 */
+#define PENDING_INS_PAIRS_FULL	2	/* 合并后分片数超上限，超出的没登上 */
+
+static int
 pending_insert_locked(const DtxPendingEntry *ent)
 {
 	DtxPendingEntry *slot = pending_find_locked(ent->gxid);
+	int			i,
+				j;
+	int			rc = PENDING_INS_OK;
 
-	if (slot == NULL)
-		slot = pending_find_locked(0);
-	if (slot == NULL)
+	if (slot != NULL)
 	{
-		/* 满了：不覆盖别人（覆盖 = 那笔事务永失收敛通道），只告警放弃。
-		 * 128 槽 × 节点级在测试与常规负载下到不了；到了先解决泄漏源。 */
+		/*
+		 * ★ P7-N82（2026-10-13）：同一 gxid 在本节点**多次** PREPARE —— Citus 一笔事务
+		 * 在同一台 worker 上可以开多条连接（每条连接各自 PREPARE 一个本地事务、带着
+		 * 各自写过的分片）。原来这里整条覆盖，后到的登记把先到那条连接的分片清单
+		 * 冲掉：判决只落到后者的分片上，前者的分片 clog 永远停在 PREPARED、本机又
+		 * 查不到登记，快照读一直报"判决暂时无法确定"（演示二第 4 步红包实测：
+		 * w4 上 citus_…_27_6 与 _27_12 两条连接，P096 那份被冲掉，读卡死半小时）。
+		 * 改为并集：(shard, sxid) 去重追加。日志重放走同一函数，多条 OPEN 同样并起来。
+		 */
+		for (i = 0; i < ent->nxids; i++)
+		{
+			bool		have = false;
+
+			for (j = 0; j < slot->nxids; j++)
+				if (slot->pairs[2 * j] == ent->pairs[2 * i] &&
+					slot->pairs[2 * j + 1] == ent->pairs[2 * i + 1])
+				{
+					have = true;
+					break;
+				}
+			if (have)
+				continue;
+			if (slot->nxids >= DTX_PENDING_MAX_PAIRS)
+			{
+				rc = PENDING_INS_PAIRS_FULL;
+				break;
+			}
+			slot->pairs[2 * slot->nxids] = ent->pairs[2 * i];
+			slot->pairs[2 * slot->nxids + 1] = ent->pairs[2 * i + 1];
+			slot->nxids++;
+		}
+		return rc;
+	}
+
+	slot = pending_find_locked(0);
+	if (slot == NULL)
+		return PENDING_INS_FULL;	/* 满了：不覆盖别人（覆盖 = 那笔事务永失收敛通道） */
+	PendingCtl->nused++;
+	*slot = *ent;
+	return PENDING_INS_OK;
+}
+
+static void
+pending_insert_warn(int rc, int64 gxid)
+{
+	/* 128 槽 × 节点级在测试与常规负载下到不了；到了先解决泄漏源 */
+	if (rc == PENDING_INS_FULL)
 		elog(WARNING,
 			 "pg_partdist: 未决 2PC 登记表已满（%d），gxid=" INT64_FORMAT
-			 " 未登记——该事务只能靠恢复守护收敛", DTX_PENDING_MAX, ent->gxid);
-		return;
-	}
-	if (slot->gxid == 0)
-		PendingCtl->nused++;
-	*slot = *ent;
+			 " 未登记——该事务只能靠恢复守护收敛", DTX_PENDING_MAX, gxid);
+	else if (rc == PENDING_INS_PAIRS_FULL)
+		elog(WARNING,
+			 "pg_partdist: 未决 2PC 登记 gxid=" INT64_FORMAT " 合并后分片数超出上限 %d，"
+			 "超出部分未登记——只能靠读者就地闭合收敛", gxid, DTX_PENDING_MAX_PAIRS);
 }
 
 static void
@@ -185,7 +235,7 @@ dtx_jrnl_load_and_compact(void)
 		if (rec.magic != DTX_JRNL_MAGIC)
 			break;				/* 尾部半条/损坏：后面的不可信，止步 */
 		if (rec.kind == DTX_JRNL_OPEN)
-			pending_insert_locked(&rec.ent);
+			pending_insert_warn(pending_insert_locked(&rec.ent), rec.ent.gxid);
 		else if (rec.kind == DTX_JRNL_CLOSE)
 			pending_remove_locked(rec.ent.gxid);
 	}
@@ -259,6 +309,7 @@ DtxPendingRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 				   int64 start_ts, int nxids, const uint32 *pairs)
 {
 	DtxPendingEntry ent;
+	int			rc;
 
 	if (gxid == 0 || nxids <= 0 || PendingCtl == NULL)
 		return;
@@ -279,8 +330,9 @@ DtxPendingRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 	dtx_jrnl_append(DTX_JRNL_OPEN, &ent, true);
 
 	SpinLockAcquire(&PendingCtl->mutex);
-	pending_insert_locked(&ent);
+	rc = pending_insert_locked(&ent);
 	SpinLockRelease(&PendingCtl->mutex);
+	pending_insert_warn(rc, gxid);
 }
 
 /* 崩溃恢复的 2PC 段重放路径：日志里通常已有，缺了才补（幂等） */
@@ -288,12 +340,33 @@ void
 DtxPendingReRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 					 int64 start_ts, int nxids, const uint32 *pairs)
 {
-	bool		have;
+	bool		have = true;
+	DtxPendingEntry *slot;
+	int			i,
+				j;
 
 	if (gxid == 0 || PendingCtl == NULL)
 		return;
+	/*
+	 * P7-N82：同一 gxid 的多个 2PC 段（多条连接各 PREPARE 一次）各带一份分片清单 ——
+	 * 登记在、但没覆盖本段全部 (shard, sxid) 时也要补（Register 按并集合并）。
+	 */
 	SpinLockAcquire(&PendingCtl->mutex);
-	have = (pending_find_locked(gxid) != NULL);
+	slot = pending_find_locked(gxid);
+	if (slot == NULL)
+		have = false;
+	else
+		for (i = 0; i < nxids && have; i++)
+		{
+			have = false;
+			for (j = 0; j < slot->nxids; j++)
+				if (slot->pairs[2 * j] == pairs[2 * i] &&
+					slot->pairs[2 * j + 1] == pairs[2 * i + 1])
+				{
+					have = true;
+					break;
+				}
+		}
 	SpinLockRelease(&PendingCtl->mutex);
 	if (!have)
 		DtxPendingRegister(gxid, coord_gsid, dtxid, start_ts, nxids, pairs);
