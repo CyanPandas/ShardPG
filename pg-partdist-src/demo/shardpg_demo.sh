@@ -27,9 +27,9 @@ case "$PROFILE" in
     128) TBL=wallet;  NSHARD=128; DATA=demo128_data.sql; STEPS=shardpg_demo128_steps.sql
          EXTRA_FUNCS=shardpg_demo128_functions.sql; NAME="演示二（128 个分区组）"
          # 2026-10-12：准备阶段另灌 BULK_ROWS 个钱包（id 257 起；台前第 1 步只现场灌 1–256 号）。
-         # 这台 2 vCPU 机器上走全局事务 + Raft 复制约 20 行/秒（5000 行一批约 4 分钟），十万行约 80 分钟。
+         # 这台 2 vCPU 机器上走全局事务 + Raft 复制约 20 行/秒（5000 行一批约 4–5 分钟，加上批间等负载），十万行约 2 小时 20 分钟（2026-10-13 实测 138 分钟）。
          BULK_ROWS="${BULK_ROWS:-100000}"; BULK_BATCH="${BULK_BATCH:-5000}"
-         PREP="约 15–20 分钟"; [[ "$BULK_ROWS" -gt 0 ]] && PREP="约 15–20 分钟，另灌 ${BULK_ROWS} 行约 $(( BULK_ROWS / 1250 )) 分钟"
+         PREP="约 15–20 分钟"; [[ "$BULK_ROWS" -gt 0 ]] && PREP="约 15–20 分钟，另灌 ${BULK_ROWS} 行约 $(( BULK_ROWS / 700 )) 分钟"
          LAUNCH="shardpg_demo128.sh" ;;
     *)   echo "DEMO_PROFILE 只能是 4 或 128" >&2; exit 2 ;;
 esac
@@ -212,7 +212,7 @@ SQL
                 say "    第 ${i}/${nb} 批 [${lo}, ${hi}] 第 ${try} 次失败（整批已回滚，稍后重试）：$(grep -E 'ERROR' <<<"$out" | tail -1 | cut -c1-120)"
             fi
         done
-        for l in $(seq 1 12); do            # 核对：允许判决应用的异步尾巴（最多 60 s）
+        for l in $(seq 1 60); do            # 核对：允许判决应用的异步尾巴（最多 5 分钟；灌数时协调组答复慢，实测要一分多钟）
             got=$(q 5432 "SELECT count(*) FROM $TBL WHERE id BETWEEN $lo AND $hi")
             [[ "$got" == "$want" ]] && break
             sleep 5
