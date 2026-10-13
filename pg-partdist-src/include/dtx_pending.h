@@ -58,6 +58,12 @@ extern int	DtxPendingSweep(void);
 extern int	DtxReaderResolve(int64 gxid, int64 *cts_out);
 extern bool DtxReaderCloseOrphan(Oid shard, bool *search_complete);
 
+/*
+ * P7-N86：本节点最近学到的判决（登记注销后仍保留一段时间）。
+ * 返回 0=不在表里 1=COMMIT（*cts_out 有效） 2=ABORT。
+ */
+extern int	DtxRecentVerdict(int64 gxid, int64 *cts_out);
+
 /* 心跳工作者用：自连触发一轮清扫（无 DB 语境，纯 libpq） */
 extern void DtxPendingSelfTriggerSweep(void);
 

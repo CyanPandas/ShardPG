@@ -278,6 +278,30 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 					 * （协调组在，重试大概率问得到）—— 宁可让客户端重试，也不给出不一致的结果。
 					 * 剪枝 / 清理 / 等锁路径不走这里（strict=false）。
 					 */
+					if (vd == 3)
+					{
+						int64		rcts = 0;
+						int			rv = DtxRecentVerdict((int64) slot.global_xid, &rcts);
+
+						/*
+						 * ★ P7-N86：本机学到过这笔的判决（登记已按它注销），槽位却还是
+						 * PREPARED —— 直接按学到的判决补落，不走要扫整条流的就地闭合（N83）。
+						 */
+						if (rv == 1 || rv == 2)
+						{
+							ShardClogSetVerdict(shard, sxid, rv == 1, rv == 1 ? rcts : 0);
+							elog(LOG, "pg_partdist: 分片 %u xid %u（gxid %lld）登记已注销而槽位仍是 PREPARED，"
+								 "按本机学到的判决补落 %s（P7-N86）", shard, sxid,
+								 (long long) slot.global_xid, rv == 1 ? "COMMIT" : "ABORT");
+							ce = verdict_cache_search(&key, HASH_ENTER);
+							ce->status = (uint8) (rv == 1 ? TXN_COMMITTED : TXN_ABORTED);
+							ce->commit_ts = (rv == 1) ? rcts : 0;
+							if (cts_out)
+								*cts_out = ce->commit_ts;
+							return (rv == 1) ? SXID_COMMITTED : SXID_ABORTED;
+						}
+					}
+
 					if (strict && (vd == 3 || vd == 4))
 					{
 						ShardClogSlot slot2;

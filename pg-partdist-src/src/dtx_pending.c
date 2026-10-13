@@ -33,11 +33,30 @@
 
 /* ---- shmem ---- */
 
+/*
+ * P7-N86：最近学到的判决环。登记注销之后，本节点仍可能在登记里的分片上读到
+ * PREPARED 槽（实测：灌数批次与快照隔离那一步，清扫"收敛 1 笔"之后十几秒内，
+ * 快照读与就地闭合仍在同一 (分片, xid) 上看到 PREPARED）。此时本机已经没有登记，
+ * 读者只能走就地 in-doubt 闭合 —— 它要从头扫整条分区流，数据一多就超过自连
+ * 5 s 的语句超时（N83），读因此卡到下一次重启。判决对一个 gxid 是不可变的，
+ * 学到过就记下来，读者撞上这种槽时直接按它补落本地分片 clog。
+ */
+#define DTX_RECENT_MAX	1024
+
+typedef struct DtxRecentEnt
+{
+	int64		gxid;
+	int32		verdict;		/* 1 = COMMIT, 2 = ABORT */
+	int64		cts;
+} DtxRecentEnt;
+
 typedef struct DtxPendingCtl
 {
 	slock_t		mutex;
 	int			nused;
 	DtxPendingEntry e[DTX_PENDING_MAX];
+	int			recent_next;
+	DtxRecentEnt recent[DTX_RECENT_MAX];
 } DtxPendingCtl;
 
 static DtxPendingCtl *PendingCtl = NULL;
@@ -824,15 +843,70 @@ dtx_pending_responsibility_moved(const DtxPendingEntry *ent)
  * 学到判决：整笔（本节点全部 pairs）幂等落分片 clog；复制给副本成功才注销登记。
  * 返回是否已注销（P7-N12：复制失败 ⇒ 登记保留，调用方按各自语境处置）。
  */
+static void
+dtx_recent_remember(int64 gxid, int verdict, int64 cts)
+{
+	int			i;
+
+	if (gxid == 0 || PendingCtl == NULL || (verdict != 1 && verdict != 2))
+		return;
+	SpinLockAcquire(&PendingCtl->mutex);
+	for (i = 0; i < DTX_RECENT_MAX; i++)
+		if (PendingCtl->recent[i].gxid == gxid)
+			break;
+	if (i == DTX_RECENT_MAX)
+	{
+		i = PendingCtl->recent_next;
+		PendingCtl->recent_next = (i + 1) % DTX_RECENT_MAX;
+	}
+	PendingCtl->recent[i].gxid = gxid;
+	PendingCtl->recent[i].verdict = verdict;
+	PendingCtl->recent[i].cts = (verdict == 1) ? cts : 0;
+	SpinLockRelease(&PendingCtl->mutex);
+}
+
+int
+DtxRecentVerdict(int64 gxid, int64 *cts_out)
+{
+	int			verdict = 0;
+	int			i;
+
+	*cts_out = 0;
+	if (gxid == 0 || PendingCtl == NULL)
+		return 0;
+	SpinLockAcquire(&PendingCtl->mutex);
+	for (i = 0; i < DTX_RECENT_MAX; i++)
+		if (PendingCtl->recent[i].gxid == gxid)
+		{
+			verdict = PendingCtl->recent[i].verdict;
+			*cts_out = PendingCtl->recent[i].cts;
+			break;
+		}
+	SpinLockRelease(&PendingCtl->mutex);
+	return verdict;
+}
+
 static bool
 dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
 	int			i;
+	int			nbad = 0;
 
 	for (i = 0; i < ent->nxids; i++)
 		ShardClogSetVerdict((Oid) ent->pairs[2 * i],
 							(TransactionId) ent->pairs[2 * i + 1],
 							verdict == 1, verdict == 1 ? cts : 0);
+	dtx_recent_remember(ent->gxid, verdict, cts);	/* P7-N86 */
+
+	/* P7-N86 诊断：落完立刻回读，槽位没变成终局就说出来 */
+	for (i = 0; i < ent->nxids; i++)
+		if (ShardClogReadStatus((Oid) ent->pairs[2 * i],
+								(TransactionId) ent->pairs[2 * i + 1])
+			!= (verdict == 1 ? TXN_COMMITTED : TXN_ABORTED))
+			nbad++;
+	if (nbad > 0)
+		elog(WARNING, "pg_partdist: gxid=%lld 判决落分片 clog 后回读，%d/%d 个槽位不是终局（P7-N86）",
+			 (long long) ent->gxid, nbad, ent->nxids);
 
 	/* ★ T7.1（R-P6-15）：本节点刚落的这本账，要复制给副本 */
 	if (!dtx_replicate_verdict(ent, verdict, cts))
@@ -958,6 +1032,8 @@ DtxPendingSweep(void)
 
 			if (!any_prepared)
 			{
+				elog(LOG, "pg_partdist: 未决登记 gxid=%lld 判决未知、槽位已无 PREPARED，按残渣注销（P7-N86 诊断）",
+					 (long long) snap[i].gxid);
 				DtxPendingFinalized(snap[i].gxid);
 				ndone++;
 			}
