@@ -1619,7 +1619,16 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
      * **外面**：XLogFlush 自带组提交与并发安全，原先夹在 PartWALCtl->lock 里，等于把
      * 本节点所有分片的提交串在一次 WAL fsync 后面。
      */
-    XLogFlush(upto_lsn);
+    /*
+     * 单副本快速提交：分区 WAL 本就不 fsync，[A] 先于 [B] 的持久序无从谈起；
+     * 回读 peer 槽位只要求字节已 write() 进 pg_wal 文件。只写不刷（内核补丁
+     * 0013），否则每笔写事务要串行等两次 WAL fsync（数据记录一次、提交记录
+     * 一次），128 终端实测 fsync/提交 0.26，原生 PG 0.04。
+     */
+    if (partwal_fast_commit)
+        XLogWriteUpTo(upto_lsn);
+    else
+        XLogFlush(upto_lsn);
 
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 

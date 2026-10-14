@@ -1,0 +1,70 @@
+diff -ruN a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+--- a/src/backend/access/transam/xlog.c	2026-10-14 22:10:23.141374676 +0000
++++ b/src/backend/access/transam/xlog.c	2026-10-14 22:10:40.810198602 +0000
+@@ -2820,6 +2820,55 @@
+ }
+ 
+ /*
++ * patch 0013: XLogWriteUpTo -- like XLogFlush(record), but only write() the
++ * WAL up to 'record' into the kernel, no fsync.  For callers that need the
++ * bytes readable from the pg_wal files (e.g. reading back peer backends'
++ * records) without paying for durability; the commit record's own
++ * XLogFlush still provides that.  Piggybacks on any concurrent write/flush.
++ */
++void
++XLogWriteUpTo(XLogRecPtr record)
++{
++	XLogwrtRqst WriteRqst;
++	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
++
++	if (!XLogInsertAllowed())
++		return;
++	if (record <= LogwrtResult.Write)
++		return;
++
++	START_CRIT_SECTION();
++	for (;;)
++	{
++		XLogRecPtr	insertpos;
++
++		SpinLockAcquire(&XLogCtl->info_lck);
++		LogwrtResult = XLogCtl->LogwrtResult;
++		SpinLockRelease(&XLogCtl->info_lck);
++		if (record <= LogwrtResult.Write)
++			break;
++
++		insertpos = WaitXLogInsertionsToFinish(record);
++
++		if (!LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE))
++			continue;			/* someone else wrote; recheck */
++
++		LogwrtResult = XLogCtl->LogwrtResult;
++		if (record <= LogwrtResult.Write)
++		{
++			LWLockRelease(WALWriteLock);
++			break;
++		}
++		WriteRqst.Write = insertpos;
++		WriteRqst.Flush = 0;	/* write only */
++		XLogWrite(WriteRqst, insertTLI, false);
++		LWLockRelease(WALWriteLock);
++		break;
++	}
++	END_CRIT_SECTION();
++}
++
++/*
+  * Write & flush xlog, but without specifying exactly where to.
+  *
+  * We normally write only completed blocks; but if there is nothing to do on
+diff -ruN a/src/include/access/xlog.h b/src/include/access/xlog.h
+--- a/src/include/access/xlog.h	2026-10-14 22:10:26.359706900 +0000
++++ b/src/include/access/xlog.h	2026-10-14 22:10:40.822199840 +0000
+@@ -199,6 +199,7 @@
+ 								   int num_fpi,
+ 								   bool topxid_included);
+ extern void XLogFlush(XLogRecPtr record);
++extern void XLogWriteUpTo(XLogRecPtr record);	/* patch 0013 */
+ /* pg_partdist 补丁 0010：在线推进本地 WAL 插入位点（升主，FRD §11 步骤 4） */
+ extern void XLogRequestInsertPositionAdvance(XLogRecPtr target);
+ extern bool XLogBackgroundFlush(void);
