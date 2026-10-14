@@ -423,7 +423,8 @@ ShardVacuumSanitizeXmax(Relation rel, TransactionId trunc_before,
 /* ================================================================== */
 
 /*
- * 死 TID 批。按扫描序收集，天然按 (blkno, offnum) 升序 —— 两个消费者都靠这个：
+ * 死 TID 批。按扫描序收集，同一页内**不保证**有序（HOT 链预扫先进），结算前排序 ——
+ * 两个消费者都靠 (blkno, offnum) 升序：
  *   ① index_bulk_delete 的回调二分查找；
  *   ② 第三阶段按块分组回收行指针。
  */
@@ -535,6 +536,36 @@ shard_vacuum_heap_pass2(Relation rel, ShardVacuumDeadItems *dead,
 		}
 		page = BufferGetPage(buf);
 
+		/*
+		 * ★ 只回收此刻仍是 LP_DEAD 的行指针（原生 lazy_vacuum_heap_page 是 Assert）。
+		 * 第一阶段标 LP_DEAD 与这里之间放过页锁；任何让该槽不再是 LP_DEAD 的路径
+		 * （复用、并发修整）一旦发生，原样置 UNUSED 就会让指向新元组的索引项悬空 ——
+		 * 128 终端高频 vacuum 实测出现"heap tid from index tuple points to unused
+		 * heap page item"。宁可少收（留到下一趟），绝不错收。
+		 */
+		{
+			int			keep = 0;
+
+			for (i = 0; i < nunused; i++)
+			{
+				ItemId		lp = PageGetItemId(page, unused[i]);
+
+				if (unused[i] <= PageGetMaxOffsetNumber(page) && ItemIdIsDead(lp))
+					unused[keep++] = unused[i];
+				else
+					ereport(WARNING,
+							(errmsg("pg_partdist: 分片 vacuum 第三阶段：%s 第 %u 页第 %u 项已不是 LP_DEAD（flags=%u），跳过",
+									RelationGetRelationName(rel), blkno, unused[i],
+									unused[i] <= PageGetMaxOffsetNumber(page) ? (unsigned) lp->lp_flags : 99u)));
+			}
+			nunused = keep;
+		}
+		if (nunused == 0)
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
 		START_CRIT_SECTION();
 
 		for (i = 0; i < nunused; i++)
@@ -576,6 +607,19 @@ shard_vacuum_flush_batch(Relation rel, ShardVacuumDeadItems *dead,
 {
 	if (dead->num_items == 0)
 		return;
+
+	/*
+	 * ★ 先排序。index_bulk_delete 的回调对死名单做二分查找，第三阶段按块分组，
+	 * 两者都要求 (blkno, offnum) 升序。"按扫描序收集天然有序"在补丁 0011 的 HOT 链
+	 * 预扫加入后已不成立：同一页里预扫找到的死根先进名单，主循环里的既有 LP_DEAD
+	 * 后进（如 [5, 9, 2]）。乱序时二分查找漏掉部分 TID —— 它们的索引项没删，行指针
+	 * 却在第三阶段被置 UNUSED，槽位随后被新元组复用：索引项指向空槽（"heap tid from
+	 * index tuple points to unused heap page item"、截断后越界读），或指向无关新行
+	 * （索引扫描比顺序扫描多数出行）。
+	 */
+	qsort(dead->items, (size_t) dead->num_items, sizeof(ItemPointerData),
+		  shard_vacuum_tid_cmp);
+
 	shard_vacuum_indexes(rel, dead);
 	shard_vacuum_heap_pass2(rel, dead, stats);
 }
@@ -936,6 +980,31 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
+		}
+
+		/*
+		 * ★ 守卫：直接置 UNUSED 的只能是 heap-only 元组（没有索引项指向）。
+		 * 带索引的关系上出现别的，说明判据有漏洞 —— 从清单里拿掉并告警，不能让
+		 * 索引项悬空（见第三阶段的同类守卫）。
+		 */
+		if (has_index && nunused > 0)
+		{
+			int			keep = 0;
+
+			for (i = 0; i < nunused; i++)
+			{
+				ItemId		lp = PageGetItemId(page, newunused[i]);
+
+				if (ItemIdIsNormal(lp) &&
+					HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, lp)))
+					newunused[keep++] = newunused[i];
+				else
+					ereport(WARNING,
+							(errmsg("pg_partdist: 分片 vacuum 第一阶段：%s 第 %u 页第 %u 项不是 heap-only 元组（flags=%u），不直接回收",
+									RelationGetRelationName(rel), blkno, newunused[i],
+									(unsigned) lp->lp_flags)));
+			}
+			nunused = keep;
 		}
 
 		/* ---- 第一阶段：PRUNE 记录 ---- */

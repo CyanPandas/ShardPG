@@ -31,6 +31,7 @@
 #include "common/relpath.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
+#include "port/atomics.h"
 #include "partition_wal_writer.h"
 
 /* ------------------------------------------------------------------ */
@@ -142,6 +143,7 @@ typedef struct PartWALCtlData
     int64          reprov_gsid[PARTWAL_REPROV_QUEUE_MAX];
     int32          reprov_target[PARTWAL_REPROV_QUEUE_MAX];
 
+    pg_atomic_uint32 clog_drop_gen;  /* 分片 clog 被 DROP 回收的代次：后端据此作废段描述符缓存 */
     slock_t        clog_dirty_mutex;
     int            clog_ndirty;
     ShardClogDirtyEnt clog_dirty[PARTWAL_CLOG_DIRTY_MAX];

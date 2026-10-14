@@ -301,6 +301,7 @@ PartWALSyncShmemInit(void)
         memset(PartWALCtl->slots, 0, sizeof(PartWALCtl->slots));
         SpinLockInit(&PartWALCtl->ckpt_mutex);
         SpinLockInit(&PartWALCtl->clog_dirty_mutex);
+        pg_atomic_init_u32(&PartWALCtl->clog_drop_gen, 0);
         PartWALCtl->clog_ndirty       = 0;
         PartWALCtl->ckpt_n            = 0;
     }

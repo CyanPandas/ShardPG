@@ -22,6 +22,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "common/file_perm.h"
 #include "utils/builtins.h"
 #include "common/relpath.h"
 
@@ -145,6 +146,84 @@ ShardClogOpenSegFile(Oid shard, uint32 segno, bool create)
 	return fd;
 }
 
+/*
+ * ★ TPC-C 分支：段文件描述符的后端本地缓存（读写共用，O_RDWR，不随事务关闭）。
+ * 原先每读 / 写一个槽都 open + pread/pwrite + close —— 每次元组可见性判定三个系统
+ * 调用，vacuum 逐元组判死也一样；128 终端下 worker 的系统态 CPU 因此偏高。
+ * 段文件只在两种情况下被删：截断水位以下的旧段（这些槽读路径走免查区、不再读写）
+ * 与 DROP 之后的回收（表已不存在）—— 缓存的描述符不会读到 / 写进有效数据之外。
+ * 只缓存成功打开的；缺席（-1）照旧每次探测。
+ */
+#define CLOG_FD_CACHE_MAX 64
+static struct
+{
+	Oid			shard;
+	uint32		segno;
+	int			fd;
+}			clog_fdc[CLOG_FD_CACHE_MAX];
+static int	clog_fdc_n = 0;
+static int	clog_fdc_next = 0;
+static uint32 clog_fdc_gen = 0;
+
+static int
+clog_cached_fd(Oid shard, uint32 segno, bool create)
+{
+	char		path[MAXPGPATH];
+	int			i;
+	int			fd;
+
+	/* DROP 回收过分片 clog（OID 可能被新表复用）⇒ 整个缓存作废 */
+	if (PartWALCtl != NULL)
+	{
+		uint32		gen = pg_atomic_read_u32(&PartWALCtl->clog_drop_gen);
+
+		if (gen != clog_fdc_gen)
+		{
+			for (i = 0; i < clog_fdc_n; i++)
+				close(clog_fdc[i].fd);
+			clog_fdc_n = 0;
+			clog_fdc_next = 0;
+			clog_fdc_gen = gen;
+		}
+	}
+
+	for (i = 0; i < clog_fdc_n; i++)
+		if (clog_fdc[i].shard == shard && clog_fdc[i].segno == segno)
+			return clog_fdc[i].fd;
+
+	ShardClogSegPath(path, MAXPGPATH, shard, segno);
+	fd = open(path, O_RDWR | PG_BINARY, 0);
+	if (fd < 0)
+	{
+		if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 无法打开分片 clog 段 \"%s\": %m", path)));
+		if (!create)
+			return -1;
+		ShardClogEnsureDir(shard);
+		fd = open(path, O_RDWR | O_CREAT | PG_BINARY, pg_file_create_mode);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 无法创建分片 clog 段 \"%s\": %m", path)));
+		ShardClogFsyncDir(shard);
+	}
+
+	if (clog_fdc_n < CLOG_FD_CACHE_MAX)
+		i = clog_fdc_n++;
+	else
+	{
+		i = clog_fdc_next;
+		clog_fdc_next = (clog_fdc_next + 1) % CLOG_FD_CACHE_MAX;
+		close(clog_fdc[i].fd);
+	}
+	clog_fdc[i].shard = shard;
+	clog_fdc[i].segno = segno;
+	clog_fdc[i].fd = fd;
+	return fd;
+}
+
 /* 写一个槽（幂等 pwrite，无锁 —— 论证见头文件）。durable=true 时 fsync 段。 */
 static void
 ShardClogWriteSlot(Oid shard, TransactionId sxid,
@@ -162,7 +241,7 @@ ShardClogWriteSlot(Oid shard, TransactionId sxid,
 				 errmsg("pg_partdist: 分片 clog 拒写保留 xid %u（shard %u）",
 						sxid, shard)));
 
-	fd = ShardClogOpenSegFile(shard, segno, true);
+	fd = clog_cached_fd(shard, segno, true);
 
 	do
 	{
@@ -171,7 +250,6 @@ ShardClogWriteSlot(Oid shard, TransactionId sxid,
 
 	if (nb != (ssize_t) sizeof(ShardClogSlot))
 	{
-		CloseTransientFile(fd);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("pg_partdist: 分片 clog 写入失败 shard=%u xid=%u: %m",
@@ -179,14 +257,10 @@ ShardClogWriteSlot(Oid shard, TransactionId sxid,
 	}
 
 	if (durable && pg_fsync(fd) != 0)
-	{
-		CloseTransientFile(fd);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("pg_partdist: 分片 clog 段 fsync 失败 shard=%u seg=%08X: %m",
 						shard, segno)));
-	}
-	CloseTransientFile(fd);
 }
 
 void
@@ -437,7 +511,7 @@ ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 	if (sxid < FirstNormalTransactionId)
 		return false;
 
-	fd = ShardClogOpenSegFile(shard, segno, false);
+	fd = clog_cached_fd(shard, segno, false);
 	if (fd < 0)
 		return false;			/* 整段没建过 = 全洞 = 未决 */
 
@@ -447,14 +521,10 @@ ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 	} while (nb < 0 && errno == EINTR);
 
 	if (nb != (ssize_t) sizeof(*out) && nb != 0)
-	{
-		CloseTransientFile(fd);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("pg_partdist: 分片 clog 读取不完整 shard=%u xid=%u (%zd/%u)",
 						shard, sxid, nb, SHARD_CLOG_SLOT_SIZE)));
-	}
-	CloseTransientFile(fd);
 
 	if (nb == 0)
 	{
@@ -660,6 +730,8 @@ ShardClogGcDropped(const Oid *oids, int n)
 		return;
 	}
 	memcpy(dropped, oids, (size_t) n * sizeof(Oid));
+	if (PartWALCtl != NULL)
+		pg_atomic_fetch_add_u32(&PartWALCtl->clog_drop_gen, 1);
 
 	for (i = 0; i < n; i++)
 	{

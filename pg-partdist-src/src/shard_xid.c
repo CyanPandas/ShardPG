@@ -272,14 +272,43 @@ shard_mvcc_set_contains(Oid relid)
 	if (n == 0)
 		return false;
 
-	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
-	for (i = 0; i < ShardXidCtl->mvcc_n; i++)
-		if (ShardXidCtl->mvcc_set[i] == relid)
+	/*
+	 * ★ TPC-C 分支：后端本地结果缓存（含否定结果）。本函数在每个元组的可见性
+	 * 判定里都要调，原先每次都拿 ShardXidCtl->lock —— 128 终端实测是 worker 上
+	 * 一处可见的锁等待。集合只在打标 / 摘标时变，以成员数作版本：变了整表作废。
+	 */
+	{
+#define MVCC_CACHE_MAX 512
+		static Oid	mc_rel[MVCC_CACHE_MAX];
+		static bool mc_val[MVCC_CACHE_MAX];
+		static int	mc_n = 0;
+		static int	mc_ver = -1;
+
+		if (mc_ver != n)
 		{
-			found = true;
-			break;
+			mc_n = 0;
+			mc_ver = n;
 		}
-	LWLockRelease(ShardXidCtl->lock);
+		for (i = 0; i < mc_n; i++)
+			if (mc_rel[i] == relid)
+				return mc_val[i];
+
+		LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+		for (i = 0; i < ShardXidCtl->mvcc_n; i++)
+			if (ShardXidCtl->mvcc_set[i] == relid)
+			{
+				found = true;
+				break;
+			}
+		LWLockRelease(ShardXidCtl->lock);
+
+		if (mc_n < MVCC_CACHE_MAX)
+		{
+			mc_rel[mc_n] = relid;
+			mc_val[mc_n] = found;
+			mc_n++;
+		}
+	}
 	return found;
 }
 
