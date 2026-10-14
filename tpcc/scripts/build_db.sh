@@ -34,7 +34,7 @@ check oorder     "SELECT count(*) FROM oorder"     "$((W*30000))"    || bad=1
 check new_order  "SELECT count(*) FROM new_order"  "$((W*9000))"     || bad=1
 check stock      "SELECT count(*) FROM stock"      "$((W*100000))"   || bad=1
 check item       "SELECT count(*) FROM item"       "100000"          || bad=1
-check order_line "SELECT count(*) = (SELECT sum(o_ol_cnt) FROM oorder) FROM order_line" "t" || bad=1
+check order_line "SELECT (SELECT count(*) FROM order_line) = (SELECT sum(o_ol_cnt) FROM oorder)" "t" || bad=1
 [[ $bad -eq 0 ]] || die "装载后行数不对"
 log "一致性基线（装载后必须全 0）"
 QC -f "$S/90_consistency.sql"
