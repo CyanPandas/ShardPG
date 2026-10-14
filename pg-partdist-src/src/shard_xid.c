@@ -1191,14 +1191,14 @@ shard_xid_allocate(Oid shard)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_partdist 分片 xid 共享内存未初始化")));
 
-	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
-
-	slot = shard_xid_slot_attach(shard, NULL);
-
-	shard_xid_wraparound_gate(shard, slot);
-
 	for (;;)
 	{
+		LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+
+		slot = shard_xid_slot_attach(shard, NULL);
+
+		shard_xid_wraparound_gate(shard, slot);
+
 		if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -1216,17 +1216,22 @@ shard_xid_allocate(Oid shard)
 
 		result = slot->next_xid++;
 
+		LWLockRelease(ShardXidCtl->lock);
+
 		/*
 		 * T2.5 终局槽跳过守卫：clog 里已有判决的号 = 某段历史已经用过它
 		 * （水位文件缺失/落后才会走到），跳过绝不重发——重发会让新事务的
-		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过；
-		 * 每次分配多一次 pread、无 fsync，可接受。
+		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过。
+		 *
+		 * ★ TPC-C 分支：pread 挪到锁外。号的唯一性只靠计数器（锁内已 ++），
+		 * 这一步只决定"这个号要不要跳过"；跳过就回头再领一个，被跳的号作废。
+		 * 原先每次分配都在全局排他锁里做一次 pread，所有分片的发号与读侧水位
+		 * 查询都排在它后面。
 		 */
 		if (ShardClogReadStatus(shard, result) == TXN_RUNNING)
 			break;
 	}
 
-	LWLockRelease(ShardXidCtl->lock);
 	return result;
 }
 

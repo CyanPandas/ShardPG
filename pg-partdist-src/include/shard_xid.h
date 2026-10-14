@@ -24,8 +24,12 @@
 /* 分片 xid 起点：0=Invalid、1=Bootstrap、2=Frozen 语义保留（设计 §5.1） */
 #define FIRST_SHARD_XID			((TransactionId) 3)
 
-/* 每次水位推进的批量（一次 fsync 覆盖 4096 个号，崩溃至多跳这么多） */
-#define SHARD_XID_BATCH			4096
+/*
+ * 每次水位推进的批量（一次 fsync 覆盖这么多号，崩溃至多跳这么多）。
+ * TPC-C 分支：4096 → 65536。落盘在全局 ShardXidCtl 排他锁里做，128 终端下每节点
+ * 约每秒一次 fsync，期间全部分片的发号与读侧水位查询一起停；放大 16 倍后罕见。
+ */
+#define SHARD_XID_BATCH			65536
 
 /* 共享内存固定槽位数（P1 够用；P2 换 DSA/dshash，见 DEV PLAN T1.2） */
 /*

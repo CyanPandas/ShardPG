@@ -710,6 +710,12 @@ ShardClogAtCommit(void)
  * 后者跑在**执行 COMMIT PREPARED 的那个后端**里，与当初 DROP 的后端无关，
  * 所以清单只能从 2PC 记录里拿，不能读本进程的 pending_drops。
  */
+uint32
+ShardClogDropGen(void)
+{
+	return (PartWALCtl != NULL) ? pg_atomic_read_u32(&PartWALCtl->clog_drop_gen) : 0;
+}
+
 void
 ShardClogGcDropped(const Oid *oids, int n)
 {

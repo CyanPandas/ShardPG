@@ -168,6 +168,8 @@ extern int	ShardClogPendingDropList(const Oid **oids);
 #define SHARD_CLOG_PENDING_DROPS_MAX 16
 
 extern void ShardClogGcDropped(const Oid *oids, int n);
+/* DROP 回收代数：每回收一批分片 clog 加一（OID 可能被复用 ⇒ 后端本地缓存据此作废） */
+extern uint32 ShardClogDropGen(void);
 
 extern void ShardClogSyncDirty(void);
 

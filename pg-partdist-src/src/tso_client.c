@@ -291,10 +291,15 @@ tso_fence_check(void)
 
 	if (TsoClientCtl == NULL || !tso_configured())
 		return;
-	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
-	beat = TsoClientCtl->last_beat_ok;
-	lease = TsoClientCtl->lease_ms;
-	LWLockRelease(TsoClientCtl->lock);
+
+	/*
+	 * ★ TPC-C 分支：无锁读。每次可见性判定都经 TsoGetStartTs 走到这里，原先
+	 * 每个元组拿一次共享 LWLock（perf：LWLockAcquire 调用方第二名）。两个字段
+	 * 都是对齐的 64/32 位整数，x86-64 上读写原子；写者仍持排他锁。两字段之间
+	 * 读到新旧混合无害：lease_ms 启动后基本不变，beat 只会前进。
+	 */
+	beat = *((volatile TimestampTz *) &TsoClientCtl->last_beat_ok);
+	lease = *((volatile int32 *) &TsoClientCtl->lease_ms);
 	if (lease <= 0 || beat == 0)
 		return;					/* 尚无租约信息（本快照刚经 RPC 取得） */
 

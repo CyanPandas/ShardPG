@@ -92,10 +92,27 @@ typedef struct ShardVerdictCacheEntry
 } ShardVerdictCacheEntry;
 
 static HTAB *verdict_cache = NULL;
+static uint32 verdict_cache_gen = 0;
 
 static ShardVerdictCacheEntry *
 verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
 {
+	/*
+	 * 分片 DROP 回收过 clog ⇒ 该 OID 可能被新表复用、sxid 从头再发：整表作废。
+	 * 终局缓存现在排在活跃表之前（见 shard_xid_state_ex），陈旧条目会直接
+	 * 盖过新表的活跃事务，必须随 drop 代数一起失效。
+	 */
+	/*
+	 * 另设容量上限：池化连接常驻数小时，见过的 (shard, sxid) 只增不减，不设上限
+	 * 每后端可涨到几十 MB。满了整表重建（纯缓存，丢了只多读几次 clog）。
+	 */
+	if (verdict_cache != NULL &&
+		(ShardClogDropGen() != verdict_cache_gen ||
+		 (action == HASH_ENTER && hash_get_num_entries(verdict_cache) >= 262144)))
+	{
+		hash_destroy(verdict_cache);
+		verdict_cache = NULL;
+	}
 	if (verdict_cache == NULL)
 	{
 		HASHCTL		ctl;
@@ -107,6 +124,7 @@ verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
 		verdict_cache = hash_create("pg_partdist shard verdict cache",
 									256, &ctl,
 									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		verdict_cache_gen = ShardClogDropGen();
 	}
 	return (ShardVerdictCacheEntry *) hash_search(verdict_cache, key,
 												  action, NULL);
@@ -169,6 +187,21 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	key.sxid = sxid;
 
 	/*
+	 * ★ TPC-C 分支：终局缓存提到活跃表之前。缓存里只有从 clog 读到或问询学到的
+	 * 终局判决（COMMITTED/ABORTED，对一个 xid 不可变），命中即不可能还在活跃表里。
+	 * 原顺序每判一个元组都先拿共享的 ShardCommitLock 查活跃表 —— perf 实测
+	 * LWLockAttemptLock 占 worker CPU 16%，其中六成来自这里（全部后端抢同一条
+	 * 缓存行）。后端本地哈希命中不拿任何锁。
+	 */
+	ce = verdict_cache_search(&key, HASH_FIND);
+	if (ce != NULL)
+	{
+		if (cts_out)
+			*cts_out = ce->commit_ts;
+		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+	}
+
+	/*
 	 * 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O。
 	 *
 	 * ★ TPC-C 分支：提交中（committing）的条目不能一律答 RUNNING。持有者在
@@ -226,15 +259,6 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 			pg_usleep(1000L);
 			waited_ms++;
 		}
-	}
-
-	/* 终局缓存 */
-	ce = verdict_cache_search(&key, HASH_FIND);
-	if (ce != NULL)
-	{
-		if (cts_out)
-			*cts_out = ce->commit_ts;
-		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
 	}
 
 	/*
