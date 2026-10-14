@@ -175,7 +175,8 @@ for p in 0001-add-wal-insert-hook \
          0008-shard-vacuum-read-hook \
          0009-shard-twophase-rmgr \
          0010-promote-advance-wal-insert-position \
-         0011-shard-row-locks; do
+         0011-shard-row-locks \
+         0012-shard-rc-follow-updates; do
   patch -p1 --forward < ../pg-partdist-src/patches/$p.patch || exit 1
 done
 ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline

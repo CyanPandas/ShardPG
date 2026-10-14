@@ -37,6 +37,7 @@ extern void TsoClientDefineGUCs(void);
 extern void RequestTsoClientShmem(void);
 extern void TsoClientShmemInit(void);
 extern int64 TsoGetStartTs(void);		/* 懒取 + 事务内缓存；遗留模式=0 */
+extern void TsoRefreshStartTs(void);	/* RC 重评后换新快照（语句边界调用） */
 extern void TsoStashCommitTs(void);		/* PRE_COMMIT 暂存（临界区外） */
 extern int64 TsoStashedCommitTs(void);	/* 临界区内只读暂存 */
 extern int64 TsoPeekStartTs(void);	/* T7.11：只看不取，0 = 本事务没有 TSO start_ts */

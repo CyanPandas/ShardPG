@@ -1719,6 +1719,19 @@ ShardXidDefineGUCs(void)
 		GUC_UNIT_S, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"pg_partdist.rc_update_recheck",
+		"READ COMMITTED 事务改分片表时，遇并发已提交的新版本按原生 EPQ 重评（默认 off）。",
+		"off = 快照隔离 first-committer-wins：目标行在本事务快照之后被改过即 40001。"
+		"on = 仅对 READ COMMITTED 事务：UPDATE/DELETE/SELECT FOR UPDATE 顺更新链锁住"
+		"最新已提交版本、重评 WHERE 后再改（与原生 PG 的 RC 写语义一致，不丢更新）；"
+		"读仍用事务开始时的 TSO 快照。REPEATABLE READ / SERIALIZABLE 不受影响。"
+		"需要内核补丁 0012。",
+		&shard_rc_follow_updates,
+		false,
+		PGC_USERSET,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"pg_partdist.shard_vacuum_truncate",
 		"分片 vacuum 的尾部截断（T7.18/P7-V2）。",
 		"三类页面动作干净收尾后，把尾部连续空页还给文件系统。抢不到排他锁就"

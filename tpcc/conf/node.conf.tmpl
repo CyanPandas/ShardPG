@@ -56,6 +56,12 @@ pg_partdist.shard_vacuum_trigger_age = 1000
 pg_partdist.shard_vacuum_trigger_interval_s = 5
 pg_partdist.shard_vacuum_truncate = off
 
+# ---- 写冲突：READ COMMITTED 按原生 EPQ 重评（需内核补丁 0012） ----
+# 关掉 = 快照隔离 first-committer-wins：district / warehouse 热行上并发更新者
+# 全部 40001 整笔重试（128 终端实测约每秒 870 次）。打开后 RC 事务的
+# UPDATE 与原生 PG 一样等前者提交、在最新版本上重算再改；读仍用 TSO 快照。
+pg_partdist.rc_update_recheck = on
+
 # ---- 日志（长跑取证） ----
 logging_collector = on
 log_directory = 'log'

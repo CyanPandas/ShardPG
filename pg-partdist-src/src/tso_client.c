@@ -466,6 +466,39 @@ TsoGetStartTs(void)
 }
 
 /*
+ * pg_partdist.rc_update_recheck：READ COMMITTED 事务在 EPQ 改过"快照之后提交的
+ * 新版本"以后，下一条语句开始前换一个新 start_ts —— 等同原生 RC 的"每语句新快照"，
+ * 只在真的发生过重评时才付这一次 RPC。不换的话旧快照仍看得见被覆盖的那个旧版本
+ * （它的删除者在快照之后提交），同一行就同时读到旧版本和本事务写的新版本。
+ * 只在语句边界调用；活跃集合登记随之上移（偏大只因旧快照已不再使用，安全）。
+ */
+void
+TsoRefreshStartTs(void)
+{
+	char		sql[128];
+	int64		oldest;
+	int64		ts;
+
+	if (cur_start_ts == 0 || !tso_configured() || TsoClientCtl == NULL)
+		return;
+
+	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+	oldest = tso_active_min_locked();
+	LWLockRelease(TsoClientCtl->lock);
+
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist.partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
+			 (int) PartDistLocalNodeId(), oldest);
+	ts = tso_rpc(sql, "start_ts");
+	tso_note_lease_renewal(0);
+	if (ts > cur_start_ts)
+	{
+		cur_start_ts = ts;
+		tso_active_register(ts);
+	}
+}
+
+/*
  * T5.2：取 GlobalSafeTs（vacuum 前缀扫描的判据，设计 §6.2/§6.3）。
  *
  * 为什么必须走 RPC：`partdist_global_safe_ts()` 在 master 之外直接 ERROR，

@@ -126,6 +126,13 @@ static SxidState
 shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				   int64 *cts_out, bool strict);
 
+/*
+ * pg_partdist.rc_update_recheck：本事务在 EPQ 路径上越过了"快照之后提交"的版本时，
+ * 记下当时的 start_ts；下一条语句开始前若仍是这个快照就换新（ShardSnapshotEagerStart）。
+ * 按 ts 而不是布尔记：事务结束后 start_ts 必然变化，残留标记自然失效，不必挂回调。
+ */
+static int64 rc_stale_ts = 0;
+
 static SxidState
 shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				int64 *cts_out)
@@ -800,6 +807,7 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
 	int64		my_ts;
 	int64		cts = 0;
+	bool		rc_recheck;
 
 	if (!OidIsValid(shard))
 		return false;
@@ -808,6 +816,15 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 
 	/* T3.4：写侧到达这里前必经过扫描（快照已取），通常是缓存命中 */
 	my_ts = TsoGetStartTs();
+
+	/*
+	 * pg_partdist.rc_update_recheck：READ COMMITTED 事务遇到快照之后提交的
+	 * 删改不报 40001，而是如实报 TM_Updated/Deleted，由执行器走原生 EPQ
+	 * （补丁 0012 放开了 heapam_tuple_lock 的更新链追随）。版本链与 commit_ts
+	 * 序一致：本事务的 commit_ts 在 PRE_COMMIT 向 TSO 取号，必晚于它覆盖的
+	 * 那个版本已落定的 commit_ts。
+	 */
+	rc_recheck = shard_rc_follow_updates && !IsolationUsesXactSnapshot();
 
 	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
 	{
@@ -823,8 +840,12 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			*result = TM_Invisible;
 			return true;
 		case SXID_COMMITTED:
-			/* 快照之后才诞生的行：对本事务不可见（防御，正常扫描不会选中） */
-			if (my_ts > 0 && cts >= my_ts)
+			/*
+			 * 快照之后才诞生的行：对本事务不可见（防御，正常扫描不会选中）。
+			 * 例外：RC 重评模式下，EPQ 顺更新链锁/改的正是这种最新版本
+			 * （补丁 0012）—— 与原生 HeapTupleSatisfiesUpdate 一样只看提交与否。
+			 */
+			if (my_ts > 0 && cts >= my_ts && !rc_recheck)
 			{
 				*result = TM_Invisible;
 				return true;
@@ -879,7 +900,9 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			 * cts < my_ts 的历史提交到不了这里（那样的行对本快照不可见，
 			 * 扫描不会选中；xmin 分支的防御同理）。
 			 */
-			if (my_ts > 0 && cts >= my_ts)
+			if (my_ts > 0 && cts >= my_ts && rc_recheck)
+				rc_stale_ts = my_ts;
+			if (my_ts > 0 && cts >= my_ts && !rc_recheck)
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 						 errmsg("could not serialize access due to concurrent update"),
@@ -1184,7 +1207,14 @@ ShardSnapshotEagerStart(PlannedStmt *pstmt)
 		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid) &&
 			sv_is_shard_rel(rte->relid))
 		{
-			(void) TsoGetStartTs();
+			int64		ts = TsoGetStartTs();
+
+			if (rc_stale_ts != 0)
+			{
+				if (rc_stale_ts == ts && !IsolationUsesXactSnapshot())
+					TsoRefreshStartTs();
+				rc_stale_ts = 0;
+			}
 			return;
 		}
 	}

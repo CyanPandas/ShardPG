@@ -1,0 +1,94 @@
+diff -ruN a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+--- a/src/backend/access/heap/heapam_handler.c	2026-10-14 21:11:11.350756957 +0000
++++ b/src/backend/access/heap/heapam_handler.c	2026-10-14 21:11:29.001579054 +0000
+@@ -58,6 +58,9 @@
+ 
+ static const TableAmRoutine heapam_methods;
+ 
++/* patch 0012：见 access/shard_stamp.h */
++bool		shard_rc_follow_updates = false;
++
+ 
+ /* ------------------------------------------------------------------------
+  * Slot related callbacks for heap AM
+@@ -367,8 +370,11 @@
+ 	Buffer		buffer;
+ 	HeapTuple	tuple = &bslot->base.tupdata;
+ 	bool		follow_updates;
++	bool		shard_rel;
+ 
+ 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
++	shard_rel = shard_relation_xid_hook &&
++		shard_relation_xid_hook(relation, false, NULL);
+ 	tmfd->traversed = false;
+ 
+ 	Assert(TTS_IS_BUFFERTUPLE(slot));
+@@ -387,8 +393,8 @@
+ 	 */
+ 	if (result == TM_Updated &&
+ 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
+-		shard_relation_xid_hook &&
+-		shard_relation_xid_hook(relation, false, NULL))
++		shard_rel &&
++		!(shard_rc_follow_updates && !IsolationUsesXactSnapshot()))
+ 	{
+ 		ReleaseBuffer(buffer);
+ 		ereport(ERROR,
+@@ -445,7 +451,9 @@
+ 					 * changes in an existing tuple, except to invalid or
+ 					 * frozen, and neither of those can match priorXmax.)
+ 					 */
+-					if (!TransactionIdEquals(HeapTupleHeaderGetXmin(tuple->t_data),
++					if (!TransactionIdEquals(shard_rel ?
++											 HeapTupleHeaderGetRawXmin(tuple->t_data) :
++											 HeapTupleHeaderGetXmin(tuple->t_data),
+ 											 priorXmax))
+ 					{
+ 						ReleaseBuffer(buffer);
+@@ -504,7 +512,14 @@
+ 					 * checked that priorXmax == xmin, so we can test that
+ 					 * variable instead of doing HeapTupleHeaderGetXmin again.
+ 					 */
+-					if (TransactionIdIsCurrentTransactionId(priorXmax) &&
++					/*
++					 * patch 0012：分片元组的 xmin 是分片 xid，不能拿原生
++					 * TransactionIdIsCurrentTransactionId 判（号段不同，撞号会
++					 * 误判）。链上的新版本是并发提交者写的，"本命令内自己插入"
++					 * 由 heap_lock_tuple 的可见性分叉点（TM_Invisible）兜住。
++					 */
++					if (!shard_rel &&
++						TransactionIdIsCurrentTransactionId(priorXmax) &&
+ 						HeapTupleHeaderGetCmin(tuple->t_data) >= cid)
+ 					{
+ 						tmfd->xmax = priorXmax;
+@@ -539,7 +554,9 @@
+ 				/*
+ 				 * As above, if xmin isn't what we're expecting, do nothing.
+ 				 */
+-				if (!TransactionIdEquals(HeapTupleHeaderGetXmin(tuple->t_data),
++				if (!TransactionIdEquals(shard_rel ?
++										 HeapTupleHeaderGetRawXmin(tuple->t_data) :
++										 HeapTupleHeaderGetXmin(tuple->t_data),
+ 										 priorXmax))
+ 				{
+ 					ReleaseBuffer(buffer);
+diff -ruN a/src/include/access/shard_stamp.h b/src/include/access/shard_stamp.h
+--- a/src/include/access/shard_stamp.h	2026-10-14 21:11:02.101802189 +0000
++++ b/src/include/access/shard_stamp.h	2026-10-14 21:11:28.999578848 +0000
+@@ -128,4 +128,16 @@
+ typedef void (*shard_at_prepare_hook_type) (void);
+ extern PGDLLIMPORT shard_at_prepare_hook_type shard_at_prepare_hook;
+ 
++/* ---- 0012：READ COMMITTED 下的更新链追随（EPQ 重评） ---- */
++
++/*
++ * 默认 false：分片表只提供快照隔离，目标行在快照之后被并发改过 ⇒ 40001
++ * （first-committer-wins，设计 §4.4）。扩展可把它打开（GUC
++ * pg_partdist.rc_update_recheck）：此时 READ COMMITTED 事务的 UPDATE/DELETE/
++ * SELECT FOR UPDATE 与原生 PG 一样顺更新链锁住最新版本、经 EvalPlanQual
++ * 重评条件后再改；读仍用事务快照。可见性分叉点（HeapTupleSatisfiesUpdate 钩子）
++ * 与本标志同进同退。
++ */
++extern PGDLLIMPORT bool shard_rc_follow_updates;
++
+ #endif							/* SHARD_STAMP_H */
