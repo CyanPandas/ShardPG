@@ -144,7 +144,7 @@ extern int	ShardVacuumRecover(Oid shard);
 
 /* T7.17（P7-V1）：一次自动启动最多处理几个分片。锁与页面扫描都在这条路上，
  * 不设上限时"很多分片同时到龄"会把一次调用拖得很长。 */
-#define SHARD_VACUUM_AUTO_BATCH		4
+#define SHARD_VACUUM_AUTO_BATCH		16	/* TPC-C 分支：4 → 16，间隔已按表大小放宽，小表一轮做完 */
 
 /* T7.19（P7-V3）：生产路径故障注入点（GUC pg_partdist.shard_vacuum_fault） */
 extern int	shard_vacuum_fault_point;

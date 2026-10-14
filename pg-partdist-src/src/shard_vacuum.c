@@ -1748,7 +1748,18 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
 		ResourceOwner oldowner = CurrentResourceOwner;
 
 		considered++;
-		ShardXidNoteAutoVacuum(shard);
+		{
+			/* 记下页数，供下次按大小放宽间隔（只读 smgr 尺寸，不扫表） */
+			Relation	vr = try_relation_open(shard, AccessShareLock);
+			BlockNumber np = InvalidBlockNumber;
+
+			if (vr != NULL)
+			{
+				np = RelationGetNumberOfBlocks(vr);
+				relation_close(vr, AccessShareLock);
+			}
+			ShardXidNoteAutoVacuum(shard, np);
+		}
 
 		BeginInternalSubTransaction(NULL);
 		PG_TRY();

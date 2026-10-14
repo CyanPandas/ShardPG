@@ -125,6 +125,8 @@ typedef struct ShardXidSlot
 	TransactionId vacuum_xid;	/* 两态恢复标记，>= trunc_before */
 	/* TPC-C 分支：自动启动器按 trigger_age 最近一次接手本分片的时刻（限流用） */
 	TimestampTz auto_vacuum_at;
+	/* TPC-C 分支：最近一次接手时的页数（按大小放宽间隔，见 ShardXidOverdueShards） */
+	BlockNumber auto_vacuum_pages;
 } ShardXidSlot;
 
 /*
@@ -970,6 +972,7 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	free_slot->trunc_before = slot_trunc_before;
 	free_slot->vacuum_xid = slot_vacuum_xid;
 	free_slot->auto_vacuum_at = 0;
+	free_slot->auto_vacuum_pages = 0;
 	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
 	free_slot->shard_relid = shard;
 	return free_slot;
@@ -1090,13 +1093,21 @@ ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max)
 			age = shard_xid_age_locked(slot);
 			if (age < (TransactionId) shard_vacuum_max_age)
 			{
-				/* TPC-C 分支：回收触发（见 shard_vacuum_trigger_age 的注释） */
+				/*
+				 * TPC-C 分支：回收触发（见 shard_vacuum_trigger_age 的注释）。
+				 * 间隔按上次的页数放宽：每 2048 页一个基本间隔。页面趟是整表扫，
+				 * 大而少改的表（order_line 一个分片 2 万页）每 5 s 扫一遍纯属浪费，
+				 * 还占着单线程启动器，让小而热的表（district/warehouse 几百页、
+				 * 每秒几百次更新）排到 30 s 一轮，死版本链越拖越长。
+				 */
+				int			mult = 1 + (int) (slot->auto_vacuum_pages / 2048);
+
 				if (shard_vacuum_trigger_age <= 0 ||
 					age < (TransactionId) shard_vacuum_trigger_age ||
 					(slot->auto_vacuum_at != 0 &&
 					 !TimestampDifferenceExceeds(slot->auto_vacuum_at,
 												 GetCurrentTimestamp(),
-												 shard_vacuum_trigger_interval_s * 1000)))
+												 shard_vacuum_trigger_interval_s * 1000 * mult)))
 					continue;
 			}
 			shards[n] = slot->shard_relid;
@@ -1150,7 +1161,7 @@ ShardXidTwoStateShards(Oid *shards, int max)
  * 只在真正处理时调（计数路径不调，否则计数本身就把限流窗口刷新了）。
  */
 void
-ShardXidNoteAutoVacuum(Oid shard)
+ShardXidNoteAutoVacuum(Oid shard, BlockNumber pages)
 {
 	int			i;
 
@@ -1161,6 +1172,8 @@ ShardXidNoteAutoVacuum(Oid shard)
 		if (ShardXidCtl->slots[i].shard_relid == shard)
 		{
 			ShardXidCtl->slots[i].auto_vacuum_at = GetCurrentTimestamp();
+			if (pages != InvalidBlockNumber)
+				ShardXidCtl->slots[i].auto_vacuum_pages = pages;
 			break;
 		}
 	LWLockRelease(ShardXidCtl->lock);
