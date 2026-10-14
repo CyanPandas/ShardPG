@@ -80,7 +80,15 @@ pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t l
      */
     const char *host = hostname;
 
-    if (strcmp(hostname, "coordinator") == 0 || strcmp(hostname, "master") == 0)
+    /*
+     * TPC-C 分支：真实多机部署里节点就叫 coordinator / worker1 这类名字并不
+     * 罕见（/etc/hosts 里解析得到），回环映射会让每台机器都连回自己 ——
+     * 组成员、探活、RPC 全错且不报错。pg_raft.loopback_node_names = off
+     * 关掉映射，主机名原样交给 libpq 解析。默认 on，单机多端口测试拓扑不变。
+     */
+    if (!pg_raft_loopback_node_names)
+        ;
+    else if (strcmp(hostname, "coordinator") == 0 || strcmp(hostname, "master") == 0)
     {
         host = "127.0.0.1";
         if (port <= 0)
@@ -121,7 +129,8 @@ pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t l
 
         snprintf(conninfo, len,
                  "host=%s port=%d dbname=postgres user=postgres connect_timeout=%d",
-                 host, port, is_self ? pg_raft_self_connect_timeout_s : 1);
+                 host, port,
+                 is_self ? pg_raft_self_connect_timeout_s : pg_raft_peer_connect_timeout_s);
     }
 }
 
@@ -1095,6 +1104,22 @@ _PG_init(void)
                             "fail because the peer is down, only because this node is busy; a short "
                             "timeout aborts whole distributed transactions under load.",
                             &pg_raft_self_connect_timeout_s, 10, 1, 300,
+                            PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.loopback_node_names",
+                             "Map node names coordinator/master/worker1..3 to 127.0.0.1.",
+                             "Only for the single-machine multi-port test topology. Turn off on a "
+                             "real multi-host cluster whose hosts carry those names; otherwise every "
+                             "node silently connects to itself.",
+                             &pg_raft_loopback_node_names, true,
+                             PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.peer_connect_timeout_s",
+                            "Connect timeout (seconds) for libpq connections to other nodes.",
+                            "Probes and RPCs to peers. 1 s suits a single host or a quiet LAN; "
+                            "raise it when cross-host latency spikes under benchmark load make "
+                            "healthy peers look dead.",
+                            &pg_raft_peer_connect_timeout_s, 1, 1, 60,
                             PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.replicate_batch_max",

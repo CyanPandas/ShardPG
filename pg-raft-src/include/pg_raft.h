@@ -55,6 +55,8 @@ extern int  pg_raft_node_id;
 extern int  pg_raft_max_groups;          /* T7.23（P7-R2）：组表大小 */
 extern int  pg_raft_probe_interval_ms;
 extern int  pg_raft_self_connect_timeout_s;   /* P7-N8：连回本节点的建连超时 */
+extern bool pg_raft_loopback_node_names;      /* TPC-C 分支：单机测试拓扑的节点名回环映射 */
+extern int  pg_raft_peer_connect_timeout_s;   /* TPC-C 分支：连别的节点的建连超时 */
 extern int  pg_raft_replicate_batch_max;      /* P7-N41：group commit 每批记录上限（1 = 逐条） */
 extern int  pg_raft_probe_fail_threshold;
 extern int  pg_raft_leader_lease_ms;

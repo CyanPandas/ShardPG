@@ -3608,8 +3608,8 @@ peer_conn_get(RaftPeer *p)
 
     snprintf(conninfo, sizeof(conninfo),
              "host=%s port=%d dbname=postgres user=postgres "
-             "connect_timeout=1 application_name=pg_raft_rpc",
-             p->host, p->port);
+             "connect_timeout=%d application_name=pg_raft_rpc",
+             p->host, p->port, pg_raft_peer_connect_timeout_s);
 
     peer_conn[slot] = PQconnectdb(conninfo);
     if (PQstatus(peer_conn[slot]) != CONNECTION_OK)

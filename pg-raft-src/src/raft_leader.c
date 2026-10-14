@@ -11,6 +11,9 @@
 int  pg_raft_node_id = 1;
 int  pg_raft_probe_interval_ms = 3000;
 int  pg_raft_self_connect_timeout_s = 10;   /* P7-N8 */
+/* TPC-C 分支：多机部署 */
+bool pg_raft_loopback_node_names = true;    /* coordinator/master/worker1..3 ⇒ 127.0.0.1 */
+int  pg_raft_peer_connect_timeout_s = 1;    /* 连别的节点（探活 / RPC）的建连超时 */
 int  pg_raft_replicate_batch_max = 32;      /* P7-N41 */
 int  pg_raft_probe_fail_threshold = 2;
 int  pg_raft_leader_lease_ms = 10000;
