@@ -122,6 +122,20 @@ InitPartitionWALDirectory(Oid partition_id)
 {
     char path[MAXPGPATH];
 
+    /*
+     * ★ TPC-C 分支：后端本地"已建"缓存。提交刷盘路径每个分区每轮都调（两次
+     * mkdir 系统调用，持 PartWALCtl->lock）。目录只建不删（分区 DROP 后 oid 不复用
+     * 于同一后端的热路径），缓存命中即返回。
+     */
+#define DIR_SEEN_MAX 1024
+    static Oid  dir_seen[DIR_SEEN_MAX];
+    static int  dir_seen_n = 0;
+    int         k;
+
+    for (k = 0; k < dir_seen_n; k++)
+        if (dir_seen[k] == partition_id)
+            return;
+
     /* Create pg_parwal/ root (ignore EEXIST) */
     snprintf(path, MAXPGPATH, "%s/%s", DataDir, PARTITION_WAL_DIR);
     if (MakePGDirectory(path) < 0 && errno != EEXIST)
@@ -137,6 +151,8 @@ InitPartitionWALDirectory(Oid partition_id)
                 (errcode_for_file_access(),
                  errmsg("could not create partition WAL directory \"%s\": %m",
                         path)));
+    if (dir_seen_n < DIR_SEEN_MAX)
+        dir_seen[dir_seen_n++] = partition_id;
 }
 
 static RelFileNumber GetRelFileNumberSafe(Oid relid);
@@ -162,7 +178,7 @@ InitPartitionWALAndRegister(Oid partition_id)
          */
         if (IsTransactionState())
         {
-#define FILESET_SEEN_MAX 16
+#define FILESET_SEEN_MAX 256
             static Oid seen[FILESET_SEEN_MAX] = {0};
             static int seen_pos = 0;
             int        s;
@@ -476,15 +492,55 @@ EnsurePartWALRegistered(Oid relid)
     if (!ShouldWritePartWAL(relid, get_rel_name(relid)))
         return;
 
-    PG_TRY();
+    /*
+     * ★ TPC-C 分支：后端本地"已登记"缓存。本函数按 DML 频度调用（每条语句的
+     * ExecutorStart），原先每次都 mkdir 两次 + 以排他模式拿 PartWALCtl->lock 写一遍
+     * 反向映射 —— 32 终端实测 1/4 的后端堵在这把全局锁上。同一 (relid, relfilenode)
+     * 在本后端已经完整登记过就直接返回；relfilenode 变了（TRUNCATE / 重写类 DDL）
+     * 键就对不上，照常走全路径。
+     */
     {
-        InitPartitionWALAndRegister(relid);
+#define ENSURE_SEEN_MAX 512
+        static Oid	seen_rel[ENSURE_SEEN_MAX];
+        static RelFileNumber seen_rfn[ENSURE_SEEN_MAX];
+        static int	seen_n = 0;
+        RelFileNumber rfn = GetRelFileNumberSafe(relid);
+        int			k;
+
+        if (RelFileNumberIsValid(rfn))
+        {
+            for (k = 0; k < seen_n; k++)
+                if (seen_rel[k] == relid && seen_rfn[k] == rfn)
+                    return;
+        }
+
+        PG_TRY();
+        {
+            InitPartitionWALAndRegister(relid);
+        }
+        PG_CATCH();
+        {
+            FlushErrorState();
+            rfn = InvalidRelFileNumber;     /* 失败不记，下次重来 */
+        }
+        PG_END_TRY();
+
+        if (RelFileNumberIsValid(rfn))
+        {
+            for (k = 0; k < seen_n; k++)
+                if (seen_rel[k] == relid)
+                {
+                    seen_rfn[k] = rfn;
+                    return;
+                }
+            if (seen_n < ENSURE_SEEN_MAX)
+            {
+                seen_rel[seen_n] = relid;
+                seen_rfn[seen_n] = rfn;
+                seen_n++;
+            }
+        }
     }
-    PG_CATCH();
-    {
-        FlushErrorState();
-    }
-    PG_END_TRY();
 }
 
 /*

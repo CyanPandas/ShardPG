@@ -25,6 +25,8 @@
 #include "shard_xid.h"
 #include "shard_vacuum.h"
 #include "dtx_pending.h"
+#include "shard_clog.h"
+#include "partition_wal_writer.h"
 
 #include "fmgr.h"
 #include "libpq-fe.h"
@@ -686,6 +688,10 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 				wait_ms = Max(1000, Min(3000, TsoClientCtl->lease_ms / 3));
 		}
 		t_beat = GetCurrentTimestamp();
+
+		/* 单副本快速提交：分片 clog 判决的延迟 fsync，每轮统一落盘（窗口 ≤ 本轮间隔） */
+		if (partwal_fast_commit)
+			ShardClogSyncDirty();
 
 		/*
 		 * T4.5：未决 2PC 清扫兜底（读者问询之外的收敛通道）。本工作者无

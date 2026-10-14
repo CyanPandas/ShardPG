@@ -2171,9 +2171,6 @@ shard_at_prepare_impl(void)
 	gxid = TsoCurrentGxid();
 	sts = TsoGetStartTs();
 
-	for (i = 0; i < xact_map_n; i++)
-		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
-
 	sz = offsetof(ShardTwoPhasePayload, pairs) +
 		(Size) xact_map_n * 2 * sizeof(uint32);
 	p = (ShardTwoPhasePayload *) palloc(sz);
@@ -2187,15 +2184,29 @@ shard_at_prepare_impl(void)
 		p->pairs[2 * i] = (uint32) xact_map[i].shard;
 		p->pairs[2 * i + 1] = (uint32) xact_map[i].sxid;
 	}
-	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
 
 	/*
 	 * T4.5：未决登记（OPEN fsync 先于 EndPrepare 的 WAL 刷盘 ⇒
 	 * "prepared 存在 ⇒ 登记必在"）。判决落分片 clog 时才注销——
 	 * COMMIT PREPARED 不注销（终局等决议）。
+	 *
+	 * ★ TPC-C 分支：登记挪到槽位写 PREPARED **之前**。原顺序是先写槽、后登记，
+	 * 读者落在两者之间就看到"槽 PREPARED、本机无登记"（DtxReaderResolve 返回 3），
+	 * 随即远程触发就地 in-doubt 闭合 —— 那要把分区流从头扫一遍找 DTX 记录。
+	 * 128 终端实测 n2 上 PREPARE 近 4000 次、闭合一次都没找到东西，却吃掉 1/3 的
+	 * 采样。先登记后写槽：读者要么看到 RUNNING（不可见、走活跃表），要么看到
+	 * PREPARED 且登记已在（正常问协调组）。PREPARE 若在此之后失败，中止回调把槽
+	 * 写成 ABORTED，清扫按残渣注销登记。
 	 */
 	DtxPendingRegister(gxid, p->coord_gsid, p->dtxid, sts,
 					   xact_map_n, p->pairs);
+
+	for (i = 0; i < xact_map_n; i++)
+	{
+		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
+	}
+
+	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
 	pfree(p);
 }
 

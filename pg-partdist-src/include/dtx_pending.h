@@ -21,7 +21,7 @@
 
 #include "postgres.h"
 
-#define DTX_PENDING_MAX			128
+#define DTX_PENDING_MAX			1024	/* TPC-C 分支：128 → 1024。128 终端下待决 2PC 常态就超过 128，满了新登记被丢，读者全走全流扫描闭合 */
 #define DTX_PENDING_MAX_PAIRS	256	/* = SHARD_XID_MAX_PER_XACT（2026-10-03：16 → 256） */
 
 typedef struct DtxPendingEntry

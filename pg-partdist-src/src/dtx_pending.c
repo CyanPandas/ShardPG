@@ -6,6 +6,7 @@
  * 一切判决从协调组 leader 的 partdist.dtx_decision 只读问询而来。
  */
 #include "postgres.h"
+#include "lib/stringinfo.h"
 
 #include "dtx_pending.h"
 #include "shard_clog.h"
@@ -22,6 +23,7 @@
 #include "storage/fd.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "utils/syscache.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -921,7 +923,8 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 int
 DtxPendingSweep(void)
 {
-	DtxPendingEntry snap[DTX_PENDING_MAX];
+	/* 堆上：每项约 2 KB，整表拷贝放栈上会爆（容量已从 128 提到 1024） */
+	DtxPendingEntry *snap = (DtxPendingEntry *) palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;
@@ -975,33 +978,43 @@ DtxPendingSweep(void)
 
 			for (j = 0; j < snap[i].nxids; j++)
 			{
-				if (ShardClogReadStatus((Oid) snap[i].pairs[2 * j],
-										(TransactionId) snap[i].pairs[2 * j + 1])
-					== TXN_PREPARED)
+				TxnStatus	st = ShardClogReadStatus((Oid) snap[i].pairs[2 * j],
+													 (TransactionId) snap[i].pairs[2 * j + 1]);
+
+				/*
+				 * ★ TPC-C 分支：RUNNING 也算"活账"。参与者在 PRE_PREPARE 里先自治登记、
+				 * 到 at-prepare 才把槽位写成 PREPARED；清扫插在两者之间时槽还是 RUNNING，
+				 * 原生 prepared 也还没出现，下面两条兜底都拦不住 —— 活登记被当残渣注销，
+				 * 决议从此落不到槽位上，该分片的读永久报"判决暂时无法确定"
+				 * （心跳清扫异步化后每 lease/3 一轮，32 终端 1 分钟实测两笔）。
+				 * 残渣的本意是"全部槽都已终局"；崩溃遗留的 RUNNING 由 T2.4 认领改判 ABORTED。
+				 */
+				if (st == TXN_PREPARED || st == TXN_RUNNING)
 				{
 					any_prepared = true;
 					break;
 				}
 			}
-			if (any_prepared && SPI_connect() == SPI_OK_CONNECT)
+			if (any_prepared)
 			{
 				bool		any_rel = false;
 
+				/*
+				 * ★ TPC-C 分支：查系统缓存，不能用 SQL 查 pg_class —— Citus 的
+				 * override_table_visibility（默认 on）在普通会话里把分片表从 pg_class
+				 * 里藏掉，清扫的自连会话于是"一张分片表都查不到"，把活登记当成
+				 * "表全没了"的残渣注销，决议从此落不到槽位上（槽位永久 PREPARED，
+				 * 读报"判决暂时无法确定"）。
+				 */
 				for (j = 0; j < snap[i].nxids; j++)
 				{
-					char		q[96];
-
-					snprintf(q, sizeof(q),
-							 "SELECT 1 FROM pg_catalog.pg_class WHERE oid = %u",
-							 (unsigned) snap[i].pairs[2 * j]);
-					if (SPI_execute(q, true, 1) == SPI_OK_SELECT &&
-						SPI_processed > 0)
+					if (SearchSysCacheExists1(RELOID,
+											  ObjectIdGetDatum((Oid) snap[i].pairs[2 * j])))
 					{
 						any_rel = true;
 						break;
 					}
 				}
-				SPI_finish();
 				if (!any_rel)
 					any_prepared = false;	/* 表全没了：按残渣注销 */
 			}
@@ -1032,8 +1045,22 @@ DtxPendingSweep(void)
 
 			if (!any_prepared)
 			{
-				elog(LOG, "pg_partdist: 未决登记 gxid=%lld 判决未知、槽位已无 PREPARED，按残渣注销（P7-N86 诊断）",
-					 (long long) snap[i].gxid);
+				{
+					StringInfoData dbg;
+					int			k;
+
+					initStringInfo(&dbg);
+					for (k = 0; k < snap[i].nxids; k++)
+						appendStringInfo(&dbg, " (%u,%u)=%d",
+										 (unsigned) snap[i].pairs[2 * k],
+										 (unsigned) snap[i].pairs[2 * k + 1],
+										 (int) ShardClogReadStatus((Oid) snap[i].pairs[2 * k],
+																   (TransactionId) snap[i].pairs[2 * k + 1]));
+					elog(LOG, "pg_partdist: 未决登记 gxid=%lld dtxid=%lld 判决未知、槽位已无 PREPARED，按残渣注销（P7-N86 诊断）nxids=%d%s",
+						 (long long) snap[i].gxid, (long long) snap[i].dtxid,
+						 snap[i].nxids, dbg.data);
+					pfree(dbg.data);
+				}
 				DtxPendingFinalized(snap[i].gxid);
 				ndone++;
 			}
@@ -1391,7 +1418,8 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 int
 DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 {
-	DtxPendingEntry snap[DTX_PENDING_MAX];
+	/* 堆上：每项约 2 KB，整表拷贝放栈上会爆（容量已从 128 提到 1024） */
+	DtxPendingEntry *snap = (DtxPendingEntry *) palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;

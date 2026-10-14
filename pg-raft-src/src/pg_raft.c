@@ -1122,6 +1122,12 @@ _PG_init(void)
                             &pg_raft_peer_connect_timeout_s, 1, 1, 60,
                             PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
 
+    DefineCustomBoolVariable("pg_raft.single_member_fast_commit",
+                             "单副本快速提交：单成员数据组的 hardstate 照写但不 fsync（默认 off）。",
+                             "只在全部数据组单成员（REPLICAS=0）时开启；控制面组与多成员组不受影响。",
+                             &pg_raft_single_member_fast_commit, false,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.replicate_batch_max",
                             "Max parwal records replicated per data-group AppendEntries batch (group commit).",
                             "P7-N41: records queued behind the replication claim are shipped in one "

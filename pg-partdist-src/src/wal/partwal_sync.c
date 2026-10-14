@@ -299,6 +299,10 @@ PartWALSyncShmemInit(void)
         PartWALCtl->diverged_pending  = true;   /* 重启前留下的分叉标记也要修 */
         PartWALCtl->repair_last_try   = 0;
         memset(PartWALCtl->slots, 0, sizeof(PartWALCtl->slots));
+        SpinLockInit(&PartWALCtl->ckpt_mutex);
+        SpinLockInit(&PartWALCtl->clog_dirty_mutex);
+        PartWALCtl->clog_ndirty       = 0;
+        PartWALCtl->ckpt_n            = 0;
     }
 
     memset(&ctl, 0, sizeof(ctl));
@@ -389,6 +393,42 @@ PartWALInsert(XLogRecPtr end_lsn,
      * buffer，locator 在 main data 里。补丁 0001-v2 让钩子对这类记录以
      * nblocks == 0 触发；这里在加锁前先把 locator 解析出来。
      */
+    /*
+     * ★ 单副本快速提交：数据记录不进分区流，只记"触达"。
+     *
+     * 分区流里的数据记录只服务于 follower 回放 / 物理基线 / Raft 复制 —— 快速模式下
+     * 三者都不存在（单成员组不提议，持久化以 pg_wal 为准）。原路径每条 WAL 记录都以
+     * 排他模式拿一次 PartWALCtl->lock 占环槽，提交时再排空、写段文件，并为回读 peer
+     * 槽位多刷一次 pg_wal —— 128 终端实测这把全局锁是两台 worker 上最大的等待点。
+     *
+     * 仍然必须记"触达"：2PC 的 PRE_PREPARE 据此写 DTX_PREPARE 标记、向协调组登记
+     * 参与者（广播收件人与 in-doubt 闭合都靠它）。DTX / CTRL / 判决标记走各自的
+     * 直写路径，不经过这里，照旧进流。查映射只要共享锁。
+     */
+    if (partwal_fast_commit)
+    {
+        Oid         part = InvalidOid;
+
+        if (nblocks == 0)
+            return;             /* SMGR（截断等）：只有副本在乎 */
+        LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+        for (i = 0; i < nblocks; i++)
+        {
+            entry = (PartWALRelEntry *)
+                hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
+                            HASH_FIND, &found);
+            if (found)
+            {
+                part = entry->partition_id;
+                break;
+            }
+        }
+        LWLockRelease(PartWALCtl->lock);
+        if (OidIsValid(part))
+            PartWALNoteTouched(part);
+        return;
+    }
+
     if (nblocks == 0)
     {
         if (rmid != RM_SMGR_ID ||
@@ -1572,6 +1612,14 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     if (write_marker && partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
         marker_payload = PartWALBuildTxnMarker(true, &marker_len);
 
+
+    /*
+     * 先把 pg_wal 刷到 upto_lsn（group-commit 回读 peer 槽位的前提，见下），放在全局锁
+     * **外面**：XLogFlush 自带组提交与并发安全，原先夹在 PartWALCtl->lock 里，等于把
+     * 本节点所有分片的提交串在一次 WAL fsync 后面。
+     */
+    XLogFlush(upto_lsn);
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
     /*
@@ -1592,8 +1640,7 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
      * 这里刷的只是数据记录（[B] 是本事务提交记录的 XLogFlush，尚未发生），
      * [A] parwal fsync 仍然先于 [B]。
      */
-    if (drain_needed)
-        XLogFlush(upto_lsn);
+    /* XLogFlush(upto_lsn) 已在加锁前完成 */
 
     PG_TRY();
     {
@@ -1840,7 +1887,11 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
      * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
      * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
      */
-    if (replicate)
+    /*
+     * 单副本快速提交：数据与提交标记合成一轮复制（标记写完后下面那次挂钩一并送出）。
+     * "标记晚于数据在多数派持久化"的不变式在单成员组上平凡成立 —— 两者都只在本地。
+     */
+    if (replicate && !(partwal_fast_commit && marker_payload != NULL))
         PartWALReplicateTouched();
 
     /*

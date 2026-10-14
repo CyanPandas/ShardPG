@@ -30,6 +30,7 @@
 #include "access/xloginsert.h"
 #include "common/relpath.h"
 #include "storage/lwlock.h"
+#include "storage/spin.h"
 #include "partition_wal_writer.h"
 
 /* ------------------------------------------------------------------ */
@@ -75,6 +76,32 @@ typedef struct PartWALSlot
 #define PARTWAL_LOST_MAX 16
 #define PARTWAL_REPROV_QUEUE_MAX 256
 
+/*
+ * 单副本快速提交：分区 checkpoint（最后分配的 partition_lsn 等）的节点级缓存。
+ * 快速模式下 checkpoint 只写这里、不写文件；读先查这里。自带自旋锁，不依赖调用方
+ * 持有哪把锁。重启后第一次取用某分区时以"checkpoint 文件"与"扫段得到的实际最大
+ * plsn"二者取大填入，保证不重发编号。
+ */
+#define PARTWAL_CKPT_CACHE_MAX 4096
+typedef struct PartWALCkptCacheEnt
+{
+    Oid            partition_id;
+    RelFileNumber  relfilenode;
+    XLogRecPtr     last_wal_lsn;
+    uint64         last_part_lsn;
+} PartWALCkptCacheEnt;
+
+/*
+ * 单副本快速提交：分片 clog 判决写入不再逐笔 fsync，只登记"脏段"，由心跳工作者每轮
+ * （≤3 s）统一 fsync。表满时写入方退回同步 fsync，不会漏。
+ */
+#define PARTWAL_CLOG_DIRTY_MAX 1024
+typedef struct ShardClogDirtyEnt
+{
+    Oid            shard;
+    uint32         segno;
+} ShardClogDirtyEnt;
+
 typedef struct PartWALCtlData
 {
     LWLock        *lock;            /* protects all fields below */
@@ -114,6 +141,14 @@ typedef struct PartWALCtlData
     int            reprov_active;   /* 正在跑的归队工作者数（并发上限见 PartDistLaunchReprovision） */
     int64          reprov_gsid[PARTWAL_REPROV_QUEUE_MAX];
     int32          reprov_target[PARTWAL_REPROV_QUEUE_MAX];
+
+    slock_t        clog_dirty_mutex;
+    int            clog_ndirty;
+    ShardClogDirtyEnt clog_dirty[PARTWAL_CLOG_DIRTY_MAX];
+
+    slock_t        ckpt_mutex;
+    int            ckpt_n;
+    PartWALCkptCacheEnt ckpt[PARTWAL_CKPT_CACHE_MAX];
 
     PartWALSlot    slots[PARTWAL_BUFFER_SLOTS];
 } PartWALCtlData;

@@ -901,6 +901,44 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
  * 表无持有者）直接 ERROR —— 静默返回会让调用方 BeingModified→等待→重评
  * 无限自旋；T2.4 认领落地后此路径改为触发认领。
  */
+/*
+ * 等锁路径遇到 2PC 参与者的 PREPARED 槽（活跃表已摘、原生事务已结束或已交给
+ * prepared 的虚拟 PGPROC）：判决要等协调组决议（广播 / 问询 / 清扫）落到本分片，
+ * 是正常窗口而不是"持有者消亡"；已知还有"登记已注销、槽位仍 PREPARED"的残留
+ * （P7-N86，根因待查）。快照读路径对这两种都有处理，等锁路径原先直接 XX000，
+ * 函数下推后 worker 发起的跨仓库 2PC 一跑就撞上。
+ *
+ * 做法：按快照读的严格三态规则解析一次（含 N86 本机近期判决补落、问协调组，学到即
+ * 幂等回写本分片 clog）；未果则短暂轮询等落地；仍定不下来报可重试的 40001。
+ * 返回 true = 已有终局（调用方返回、由内核重评）；槽不是 PREPARED 返回 false。
+ */
+static bool
+sv_wait_resolve_prepared(Oid shard, TransactionId sxid)
+{
+	ShardClogSlot slot;
+	int			i;
+
+	(void) ShardClogReadSlot(shard, sxid, &slot);
+	if ((TxnStatus) slot.status != TXN_PREPARED)
+		return false;
+
+	if (shard_xid_state_ex(shard, sxid, NULL, NULL, true) != SXID_RUNNING)
+		return true;
+	for (i = 0; i < 200; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(10000L);
+		if (shard_xid_state(shard, sxid, NULL, NULL) != SXID_RUNNING)
+			return true;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("could not serialize access due to pending distributed commit"),
+			 errdetail("分片 %u 的 xid %u（2PC 参与者）判决尚未落到本分片。", shard, sxid),
+			 errhint("重试事务。")));
+	return false;				/* 不可达 */
+}
+
 static void
 sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 			 ItemPointer ctid, XLTW_Oper oper)
@@ -914,6 +952,8 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (shard_xid_state(shard, sxid, &native, NULL) != SXID_RUNNING)
 		return;					/* 已结束，重评即可 */
 
+	if (!TransactionIdIsValid(native) && sv_wait_resolve_prepared(shard, sxid))
+		return;
 	if (!TransactionIdIsValid(native))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -941,11 +981,15 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 
 	if (shard_xid_state(shard, sxid, NULL, NULL) == SXID_RUNNING &&
 		!TransactionIdIsInProgress(native))
+	{
+		if (sv_wait_resolve_prepared(shard, sxid))
+			return;
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("分片 %u 的 xid %u 是无主 RUNNING 条目（持有者原生 xid %u 已不在）",
 						shard, sxid, native),
 				 errdetail("持有者后端异常消亡；等 T2.4 认领或重启集群。")));
+	}
 }
 
 /*

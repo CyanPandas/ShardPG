@@ -199,6 +199,74 @@ ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts)
 	ShardClogWriteSlot(shard, sxid, &slot, false);
 }
 
+/* ---- 单副本快速提交：判决写的延迟 fsync（脏段登记 + 心跳统一落盘） ---- */
+static bool
+clog_note_dirty(Oid shard, uint32 segno)
+{
+	int			i;
+	bool		ok = false;
+
+	if (PartWALCtl == NULL)
+		return false;
+	SpinLockAcquire(&PartWALCtl->clog_dirty_mutex);
+	for (i = 0; i < PartWALCtl->clog_ndirty; i++)
+		if (PartWALCtl->clog_dirty[i].shard == shard &&
+			PartWALCtl->clog_dirty[i].segno == segno)
+		{
+			ok = true;
+			break;
+		}
+	if (!ok && PartWALCtl->clog_ndirty < PARTWAL_CLOG_DIRTY_MAX)
+	{
+		PartWALCtl->clog_dirty[PartWALCtl->clog_ndirty].shard = shard;
+		PartWALCtl->clog_dirty[PartWALCtl->clog_ndirty].segno = segno;
+		PartWALCtl->clog_ndirty++;
+		ok = true;
+	}
+	SpinLockRelease(&PartWALCtl->clog_dirty_mutex);
+	return ok;
+}
+
+/*
+ * 心跳工作者每轮调用：把登记的脏段统一 fsync。失败的段重新登记，留给下一轮
+ * （WARNING，不让心跳工作者因此退出）。段文件不在（分片已 DROP）静默跳过。
+ */
+void
+ShardClogSyncDirty(void)
+{
+	ShardClogDirtyEnt snap[PARTWAL_CLOG_DIRTY_MAX];
+	int			n,
+				i;
+
+	if (PartWALCtl == NULL)
+		return;
+	SpinLockAcquire(&PartWALCtl->clog_dirty_mutex);
+	n = PartWALCtl->clog_ndirty;
+	memcpy(snap, PartWALCtl->clog_dirty, sizeof(ShardClogDirtyEnt) * n);
+	PartWALCtl->clog_ndirty = 0;
+	SpinLockRelease(&PartWALCtl->clog_dirty_mutex);
+
+	for (i = 0; i < n; i++)
+	{
+		char		path[MAXPGPATH];
+		int			fd;
+
+		ShardClogSegPath(path, sizeof(path), snap[i].shard, snap[i].segno);
+		fd = open(path, O_RDWR | PG_BINARY, 0);
+		if (fd < 0)
+			continue;
+		if (pg_fsync(fd) != 0)
+		{
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("pg_partdist: 分片 clog 延迟落盘 fsync 失败 shard=%u seg=%08X: %m",
+							snap[i].shard, snap[i].segno)));
+			(void) clog_note_dirty(snap[i].shard, snap[i].segno);
+		}
+		close(fd);
+	}
+}
+
 void
 ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 					int64 commit_ts)
@@ -210,7 +278,16 @@ ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 		memset(&slot, 0, sizeof(slot));
 	slot.status = (uint32) (committed ? TXN_COMMITTED : TXN_ABORTED);
 	slot.commit_ts = committed ? (uint64) commit_ts : 0;
-	ShardClogWriteSlot(shard, sxid, &slot, true);
+
+	/*
+	 * 单副本快速提交：判决写不逐笔 fsync（32→128 终端实测它成了 worker 上最大的
+	 * 一块），登记脏段由心跳工作者 ≤3 s 内统一落盘。PostgreSQL 进程崩溃不丢（页缓存
+	 * 还在）；整机掉电时，最近一轮未落盘、且早于最近检查点 redo 点的判决可能丢失
+	 * （0007 redo 只重放检查点之后的提交记录）。登记表满则当场同步 fsync。
+	 */
+	ShardClogWriteSlot(shard, sxid, &slot,
+					   !(partwal_fast_commit &&
+						 clog_note_dirty(shard, sxid / SHARD_CLOG_XIDS_PER_SEGMENT)));
 }
 
 void

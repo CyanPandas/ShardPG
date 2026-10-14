@@ -725,6 +725,17 @@ _PG_init(void)
         NULL, NULL, NULL
     );
     DefineCustomBoolVariable(
+        "pg_partdist.single_replica_fast_commit",
+        "单副本快速提交：分区 WAL 不 fsync、数据与提交标记一轮复制（默认 off）。",
+        "只能在全部数据组单成员（REPLICAS=0）时开启：持久化以 pg_wal 为准，崩溃可能丢分区流尾部；"
+        "多副本下 follower 依赖落盘才 ack，开启会破坏多数派持久化语义。",
+        &partwal_fast_commit,
+        false,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
         "pg_partdist.auto_repair_diverged",
         "心跳工作者自动对带分叉标记的分片重做物理基线（默认 on）。",
         "标记来源：复制挂钩失败、重传内容不一致（R-P4-13）、捕获环溢出（P7-W2）。"

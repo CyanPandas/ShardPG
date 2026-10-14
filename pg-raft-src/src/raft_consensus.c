@@ -1749,7 +1749,14 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
         return false;
     }
 
-    if (pg_fsync(fd) != 0)
+    /*
+     * 单副本快速提交（pg_raft.single_member_fast_commit）：单成员数据组的 hardstate 照写
+     * （last_applied 必须跟上，否则重启后环被判满），但不 fsync —— 每次提交一次。
+     * 控制面组与多成员组不受影响。
+     */
+    if (!(pg_raft_single_member_fast_commit && ctx->group_id != RAFT_CONTROL_GROUP &&
+          group_cluster_size(ctx) == 1) &&
+        pg_fsync(fd) != 0)
     {
         elog(WARNING, "pg_raft: fsync hardstate 失败 \"%s\": %m", tmppath);
         close(fd);
@@ -1799,6 +1806,7 @@ persist_hard_state_unlocked(RaftGroupCtx *ctx)
         SpinLockRelease(&ctx->cons->mutex);
         return;
     }
+
     if (ctx->g->hs_writers > 0)
         ctx->g->hs_overlap = true;
     ctx->g->hs_writers++;
@@ -1923,11 +1931,21 @@ raft_persist_spi_end(bool spi_owned)
 static bool
 raft_log_table_ready(void)
 {
-    return (SPI_execute("SELECT 1 FROM information_schema.columns "
-                        "WHERE table_schema = 'partdist' "
-                        "AND table_name = 'raft_log' "
-                        "AND column_name = 'group_id'",
-                        true, 1) == SPI_OK_SELECT && SPI_processed > 0);
+    /*
+     * 正结果按后端缓存：information_schema.columns 是重视图，单次数毫秒，而这里在
+     * 数据组提交路径上每个分区每轮都要调（写 raft_log 前）。表一旦就绪（扩展装好、
+     * 列已加上）在后端生命周期内不会再"不就绪"；负结果不缓存，装扩展前后照常重查。
+     */
+    static bool ready = false;
+
+    if (ready)
+        return true;
+    ready = (SPI_execute("SELECT 1 FROM information_schema.columns "
+                         "WHERE table_schema = 'partdist' "
+                         "AND table_name = 'raft_log' "
+                         "AND column_name = 'group_id'",
+                         true, 1) == SPI_OK_SELECT && SPI_processed > 0);
+    return ready;
 }
 
 static void logtrack_note(int64 group_id, int64 index);   /* P7-N46，定义见下 */
@@ -2557,6 +2575,58 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
     raft_persist_spi_end(spi_owned);
 }
 
+/*
+ * persist_log_entry_sql 的批量版：一批条目一条多行 INSERT（每条一次 SPI 解析/规划/执行
+ * 原先占数据组提交路径的大头）。语义与逐条调用相同。
+ */
+static void
+persist_log_entries_sql_batch(RaftGroupCtx *ctx, int n, const int64 *idx, int64 term,
+                              const char *op_type, char **payload, bool committed)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int            k;
+    char          *op_lit;
+
+    if (n <= 0)
+        return;
+    if (n == 1)
+    {
+        persist_log_entry_sql(ctx, idx[0], term, op_type, payload[0], committed);
+        return;
+    }
+    if (!raft_persist_spi_begin(&spi_owned))
+        return;
+    if (!raft_log_table_ready())
+    {
+        raft_persist_spi_end(spi_owned);
+        return;
+    }
+    if (ctx->g->repersist_from > 0)
+        repersist_from_ring(ctx);
+    for (k = 0; k < n; k++)
+        logtrack_note(ctx->group_id, idx[k]);
+
+    op_lit = quote_literal_cstr(op_type);
+    initStringInfo(&sql);
+    appendStringInfoString(&sql,
+                           "INSERT INTO partdist.raft_log "
+                           "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+    for (k = 0; k < n; k++)
+        appendStringInfo(&sql, "%s(%lld, %lld, %lld, %s, %s::jsonb, %s)",
+                         k == 0 ? "" : ", ",
+                         (long long) ctx->group_id, (long long) idx[k], (long long) term,
+                         op_lit, quote_literal_cstr(payload[k]),
+                         committed ? "true" : "false");
+    appendStringInfoString(&sql,
+                           " ON CONFLICT (group_id, log_index) DO UPDATE SET "
+                           "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
+                           "payload = EXCLUDED.payload, committed = partdist.raft_log.committed OR EXCLUDED.committed");
+    (void) SPI_execute(sql.data, false, 0);
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+}
+
 static void
 mark_log_committed_sql(RaftGroupCtx *ctx, int64 upto_index)
 {
@@ -2576,8 +2646,16 @@ mark_log_committed_sql(RaftGroupCtx *ctx, int64 upto_index)
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "UPDATE partdist.raft_log SET committed = true "
-                     "WHERE group_id = %lld AND log_index <= %lld AND committed = false",
-                     (long long) ctx->group_id, (long long) upto_index);
+                     "WHERE group_id = %lld AND log_index > %lld AND log_index <= %lld "
+                     "AND committed = false",
+                     (long long) ctx->group_id,
+                     /*
+                      * 下界：sql_marked_upto 以下已全部标记（删行/回滚时水位随之退回，
+                      * 见 P7-N41 各处）。原先没有下界，每次提交都把本组全部历史日志
+                      * 沿 (group_id, log_index) 扫一遍——组里几万条时单次 >10 ms 且持续变慢。
+                      */
+                     (long long) Max(ctx->g->sql_marked_upto, 0),
+                     (long long) upto_index);
     if (SPI_execute(sql.data, false, 0) == SPI_OK_UPDATE &&
         upto_index > ctx->g->sql_marked_upto)
         ctx->g->sql_marked_upto = upto_index;
@@ -8651,6 +8729,7 @@ catchup_batch_to_peer(RaftGroupCtx *ctx, int slot)
 static int
 group_propose_batch(RaftGroupCtx *ctx, int n, char **payload, char **hex)
 {
+    bool   single_member;
     int64  idx[RAFT_LOG_CAPACITY];
     int64  term;
     int64  first;
@@ -8694,8 +8773,14 @@ group_propose_batch(RaftGroupCtx *ctx, int n, char **payload, char **hex)
     first = idx[0];
     last = idx[n - 1];
 
-    for (k = 0; k < n; k++)
-        persist_log_entry_sql(ctx, idx[k], term, RAFT_OP_PARWAL, payload[k], false);
+    /*
+     * 单成员组（多数派 = 1，单副本模式）：本地落盘即提交。raft_log 行与用户数据在同一个
+     * 本地事务里，事务提交 ⇔ 条目持久化 ⇔ Raft 提交，所以直接写成 committed，
+     * 省掉随后那次 mark_log_committed_sql 的 UPDATE。事务回滚时行随之消失，
+     * 与原路径一样由 repersist_from_ring 按环补写。
+     */
+    single_member = (majority == 1);
+    persist_log_entries_sql_batch(ctx, n, idx, term, RAFT_OP_PARWAL, payload, single_member);
 
     raft_spi_ctx = true;
     acks = gc_replicate_batch(ctx, term, first, n, idx,
@@ -8731,7 +8816,13 @@ group_propose_batch(RaftGroupCtx *ctx, int n, char **payload, char **hex)
         raft_spi_ctx = true;
     }
 
-    mark_log_committed_sql(ctx, Min(committed_upto, last));
+    if (single_member && committed_upto >= last)
+    {
+        if (last > ctx->g->sql_marked_upto)
+            ctx->g->sql_marked_upto = last;    /* 已按 committed 写入，无需再 UPDATE */
+    }
+    else
+        mark_log_committed_sql(ctx, Min(committed_upto, last));
     flush_replication(ctx, Min(committed_upto, last), term);
     raft_spi_ctx = false;
     group_apply_pending(ctx);
@@ -9372,6 +9463,25 @@ replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
     int64 last;
     int64 plsn;
 
+    /*
+     * 单副本快速提交：单成员数据组完全不做 Raft 提议，只推进游标。
+     *
+     * 没有 follower，组日志没有读者；而提议要经 SPI 从段文件把记录读回来组装条目 ——
+     * 后端本地的稀疏索引在 dtx_decide 这类经池化连接进来的后端里几乎总是空的，
+     * 退化成整条分区流扫描（128 终端实测写一条决议平均 155 ms，在协调组认领位里
+     * 串行，发起方平均等 700 ms）。各条路径的持久性另有承载：
+     *   - 数据记录：pg_wal（快速模式的前提）；
+     *   - DTX 决议：dtx_write_decision 直接写 partdist.dtx_decision，随 dtx_decide
+     *     的事务提交（WAL fsync）后才回给发起方 —— 这就是单成员组上的"多数派持久化"；
+     *   - FORGET：dtx_forget_append 在此模式下直接删决议行（原先靠 leader apply 删）。
+     */
+    if (pg_raft_single_member_fast_commit && group_cluster_size(ctx) == 1)
+    {
+        if (cur_plsn > ctx->g->last_data_plsn)
+            ctx->g->last_data_plsn = cur_plsn;
+        return;
+    }
+
     last = ctx->g->last_data_plsn;
     if (last == 0)
     {
@@ -9477,6 +9587,67 @@ pg_raft_partwal_replicate(Oid partition_id)
         return;
     restore_groups_if_needed();
 
+    /*
+     * ★ 单副本快速提交：单成员组只做写栅栏（leader 检查），不 SPI。
+     * 原路径每个触达分区每次提交都要 SPI 查组号 + flush 点（快速模式下 flush 点无用），
+     * 一笔 NewOrder 五次。分区 → 全局分片号是建表时定死的映射，按后端缓存；
+     * 未命中才查一次。成员数未知（0）或多成员组照常走下面的完整路径。
+     */
+    if (pg_raft_single_member_fast_commit)
+    {
+#define FAST_GID_CACHE 1024
+        static Oid   fc_part[FAST_GID_CACHE];
+        static int64 fc_gid[FAST_GID_CACHE];
+        static int   fc_n = 0;
+        int64        fgid = 0;
+        int          k;
+
+        for (k = 0; k < fc_n; k++)
+            if (fc_part[k] == partition_id)
+            {
+                fgid = fc_gid[k];
+                break;
+            }
+        if (k == fc_n && raft_persist_spi_begin(&spi_owned))
+        {
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "SELECT partdist.global_id_for_partition(%u::oid)::bigint",
+                             (unsigned) partition_id);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+                if (!isnull)
+                    fgid = DatumGetInt64(d);
+            }
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+            if (fgid > 0 && fc_n < FAST_GID_CACHE)
+            {
+                fc_part[fc_n] = partition_id;
+                fc_gid[fc_n] = fgid;
+                fc_n++;
+            }
+        }
+        if (fgid <= 0)
+            return;                 /* 非全局分片：不纳管 */
+        if (raft_group_ctx(fgid, &ctx) && group_cluster_size(&ctx) == 1)
+        {
+            SpinLockAcquire(&ctx.cons->mutex);
+            state = ctx.cons->state;
+            SpinLockRelease(&ctx.cons->mutex);
+            if (state != RAFT_LEADER)
+                ereport(ERROR,
+                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                         errmsg("pg_raft: 分区 %u(组 %lld)的本地写入被拒：本节点不是该分区组的 leader",
+                                partition_id, (long long) fgid),
+                         errdetail("分区主副本可能已切换，请经路由层重试。")));
+            return;
+        }
+        /* 组未就绪 / 多成员：走完整路径 */
+    }
+
     if (!raft_persist_spi_begin(&spi_owned))
         return;
     initStringInfo(&sql);
@@ -9535,6 +9706,24 @@ pg_raft_partwal_replicate(Oid partition_id)
 
     if (cur <= 0)
         return;
+
+    /*
+     * ★ 单副本快速提交：单成员数据组的提交路径不做 Raft 复制。
+     *
+     * 没有 follower，这一步只是记账（raft_log 行 + 环 + hardstate），却要占组的复制认领位
+     * 串行执行，并从段文件回读记录 —— 32 终端实测 1/3 的后端睡在认领位上、另有一批读者
+     * 等这些提交落定。in-doubt 闭合扫的是 parwal 流而不是 raft_log；DTX 决议走
+     * dtx_write_decision 自己的同步复制，不经过这里。
+     *
+     * 只把复制游标推进到 cur：之后真正需要复制时（决议记录）只送新增的那几条，
+     * 不会回头补历史。写栅栏（上面的 leader 检查）照旧。
+     */
+    if (pg_raft_single_member_fast_commit && group_cluster_size(&ctx) == 1)
+    {
+        if (cur > ctx.g->last_data_plsn)
+            ctx.g->last_data_plsn = cur;
+        return;
+    }
 
     /*
      * cur 是取自本地 parwal 的当前 flush 点，它必然 >= 本事务刚落盘的那些记录的
@@ -9624,6 +9813,14 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
  * 调用方必须已确认本节点是协调组 leader，并已持有复制认领位。
  * 返回该 DECISION 记录的 partition_lsn。
  */
+static struct
+{
+    bool    set;
+    int64   dtxid;
+    int     verdict;
+    int64   commit_ts;
+} pending_bcast;
+
 static int64
 dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
                    int32 verdict, uint64 commit_ts,
@@ -9694,22 +9891,48 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
             bcast_rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
         if (*bcast_rv != NULL)
         {
-            void (*bcast) (int64, int, int64) =
-                (void (*) (int64, int, int64)) *bcast_rv;
-
-            PG_TRY();
-            {
-                bcast(dtxid, (int) verdict, (int64) commit_ts);
-            }
-            PG_CATCH();
-            {
-                FlushErrorState();  /* 广播是尽力而为，绝不打穿提交路径 */
-            }
-            PG_END_TRY();
+            /*
+             * ★ TPC-C 分支：不在这里发 —— 调用方此刻还持着协调组的复制认领位，
+             * 广播是对每个参与者的远程 RPC，夹在认领位里会把本组所有决议串在别人的
+             * 网络往返后面（128 终端实测 dtx_decide 的认领位等待占 worker 采样近 1/5）。
+             * 暂存，由调用方放掉认领位后 dtx_flush_pending_broadcast() 发出。
+             */
+            pending_bcast.set = true;
+            pending_bcast.dtxid = dtxid;
+            pending_bcast.verdict = (int) verdict;
+            pending_bcast.commit_ts = (int64) commit_ts;
         }
     }
 
     return plsn;
+}
+
+/* 发出 dtx_write_decision 暂存的决议广播（尽力而为，失败吞掉）；调用方须已放掉认领位 */
+static void
+dtx_flush_pending_broadcast(void)
+{
+    static void **bcast_rv = NULL;
+
+    if (!pending_bcast.set)
+        return;
+    pending_bcast.set = false;
+    if (bcast_rv == NULL)
+        bcast_rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
+    if (*bcast_rv != NULL)
+    {
+        void (*bcast) (int64, int, int64) =
+            (void (*) (int64, int, int64)) *bcast_rv;
+
+        PG_TRY();
+        {
+            bcast(pending_bcast.dtxid, pending_bcast.verdict, pending_bcast.commit_ts);
+        }
+        PG_CATCH();
+        {
+            FlushErrorState();  /* 广播是尽力而为，绝不打穿提交路径 */
+        }
+        PG_END_TRY();
+    }
 }
 
 /* 查已有决议；返回 verdict，0 = 尚无决议 */
@@ -9878,6 +10101,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
         replicate_release(&ctx);
     }
     PG_END_TRY();
+    dtx_flush_pending_broadcast();
 
     pfree(parts_sql);
     PG_RETURN_INT32(verdict);
@@ -10085,6 +10309,7 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
         replicate_release(&ctx);
     }
     PG_END_TRY();
+    dtx_flush_pending_broadcast();
 
     pfree(parts_sql);
     PG_RETURN_INT32(existing);
@@ -10878,6 +11103,19 @@ dtx_forget_append(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid)
                         (long long) ctx->group_id, (long long) dtxid)));
 
     replicate_group_upto(ctx, plsn, (Oid) local_oid);
+
+    /* 单副本快速提交：单成员组不提议，没有 apply 来删行 —— leader 直接删 */
+    if (pg_raft_single_member_fast_commit && group_cluster_size(ctx) == 1 &&
+        raft_persist_spi_begin(&spi_owned))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.dtx_decision WHERE dtxid = %lld",
+                         (long long) dtxid);
+        (void) SPI_execute(sql.data, false, 0);
+        pfree(sql.data);
+        raft_persist_spi_end(spi_owned);
+    }
 }
 
 /*
@@ -12192,9 +12430,15 @@ dtx_master_pre_record_commit(void)
      * xmin 探针过滤 —— 该表平时为空（GC 及时），探针是一次只读小查询
      * （代价挂 R-P4-3 风险单持续观察）。
      */
-    if (application_name != NULL &&
-        strncmp(application_name, "citus_internal", 14) == 0)
-        return;
+    /*
+     * ★ TPC-C 分支：去掉"application_name 以 citus_internal 开头即退出"的闸门。
+     * 函数下推（create_distributed_function）后，事务函数在 worker 的 citus_internal
+     * 任务连接里执行；它碰到远程仓库时，**这个 worker 就是 2PC 驱动者**。闸门让它
+     * 从不写决议 —— 远程参与者的分片槽位永远停在 PREPARED（实测下推后频繁出现
+     * "判决暂时无法确定"与等锁路径的孤儿 RUNNING）。是不是驱动者改由下面
+     * pg_dist_transaction 的 xmin 探针判定（本事务写了 2PC 记录才命中），参与侧每次
+     * 提交多一次只读小查询；只读事务在下一行就已退出。
+     */
     if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
         return;
 

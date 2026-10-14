@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "partwal_sync.h"		/* 快速模式 checkpoint 缓存在 PartWALCtl 里 */
 #include "partition_wal_writer.h"
 #include "partition_wal.h"
 
@@ -123,7 +124,7 @@ defer_sync_ent(PartWALDeferEnt *e)
             ereport(ERROR,
                     (errcode_for_file_access(),
                      errmsg("pg_partdist: 批量落盘：打不开段文件 \"%s\": %m", abspath)));
-        if (pg_fsync(fd) != 0)
+        if (!partwal_fast_commit && pg_fsync(fd) != 0)
         {
             close(fd);
             ereport(ERROR,
@@ -181,6 +182,60 @@ PartWALDeferSyncReset(void)
 /* Checkpoint file I/O                                                  */
 /* ================================================================== */
 
+/* ---- 单副本快速提交：checkpoint 节点级缓存（见 partwal_sync.h） ---- */
+static bool
+ckpt_cache_get(Oid partition_id, PartWALCheckpointFile *out)
+{
+    int i;
+    bool hit = false;
+
+    if (PartWALCtl == NULL)
+        return false;
+    SpinLockAcquire(&PartWALCtl->ckpt_mutex);
+    for (i = 0; i < PartWALCtl->ckpt_n; i++)
+        if (PartWALCtl->ckpt[i].partition_id == partition_id)
+        {
+            out->magic = PARTWAL_CHECKPOINT_MAGIC;
+            out->relfilenode = PartWALCtl->ckpt[i].relfilenode;
+            out->last_wal_lsn = PartWALCtl->ckpt[i].last_wal_lsn;
+            out->last_part_lsn = PartWALCtl->ckpt[i].last_part_lsn;
+            hit = true;
+            break;
+        }
+    SpinLockRelease(&PartWALCtl->ckpt_mutex);
+    return hit;
+}
+
+/* 返回是否已存进缓存（满了返回 false，调用方须退回写文件） */
+static bool
+ckpt_cache_put(Oid partition_id, RelFileNumber relfilenode,
+               XLogRecPtr last_wal_lsn, uint64 last_part_lsn)
+{
+    int i;
+    bool ok = false;
+
+    if (PartWALCtl == NULL)
+        return false;
+    SpinLockAcquire(&PartWALCtl->ckpt_mutex);
+    for (i = 0; i < PartWALCtl->ckpt_n; i++)
+        if (PartWALCtl->ckpt[i].partition_id == partition_id)
+            break;
+    if (i < PARTWAL_CKPT_CACHE_MAX)
+    {
+        if (i == PartWALCtl->ckpt_n)
+            PartWALCtl->ckpt_n++;
+        PartWALCtl->ckpt[i].partition_id = partition_id;
+        PartWALCtl->ckpt[i].relfilenode = relfilenode;
+        PartWALCtl->ckpt[i].last_wal_lsn = last_wal_lsn;
+        PartWALCtl->ckpt[i].last_part_lsn = last_part_lsn;
+        ok = true;
+    }
+    SpinLockRelease(&PartWALCtl->ckpt_mutex);
+    return ok;
+}
+
+static uint64 partwal_scan_max_plsn(Oid partition_id);
+
 void
 WritePartWALCheckpoint(Oid partition_id,
                        RelFileNumber relfilenode,
@@ -204,6 +259,16 @@ WritePartWALCheckpoint(Oid partition_id,
     chk.last_wal_lsn   = last_wal_lsn;
     chk.last_part_lsn  = last_part_lsn;
 
+    /*
+     * 快速模式：checkpoint 只进节点级缓存，不写文件 —— 原先每个分区每轮 flush 都要
+     * "开临时文件 + 写 + rename"，全在 PartWALCtl->lock 之下。缓存满时退回写文件。
+     */
+    if (partwal_fast_commit &&
+        ckpt_cache_put(partition_id, relfilenode, last_wal_lsn, last_part_lsn))
+        return;
+    if (!partwal_fast_commit)
+        (void) ckpt_cache_put(partition_id, relfilenode, last_wal_lsn, last_part_lsn);
+
     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0)
     {
@@ -218,7 +283,7 @@ WritePartWALCheckpoint(Oid partition_id,
         nb = write(fd, &chk, sizeof(chk));
     } while (nb < 0 && errno == EINTR);
 
-    if (pg_fsync(fd) != 0)
+    if (!partwal_fast_commit && pg_fsync(fd) != 0)
         ereport(WARNING,
                 (errcode_for_file_access(),
                  errmsg("pg_partdist: fsync failed for checkpoint \"%s\": %m",
@@ -267,23 +332,48 @@ ReadPartWALCheckpoint(Oid partition_id, PartWALCheckpointFile *out)
             }
     }
 
+    if (partwal_fast_commit && ckpt_cache_get(partition_id, out))
+        return true;
+
     snprintf(path, MAXPGPATH, "%s/%s/%u/%s",
              DataDir, PARTITION_WAL_DIR, partition_id,
              PARTWAL_CHECKPOINT_FILENAME);
 
-    fd = open(path, O_RDONLY, 0);
-    if (fd < 0)
-        return false;
+    {
+        bool    file_ok = false;
 
-    nb = read(fd, out, sizeof(*out));
-    close(fd);
+        fd = open(path, O_RDONLY, 0);
+        if (fd >= 0)
+        {
+            nb = read(fd, out, sizeof(*out));
+            close(fd);
+            file_ok = (nb == (ssize_t) sizeof(*out) &&
+                       out->magic == PARTWAL_CHECKPOINT_MAGIC);
+        }
 
-    if (nb != (ssize_t) sizeof(*out))
-        return false;
-    if (out->magic != PARTWAL_CHECKPOINT_MAGIC)
-        return false;
+        if (partwal_fast_commit)
+        {
+            /*
+             * 缓存未命中（重启后第一次取用该分区）：文件可能停在快速模式开启前，
+             * 段里实际写到的编号以扫描为准，二者取大 —— 不能重发 partition_lsn。
+             */
+            uint64  scanned = partwal_scan_max_plsn(partition_id);
 
-    return true;
+            if (!file_ok)
+            {
+                if (scanned == 0)
+                    return false;
+                memset(out, 0, sizeof(*out));
+                out->magic = PARTWAL_CHECKPOINT_MAGIC;
+            }
+            if (scanned > out->last_part_lsn)
+                out->last_part_lsn = scanned;
+            (void) ckpt_cache_put(partition_id, out->relfilenode,
+                                  out->last_wal_lsn, out->last_part_lsn);
+            return true;
+        }
+        return file_ok;
+    }
 }
 
 
@@ -367,6 +457,12 @@ GetLastWrittenPartitionLSN(Oid partition_id)
      * Slow path: no checkpoint file (first run or after reset).
      * Scan all segment files.
      */
+    return partwal_scan_max_plsn(partition_id);
+}
+
+static uint64
+partwal_scan_max_plsn(Oid partition_id)
+{
     {
         char            dirpath[MAXPGPATH];
         PartWALSegName *segfiles;
@@ -460,6 +556,8 @@ CreatePartitionWALWriter(Oid partition_id, RelFileNumber relfilenode)
  * FlushPartitionWALWriter — write all buffered bytes to the current segment.
  * If with_fsync, also fsync and update the checkpoint file.
  */
+bool partwal_fast_commit = false;
+
 void
 FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync)
 {
@@ -520,7 +618,7 @@ FlushPartitionWALWriter(PartitionWALWriter *writer, bool with_fsync)
          * "落盘成功才 ack" 来保证「多数派提交 == 多数派已持久化」。若这里只
          * 告警，一次 EIO 仍会产生 ack，多数派提交就不再蕴含持久化。
          */
-        if (pg_fsync(writer->fd) != 0)
+        if (!partwal_fast_commit && pg_fsync(writer->fd) != 0)
             ereport(ERROR,
                     (errcode_for_file_access(),
                      errmsg("pg_partdist: fsync failed for partition %u WAL: %m",

@@ -169,4 +169,6 @@ extern int	ShardClogPendingDropList(const Oid **oids);
 
 extern void ShardClogGcDropped(const Oid *oids, int n);
 
+extern void ShardClogSyncDirty(void);
+
 #endif							/* SHARD_CLOG_H */

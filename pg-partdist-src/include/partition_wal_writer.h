@@ -52,6 +52,13 @@ extern PartitionWALWriter *CreatePartitionWALWriter(Oid partition_id,
 extern void DestroyPartitionWALWriter(PartitionWALWriter *writer);
 
 /*
+ * 单副本快速提交（GUC pg_partdist.single_replica_fast_commit，默认 off）：分区 WAL 段与
+ * checkpoint 文件照常写入但不 fsync。只能在全部数据组都是单成员（REPLICAS=0）时开启 ——
+ * 多副本下 follower 依赖"落盘成功才 ack"。持久化以 pg_wal 为准；崩溃可能丢分区流尾部。
+ */
+extern bool partwal_fast_commit;
+
+/*
  * AppendPartWALRecord — buffer one PartWALRecord (header + raw_data bytes)
  * for the given partition.  Flushes automatically on segment boundary or
  * when buffer is full.  Updates last_partition_lsn and last_wal_lsn.
