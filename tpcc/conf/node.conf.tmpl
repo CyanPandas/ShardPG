@@ -67,3 +67,10 @@ deadlock_timeout = 1s
 # ---- 事务函数下推（sql/06_delegate.sql） ----
 # 下推到 worker 的事务函数碰到远程仓库时，由 worker 发起嵌套分布式访问
 citus.allow_nested_distributed_execution = on
+# 下推后事务函数跑在 worker 的 Citus 内部后端里；原版 Citus 在这类后端里不缓存
+# 任何连接 —— 每次跨 worker 访问都新建连接、对端 fork 新后端（还会连带新建 TSO 连接）。
+# 补丁 pg-partdist-src/patches/citus-0001 提供此开关。
+citus.cache_connections_in_internal_backends = on
+# 串行化冲突等远程报错中止事务后，远端只是停在（失败的）事务里的连接回滚后继续缓存，
+# 不关掉重连（每次重连 worker 都要 fork 新后端、再建 TSO 连接）。补丁 citus-0001。
+citus.keep_connections_after_abort = on
