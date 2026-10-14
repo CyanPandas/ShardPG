@@ -1807,16 +1807,20 @@ typedef void (*SelfCallDone) (PGresult *res, bool ok, const char *errmsg);
 static PGconn *vac_auto_conn = NULL;
 static PGconn *repair_conn = NULL;
 static PGconn *dtx_sweep_conn = NULL;	/* 第三路：未决 2PC 清扫（见 ShardDtxSweepSelfTrigger） */
+static PGresult *vac_auto_last = NULL;	/* 各路已收到、尚未交给回调的结果 */
+static PGresult *repair_last = NULL;
+static PGresult *dtx_sweep_last = NULL;
 
 static bool
-self_call_start(PGconn **connp, const char *sql)
+self_call_start_opts(PGconn **connp, const char *sql, const char *options)
 {
-	char		conninfo[256];
+	char		conninfo[320];
 	PGconn	   *conn;
 
 	snprintf(conninfo, sizeof(conninfo),
-			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
-			 PostPortNumber);
+			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2%s%s%s",
+			 PostPortNumber,
+			 options ? " options='" : "", options ? options : "", options ? "'" : "");
 	conn = PQconnectdb(conninfo);
 	if (PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
 	{
@@ -1827,35 +1831,51 @@ self_call_start(PGconn **connp, const char *sql)
 	return true;
 }
 
-/* 在途则轮询一次；结束了就回调并收连接。返回 true = 仍在途 */
 static bool
-self_call_poll(PGconn **connp, SelfCallDone done)
+self_call_start(PGconn **connp, const char *sql)
+{
+	return self_call_start_opts(connp, sql, NULL);
+}
+
+/*
+ * 在途则轮询一次；结束了就回调并收连接。返回 true = 仍在途。
+ * 只在 !PQisBusy 时取结果——PQgetResult 在忙时会阻塞，而这是心跳 worker，
+ * 一阻塞就续不上 TSO 租约。
+ */
+static bool
+self_call_poll(PGconn **connp, PGresult **lastp, SelfCallDone done)
 {
 	PGconn	   *conn = *connp;
 	PGresult   *res;
-	PGresult   *last = NULL;
 
 	if (conn == NULL)
 		return false;
 	if (!PQconsumeInput(conn))
 	{
 		done(NULL, false, PQerrorMessage(conn));
+		if (*lastp)
+			PQclear(*lastp);
+		*lastp = NULL;
 		PQfinish(conn);
 		*connp = NULL;
 		return false;
 	}
-	if (PQisBusy(conn))
-		return true;
-	while ((res = PQgetResult(conn)) != NULL)
+	for (;;)
 	{
-		if (last)
-			PQclear(last);
-		last = res;
+		if (PQisBusy(conn))
+			return true;		/* 已收到的结果留在 *lastp，下一轮接着取 */
+		res = PQgetResult(conn);
+		if (res == NULL)
+			break;
+		if (*lastp)
+			PQclear(*lastp);
+		*lastp = res;
 	}
-	done(last, last != NULL && PQresultStatus(last) == PGRES_TUPLES_OK &&
-		 PQntuples(last) > 0, PQerrorMessage(conn));
-	if (last)
-		PQclear(last);
+	done(*lastp, *lastp != NULL && PQresultStatus(*lastp) == PGRES_TUPLES_OK &&
+		 PQntuples(*lastp) > 0, PQerrorMessage(conn));
+	if (*lastp)
+		PQclear(*lastp);
+	*lastp = NULL;
 	PQfinish(conn);
 	*connp = NULL;
 	return false;
@@ -1910,9 +1930,9 @@ dtx_sweep_done(PGresult *res, bool ok, const char *err)
 void
 ShardSelfCallsPoll(void)
 {
-	(void) self_call_poll(&vac_auto_conn, vac_auto_done);
-	(void) self_call_poll(&repair_conn, repair_done);
-	(void) self_call_poll(&dtx_sweep_conn, dtx_sweep_done);
+	(void) self_call_poll(&vac_auto_conn, &vac_auto_last, vac_auto_done);
+	(void) self_call_poll(&repair_conn, &repair_last, repair_done);
+	(void) self_call_poll(&dtx_sweep_conn, &dtx_sweep_last, dtx_sweep_done);
 }
 
 /*
@@ -1926,9 +1946,9 @@ ShardDtxSweepSelfTrigger(void)
 	if (dtx_sweep_conn != NULL)
 		return;					/* 上一次还在跑 */
 	/* 限时：一次清扫卡住不能让这一路永远占着、后续清扫都起不来 */
-	(void) self_call_start(&dtx_sweep_conn,
-						   "SET statement_timeout = 60000; "
-						   "SELECT partdist.dtx_pending_sweep()");
+	(void) self_call_start_opts(&dtx_sweep_conn,
+								"SELECT partdist.dtx_pending_sweep()",
+								"-c statement_timeout=60000");
 }
 
 bool

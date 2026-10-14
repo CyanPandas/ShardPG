@@ -656,6 +656,11 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 	for (;;)
 	{
 		int			wait_ms = 5000;
+		TimestampTz iter_start;
+		TimestampTz t_beat;
+		TimestampTz t_side;
+		long		ms_beat;
+		long		ms_side;
 
 		CHECK_FOR_INTERRUPTS();
 		if (ShutdownRequestPending)
@@ -666,12 +671,21 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
+		iter_start = GetCurrentTimestamp();
 		if (tso_configured())
 		{
-			(void) TsoHeartbeatOnce();
+			if (!TsoHeartbeatOnce())
+				ereport(LOG,
+						(errmsg("pg_partdist: TSO 心跳续租失败：%s", tso_last_err)));
+			/*
+			 * TPC-C 分支：续租间隔封顶 3 s。原先 lease/3（lease=60 s 时 20 s 一次），
+			 * 偶发连丢两次就越过 lease−lease/4 的栅栏；心跳本身只是一次 LW 锁 +
+			 * 一行更新，勤一点几乎没有代价。
+			 */
 			if (TsoClientCtl != NULL && TsoClientCtl->lease_ms > 0)
-				wait_ms = Max(1000, TsoClientCtl->lease_ms / 3);
+				wait_ms = Max(1000, Min(3000, TsoClientCtl->lease_ms / 3));
 		}
+		t_beat = GetCurrentTimestamp();
 
 		/*
 		 * T4.5：未决 2PC 清扫兜底（读者问询之外的收敛通道）。本工作者无
@@ -714,6 +728,15 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			if (PartWALReprovQueuePop(&qg, &qt))
 				PartDistLaunchReprovision(qg, qt);
 		}
+
+		/* 一轮（不含等待）超过 2 s 就记下各段耗时：心跳被拖住时据此定位 */
+		t_side = GetCurrentTimestamp();
+		ms_beat = (long) ((t_beat - iter_start) / 1000);
+		ms_side = (long) ((t_side - t_beat) / 1000);
+		if (ms_beat + ms_side > 2000)
+			ereport(LOG,
+					(errmsg("pg_partdist: TSO 心跳循环一轮耗时 %ld ms（续租 %ld ms，附带任务 %ld ms）",
+							ms_beat + ms_side, ms_beat, ms_side)));
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
