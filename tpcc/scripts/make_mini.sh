@@ -6,14 +6,15 @@
 # 在一份拷贝上跑：bash scripts/make_mini.sh；会改 sql/ 与 scripts/ 下的文件。
 set -euo pipefail
 D="$(cd "$(dirname "$0")/.." && pwd)"
-grep -q 'MINI_SCALE' "$D/sql/04_load_funcs.sql" && { echo "已是迷你规模"; exit 0; }
+# 各条替换都可重复执行（改过的文件不会再匹配）；只有文件头标记需要判重。
+# 不能按"某个文件已改"整体跳过：单独换回标准版的文件（如 build_db.sh）也要能再改。
+grep -q 'MINI_SCALE' "$D/sql/04_load_funcs.sql" || sed -i '1i -- MINI_SCALE：由 scripts/make_mini.sh 生成' "$D/sql/04_load_funcs.sql"
 
 sed -i -e 's/generate_series(1, 100000) i/generate_series(1, 10000) i/' "$D/sql/03_distribute.sql"
 
 sed -i -e 's/% 3000 + 1/% 300 + 1/' -e 's/每个区 3000 单对 1..3000/每个区 300 单对 1..300（MINI）/' "$D/sql/02_gen_funcs.sql"
 
-sed -i -e '1i -- MINI_SCALE：由 scripts/make_mini.sh 生成' \
-       -e 's/, 3001,/, 301,/' \
+sed -i -e 's/, 3001,/, 301,/' \
        -e 's/generate_series(1, 3000) c/generate_series(1, 300) c/g' \
        -e 's/generate_series(1, 3000) o/generate_series(1, 300) o/g' \
        -e 's/o <= 2100/o <= 210/g' \
