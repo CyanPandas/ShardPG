@@ -1,0 +1,254 @@
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index 17e951b..9f225e3 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -4512,6 +4512,197 @@ get_mxact_status_for_lock(LockTupleMode mode, bool is_update)
+  *
+  * See README.tuplock for a thorough explanation of this mechanism.
+  */
++/*
++ * patch 0011: row locks on shard-managed relations.
++ *
++ * Shard tuples carry per-shard xids, so the native machinery (multixacts,
++ * native clog/procarray probes, follow_updates) cannot be used.  The shard
++ * variant only ever stores a single locker:
++ *   - xmax = the current transaction's shard xid, HEAP_XMAX_LOCK_ONLY plus
++ *     the mode bits (exactly what compute_new_xmax_infomask produces for a
++ *     tuple without a prior xmax), so the WAL record and redo are native;
++ *   - any running foreign xmax (locker or updater) is waited for, whatever
++ *     the lock strengths -- compatible modes (two FOR SHARE, KEY SHARE vs
++ *     NO KEY UPDATE) are serialized instead of being merged into a multi;
++ *   - our own lock is upgraded in place, or kept if already strong enough;
++ *   - follow_updates is ignored: an updated tuple is reported as TM_Updated
++ *     (TSO mode raises 40001 inside the visibility fork before that).
++ * The forked HeapTupleSatisfiesUpdate reports TM_Ok for a lock-only xmax
++ * that is ours or whose holder has ended, TM_BeingModified while a foreign
++ * holder runs.
++ */
++static LockTupleMode
++shard_lock_mode_of(uint16 infomask, uint16 infomask2)
++{
++	if (HEAP_XMAX_IS_KEYSHR_LOCKED(infomask))
++		return LockTupleKeyShare;
++	if (HEAP_XMAX_IS_SHR_LOCKED(infomask))
++		return LockTupleShare;
++	return (infomask2 & HEAP_KEYS_UPDATED) ?
++		LockTupleExclusive : LockTupleNoKeyExclusive;
++}
++
++static TM_Result
++shard_heap_lock_tuple(Relation relation, HeapTuple tuple, CommandId cid,
++					  LockTupleMode mode, LockWaitPolicy wait_policy,
++					  Buffer *buffer, TM_FailureData *tmfd)
++{
++	TM_Result	result;
++	ItemPointer tid = &(tuple->t_self);
++	ItemId		lp;
++	Page		page;
++	Buffer		vmbuffer = InvalidBuffer;
++	BlockNumber block;
++	TransactionId xid;
++	uint16		new_infomask,
++				new_infomask2;
++	bool		have_tuple_lock = false;
++	bool		cleared_all_frozen = false;
++
++	xid = shard_stamp_xid(relation, GetCurrentTransactionId(), NULL);
++
++	*buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
++	block = ItemPointerGetBlockNumber(tid);
++	if (PageIsAllVisible(BufferGetPage(*buffer)))
++		visibilitymap_pin(relation, block, &vmbuffer);
++
++	LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
++
++	page = BufferGetPage(*buffer);
++	lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
++	Assert(ItemIdIsNormal(lp));
++
++	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
++	tuple->t_len = ItemIdGetLength(lp);
++	tuple->t_tableOid = RelationGetRelid(relation);
++
++l3s:
++	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
++
++	if (result == TM_Invisible)
++		goto out_locked;
++
++	if (result == TM_BeingModified)
++	{
++		TransactionId xwait = HeapTupleHeaderGetRawXmax(tuple->t_data);
++
++		if (wait_policy == LockWaitSkip)
++		{
++			result = TM_WouldBlock;
++			goto failed;
++		}
++		if (wait_policy == LockWaitError)
++			ereport(ERROR,
++					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
++					 errmsg("could not obtain lock on row in relation \"%s\"",
++							RelationGetRelationName(relation))));
++
++		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
++		(void) heap_acquire_tuplock(relation, tid, mode, LockWaitBlock,
++									&have_tuple_lock);
++		if (shard_visibility_hooks && shard_visibility_hooks->xmax_wait)
++			shard_visibility_hooks->xmax_wait(relation, xwait, tid, XLTW_Lock);
++		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
++		goto l3s;
++	}
++
++	if (result != TM_Ok)
++		goto failed;
++
++	/* our own lock: keep it if strong enough, otherwise upgrade in place */
++	if (!(tuple->t_data->t_infomask & HEAP_XMAX_INVALID) &&
++		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask) &&
++		TransactionIdEquals(HeapTupleHeaderGetRawXmax(tuple->t_data), xid) &&
++		shard_lock_mode_of(tuple->t_data->t_infomask,
++						   tuple->t_data->t_infomask2) >= mode)
++		goto out_locked;
++
++	if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
++	{
++		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
++		visibilitymap_pin(relation, block, &vmbuffer);
++		LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
++		goto l3s;
++	}
++
++	new_infomask = HEAP_XMAX_LOCK_ONLY;
++	new_infomask2 = 0;
++	switch (mode)
++	{
++		case LockTupleKeyShare:
++			new_infomask |= HEAP_XMAX_KEYSHR_LOCK;
++			break;
++		case LockTupleShare:
++			new_infomask |= HEAP_XMAX_SHR_LOCK;
++			break;
++		case LockTupleNoKeyExclusive:
++			new_infomask |= HEAP_XMAX_EXCL_LOCK;
++			break;
++		case LockTupleExclusive:
++			new_infomask |= HEAP_XMAX_EXCL_LOCK;
++			new_infomask2 |= HEAP_KEYS_UPDATED;
++			break;
++	}
++
++	START_CRIT_SECTION();
++
++	/* same tuple surgery as the native path (no hint bits: they're in XMAX_BITS) */
++	tuple->t_data->t_infomask &= ~HEAP_XMAX_BITS;
++	tuple->t_data->t_infomask2 &= ~HEAP_KEYS_UPDATED;
++	tuple->t_data->t_infomask |= new_infomask;
++	tuple->t_data->t_infomask2 |= new_infomask2;
++	HeapTupleHeaderClearHotUpdated(tuple->t_data);
++	HeapTupleHeaderSetXmax(tuple->t_data, xid);
++	tuple->t_data->t_ctid = *tid;
++
++	if (PageIsAllVisible(page) &&
++		visibilitymap_clear(relation, block, vmbuffer,
++							VISIBILITYMAP_ALL_FROZEN))
++		cleared_all_frozen = true;
++
++	MarkBufferDirty(*buffer);
++
++	if (RelationNeedsWAL(relation))
++	{
++		xl_heap_lock xlrec;
++		XLogRecPtr	recptr;
++
++		XLogBeginInsert();
++		XLogRegisterBuffer(0, *buffer, REGBUF_STANDARD);
++
++		xlrec.offnum = ItemPointerGetOffsetNumber(&tuple->t_self);
++		xlrec.xmax = xid;		/* shard xid travels in the record body */
++		xlrec.infobits_set = compute_infobits(new_infomask,
++											  tuple->t_data->t_infomask2);
++		xlrec.flags = cleared_all_frozen ? XLH_LOCK_ALL_FROZEN_CLEARED : 0;
++		XLogRegisterData((char *) &xlrec, SizeOfHeapLock);
++
++		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_LOCK);
++
++		PageSetLSN(page, recptr);
++	}
++
++	END_CRIT_SECTION();
++
++	result = TM_Ok;
++	goto out_locked;
++
++failed:
++	tmfd->ctid = tuple->t_data->t_ctid;
++	tmfd->xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
++	/* no combo cids on shard tuples: the raw command id is the cmax */
++	tmfd->cmax = (result == TM_SelfModified) ?
++		HeapTupleHeaderGetRawCommandId(tuple->t_data) : InvalidCommandId;
++
++out_locked:
++	LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
++	if (BufferIsValid(vmbuffer))
++		ReleaseBuffer(vmbuffer);
++	if (have_tuple_lock)
++		UnlockTupleTuplock(relation, tid, mode);
++	return result;
++}
++
+ TM_Result
+ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 				CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy,
+@@ -4535,10 +4726,8 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
+ 	bool		cleared_all_frozen = false;
+ 
+ 	if (unlikely(shard_relation_p(relation)))
+-		ereport(ERROR,
+-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+-				 errmsg("row-level locking is not supported on shard-managed relation \"%s\"",
+-						RelationGetRelationName(relation))));
++		return shard_heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
++									 buffer, tmfd);
+ 
+ 	*buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
+ 	block = ItemPointerGetBlockNumber(tid);
+diff --git a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+index 5a17112..de07b3d 100644
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -24,6 +24,7 @@
+ #include "access/heaptoast.h"
+ #include "access/multixact.h"
+ #include "access/rewriteheap.h"
++#include "access/shard_stamp.h"
+ #include "access/syncscan.h"
+ #include "access/tableam.h"
+ #include "access/tsmapi.h"
+@@ -377,6 +378,26 @@ tuple_lock_retry:
+ 	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
+ 							 follow_updates, &buffer, tmfd);
+ 
++	/*
++	 * patch 0011: shard-managed relations provide snapshot isolation without
++	 * READ COMMITTED style rechecks (design §4.4) -- chasing the update chain
++	 * would lock and re-evaluate a version our snapshot cannot see.  TSO mode
++	 * already raised 40001 inside the visibility fork; this covers legacy
++	 * mode (no start_ts), where the fork reports TM_Updated.
++	 */
++	if (result == TM_Updated &&
++		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION) &&
++		shard_relation_xid_hook &&
++		shard_relation_xid_hook(relation, false, NULL))
++	{
++		ReleaseBuffer(buffer);
++		ereport(ERROR,
++				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
++				 errmsg("could not serialize access due to concurrent update"),
++				 errdetail("shard-managed relation \"%s\" does not re-read concurrently updated rows",
++						   RelationGetRelationName(relation))));
++	}
++
+ 	if (result == TM_Updated &&
+ 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
+ 	{

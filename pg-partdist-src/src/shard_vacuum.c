@@ -628,6 +628,58 @@ shard_vacuum_fault(int point, const char *what)
 /* 页面趟主体                                                          */
 /* ================================================================== */
 
+/*
+ * 补丁 0011 配套（TPC-C 分支）：从一个链根沿 HOT 链收集成员。
+ *
+ * rootoff 是 LP_NORMAL 的非 heap-only 元组时，成员从它自己开始；是既有的
+ * LP_REDIRECT 时，从重定向目标开始（根本身不是元组）。每一跳都核对链的完整性
+ * —— 目标是本页的 LP_NORMAL heap-only 元组、且 xmin == 上一跳的 xmax ——
+ * 断了就停（与 heap_prune_chain 同一套判据：槽位可能已被回收复用）。
+ * 返回成员数。
+ */
+static int
+shard_hot_chain_members(Page page, BlockNumber blkno, OffsetNumber rootoff,
+						OffsetNumber *members)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	ItemId		rootlp = PageGetItemId(page, rootoff);
+	OffsetNumber off;
+	TransactionId prior_xmax = InvalidTransactionId;
+	int			n = 0;
+
+	if (ItemIdIsRedirected(rootlp))
+		off = ItemIdGetRedirect(rootlp);
+	else
+		off = rootoff;
+
+	while (off >= FirstOffsetNumber && off <= maxoff && n < MaxHeapTuplesPerPage)
+	{
+		ItemId		lp = PageGetItemId(page, off);
+		HeapTupleHeader htup;
+
+		if (!ItemIdIsNormal(lp))
+			break;
+		htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+		if (off != rootoff)
+		{
+			if (!HeapTupleHeaderIsHeapOnly(htup))
+				break;
+			if (TransactionIdIsValid(prior_xmax) &&
+				!TransactionIdEquals(HeapTupleHeaderGetRawXmin(htup), prior_xmax))
+				break;
+		}
+		members[n++] = off;
+
+		if (!HeapTupleHeaderIsHotUpdated(htup) ||
+			ItemPointerGetBlockNumber(&htup->t_ctid) != blkno)
+			break;
+		prior_xmax = HeapTupleHeaderGetRawXmax(htup);
+		off = ItemPointerGetOffsetNumber(&htup->t_ctid);
+	}
+	return n;
+}
+
 static void
 shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 						TransactionId trunc_before, ShardVacuumPruneMode mode,
@@ -673,9 +725,13 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 		OffsetNumber newdead[MaxHeapTuplesPerPage];
 		OffsetNumber newunused[MaxHeapTuplesPerPage];
 		OffsetNumber alldead[MaxHeapTuplesPerPage];
+		OffsetNumber redirected[MaxHeapTuplesPerPage * 2];
+		bool		handled[MaxHeapTuplesPerPage + 1];
 		int			ndead = 0;
 		int			nunused = 0;
 		int			nall = 0;
+		int			nredir = 0;
+		int			nredir_tuples = 0;
 		int			i;
 		Size		freespace;
 
@@ -721,10 +777,79 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 							shard, blkno)));
 
 		maxoff = PageGetMaxOffsetNumber(page);
+		memset(handled, 0, sizeof(handled));
+
+		/*
+		 * 补丁 0011 配套：带索引的关系按 HOT 链处置（取代此前"带 HOT 链的
+		 * 死根元组 ⇒ ERROR"）。从每个根走链，取**死前缀**：
+		 *   · 死前缀之后还有活成员 L ⇒ 根做成 LP_REDIRECT → L（根是元组或
+		 *     既有重定向都一样），前缀里的 heap-only 成员 ⇒ LP_UNUSED；
+		 *     索引项仍指向根，不进死名单；
+		 *   · 整条链都死 ⇒ 根 ⇒ LP_DEAD（进索引两阶段），成员 ⇒ LP_UNUSED。
+		 * 只取前缀是保守的：后继只能在前驱的更新提交之后才被改，链上删改的
+		 * 提交序单调，真实的死集合必是前缀；判据用 xid < 截断点，可能把真死
+		 * 的尾部判成"还不能动"，只会少收不会错收。
+		 */
+		if (has_index)
+		{
+			for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+			{
+				ItemId		itemid = PageGetItemId(page, off);
+				OffsetNumber members[MaxHeapTuplesPerPage];
+				bool		root_is_redirect = ItemIdIsRedirected(itemid);
+				int			n;
+				int			k;
+
+				if (!root_is_redirect &&
+					(!ItemIdIsNormal(itemid) ||
+					 HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, itemid))))
+					continue;
+
+				n = shard_hot_chain_members(page, blkno, off, members);
+				for (k = 0; k < n; k++)
+				{
+					HeapTupleHeader m = (HeapTupleHeader)
+					PageGetItem(page, PageGetItemId(page, members[k]));
+
+					if (!prune_tuple_is_dead(shard, m, mode, trunc_before, cur_tb))
+						break;
+				}
+
+				/* 链头还活着 ⇒ 整条链不动（悬空的重定向 n==0 例外：按整链已死处置） */
+				if (k == 0 && !(root_is_redirect && n == 0))
+					continue;
+
+				handled[off] = true;
+				for (i = 0; i < k; i++)
+				{
+					handled[members[i]] = true;
+					if (members[i] != off)
+						newunused[nunused++] = members[i];
+				}
+
+				if (k < n)
+				{
+					redirected[nredir * 2] = off;
+					redirected[nredir * 2 + 1] = members[k];
+					nredir++;
+					if (!root_is_redirect)
+						nredir_tuples++;
+				}
+				else
+				{
+					newdead[ndead++] = off;
+					alldead[nall++] = off;
+				}
+			}
+		}
+
 		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
 		{
 			ItemId		itemid = PageGetItemId(page, off);
 			HeapTupleHeader tuple;
+
+			if (handled[off])
+				continue;
 
 			/*
 			 * 既有的 LP_DEAD：上一趟清完索引之前崩溃、或第三阶段跳过该页
@@ -762,6 +887,16 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 					stats->tuples_deferred++;
 					continue;
 				}
+
+				/*
+				 * 0011 配套：带索引的关系上，② 判死却没被任何死前缀走到的
+				 * heap-only 元组 —— 前驱还活着（判据保守所致），此时摘掉它会把
+				 * 仍在用的链从中间截断。留到前驱也判死的那一趟随链处置。不计
+				 * deferred：截断点之下遗留的"已提交删除"在免查区里本就读作已删除，
+				 * 不挡截断（与 ① 不同 —— 中止插入在免查区里会被读成已提交）。
+				 */
+				if (has_index && mode == SVP_DEAD_XMAX)
+					continue;
 				/* heap-only 元组没有索引项指向它，可以直接置 LP_UNUSED */
 				newunused[nunused++] = off;
 			}
@@ -770,8 +905,9 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 				/*
 				 * ★ 带索引的关系上，"死根元组 + 链上还有活的后继"必须做成
 				 * LP_REDIRECT（把根的行指针指向第一个活成员），否则索引项
-				 * 被删掉之后那条活行就再也扫不到了。**本实现不产生
-				 * LP_REDIRECT**，撞见即 fail-closed。
+				 * 被删掉之后那条活行就再也扫不到了。这件事由上面的链处置
+				 * 预扫做（0011 配套），带索引关系的死根走不到这里；下面的
+				 * ERROR 只是两处判据不一致时的守卫位。
 				 *
 				 * 无索引的关系上不存在这个问题（页外没有任何东西引用行指针，
 				 * 顺序扫描逐个访问 LP_NORMAL，被摘掉根的 heap-only 元组照样
@@ -782,33 +918,32 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 				 */
 				if (has_index && HeapTupleHeaderIsHotUpdated(tuple))
 					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							(errcode(ERRCODE_INTERNAL_ERROR),
 							 errmsg("分片 %u 第 %u 页第 %u 项是带 HOT 链的死根元组，"
-									"而该关系有索引", shard, blkno, off),
-							 errdetail("清掉它的索引项会让链上仍然活着的后继元组"
-									   "无法经索引访问；正确做法是把根做成 "
-									   "LP_REDIRECT —— 本实现尚未产生 LP_REDIRECT。"),
-							 errhint("分片打标表在 P1 起禁建索引；TOAST 关系不产生 "
-									 "HOT 链。撞见这条说明有第三种情形，须先补 "
-									 "LP_REDIRECT。")));
+									"却没被链处置预扫走到", shard, blkno, off),
+							 errdetail("带索引的关系上所有链根都由预扫按死前缀处置"
+									   "（LP_REDIRECT / LP_DEAD），走到这里说明预扫"
+									   "与主循环的判据不一致。"),
+							 errhint("报缺陷，不要绕过 —— 清掉它的索引项会让链上"
+									 "仍然活着的后继元组无法经索引访问。")));
 
 				newdead[ndead++] = off;
 				alldead[nall++] = off;
 			}
 		}
 
-		if (ndead == 0 && nunused == 0 && nall == 0)
+		if (ndead == 0 && nunused == 0 && nall == 0 && nredir == 0)
 		{
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
 
 		/* ---- 第一阶段：PRUNE 记录 ---- */
-		if (ndead > 0 || nunused > 0)
+		if (ndead > 0 || nunused > 0 || nredir > 0)
 		{
 			START_CRIT_SECTION();
 
-			heap_page_prune_execute(buf, NULL, 0, newdead, ndead,
+			heap_page_prune_execute(buf, redirected, nredir, newdead, ndead,
 									newunused, nunused);
 			MarkBufferDirty(buf);
 
@@ -825,13 +960,17 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 				 * GlobalSafeTs**（按 §6.2 的定义没有活跃快照还需要它）。
 				 */
 				xlrec.snapshotConflictHorizon = InvalidTransactionId;
-				xlrec.nredirected = 0;
+				xlrec.nredirected = (uint16) nredir;
 				xlrec.ndead = (uint16) ndead;
 				xlrec.isCatalogRel = is_catalog;
 
 				XLogBeginInsert();
 				XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
 				XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+				/* 顺序与 log_heap_prune / heap_xlog_prune 一致：重定向对、死、未用 */
+				if (nredir > 0)
+					XLogRegisterBufData(0, (char *) redirected,
+										nredir * 2 * sizeof(OffsetNumber));
 				if (ndead > 0)
 					XLogRegisterBufData(0, (char *) newdead,
 										ndead * sizeof(OffsetNumber));
@@ -845,7 +984,8 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 
 			END_CRIT_SECTION();
 
-			stats->tuples_touched += ndead + nunused;
+			/* 被做成重定向的根元组也是一条被回收的元组（既有重定向改目标不算） */
+			stats->tuples_touched += ndead + nunused + nredir_tuples;
 		}
 
 		if (!has_index)
@@ -1517,6 +1657,7 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
 		ResourceOwner oldowner = CurrentResourceOwner;
 
 		considered++;
+		ShardXidNoteAutoVacuum(shard);
 
 		BeginInternalSubTransaction(NULL);
 		PG_TRY();
@@ -1642,38 +1783,87 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
  * ★ 为什么不在 bgworker 里直接干：页面趟要开关系、拿锁、跑索引 AM，这些都
  *   需要 catalog 与一个正经的事务环境，而心跳 worker 是 `dbname=NULL` 起来的
  *   （只走完 BaseInit，不连任何库）。自连出一个干净 backend 是既有做法，
- *   也顺带把"一次调用占住多久"限制在那个 backend 里，不拖住心跳。
- */
-/*
- * T7.27（P7-W2 闭环）：分叉标记的自动修复。
- *
- * 标记由三处写下：复制挂钩失败、副本收到与已提交记录不一致的重传（R-P4-13）、
- * 捕获环溢出（P7-W2）。此前修复全靠人手调 repair_diverged_shards()，或者等下一次
- * 升主顺带跑一次 —— 标记写下之后可能几天没人看。这里由心跳按节点级限流周期性
- * 自连调用；本节点不是组 leader 的分片会被 skipped（发不出基线），留待下一轮。
+ *   也顺带把"一次调用占住多久"限制在那个 backend 里。
+ *   ★ 但原先用的是同步 PQexec，心跳照样被拖住 —— 见下面"改为异步"的注释。
  */
 bool		shard_auto_repair_diverged = true;	/* GUC，见 pg_partdist.c */
 int			shard_auto_repair_interval_s = 60;
 
-void
-ShardDivergedSelfTriggerRepair(void)
+/*
+ * TPC-C 分支：自连调用改为**异步**。
+ *
+ * 心跳工作者的同一个循环还负责向 TSO 续租（TsoHeartbeatOnce）。原先两路自连
+ * 都是 PQexec —— 一趟 sweep（大表整表扫）或一次重做基线跑多久，续租就被推迟
+ * 多久；超过 lease − lease/4（默认 7.5 s）本节点所有持有分片快照的事务都被
+ * 栅栏作废（"分片快照被栅栏作废：本节点已 7500 ms 未能向 TSO 续租"）。
+ * 沙箱实测：按回收触发打开后，装载期间 stock 表的 sweep 让 3 个装载事务被作废。
+ *
+ * 现在：发出查询（PQsendQuery）即返回，之后每轮心跳只做一次非阻塞轮询
+ * （PQconsumeInput + PQisBusy），结果到了再记日志、收连接。同一路调用在途时
+ * 不再发起第二个。建连仍是同步的，但上限是 connect_timeout=2。
+ */
+typedef void (*SelfCallDone) (PGresult *res, bool ok, const char *errmsg);
+
+static PGconn *vac_auto_conn = NULL;
+static PGconn *repair_conn = NULL;
+
+static bool
+self_call_start(PGconn **connp, const char *sql)
 {
 	char		conninfo[256];
 	PGconn	   *conn;
-	PGresult   *res;
 
 	snprintf(conninfo, sizeof(conninfo),
 			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
 			 PostPortNumber);
 	conn = PQconnectdb(conninfo);
-	if (PQstatus(conn) != CONNECTION_OK)
+	if (PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
 	{
 		PQfinish(conn);
-		PartWALNoteDivergedPending();	/* 连不上：下一轮再试 */
-		return;
+		return false;
 	}
-	res = PQexec(conn, "SELECT partdist.repair_diverged_shards()");
-	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
+	*connp = conn;
+	return true;
+}
+
+/* 在途则轮询一次；结束了就回调并收连接。返回 true = 仍在途 */
+static bool
+self_call_poll(PGconn **connp, SelfCallDone done)
+{
+	PGconn	   *conn = *connp;
+	PGresult   *res;
+	PGresult   *last = NULL;
+
+	if (conn == NULL)
+		return false;
+	if (!PQconsumeInput(conn))
+	{
+		done(NULL, false, PQerrorMessage(conn));
+		PQfinish(conn);
+		*connp = NULL;
+		return false;
+	}
+	if (PQisBusy(conn))
+		return true;
+	while ((res = PQgetResult(conn)) != NULL)
+	{
+		if (last)
+			PQclear(last);
+		last = res;
+	}
+	done(last, last != NULL && PQresultStatus(last) == PGRES_TUPLES_OK &&
+		 PQntuples(last) > 0, PQerrorMessage(conn));
+	if (last)
+		PQclear(last);
+	PQfinish(conn);
+	*connp = NULL;
+	return false;
+}
+
+static void
+repair_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok)
 	{
 		const char *out = PQgetvalue(res, 0, 0);
 
@@ -1684,40 +1874,65 @@ ShardDivergedSelfTriggerRepair(void)
 	else
 	{
 		ereport(LOG,
-				(errmsg("pg_partdist: 分叉标记自动修复调用失败：%s",
-						PQerrorMessage(conn))));
+				(errmsg("pg_partdist: 分叉标记自动修复调用失败：%s", err)));
 		PartWALNoteDivergedPending();
 	}
-	PQclear(res);
-	PQfinish(conn);
+}
+
+static void
+vac_auto_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok)
+	{
+		if (strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+			ereport(LOG,
+					(errmsg("pg_partdist: 分片 vacuum 自动启动器处理 %s 个到龄分片，"
+							"截断 %s 个：%s",
+							PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
+							PQgetvalue(res, 0, 2))));
+	}
+	else
+		ereport(LOG,
+				(errmsg("pg_partdist: 分片 vacuum 自动启动器调用失败：%s", err)));
+}
+
+/* 心跳每轮调一次：推进两路在途的自连调用 */
+void
+ShardSelfCallsPoll(void)
+{
+	(void) self_call_poll(&vac_auto_conn, vac_auto_done);
+	(void) self_call_poll(&repair_conn, repair_done);
+}
+
+bool
+ShardDivergedRepairInFlight(void)
+{
+	return repair_conn != NULL;
+}
+
+/*
+ * T7.27（P7-W2 闭环）：分叉标记的自动修复。
+ *
+ * 标记由三处写下：复制挂钩失败、副本收到与已提交记录不一致的重传（R-P4-13）、
+ * 捕获环溢出（P7-W2）。此前修复全靠人手调 repair_diverged_shards()，或者等下一次
+ * 升主顺带跑一次 —— 标记写下之后可能几天没人看。这里由心跳按节点级限流周期性
+ * 自连调用；本节点不是组 leader 的分片会被 skipped（发不出基线），留待下一轮。
+ */
+void
+ShardDivergedSelfTriggerRepair(void)
+{
+	if (repair_conn != NULL)
+		return;					/* 上一次还在跑 */
+	if (!self_call_start(&repair_conn, "SELECT partdist.repair_diverged_shards()"))
+		PartWALNoteDivergedPending();	/* 连不上：下一轮再试 */
 }
 
 void
 ShardVacuumSelfTriggerAuto(void)
 {
-	char		conninfo[256];
-	PGconn	   *conn;
-	PGresult   *res;
-
-	snprintf(conninfo, sizeof(conninfo),
-			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
-			 PostPortNumber);
-	conn = PQconnectdb(conninfo);
-	if (PQstatus(conn) != CONNECTION_OK)
-	{
-		PQfinish(conn);
-		return;
-	}
-	res = PQexec(conn,
-				 "SELECT shards_considered, shards_truncated, detail "
-				 "FROM partdist.shard_vacuum_auto(" CppAsString2(SHARD_VACUUM_AUTO_BATCH) ")");
-	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
-		strcmp(PQgetvalue(res, 0, 0), "0") != 0)
-		ereport(LOG,
-				(errmsg("pg_partdist: 分片 vacuum 自动启动器处理 %s 个到龄分片，"
-						"截断 %s 个：%s",
-						PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
-						PQgetvalue(res, 0, 2))));
-	PQclear(res);
-	PQfinish(conn);
+	if (vac_auto_conn != NULL)
+		return;					/* 上一趟还在跑 */
+	(void) self_call_start(&vac_auto_conn,
+						   "SELECT shards_considered, shards_truncated, detail "
+						   "FROM partdist.shard_vacuum_auto(" CppAsString2(SHARD_VACUUM_AUTO_BATCH) ")");
 }

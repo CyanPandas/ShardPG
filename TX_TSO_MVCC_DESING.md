@@ -244,6 +244,11 @@ PREPARE TRANSACTION 才向客户端返回成功——同步应答本身就是持
 判定路径：`元组 xmin(分片 xid) → 本分片 clog[xid] → status/ts 比较`。
 一个事务内跨分片的读共用同一个 start_ts——TSO 单调性保证这天然是全局一致快照。
 
+> **★ TPC-C 分支补充（提交中窗口）**：本地一阶段提交在 PRE_COMMIT 取 commit_ts、COMMIT 回调
+> 才写判决。读者若在两者之间取到 s > c，必须**等它落定**而不是判 RUNNING，否则违反本节规则。
+> 实现：持有者先置活跃表 committing 再取号；读者遇 committing 且（号未知或 < s）即等待
+> （DEV PLAN §6 C7）。start_ts 在语句执行前取定（ExecutorStart），不再在首次判定时懒取。
+
 ### 4.2 PREPARED 三态处置（读者永不阻塞、永不安装决议）
 
 读到 PREPARED 条目时：
@@ -545,6 +550,8 @@ clog 行以 RUNNING 落账后、事务未到提交/中止时崩溃 ⇒ 该行永
 - `XactLockTableWait`：共享内存维护"活跃 (分片, 分片xid) → 持有者原生 xid"反查表，
   等待路径先反查再等（行锁排队仍按原生 xid）；
 - MultiXact 与分片 xid 空间根本冲突：第一期禁分片表 SELECT FOR SHARE 多锁者；
+  **★ TPC-C 分支（补丁 0011）**：分片表行锁改为**单持锁者**实现 —— xmax 只存一个分片 xid
+  （lock-only），兼容的锁模式也排队等待而不组 multixact；多锁者并发因此退化为串行，语义不变；
 - SSI（predicate.c）按原生 xid：分片表禁 SERIALIZABLE。
 
 **⑤ vacuum / freeze / 剪枝**
@@ -648,7 +655,7 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 | 功能 | 处置 | 原因 |
 |---|---|---|
 | 分片表 SERIALIZABLE | 禁 | SSI 按原生 xid；本方案语义即 SI |
-| 分片表 SELECT FOR SHARE（多锁者） | 禁 | MultiXact 实例级 |
+| 分片表 SELECT FOR SHARE（多锁者） | 禁 —— **★ TPC-C 分支（补丁 0011）改为放行**：行锁全部四种强度 + NOWAIT / SKIP LOCKED 可用；多个持锁者不合并成 multixact，而是排队（第二个持锁者等第一个结束） | MultiXact 实例级（分支实现绕开了它：分片表永不产生 multi，vacuum 撞见 multi 仍 fail-closed） |
 | 分片表逻辑解码 | 禁 | 解码按原生 xid 组事务。**实装位置（T6.6 修正）**：禁令在**入口**——`pg_create_logical_replication_slot` / `pg_logical_slot_{get,peek}_{,binary_}changes` 进禁用函数表，白名单非空时连槽都不许建。此前守卫挂在可见性层（`HeapTupleSatisfiesHistoricMVCC`），够不着。**★ 禁令的理由已于 2026-09-06 更正回本行原文**：曾把它写成"遏制一个会打掉整节点的崩溃"（R-P6-7），而栈回溯查明那个崩溃是**构建产物的 ABI 撕裂**（补丁 0007 给 `xl_xact_parsed_commit` 加了字段，而 1218 个 .o 编于头文件改动之前，`decode.o` 按旧结构在栈上分配、`ParseCommitRecord` 按新结构 memset），clean rebuild 后即消失——**不是任何补丁的设计缺陷**。禁令仍然成立，但成立的理由是本行开头那句：解码按原生 xid 组事务，对分片表就是错的分组。~~**已知洞**：禁令挂在 ExecutorStart，只覆盖 SQL 调用，walsender 的 START_REPLICATION 绕得过去（R-P6-14）~~ **2026-09-13 已堵（T7.22）**：认证钩子拒 `replication=database` 连接 + 打标登记时终止已连着的逻辑 walsender + 最后一张打标表删除时立持久化的"逻辑解码围栏"（确认位点早于它的旧逻辑槽仍被拒）。未动内核 |
 | 分片表原生流复制热备读 | 本来就不用 | 本项目用自己的回放 |
 | 分片表异步提交（synchronous_commit=off） | 禁 | 可见性/提交点语义只许断言已持久事实（§4.5）；[A]<[B] 与多数派提交点均以同步提交为前提。**实装位置**：`shard_xid_for_current_xact` 写路径（T6.6 补——此前本行只有文档、**代码零守卫**）；`on`/`local`/`remote_write` 放行 |
@@ -659,7 +666,7 @@ COPY、维护任务）自带"亲手读写分片数据"的路径，且全部假�
 | 分片打标表的 Citus 路由写（coordinator 经手的 INSERT/UPDATE/DELETE/COPY） | **P1 禁；P4 之后解禁——★ 2026-09-09 回填**：MX 接线（§9.1）+ 决议搬迁（DTX-2PC）落地后，Citus 驱动的 2PC 写是**正路**，tx1/tx2/tx4 三套验收全部走这条路。本行原文只对 P1–P3 成立 | 本分支 Citus 分布式写一律 2PC（PREPARE TRANSACTION，DTX 链路即建于其上）→ 撞上一条禁令，事务在 PREPARE 点中止（T1.9 实测两轮）；2PC × 打标的接线 = P4 正题（决议搬迁 + MX） |
 | 引用表运行期写入 | **禁（2026-09-09 裁定：拦；2026-09-10 T7.10 守卫已实装）**——★ 复核发现代码**零守卫、测试零断言**（`shard_guard.c` 全文无引用表判据），此前本行只是纸面约定。守卫已实装（`shard_guard.c` `ShardGuardIsReferenceTable()`：按 `pg_dist_partition.partmethod='n'` 判定，backend 本地哈希缓存；判据挂在 `pstmt->resultRelations` 上）。**覆盖边界如实记**：拦的是协调者上对引用表**本体**的写；worker 上那张 `<ref>_<shardid>` 分片是普通本地表、不在 `pg_dist_partition` 里，本判据看不见它 —— 要堵那一层得按分片名判，属后续工作 | 无分片写集 ⇒ 无协调者分片；Citus 原生 2PC 恢复已关（§9.2） |
 | 分片表的**子事务写**（SAVEPOINT / plpgsql `EXCEPTION` 块内写打标表） | 禁（ERROR）——**★ 2026-09-09 补行** | §5.4 承诺的 per-shard 子 xid + parent 链**未实现**（`shard_xid.c:1213-1220` 直接拒写，`shard_clog.h:51` 的 `parent_xid` 恒 0）。此前 §10 无此行，而代码一直在拦 |
-| 打标后 `CREATE INDEX`；`LP_REDIRECT` | 禁 / 撞见即 ERROR——**★ 2026-09-09 补行** | 索引须在打标前建（T5.8 两阶段）；行指针重定向不产生，撞见即报错（`shard_vacuum.c:715-736`）。二者同属「解禁用户索引」专项，v1 不做 |
+| 打标后 `CREATE INDEX`；`LP_REDIRECT` | 禁 / 撞见即 ERROR——**★ 2026-09-09 补行** | 索引须在打标前建（T5.8 两阶段）；行指针重定向不产生，撞见即报错（`shard_vacuum.c:715-736`）。二者同属「解禁用户索引」专项，v1 不做 **★ TPC-C 分支：LP_REDIRECT 已实现** —— `shard_vacuum.c` 的链处置预扫按 HOT 链取死前缀，后面还有活成员就把根做成重定向、整链死则根进 LP_DEAD 走索引两阶段；"打标后禁 CREATE INDEX"不变 |
 | 分片 xid **回卷** | 未实现——**★ 2026-09-09 补行，降级为已知边界** | 分片 xid 是线性计数器，全仓普通 `<`/`>=` 比较、无模运算；靠 §7 阶段 2 的停发线（2^31 − 边距）让线性假设成立。**到线即停写**，不是回绕 |
 | 物理基线（供给副本 / 修复分叉）**上限 1 GB** | 超出显式 ERROR——**★ 2026-09-09 补行** | `fileset_inline_max_blocks = 131072`（`shard_fileset.c:158, 268-275`），无流式基线 ⇒ **大于 1 GB 的分片既不能供给副本、也不能修复分叉**。见 P7 计划 P7-R3 |
 | **中途启用 TSO**（先以遗留模式写数据，之后才配 `tso_conninfo`） | **可见性已修（T7.29，2026-09-13）；vacuum 截断仍受限——★ 2026-09-13 补行，已知边界** | 可见性：commit_ts 是双宇宙字段，MARKER 现带 `CTS_IS_TSO` 位、gclog 槽记宇宙位，非 TSO 宇宙的 commit_ts 按 0（对一切快照可见）比较，已提交行不再"消失"（`test_cts_universe_p7.sh`）。截断：§6.3 前缀扫描把"COMMITTED 且 commit_ts=0"判为 commit-ts-too-new 停下，遗留模式留下的提交会**挡住 clog 截断前缀**（少清不错清，但龄会涨向停发线）。放宽需先逐路径证明"TSO 模式提交永不存 0"，截断不可逆，故暂不放宽；运维上应在写入数据之前配好 TSO |

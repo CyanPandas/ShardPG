@@ -7,7 +7,7 @@
 #
 # ★ 逐条核实的结果（T6.6 动手前）：
 #   SERIALIZABLE ......... shard_visibility.c:279          ✓ 实装
-#   行锁 FOR SHARE/UPDATE  补丁 0005（heap_lock_tuple）     ✓ 实装
+#   行锁 FOR SHARE/UPDATE  补丁 0005（heap_lock_tuple）     ✓ 实装 —— 0011 起解禁，翻成正向
 #   COPY FREEZE / 推测插入 补丁 0005                        ✓ 实装
 #   逻辑解码 ............. 补丁 0006                        ✓ 实装
 #   CIC / CLUSTER / VACUUM 补丁侧 + ShardXidUtilityGuard    ✓ 实装
@@ -89,10 +89,11 @@ ban() {
 echo "================ [1] §10 逐条负向 ================"
 ban "SERIALIZABLE 读分片表" "SERIALIZABLE" \
     "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM t66neg;"
-ban "SELECT FOR SHARE" "row-level locking" \
-    "SELECT * FROM t66neg WHERE id=1 FOR SHARE"
-ban "SELECT FOR UPDATE" "row-level locking" \
-    "SELECT * FROM t66neg WHERE id=1 FOR UPDATE"
+# 补丁 0011（TPC-C 分支）：单持锁者行锁解禁 —— 两条负向翻成正向
+for m in "FOR SHARE" "FOR UPDATE"; do
+  out=$(PSQLO $W "$NOPROP" -Atc "SELECT id FROM t66neg WHERE id=1 $m" </dev/null 2>&1 | tr '\n' ' ')
+  check "放行：SELECT $m（0011）" "$out" "1 "
+done
 ban "CLUSTER" "不允许作用于分片打标表" \
     "CLUSTER t66neg USING t66neg_pkey"
 ban "VACUUM FULL" "不允许作用于分片打标表" \

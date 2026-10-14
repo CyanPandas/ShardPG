@@ -376,7 +376,8 @@ neg "commit_ts 为 0 即拒" "commit_ts 为 0" \
     "SELECT tuples_removed FROM partdist.shard_remove_dead('p5d'::regclass, $TD::bigint)"
 check "被拒后元组未被删" "$(NORMAL p5d)" "1"
 # ★ T5.8 的边界：带索引的关系上出现"死根元组 + 链上还有活的后继"时，正确做法
-#   是把根做成 LP_REDIRECT，而本实现不产生 LP_REDIRECT ⇒ fail-closed。
+#   是把根做成 LP_REDIRECT。补丁 0011 配套（TPC-C 分支）起由链处置预扫实现，
+#   原来的 fail-closed 负向翻成正向：根变 LP_REDIRECT、索引仍能找到活行。
 #   分片表上一次已提交 UPDATE 就会造出这一格（索引列没变 ⇒ 走 HOT）。
 set_whitelist "$OI"; check "p5idx 重新打标" "$?" "0"
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation TO off; DROP TABLE IF EXISTS p5hot; CREATE TABLE p5hot(id int, v text) WITH (autovacuum_enabled=off); CREATE INDEX p5hot_i ON p5hot(id);" </dev/null >/dev/null
@@ -388,10 +389,20 @@ UPDATE p5hot SET v='b' WHERE id=1;
 SQL
 THOT=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5hot',0)) WHERE lp_flags=1" </dev/null)
 PSQL "$WPORT" -Atc "SELECT sclog_wts($OHOT::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((THOT-1))) g WHERE sclog_read($OHOT::oid, g::bigint)=2" </dev/null >/dev/null
-neg "★ 带索引 + HOT 链的死根元组即拒（LP_REDIRECT 未实现）" "带 HOT 链的死根元组" \
-    "SELECT tuples_removed FROM partdist.shard_remove_dead('p5hot'::regclass, $THOT::bigint)"
-check "被拒后 p5hot 的行仍可见" "$(PSQL "$WPORT" -Atc "SELECT v FROM p5hot WHERE id=1" </dev/null)" "b"
-check "负向计数守卫（累计应跑 5 条）" "$NEG_RUN" "5"
+r=$(PSQL "$WPORT" -Atc "SELECT tuples_removed FROM partdist.shard_remove_dead('p5hot'::regclass, $THOT::bigint)" </dev/null 2>&1)
+check "★ 带索引 + HOT 链的死根元组：回收 1 条（根做成重定向）" "$r" "1"
+check "根的行指针 = LP_REDIRECT" \
+      "$(PSQL "$WPORT" -Atc "SELECT lp_flags FROM heap_page_items(get_raw_page('p5hot',0)) WHERE lp=1" </dev/null)" "2"
+check "走索引仍能找到活行" \
+      "$(PSQL "$WPORT" -Atc "SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT v FROM p5hot WHERE id=1" </dev/null | tail -1)" "b"
+PSQL "$WPORT" -v ON_ERROR_STOP=1 -q -c "UPDATE p5hot SET v='c' WHERE id=1;" </dev/null >/dev/null
+THOT2=$(PSQL "$WPORT" -Atc "SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1 FROM heap_page_items(get_raw_page('p5hot',0)) WHERE lp_flags=1" </dev/null)
+PSQL "$WPORT" -Atc "SELECT sclog_wts($OHOT::oid, g::bigint, 2, $CTS_COMMITTED::bigint) FROM generate_series(3, $((THOT2-1))) g WHERE sclog_read($OHOT::oid, g::bigint)=2" </dev/null >/dev/null
+r=$(PSQL "$WPORT" -Atc "SELECT tuples_removed FROM partdist.shard_remove_dead('p5hot'::regclass, $THOT2::bigint)" </dev/null 2>&1)
+check "既有重定向改目标：回收链上那条死 heap-only 成员" "$r" "1"
+check "重定向改指到新活成员后，走索引读到最新值" \
+      "$(PSQL "$WPORT" -Atc "SET enable_seqscan=off; SET enable_bitmapscan=off; SELECT v FROM p5hot WHERE id=1" </dev/null | tail -1)" "c"
+check "负向计数守卫（累计应跑 4 条）" "$NEG_RUN" "4"
 
 # ================================================================
 #  T5.8 的正主用例：**TOAST 关系**
@@ -480,7 +491,7 @@ neg "★ 趟标记落后于目标即拒" "不许截断 clog" \
     "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
 neg "trunc_before 超过下一个待发号即拒" "超过下一个待发号" \
     "SELECT swept FROM partdist.shard_vacuum_sweep('p5e'::regclass, 999999::bigint)"
-check "负向计数守卫（累计应跑 8 条）" "$NEG_RUN" "8"
+check "负向计数守卫（累计应跑 7 条）" "$NEG_RUN" "7"
 
 echo "========== [20] 完整 sweep → 截断 → 免查区生效 =========="
 # 半程那趟已经把号更小的清掉了（这正是 sweep 该有的行为），所以这里对
@@ -581,7 +592,7 @@ check "★ 有页被 pin 住时 sweep 不完整（swept=false 且有跳页）" \
 check "★ 不完整的趟不落标记（水位仍 0/0）" "$(WM "$OH")" "0/0"
 neg "不完整的趟之后仍拒截断" "不许截断 clog" \
     "SELECT partdist.shard_clog_truncate($OH::oid, $TH::bigint)"
-check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
+check "负向计数守卫（累计应跑 8 条）" "$NEG_RUN" "8"
 # 游标随事务结束释放 ⇒ 整趟重来即可（这正是状态一的恢复动作）
 SW2=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5h'::regclass, $TH::bigint)" </dev/null)
 check "整趟重来：干净收尾" "$SW2" "true/0/0"
@@ -724,7 +735,7 @@ PSQL "$WPORT" -Atc "SELECT partdist.shard_clog_truncate($OJ::oid, $TJ2::bigint)"
 check "★ 推进截断点后相位降回 0" "$(PHASE "$OJ")" "0"
 PSQL "$WPORT" -q -c "INSERT INTO p5j VALUES (999,'unlocked');" </dev/null >/dev/null
 check "★ 解锁后写入恢复" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j WHERE id=999" </dev/null)" "1"
-check "负向计数守卫（累计应跑 10 条）" "$NEG_RUN" "10"
+check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
 set_guc pg_partdist.shard_vacuum_max_age 200000000 >/dev/null
 set_guc pg_partdist.shard_xid_stop_age 2146483648 >/dev/null
 check "阈值已复位" "$(PSQL "$WPORT" -Atc "SELECT max_age||'/'||stop_age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)" "200000000/2146483648"

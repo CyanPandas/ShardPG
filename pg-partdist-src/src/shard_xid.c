@@ -39,6 +39,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"		/* TPC-C 分支：回收触发限流 */
 #include "utils/rel.h"
 #include "access/relation.h"		/* T7.30：relation_open */
 #include "storage/bufmgr.h"			/* T7.30：RelationGetNumberOfBlocks */
@@ -53,6 +54,16 @@
 /* T5.6：回卷护栏两阶段的阈值（设计 §7），GUC 可调 —— 验收要把它们调小 */
 static int	shard_vacuum_max_age = 200000000;
 bool		shard_vacuum_auto_enabled = true;	/* T7.17：自动启动器开关 */
+/*
+ * TPC-C 分支：按"死元组回收"而不是按"防回卷"触发自动 vacuum。
+ * shard_vacuum_max_age 是回卷护栏（默认 2 亿，长跑压测里永远到不了），
+ * 而压测要的是持续回收空间。trigger_age > 0 时，龄达到它的分片也交给
+ * 自动启动器，但同一分片两次接手之间至少隔 trigger_interval_s ——
+ * 热点页拿不到 cleanup lock 时本趟不干净、截断点不前进、龄不回落，
+ * 不限流就会每 5 s 心跳整表重扫一遍。默认 0 = 关，行为与改动前一致。
+ */
+static int	shard_vacuum_trigger_age = 0;
+static int	shard_vacuum_trigger_interval_s = 300;
 static int	shard_xid_stop_age = 2146483648;
 
 /* ---- T1.1：GUC 白名单 ---- */
@@ -112,6 +123,8 @@ typedef struct ShardXidSlot
 	 */
 	TransactionId trunc_before;	/* clog 实际截断点 = 隐式 freeze 点 */
 	TransactionId vacuum_xid;	/* 两态恢复标记，>= trunc_before */
+	/* TPC-C 分支：自动启动器按 trigger_age 最近一次接手本分片的时刻（限流用） */
+	TimestampTz auto_vacuum_at;
 } ShardXidSlot;
 
 /*
@@ -927,6 +940,7 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	/* T5.1：两个 vacuum 水位随槽位常驻，供后续落盘原样带回（见结构体注释） */
 	free_slot->trunc_before = slot_trunc_before;
 	free_slot->vacuum_xid = slot_vacuum_xid;
+	free_slot->auto_vacuum_at = 0;
 	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
 	free_slot->shard_relid = shard;
 	return free_slot;
@@ -1046,7 +1060,16 @@ ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max)
 				continue;
 			age = shard_xid_age_locked(slot);
 			if (age < (TransactionId) shard_vacuum_max_age)
-				continue;
+			{
+				/* TPC-C 分支：回收触发（见 shard_vacuum_trigger_age 的注释） */
+				if (shard_vacuum_trigger_age <= 0 ||
+					age < (TransactionId) shard_vacuum_trigger_age ||
+					(slot->auto_vacuum_at != 0 &&
+					 !TimestampDifferenceExceeds(slot->auto_vacuum_at,
+												 GetCurrentTimestamp(),
+												 shard_vacuum_trigger_interval_s * 1000)))
+					continue;
+			}
 			shards[n] = slot->shard_relid;
 			if (ages != NULL)
 				ages[n] = age;
@@ -1091,6 +1114,27 @@ ShardXidTwoStateShards(Oid *shards, int max)
 	}
 	LWLockRelease(ShardXidCtl->lock);
 	return n;
+}
+
+/*
+ * TPC-C 分支：自动启动器接手一个分片时记下时刻，供 trigger_interval_s 限流。
+ * 只在真正处理时调（计数路径不调，否则计数本身就把限流窗口刷新了）。
+ */
+void
+ShardXidNoteAutoVacuum(Oid shard)
+{
+	int			i;
+
+	if (ShardXidCtl == NULL)
+		return;
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+		if (ShardXidCtl->slots[i].shard_relid == shard)
+		{
+			ShardXidCtl->slots[i].auto_vacuum_at = GetCurrentTimestamp();
+			break;
+		}
+	LWLockRelease(ShardXidCtl->lock);
 }
 
 /* 同上，只要个数（心跳每 5 s 一次，别为计数分配数组） */
@@ -1478,7 +1522,21 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			 * （tso_conninfo 空）内部自跳过。
 			 */
 			if (xact_map_n > 0)
+			{
+				/*
+				 * TPC-C 分支：先置"提交中"再取号、取到再填号 —— 读者靠这个
+				 * 顺序判断"我的快照之前可能提交"（见 shard_xid_state_ex）。
+				 * 遗留模式不取号，也就不置位（读者 my_ts=0 不比 ts）。
+				 */
+				if (TsoConfigured())
+					for (i = 0; i < xact_map_n; i++)
+						ShardCommitMarkCommitting(xact_map[i].shard, xact_map[i].sxid, 0);
 				TsoStashCommitTs();
+				if (TsoConfigured())
+					for (i = 0; i < xact_map_n; i++)
+						ShardCommitMarkCommitting(xact_map[i].shard, xact_map[i].sxid,
+												  TsoStashedCommitTs());
+			}
 			break;
 
 		case XACT_EVENT_PRE_PREPARE:
@@ -1608,6 +1666,28 @@ ShardXidDefineGUCs(void)
 		true,
 		PGC_SIGHUP,
 		0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.shard_vacuum_trigger_age",
+		"按回收需要触发自动 vacuum 的分片 xid 龄（TPC-C 分支）。",
+		"0 = 关（只按 shard_vacuum_max_age 防回卷触发）。>0 时龄达到此值的分片"
+		"也由自动启动器处理，同一分片两次之间至少隔 "
+		"pg_partdist.shard_vacuum_trigger_interval_s。不发 WARNING。",
+		&shard_vacuum_trigger_age,
+		0,
+		0, INT_MAX,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.shard_vacuum_trigger_interval_s",
+		"按回收触发时同一分片两次自动 vacuum 的最小间隔（TPC-C 分支）。",
+		"防止截断点推不动（热点页拿不到 cleanup lock）时每轮心跳整表重扫。",
+		&shard_vacuum_trigger_interval_s,
+		300,
+		1, 86400,
+		PGC_SIGHUP,
+		GUC_UNIT_S, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"pg_partdist.shard_vacuum_truncate",

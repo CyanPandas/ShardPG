@@ -3,8 +3,9 @@
 #
 # 覆盖：T1.1 谓词/TOAST 归属、T1.2 发号+水位崩溃安全、T1.3 事务绑定、
 #       T1.4 打标（xmin/xmax 序列）、T1.6 自见性/跨会话可见性、T1.7 冲突等待
-#       两向（首提交者胜=行锁禁令报错；前者回滚后者继续）、T1.8 严格模式、
-#       负向全集（SAVEPOINT/行锁/隔离级别/维护命令/PREPARE/COPY FREEZE）、
+#       两向（首提交者胜=40001；前者回滚后者继续）、T1.8 严格模式、
+#       负向全集（SAVEPOINT/隔离级别/维护命令/PREPARE/COPY FREEZE）、
+#       行锁正向（补丁 0011 起 FOR UPDATE/FOR SHARE 放行，见 [5b]）、
 #       SELECT 不触发剪枝（P1_PRECHECK 结论 D）、普通表对照。
 # 三方 pagecmp 与崩溃点扫描在 test_shard_pagecmp_p1.sh。
 #
@@ -112,10 +113,12 @@ PSQL "$WPORT" -q -c "BEGIN; UPDATE p1_shard SET v=1 WHERE id=2; SELECT pg_sleep(
 BG=$!
 sleep 1
 t0=$(date +%s%N)
-w1err=$(PSQL "$WPORT" -c "UPDATE p1_shard SET v=2 WHERE id=2;" </dev/null 2>&1 | grep -c "row-level locking is not supported")
+# 补丁 0011 起：遗留模式下 TM_Updated 不再撞行锁禁令，而是在 heapam_tuple_lock
+# 拒绝追链重读，报 40001（与 TSO 模式的 first-committer-wins 同一句话）
+w1err=$(PSQL "$WPORT" -c "UPDATE p1_shard SET v=2 WHERE id=2;" </dev/null 2>&1 | grep -c "could not serialize access")
 t1=$(date +%s%N); w1ms=$(( (t1-t0)/1000000 ))
 wait "$BG"
-check "前者提交：后者按首提交者胜报行锁禁令" "$w1err" "1"
+check "前者提交：后者按首提交者胜报 40001" "$w1err" "1"
 check "后者确实等待了（${w1ms}ms > 2000）" "$([[ "$w1ms" -gt 2000 ]] && echo ok)" "ok"
 r=$(PSQL "$WPORT" -Atc "SELECT v FROM p1_shard WHERE id=2" </dev/null)
 check "终值 = 前者的写入" "$r" "1"
@@ -170,8 +173,6 @@ neg() {  # neg <名字> <期望片段> <SQL...>
 }
 NEG_RUN=0
 neg "SAVEPOINT 内写"      "不支持在子事务"                  -c "BEGIN; SAVEPOINT s; INSERT INTO p1_shard VALUES (90,0,'x'); ROLLBACK;"
-neg "FOR UPDATE"          "row-level locking is not supported" -c "SELECT id FROM p1_shard WHERE id=2 FOR UPDATE;"
-neg "FOR SHARE"           "row-level locking is not supported" -c "SELECT id FROM p1_shard WHERE id=2 FOR SHARE;"
 neg "SERIALIZABLE 读"     "SERIALIZABLE 隔离级别"           -c "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT count(*) FROM p1_shard; ROLLBACK;"
 neg "VACUUM 点名"         "VACUUM 不允许作用于分片打标表"    -c "VACUUM p1_shard;"
 # T2.6：ANALYZE 解禁（0008 读侧分叉，只判不收），负向翻正向
@@ -184,7 +185,40 @@ neg "PREPARE 含分片写"    "PREPARE TRANSACTION"             -c "BEGIN; INSER
 neg "COPY FREEZE"         "COPY FREEZE"                     -c "BEGIN; TRUNCATE p1_shard; COPY p1_shard FROM PROGRAM 'echo 93,0,x' WITH (FORMAT csv, FREEZE);"
 neg "严格模式读"          "读被拦截"                        -c "SET pg_partdist.shard_safety_mode=strict; SELECT count(*) FROM p1_shard;"
 neg "严格模式写"          "写入被拦截"                      -c "SET pg_partdist.shard_safety_mode=strict; INSERT INTO p1_shard VALUES (92,0,'x');"
-check "负向用例计数守卫（应跑 12 条，T2.6 起 ANALYZE 转正）" "$NEG_RUN" "12"
+check "负向用例计数守卫（应跑 10 条，T2.6 起 ANALYZE 转正，0011 起行锁转正）" "$NEG_RUN" "10"
+
+echo "========== [5b] 行锁正向（补丁 0011） =========="
+# 单持锁者 lock-only xmax：加锁不改可见性；自己加锁后自己 UPDATE 不自锁；
+# 外人加锁时 UPDATE 等待、持锁者提交后继续（锁不参与 first-committer-wins）
+r=$(PSQL "$WPORT" -Atc "SELECT id FROM p1_shard WHERE id=2 FOR UPDATE" </dev/null 2>&1)
+check "FOR UPDATE 放行" "$r" "2"
+r=$(PSQL "$WPORT" -Atc "SELECT id FROM p1_shard WHERE id=2 FOR SHARE" </dev/null 2>&1)
+check "FOR SHARE 放行" "$r" "2"
+r=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p1_shard WHERE id=2" </dev/null)
+check "已提交的加锁不让行消失" "$r" "1"
+r=$(PSQL "$WPORT" -qAtc "BEGIN; SELECT v FROM p1_shard WHERE id=2 FOR UPDATE; UPDATE p1_shard SET v=v+10 WHERE id=2 RETURNING v; COMMIT;" </dev/null 2>&1 | tail -1)
+check "自己加锁后自己 UPDATE（不自锁）" "$r" "11"
+r=$(PSQL "$WPORT" -qAtc "BEGIN; SELECT 1 FROM p1_shard WHERE id=2 FOR SHARE; SELECT 1 FROM p1_shard WHERE id=2 FOR UPDATE; SELECT (t_infomask & x'0080'::int) <> 0 AND (t_infomask & x'0010'::int) = 0 FROM heap_page_items(get_raw_page('p1_shard',0)) WHERE t_ctid = (SELECT ctid FROM p1_shard WHERE id=2) AND t_xmax::text <> '0'; COMMIT;" </dev/null 2>&1 | tail -1)
+check "同事务 FOR SHARE → FOR UPDATE 原地升级（LOCK_ONLY 在、KEYSHR 位已清）" "$r" "t"
+r=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM heap_page_items(get_raw_page('p1_shard',0)) WHERE t_infomask & x'1000'::int <> 0" </dev/null)
+check "不产生 multixact（HEAP_XMAX_IS_MULTI 位为 0）" "$r" "0"
+PSQL "$WPORT" -q -c "BEGIN; SELECT 1 FROM p1_shard WHERE id=3 FOR UPDATE; SELECT pg_sleep(3); COMMIT;" </dev/null >/dev/null &
+BG=$!
+sleep 1
+t0=$(date +%s%N)
+w3ok=$(PSQL "$WPORT" -c "UPDATE p1_shard SET v=v+1 WHERE id=3;" </dev/null 2>&1 | grep -c "^UPDATE 1")
+t1=$(date +%s%N); w3ms=$(( (t1-t0)/1000000 ))
+wait "$BG"
+check "外人持锁：UPDATE 等它提交后照常成功（锁不是删改）" "$w3ok" "1"
+check "确实等待了（${w3ms}ms > 1500）" "$([[ "$w3ms" -gt 1500 ]] && echo ok)" "ok"
+PSQL "$WPORT" -q -c "BEGIN; SELECT 1 FROM p1_shard WHERE id=3 FOR UPDATE; SELECT pg_sleep(3); COMMIT;" </dev/null >/dev/null &
+BG=$!
+sleep 1
+r=$(PSQL "$WPORT" -c "SELECT 1 FROM p1_shard WHERE id=3 FOR UPDATE NOWAIT" </dev/null 2>&1 | grep -c "could not obtain lock")
+check "NOWAIT：外人持锁即报 55P03" "$r" "1"
+r=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM (SELECT 1 FROM p1_shard WHERE id=3 FOR UPDATE SKIP LOCKED) s" </dev/null 2>&1)
+check "SKIP LOCKED：外人持锁的行被跳过" "$r" "0"
+wait "$BG"
 r=$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p1_shard" </dev/null)
 check "负向用例未破坏数据（行数不变）" "$r" "$base_rows"
 

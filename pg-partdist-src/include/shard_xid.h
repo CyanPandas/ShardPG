@@ -125,6 +125,7 @@ extern bool shard_vacuum_auto_enabled;
 /* T7.17（P7-V1）：到龄分片枚举，供 vacuum 自动启动器用。只读 shmem */
 extern int	ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max);
 extern int	ShardXidTwoStateShards(Oid *shards, int max);
+extern void ShardXidNoteAutoVacuum(Oid shard);	/* TPC-C 分支：回收触发限流 */
 extern int	ShardXidOverdueCount(void);
 
 extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,

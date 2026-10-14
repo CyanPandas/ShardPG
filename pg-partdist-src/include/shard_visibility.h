@@ -45,6 +45,13 @@ extern void ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
  * 判决写失败升 PANIC（借崩溃恢复走 0007 redo 补齐）；摘条目异常仅 WARNING。 */
 extern void ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed);
 
+/* TPC-C 分支：PRE_COMMIT 置"提交中"（cts=0 = 号未到）/ 填 commit_ts */
+extern void ShardCommitMarkCommitting(Oid shard, TransactionId sxid, int64 commit_ts);
+
+/* TPC-C 分支：ExecutorStart 里对涉及分片关系的计划提前取 start_ts */
+struct PlannedStmt;
+extern void ShardSnapshotEagerStart(struct PlannedStmt *pstmt);
+
 /* T1.8 守卫点：strict 模式拦截 + SERIALIZABLE 禁令；读写路径共用 */
 extern void ShardAccessGate(Oid shard, const char *what);
 

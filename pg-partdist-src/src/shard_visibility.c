@@ -25,6 +25,7 @@
 #include "shard_clog.h"
 #include "dtx_pending.h"
 #include "tso.h"
+#include "nodes/plannodes.h"		/* TPC-C 分支：ShardSnapshotEagerStart */
 #include "shard_visibility.h"
 #include "shard_route.h"
 #include "shard_replay.h"		/* T7.26：剪枝守卫判据 */
@@ -67,7 +68,16 @@ typedef struct ShardCommitEntry
 {
 	ShardCommitKey key;
 	TransactionId native_xid;	/* 持有者的原生 top xid（反查表） */
+	/*
+	 * TPC-C 分支：提交中标记（见 ShardCommitMarkCommitting）。committing 置位
+	 * 早于向 TSO 申请 commit_ts；commit_ts = 0 表示号还没拿到。
+	 */
+	bool		committing;
+	int64		commit_ts;
 } ShardCommitEntry;
+
+/* 读者等"提交中"事务落定的上限：超时报 40001（可重试），绝不给出未定的判决 */
+#define SHARD_COMMITTING_WAIT_MAX_MS	10000
 
 static HTAB *ShardCommitHash = NULL;
 static LWLock *ShardCommitLock = NULL;
@@ -151,18 +161,65 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	key.shard = shard;
 	key.sxid = sxid;
 
-	/* 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O */
-	LWLockAcquire(ShardCommitLock, LW_SHARED);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
-										 HASH_FIND, NULL);
-	if (e != NULL)
+	/*
+	 * 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O。
+	 *
+	 * ★ TPC-C 分支：提交中（committing）的条目不能一律答 RUNNING。持有者在
+	 * PRE_COMMIT 先置 committing、再向 TSO 取 commit_ts c、再写 clog 判决；
+	 * 读者若在"c 已发出、判决未落"的窗口里拿到 start_ts s > c，按 RUNNING
+	 * 判为不可见就违反了 §4.1（c < s 必须可见）—— 同一语句里旧版本可见、
+	 * 新版本稍后又可见，行"消失"或"重复"（TPC-C 2 仓 8 终端实测：NOT NULL
+	 * 违例、new_order 号段断档）。规则：
+	 *   · 未置 committing ⇒ 持有者的 c 一定在本读者的 s 之后才会取到（置位先于
+	 *     取号，而 s 早已拿到）⇒ RUNNING（不可见）正确；
+	 *   · committing 且 c 已知且 c >= s ⇒ 同样不可见，答 RUNNING；
+	 *   · 其余（号未知，或 c < s）⇒ 判决即将落定且可能可见 ⇒ 等它落定再重查。
+	 * 等待不释放调用方可能持有的缓冲区共享锁：持有者的提交路径不碰堆页面，
+	 * 且窗口是一次 TSO RPC + 提交记录 + 判决写的量级。超时报 40001。
+	 */
 	{
-		if (native_xid)
-			*native_xid = e->native_xid;
-		LWLockRelease(ShardCommitLock);
-		return SXID_RUNNING;
+		int			waited_ms = 0;
+		int64		my_ts = 0;
+		bool		have_my_ts = false;
+
+		for (;;)
+		{
+			bool		committing;
+			int64		cts;
+
+			LWLockAcquire(ShardCommitLock, LW_SHARED);
+			e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+												 HASH_FIND, NULL);
+			if (e == NULL)
+			{
+				LWLockRelease(ShardCommitLock);
+				break;			/* 已落定（或从未在活跃表）：往下查终局 */
+			}
+			if (native_xid)
+				*native_xid = e->native_xid;
+			committing = e->committing;
+			cts = e->commit_ts;
+			LWLockRelease(ShardCommitLock);
+
+			if (!committing)
+				return SXID_RUNNING;
+			if (!have_my_ts)
+			{
+				my_ts = TsoGetStartTs();
+				have_my_ts = true;
+			}
+			if (my_ts <= 0 || (cts != 0 && cts >= my_ts))
+				return SXID_RUNNING;
+			if (waited_ms >= SHARD_COMMITTING_WAIT_MAX_MS)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access: 分片 %u 的 xid %u 提交中超过 %d ms 未落定",
+								shard, sxid, SHARD_COMMITTING_WAIT_MAX_MS),
+						 errhint("重试事务。")));
+			pg_usleep(1000L);
+			waited_ms++;
+		}
 	}
-	LWLockRelease(ShardCommitLock);
 
 	/* 终局缓存 */
 	ce = verdict_cache_search(&key, HASH_FIND);
@@ -518,8 +575,10 @@ sv_replayed_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 		return true;
 	}
 
+	/* lock-only xmax（补丁 0011 行锁）是锁不是删除：读侧一律当作没有 xmax */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
-		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 	{
 		*visible = true;
 		return true;
@@ -598,8 +657,10 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			break;
 	}
 
+	/* lock-only xmax（补丁 0011 行锁）是锁不是删除：读侧一律当作没有 xmax */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
-		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 	{
 		*visible = true;
 		return true;
@@ -647,8 +708,10 @@ sv_satisfies_self(HeapTuple htup, Buffer buffer, bool *visible)
 			break;
 	}
 
+	/* lock-only xmax（补丁 0011 行锁）是锁不是删除：读侧一律当作没有 xmax */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
-		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 	{
 		*visible = true;
 		return true;
@@ -701,8 +764,10 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			break;
 	}
 
+	/* lock-only xmax（补丁 0011 行锁）是锁不是删除：读侧一律当作没有 xmax */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
-		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 	{
 		*visible = true;
 		return true;
@@ -771,6 +836,22 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
 	{
 		*result = TM_Ok;
+		return true;
+	}
+
+	/*
+	 * 补丁 0011：lock-only xmax。分片表只存单个持锁者（不组 multixact），
+	 * 判据只看持锁者是否还在跑：外人在跑 ⇒ BeingModified（调用方经 xmax_wait
+	 * 等它结束后重评）；是自己 ⇒ TM_Ok（heap_lock_tuple 原地升级/保留，
+	 * heap_update/delete 用自己的 xmax 覆盖 —— 更新本身蕴含排他锁）；已提交
+	 * 或已中止 ⇒ 锁已释放 ⇒ TM_Ok。**锁不参与 first-committer-wins**：已提交
+	 * 的加锁不是删改，不能落到下面 COMMITTED 分支报 40001。
+	 */
+	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+	{
+		*result = (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple),
+								   NULL, NULL) == SXID_RUNNING) ?
+			TM_BeingModified : TM_Ok;
 		return true;
 	}
 
@@ -845,8 +926,18 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (TransactionIdIsCurrentTransactionId(native))
 		return;					/* 防御：自己等自己必死锁 */
 
-	if (TransactionIdIsInProgress(native))
-		XactLockTableWait(native, (Relation) relation, ctid, oper);
+	/*
+	 * TPC-C 分支：**无条件**等持有者的 xid 锁，不再先问 TransactionIdIsInProgress。
+	 *
+	 * CommitTransaction / AbortTransaction 的顺序是 ProcArrayEndTransaction →
+	 * XactCallback（这里才 ShardCommitMarkEnded 写判决、摘活跃表条目）→
+	 * ResourceOwnerRelease 放 xid 锁。持有者走在前两步之间时，procarray 已说
+	 * "不在跑"、活跃表仍说 RUNNING —— 旧写法因此跳过等待、直接落到下面的
+	 * "无主 RUNNING" ERROR。行锁解禁后 TPC-C 8 终端 2 分钟实测 7 个终端被它打掉。
+	 * xid 锁要到回调之后才放，等到它即保证判决已落；持有者真的早已结束时
+	 * 锁当场拿到，零代价。
+	 */
+	XactLockTableWait(native, (Relation) relation, ctid, oper);
 
 	if (shard_xid_state(shard, sxid, NULL, NULL) == SXID_RUNNING &&
 		!TransactionIdIsInProgress(native))
@@ -925,7 +1016,8 @@ sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
 	}
 
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
-		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))	/* 0011：锁不是删除 */
 	{
 		*res = (int) HEAPTUPLE_LIVE;
 		return true;
@@ -992,7 +1084,66 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 				 errhint("活跃分片事务数不该有这个量级；查泄漏。")));
 	}
 	e->native_xid = native_xid;
+	e->committing = false;
+	e->commit_ts = 0;
 	LWLockRelease(ShardCommitLock);
+}
+
+/*
+ * TPC-C 分支：PRE_COMMIT 里调两次 —— 取 commit_ts 之前 (cts=0：置"提交中")、
+ * 取到之后 (cts=c：填号)。读者据此区分"一定在我快照之后提交"和"可能在我
+ * 快照之前提交、只是判决还没落"（见 shard_xid_state_ex 的注释）。
+ * 条目缺失静默（不该发生；读者那一侧缺条目会走 clog 查终局，方向安全）。
+ */
+void
+ShardCommitMarkCommitting(Oid shard, TransactionId sxid, int64 commit_ts)
+{
+	ShardCommitKey key;
+	ShardCommitEntry *e;
+
+	if (ShardCommitHash == NULL)
+		return;
+	key.shard = shard;
+	key.sxid = sxid;
+	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+	if (e != NULL)
+	{
+		e->committing = true;
+		e->commit_ts = commit_ts;
+	}
+	LWLockRelease(ShardCommitLock);
+}
+
+/*
+ * TPC-C 分支：语句执行前就把 start_ts 定下来（ExecutorStart 调）。
+ *
+ * start_ts 原先在第一次可见性判定时才懒取。索引扫描先读 btree 叶子页拿到一批
+ * TID、再逐个去堆里判可见 —— 若中间有事务做了非 HOT 更新（新版本的索引项在
+ * 叶子页读完之后才插入）并提交，懒取到的 s 已晚于它的 commit_ts：旧版本被判
+ * "已删除"、新版本的索引项又不在手里，一行都读不到（1 行热点、4 写 3 读 30 s
+ * 必现）。原生 PG 在扫描之前取快照，没有这个窗口。
+ * 只看 rtable 里有没有分片关系；没有就不取号（不给纯元数据语句加 RPC，也不
+ * 抢在 join 协议注入 start_ts 之前自取）。
+ */
+void
+ShardSnapshotEagerStart(PlannedStmt *pstmt)
+{
+	ListCell   *lc;
+
+	if (pstmt == NULL || shard_visibility_hooks == NULL)
+		return;
+	foreach(lc, pstmt->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid) &&
+			sv_is_shard_rel(rte->relid))
+		{
+			(void) TsoGetStartTs();
+			return;
+		}
+	}
 }
 
 /*

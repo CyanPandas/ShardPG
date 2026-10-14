@@ -334,6 +334,9 @@ partdist_executor_start(QueryDesc *queryDesc, int eflags)
      */
     ShardGuardCheckPlan(queryDesc->plannedstmt);
 
+    /* TPC-C 分支：扫描开始之前定下分片快照（见 ShardSnapshotEagerStart） */
+    ShardSnapshotEagerStart(queryDesc->plannedstmt);
+
     /* Call the routing check in write_router.c */
     pg_partdist_executor_start(queryDesc, eflags);
 

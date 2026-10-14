@@ -689,6 +689,8 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * 要的节奏完全一致；另起一个只是多一份要维护的生命周期。
 		 * 零到龄分片时代价 = 一次 LW_SHARED + 64 槽线性扫描，不自连。
 		 */
+		/* TPC-C 分支：自连调用异步化后，每轮先推进在途的那几路 */
+		ShardSelfCallsPoll();
 		if (shard_vacuum_auto_enabled && ShardXidOverdueCount() > 0)
 			ShardVacuumSelfTriggerAuto();
 
@@ -696,7 +698,7 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * T7.27（P7-W2）：分叉标记自动修复。无待修标记时只是一次布尔读；
 		 * 有标记也按 auto_repair_interval_s 节点级限流（基线是重活）。
 		 */
-		if (shard_auto_repair_diverged &&
+		if (shard_auto_repair_diverged && !ShardDivergedRepairInFlight() &&
 			PartWALDivergedRepairDue(shard_auto_repair_interval_s * 1000))
 			ShardDivergedSelfTriggerRepair();
 

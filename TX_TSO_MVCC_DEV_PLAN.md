@@ -5643,6 +5643,90 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
     集群级开关"那一支：`ShardGuardClusterManaged()` = `pg_raft.raft_enabled`。`negative_p6`
     撤掉协调者白名单两行、改断言"协调者白名单为空"后 **40/0**。详见 P7 计划 §1.3。
 
+
+## 6 TPC-C 分支（`shardpg-tpcc`，2026-10-14 起）
+
+**目标实验**：三台服务器、10 仓库、16 终端、6 小时 TPC-C。工具链与操作手册在 `tpcc/README.md`。
+本节记录为这个实验对产品代码做的改动、它们与 §10 限制的关系、以及验证状态。
+
+| # | 改动 | 解除的阻塞 | 位置 |
+|---|---|---|---|
+| C1 | **分片表行锁**（补丁 0011 + `shard_visibility.c`） | 标准 TPC-C 事务的 `SELECT ... FOR UPDATE`；原先 `heap_lock_tuple` 一律 ERROR | `patches/0011-shard-row-locks.patch`、`src/shard_visibility.c` |
+| C2 | **分片 vacuum 的 LP_REDIRECT**（链处置预扫） | 带索引的表一旦有 HOT 更新，vacuum 撞"带 HOT 链的死根元组"即 ERROR ⇒ 6 h 内空间无法回收 | `src/shard_vacuum.c` |
+| C3 | **按回收触发自动 vacuum**：`shard_vacuum_trigger_age` / `_interval_s` | 自动启动器只按回卷龄（2 亿）触发，长跑压测里永远到不了 | `src/shard_xid.c`、`src/shard_vacuum.c` |
+| C4 | **多机部署**：`pg_raft.loopback_node_names` / `pg_raft.peer_connect_timeout_s` | 节点名 coordinator/master/worker1..3 被硬映射到 127.0.0.1；跨机 RPC 建连超时写死 1 s | `pg-raft-src/src/pg_raft.c`、`raft_consensus.c`、`raft_leader.c` |
+| C5 | **心跳自连异步化**（vacuum 自动启动器 / 分叉自动修复） | 两路都是同步 PQexec，跑多久续租就推迟多久，超 7.5 s 本节点全部分片快照被栅栏作废 | `src/shard_vacuum.c`、`src/tso_client.c` |
+| C6 | **`sv_xmax_wait` 无条件等 xid 锁**（原生 xid 已退出 procarray、判决未落的瞬时窗） | 等待者误报"无主 RUNNING"ERROR，TPC-C 2 仓 8 终端 2 分钟 7 个终端被打掉 | `src/shard_visibility.c` |
+| C7 | **SI 提交中窗口**：活跃表 committing 标记 + `ShardSnapshotEagerStart` | 原版缺陷：持有者已取 commit_ts c、判决未落时，start_ts s > c 的读者把它当 RUNNING ⇒ 同一行旧新两版同时可见 / 一版都不可见（违反 §4.1） | `src/shard_visibility.c`、`src/shard_xid.c`、`src/pg_partdist.c` |
+
+所有新 GUC 默认值 = 改动前行为；C1/C2 无开关（原先的行为是报错）；C5–C7 是缺陷修复，无开关。
+C5–C7 是 TPC-C 沙箱压测**暴露出来的既有缺陷**（C7 在 `shardpg-test` 原版上复现，不依赖本分支的
+任何改动），不是本分支引入的。
+
+### C7 设计要点（可见性核心层，评审重点）
+
+- **缺陷**：0007/T3.3 的 commit_ts 在 `XACT_EVENT_PRE_COMMIT` 取（TsoStashCommitTs），判决在
+  `XACT_EVENT_COMMIT` 写 clog。这之间若有读者取到 s > c，它把 T 判为 RUNNING（不可见），而 §4.1
+  要求 c < s 必可见。在更新链上表现为：读旧版本时 T 判 RUNNING ⇒ 旧版本可见，读新版本时 T 已
+  落定 ⇒ 新版本也可见（一行两次），或时序反过来一次都没有。`test_tso_si_p3` 的竞态注入只用
+  只增负载，碰不到这一格。
+- **修法**：PRE_COMMIT 里**先**把本事务全部活跃表条目置 committing（commit_ts=0），**再**向 TSO
+  取号，取到后填号。读者命中活跃表时：未置 committing ⇒ 持有者的号必在读者的 s 之后才取到
+  ⇒ RUNNING 正确；committing 且号已知且 ≥ s ⇒ RUNNING；其余（号未知或 < s）⇒ 每 1 ms 重查直到
+  条目摘除，再走 clog 终局判决。等待上限 10 s，超时报 40001（可重试），不给未定判决。
+- **懒取 start_ts 的另一半**：索引扫描先读 btree 叶子页、后判可见，start_ts 若在两者之间才取，
+  中间提交的非 HOT 更新的新索引项不在手里而旧版本已判删 ⇒ 读空。`ShardSnapshotEagerStart` 在
+  ExecutorStart 对 rtable 含分片关系的计划提前取号（不含分片关系的语句不取，以免抢在 join 协议
+  注入 start_ts 之前自取）。
+- **代价**：读者可能短暂等待提交中的写者（等待时不释放缓冲区共享锁；持有者的提交路径不碰堆
+  页面）。1 行热点 4 写 3 读的极端负载下，写吞吐约降到 1/4。
+- **未覆盖**：2PC 路径不变（PREPARE 时条目被摘，读者走 §4.2 三态）；回放副本读（R3）不经活跃表。
+
+### C1 设计要点
+
+- **单持锁者**：xmax 只存本事务的分片 xid + `HEAP_XMAX_LOCK_ONLY` + 模式位；与
+  `compute_new_xmax_infomask` 对"无旧 xmax"的产出逐位相同 ⇒ `XLOG_HEAP_LOCK` 与
+  `heap_xlog_lock` 原样可用，回放侧 `shard_replay.c` 早就从记录体取号。
+- **不组 multixact**：外人在跑的 xmax（锁或更新）一律经 `xmax_wait` 等待后重评。兼容的锁模式
+  也排队 —— 并发度低于原生，语义更严；vacuum 撞见 multi 仍 fail-closed。
+- **可见性**：lock-only xmax 在 MVCC/Self/Dirty/回放读/vacuum 读侧一律等同"无 xmax"；更新判定
+  只看持锁者是否在跑（在跑 ⇒ BeingModified；自己 / 已结束 ⇒ TM_Ok）。**已提交的加锁不触发
+  first-committer-wins**（它不是删改）。
+- **不追链重读**：`heapam_tuple_lock` 对分片表遇 `TM_Updated + FIND_LAST_VERSION` 报 40001。
+  TSO 模式在可见性分叉里已先报；这里兜遗留模式 —— `test_shard_xid_p1` [3] 的期望因此从
+  "row-level locking is not supported"改为"could not serialize access"。
+- 未覆盖：外键（RI 检查的快照语义与分片 SI 不一致，未验证，TPC-C 套件不建外键）。
+
+### C2 设计要点
+
+预扫从每个根（非 heap-only 的 LP_NORMAL，或既有 LP_REDIRECT）沿 HOT 链走（核对同页、
+heap-only、xmin == 前一跳 xmax），取**死前缀**：后面还有活成员 ⇒ 根做成重定向、前缀成员
+LP_UNUSED，索引项不动；整链死 ⇒ 根 LP_DEAD 进索引两阶段。只取前缀是保守的（链上删改的
+提交序单调，判据用 xid < 截断点只会少收）。② 判死却没被死前缀走到的 heap-only 元组在带索引
+关系上**不动**（前驱还活着，摘掉会截断活链），也不计 deferred（截断点以下的已提交删除在免查区
+读作已删除，不挡截断）。`test_shard_vacuum_p5` [16] 的负向翻成正向（重定向 + 改目标两格）。
+
+### 验证状态
+
+沙箱 = pg-test-container 内用分支内核（/tmp/tpcc-install，PG 16.14 + 0001–0011）+ 分支扩展起的
+**单节点**实例（端口 5499，不碰 9 节点集群），本地打标表（不经 Citus 分布）、TSO master 在本机。
+**C1–C7 都还没在多节点集群 / 三台服务器上跑过**；`tests/` 下改写过的既有套件（p1 / negative_p6 /
+vacuum_p5）也还没在 9 节点环境里执行。
+
+#### 验证记录
+
+| 时间 | 动作 | 结果 |
+|---|---|---|
+| 2026-10-14 | 内核（0001–0011）全量编译 + 两扩展编译 | 0 错误；新增代码 0 警告（唯一警告是既有 0001 的 `xloginsert.c:507`） |
+| 2026-10-14 | 沙箱：行锁 23 项（四种强度、自锁、升级、不降级、无 multi、外人持锁等待、两 FOR SHARE 排队、NOWAIT、SKIP LOCKED、40001 ×2、回滚后取原值、死锁检测、崩溃恢复） | 21/2。2 项为脚本问题：raw md5 含 `t_cid`（`heap_xlog_lock` 原生把 cmax 写成 FirstCommandId，正常路径不写 —— 逐字段比对确认差异**只在 t_cid**，`pagecmp.py` 本就掩码此字段）；`pg_tso_boot` 删晚导致恢复后取不到号 |
+| 2026-10-14 | 沙箱：LP_REDIRECT 13 项（死根重定向、改目标、整链删除、1000 行 × 30 轮更新 + 周期回收） | 12/1。1 项为脚本问题：整链删光后尾部截断把空页还给文件系统（0 块），取第 0 页失败。30 轮更新期间表大小稳定在 ~400 KB，索引扫描每 id 恰 1 行 |
+| 2026-10-14 | 沙箱：C3 默认关 / 打开 / 限流窗口 | 关：截断点不动；开：心跳自动推进；限流窗口内不重扫 |
+| 2026-10-14 | 沙箱：2 仓 TPC-C 装载（trigger_age=1，interval=30） | C5 前：3 个装载块被"栅栏作废"；C5 后：0 次，行数与一致性全对 |
+| 2026-10-14 | 沙箱：2 仓 8 终端 TPC-C 2 min | C6 前 7/8 终端被"无主 RUNNING"打掉；C6 后出现 NOT NULL 违例与 new_order 断档 ⇒ 定位到 C7 |
+| 2026-10-14 | 沙箱：1 行热点 4 写 3 读（日志表记录异常） | 原版扩展 2 轮 3.1 万次读 5 次"一行两版"；C7 后 4 轮 4.0 万次读 0 次 |
+| 2026-10-14 | 沙箱：2 仓 8 终端 TPC-C 3 min（C5–C7 全上） | 0 终端中止、0 失败、重试 25%（Payment 49%：8 终端挤 2 仓）、一致性 5 项全 0、无 multixact、栅栏作废 0 次、自动回收 20 次 |
+| 2026-10-14 | 沙箱：`tests/test_si_committing_window_tpcc.sh` | 8/0 |
+
 ---
 
 *本文与 TX_TSO_MVCC_DESING.md 配套使用；方案性问题以设计文档为准，本文只管

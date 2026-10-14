@@ -28,6 +28,7 @@
 > `PREPARE TRANSACTION` 之后、本地 commit record 落盘之前"。
 
 | 10 | `0010-promote-advance-wal-insert-position.patch` | `XLogRequestInsertPositionAdvance()` + `XLogAdvancePendingInsertPosition()`（改 `xlog.c`、`xlog.h`） | TX-TSO-MVCC P6（T6.3b）/ FRD §11 步骤 4：**在线**把本地 WAL 插入位点推进到目标 LSN 之后的段边界，语义类似 `pg_resetwal -l`。**跳跃发生在 `CreateCheckPoint` 持有全部插入锁的临界区内**（排在"空闲跳过检查"之后），跳完紧接着算出的 `checkPoint.redo` 就落在新段里 —— 因此不存在"跳了却没有检查点"的丢数据窗口。`PrevBytePos` 取旧的 end-of-WAL 而非落点本身：跳跃后的第一条记录被恢复以随机访问方式读到，`ValidXLogRecordHeader` 校验 `xl_prev < RecPtr`，取落点会判负。**跳过的段号成为永久空洞**：本地崩溃恢复不受影响，原生归档/PITR 在此断链（见下节裁定） |
+| 11 | `0011-shard-row-locks.patch` | 无新钩子（改 `heapam.c` / `heapam_handler.c`，复用 0005 的 `shard_relation_xid_hook` 与 0006 的 `xmax_wait`） | **TPC-C 分支（`shardpg-tpcc`）**：分片表行锁。`heap_lock_tuple` 对分片表从"直接 ERROR"改为单持锁者分支 `shard_heap_lock_tuple()`：xmax = 本事务分片 xid + `HEAP_XMAX_LOCK_ONLY` + 锁模式位（与 `compute_new_xmax_infomask` 对"无旧 xmax"的产出逐位相同，故 `XLOG_HEAP_LOCK` 记录体与 `heap_xlog_lock` redo 原样可用，回放侧 `shard_replay.c` 早已从记录体取号）；外人在跑的 xmax（锁或更新）一律经 `xmax_wait` 等待后重评 —— 兼容的锁模式也排队，**绝不组 multixact**；自己的锁够强就保留、不够就原地升级；`follow_updates` 忽略；NOWAIT / SKIP LOCKED 照原生语义。`heapam_tuple_lock` 对分片表遇 `TM_Updated + FIND_LAST_VERSION` 报 40001（不追链重读：分片表是 SI，设计 §4.4；TSO 模式在可见性分叉里已先报，此处兜遗留模式）。配套扩展改动：`shard_visibility.c` 让 lock-only xmax 在读侧等同无 xmax、在更新判定里只看持锁者是否在跑 |
 
 > 3 号位空缺：`0003` 曾用于一版被放弃的尝试，编号保留不复用，避免与历史记录混淆。
 > 0010 是"3 号位那件事"的重做，按 README 纪律另起编号。
@@ -172,7 +173,9 @@ for p in 0001-add-wal-insert-hook \
          0006-shard-visibility-hooks \
          0007-shard-xact-record-xids \
          0008-shard-vacuum-read-hook \
-         0009-shard-twophase-rmgr; do
+         0009-shard-twophase-rmgr \
+         0010-promote-advance-wal-insert-position \
+         0011-shard-row-locks; do
   patch -p1 --forward < ../pg-partdist-src/patches/$p.patch || exit 1
 done
 ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline
