@@ -5657,6 +5657,7 @@ P6 增补（2026-09-02，T6.0 核查产出，详见 `docs/P6_PRECHECK.md`）：
 | C4 | **多机部署**：`pg_raft.loopback_node_names` / `pg_raft.peer_connect_timeout_s` | 节点名 coordinator/master/worker1..3 被硬映射到 127.0.0.1；跨机 RPC 建连超时写死 1 s | `pg-raft-src/src/pg_raft.c`、`raft_consensus.c`、`raft_leader.c` |
 | C5 | **心跳自连异步化**（vacuum 自动启动器 / 分叉自动修复） | 两路都是同步 PQexec，跑多久续租就推迟多久，超 7.5 s 本节点全部分片快照被栅栏作废 | `src/shard_vacuum.c`、`src/tso_client.c` |
 | C6 | **`sv_xmax_wait` 无条件等 xid 锁**（原生 xid 已退出 procarray、判决未落的瞬时窗） | 等待者误报"无主 RUNNING"ERROR，TPC-C 2 仓 8 终端 2 分钟 7 个终端被打掉 | `src/shard_visibility.c` |
+| C8 | **单副本（单成员 Raft 组）**：`raft_replicate_table_shards[_bulk]` 接受 `p_replicas = 0` | 单副本时不能完全不建组 —— 0009 的 postcommit 不写终局，跨分片 2PC 的判决靠协调者分片组决议广播落到参与方 | `sql/pg_partdist--1.0.sql` |
 | C7 | **SI 提交中窗口**：活跃表 committing 标记 + `ShardSnapshotEagerStart` | 原版缺陷：持有者已取 commit_ts c、判决未落时，start_ts s > c 的读者把它当 RUNNING ⇒ 同一行旧新两版同时可见 / 一版都不可见（违反 §4.1） | `src/shard_visibility.c`、`src/shard_xid.c`、`src/pg_partdist.c` |
 
 所有新 GUC 默认值 = 改动前行为；C1/C2 无开关（原先的行为是报错）；C5–C7 是缺陷修复，无开关。
@@ -5726,6 +5727,9 @@ vacuum_p5）也还没在 9 节点环境里执行。
 | 2026-10-14 | 沙箱：1 行热点 4 写 3 读（日志表记录异常） | 原版扩展 2 轮 3.1 万次读 5 次"一行两版"；C7 后 4 轮 4.0 万次读 0 次 |
 | 2026-10-14 | 沙箱：2 仓 8 终端 TPC-C 3 min（C5–C7 全上） | 0 终端中止、0 失败、重试 25%（Payment 49%：8 终端挤 2 仓）、一致性 5 项全 0、无 multixact、栅栏作废 0 次、自动回收 20 次 |
 | 2026-10-14 | 沙箱：`tests/test_si_committing_window_tpcc.sh` | 8/0 |
+| 2026-10-14 | 迷你集群（容器内 1 coordinator + 2 worker，端口 5500–5502，分支内核 + 扩展，Citus 分布）：`gen_node_conf.sh` + `wire_cluster.sh` | 一次通过：group0 选主、各节点 TSO 取号、GlobalSafeTs 非 0 |
+| 2026-10-14 | 迷你集群：`03_distribute.sql`，SHARD_COUNT=2、REPLICAS=0 | 8 张表 16 个单成员组全部建组→当选→打标（"1 主 + 0 副本"），约 3.5 min |
+| 2026-10-14 | 迷你集群：装载首轮 | 全失败，两处套件缺陷：① Citus 不支持 `LANGUAGE sql` 函数带参数访问分布表 ⇒ 改 plpgsql；② 跨分片写未加入全局事务，PREPARE 被拒 ⇒ 新增 `tpcc.begin_global()`。修后单块跨分片 2PC（warehouse + district）提交且两边可见 |
 
 ---
 

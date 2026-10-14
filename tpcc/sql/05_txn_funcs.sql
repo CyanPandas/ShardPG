@@ -11,6 +11,7 @@
 --     零写入 —— 对数据库的净效果与回滚相同，但少了被回滚的那部分写负载。
 --
 -- 随机参数在函数内生成；终端的"主仓库"由 pgbench 传入（client_id 映射）。
+-- 每个函数第一句 tpcc.begin_global()：加入 ShardPG 全局事务（见 02_gen_funcs.sql）。
 
 -- §2.4 New-Order。返回新订单号；-1 = 1% 的无效商品回滚
 CREATE OR REPLACE FUNCTION tpcc.new_order(p_w int, p_nw int) RETURNS int
@@ -36,6 +37,7 @@ DECLARE
     v_p        numeric;
     r          record;
 BEGIN
+    PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
     -- 生成订单行；按 (供货仓, 商品) 排序，压低 stock 行锁的死锁概率
     FOR r IN
         SELECT * FROM (
@@ -104,12 +106,16 @@ BEGIN
 END $$;
 
 -- 按姓取客户：同姓客户按 c_first 排序取中位（§2.5.2.2）
+-- （plpgsql 而不是 sql：Citus 不支持 sql 函数里带参数访问分布表）
 CREATE OR REPLACE FUNCTION tpcc.customer_by_name(p_w int, p_d int, p_last text) RETURNS int
-LANGUAGE sql STABLE AS $$
-    SELECT ids[(array_length(ids, 1) + 1) / 2]
-      FROM (SELECT array_agg(c_id ORDER BY c_first) AS ids FROM customer
-             WHERE c_w_id = p_w AND c_d_id = p_d AND c_last = p_last) s
-$$;
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    ids int[];
+BEGIN
+    SELECT array_agg(c_id ORDER BY c_first) INTO ids FROM customer
+     WHERE c_w_id = p_w AND c_d_id = p_d AND c_last = p_last;
+    RETURN ids[(array_length(ids, 1) + 1) / 2];
+END $$;
 
 -- §2.5 Payment。返回客户号；0 = 按姓没找到客户（不写入）
 CREATE OR REPLACE FUNCTION tpcc.payment(p_w int, p_nw int) RETURNS int
@@ -125,6 +131,7 @@ DECLARE
     v_credit  text;
     v_data    text;
 BEGIN
+    PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
     v_c_d := v_d;
     IF p_nw > 1 AND tpcc.rand_int(1, 100) > 85 THEN               -- 15% 远程客户
         v_c_w := ((p_w - 1 + tpcc.rand_int(1, p_nw - 1)) % p_nw) + 1;
@@ -172,6 +179,7 @@ DECLARE
     v_n   int;
     v_bal numeric;
 BEGIN
+    PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
     IF tpcc.rand_int(1, 100) <= 60 THEN
         v_c := tpcc.customer_by_name(p_w, v_d,
                    tpcc.lastname(tpcc.nurand(255, 0, 999, tpcc.c_last_run())));
@@ -201,6 +209,7 @@ DECLARE
     v_sum     numeric;
     v_done    int := 0;
 BEGIN
+    PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
     FOR v_d IN 1..10 LOOP
         SELECT no_o_id INTO v_o FROM new_order
          WHERE no_w_id = p_w AND no_d_id = v_d ORDER BY no_o_id LIMIT 1 FOR UPDATE;
@@ -231,6 +240,7 @@ DECLARE
     v_next      int;
     v_n         int;
 BEGIN
+    PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
     SELECT d_next_o_id INTO v_next FROM district WHERE d_w_id = p_w AND d_id = v_d;
     SELECT count(DISTINCT s_i_id) INTO v_n
       FROM order_line JOIN stock ON s_w_id = ol_w_id AND s_i_id = ol_i_id

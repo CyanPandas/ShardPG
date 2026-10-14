@@ -32,9 +32,21 @@ tpcc/
 | B | worker | 5433 | 3 |
 | C | worker | 5433 | 4 |
 
-- 每张表 6 个分片（`SHARD_COUNT=6`，每台 worker 2 个主分片），每个分片一个 Raft 组
-  = 1 主 + 2 副本，三台各一份。
+- 每张表 6 个分片（`SHARD_COUNT=6`，每台 worker 2 个主分片），每个分片一个 Raft 组：
+  单副本（`REPLICAS=0`）= 只有主；三副本（`REPLICAS=2`）= 1 主 + 2 副本，三台各一份。
 - 压测客户端（pgbench）最好放第四台机器；放 A 上会和 coordinator 抢 CPU。
+
+### 单副本模式（`REPLICAS=0`，`cluster.env.example` 的默认值）
+
+每个分片仍建一个 Raft 组，但组里只有 placement 一个成员（多数派 = 1），不供副本。
+
+- **组不能省**：跨仓库事务（约 10% 的 NewOrder、15% 的 Payment）走 Citus 2PC；打标分片在
+  `COMMIT PREPARED` 时不写终局判决（补丁 0009），判决与 commit_ts 靠协调者分片组的决议广播
+  落到参与方。完全不建组时，跨分片事务提交后参与方的行会一直停在 PREPARED、对读者不可见。
+- **与 3 副本的差异**：没有副本回放、没有物理基线、没有分叉修复；监控里 `ring_overwrites`、
+  `diverged_pending` 失去意义。任何一台 worker 宕机，它上面的分片直接不可用（没有可升主的
+  副本）——6 h 长跑期间不要做故障注入。
+- 写路径少了副本复制的等待，吞吐会高于 3 副本；两者的数字不能直接对比。
 - 主机名用 IP。**不要**把节点叫 `coordinator` / `master` / `worker1..3`：pg_raft 原本
   会把这几个名字回环映射到 127.0.0.1（单机测试拓扑用的）。本分支加了
   `pg_raft.loopback_node_names`，模板里已设为 `off`。
@@ -89,6 +101,13 @@ bash scripts/run.sh 6h-10w-16t          # 正式跑（预热 15 min + 6 h）
 - 行锁（`SELECT ... FOR UPDATE / FOR SHARE`、`NOWAIT`、`SKIP LOCKED`）由本分支的补丁 0011
   提供。分片表上**只存单个持锁者**：兼容的锁模式（两个 FOR SHARE、KEY SHARE 对
   NO KEY UPDATE）也会排队，不会合并成 multixact。并发度比原生 PG 略低，语义更严。
+- **每个事务都要先加入 ShardPG 全局事务**（`tpcc.begin_global()`，五类事务函数和装载函数的
+  第一句）：取 gxid + TSO start_ts，`SET LOCAL pg_partdist.join_info` 并让 Citus 把它传播到
+  每条分片连接。不加入的话，跨分片写在 PREPARE 时被拒（"未加入全局事务的分片写不允许
+  PREPARE TRANSACTION"）；只读事务加入后各 worker 共用同一个快照。必须是 `SET LOCAL` 语句
+  （Citus 拦截语句来传播，`set_config()` 它看不到），且要在第一次访问分布表之前。
+  自己写别的负载时同样要遵守。
+- 访问分布表的函数一律写 plpgsql：Citus 不支持 `LANGUAGE sql` 函数里带参数访问分布表。
 - 事务函数里**不能有 EXCEPTION 块**（plpgsql 的异常块是子事务，分片表禁子事务写）。所以
   NewOrder 的 1% 无效商品回滚改成"先查完全部商品、有无效的就零写入返回"，净效果与回滚
   相同。

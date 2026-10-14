@@ -75,3 +75,23 @@ CREATE OR REPLACE FUNCTION tpcc.load_o_c_id(w int, d int, o int) RETURNS int
 LANGUAGE sql IMMUTABLE AS $$
     SELECT ((o - 1) * 1777 + (w * 10 + d) * 7) % 3000 + 1
 $$;
+
+-- 加入 ShardPG 全局事务（每个事务函数 / 装载函数的第一句）。
+--
+-- 跨分片写走 Citus 2PC，而打标分片只放行"已加入全局事务"的 PREPARE
+-- （"未加入全局事务的分片写不允许 PREPARE TRANSACTION"）。加入协议由驱动端完成：
+-- 取 gxid + TSO start_ts，SET LOCAL pg_partdist.join_info，再让 Citus 把这条
+-- SET LOCAL 传播到本事务之后打开的每条分片连接（propagate_set_commands = local）。
+-- 协调者分片给 0（同 demo.global_txn() 的默认用法）。只读事务也加入：所有 worker
+-- 连接共用这一个 start_ts，跨节点的读才是同一个快照。
+-- 必须在本事务第一次访问分布表**之前**调用（连接一旦打开，后来的 SET 不再补发）。
+CREATE OR REPLACE FUNCTION tpcc.begin_global() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    g  bigint := partdist.partdist_gxid_next();
+    ts bigint := partdist.partdist_tso_client_start_ts();
+BEGIN
+    -- 必须是 SET LOCAL **语句**：Citus 在 ProcessUtility 里拦截它再传播，set_config() 它看不到
+    EXECUTE 'SET LOCAL citus.propagate_set_commands = ''local''';
+    EXECUTE format('SET LOCAL pg_partdist.join_info = %L', format('%s,%s,0', g, ts));
+END $$;

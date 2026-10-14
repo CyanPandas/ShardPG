@@ -19,11 +19,17 @@ done > "$tasks"
 n=$(wc -l < "$tasks")
 log "$n 个装载块"
 export PSQL_BIN COORD_HOST COORD_PORT DBUSER DB
+errs=$(mktemp -d)
+trap 'rm -f "$tasks"; rm -rf "$errs"' EXIT
+export errs
 fails=$(xargs -P "$LOAD_PARALLEL" -I{} bash -c \
-  '"$PSQL_BIN" -h "$COORD_HOST" -p "$COORD_PORT" -U "$DBUSER" -d "$DB" -X -q -v ON_ERROR_STOP=1 -c "{}" >/dev/null 2>&1 || echo "FAILED: {}"' \
+  'f="$errs/$(echo "{}" | md5sum | cut -c1-12)";
+   "$PSQL_BIN" -h "$COORD_HOST" -p "$COORD_PORT" -U "$DBUSER" -d "$DB" -X -q -v ON_ERROR_STOP=1 -c "{}" >/dev/null 2>"$f" \
+     || echo "FAILED: {} —— $(grep -m1 ERROR "$f")"' \
   < "$tasks")
 if [[ -n "$fails" ]]; then
-  echo "$fails"
-  die "有装载块失败（见上）。整库重建：重新跑 build_db.sh"
+  echo "$fails" | head -5
+  echo "（共 $(echo "$fails" | wc -l) 块失败，上面只列前 5 条）"
+  die "有装载块失败。整库重建：重新跑 build_db.sh"
 fi
 log "装载完成"

@@ -35,7 +35,8 @@ pg_raft.election_timeout_ms = 6000
 pg_raft.probe_interval_ms = 3000
 pg_raft.probe_fail_threshold = 3
 # 组数上限（PGC_POSTMASTER，决定共享内存里组表的大小，约 104 KB/组）。
-# 8 张分布表 × SHARD_COUNT 个分片，每台 worker 都是每个组的成员：6 分片 ⇒ 48 组 + 控制组。
+# 8 张分布表 × SHARD_COUNT 个分片 = 48 个数据组。REPLICAS=2 时每台 worker 是全部 48 组的成员；
+# REPLICAS=0（单副本）时每台只有自己 placement 的那 1/3（16 组）。64 两种都够。
 pg_raft.max_groups = 64
 # TPC-C 分支：多机部署
 pg_raft.loopback_node_names = off     # 节点名不再回环映射；主机名原样交给 libpq

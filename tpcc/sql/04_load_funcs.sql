@@ -1,9 +1,13 @@
 -- 装载函数（TPC-C §4.3.3.1）。每个函数一次只装一小块、各自一个事务（由
 -- scripts/load.sh 逐块调用）：大事务会让分区 WAL 捕获环长时间背压，
 -- 且一次失败要整块重来。所有块都按仓库号落在同一组共置分片上。
+-- 一律写成 plpgsql：Citus 不支持在 LANGUAGE sql 函数里带参数访问分布表
+-- （"could not create distributed plan … use of parameters in SQL functions"）。
 
 CREATE OR REPLACE FUNCTION tpcc.load_warehouse(w int) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM tpcc.begin_global();
     INSERT INTO warehouse
     SELECT w, 300000.00, (tpcc.rand_int(0, 2000) / 10000.0)::numeric(4,4),
            tpcc.astring(6, 10), tpcc.astring(10, 20), tpcc.astring(10, 20),
@@ -13,11 +17,13 @@ LANGUAGE sql AS $$
            tpcc.astring(6, 10), tpcc.astring(10, 20), tpcc.astring(10, 20),
            tpcc.astring(10, 20), tpcc.astring(2, 2), tpcc.zip()
       FROM generate_series(1, 10) d;
-$$;
+END $$;
 
 -- stock：每仓 10 万行，按 i_lo..i_hi 分块
 CREATE OR REPLACE FUNCTION tpcc.load_stock(w int, i_lo int, i_hi int) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM tpcc.begin_global();
     INSERT INTO stock
     SELECT w, i, tpcc.rand_int(10, 100), 0, 0, 0, tpcc.data_original(),
            tpcc.astring(24, 24), tpcc.astring(24, 24), tpcc.astring(24, 24),
@@ -25,11 +31,13 @@ LANGUAGE sql AS $$
            tpcc.astring(24, 24), tpcc.astring(24, 24), tpcc.astring(24, 24),
            tpcc.astring(24, 24)
       FROM generate_series(i_lo, i_hi) i;
-$$;
+END $$;
 
 -- customer + history：每区 3000 个客户，每个客户一条 history
 CREATE OR REPLACE FUNCTION tpcc.load_customer(w int, d int) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM tpcc.begin_global();
     INSERT INTO customer
     SELECT w, d, c,
            (tpcc.rand_int(0, 5000) / 10000.0)::numeric(4,4),
@@ -44,11 +52,13 @@ LANGUAGE sql AS $$
     INSERT INTO history
     SELECT c, d, w, d, w, now(), 10.00, tpcc.astring(12, 24)
       FROM generate_series(1, 3000) c;
-$$;
+END $$;
 
 -- oorder + order_line + new_order：每区 3000 单，o_id > 2100 的未发货、进 new_order
 CREATE OR REPLACE FUNCTION tpcc.load_orders(w int, d int) RETURNS void
-LANGUAGE sql AS $$
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM tpcc.begin_global();
     INSERT INTO oorder
     SELECT w, d, o, tpcc.load_o_c_id(w, d, o),
            CASE WHEN o <= 2100 THEN tpcc.rand_int(1, 10) END,
@@ -63,4 +73,4 @@ LANGUAGE sql AS $$
            LATERAL generate_series(1, tpcc.load_ol_cnt(w, d, o)) ol;
     INSERT INTO new_order
     SELECT w, d, o FROM generate_series(2101, 3000) o;
-$$;
+END $$;

@@ -17,6 +17,10 @@ for i in "${!NODE_IDS[@]}"; do
       -e "s|@COORD_HOST@|$COORD_HOST|" \
       -e "s|@COORD_PORT@|$COORD_PORT|" \
       "$TPCC_DIR/conf/node.conf.tmpl" > "$out/node$id.conf"
+  # 可选覆盖段（后写者生效）：小机器上压内存、调超时等，不必改模板
+  if [[ -n "${NODE_CONF_EXTRA:-}" ]]; then
+    { echo; echo "# ---- 覆盖段：$NODE_CONF_EXTRA ----"; cat "$NODE_CONF_EXTRA"; } >> "$out/node$id.conf"
+  fi
   echo "node$id（${NODE_ROLES[$i]} ${NODE_HOSTS[$i]}:${NODE_PORTS[$i]}）→ $out/node$id.conf"
 done
 cat <<'TXT'

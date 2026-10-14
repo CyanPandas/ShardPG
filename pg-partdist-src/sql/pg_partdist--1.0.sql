@@ -1746,8 +1746,11 @@ DECLARE
     v_fail      text;
     v_round     integer;
 BEGIN
-    IF p_replicas < 1 THEN
-        RAISE EXCEPTION 'raft_replicate_table_shards: p_replicas 必须 >= 1';
+    -- TPC-C 分支：p_replicas = 0 = 单副本（每个分片一个只有 placement 的单成员 Raft 组）。
+    -- 组仍然要建：跨分片 2PC 的判决与 commit_ts 靠协调者分片组的决议广播落到参与方
+    -- （0009 postcommit 不写终局），完全不建组的打标分片做不了跨分片事务。
+    IF p_replicas < 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards: p_replicas 必须 >= 0（0 = 单成员组，不供副本）';
     END IF;
 
     -- 全部 primary worker，以及它们各自的 raft 节点号（逐个问，不猜映射）
@@ -1950,8 +1953,11 @@ DECLARE
     v_armed     integer;
     r           record;
 BEGIN
-    IF p_replicas < 1 THEN
-        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: p_replicas 必须 >= 1';
+    -- TPC-C 分支：p_replicas = 0 = 单副本（每个分片一个只有 placement 的单成员 Raft 组）。
+    -- 组仍然要建：跨分片 2PC 的判决与 commit_ts 靠协调者分片组的决议广播落到参与方
+    -- （0009 postcommit 不写终局），完全不建组的打标分片做不了跨分片事务。
+    IF p_replicas < 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: p_replicas 必须 >= 0（0 = 单成员组，不供副本）';
     END IF;
 
     -- ⓪ worker 清单与 raft 节点号
