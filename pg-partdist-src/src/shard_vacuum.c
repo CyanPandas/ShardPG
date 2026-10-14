@@ -505,6 +505,28 @@ shard_vacuum_indexes(Relation rel, ShardVacuumDeadItems *dead)
  * LP_DEAD —— **这是安全的中间态**（LP_DEAD 不被任何索引项指向，扫描也不会
  * 返回它），下一趟扫描会把既有的 LP_DEAD 一并收进死名单再回收。
  */
+/*
+ * ★ TPC-C 分支：带短暂重试的 cleanup lock。热点页（warehouse / district 的那几页）
+ * 时刻有后端 pin 着，单次 ConditionalLockBufferForCleanup 几乎总失败 —— 128 终端下
+ * 这些分片约 70% 的趟被跳过，版本链一路膨胀（13 行的 warehouse 分片涨到 108 页，
+ * 吞吐逐轮下滑）。pin 都是微秒级的，短暂重试（≤ ~10 ms）就能等到空档；仍拿不到
+ * 照旧跳过。只阻塞 vacuum 自己，不阻塞业务。
+ */
+static bool
+shard_vacuum_cleanup_lock(Buffer buf)
+{
+	int			i;
+
+	for (i = 0; i < 50; i++)
+	{
+		if (ConditionalLockBufferForCleanup(buf))
+			return true;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(200L);
+	}
+	return false;
+}
+
 static void
 shard_vacuum_heap_pass2(Relation rel, ShardVacuumDeadItems *dead,
 						ShardVacuumPageStats *stats)
@@ -528,7 +550,7 @@ shard_vacuum_heap_pass2(Relation rel, ShardVacuumDeadItems *dead,
 		CHECK_FOR_INTERRUPTS();
 
 		buf = ReadBuffer(rel, blkno);
-		if (!ConditionalLockBufferForCleanup(buf))
+		if (!shard_vacuum_cleanup_lock(buf))
 		{
 			ReleaseBuffer(buf);
 			stats->pages_skipped++;
@@ -793,7 +815,7 @@ shard_vacuum_prune_pass(Relation rel, Oid shard, TransactionId cur_tb,
 		 * 跳过 ⇒ 本趟不完整 ⇒ 截断不得进行（由 T5.4 的门禁按
 		 * pages_skipped 判定）。
 		 */
-		if (!ConditionalLockBufferForCleanup(buf))
+		if (!shard_vacuum_cleanup_lock(buf))
 		{
 			ReleaseBuffer(buf);
 			stats->pages_skipped++;

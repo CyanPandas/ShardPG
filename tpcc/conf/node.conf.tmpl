@@ -48,11 +48,13 @@ pg_partdist.tso_conninfo = 'host=@COORD_HOST@ port=@COORD_PORT@ dbname=postgres 
 pg_partdist.tso_lease_ms = 60000
 
 # ---- 分片 vacuum（TPC-C 分支） ----
-# 回卷护栏阈值保持默认（2 亿）；回收触发单独设：龄满 2 万就清一次，
-# 同一分片两次之间至少隔 5 分钟（热点页拿不到 cleanup lock 时不至于每 5 s 重扫）。
+# 回卷护栏阈值保持默认（2 亿）；回收触发单独设：龄满 1000 就清，同一分片最少隔 5 s。
+# 压测下死版本堆积比扫描代价高得多（热表膨胀、索引链变长），所以清得勤；
+# 物理截尾暂关（与并发扩展的交互尚未完全验证），只回收槽位不缩文件。
 pg_partdist.shard_vacuum_auto = on
-pg_partdist.shard_vacuum_trigger_age = 20000
-pg_partdist.shard_vacuum_trigger_interval_s = 300
+pg_partdist.shard_vacuum_trigger_age = 1000
+pg_partdist.shard_vacuum_trigger_interval_s = 5
+pg_partdist.shard_vacuum_truncate = off
 
 # ---- 日志（长跑取证） ----
 logging_collector = on
