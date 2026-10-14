@@ -1806,6 +1806,7 @@ typedef void (*SelfCallDone) (PGresult *res, bool ok, const char *errmsg);
 
 static PGconn *vac_auto_conn = NULL;
 static PGconn *repair_conn = NULL;
+static PGconn *dtx_sweep_conn = NULL;	/* 第三路：未决 2PC 清扫（见 ShardDtxSweepSelfTrigger） */
 
 static bool
 self_call_start(PGconn **connp, const char *sql)
@@ -1896,12 +1897,38 @@ vac_auto_done(PGresult *res, bool ok, const char *err)
 				(errmsg("pg_partdist: 分片 vacuum 自动启动器调用失败：%s", err)));
 }
 
-/* 心跳每轮调一次：推进两路在途的自连调用 */
+static void
+dtx_sweep_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+		elog(LOG, "pg_partdist: 未决 2PC 清扫收敛 %s 笔", PQgetvalue(res, 0, 0));
+	else if (!ok)
+		elog(LOG, "pg_partdist: 未决 2PC 清扫调用失败：%s", err);
+}
+
+/* 心跳每轮调一次：推进在途的自连调用 */
 void
 ShardSelfCallsPoll(void)
 {
 	(void) self_call_poll(&vac_auto_conn, vac_auto_done);
 	(void) self_call_poll(&repair_conn, repair_done);
+	(void) self_call_poll(&dtx_sweep_conn, dtx_sweep_done);
+}
+
+/*
+ * TPC-C 分支：未决 2PC 清扫的异步版（取代心跳里同步的 DtxPendingSelfTriggerSweep）。
+ * 清扫要远程问询协调组 leader；单副本迷你集群装载期间实测心跳因此 45 s 没续上租，
+ * coordinator 与 worker 同一秒被栅栏作废。
+ */
+void
+ShardDtxSweepSelfTrigger(void)
+{
+	if (dtx_sweep_conn != NULL)
+		return;					/* 上一次还在跑 */
+	/* 限时：一次清扫卡住不能让这一路永远占着、后续清扫都起不来 */
+	(void) self_call_start(&dtx_sweep_conn,
+						   "SET statement_timeout = 60000; "
+						   "SELECT partdist.dtx_pending_sweep()");
 }
 
 bool

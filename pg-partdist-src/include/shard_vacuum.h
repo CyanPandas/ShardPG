@@ -163,5 +163,6 @@ extern void ShardDivergedSelfTriggerRepair(void);
 /* TPC-C 分支：两路自连改为异步，心跳每轮推进一次（不阻塞续租） */
 extern void ShardSelfCallsPoll(void);
 extern bool ShardDivergedRepairInFlight(void);
+extern void ShardDtxSweepSelfTrigger(void);
 
 #endif							/* SHARD_VACUUM_H */

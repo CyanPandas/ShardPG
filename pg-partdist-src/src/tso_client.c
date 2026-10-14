@@ -679,7 +679,7 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * 里做 SPI 寻址 + 远程 peek。登记表空则零开销。
 		 */
 		if (DtxPendingCount() > 0)
-			DtxPendingSelfTriggerSweep();
+			ShardDtxSweepSelfTrigger();	/* TPC-C 分支：异步，不拖住续租 */
 
 		/*
 		 * T7.17（P7-V1）：分片 vacuum 自动启动器。
