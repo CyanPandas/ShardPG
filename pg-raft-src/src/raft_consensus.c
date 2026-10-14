@@ -9922,6 +9922,7 @@ dtx_flush_pending_broadcast(void)
     {
         void (*bcast) (int64, int, int64) =
             (void (*) (int64, int, int64)) *bcast_rv;
+        MemoryContext bcxt = CurrentMemoryContext;
 
         PG_TRY();
         {
@@ -9929,7 +9930,15 @@ dtx_flush_pending_broadcast(void)
         }
         PG_CATCH();
         {
+            ErrorData  *ed;
+
+            MemoryContextSwitchTo(TopMemoryContext);
+            ed = CopyErrorData();
             FlushErrorState();  /* 广播是尽力而为，绝不打穿提交路径 */
+            MemoryContextSwitchTo(bcxt);
+            elog(LOG, "pg_raft: 决议广播失败（dtxid=%lld）：%s",
+                 (long long) pending_bcast.dtxid, ed->message);
+            FreeErrorData(ed);
         }
         PG_END_TRY();
     }
@@ -12731,6 +12740,8 @@ dtx_master_pre_record_commit(void)
  * 登记落盘 < [B] < ack ⇒ "prepared 存在 ⇒ 登记必在"。一次小事务的 fsync
  * 换写集完整性，值得。
  */
+static PGconn *note_selfconn = NULL;
+
 bool
 pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
                              const int64 *gsids, int ngsids)
@@ -12745,14 +12756,29 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
     if (gid == NULL)
         return true;
 
-    pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
-    conn = PQconnectdb(selfconn);
-    if (PQstatus(conn) != CONNECTION_OK)
+    /*
+     * ★ TPC-C 分支：自连接按 backend 缓存。原来每次 PREPARE 都 PQconnectdb 一次
+     * = 本节点 fork 一个新后端、走一遍认证与 relcache 预热，128 终端下这是每笔
+     * 2PC 的固定毫秒级开销。连接上每条语句自动提交，独立事务的语义不变。
+     */
+    if (note_selfconn != NULL && PQstatus(note_selfconn) != CONNECTION_OK)
     {
-        elog(WARNING, "pg_raft: DTX 参与登记连回本节点失败: %s", PQerrorMessage(conn));
-        PQfinish(conn);
-        return false;
+        PQfinish(note_selfconn);
+        note_selfconn = NULL;
     }
+    if (note_selfconn == NULL)
+    {
+        pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
+        note_selfconn = PQconnectdb(selfconn);
+        if (PQstatus(note_selfconn) != CONNECTION_OK)
+        {
+            elog(WARNING, "pg_raft: DTX 参与登记连回本节点失败: %s", PQerrorMessage(note_selfconn));
+            PQfinish(note_selfconn);
+            note_selfconn = NULL;
+            return false;
+        }
+    }
+    conn = note_selfconn;
 
     initStringInfo(&sql);
     appendStringInfoString(&sql, "SELECT partdist.dtx_note_participant(");
@@ -12763,7 +12789,6 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
         if (q == NULL)
         {
             pfree(sql.data);
-            PQfinish(conn);
             return false;
         }
         appendStringInfoString(&sql, q);
@@ -12781,7 +12806,11 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
         elog(WARNING, "pg_raft: DTX 参与登记失败: %s", PQerrorMessage(conn));
     PQclear(res);
     pfree(sql.data);
-    PQfinish(conn);
+    if (!ok && PQtransactionStatus(conn) != PQTRANS_IDLE)
+    {
+        PQfinish(note_selfconn);    /* 状态不明的连接不复用 */
+        note_selfconn = NULL;
+    }
     return ok;
 }
 

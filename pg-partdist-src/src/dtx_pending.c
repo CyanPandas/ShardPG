@@ -13,6 +13,7 @@
 #include "gxid.h"					/* T7.1：从 gxid 还原本地 xid */
 #include "partwal_sync.h"			/* T7.1：判决标记补发 */
 #include "partition_wal_header.h"	/* T7.1：XLOG_XACT_* / MARKER 载荷 */
+#include "partition_wal_writer.h"	/* partwal_fast_commit */
 
 #include "access/htup_details.h"
 #include "executor/spi.h"
@@ -56,6 +57,13 @@ typedef struct DtxPendingCtl
 {
 	slock_t		mutex;
 	int			nused;
+	/*
+	 * TPC-C 分支：gxid / dtxid 的紧凑镜像（与 e[] 同下标，0 = 空槽）。每项约 2 KB，
+	 * 原来按 e[i].gxid 跨 2 KB 步长扫 1024 项 = 上千次缓存缺失，全程持自旋锁；
+	 * 读者、广播、登记都在扫，128 终端下这把锁成了排队点。镜像扫 8 KB 连续内存。
+	 */
+	int64		gx[DTX_PENDING_MAX];
+	int64		dx[DTX_PENDING_MAX];
 	DtxPendingEntry e[DTX_PENDING_MAX];
 	int			recent_next;
 	DtxRecentEnt recent[DTX_RECENT_MAX];
@@ -146,7 +154,7 @@ pending_find_locked(int64 gxid)
 	int			i;
 
 	for (i = 0; i < DTX_PENDING_MAX; i++)
-		if (PendingCtl->e[i].gxid == gxid)
+		if (PendingCtl->gx[i] == gxid)
 			return &PendingCtl->e[i];
 	return NULL;
 }
@@ -205,6 +213,8 @@ pending_insert_locked(const DtxPendingEntry *ent)
 		return PENDING_INS_FULL;	/* 满了：不覆盖别人（覆盖 = 那笔事务永失收敛通道） */
 	PendingCtl->nused++;
 	*slot = *ent;
+	PendingCtl->gx[slot - PendingCtl->e] = ent->gxid;
+	PendingCtl->dx[slot - PendingCtl->e] = ent->dtxid;
 	return PENDING_INS_OK;
 }
 
@@ -229,7 +239,11 @@ pending_remove_locked(int64 gxid)
 
 	if (slot != NULL)
 	{
-		memset(slot, 0, sizeof(*slot));
+		PendingCtl->gx[slot - PendingCtl->e] = 0;
+		PendingCtl->dx[slot - PendingCtl->e] = 0;
+		/* 只清头部即可：空槽靠 gx[] 判定，pairs 下次登记整条覆盖 */
+		slot->gxid = 0;
+		slot->nxids = 0;
 		PendingCtl->nused--;
 	}
 }
@@ -347,8 +361,12 @@ DtxPendingRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 	ent.nxids = nxids;
 	memcpy(ent.pairs, pairs, (Size) nxids * 2 * sizeof(uint32));
 
-	/* 持久化点：OPEN fsync 先于 shmem 登记（也先于 PREPARE 的 WAL 刷盘） */
-	dtx_jrnl_append(DTX_JRNL_OPEN, &ent, true);
+	/*
+	 * 持久化点：OPEN fsync 先于 shmem 登记（也先于 PREPARE 的 WAL 刷盘）。
+	 * 单副本快速提交下不 fsync：prepared 一旦持久，崩溃恢复时 2PC 段的 recover
+	 * 回调会 DtxPendingReRegister 补登；PREPARE 之前就崩 = 事务本身不存在。
+	 */
+	dtx_jrnl_append(DTX_JRNL_OPEN, &ent, !partwal_fast_commit);
 
 	SpinLockAcquire(&PendingCtl->mutex);
 	rc = pending_insert_locked(&ent);
@@ -443,7 +461,7 @@ DtxPendingContainsDtxid(int64 dtxid)
 		return false;
 	SpinLockAcquire(&PendingCtl->mutex);
 	for (i = 0; i < DTX_PENDING_MAX; i++)
-		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
+		if (PendingCtl->gx[i] != 0 && PendingCtl->dx[i] == dtxid)
 		{
 			found = true;
 			break;
@@ -934,7 +952,7 @@ DtxPendingSweep(void)
 
 	SpinLockAcquire(&PendingCtl->mutex);
 	for (i = 0; i < DTX_PENDING_MAX; i++)
-		if (PendingCtl->e[i].gxid != 0)
+		if (PendingCtl->gx[i] != 0)
 			snap[nsnap++] = PendingCtl->e[i];
 	SpinLockRelease(&PendingCtl->mutex);
 
@@ -1320,17 +1338,100 @@ DtxReaderCloseOrphan(Oid shard, bool *search_complete)
  * 对端按 dtxid 找自己的未决登记、幂等落分片 clog（与清扫同一落账函数）。
  * 由 pg_raft 决议点经 rendezvous "partdist_dtx_broadcast_fn" 调用。
  */
+/*
+ * TPC-C 分支：广播连接按 backend 缓存。原来每个参与节点每笔决议 PQconnectdb 一次
+ * （对端 fork 新后端），128 终端下既慢又常撞 connect_timeout —— 推不到的判决堆进
+ * 未决登记表，表满后读者全走慢路径。
+ */
+#define DTX_BCAST_CONN_MAX	16
+
+typedef struct DtxBcastConn
+{
+	char		host[NAMEDATALEN];
+	int			port;
+	PGconn	   *conn;
+} DtxBcastConn;
+
+static DtxBcastConn bcast_conns[DTX_BCAST_CONN_MAX];
+static int	bcast_nconns = 0;
+
+static PGconn *
+dtx_bcast_conn(const char *host, int port)
+{
+	char		conninfo[256];
+	int			i;
+	DtxBcastConn *c = NULL;
+
+	for (i = 0; i < bcast_nconns; i++)
+		if (bcast_conns[i].port == port && strcmp(bcast_conns[i].host, host) == 0)
+		{
+			c = &bcast_conns[i];
+			break;
+		}
+	if (c != NULL && c->conn != NULL)
+	{
+		if (PQstatus(c->conn) == CONNECTION_OK &&
+			PQtransactionStatus(c->conn) == PQTRANS_IDLE)
+			return c->conn;
+		PQfinish(c->conn);
+		c->conn = NULL;
+	}
+	if (c == NULL)
+	{
+		if (bcast_nconns >= DTX_BCAST_CONN_MAX)
+			return NULL;
+		c = &bcast_conns[bcast_nconns++];
+		strlcpy(c->host, host, NAMEDATALEN);
+		c->port = port;
+		c->conn = NULL;
+	}
+	snprintf(conninfo, sizeof(conninfo),
+			 "host=%s port=%d dbname=postgres user=postgres "
+			 "connect_timeout=2 options='-c statement_timeout=2000'",
+			 host, port);
+	c->conn = PQconnectdb(conninfo);
+	if (PQstatus(c->conn) != CONNECTION_OK)
+	{
+		PQfinish(c->conn);
+		c->conn = NULL;
+	}
+	return c->conn;
+}
+
+static void
+dtx_bcast_drop(PGconn *conn)
+{
+	int			i;
+
+	for (i = 0; i < bcast_nconns; i++)
+		if (bcast_conns[i].conn == conn)
+		{
+			PQfinish(conn);
+			bcast_conns[i].conn = NULL;
+		}
+}
+
 void
 DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 {
-	char		sql[256];
+	char		sql[1024];		/* 原 256：17 位 dtxid 下参与者查询被截断成语法错误，广播全军覆没 */
 	char		hosts[16][NAMEDATALEN];
 	int			ports[16];
+	int			nodeids[16];
+	PGconn	   *sent[16];
 	int			nnodes = 0;
+	int			self_id = -1;
 	int			i;
 
 	if (dtxid == 0 || (verdict != 1 && verdict != 2))
 		return;
+
+	{
+		const char *nid = GetConfigOption("pg_raft.node_id", true, false);
+
+		if (nid != NULL)
+			self_id = atoi(nid);
+	}
 
 	/*
 	 * ★ SPI 必须在**任何**出口关闭：本函数跑在 dtx_write_decision 的提交
@@ -1343,7 +1444,7 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 	PG_TRY();
 	{
 		snprintf(sql, sizeof(sql),
-				 "SELECT DISTINCT n.hostname, n.port "
+				 "SELECT DISTINCT n.hostname, n.port, n.node_id "
 				 "  FROM partdist.dtx_participant dp "
 				 "  JOIN partdist.shard_identity si "
 				 "    ON si.global_shard_id = ANY (dp.gsids) "
@@ -1358,16 +1459,21 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 			for (i = 0; i < np && nnodes < 16; i++)
 			{
 				bool		isnull;
+				bool		idnull;
 				char	   *h = SPI_getvalue(SPI_tuptable->vals[i],
 											 SPI_tuptable->tupdesc, 1);
 				Datum		pd = SPI_getbinval(SPI_tuptable->vals[i],
 											   SPI_tuptable->tupdesc, 2,
 											   &isnull);
+				Datum		nd = SPI_getbinval(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 3,
+											   &idnull);
 
 				if (h == NULL || isnull)
 					continue;
 				strlcpy(hosts[nnodes], h, NAMEDATALEN);
 				ports[nnodes] = DatumGetInt32(pd);
+				nodeids[nnodes] = idnull ? -2 : DatumGetInt32(nd);
 				nnodes++;
 			}
 		}
@@ -1378,28 +1484,48 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 	}
 	PG_END_TRY();
 
+	/* 先把远端的请求全发出去（流水），本节点那份就地落账，最后统一收回执 */
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist.dtx_apply_decision(%lld, %d, %lld)",
+			 (long long) dtxid, verdict, (long long) commit_ts);
 	for (i = 0; i < nnodes; i++)
 	{
-		char		conninfo[256];
-		PGconn	   *conn;
-		PGresult   *res;
-
-		snprintf(conninfo, sizeof(conninfo),
-				 "host=%s port=%d dbname=postgres user=postgres "
-				 "connect_timeout=2 options='-c statement_timeout=2000'",
-				 hosts[i], ports[i]);
-		conn = PQconnectdb(conninfo);
-		if (PQstatus(conn) != CONNECTION_OK)
+		sent[i] = NULL;
+		if (nodeids[i] == self_id)
+			continue;
+		sent[i] = dtx_bcast_conn(hosts[i], ports[i]);
+		if (sent[i] != NULL && !PQsendQuery(sent[i], sql))
 		{
-			PQfinish(conn);
-			continue;			/* 推不到就算了，拉取通道兜底 */
+			dtx_bcast_drop(sent[i]);
+			sent[i] = NULL;		/* 推不到就算了，拉取通道兜底 */
 		}
-		snprintf(sql, sizeof(sql),
-				 "SELECT partdist.dtx_apply_decision(%lld, %d, %lld)",
-				 (long long) dtxid, verdict, (long long) commit_ts);
-		res = PQexec(conn, sql);
-		PQclear(res);
-		PQfinish(conn);
+	}
+	for (i = 0; i < nnodes; i++)
+		if (nodeids[i] == self_id)
+		{
+			int			n = DtxApplyDecisionByDtxid(dtxid, verdict, commit_ts);
+
+			if (n == 0)
+				elog(DEBUG1, "pg_partdist: 广播本机落账 0 笔 dtxid=%lld pending=%d",
+					 (long long) dtxid, DtxPendingCount());
+		}
+	if (nnodes == 0)
+		elog(DEBUG1, "pg_partdist: 广播收件人为空 dtxid=%lld", (long long) dtxid);
+	for (i = 0; i < nnodes; i++)
+	{
+		PGresult   *res;
+		bool		bad = false;
+
+		if (sent[i] == NULL)
+			continue;
+		while ((res = PQgetResult(sent[i])) != NULL)
+		{
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+				bad = true;
+			PQclear(res);
+		}
+		if (bad && PQtransactionStatus(sent[i]) != PQTRANS_IDLE)
+			dtx_bcast_drop(sent[i]);
 	}
 }
 
@@ -1418,8 +1544,11 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 int
 DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 {
-	/* 堆上：每项约 2 KB，整表拷贝放栈上会爆（容量已从 128 提到 1024） */
-	DtxPendingEntry *snap = (DtxPendingEntry *) palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
+	/*
+	 * 同一 dtxid 在本节点通常只有 1 条登记（多条连接的段已按 gxid 并成一条）；
+	 * 原来每次 palloc 整表 2 MB 当快照，广播每笔都付。这里按需拷，最多 8 条一批。
+	 */
+	DtxPendingEntry snap[8];
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;
@@ -1428,8 +1557,8 @@ DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 		return 0;
 
 	SpinLockAcquire(&PendingCtl->mutex);
-	for (i = 0; i < DTX_PENDING_MAX; i++)
-		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
+	for (i = 0; i < DTX_PENDING_MAX && nsnap < lengthof(snap); i++)
+		if (PendingCtl->gx[i] != 0 && PendingCtl->dx[i] == dtxid)
 			snap[nsnap++] = PendingCtl->e[i];
 	SpinLockRelease(&PendingCtl->mutex);
 
