@@ -38,6 +38,9 @@
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_namespace.h"
+#include "pgstat.h"
+#include "utils/lsyscache.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "access/xact.h"
@@ -11025,17 +11028,13 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
      * 错判成 ABORT，所以删除条件是"发起 backend 已死 && 所有节点都已无该 gid
      * 的 prepared 事务"，任一节点不可达即整轮放弃。
      */
-    if (pg_raft_coordinator_node_id > 0 &&
-        pg_raft_node_id == pg_raft_coordinator_node_id)
-    {
-        static int gc_tick = 0;
-
-        if (++gc_tick >= 6)
-        {
-            gc_tick = 0;
-            (void) dtx_gc_dist_transaction();
-        }
-    }
+    /*
+     * ★ TPC-C 分支：每个节点、每轮都跑（函数下推后 2PC 驱动者是 worker，行写在
+     * worker 本地的 pg_dist_transaction 里）。原先"static 计数满 6 轮才跑一次"
+     * 从未触发过：恢复守护每轮经**新建的**自连接调用本函数，计数在新后端里
+     * 永远从 0 开始。
+     */
+    (void) dtx_gc_dist_transaction();
 
     PG_RETURN_INT32(handled);
 }
@@ -11478,13 +11477,18 @@ dtx_gc_dist_transaction(void)
      * 候选 = 发起 backend 已死的行。存活栅栏在同一条 SQL 里做（都在本机）：
      * gid 第二段是发起 backend 的 pid。
      */
+    /*
+     * ★ TPC-C 分支：候选不再要求"发起 backend 已死"。函数下推后 2PC 由 worker 上
+     * 的池化连接驱动，这些 backend 常驻不退 —— 行永远不进候选，表只增不减
+     * （128 终端几轮下来 4 万行），而每笔 2PC 驱动者的提交探针都要扫它。
+     * 去掉它是安全的：本查询只看得见已提交的行，Citus 写这行时全部 PREPARE 都已
+     * 成功；此后"全网（含本机）都没有这个 gid 的 prepared" ⇔ COMMIT PREPARED 已
+     * 全部做完，行再无用处。下面的逐节点确认原样保留，任一节点不可达整轮放弃。
+     */
     initStringInfo(&sql);
     appendStringInfoString(&sql,
         "SELECT DISTINCT t.gid FROM pg_catalog.pg_dist_transaction t "
-        " WHERE (split_part(t.gid, '_', 3) ~ '^[0-9]+$') "
-        "   AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a "
-        "                    WHERE a.pid = split_part(t.gid, '_', 3)::int) "
-        " LIMIT 128");
+        " LIMIT 5000");
     if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
     {
         MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
@@ -11558,18 +11562,25 @@ dtx_gc_dist_transaction(void)
         pfree(qry.data);
     }
 
-    /* 删除全网确认已闭合的行 */
+    /* 删除全网确认已闭合的行（一条 DELETE 批量删，候选上限已提到 5000） */
     if (!raft_persist_spi_begin(&spi_owned))
         return -1;
-    for (i = 0; i < n; i++)
     {
-        if (keep[i] || gids[i] == NULL)
-            continue;
+        bool        any = false;
+
         initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "DELETE FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
-                         quote_literal_cstr(gids[i]));
-        if (SPI_execute(sql.data, false, 0) == SPI_OK_DELETE)
+        appendStringInfoString(&sql,
+            "DELETE FROM pg_catalog.pg_dist_transaction WHERE gid = ANY(ARRAY[");
+        for (i = 0; i < n; i++)
+        {
+            if (keep[i] || gids[i] == NULL)
+                continue;
+            appendStringInfo(&sql, "%s%s", any ? "," : "",
+                             quote_literal_cstr(gids[i]));
+            any = true;
+        }
+        appendStringInfoString(&sql, "]::text[])");
+        if (any && SPI_execute(sql.data, false, 0) == SPI_OK_DELETE)
             deleted += (int) SPI_processed;
         pfree(sql.data);
     }
@@ -12400,6 +12411,40 @@ done:
     PG_END_TRY();
 }
 
+/*
+ * TPC-C 分支：本事务是否往 pg_dist_transaction 插过行（= Citus 2PC 驱动者）。
+ *
+ * 原先每笔写事务提交都跑一次 "WHERE t.xmin = pg_current_xact_id()" 的 SPI 探针 ——
+ * 那是对 pg_dist_transaction 的顺序扫描，表里攒着全部未回收的 2PC 记录，
+ * 128 终端实测吃掉 worker 约 1/4 的 CPU（perf：ExecInterpExpr / heapgettup /
+ * heap_getsysattr / xid8toxid 一串）。改为先看 pgstat 的本事务插入计数（O(1)、
+ * 无 SPI）：计数为 0 即不是驱动者，直接返回。
+ *
+ * 返回 true = 不能排除（计数 > 0，或统计未开启 / 表不存在无法判断）—— 调用方
+ * 照旧走 SPI 探针。宁可多探一次，绝不漏判：漏判 = 决议永远不做 = 行永久不可见。
+ */
+static bool
+dtx_maybe_wrote_dist_transaction(void)
+{
+    Oid         dist_txn_relid;
+    PgStat_TableStatus *tab;
+    PgStat_TableXactStatus *trans;
+    PgStat_Counter n = 0;
+
+    if (!pgstat_track_counts)
+        return true;
+    /* 每次查 syscache（命中即哈希一次）：不缓存 OID，免得 Citus 重建后拿着旧号漏判 */
+    dist_txn_relid = get_relname_relid("pg_dist_transaction", PG_CATALOG_NAMESPACE);
+    if (!OidIsValid(dist_txn_relid))
+        return true;            /* 未装 Citus：交给原路径判（它自己会退出） */
+    tab = find_tabstat_entry(dist_txn_relid);
+    if (tab == NULL)
+        return false;
+    for (trans = tab->trans; trans != NULL; trans = trans->upper)
+        n += trans->tuples_inserted;
+    return n > 0;
+}
+
 static void
 dtx_master_pre_record_commit(void)
 {
@@ -12449,6 +12494,9 @@ dtx_master_pre_record_commit(void)
      * 提交多一次只读小查询；只读事务在下一行就已退出。
      */
     if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
+        return;
+
+    if (!dtx_maybe_wrote_dist_transaction())
         return;
 
     /* ---- 1) 本事务刚写进 pg_dist_transaction 的行 = 已 prepare 的参与节点 ---- */
