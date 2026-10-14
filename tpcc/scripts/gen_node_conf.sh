@@ -21,7 +21,11 @@ for i in "${!NODE_IDS[@]}"; do
   # 复制认领位，把装载/压测写入拖到"等待复制认领位超过 60000 ms"。
   if [[ "${REPLICAS:-0}" == 0 ]]; then
     { echo; echo "# ---- 单副本（REPLICAS=0）：无副本可分叉，关自动修复 ----"
-      echo "pg_partdist.auto_repair_diverged = off"; } >> "$out/node$id.conf"
+      echo "pg_partdist.auto_repair_diverged = off"
+      # 单副本快速提交：分区 WAL / 单成员组 hardstate 不 fsync，数据与标记一轮复制。
+      # 持久化以 pg_wal 为准（崩溃可能丢分区流尾部）；多副本模式绝不能开。
+      echo "pg_partdist.single_replica_fast_commit = on"
+      echo "pg_raft.single_member_fast_commit = on"; } >> "$out/node$id.conf"
   fi
   # 可选覆盖段（后写者生效）：小机器上压内存、调超时等，不必改模板
   if [[ -n "${NODE_CONF_EXTRA:-}" ]]; then
