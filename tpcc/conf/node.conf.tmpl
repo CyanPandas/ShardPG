@@ -1,0 +1,64 @@
+# ShardPG TPC-C 节点配置模板（追加到每个节点的 postgresql.conf）。
+# scripts/gen_node_conf.sh 会替换 @...@ 占位符，按 cluster.env 生成每个节点的一份。
+
+port = @PORT@
+listen_addresses = '*'
+shared_preload_libraries = 'citus,pg_partdist,pg_raft'
+
+# ---- 连接与 2PC ----
+# 16 终端 × Citus 到各 worker 的连接 + worker 取 TSO 的自连 + Raft/DTX 自连。
+# W7 实测：32 客户端打满 max_connections=100 后 worker 取 commit_ts 失败、事务中止。
+max_connections = 400
+max_prepared_transactions = 400
+citus.max_client_connections = 300
+
+# ---- 资源（按 16 GB 内存的服务器给的起点，按实际机器调） ----
+shared_buffers = 4GB
+work_mem = 16MB
+maintenance_work_mem = 512MB
+max_wal_size = 8GB
+checkpoint_timeout = 15min
+effective_cache_size = 8GB
+
+# ---- ShardPG 硬约束 ----
+synchronous_commit = on               # §10：分片表禁异步提交（off 时写分片表直接报错）
+citus.recover_2pc_interval = -1       # DTX-2PC §9.4：Citus 自带 2PC 恢复会造成分叉提交，必须关
+citus.shard_replication_factor = 1    # 复制由 Raft 负责
+
+# ---- Raft ----
+pg_raft.node_id = @NODE_ID@
+pg_raft.raft_enabled = on
+pg_raft.peers = '@PEERS@'
+pg_raft.coordinator_node_id = 1
+pg_raft.heartbeat_ms = 500
+pg_raft.election_timeout_ms = 6000
+pg_raft.probe_interval_ms = 3000
+pg_raft.probe_fail_threshold = 3
+# 组数上限（PGC_POSTMASTER，决定共享内存里组表的大小，约 104 KB/组）。
+# 8 张分布表 × SHARD_COUNT 个分片，每台 worker 都是每个组的成员：6 分片 ⇒ 48 组 + 控制组。
+pg_raft.max_groups = 64
+# TPC-C 分支：多机部署
+pg_raft.loopback_node_names = off     # 节点名不再回环映射；主机名原样交给 libpq
+pg_raft.peer_connect_timeout_s = 3    # 压测负载下跨机建连偶有毛刺，1 s 会把活着的对端判死
+
+# ---- TSO（必须在灌任何数据之前生效：P7-G4） ----
+pg_partdist.tso_master = @TSO_MASTER@
+pg_partdist.tso_conninfo = 'host=@COORD_HOST@ port=@COORD_PORT@ dbname=postgres user=postgres'
+pg_partdist.tso_lease_ms = 60000
+
+# ---- 分片 vacuum（TPC-C 分支） ----
+# 回卷护栏阈值保持默认（2 亿）；回收触发单独设：龄满 2 万就清一次，
+# 同一分片两次之间至少隔 5 分钟（热点页拿不到 cleanup lock 时不至于每 5 s 重扫）。
+pg_partdist.shard_vacuum_auto = on
+pg_partdist.shard_vacuum_trigger_age = 20000
+pg_partdist.shard_vacuum_trigger_interval_s = 300
+
+# ---- 日志（长跑取证） ----
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql-%Y%m%d-%H.log'
+log_rotation_age = 1h
+log_line_prefix = '%m [%p] %q%u@%d '
+log_min_duration_statement = 5000
+log_lock_waits = on
+deadlock_timeout = 1s
