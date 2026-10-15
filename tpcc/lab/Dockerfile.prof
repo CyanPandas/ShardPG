@@ -1,0 +1,24 @@
+FROM shardpg:tpcc-01e5635-20261014
+USER root
+COPY fix-src.tar.gz /tmp/fix-src.tar.gz
+RUN set -eu; rm -rf /work/pg-partdist-src /work/pg-raft-src /work/tpcc; \
+    tar -xzf /tmp/fix-src.tar.gz -C /work; \
+    cd /work/postgres-src; \
+    for p in /work/pg-partdist-src/patches/0012-*.patch /work/pg-partdist-src/patches/0013-*.patch /work/pg-partdist-src/patches/0014-*.patch /work/pg-partdist-src/patches/0015-*.patch; do \
+      [ -f "$p" ] || continue; patch -p1 --forward < "$p"; done; \
+    make -j16 >/tmp/pg-build.log 2>&1 || { tail -40 /tmp/pg-build.log; exit 1; }; \
+    make install >/dev/null; \
+    cd /work/citus-src; \
+    for p in /work/pg-partdist-src/patches/citus-*.patch; do \
+      [ -f "$p" ] || continue; patch -p1 --forward < "$p"; done; \
+    make -j8 >/tmp/citus-build.log 2>&1 || { tail -40 /tmp/citus-build.log; exit 1; }; \
+    make install >/dev/null; \
+    for d in pg-partdist-src pg-raft-src; do \
+      make -C /work/$d clean PG_CONFIG=/work/pg-install/bin/pg_config >/dev/null; \
+      make -C /work/$d -j4 PG_CONFIG=/work/pg-install/bin/pg_config; \
+      make -C /work/$d install PG_CONFIG=/work/pg-install/bin/pg_config; done; \
+    chown -R postgres /work/tpcc; rm -f /tmp/fix-src.tar.gz
+LABEL tpcc.fix="fast-commit+citus-0001+pg-0012"
+ENV LD_LIBRARY_PATH=/work/pg-install/lib
+USER postgres
+CMD ["/bin/sleep","infinity"]
