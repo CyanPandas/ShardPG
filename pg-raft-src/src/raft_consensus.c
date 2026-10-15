@@ -39,6 +39,7 @@
 #include "lib/stringinfo.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_namespace.h"
+#include "access/shard_stamp.h"	/* 补丁 0014：shard_elr_inhibit */
 #include "pgstat.h"
 #include "utils/lsyscache.h"
 #include "utils/array.h"
@@ -12570,6 +12571,9 @@ dtx_master_pre_record_commit(void)
      * 否则表现就是"2PC 事务提交成功但决议永远不出现、行永久不可见"，
      * 而日志上一片安静（2026-09-09 在 pg-test 环境实测踩过一整轮）。
      */
+    /* 补丁 0014：2PC 驱动者的本地提交必须先刷盘，Citus 才能发 COMMIT PREPARED */
+    if (probe_rows > 0)
+        shard_elr_inhibit = true;
     if (probe_rows > 0)
         elog(LOG, "pg_raft: [R11] 2PC 探针命中 %d 行：dtxid=" INT64_FORMAT " nnodes=%d",
              probe_rows, dtxid, nnodes);
@@ -12578,6 +12582,61 @@ dtx_master_pre_record_commit(void)
 
     if (dtxid == 0 || nnodes == 0)
         return;                     /* 不是跨节点的 Citus 2PC 事务 */
+
+    /*
+     * ★ TPC-C 分支快路径：只有一个参与节点时，一次往返在它上面做完
+     * "取写集 → 选协调组 → 下发协调组 → 决议"（partdist.dtx_local_note_decide，
+     * 同一事务一次提交）。原路径是三次往返 + 参与节点上两次提交 fsync，全部夹在
+     * 本事务持有热行锁（warehouse/district）的提交路径里 —— 等待采样里挡住
+     * 别人的 Payment 有三成正卡在这段远程收尾上。
+     * 决议时间戳提前到这里取：此刻 Citus 的 PREPARE 已全部成功，仍是"票齐"之后。
+     * 对端不是协调组 leader 或任何失败：远端事务整体回滚（协调组也没下发），
+     * 回落到下面的常规路径，语义不变。
+     */
+    if (nnodes == 1)
+    {
+        static void **tso_fast_rv = NULL;
+        int64       fast_cts = 0;
+        PGconn     *fconn;
+        PGresult   *fres;
+        char        fqry[160];
+
+        if (tso_fast_rv == NULL)
+            tso_fast_rv = find_rendezvous_variable("partdist_tso_dtx_decision_ts_fn");
+        if (*tso_fast_rv != NULL)
+            fast_cts = ((int64 (*)(void)) *tso_fast_rv) ();   /* 失败直接 ERROR：尚未下发任何东西 */
+
+        snprintf(fqry, sizeof(fqry),
+                 "SELECT partdist.dtx_local_note_decide(%lld, %lld)",
+                 (long long) dtxid, (long long) fast_cts);
+        fconn = dtx_get_conn(nodes[0].host, nodes[0].port);
+        fres = PQexec(fconn, fqry);
+        if (PQresultStatus(fres) == PGRES_TUPLES_OK && PQntuples(fres) == 1 &&
+            !PQgetisnull(fres, 0, 0))
+        {
+            int     fv = atoi(PQgetvalue(fres, 0, 0));
+
+            PQclear(fres);
+            if (fv == 0)
+                return;             /* 写集为空：不需要决议（同下面 nparts == 0） */
+            if (fv != 1)
+                ereport(ERROR,
+                        (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                         errmsg("pg_raft: 分布式事务 %lld 的全局决议是 ABORT", (long long) dtxid),
+                         errdetail("协调组日志里已有一条 ABORT 决议（多半是恢复守护在推定中止时抢先写入）。")));
+            elog(DEBUG1, "pg_raft: dtx %lld COMMIT（单参与节点快路径）", (long long) dtxid);
+            return;
+        }
+        elog(DEBUG1, "pg_raft: dtx %lld 单参与节点快路径未成，回落常规路径：%s",
+             (long long) dtxid, PQerrorMessage(fconn));
+        PQclear(fres);
+        if (PQtransactionStatus(fconn) != PQTRANS_IDLE)
+        {
+            PGresult *rb = PQexec(fconn, "ROLLBACK");
+
+            PQclear(rb);
+        }
+    }
 
     /* ---- 2) 逐节点取真实写集（只读参与者返回空数组，自动剔除） ---- */
     for (i = 0; i < nnodes; i++)
@@ -12789,6 +12848,7 @@ dtx_master_pre_record_commit(void)
  * 换写集完整性，值得。
  */
 static PGconn *note_selfconn = NULL;
+static bool note_selfconn_async = false;    /* 该连接已 SET synchronous_commit=off */
 
 bool
 pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
@@ -12818,6 +12878,7 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
     {
         pg_raft_format_conninfo("127.0.0.1", PostPortNumber, selfconn, sizeof(selfconn));
         note_selfconn = PQconnectdb(selfconn);
+        note_selfconn_async = false;
         if (PQstatus(note_selfconn) != CONNECTION_OK)
         {
             elog(WARNING, "pg_raft: DTX 参与登记连回本节点失败: %s", PQerrorMessage(note_selfconn));
@@ -12827,6 +12888,19 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
         }
     }
     conn = note_selfconn;
+    /*
+     * ★ TPC-C 分支：登记行异步提交。"prepared 存在 ⇒ 登记必在"由 WAL 次序保证：
+     * 登记的提交记录先于本事务的 PREPARE 记录写进同一条 pg_wal，PREPARE 刷盘时
+     * 它一并落盘；PREPARE 之前崩溃则 prepared 本身不存在。每笔 2PC 省参与节点
+     * 一次 fsync（夹在发起端持热行锁的提交路径里）。
+     */
+    if (!note_selfconn_async)
+    {
+        PGresult   *sr = PQexec(conn, "SET synchronous_commit TO off");
+
+        note_selfconn_async = (PQresultStatus(sr) == PGRES_COMMAND_OK);
+        PQclear(sr);
+    }
 
     initStringInfo(&sql);
     appendStringInfoString(&sql, "SELECT partdist.dtx_note_participant(");

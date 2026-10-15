@@ -146,6 +146,33 @@ CREATE OR REPLACE FUNCTION dtx_decide(
 COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
     '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
 
+-- TPC-C 分支：只有一个参与节点时，master 一次往返在该节点上做完
+-- "取写集 → 选协调组 → 下发协调组 → 决议"（同一事务、一次提交）。
+-- 原来是三次往返、两次提交（note_coord 与决议各一次 fsync），夹在
+-- master 持有热行锁的提交路径里。
+-- 返回：1/2 = 决议；0 = 本节点在该事务里没写纳管分片（无需决议）；
+--       -1 = 本节点不是协调组 leader（调用方回落到常规路径）。
+CREATE OR REPLACE FUNCTION dtx_local_note_decide(p_dtxid bigint, p_commit_ts bigint)
+RETURNS integer LANGUAGE plpgsql VOLATILE AS $fn$
+DECLARE
+    parts bigint[];
+    coord bigint;
+    v     integer;
+BEGIN
+    parts := partdist.dtx_local_participant(p_dtxid);   -- 升序去重
+    IF parts IS NULL OR cardinality(parts) = 0 THEN
+        RETURN 0;
+    END IF;
+    -- 与 master 侧 parts[dtxid % nparts]（qsort 升序）同一选法
+    coord := parts[(p_dtxid % cardinality(parts)) + 1];
+    PERFORM partdist.dtx_note_coord(p_dtxid, coord);
+    v := partdist.dtx_decide(coord, p_dtxid, 1, parts, p_commit_ts);
+    IF v IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'dtx_local_note_decide: not coord leader';
+    END IF;
+    RETURN v;
+END $fn$;
+
 -- R-P4-12：把本节点该组的 apply 积压排空（leader 自追平），返回 last_applied。
 -- dtx_peek 在读表前调它——新 leader 可能尚未 apply 决议，先追平再应答。
 -- R-P4-13 绕行：本地决议行缺失时，向组内其他成员只读拉取该决议。
