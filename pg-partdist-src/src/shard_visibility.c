@@ -74,13 +74,51 @@ typedef struct ShardCommitEntry
 	 */
 	bool		committing;
 	int64		commit_ts;
+	/*
+	 * 补丁 0014 提前放锁：提交记录已插入、锁已放，WAL 尚未刷盘，分片判决等刷完
+	 * 再写（判决先于 WAL 落盘，崩溃后就会有"判决已提交、提交记录却丢了"的行）。
+	 * 写者路径（更新判定、Dirty、唯一性检查、等锁）把它当已提交 —— 它们自己的
+	 * 提交记录排在后面，刷盘必然连带；快照读仍按"提交中"等判决落地，绝不看到
+	 * 可能丢失的数据。
+	 */
+	bool		elr_done;
+	XLogRecPtr	elr_lsn;		/* 该事务提交记录的末尾（读者据此在自己结束前补刷） */
 } ShardCommitEntry;
+
+/*
+ * 本事务读到过的"已放锁待刷盘"版本里，最大的提交记录 LSN。事务结束、回复客户端
+ * 之前须 XLogFlush 到这里（ShardElrTakeObservedLsn，见 shard_xid_xact_callback）——
+ * 这样快照读不必轮询等判决落地，又绝不会把可能因崩溃丢失的数据交给客户端。
+ */
+static XLogRecPtr elr_observed_lsn = InvalidXLogRecPtr;
+
+XLogRecPtr
+ShardElrTakeObservedLsn(void)
+{
+	XLogRecPtr	l = elr_observed_lsn;
+
+	elr_observed_lsn = InvalidXLogRecPtr;
+	return l;
+}
 
 /* 读者等"提交中"事务落定的上限：超时报 40001（可重试），绝不给出未定的判决 */
 #define SHARD_COMMITTING_WAIT_MAX_MS	10000
 
 static HTAB *ShardCommitHash = NULL;
-static LWLock *ShardCommitLock = NULL;
+/*
+ * TPC-C 分支：活跃表分 16 个分区锁（dynahash HASH_PARTITION，按键哈希取锁）。
+ * 原来一把锁，可见性判定每次缓存未命中都抢它的共享模式（perf：LWLock 开销的
+ * 四分之一），提交 / 放锁 / 刷盘后各一次排他。表上没有全表遍历，分区无代价。
+ */
+#define SHARD_COMMIT_PARTITIONS 16
+static LWLock *ShardCommitLocks[SHARD_COMMIT_PARTITIONS];
+#define SC_LOCK(h)	(ShardCommitLocks[(h) % SHARD_COMMIT_PARTITIONS])
+
+static inline uint32
+sc_hash(const ShardCommitKey *k)
+{
+	return get_hash_value(ShardCommitHash, k);
+}
 
 /* ---- 后端终局缓存（COMMITTED/ABORTED 不可变，读一次 clog 记住） ---- */
 
@@ -167,6 +205,7 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				   int64 *cts_out, bool strict)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 	ShardVerdictCacheEntry *ce;
 	ShardClogSlot slot;
@@ -185,6 +224,7 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 
 	key.shard = shard;
 	key.sxid = sxid;
+	kh = sc_hash(&key);
 
 	/*
 	 * ★ TPC-C 分支：终局缓存提到活跃表之前。缓存里只有从 clog 读到或问询学到的
@@ -225,21 +265,41 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 		for (;;)
 		{
 			bool		committing;
+			bool		elr;
+			XLogRecPtr	elr_lsn;
 			int64		cts;
 
-			LWLockAcquire(ShardCommitLock, LW_SHARED);
-			e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+			LWLockAcquire(SC_LOCK(kh), LW_SHARED);
+			e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh,
 												 HASH_FIND, NULL);
 			if (e == NULL)
 			{
-				LWLockRelease(ShardCommitLock);
+				LWLockRelease(SC_LOCK(kh));
 				break;			/* 已落定（或从未在活跃表）：往下查终局 */
 			}
 			if (native_xid)
 				*native_xid = e->native_xid;
 			committing = e->committing;
 			cts = e->commit_ts;
-			LWLockRelease(ShardCommitLock);
+			elr = e->elr_done;
+			elr_lsn = e->elr_lsn;
+			LWLockRelease(SC_LOCK(kh));
+
+			/*
+			 * 补丁 0014："已放锁、待刷盘"一律按已提交判（可见与否照常比 commit_ts）。
+			 * 写者路径：自己的提交记录排在后面，刷盘连带。快照读：记下它的提交记录
+			 * LSN，本事务结束、回复之前补刷到那里 —— 不再 1 ms 一轮地轮询活跃表。
+			 */
+			if (elr)
+			{
+				if (strict && elr_lsn > elr_observed_lsn)
+					elr_observed_lsn = elr_lsn;
+				if (native_xid)
+					*native_xid = InvalidTransactionId;
+				if (cts_out)
+					*cts_out = cts;
+				return SXID_COMMITTED;
+			}
 
 			if (!committing)
 				return SXID_RUNNING;
@@ -282,19 +342,18 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	 * 截断前缓存下的 ABORTED 会在本后端内继续报 ABORTED —— 由上一段的
 	 * "没有元组还会问到那些号"覆盖。
 	 */
+	/*
+	 * TPC-C 分支：认领与截断水位一起走后端缓存（ShardXidClaimedTruncBefore，代数
+	 * 校验）。原先每次缓存未命中都拿两次全局 ShardXidCtl 共享锁线性扫槽位，perf
+	 * 里占 LWLock 开销的四分之一。语义同下面两段注释：先认领再读 clog；免查区
+	 * 以下一律已提交。
+	 */
 	{
-		TransactionId frozen_before;
+		TransactionId frozen_before = ShardXidClaimedTruncBefore(shard);
 
-		ShardVacuumGetWatermarks(shard, &frozen_before, NULL);
 		if (TransactionIdIsValid(frozen_before) && sxid < frozen_before)
 			return SXID_COMMITTED;	/* cts_out 已在函数开头置 0 */
 	}
-
-	/*
-	 * T2.4：咨询 clog 前确保认领已跑（读路径入口；发号路径在分配时已触发）。
-	 * 崩溃遗留的无主 RUNNING 在此改判 ABORTED，之后才读真相源。
-	 */
-	(void) ShardXidEnsureClaimed(shard);
 
 	/* 分片 clog（真相源）。全零/空洞 = RUNNING = 未决不可见（§5.3）。 */
 	(void) ShardClogReadSlot(shard, sxid, &slot);
@@ -966,6 +1025,13 @@ sv_wait_resolve_prepared(Oid shard, TransactionId sxid)
 	int			i;
 
 	(void) ShardClogReadSlot(shard, sxid, &slot);
+	/*
+	 * 调用方刚看到 PREPARED，判决可能就在这之间落地（单参与节点快路径让这个窗口
+	 * 常见了）：已是终局就算"已决"，让调用方重评，而不是当成无主 RUNNING 报错。
+	 */
+	if ((TxnStatus) slot.status == TXN_COMMITTED ||
+		(TxnStatus) slot.status == TXN_ABORTED)
+		return true;
 	if ((TxnStatus) slot.status != TXN_PREPARED)
 		return false;
 
@@ -1146,6 +1212,7 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 						   TransactionId native_xid)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 
 	if (ShardCommitHash == NULL)
@@ -1162,12 +1229,13 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh,
 										 HASH_ENTER_NULL, NULL);
 	if (e == NULL)
 	{
-		LWLockRelease(ShardCommitLock);
+		LWLockRelease(SC_LOCK(kh));
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("分片活跃表已满（上限 %d 条）",
@@ -1177,7 +1245,9 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	e->native_xid = native_xid;
 	e->committing = false;
 	e->commit_ts = 0;
-	LWLockRelease(ShardCommitLock);
+	e->elr_done = false;
+	e->elr_lsn = InvalidXLogRecPtr;
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1190,20 +1260,22 @@ void
 ShardCommitMarkCommitting(Oid shard, TransactionId sxid, int64 commit_ts)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 
 	if (ShardCommitHash == NULL)
 		return;
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_FIND, NULL);
 	if (e != NULL)
 	{
 		e->committing = true;
 		e->commit_ts = commit_ts;
 	}
-	LWLockRelease(ShardCommitLock);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1257,15 +1329,45 @@ ShardSnapshotEagerStart(PlannedStmt *pstmt)
 void
 ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 {
+	ShardCommitMarkEndedTs(shard, sxid, committed,
+						   committed ? TsoStashedCommitTs() : 0);
+}
+
+/* 提前放锁：提交记录已插入、尚未刷盘（见 ShardCommitEntry.elr_done） */
+void
+ShardCommitMarkElrDone(Oid shard, TransactionId sxid, XLogRecPtr lsn)
+{
 	ShardCommitKey key;
+	uint32		kh;
+	ShardCommitEntry *e;
+
+	if (ShardCommitHash == NULL)
+		return;
+	key.shard = shard;
+	key.sxid = sxid;
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_FIND, NULL);
+	if (e != NULL)
+	{
+		e->elr_lsn = lsn;
+		e->elr_done = true;
+	}
+	LWLockRelease(SC_LOCK(kh));
+}
+
+void
+ShardCommitMarkEndedTs(Oid shard, TransactionId sxid, bool committed, int64 cts)
+{
+	ShardCommitKey key;
+	uint32		kh;
 
 	if (ShardCommitHash == NULL)
 		return;
 
 	PG_TRY();
 	{
-		ShardClogSetVerdict(shard, sxid, committed,
-							committed ? TsoStashedCommitTs() : 0);
+		ShardClogSetVerdict(shard, sxid, committed, committed ? cts : 0);
 	}
 	PG_CATCH();
 	{
@@ -1278,12 +1380,13 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	if (hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL) == NULL)
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	if (hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_REMOVE, NULL) == NULL)
 		elog(WARNING,
 			 "pg_partdist: 事务结束时活跃表缺条目（分片 %u，xid %u）",
 			 shard, sxid);
-	LWLockRelease(ShardCommitLock);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1297,14 +1400,16 @@ void
 ShardCommitRemove(Oid shard, TransactionId sxid)
 {
 	ShardCommitKey key;
+	uint32		kh;
 
 	if (ShardCommitHash == NULL)
 		return;
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	(void) hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
-	LWLockRelease(ShardCommitLock);
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	(void) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_REMOVE, NULL);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /* ---- 接线 ---- */
@@ -1330,7 +1435,7 @@ RequestShardCommitShmem(void)
 {
 	RequestAddinShmemSpace(hash_estimate_size(SHARD_COMMIT_MAX_ENTRIES,
 											  sizeof(ShardCommitEntry)));
-	RequestNamedLWLockTranche("pg_partdist_shard_commit", 1);
+	RequestNamedLWLockTranche("pg_partdist_shard_commit", SHARD_COMMIT_PARTITIONS);
 }
 
 void
@@ -1338,18 +1443,22 @@ ShardCommitShmemInit(void)
 {
 	HASHCTL		ctl;
 
+	int			i;
+
 	ShardCommitHash = NULL;
-	ShardCommitLock = NULL;
 
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(ShardCommitKey);
 	ctl.entrysize = sizeof(ShardCommitEntry);
+	ctl.num_partitions = SHARD_COMMIT_PARTITIONS;
 	ShardCommitHash = ShmemInitHash("pg_partdist_shard_commit",
 									SHARD_COMMIT_MAX_ENTRIES,
 									SHARD_COMMIT_MAX_ENTRIES,
 									&ctl,
-									HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
-	ShardCommitLock = &GetNamedLWLockTranche("pg_partdist_shard_commit")[0].lock;
+									HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE |
+									HASH_PARTITION);
+	for (i = 0; i < SHARD_COMMIT_PARTITIONS; i++)
+		ShardCommitLocks[i] = &GetNamedLWLockTranche("pg_partdist_shard_commit")[i].lock;
 }
 
 void

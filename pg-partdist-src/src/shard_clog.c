@@ -375,7 +375,13 @@ ShardClogSetPrepared(Oid shard, TransactionId sxid, int64 start_ts, int64 gxid)
 	slot.status = (uint32) TXN_PREPARED;
 	slot.start_ts = (uint64) start_ts;
 	slot.global_xid = (uint64) gxid;
-	ShardClogWriteSlot(shard, sxid, &slot, true);
+	/*
+	 * 单副本快速提交：不逐笔 fsync，登记脏段由检查点落盘。崩溃后 2PC 段的 recover
+	 * 回调按持久的 prepare 状态重新 ShardClogSetPrepared，丢了也补得回来。
+	 */
+	ShardClogWriteSlot(shard, sxid, &slot,
+					   !(partwal_fast_commit &&
+						 clog_note_dirty(shard, sxid / SHARD_CLOG_XIDS_PER_SEGMENT)));
 }
 
 /*

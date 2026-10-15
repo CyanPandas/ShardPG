@@ -132,6 +132,7 @@ extern int	ShardXidTwoStateShards(Oid *shards, int max);
 extern void ShardXidNoteAutoVacuum(Oid shard, BlockNumber pages);	/* TPC-C 分支：回收触发限流（pages=Invalid 不更新） */
 extern int	ShardXidOverdueCount(void);
 
+extern TransactionId ShardXidClaimedTruncBefore(Oid shard);	/* TPC-C 分支：认领 + 截断水位（后端缓存） */
 extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 									 TransactionId *vacuum_xid);
 extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,

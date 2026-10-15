@@ -727,9 +727,23 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		}
 		t_beat = GetCurrentTimestamp();
 
-		/* 单副本快速提交：分片 clog 判决的延迟 fsync，每轮统一落盘（窗口 ≤ 本轮间隔） */
+		/*
+		 * 单副本快速提交：分片 clog 判决的延迟 fsync。持久性由检查点钩子（内核补丁
+		 * 0015）保证；这里只做 60 s 一次的兜底，免得登记表长期积压。原先每轮都刷，
+		 * 128 终端下每节点每秒几十次 fsync，与 WAL 刷盘抢同一块盘。
+		 */
 		if (partwal_fast_commit)
-			ShardClogSyncDirty();
+		{
+			static TimestampTz last_clog_sync = 0;
+			TimestampTz now_c = GetCurrentTimestamp();
+
+			if (last_clog_sync == 0 ||
+				TimestampDifferenceExceeds(last_clog_sync, now_c, 60000))
+			{
+				ShardClogSyncDirty();
+				last_clog_sync = now_c;
+			}
+		}
 
 		/*
 		 * T4.5：未决 2PC 清扫兜底（读者问询之外的收敛通道）。本工作者无

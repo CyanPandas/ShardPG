@@ -62,6 +62,10 @@ pg_partdist.shard_vacuum_truncate = off
 # UPDATE 与原生 PG 一样等前者提交、在最新版本上重算再改；读仍用 TSO 快照。
 pg_partdist.rc_update_recheck = on
 
+# ---- 提前放锁（需内核补丁 0014）：提交记录插入后先放行锁，回复客户端前再刷 WAL ----
+# 客户端收到的提交仍然持久；热行（warehouse/district）上的后继写者不必排在前者的 fsync 后面。
+pg_partdist.early_lock_release = on
+
 # ---- 日志（长跑取证） ----
 logging_collector = on
 log_directory = 'log'

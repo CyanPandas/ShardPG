@@ -33,6 +33,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "storage/fd.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"		/* P7-N40：孤儿登记 GC 判"表还在不在" */
 #include "access/xlog.h"			/* T7.22：GetXLogInsertRecPtr */
 #include "storage/ipc.h"
@@ -169,6 +170,13 @@ typedef struct ShardXidState
 	uint32		vacuum_cursor;
 
 	/*
+	 * TPC-C 分支：槽位"身份/截断水位"代数。建槽、释放槽、改截断水位时加一；
+	 * 发号不动它。读侧（可见性判定的每次缓存未命中）据此在后端本地缓存
+	 * 截断水位与"已认领"，不必每次拿全局 ShardXidCtl 锁线性扫 256 个槽。
+	 */
+	pg_atomic_uint64 wm_gen;
+
+	/*
 	 * T2.7 partition_map 驱动门控：已登记打标的表 OID 集合。真相 =
 	 * partition_map.shard_mvcc 列（注册函数写）；本集合是运行时判定用的
 	 * 影子，重启时由 ShardXidShmemInit 扫 pg_shard_xid/ 目录重建（注册即
@@ -202,6 +210,39 @@ static struct
 	TransactionId sxid;
 }			xact_map[SHARD_XID_MAX_PER_XACT];
 static int	xact_map_n = 0;
+
+/*
+ * 补丁 0014 提前放锁：本次提交待刷盘后才写的分片判决（XACT_EVENT_COMMIT 里
+ * 拷出来 —— 那之后 xact_map 与 TSO 暂存都会被清掉）。
+ */
+static struct
+{
+	Oid			shard;
+	TransactionId sxid;
+}			elr_map[SHARD_XID_MAX_PER_XACT];
+static int	elr_map_n = 0;
+static int64 elr_cts = 0;
+static MemoryContext elr_cxt = NULL;
+
+/* 内核在 CommitTransaction 末尾 XLogFlush 之后调（事务已结束，不访问目录） */
+static void
+shard_elr_post_flush(void)
+{
+	MemoryContext old;
+	int			i;
+
+	if (elr_map_n == 0)
+		return;
+	if (elr_cxt == NULL)
+		elr_cxt = AllocSetContextCreate(TopMemoryContext, "pg_partdist elr",
+										ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(elr_cxt);
+	for (i = 0; i < elr_map_n; i++)
+		ShardCommitMarkEndedTs(elr_map[i].shard, elr_map[i].sxid, true, elr_cts);
+	elr_map_n = 0;
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(elr_cxt);
+}
 
 /*
  * 后端本地 TOAST→属主 映射（会话生存期）。
@@ -895,6 +936,7 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 								trunc_before, vacuum_xid);
 	slot->trunc_before = trunc_before;
 	slot->vacuum_xid = vacuum_xid;
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	LWLockRelease(ShardXidCtl->lock);
 }
 
@@ -975,6 +1017,7 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	free_slot->auto_vacuum_pages = 0;
 	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
 	free_slot->shard_relid = shard;
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	return free_slot;
 }
 
@@ -1558,6 +1601,22 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 {
 	int			i;
 
+	/*
+	 * 补丁 0014：本事务读到过"已放锁待刷盘"的版本 ⇒ 结束前刷到它们的提交记录。
+	 * 本事务自己走了提前放锁时不必在这里刷（还持着锁）：自己的提交记录排在
+	 * 那些之后，CommitTransaction 末尾那次刷盘一并覆盖。
+	 */
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+		event == XACT_EVENT_PREPARE || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		XLogRecPtr	obs = ShardElrTakeObservedLsn();
+
+		if (obs != InvalidXLogRecPtr &&
+			!(event == XACT_EVENT_COMMIT && shard_elr_pending_lsn >= obs))
+			XLogFlush(obs);
+	}
+
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
@@ -1611,6 +1670,27 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			if (shard_elr_pending_lsn != InvalidXLogRecPtr && xact_map_n > 0 &&
+				event == XACT_EVENT_COMMIT)
+			{
+				/*
+				 * 补丁 0014：提交记录已插入未刷盘 —— 判决推迟到刷盘后
+				 * （shard_elr_post_flush），活跃表条目先标"已放锁待刷盘"。
+				 */
+				elr_cts = TsoStashedCommitTs();
+				for (i = 0; i < xact_map_n; i++)
+				{
+					ShardCommitMarkElrDone(xact_map[i].shard, xact_map[i].sxid,
+										   shard_elr_pending_lsn);
+					elr_map[i].shard = xact_map[i].shard;
+					elr_map[i].sxid = xact_map[i].sxid;
+				}
+				elr_map_n = xact_map_n;
+				xact_map_n = 0;
+				ShardClogAtCommit();
+				TsoClientClearActive();
+				break;
+			}
 			/* 先翻临时提交表（删除条目=提交点，P1 桩），再清映射 */
 			for (i = 0; i < xact_map_n; i++)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, true);
@@ -1737,6 +1817,17 @@ ShardXidDefineGUCs(void)
 		GUC_UNIT_S, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"pg_partdist.early_lock_release",
+		"同步提交的事务先放行锁、回复客户端前再刷 WAL（内核补丁 0014，默认 off）。",
+		"客户端收到的提交仍然持久：刷盘完成才回复。热行上的后继写者不必等前者的 "
+		"fsync（它自己的提交记录排在后面，刷盘必然连带）；快照读等分片判决落地，"
+		"判决在刷盘之后才写，读者看不到可能因崩溃丢失的数据。",
+		&shard_early_lock_release,
+		false,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"pg_partdist.rc_update_recheck",
 		"READ COMMITTED 事务改分片表时，遇并发已提交的新版本按原生 EPQ 重评（默认 off）。",
 		"off = 快照隔离 first-committer-wins：目标行在本事务快照之后被改过即 40001。"
@@ -1811,6 +1902,7 @@ ShardXidShmemInit(void)
 		memset(ShardXidCtl->shadow, 0, sizeof(ShardXidCtl->shadow));
 		memset(ShardXidCtl->mvcc_set, 0, sizeof(ShardXidCtl->mvcc_set));
 		ShardXidCtl->mvcc_n = 0;
+		pg_atomic_init_u64(&ShardXidCtl->wm_gen, 1);
 		ShardXidCtl->logical_fence_lsn = ShardLogicalFenceLoad();
 		ShardXidCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_shard_xid")[0].lock;
@@ -1923,7 +2015,60 @@ ShardXidSlotRelease(Oid relid)
 		if (ShardXidCtl->shadow[i].shard_relid == relid)
 			memset(&ShardXidCtl->shadow[i], 0, sizeof(ShardXidShadow));
 	}
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
+ * TPC-C 分支：可见性判定用的"认领 + 截断水位"快路径。等价于先
+ * ShardXidEnsureClaimed(shard) 再 ShardVacuumGetWatermarks(shard, &tb, NULL)，
+ * 但在代数没变时直接用后端本地缓存（一次原子读，不拿锁）。先读代数再取值：
+ * 取值期间若有变化，存下的是旧代数，下一次必然重取 —— 不会用到比真实更旧的水位
+ * 而又以为是新的。
+ */
+#define WM_CACHE_N 64
+static struct
+{
+	Oid			shard;
+	uint64		gen;
+	TransactionId trunc_before;
+}			wm_cache[WM_CACHE_N];
+
+TransactionId
+ShardXidClaimedTruncBefore(Oid shard)
+{
+	uint64		gen;
+	int			i,
+				h;
+	TransactionId tb;
+
+	if (ShardXidCtl == NULL)
+		return InvalidTransactionId;
+	gen = pg_atomic_read_u64(&ShardXidCtl->wm_gen);
+	h = (int) (shard % WM_CACHE_N);
+	for (i = 0; i < WM_CACHE_N; i++)
+	{
+		int			k = (h + i) % WM_CACHE_N;
+
+		if (wm_cache[k].shard == shard)
+		{
+			if (wm_cache[k].gen == gen)
+				return wm_cache[k].trunc_before;
+			h = k;
+			break;
+		}
+		if (wm_cache[k].shard == InvalidOid)
+		{
+			h = k;
+			break;
+		}
+	}
+	(void) ShardXidEnsureClaimed(shard);
+	ShardVacuumGetWatermarks(shard, &tb, NULL);
+	wm_cache[h].shard = shard;
+	wm_cache[h].gen = gen;
+	wm_cache[h].trunc_before = tb;
+	return tb;
 }
 
 /*
@@ -2370,6 +2515,7 @@ ShardXidInstallHook(void)
 	shard_twophase_postcommit_hook = shard_twophase_postcommit_impl;
 	shard_twophase_postabort_hook = shard_twophase_postabort_impl;
 	RegisterXactCallback(shard_xid_xact_callback, NULL);
+	shard_elr_post_flush_hook = shard_elr_post_flush;
 }
 
 /* ================= P1 数据保护拦截 ================= */

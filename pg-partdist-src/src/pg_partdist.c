@@ -32,6 +32,7 @@
 #include "funcapi.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "shard_clog.h"			/* 补丁 0015：检查点钩子 ShardClogSyncDirty */
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
@@ -952,6 +953,13 @@ _PG_init(void)
 
         *rv = (void *) DtxPendingContainsDtxid;
     }
+
+    /*
+     * 内核补丁 0015：检查点时把分片 clog 的脏段落盘（与原生 clog 同一时机）。
+     * 判决丢失只可能发生在"早于检查点 redo 点且未落盘"的那部分；redo 点之后的
+     * 由 0007 的提交记录重放补回。有了它，心跳就不必每轮 fsync。
+     */
+    shard_checkpoint_hook = ShardClogSyncDirty;
 
     /* T4.5②：决议主动广播（pg_raft 在决议达多数派后触发；推送是纯优化） */
     {

@@ -177,7 +177,9 @@ for p in 0001-add-wal-insert-hook \
          0010-promote-advance-wal-insert-position \
          0011-shard-row-locks \
          0012-shard-rc-follow-updates \
-         0013-xlog-write-upto; do
+         0013-xlog-write-upto \
+         0014-early-lock-release \
+         0015-checkpoint-hook; do
   patch -p1 --forward < ../pg-partdist-src/patches/$p.patch || exit 1
 done
 ./configure --prefix=/work/pg-install --with-openssl --with-icu --with-readline
