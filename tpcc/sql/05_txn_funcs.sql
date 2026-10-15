@@ -35,6 +35,9 @@ DECLARE
     v_s_qty    int;
     v_dist     text;
     v_p        numeric;
+    v_found    int;
+    v_dists    text[] := '{}';
+    v_sdist    text[];
     r          record;
 BEGIN
     PERFORM tpcc.begin_global();     -- 必须先于任何分布表访问
@@ -56,51 +59,51 @@ BEGIN
         IF r.supply <> p_w THEN v_all_local := 0; END IF;
     END LOOP;
 
-    -- 先查全部商品（只读）：有无效的 ⇒ 零写入返回（见文件头）
+    -- TXN_REORDER_V1：先查全部商品（只读，一条语句）：有无效的 ⇒ 零写入返回（见文件头）
+    SELECT array_agg(i.i_price ORDER BY u.ord), count(i.i_price)
+      INTO v_price, v_found
+      FROM unnest(v_items) WITH ORDINALITY AS u(id, ord)
+      LEFT JOIN item i ON i.i_id = u.id;
+    IF v_found < v_ol_cnt THEN
+        RETURN -1;
+    END IF;
+
+    -- 库存扣减放在锁 district 之前：district 行锁一直持有到提交，锁内语句越少越好
+    -- （TPC-C 不规定语句次序，事务效果相同）。读改写合成一条 UPDATE ... RETURNING。
     FOR v_i IN 1..v_ol_cnt LOOP
-        SELECT i_price INTO v_p FROM item WHERE i_id = v_items[v_i];
-        IF NOT FOUND THEN
-            RETURN -1;
-        END IF;
-        v_price := v_price || v_p;
+        v_sw := v_supply[v_i];
+        UPDATE stock
+           SET s_quantity   = CASE WHEN s_quantity - v_qty[v_i] >= 10 THEN s_quantity - v_qty[v_i]
+                                   ELSE s_quantity - v_qty[v_i] + 91 END,
+               s_ytd        = s_ytd + v_qty[v_i],
+               s_order_cnt  = s_order_cnt + 1,
+               s_remote_cnt = s_remote_cnt + CASE WHEN v_sw <> p_w THEN 1 ELSE 0 END
+         WHERE s_w_id = v_sw AND s_i_id = v_items[v_i]
+        -- 不在 RETURNING 里写 CASE v_d WHEN ...：Citus 反解析带参数的简单 CASE 会出错
+        RETURNING ARRAY[s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05,
+                        s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10]::text[]
+          INTO v_sdist;
+        v_dists := v_dists || v_sdist[v_d];
     END LOOP;
 
     SELECT w_tax INTO v_w_tax FROM warehouse WHERE w_id = p_w;
     SELECT c_discount INTO v_disc FROM customer
      WHERE c_w_id = p_w AND c_d_id = v_d AND c_id = v_c;
 
-    SELECT d_next_o_id, d_tax INTO v_o_id, v_d_tax FROM district
-     WHERE d_w_id = p_w AND d_id = v_d FOR UPDATE;
     UPDATE district SET d_next_o_id = d_next_o_id + 1
-     WHERE d_w_id = p_w AND d_id = v_d;
+     WHERE d_w_id = p_w AND d_id = v_d
+    RETURNING d_next_o_id - 1, d_tax INTO v_o_id, v_d_tax;
 
     INSERT INTO oorder (o_w_id, o_d_id, o_id, o_c_id, o_carrier_id, o_ol_cnt, o_all_local, o_entry_d)
     VALUES (p_w, v_d, v_o_id, v_c, NULL, v_ol_cnt, v_all_local, now());
     INSERT INTO new_order (no_w_id, no_d_id, no_o_id) VALUES (p_w, v_d, v_o_id);
 
     FOR v_i IN 1..v_ol_cnt LOOP
-        v_sw := v_supply[v_i];
-        SELECT s_quantity,
-               CASE v_d WHEN 1 THEN s_dist_01 WHEN 2 THEN s_dist_02 WHEN 3 THEN s_dist_03
-                        WHEN 4 THEN s_dist_04 WHEN 5 THEN s_dist_05 WHEN 6 THEN s_dist_06
-                        WHEN 7 THEN s_dist_07 WHEN 8 THEN s_dist_08 WHEN 9 THEN s_dist_09
-                        ELSE s_dist_10 END
-          INTO v_s_qty, v_dist
-          FROM stock WHERE s_w_id = v_sw AND s_i_id = v_items[v_i] FOR UPDATE;
-
-        UPDATE stock
-           SET s_quantity   = CASE WHEN v_s_qty - v_qty[v_i] >= 10 THEN v_s_qty - v_qty[v_i]
-                                   ELSE v_s_qty - v_qty[v_i] + 91 END,
-               s_ytd        = s_ytd + v_qty[v_i],
-               s_order_cnt  = s_order_cnt + 1,
-               s_remote_cnt = s_remote_cnt + CASE WHEN v_sw <> p_w THEN 1 ELSE 0 END
-         WHERE s_w_id = v_sw AND s_i_id = v_items[v_i];
-
         INSERT INTO order_line (ol_w_id, ol_d_id, ol_o_id, ol_number, ol_i_id, ol_delivery_d,
                                 ol_amount, ol_supply_w_id, ol_quantity, ol_dist_info)
         VALUES (p_w, v_d, v_o_id, v_i, v_items[v_i], NULL,
                 (v_qty[v_i] * v_price[v_i] * (1 + v_w_tax + v_d_tax) * (1 - v_disc))::numeric(6,2),
-                v_sw, v_qty[v_i], v_dist);
+                v_supply[v_i], v_qty[v_i], v_dists[v_i]);
     END LOOP;
     RETURN v_o_id;
 END $$;
@@ -147,11 +150,6 @@ BEGIN
         v_c := tpcc.nurand(1023, 1, 3000, tpcc.c_id_c());
     END IF;
 
-    SELECT w_name INTO v_w_name FROM warehouse WHERE w_id = p_w FOR UPDATE;
-    UPDATE warehouse SET w_ytd = w_ytd + v_amt WHERE w_id = p_w;
-    SELECT d_name INTO v_d_name FROM district WHERE d_w_id = p_w AND d_id = v_d FOR UPDATE;
-    UPDATE district SET d_ytd = d_ytd + v_amt WHERE d_w_id = p_w AND d_id = v_d;
-
     SELECT c_credit, c_data INTO v_credit, v_data FROM customer
      WHERE c_w_id = v_c_w AND c_d_id = v_c_d AND c_id = v_c FOR UPDATE;
     IF v_credit = 'BC' THEN
@@ -163,6 +161,12 @@ BEGIN
            c_payment_cnt = c_payment_cnt + 1,
            c_data = v_data
      WHERE c_w_id = v_c_w AND c_d_id = v_c_d AND c_id = v_c;
+
+    -- TXN_REORDER_V1：warehouse / district 是全库最热的行，行锁持有到提交；
+    -- 放到客户（15% 远程）之后再锁，读改写各合成一条 UPDATE ... RETURNING。
+    UPDATE warehouse SET w_ytd = w_ytd + v_amt WHERE w_id = p_w RETURNING w_name INTO v_w_name;
+    UPDATE district SET d_ytd = d_ytd + v_amt WHERE d_w_id = p_w AND d_id = v_d
+    RETURNING d_name INTO v_d_name;
 
     INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data)
     VALUES (v_c, v_c_d, v_c_w, v_d, p_w, now(), v_amt, left(v_w_name || '    ' || v_d_name, 24));
