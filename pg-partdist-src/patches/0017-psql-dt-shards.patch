@@ -1,8 +1,8 @@
 diff --git a/src/bin/psql/describe.c b/src/bin/psql/describe.c
-index 45f6a86..630556b 100644
+index 45f6a86..0c3ef81 100644
 --- a/src/bin/psql/describe.c
 +++ b/src/bin/psql/describe.c
-@@ -3893,6 +3893,226 @@ describeRoleGrants(const char *pattern, bool showSystem)
+@@ -3893,6 +3893,272 @@ describeRoleGrants(const char *pattern, bool showSystem)
  }
  
  
@@ -13,8 +13,8 @@ index 45f6a86..630556b 100644
 + * 返回 NULL，由调用方照原样输出 —— 连普通 PostgreSQL 或只看本地表时与原版一致。
 + *
 + * from / where 是 listTables 已经拼好的 FROM 与 WHERE 子句（含模式匹配），各分支
-+ * 共用，保证父表行与分片行的筛选条件完全相同。带模式时展开分片；不带模式时每张
-+ * 分布式表只出一行汇总，免得几百个分片刷屏。树形符号与宕机标记一律用 ASCII：
++ * 共用，保证父表行与分片行的筛选条件完全相同。父表下面逐行列出它的全部分片；
++ * 带不带模式都展开（表多时用模式缩小范围，如 \dt customer*）。树形符号与宕机标记一律用 ASCII：
 + * 客户端编码不是 UTF8 时 psql 按字节算宽度，框线字符会把列挤歪。
 + *
 + * 主从来自 pg_partdist 的控制面登记（partdist.partition_map / node_map），切主后
@@ -29,8 +29,8 @@ index 45f6a86..630556b 100644
 +	PGresult   *res;
 +	PQExpBufferData q;
 +	bool		have_partdist;
-+	bool		expand = (pattern != NULL);
-+	bool		with_rows = (verbose && expand);
++	bool		expand = true;
++	bool		with_rows = verbose;
 +	int			col;
 +	int			i;
 +	int			hashcol;
@@ -111,9 +111,11 @@ index 45f6a86..630556b 100644
 +							 " FROM pg_catalog.pg_dist_shard s JOIN partdist.partition_map m ON m.partition_id = s.shardid"
 +							 " WHERE s.logicalrelid = c.oid) || ' replicas', '')");
 +	appendPQExpBufferStr(&q,
-+						 " || COALESCE(', colocated with ' || (SELECT pg_catalog.string_agg(o.logicalrelid::pg_catalog.regclass::pg_catalog.text, ', ' ORDER BY 1)"
++						 " || COALESCE(', colocated with ' || (SELECT pg_catalog.string_agg(t.n, ', ' ORDER BY t.n)"
++						 " || CASE WHEN pg_catalog.max(t.total) > 3 THEN ' and ' || (pg_catalog.max(t.total) - 3) || ' more' ELSE '' END"
++						 " FROM (SELECT o.logicalrelid::pg_catalog.regclass::pg_catalog.text AS n, pg_catalog.count(*) OVER () AS total"
 +						 " FROM pg_catalog.pg_dist_partition o WHERE o.colocationid = dp.colocationid AND dp.colocationid <> 0"
-+						 " AND o.logicalrelid <> c.oid), '')"
++						 " AND o.logicalrelid <> c.oid ORDER BY 1 LIMIT 3) t), '')"
 +						 "\n       WHEN dp.partmethod = 'n' AND dp.repmodel = 't' THEN 'reference table'"
 +						 "\n       WHEN dp.partmethod IS NOT NULL THEN 'citus table' END AS \"Hash range\",\n"
 +						 "  NULL::pg_catalog.text AS \"Primary\", NULL::pg_catalog.text AS \"Replicas\"");
@@ -226,10 +228,54 @@ index 45f6a86..630556b 100644
 +	return res;
 +}
 +
++/*
++ * ShardPG：\dt 按名字找不到时，看它是不是某张分布式表的分片（子表）。
++ * 分片表只在 worker 上，master 的 pg_class 里没有，原版只会说"找不到"。
++ */
++static void
++shardpgHintShardName(const char *pattern)
++{
++	PQExpBufferData q;
++	PGresult   *res;
++
++	res = PSQLexec("SELECT pg_catalog.to_regclass('pg_catalog.pg_dist_shard') IS NOT NULL");
++	if (!res)
++		return;
++	if (PQntuples(res) != 1 || strcmp(PQgetvalue(res, 0, 0), "t") != 0)
++	{
++		PQclear(res);
++		return;
++	}
++	PQclear(res);
++
++	initPQExpBuffer(&q);
++	appendPQExpBufferStr(&q,
++						 "SELECT pg_catalog.shard_name(s.logicalrelid, s.shardid),"
++						 " s.logicalrelid::pg_catalog.regclass::pg_catalog.text\n"
++						 "FROM pg_catalog.pg_dist_shard s\n");
++	if (!validateSQLNamePattern(&q, pattern, false, false, NULL,
++								"pg_catalog.shard_name(s.logicalrelid, s.shardid)",
++								NULL, NULL, NULL, 1))
++	{
++		termPQExpBuffer(&q);
++		return;
++	}
++	appendPQExpBufferStr(&q, "ORDER BY 1 LIMIT 1;");
++	res = PSQLexec(q.data);
++	termPQExpBuffer(&q);
++	if (!res)
++		return;
++	if (PQntuples(res) == 1)
++		pg_log_error_hint("%s 是分布式表 %s 的分片（子表），用 \\dt %s 查看。",
++						  PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
++						  PQgetvalue(res, 0, 1));
++	PQclear(res);
++}
++
  /*
   * listTables()
   *
-@@ -3918,10 +4138,14 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -3918,10 +4184,14 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  	bool		showForeign = strchr(tabtypes, 'E') != NULL;
  
  	PQExpBufferData buf;
@@ -245,7 +291,7 @@ index 45f6a86..630556b 100644
  
  	/* If tabtypes is empty, we default to \dtvmsE (but see also command.c) */
  	if (!(showTables || showIndexes || showViews || showMatViews || showSeq || showForeign))
-@@ -4002,6 +4226,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4002,6 +4272,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  						  gettext_noop("Description"));
  	}
  
@@ -253,7 +299,7 @@ index 45f6a86..630556b 100644
  	appendPQExpBufferStr(&buf,
  						 "\nFROM pg_catalog.pg_class c"
  						 "\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace");
-@@ -4016,6 +4241,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4016,6 +4287,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  							 "\n     LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid"
  							 "\n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid");
  
@@ -261,7 +307,7 @@ index 45f6a86..630556b 100644
  	appendPQExpBufferStr(&buf, "\nWHERE c.relkind IN (");
  	if (showTables)
  	{
-@@ -4056,9 +4282,26 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4056,9 +4328,26 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  		return false;
  	}
  
@@ -289,7 +335,20 @@ index 45f6a86..630556b 100644
  	termPQExpBuffer(&buf);
  	if (!res)
  		return false;
-@@ -4081,8 +4324,9 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4071,8 +4360,12 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+ 	if (PQntuples(res) == 0 && !pset.quiet)
+ 	{
+ 		if (pattern)
++		{
+ 			pg_log_error("Did not find any relation named \"%s\".",
+ 						 pattern);
++			if (showTables)
++				shardpgHintShardName(pattern);
++		}
+ 		else
+ 			pg_log_error("Did not find any relations.");
+ 	}
+@@ -4081,8 +4374,9 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  		myopt.nullPrint = NULL;
  		myopt.title = _("List of relations");
  		myopt.translate_header = true;

@@ -217,7 +217,12 @@ for sid in ${IDS//,/ }; do
 done
 out=$(run "\\dt")
 expect_has "不带模式：有汇总" "$out" "shard key: o_w_id, 4 shards, 2 replicas, colocated with customer"
-expect_hasnt "不带模式：不展开子表" "$out" "+-- "
+expect_has "不带模式：也展开子表" "$out" "+-- customer_"
+out=$(run "\\dt customer*")
+expect_eq "\\dt customer* 展开 4 个子表" "$(grep -cE '(\+--|`--) customer_[0-9]+ ' <<<"$out")" "4"
+# 安静模式（-q）下原版 psql 找不到时只印空表、不报错，提示也随之不出现；这一项不加 -q
+out=$(docker exec -u postgres "$C" bash -c "exec $BIN/psql -h /tmp -p 5432 -U postgres -d postgres -X -c \"\\\\dt customer_1*\" 2>&1" </dev/null)
+expect_has "按子表名查：提示属于哪张表" "$out" "是分布式表 customer 的分片（子表），用 \\dt customer 查看。"
 out=$(run "\\dt+ customer")
 printf '%s\n' "$out" | sed 's/^/        > /'
 expect_has "\\dt+ 有 Rows 列" "$out" "Rows"
