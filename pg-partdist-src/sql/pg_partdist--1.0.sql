@@ -2365,3 +2365,238 @@ $fn$;
 
 COMMENT ON FUNCTION replay_auto_follow(OID) IS
     'T7.25/P7-R4：副本撞上 DDL 结构栅栏后的自动跟随 —— 按 leader 随流发来的索引定义清单对账本地壳表（缺的建、多的删），再按 leader 新 fileset 重配 locmap。回放启动器会自动调它；也可手工调用。';
+
+-- ============================================================================
+-- P7-N87 / N88 / N89：ShardPG 建表 / 删表一条龙 + shardpg 模式
+--
+--   CREATE TABLE t (..., SHARD KEY (列) [SHARDS n] [REPLICAS n] [COLOCATE WITH 表]);
+--       内核补丁 0016 解析，src/shardpg_ddl.c 执行：建表 + 分布 → 提交 →
+--       partdist.shardpg_onboard()（建 Raft 组、选主、供副本、打标）
+--   DROP TABLE t;
+--       src/shardpg_ddl.c 把分片记进 partdist.shardpg_drop_queue 与 DROP 同一事务提交，
+--       之后 partdist.shardpg_cleanup_dropped() 拆组、删副本表、删登记
+--   SELECT * FROM shardpg.shards;           每个分片的主、从、哈希范围、任期（WHERE table_name IN ('t1', 't2')）
+--   SELECT shardpg.cleanup_dropped();       事务块里删的表，提交后手工清
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS partdist.shardpg_drop_queue (
+    shardid     bigint PRIMARY KEY,
+    shard_name  text NOT NULL,          -- shard_name(表, 分片号)：worker 上的物理表名（已按需加引号/模式）
+    rel_name    text,
+    dropped_at  timestamptz NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE partdist.shardpg_drop_queue IS
+    'P7-N88：已 DROP、待清理 Raft 组 / 副本表 / 登记的分片。与 DROP 同一事务写入，清理干净后删行。';
+
+-- 路由对齐控制面登记；出错不影响调用方（DROP 前的预备动作）
+CREATE OR REPLACE FUNCTION partdist.shardpg_reconcile_quiet()
+RETURNS integer LANGUAGE plpgsql AS $fn$
+BEGIN
+    RETURN partdist.reconcile_routing();
+EXCEPTION WHEN OTHERS THEN
+    RAISE LOG 'shardpg_reconcile_quiet: %', SQLERRM;
+    RETURN -1;
+END $fn$;
+
+-- 建组、选主、供副本、打标。不抛错：成功返回 'ok'，失败返回原因（调用方据此回退建表）
+CREATE OR REPLACE FUNCTION partdist.shardpg_onboard(p_tbl regclass, p_replicas integer)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    t0      timestamptz := clock_timestamp();
+    sids    bigint[];
+    todo    bigint[];
+    failed  bigint[];
+    r       record;
+    i       int;
+    bad     int := 0;
+    detail  text := '';
+    v_cmm   text;
+BEGIN
+    SELECT array_agg(shardid ORDER BY shardid) INTO sids
+      FROM pg_catalog.pg_dist_shard WHERE logicalrelid = p_tbl;
+    IF sids IS NULL THEN
+        RETURN format('%s 没有分片', p_tbl);
+    END IF;
+
+    -- 建组 + 选主 + 供副本：placement 先当选、副本再入组、逐个供；每批 32 个，没过的单独重跑（最多 4 轮）
+    -- 内部过程的 NOTICE（第几轮、临时表）对建表的人没用，先压到 WARNING，出函数前还原
+    v_cmm := current_setting('client_min_messages');
+    PERFORM set_config('client_min_messages', 'warning', true);
+    todo := sids;
+    FOR i IN 1..4 LOOP
+        bad := 0; detail := ''; failed := '{}';
+        FOR r IN SELECT b.*
+                   FROM generate_series(0, (coalesce(array_length(todo, 1), 0) - 1) / 32) wv(k),
+                        LATERAL partdist.raft_replicate_table_shards_bulk(
+                            p_tbl, p_replicas, 180, 3, (todo)[wv.k * 32 + 1 : wv.k * 32 + 32]) b
+        LOOP
+            IF r.status <> 'ok' THEN
+                bad := bad + 1;
+                failed := failed || r.shardid;
+                detail := detail || format('分片 %s：%s；', r.shardid, left(r.status, 200));
+            END IF;
+        END LOOP;
+        EXIT WHEN bad = 0;
+        RAISE WARNING '建组：% 个分片没就绪，单独再跑一轮（第 % 轮）', bad, i;
+        todo := failed;
+    END LOOP;
+    PERFORM set_config('client_min_messages', v_cmm, true);
+    IF bad > 0 THEN
+        RETURN format('建组 / 供副本失败 %s 个分片：%s', bad, detail);
+    END IF;
+    RAISE NOTICE '建组：每个分片 1 主 % 从，选主、供副本完成（% s）',
+        p_replicas, round(extract(epoch FROM clock_timestamp() - t0));
+
+    -- 打标：分片级 xid / clog / TSO 时间戳。组主刚漂移、路由还没跟上时 placement 会拒，重试到 90 s
+    PERFORM set_config('client_min_messages', 'warning', true);
+    FOR i IN 1..30 LOOP
+        bad := 0; detail := '';
+        PERFORM partdist.shardpg_reconcile_quiet();
+        FOR r IN SELECT * FROM partdist.set_table_shard_mvcc(p_tbl) LOOP
+            IF r.status !~ '^(registered|already)' THEN
+                bad := bad + 1;
+                detail := detail || format('分片 %s（:%s）：%s；', r.shardid, r.node_port, r.status);
+            END IF;
+        END LOOP;
+        EXIT WHEN bad = 0;
+        PERFORM pg_sleep(3);
+    END LOOP;
+    PERFORM set_config('client_min_messages', v_cmm, true);
+    IF bad > 0 THEN
+        RETURN format('打标失败 %s 个分片：%s', bad, detail);
+    END IF;
+    RAISE NOTICE '打标：% 个分片已接入分布式事务', array_length(sids, 1);
+    RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+    IF v_cmm IS NOT NULL THEN
+        PERFORM set_config('client_min_messages', v_cmm, true);
+    END IF;
+    RETURN 'error: ' || SQLERRM;
+END $fn$;
+
+-- 清理已删表留下的 Raft 组、副本表、主从登记。不抛错，返回摘要。
+-- 只处理已经不在 pg_dist_shard 里的分片 —— 重复执行、在删表提交前执行都不会误伤。
+CREATE OR REPLACE FUNCTION partdist.shardpg_cleanup_dropped()
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_ids    bigint[];
+    v_names  text[];
+    v_list   text;
+    v_n      int;
+    v_groups int := 0;
+    v_round  int;
+    v_left   text;
+    r        record;
+BEGIN
+    SELECT array_agg(q.shardid ORDER BY q.shardid), array_agg(q.shard_name ORDER BY q.shardid), count(*)
+      INTO v_ids, v_names, v_n
+      FROM partdist.shardpg_drop_queue q
+     WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_shard s WHERE s.shardid = q.shardid);
+    IF v_n = 0 THEN
+        RETURN '没有待清理的分片';
+    END IF;
+    v_list := array_to_string(v_ids, ',');
+
+    FOR v_round IN 1..4 LOOP
+        -- ① 关回放槽，再拆 Raft 组；拆组时在途的消息会把组建回来，隔 3 秒再拆一遍
+        PERFORM pg_catalog.run_command_on_workers(format(
+            $q$SELECT count(partdist.replay_disable(pg_catalog.to_regclass(t)))
+                 FROM unnest(%L::text[]) t WHERE pg_catalog.to_regclass(t) IS NOT NULL$q$, v_names));
+        FOR r IN SELECT * FROM pg_catalog.run_command_on_workers(format(
+            'SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id IN (%s)',
+            v_list)) LOOP
+            IF r.success AND v_round = 1 THEN v_groups := v_groups + r.result::int; END IF;
+        END LOOP;
+        PERFORM pg_sleep(3);
+        PERFORM pg_catalog.run_command_on_workers(format(
+            'SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id IN (%s)',
+            v_list));
+        IF v_round = 1 THEN
+            IF v_groups > 0 THEN
+                RAISE NOTICE '清理：已拆除 % 个分片的 Raft 组', v_n;
+            ELSE
+                RAISE NOTICE '清理：% 个分片没有残留的 Raft 组', v_n;
+            END IF;
+        END IF;
+
+        -- ② 删各节点上的副本表（副本是本地表，Citus 不会跟着删）；逐张删，删不掉的下一轮再试
+        PERFORM pg_catalog.run_command_on_workers(format(
+            $o$DO $$ DECLARE t text; BEGIN
+                 FOREACH t IN ARRAY %L::text[] LOOP
+                   BEGIN
+                     IF pg_catalog.to_regclass(t) IS NOT NULL THEN
+                       EXECUTE 'DROP TABLE IF EXISTS ' || t;
+                     END IF;
+                   EXCEPTION WHEN OTHERS THEN NULL;
+                   END;
+                 END LOOP; END $$$o$, v_names));
+        IF v_round = 1 THEN
+            RAISE NOTICE '清理：已删除各节点上的副本表';
+        END IF;
+
+        -- ③ 删主从登记（master 与各 worker），回收打标登记与回放槽位
+        DELETE FROM partdist.partition_map WHERE partition_id::bigint = ANY (v_ids);
+        PERFORM pg_catalog.run_command_on_workers(format(
+            'DELETE FROM partdist.partition_map WHERE partition_id::bigint IN (%s)', v_list));
+        PERFORM pg_catalog.run_command_on_workers('SELECT partdist.shard_mvcc_gc_orphans()');
+        PERFORM pg_catalog.run_command_on_workers('SELECT slots_freed FROM partdist.replay_reclaim_stale(0)');
+        IF v_round = 1 THEN
+            RAISE NOTICE '清理：已删除主从登记，回收残留';
+        END IF;
+
+        -- ④ 核对：每台 worker 上 Raft 组 / 物理表 / 登记都应为 0
+        v_left := '';
+        FOR r IN SELECT nodeport, success, result FROM pg_catalog.run_command_on_workers(format(
+            $q$SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN (%1$s)) || '|' ||
+                      (SELECT count(*) FROM unnest(%2$L::text[]) t WHERE pg_catalog.to_regclass(t) IS NOT NULL) || '|' ||
+                      (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN (%1$s))$q$,
+            v_list, v_names)) ORDER BY 1
+        LOOP
+            IF NOT r.success OR r.result <> '0|0|0' THEN
+                v_left := v_left || format(' :%s(%s)', r.nodeport,
+                                           CASE WHEN r.success THEN '组|表|登记=' || r.result ELSE '连不上' END);
+            END IF;
+        END LOOP;
+        EXIT WHEN v_left = '';
+        PERFORM pg_sleep(3);
+    END LOOP;
+
+    IF v_left = '' THEN
+        DELETE FROM partdist.shardpg_drop_queue WHERE shardid = ANY (v_ids);
+        RETURN format('已清理 %s 个分片', v_n);
+    END IF;
+    RAISE WARNING '清理：还有残留%（稍后再执行 SELECT shardpg.cleanup_dropped();）', v_left;
+    RETURN 'residue:' || v_left;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING '清理中断：%（稍后再执行 SELECT shardpg.cleanup_dropped();）', SQLERRM;
+    RETURN 'error: ' || SQLERRM;
+END $fn$;
+
+-- ---- 面向用户的 shardpg 模式 ----
+CREATE SCHEMA IF NOT EXISTS shardpg;
+
+CREATE OR REPLACE VIEW shardpg.shards AS
+SELECT s.logicalrelid AS table_name,
+       pg_catalog.shard_name(s.logicalrelid, s.shardid) AS shard_name,
+       pg_catalog.column_to_column_name(p.logicalrelid, p.partkey) AS shard_key,
+       '[' || s.shardminvalue || ', ' || s.shardmaxvalue || ']' AS hash_range,
+       COALESCE((SELECT ':' || nm.port FROM partdist.node_map nm WHERE nm.node_id = m.primary_node),
+                (SELECT ':' || nd.nodeport FROM pg_catalog.pg_dist_placement pl
+                   JOIN pg_catalog.pg_dist_node nd ON nd.groupid = pl.groupid AND nd.noderole = 'primary'
+                  WHERE pl.shardid = s.shardid ORDER BY nd.nodeport LIMIT 1)) AS "primary",
+       (SELECT string_agg(':' || nm.port, ',' ORDER BY nm.port)
+          FROM partdist.node_map nm WHERE nm.node_id = ANY (m.secondary_nodes)) AS replicas,
+       m.primary_term AS term
+  FROM pg_catalog.pg_dist_shard s
+  JOIN pg_catalog.pg_dist_partition p ON p.logicalrelid = s.logicalrelid AND p.partmethod = 'h'
+  LEFT JOIN partdist.partition_map m ON m.partition_id::bigint = s.shardid
+ ORDER BY s.logicalrelid::text, s.shardminvalue::int;
+COMMENT ON VIEW shardpg.shards IS
+    'P7-N89：每个分片的物理表名、分片键、哈希范围、主、从、任期（主从取控制面登记，没登记的取 Citus 放置节点）。';
+
+CREATE OR REPLACE FUNCTION shardpg.cleanup_dropped()
+RETURNS text LANGUAGE sql AS $fn$
+    SELECT partdist.shardpg_cleanup_dropped()
+$fn$;
+COMMENT ON FUNCTION shardpg.cleanup_dropped() IS
+    'P7-N88：清理已删分片表留下的 Raft 组、副本表、主从登记（在事务块里 DROP 的表提交后执行；自动清理没清干净时再执行）。';

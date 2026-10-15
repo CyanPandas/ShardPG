@@ -21,6 +21,7 @@
 #include "shard_xid.h"
 #include "shard_visibility.h"
 #include "tso.h"
+#include "shardpg_ddl.h"     /* P7-N87/N88：SHARD KEY 建表、分片表 DROP */
 
 #include "storage/bufmgr.h"
 
@@ -421,6 +422,37 @@ UtilityMayChangeRelfilenode(Node *parsetree)
 static void PartDistMaybeInstallUsr2Backtrace(void);   /* P7-N21 取证，定义见下 */
 
 /*
+ * 执行语句本身，以及执行后必须紧跟的登记（§12 fileset diff、T7.8 删表标志）。
+ * ShardPG 的建表 / 删表（shardpg_ddl.c）会在语句内提交事务，它们调这个函数执行
+ * 语句，保证这两条登记落在执行语句的那笔事务里。
+ */
+static void
+partdist_run_chain(PlannedStmt *pstmt, const char *queryString, bool readOnlyTree,
+                   ProcessUtilityContext context, ParamListInfo params,
+                   QueryEnvironment *queryEnv, DestReceiver *dest, QueryCompletion *qc)
+{
+    if (prev_ProcessUtility_hook)
+        prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
+                                 context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+
+    /* §12：可能动了 relfilenode → 让 PRE_COMMIT 去 diff 一次 fileset */
+    if (pstmt->utilityStmt != NULL &&
+        UtilityMayChangeRelfilenode(pstmt->utilityStmt))
+        ShardFilesetNoteMaybeChanged();
+
+    /*
+     * T7.8：记下"本事务删过表"。此刻**不能发通知**（还没提交），
+     * 只置标志；提交回调推代次，下一条语句才真扫。
+     */
+    if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, DropStmt) &&
+        ((DropStmt *) pstmt->utilityStmt)->removeType == OBJECT_TABLE)
+        drop_seen_in_xact = true;
+}
+
+/*
  * partdist_process_utility — ProcessUtility_hook wrapper.
  *
  * For COPY FROM statements, calls pg_partdist_process_utility BEFORE the
@@ -481,26 +513,14 @@ partdist_process_utility(PlannedStmt *pstmt,
                                         tstmt->kind == TRANS_STMT_COMMIT_PREPARED);
     }
 
-    /* Execute the statement via the existing chain */
-    if (prev_ProcessUtility_hook)
-        prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
-                                 context, params, queryEnv, dest, qc);
-    else
-        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-                                context, params, queryEnv, dest, qc);
-
-    /* §12：可能动了 relfilenode → 让 PRE_COMMIT 去 diff 一次 fileset */
-    if (pstmt->utilityStmt != NULL &&
-        UtilityMayChangeRelfilenode(pstmt->utilityStmt))
-        ShardFilesetNoteMaybeChanged();
-
     /*
-     * T7.8：记下"本事务删过表"。此刻**不能发通知**（还没提交），
-     * 只置标志；提交回调推代次，下一条语句才真扫。
+     * P7-N87/N88：SHARD KEY 建表、分片表 DROP 由 shardpg_ddl.c 接手（它会在语句内
+     * 提交事务，执行语句仍走 partdist_run_chain）；其余语句照常执行。
      */
-    if (pstmt->utilityStmt != NULL && IsA(pstmt->utilityStmt, DropStmt) &&
-        ((DropStmt *) pstmt->utilityStmt)->removeType == OBJECT_TABLE)
-        drop_seen_in_xact = true;
+    if (!ShardpgDdlIntercept(pstmt, queryString, readOnlyTree, context, params,
+                             queryEnv, dest, qc, partdist_run_chain))
+        partdist_run_chain(pstmt, queryString, readOnlyTree, context, params,
+                           queryEnv, dest, qc);
 
     /*
      * ★ T7.8（P7-D1）：`COMMIT PREPARED` **执行完之后**补一遍 DROP 通知。
@@ -867,6 +887,9 @@ _PG_init(void)
     /* Chain object-access hook */
     prev_object_access_hook = object_access_hook;
     object_access_hook = partdist_object_access;
+
+    /* P7-N87：shardpg.shard_count / shardpg.replicas / shardpg.drop_cleanup */
+    ShardpgDdlDefineGucs();
 
     /* Chain ProcessUtility hook */
     prev_ProcessUtility_hook = ProcessUtility_hook;

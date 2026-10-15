@@ -113,16 +113,23 @@ need_grep "0010   XLogRequestInsertPositionAdvance 原型（xlog.h）" \
 need_str_in "0007   pg_waldump 能解分片 xid 注解（前端另编一份 xactdesc.o）" \
             "bin/pg_waldump" "shard xids:"
 
+# P7-N87 / N90（2026-10-15）：0016 只改 gram.y（不动头文件，只能验二进制）；0017 只改 psql。
+#   判据用 ASCII 串：strings 默认不输出中文报错文本。
+need_str_in "0016   SHARD KEY 文法（gram.y 产出的 shardpg 选项命名空间）" \
+            "bin/postgres" "shard_key"
+need_str_in "0017   psql \\dt 显示分片与主从（describe.c）" \
+            "bin/psql" "shard key: "
+
 if [[ "$fail" -ne 0 ]]; then
   cat <<'EOF'
 
 ！这份 pg-install 不是打过补丁的构建，pg_partdist 编不过。
   修法见 pg-partdist-src/patches/README.md 的「补丁与仓库里 pg-install/ 的关系」：
-  在容器里用 postgres-src 基线 + **全部十个补丁**重编，再把 bin/postgres 与
+  在容器里用 postgres-src 基线 + **全部补丁（0001–0010、0016、0017）**重编，再把 bin/postgres 与
   受影响的头文件同步回仓库并提交。
 EOF
   exit 1
 fi
 
-echo "  → 十个补丁齐全（0001/0001v2/0002/0004 声明+符号，0005–0010 符号，0007 另验 pg_waldump）"
+echo "  → 补丁齐全（0001/0001v2/0002/0004 声明+符号，0005–0010 符号，0007 另验 pg_waldump，0016 文法、0017 psql）"
 exit 0

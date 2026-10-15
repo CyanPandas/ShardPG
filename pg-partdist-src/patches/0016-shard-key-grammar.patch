@@ -1,0 +1,227 @@
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 702522f..12949ed 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -167,6 +167,8 @@ static void base_yyerror(YYLTYPE *yylloc, core_yyscan_t yyscanner,
+ 						 const char *msg);
+ static RawStmt *makeRawStmt(Node *stmt, int stmt_location);
+ static void updateRawStmtEnd(RawStmt *rs, int end_location);
++static void extractShardClause(List **tableElts, List **options, bool allowed,
++							   core_yyscan_t yyscanner);
+ static Node *makeColumnRef(char *colname, List *indirection,
+ 						   int location, core_yyscan_t yyscanner);
+ static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
+@@ -521,6 +523,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ 				 SetResetClause FunctionSetResetClause
+ 
+ %type <node>	TableElement TypedTableElement ConstraintElem TableFuncElement
++%type <node>	TableShardClause shard_opt
++%type <list>	opt_shard_opts
+ %type <node>	columnDef columnOptions
+ %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
+ %type <node>	def_arg columnElem where_clause where_or_current_clause
+@@ -852,6 +856,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+  */
+ %nonassoc	UNBOUNDED		/* ideally would have same precedence as IDENT */
+ %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
++/*
++ * ShardPG：表元素 `SHARD KEY (列)` 与列定义 `shard key(...)`（列名 shard、类型名 key）
++ * 在读到 IDENT、下一个记号是 KEY 时冲突。给 KEY 一个高于 IDENT 的优先级，让它移进
++ * 分片键子句。KEY 此前没有优先级，原文法零冲突，所以这条只影响新增的这一处。
++ */
++%nonassoc	KEY
+ %left		Op OPERATOR		/* multi-character ops and user-defined operators */
+ %left		'+' '-'
+ %left		'*' '/' '%'
+@@ -3520,6 +3530,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
+ 					n->oncommit = $12;
+ 					n->tablespacename = $13;
+ 					n->if_not_exists = false;
++					extractShardClause(&n->tableElts, &n->options, true, yyscanner);
+ 					$$ = (Node *) n;
+ 				}
+ 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
+@@ -3540,6 +3551,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
+ 					n->oncommit = $15;
+ 					n->tablespacename = $16;
+ 					n->if_not_exists = true;
++					extractShardClause(&n->tableElts, &n->options, true, yyscanner);
+ 					$$ = (Node *) n;
+ 				}
+ 		| CREATE OptTemp TABLE qualified_name OF any_name
+@@ -3697,6 +3709,65 @@ TableElement:
+ 			columnDef							{ $$ = $1; }
+ 			| TableLikeClause					{ $$ = $1; }
+ 			| TableConstraint					{ $$ = $1; }
++			| TableShardClause					{ $$ = $1; }
++		;
++
++/*
++ * ShardPG：SHARD KEY (列) [SHARDS n] [REPLICAS n] [COLOCATE WITH 表]
++ *
++ * 不新增关键字（SHARD / SHARDS / REPLICAS / COLOCATE 都按普通标识符读、在动作里校验
++ * 拼写），关键字表与 kwlist.h 不变，Citus 和扩展的头文件不受影响。解析结果是一个
++ * DefElem（命名空间 "shardpg"），由 CREATE TABLE 的动作挪进 options，再由 pg_partdist
++ * 的 ProcessUtility 钩子摘下执行；没装 pg_partdist 时 reloption 校验报
++ * "unrecognized parameter namespace \"shardpg\""。
++ */
++TableShardClause:
++			IDENT KEY '(' ColId ')' opt_shard_opts
++				{
++					if (strcmp($1, "shard") != 0)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("syntax error at or near \"%s\"", $1),
++								 parser_errposition(@1)));
++					$$ = (Node *) makeDefElemExtended("shardpg", "shard_key",
++						(Node *) lcons(makeDefElemExtended("shardpg", "column",
++															(Node *) makeString($4),
++															DEFELEM_UNSPEC, @4),
++									   $6),
++						DEFELEM_UNSPEC, @1);
++				}
++		;
++
++opt_shard_opts:
++			opt_shard_opts shard_opt			{ $$ = lappend($1, $2); }
++			| /*EMPTY*/							{ $$ = NIL; }
++		;
++
++shard_opt:
++			IDENT Iconst
++				{
++					if (strcmp($1, "shards") != 0 && strcmp($1, "replicas") != 0)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("SHARD KEY 不认识的选项 \"%s\"", $1),
++								 errhint("可用选项：SHARDS n、REPLICAS n、COLOCATE WITH 表名。"),
++								 parser_errposition(@1)));
++					$$ = (Node *) makeDefElemExtended("shardpg", $1,
++													  (Node *) makeInteger($2),
++													  DEFELEM_UNSPEC, @1);
++				}
++			| IDENT WITH any_name
++				{
++					if (strcmp($1, "colocate") != 0)
++						ereport(ERROR,
++								(errcode(ERRCODE_SYNTAX_ERROR),
++								 errmsg("SHARD KEY 不认识的选项 \"%s\"", $1),
++								 errhint("可用选项：SHARDS n、REPLICAS n、COLOCATE WITH 表名。"),
++								 parser_errposition(@1)));
++					$$ = (Node *) makeDefElemExtended("shardpg", "colocate",
++													  (Node *) makeString(NameListToString($3)),
++													  DEFELEM_UNSPEC, @1);
++				}
+ 		;
+ 
+ TypedTableElement:
+@@ -5445,6 +5516,7 @@ CreateForeignTableStmt:
+ 					$4->relpersistence = RELPERSISTENCE_PERMANENT;
+ 					n->base.relation = $4;
+ 					n->base.tableElts = $6;
++					extractShardClause(&n->base.tableElts, &n->base.options, false, yyscanner);
+ 					n->base.inhRelations = $8;
+ 					n->base.ofTypename = NULL;
+ 					n->base.constraints = NIL;
+@@ -5466,6 +5538,7 @@ CreateForeignTableStmt:
+ 					$7->relpersistence = RELPERSISTENCE_PERMANENT;
+ 					n->base.relation = $7;
+ 					n->base.tableElts = $9;
++					extractShardClause(&n->base.tableElts, &n->base.options, false, yyscanner);
+ 					n->base.inhRelations = $11;
+ 					n->base.ofTypename = NULL;
+ 					n->base.constraints = NIL;
+@@ -18905,6 +18978,67 @@ makeRecursiveViewSelect(char *relname, List *aliases, Node *query)
+ 	return (Node *) s;
+ }
+ 
++/*
++ * ShardPG：把表元素列表里的 SHARD KEY 子句（命名空间 "shardpg" 的 DefElem）挪进
++ * CREATE TABLE 的 options，选项逐个展开成 shardpg.column / shards / replicas / colocate。
++ * 外部表不支持（allowed = false）。
++ */
++static void
++extractShardClause(List **tableElts, List **options, bool allowed,
++				   core_yyscan_t yyscanner)
++{
++	ListCell   *lc;
++	List	   *keep = NIL;
++	bool		seen = false;
++
++	foreach(lc, *tableElts)
++	{
++		Node	   *elt = (Node *) lfirst(lc);
++		DefElem    *d;
++		ListCell   *lc2;
++
++		if (!IsA(elt, DefElem) ||
++			((DefElem *) elt)->defnamespace == NULL ||
++			strcmp(((DefElem *) elt)->defnamespace, "shardpg") != 0)
++		{
++			keep = lappend(keep, elt);
++			continue;
++		}
++		d = (DefElem *) elt;
++		if (!allowed)
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("外部表不支持 SHARD KEY"),
++					 parser_errposition(d->location)));
++		if (seen)
++			ereport(ERROR,
++					(errcode(ERRCODE_SYNTAX_ERROR),
++					 errmsg("SHARD KEY 只能指定一次"),
++					 parser_errposition(d->location)));
++		seen = true;
++		foreach(lc2, (List *) d->arg)
++		{
++			DefElem    *o = lfirst_node(DefElem, lc2);
++			ListCell   *lc3;
++
++			foreach(lc3, *options)
++			{
++				DefElem    *prev = lfirst_node(DefElem, lc3);
++
++				if (prev->defnamespace != NULL &&
++					strcmp(prev->defnamespace, "shardpg") == 0 &&
++					strcmp(prev->defname, o->defname) == 0)
++					ereport(ERROR,
++							(errcode(ERRCODE_SYNTAX_ERROR),
++							 errmsg("SHARD KEY 选项 \"%s\" 重复", o->defname),
++							 parser_errposition(o->location)));
++			}
++			*options = lappend(*options, o);
++		}
++	}
++	*tableElts = keep;
++}
++
+ /* parser_init()
+  * Initialize to parse one query string
+  */
+diff --git a/src/interfaces/ecpg/preproc/parse.pl b/src/interfaces/ecpg/preproc/parse.pl
+index 9c45388..d8e2daf 100644
+--- a/src/interfaces/ecpg/preproc/parse.pl
++++ b/src/interfaces/ecpg/preproc/parse.pl
+@@ -89,7 +89,12 @@ my %replace_types = (
+ 	'PLpgSQL_Expr' => 'ignore',
+ 	'PLAssignStmt' => 'ignore',
+ 	'plassign_target' => 'ignore',
+-	'plassign_equals' => 'ignore',);
++	'plassign_equals' => 'ignore',
++
++	# ShardPG（内核补丁 0016）：SHARD KEY 表元素只给后端用，嵌入式 SQL 不支持
++	'TableShardClause' => 'ignore',
++	'opt_shard_opts' => 'ignore',
++	'shard_opt' => 'ignore',);
+ 
+ # these replace_line commands excise certain keywords from the core keyword
+ # lists.  Be sure to account for these in ColLabel and related productions.
+@@ -108,6 +113,7 @@ my %replace_line = (
+ 	'col_name_keywordVALUES' => 'ignore',
+ 	'reserved_keywordTO' => 'ignore',
+ 	'reserved_keywordUNION' => 'ignore',
++	'TableElementTableShardClause' => 'ignore',
+ 
+ 	# some other production rules have to be ignored or replaced
+ 	'fetch_argsFORWARDopt_from_incursor_name' => 'ignore',
