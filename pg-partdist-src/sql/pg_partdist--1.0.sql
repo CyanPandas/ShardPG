@@ -2377,6 +2377,7 @@ COMMENT ON FUNCTION replay_auto_follow(OID) IS
 --       之后 partdist.shardpg_cleanup_dropped() 拆组、删副本表、删登记
 --   SELECT * FROM shardpg.shards;           每个分片的主、从、哈希范围、任期（WHERE table_name IN ('t1', 't2')）
 --   SELECT shardpg.cleanup_dropped();       事务块里删的表，提交后手工清
+--   BEGIN; SELECT shardpg.global_txn(); ...  一个事务写多个分片（分布式事务）
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS partdist.shardpg_drop_queue (
@@ -2598,5 +2599,24 @@ CREATE OR REPLACE FUNCTION shardpg.cleanup_dropped()
 RETURNS text LANGUAGE sql AS $fn$
     SELECT partdist.shardpg_cleanup_dropped()
 $fn$;
+-- 加入全局事务：一个事务要写多个分片时，BEGIN 之后先调它（取 gxid + TSO 起始时间戳，经 Citus 传给各分片）
+CREATE OR REPLACE FUNCTION shardpg.global_txn()
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    g   bigint;
+    ts  bigint;
+BEGIN
+    IF transaction_timestamp() = statement_timestamp() THEN
+        RAISE EXCEPTION '请先 BEGIN，再在事务里调用 shardpg.global_txn()';
+    END IF;
+    g  := partdist.partdist_gxid_next();
+    ts := partdist.partdist_tso_client_start_ts();
+    EXECUTE 'SET LOCAL citus.propagate_set_commands = ''local''';
+    EXECUTE format('SET LOCAL pg_partdist.join_info = %L', format('%s,%s,0', g, ts));
+    RETURN format('已加入全局事务：gxid = %s，start_ts = %s', g, ts);
+END $fn$;
+COMMENT ON FUNCTION shardpg.global_txn() IS
+    'P7-N89：BEGIN 之后调用，本事务加入全局事务（gxid + TSO start_ts），之后可在一个事务里写多个分片、跨分片读到同一快照。';
+
 COMMENT ON FUNCTION shardpg.cleanup_dropped() IS
     'P7-N88：清理已删分片表留下的 Raft 组、副本表、主从登记（在事务块里 DROP 的表提交后执行；自动清理没清干净时再执行）。';

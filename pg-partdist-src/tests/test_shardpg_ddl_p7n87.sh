@@ -194,6 +194,31 @@ expect_eq "customer 读回 24 行" "$nc" "24"
 expect_eq "orders 读回 24 行" "$no" "24"
 
 # ---------------------------------------------------------------------------
+step 3b "shardpg.global_txn()：一个事务写多个分片"
+out=$(run "SELECT shardpg.global_txn()")
+expect_has "不在事务块里调用会报错" "$out" "请先 BEGIN，再在事务里调用 shardpg.global_txn()"
+out=$(runf <<'SQL'
+BEGIN;
+SELECT shardpg.global_txn();
+UPDATE customer SET c_balance = 100;
+COMMIT;
+SQL
+)
+expect_has "加入全局事务" "$out" "已加入全局事务"
+expect_hasnt "跨 4 个分片的 UPDATE 无报错" "$out" "ERROR"
+expect_eq "4 个分片都已更新（24 × 100）" "$(q "SELECT sum(c_balance) FROM customer")" "2400.00"
+out=$(runf <<'SQL'
+BEGIN;
+SELECT shardpg.global_txn();
+UPDATE customer SET c_balance = c_balance - 10 WHERE c_w_id = 1;
+UPDATE customer SET c_balance = c_balance + 10 WHERE c_w_id = 2;
+ROLLBACK;
+SQL
+)
+expect_hasnt "跨分片事务回滚无报错" "$out" "ERROR"
+expect_eq "回滚后两个分片都恢复" "$(q "SELECT string_agg(c_w_id || ':' || sum, ',' ORDER BY c_w_id) FROM (SELECT c_w_id, sum(c_balance) FROM customer WHERE c_w_id IN (1, 2) GROUP BY 1) x")" "1:600.00,2:600.00"
+
+# ---------------------------------------------------------------------------
 step 4 "shardpg.shards 视图"
 expect_eq "8 行" "$(q "SELECT count(*) FROM shardpg.shards WHERE table_name IN ('customer'::regclass, 'orders'::regclass)")" "8"
 expect_eq "主都有值、从都是 2 个" "$(q "SELECT count(*) FROM shardpg.shards WHERE table_name IN ('customer'::regclass, 'orders'::regclass) AND \"primary\" IS NOT NULL AND cardinality(string_to_array(replicas, ',')) = 2")" "8"
