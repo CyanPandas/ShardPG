@@ -1,34 +1,40 @@
 -- ════════════════════════════════════════════════════════════════════════════
--- ShardPG 事务逻辑演示：沿用四步演示第 1 步建的 customer / orders（12 个客户，订单为空）
+-- ShardPG 事务逻辑演示：在四步演示第 1 步建好的 customer / orders 上直接做，不清空、不重建
 --
--- 开两个窗口，都连 master（:5432）：
+-- 开三个窗口，都连 master（:5432）：
 --   docker exec -it -e PGCLIENTENCODING=UTF8 -u postgres pg-test-container \
 --       /work/pg-install/bin/psql -h /tmp -p 5432 -U postgres
--- 每段前面的【窗口 A】/【窗口 B】表示这段在哪个窗口输入。
+--   窗口 W：持续写入，从第 1 部分开始一直写到演示结束
+--   窗口 A、窗口 B：其余操作
+-- 每段前面的【窗口 W】/【窗口 A】/【窗口 B】表示这段在哪个窗口输入。
 --
--- 一共三部分：1 边写边读 → 2 分布式事务 → 3 增删改查
+-- 一共三部分：1 开始持续写入、边写边读 → 2 分布式事务 → 3 增删改查（2、3 进行时写入一直不停）
 -- ════════════════════════════════════════════════════════════════════════════
 
--- ════ 第 1 部分：不停地写，写的过程中读行数 ════
--- 【窗口 A】一个循环不停地下订单，每张订单单独提交（4 个仓库轮流写，每条只写一个分片）；
---           要跑几十秒，输入后不用等它，直接去窗口 B
+-- ════ 第 1 部分：开始持续写入，边写边读 ════
+-- 【窗口 W】不停地下订单，每张订单单独提交（4 个仓库轮流写，每条只写一个分片），订单号接着表里已有的往下编。
+--           启动后它会一直写，不用等它；演示结束时在这个窗口按 Ctrl+C 停掉
 DO $$
+DECLARE
+  base int;
 BEGIN
-  FOR i IN 1..40 LOOP
+  SELECT coalesce(max(o_id), 0) INTO base FROM orders WHERE o_d_id = 9;
+  FOR i IN 1..1000000 LOOP
     INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt)
-    VALUES (1 + i % 4, 1, 100 + i, 1 + i % 2, 5);
+    VALUES (1 + i % 4, 9, base + i, 1 + i % 2, 5);
     COMMIT;
+    PERFORM pg_sleep(0.2);
   END LOOP;
 END $$;
--- 【窗口 B】A 还在写的时候，每秒查一次订单数，查 15 次（只显示数据行）
+-- 【窗口 B】写入进行中，每秒查一次订单总数，查 10 次（只显示数据行）
 \pset tuples_only on
-SELECT now()::time(0) AS t, count(*) AS orders FROM orders \watch i=1 c=15
+SELECT now()::time(0) AS t, count(*) AS orders FROM orders \watch i=1 c=10
 \pset tuples_only off
--- 【窗口 B】等窗口 A 显示 DO（写完了）再查：一共 40 张订单，4 个仓库各 10 张
-SELECT o_w_id, count(*) AS orders FROM orders GROUP BY 1 ORDER BY 1;
 
--- ════ 第 2 部分：分布式事务（一个事务写多个分片） ════
+-- ════ 第 2 部分：分布式事务（一个事务写多个分片），窗口 W 仍在写入 ════
 -- 规则：一个事务只写一个分片时直接写；要写多个分片，BEGIN 之后先执行 SELECT shardpg.global_txn();
+-- 【窗口 B】写入还在继续
+SELECT count(*) AS orders FROM orders;
 -- 2.1 准备：每个客户 1000 元。不带分片键的 UPDATE 会改到全部 4 个分片，所以放在全局事务里
 -- 【窗口 A】
 BEGIN;
@@ -99,7 +105,9 @@ ROLLBACK;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
 SELECT sum(c_balance) AS total FROM customer;
 
--- ════ 第 3 部分：增删改查 ════
+-- ════ 第 3 部分：增删改查，窗口 W 仍在写入 ════
+-- 【窗口 B】写入还在继续
+SELECT count(*) AS orders FROM orders;
 -- 3.1 增：仓库 1 新来一个客户，给他下两张订单（客户和订单在同一仓库 → 同一个分片）
 -- 【窗口 A】
 INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last, c_balance) VALUES (1, 3, 1, 'Nina', 'He', 500);
@@ -132,3 +140,9 @@ DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_c_id = 1;
 DELETE FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 SELECT count(*) AS customers FROM customer;
 SELECT count(*) AS orders FROM orders WHERE o_d_id = 3;
+
+-- ════ 结束：停掉持续写入 ════
+-- 【窗口 W】按 Ctrl+C 停止循环（提示 canceling statement due to user request；已经提交的订单都保留）
+-- 【窗口 B】整场演示期间写入的订单，按仓库统计；以及订单总数
+SELECT o_w_id, count(*) AS orders, min(o_id), max(o_id) FROM orders WHERE o_d_id = 9 GROUP BY 1 ORDER BY 1;
+SELECT count(*) AS orders FROM orders;
