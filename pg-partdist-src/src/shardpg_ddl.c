@@ -57,6 +57,7 @@
 #include "utils/snapmgr.h"
 
 #include "shardpg_ddl.h"
+#include "tso.h"
 
 int			shardpg_shard_count = 0;		/* 0 = 等于 worker 数 */
 int			shardpg_replicas = 2;
@@ -83,6 +84,14 @@ ShardpgDdlDefineGucs(void)
 							 "DROP TABLE 删分片表时自动拆 Raft 组、删副本表、删登记。",
 							 "关掉后 DROP 只记清理队列，由 SELECT shardpg.cleanup_dropped() 手工清。",
 							 &shardpg_drop_cleanup,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("shardpg.auto_global_txn",
+							 "跨分片事务自动加入全局事务（统一 gxid 与快照时间戳）。",
+							 "Citus 开每个远程事务分支时，master 把本事务的全局事务号和 start_ts 随同一条 BEGIN "
+							 "交代过去（P7-N91）。关掉后一个事务写多个分片会在 PREPARE 时被拒。",
+							 &shardpg_auto_global_txn,
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

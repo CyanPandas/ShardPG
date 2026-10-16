@@ -26,6 +26,11 @@
 #include "shard_vacuum.h"
 #include "dtx_pending.h"
 
+#include "gxid.h"				/* P7-N91：GxidAllocate */
+
+#include <dlfcn.h>
+
+#include "access/xact.h"
 #include "fmgr.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
@@ -811,4 +816,76 @@ partdist_join_global_txn(PG_FUNCTION_ARGS)
 		cur_coord_gsid = coord_gsid;
 
 	PG_RETURN_VOID();
+}
+
+/* ================================================================== */
+/* P7-N91：跨分片事务自动加入全局事务                                   */
+/* ================================================================== */
+
+/*
+ * Citus 每在一台 worker 上开一个远程事务分支，都会在 BEGIN 的同一条消息里调用
+ * assign_distributed_transaction_id(...) 交代它的分布式事务号。补丁 citus-0002 在拼这一句的
+ * 地方留了钩子 remote_transaction_begin_hook，允许扩展往同一条消息里追加语句。
+ *
+ * master（发起端）在这里把本事务的全局事务号和快照时间戳一并交代过去：
+ *   - 本事务第一次开分支时分配 gxid（GxidAllocate）、取 TSO start_ts（TsoGetStartTs）；
+ *   - 之后每开一个分支都附同一份 partdist_join_global_txn(gxid, start_ts, coord_gsid)；
+ *   - 参与端照常经 partdist_join_global_txn 加入（与 join_info 通道殊途同归）；
+ *   - 事务结束 TsoClientClearActive 清零，下一事务重新分配 —— 生命周期与事务严格一致，
+ *     不需要登记表，也不存在"登记过期、后加入的分支拿到另一个 gxid"的问题。
+ * 会话里已手工 SET LOCAL pg_partdist.join_info 时沿用那份三元组，两条通道不冲突。
+ *
+ * 只对客户端后端生效（Citus 维护进程等后台进程开的分支不加入）；
+ * shardpg.auto_global_txn = off 时完全不介入（反向对照、性能对比用）。
+ * 钩子按名字 dlsym 查找：citus.so 没打补丁时找不到就只记 LOG、不启用，节点照常启动。
+ */
+bool		shardpg_auto_global_txn = true;
+
+typedef void (*CitusRemoteTxnBeginHook) (StringInfo command);
+static CitusRemoteTxnBeginHook prev_remote_begin_hook = NULL;
+
+static void
+partdist_remote_txn_begin(StringInfo command)
+{
+	int64		ts;
+
+	if (prev_remote_begin_hook)
+		prev_remote_begin_hook(command);
+
+	if (!shardpg_auto_global_txn || MyBackendType != B_BACKEND ||
+		!IsTransactionState() || !tso_configured())
+		return;
+
+	if (cur_gxid == 0)
+	{
+		if (pending_join_ts > 0)
+			(void) TsoGetStartTs();			/* 手工 join_info：注入它的三元组 */
+		else
+			cur_gxid = GxidAllocate();
+	}
+	ts = TsoGetStartTs();
+	if (cur_gxid == 0 || ts <= 0)
+		return;
+
+	appendStringInfo(command,
+					 "SELECT partdist.partdist_join_global_txn(" INT64_FORMAT ", "
+					 INT64_FORMAT ", " INT64_FORMAT ");",
+					 cur_gxid, ts, cur_coord_gsid);
+}
+
+void
+TsoClientInstallRemoteBeginHook(void)
+{
+	CitusRemoteTxnBeginHook *hookp;
+
+	hookp = (CitusRemoteTxnBeginHook *) dlsym(RTLD_DEFAULT, "remote_transaction_begin_hook");
+	if (hookp == NULL)
+	{
+		ereport(LOG,
+				(errmsg("pg_partdist: citus.so 没有 remote_transaction_begin_hook（未打补丁 citus-0002），"
+						"跨分片事务不会自动加入全局事务")));
+		return;
+	}
+	prev_remote_begin_hook = *hookp;
+	*hookp = partdist_remote_txn_begin;
 }

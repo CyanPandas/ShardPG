@@ -32,20 +32,16 @@ SELECT now()::time(0) AS t, count(*) AS orders FROM orders \watch i=1 c=10
 \pset tuples_only off
 
 -- ════ 第 2 部分：分布式事务（一个事务写多个分片），窗口 W 仍在写入 ════
--- 规则：一个事务只写一个分片时直接写；要写多个分片，BEGIN 之后先执行 SELECT shardpg.global_txn();
+-- 一个事务写多个分片时，系统自动把它作为一个全局事务（统一的事务号和快照时间戳），写法和普通 PostgreSQL 一样
 -- 【窗口 B】写入还在继续
 SELECT count(*) AS orders FROM orders;
--- 2.1 准备：每个客户 1000 元。不带分片键的 UPDATE 会改到全部 4 个分片，所以放在全局事务里
+-- 2.1 准备：每个客户 1000 元。不带分片键的 UPDATE 会改到全部 4 个分片，一条语句就是一个全局事务
 -- 【窗口 A】
-BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = 1000;
-COMMIT;
 SELECT count(*) AS customers, sum(c_balance) AS total FROM customer;
 -- 2.2 提交：仓库 1 的 Tom 转 300 元给仓库 2 的 Lucy，同时给 Tom 下一张订单（三个写操作，跨两个分片）
 -- 【窗口 A】
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 300 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
 UPDATE customer SET c_balance = c_balance + 300 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;
 INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 1, 5);
@@ -55,7 +51,6 @@ SELECT sum(c_balance) AS total FROM customer;
 -- 2.3 回滚：仓库 3 转 500 给仓库 4，事务里看得到修改，ROLLBACK 之后两边都恢复
 -- 【窗口 A】
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 500 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 1;
 UPDATE customer SET c_balance = c_balance + 500 WHERE c_w_id = 4 AND c_d_id = 1 AND c_id = 1;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (3, 4) ORDER BY 1;
@@ -64,7 +59,6 @@ SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AN
 -- 2.4 中途出错：两笔余额已改，第三条插入的订单号重复 → 整个事务作废，COMMIT 实际执行的是 ROLLBACK
 -- 【窗口 A】
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 200 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 2;
 UPDATE customer SET c_balance = c_balance + 200 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 2;
 INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 2, 3);
@@ -74,14 +68,12 @@ SELECT sum(c_balance) AS total FROM customer;
 -- 2.5 隔离：A 改了还没提交，B 看不见；B 开着的事务看到的是开始那一刻的快照，A 提交后也不变
 -- 【窗口 A】
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 100 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
 UPDATE customer SET c_balance = c_balance + 100 WHERE c_w_id = 4 AND c_d_id = 1 AND c_id = 1;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY 1;
 -- 【窗口 B】
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY 1;
 BEGIN;
-SELECT shardpg.global_txn();
 SELECT sum(c_balance) AS total FROM customer;
 -- 【窗口 A】
 COMMIT;
@@ -92,11 +84,9 @@ SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AN
 -- 2.6 写写冲突：A、B 同时改同一个客户，B 被挡住；A 提交后 B 报错（先提交者胜），B 只能重试
 -- 【窗口 A】
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance + 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
 -- 【窗口 B】最后这条 UPDATE 会卡住（在等 A），不用等它，回到窗口 A
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
 -- 【窗口 A】提交
 COMMIT;
@@ -128,11 +118,8 @@ SELECT c.c_w_id, c.c_d_id, c.c_id, c.c_first, count(o.o_id) AS orders
 -- 3.3 改：改一个客户（单分片，直接改）
 UPDATE customer SET c_balance = c_balance + 50, c_last = 'Huang' WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 SELECT c_w_id, c_d_id, c_id, c_first, c_last, c_balance FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
--- 一次改多个仓库：要放进全局事务
-BEGIN;
-SELECT shardpg.global_txn();
+-- 一次改多个仓库（4 个分片）：直接改
 UPDATE customer SET c_last = upper(c_last) WHERE c_d_id = 2;
-COMMIT;
 SELECT c_w_id, c_d_id, c_id, c_first, c_last FROM customer WHERE c_d_id = 2 ORDER BY 1;
 -- 3.4 删：删一张订单，再删这个客户的其余订单和客户本人（都在仓库 1 的分片里）
 DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_id = 2;

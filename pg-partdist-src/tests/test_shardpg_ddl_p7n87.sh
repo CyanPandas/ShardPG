@@ -194,29 +194,44 @@ expect_eq "customer 读回 24 行" "$nc" "24"
 expect_eq "orders 读回 24 行" "$no" "24"
 
 # ---------------------------------------------------------------------------
-step 3b "shardpg.global_txn()：一个事务写多个分片"
-out=$(run "SELECT shardpg.global_txn()")
-expect_has "不在事务块里调用会报错" "$out" "请先 BEGIN，再在事务里调用 shardpg.global_txn()"
-out=$(runf <<'SQL'
-BEGIN;
-SELECT shardpg.global_txn();
-UPDATE customer SET c_balance = 100;
-COMMIT;
-SQL
-)
-expect_has "加入全局事务" "$out" "已加入全局事务"
-expect_hasnt "跨 4 个分片的 UPDATE 无报错" "$out" "ERROR"
+step 3b "跨分片事务自动加入全局事务（P7-N91，Citus 补丁 citus-0002）"
+expect_eq "shardpg.global_txn() 已移除" "$(q "SELECT to_regprocedure('shardpg.global_txn()') IS NULL")" "t"
+expect_eq "自动加入默认开" "$(q 'SHOW shardpg.auto_global_txn')" "on"
+out=$(run "UPDATE customer SET c_balance = 100")
+expect_hasnt "不带分片键的 UPDATE（自动提交，跨 4 个分片）无报错" "$out" "ERROR"
 expect_eq "4 个分片都已更新（24 × 100）" "$(q "SELECT sum(c_balance) FROM customer")" "2400.00"
 out=$(runf <<'SQL'
 BEGIN;
-SELECT shardpg.global_txn();
 UPDATE customer SET c_balance = c_balance - 10 WHERE c_w_id = 1;
 UPDATE customer SET c_balance = c_balance + 10 WHERE c_w_id = 2;
+COMMIT;
+SQL
+)
+expect_hasnt "显式事务写两个分片后提交无报错" "$out" "ERROR"
+W12="SELECT string_agg(c_w_id || ':' || sum, ',' ORDER BY c_w_id) FROM (SELECT c_w_id, sum(c_balance) FROM customer WHERE c_w_id IN (1, 2) GROUP BY 1) x"
+expect_eq "提交后两个分片都生效" "$(q "$W12")" "1:540.00,2:660.00"
+out=$(runf <<'SQL'
+BEGIN;
+UPDATE customer SET c_balance = c_balance - 5 WHERE c_w_id = 1;
+UPDATE customer SET c_balance = c_balance + 5 WHERE c_w_id = 2;
 ROLLBACK;
 SQL
 )
-expect_hasnt "跨分片事务回滚无报错" "$out" "ERROR"
-expect_eq "回滚后两个分片都恢复" "$(q "SELECT string_agg(c_w_id || ':' || sum, ',' ORDER BY c_w_id) FROM (SELECT c_w_id, sum(c_balance) FROM customer WHERE c_w_id IN (1, 2) GROUP BY 1) x")" "1:600.00,2:600.00"
+expect_hasnt "显式事务回滚无报错" "$out" "ERROR"
+expect_eq "回滚后两个分片都恢复" "$(q "$W12")" "1:540.00,2:660.00"
+out=$(run "INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 5, 1, 1, 1), (2, 5, 1, 1, 1), (3, 5, 1, 1, 1), (4, 5, 1, 1, 1)")
+expect_hasnt "一条 INSERT 写 4 个仓库（跨分片）无报错" "$out" "ERROR"
+expect_eq "4 个分片各写入一行" "$(q "SELECT count(DISTINCT o_w_id) || '/' || count(*) FROM orders WHERE o_d_id = 5")" "4/4"
+# 反向对照：关掉自动加入，同样的跨分片写在 PREPARE 被拒（证明起作用的是自动加入）
+out=$(runf <<'SQL'
+SET shardpg.auto_global_txn = off;
+UPDATE customer SET c_balance = c_balance + 1;
+SQL
+)
+expect_has "关掉自动加入后跨分片写被拒" "$out" "未加入全局事务的分片写不允许 PREPARE TRANSACTION"
+expect_eq "被拒的写没有生效" "$(q "SELECT sum(c_balance) FROM customer")" "2400.00"
+np=0; for p in $WORKERS; do np=$((np + $(q "SELECT count(*) FROM pg_prepared_xacts" "$p"))); done
+expect_eq "被拒的写没有留下 prepared 事务" "$np" "0"
 
 # ---------------------------------------------------------------------------
 step 4 "shardpg.shards 视图"

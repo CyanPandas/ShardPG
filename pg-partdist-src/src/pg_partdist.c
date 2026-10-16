@@ -890,6 +890,8 @@ _PG_init(void)
 
     /* P7-N87：shardpg.shard_count / shardpg.replicas / shardpg.drop_cleanup */
     ShardpgDdlDefineGucs();
+    /* P7-N91：跨分片事务自动加入全局事务（Citus 已先于本扩展加载） */
+    TsoClientInstallRemoteBeginHook();
 
     /* Chain ProcessUtility hook */
     prev_ProcessUtility_hook = ProcessUtility_hook;

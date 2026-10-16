@@ -119,6 +119,12 @@ need_str_in "0016   SHARD KEY 文法（gram.y 产出的 shardpg 选项命名空�
             "bin/postgres" "shard_key"
 need_str_in "0017   psql \\dt 显示分片与主从（describe.c）" \
             "bin/psql" "shard key: "
+# P7-N91：Citus 补丁 citus-0002 —— citus.so 必须导出 remote_transaction_begin_hook（PGDLLEXPORT）
+if nm -D --defined-only "$ROOT/lib/postgresql/citus.so" 2>/dev/null | grep -q " remote_transaction_begin_hook$"; then
+  say "citus-0002 remote_transaction_begin_hook（lib/postgresql/citus.so）" "OK"
+else
+  say "citus-0002 remote_transaction_begin_hook（lib/postgresql/citus.so）" "缺失（citus.so 未打补丁？）"; fail=1
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   cat <<'EOF'

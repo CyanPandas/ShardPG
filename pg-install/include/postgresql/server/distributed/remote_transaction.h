@@ -15,6 +15,7 @@
 
 #include "lib/ilist.h"
 #include "nodes/pg_list.h"
+#include "lib/stringinfo.h"
 
 
 /* forward declare, to avoid recursive includes */
@@ -153,5 +154,12 @@ extern char *SuperuserRole;
 extern char *MainDb;
 extern struct MultiConnection *MainDBConnection;
 extern bool IsMainDBCommandInXact;
+
+/*
+ * ShardPG：远程事务分支开启钩子。Citus 拼 BEGIN + assign_distributed_transaction_id 时调用，
+ * 扩展可往 command 末尾追加语句，随同一条消息发给 worker。
+ */
+typedef void (*remote_transaction_begin_hook_type) (StringInfo command);
+extern PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook;
 
 #endif /* REMOTE_TRANSACTION_H */

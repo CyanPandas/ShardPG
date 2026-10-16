@@ -49,6 +49,10 @@ extern bool TsoConfigured(void);		/* conninfo 非空 = TSO 模式 */
 /* ---- T4.1 连接加入协议 ---- */
 extern void TsoInjectStartTs(int64 ts);	/* 注入协调者下发的快照（登记活跃集合） */
 extern int64 TsoCurrentGxid(void);		/* 0 = 未加入全局事务 */
+
+/* P7-N91：跨分片事务自动加入全局事务（Citus 补丁 citus-0002 的钩子） */
+extern bool shardpg_auto_global_txn;
+extern void TsoClientInstallRemoteBeginHook(void);
 extern int64 TsoCurrentCoordGsid(void);	/* 0 = 未知 */
 
 /* T5.2：worker 侧取 GlobalSafeTs（经 RPC；失败返回 0 = 不清，安全方向） */

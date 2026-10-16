@@ -1,0 +1,54 @@
+diff --git a/src/backend/distributed/transaction/remote_transaction.c b/src/backend/distributed/transaction/remote_transaction.c
+index 9ef7595..79b9687 100644
+--- a/src/backend/distributed/transaction/remote_transaction.c
++++ b/src/backend/distributed/transaction/remote_transaction.c
+@@ -83,6 +83,12 @@ static char *IsolationLevelName[] = {
+ /* The MultiConnection used for connecting Citus main database. */
+ MultiConnection *MainDBConnection = NULL;
+ 
++/*
++ * ShardPG：开远程事务分支时，扩展可往同一条 BEGIN 消息里追加自己的交接语句
++ * （紧跟在 assign_distributed_transaction_id 之后）。为空时行为与原版相同。
++ */
++PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook = NULL;
++
+ /*
+  * IsMainDBCommand is true if this is a query in the Citus main database that is started
+  * by a query from a different database.
+@@ -422,6 +428,12 @@ AssignDistributedTransactionIdCommand(void)
+ 					 distributedTransactionId->transactionNumber,
+ 					 timestamp);
+ 
++	/* ShardPG：扩展随同一条消息交代自己的事务上下文（如全局事务号与快照时间戳） */
++	if (remote_transaction_begin_hook != NULL)
++	{
++		remote_transaction_begin_hook(assignDistributedTransactionId);
++	}
++
+ 	/* free the StringInfo but not the buffer itself */
+ 	char *command = assignDistributedTransactionId->data;
+ 	pfree(assignDistributedTransactionId);
+diff --git a/src/include/distributed/remote_transaction.h b/src/include/distributed/remote_transaction.h
+index 45e2eba..8e84cb6 100644
+--- a/src/include/distributed/remote_transaction.h
++++ b/src/include/distributed/remote_transaction.h
+@@ -15,6 +15,7 @@
+ 
+ #include "lib/ilist.h"
+ #include "nodes/pg_list.h"
++#include "lib/stringinfo.h"
+ 
+ 
+ /* forward declare, to avoid recursive includes */
+@@ -154,4 +155,11 @@ extern char *MainDb;
+ extern struct MultiConnection *MainDBConnection;
+ extern bool IsMainDBCommandInXact;
+ 
++/*
++ * ShardPG：远程事务分支开启钩子。Citus 拼 BEGIN + assign_distributed_transaction_id 时调用，
++ * 扩展可往 command 末尾追加语句，随同一条消息发给 worker。
++ */
++typedef void (*remote_transaction_begin_hook_type) (StringInfo command);
++extern PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook;
++
+ #endif /* REMOTE_TRANSACTION_H */
