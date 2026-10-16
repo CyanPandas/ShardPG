@@ -15,6 +15,9 @@
  *     场景由注册前清目录 + 实践上的后端换代覆盖，P2 已知边界）。
  *   - T3.3 起真 SI（§4.1）：COMMITTED 且 commit_ts < start_ts 才可见，
  *     xmax 对称；遗留模式（TSO 未配置，start_ts=0）退回 P2"已提交即可见"。
+ *   - P7-N92：活跃表条目带"提交中"标记（取 commit_ts 之前置上）。快照读遇到
+ *     提交中、且 commit_ts 未知或早于本快照的条目，等它落账再判 —— 否则同一
+ *     快照先当它未提交、落账后又按 commit_ts 看见它（前后两次读不一致）。
  *   - 自见性按元组原始 cid 近似：同事务内"插入后又更新/删除同一行"会把
  *     cmin 覆盖成 cmax（内核 AdjustCmax 对分片 xid 不生成 combo cid），
  *     记录为已知限制，验收用例避开。
@@ -44,10 +47,14 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapshot.h"
+#include "utils/timestamp.h"
 
 /* ---- T1.8 GUC ---- */
 
 int			shard_safety_mode = SHARD_SAFETY_PERMISSIVE;
+
+/* P7-N92：快照读等"提交中"事务落账的上限（毫秒）；0 = 不等（旧行为） */
+int			shard_commit_wait_timeout_ms = 10000;
 
 static const struct config_enum_entry shard_safety_mode_options[] = {
 	{"permissive", SHARD_SAFETY_PERMISSIVE, false},
@@ -67,6 +74,12 @@ typedef struct ShardCommitEntry
 {
 	ShardCommitKey key;
 	TransactionId native_xid;	/* 持有者的原生 top xid（反查表） */
+	/*
+	 * P7-N92 提交进度：0 = 还在执行（没开始取 commit_ts）；-1 = 提交中、
+	 * commit_ts 正在取；> 0 = 提交中、commit_ts 已取到（只会变大：2PC 驱动端
+	 * 的决议号覆盖 PRE_COMMIT 暂存值）。见 ShardCommitSetCommitTs。
+	 */
+	int64		commit_ts;
 } ShardCommitEntry;
 
 static HTAB *ShardCommitHash = NULL;
@@ -135,6 +148,7 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	ShardCommitEntry *e;
 	ShardVerdictCacheEntry *ce;
 	ShardClogSlot slot;
+	TimestampTz wait_start = 0;
 
 	if (native_xid)
 		*native_xid = InvalidTransactionId;
@@ -151,18 +165,60 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	key.shard = shard;
 	key.sxid = sxid;
 
-	/* 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O */
-	LWLockAcquire(ShardCommitLock, LW_SHARED);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
-										 HASH_FIND, NULL);
-	if (e != NULL)
+	/*
+	 * 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O。
+	 *
+	 * ★ P7-N92（2026-10-16）：命中的条目若已"提交中"，快照读（strict）不能直接按
+	 * 未提交处理。单分片事务在 PRE_COMMIT 先取 commit_ts，再等复制确认（RF=3 时
+	 * 约 0.8 秒），落账后才摘条目。commit_ts 早于本快照 start_ts 的这笔，现在当它
+	 * 未提交，落账后同一快照再读就会按 commit_ts < start_ts 看见它 —— 实测持续单条
+	 * INSERT 时，开着的事务里两次 count(*) 15 次有 9 次多出 1 行。
+	 * 做法：等它落账（摘条目）后重判。commit_ts 已取到且不早于本快照的不用等 ——
+	 * 它对本快照永远不可见。还在执行（commit_ts 一个都没取）的也不用等：提交中标记
+	 * 在取号之前置上，此刻没置 ⇒ 它的 commit_ts 将在本快照号发出之后才发，必然更大。
+	 * 等待时可能持有缓冲区共享锁（与 TSO 取号、DtxReaderResolve 同样的处境），
+	 * 提交中的事务不需要再拿堆页锁，不会互等；上限 pg_partdist.commit_wait_timeout，
+	 * 超时报可重试错误。
+	 */
+	for (;;)
 	{
+		int64		ects;
+		int64		my_ts;
+
+		LWLockAcquire(ShardCommitLock, LW_SHARED);
+		e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+											 HASH_FIND, NULL);
+		if (e == NULL)
+		{
+			LWLockRelease(ShardCommitLock);
+			break;				/* 已落账（或不在本次启动内）：往下查终局 */
+		}
 		if (native_xid)
 			*native_xid = e->native_xid;
+		ects = e->commit_ts;
 		LWLockRelease(ShardCommitLock);
-		return SXID_RUNNING;
+
+		if (!strict || ects == 0 || shard_commit_wait_timeout_ms <= 0)
+			return SXID_RUNNING;
+		my_ts = TsoGetStartTs();
+		if (my_ts <= 0 || (ects > 0 && ects >= my_ts))
+			return SXID_RUNNING;
+
+		if (wait_start == 0)
+			wait_start = GetCurrentTimestamp();
+		else if (TimestampDifferenceExceeds(wait_start, GetCurrentTimestamp(),
+											shard_commit_wait_timeout_ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("分片 %u 上有一笔事务（xid %u）正在提交，等了 %d 毫秒仍未落账，"
+							"本次读取给不出一致的结果", shard, sxid,
+							shard_commit_wait_timeout_ms),
+					 errdetail("它的提交时间戳%s本事务的快照（start_ts " INT64_FORMAT
+							   "）：现在当它未提交，它落账后同一快照就会看见它。",
+							   ects < 0 ? "还没取到，可能早于" : "早于", my_ts),
+					 errhint("稍后重试本事务；一直这样说明这笔提交卡在复制确认上（P7-N92）。")));
+		pg_usleep(1000L);
 	}
-	LWLockRelease(ShardCommitLock);
 
 	/* 终局缓存 */
 	ce = verdict_cache_search(&key, HASH_FIND);
@@ -992,6 +1048,30 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 				 errhint("活跃分片事务数不该有这个量级；查泄漏。")));
 	}
 	e->native_xid = native_xid;
+	e->commit_ts = 0;
+	LWLockRelease(ShardCommitLock);
+}
+
+/*
+ * P7-N92：登记本事务在该分片上的提交进度（-1 = 开始取 commit_ts；> 0 = 取到的号）。
+ * 由 TsoStashCommitTs 在取号前后、PartDistTsoDtxDecisionTs 在决议号覆盖后调用
+ * （经 ShardXidPublishCommitTs 遍历本事务碰过的分片）。条目不在（PREPARE 已摘、
+ * 或从没进表）静默跳过。
+ */
+void
+ShardCommitSetCommitTs(Oid shard, TransactionId sxid, int64 cts)
+{
+	ShardCommitKey key;
+	ShardCommitEntry *e;
+
+	if (ShardCommitHash == NULL)
+		return;
+	key.shard = shard;
+	key.sxid = sxid;
+	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+	if (e != NULL)
+		e->commit_ts = cts;
 	LWLockRelease(ShardCommitLock);
 }
 
@@ -1073,6 +1153,16 @@ ShardVisibilityDefineGUCs(void)
 		shard_safety_mode_options,
 		PGC_SUSET,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.commit_wait_timeout",
+		"快照读遇到正在提交、提交时间戳早于本快照的分片事务时，最多等它落账多久（P7-N92）。",
+		"超时报可重试的串行化错误。0 = 不等，按未提交处理（旧行为：同一快照前后两次读可能不一致）。",
+		&shard_commit_wait_timeout_ms,
+		10000, 0, 3600 * 1000,
+		PGC_SUSET,
+		GUC_UNIT_MS,
 		NULL, NULL, NULL);
 }
 

@@ -70,6 +70,9 @@ extern int	ShardXidXactCount(void);
 
 extern TransactionId ShardXidMineForShard(Oid shard);
 
+/* P7-N92：把本事务碰过的各分片在活跃表里的提交进度登记为 cts（见 ShardCommitSetCommitTs） */
+extern void ShardXidPublishCommitTs(int64 cts);
+
 /* T2.4：确保该分片本次启动已完成无主 RUNNING 认领（槽位存在=已认领）。
  * 发号路径自动触发；可见性读路径在咨询 clog 前调用。返回本次改判条数。 */
 extern int	ShardXidEnsureClaimed(Oid shard);

@@ -29,6 +29,7 @@
 #define SHARD_SAFETY_STRICT			1
 
 extern int	shard_safety_mode;
+extern int	shard_commit_wait_timeout_ms;	/* P7-N92 */
 
 extern void ShardVisibilityDefineGUCs(void);
 extern void RequestShardCommitShmem(void);
@@ -44,6 +45,9 @@ extern void ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 /* 事务结束回调里调用：先写 clog 终局判决（fsync），后摘活跃表条目。
  * 判决写失败升 PANIC（借崩溃恢复走 0007 redo 补齐）；摘条目异常仅 WARNING。 */
 extern void ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed);
+
+/* P7-N92：提交进度（-1 = 开始取 commit_ts，> 0 = 取到的号）；快照读据此决定等不等 */
+extern void ShardCommitSetCommitTs(Oid shard, TransactionId sxid, int64 cts);
 
 /* T1.8 守卫点：strict 模式拦截 + SERIALIZABLE 禁令；读写路径共用 */
 extern void ShardAccessGate(Oid shard, const char *what);

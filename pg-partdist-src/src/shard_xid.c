@@ -1462,6 +1462,15 @@ ShardXidMineForShard(Oid shard)
 	return InvalidTransactionId;
 }
 
+void
+ShardXidPublishCommitTs(int64 cts)
+{
+	int			i;
+
+	for (i = 0; i < xact_map_n; i++)
+		ShardCommitSetCommitTs(xact_map[i].shard, xact_map[i].sxid, cts);
+}
+
 static void
 shard_xid_xact_callback(XactEvent event, void *arg)
 {

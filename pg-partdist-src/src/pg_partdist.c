@@ -562,6 +562,14 @@ partdist_process_utility(PlannedStmt *pstmt,
 static bool debug_segv_backtrace = false;
 
 #ifdef HAVE_EXECINFO_H
+/*
+ * ★ 2026-10-16：处理器跑在备用信号栈上（sigaltstack + SA_ONSTACK）。栈溢出时原栈已经
+ * 没有空间压信号帧，内核只能直接杀进程 —— 日志里只有 "terminated by signal 11"，处理器
+ * 一行都打不出来（实测：SHARD KEY 建表失败路径上 master 崩了两次都没有栈，而对空闲后端
+ * kill -SEGV 能正常打出）。备用栈在 postmaster 里设好，随 fork 继承（每个子进程各一份）。
+ */
+static char partdist_segv_altstack[256 * 1024];
+
 static void
 partdist_segv_handler(int signum)
 {
@@ -787,10 +795,23 @@ _PG_init(void)
 #ifdef HAVE_EXECINFO_H
     if (debug_segv_backtrace)
     {
-        /* 处理器随 fork 继承，因此在 postmaster 装一次即覆盖全部后端 */
-        signal(SIGSEGV, partdist_segv_handler);
-        signal(SIGBUS,  partdist_segv_handler);
-        signal(SIGILL,  partdist_segv_handler);
+        /* 处理器与备用栈随 fork 继承，因此在 postmaster 装一次即覆盖全部后端 */
+        stack_t     ss;
+        struct sigaction sa;
+
+        ss.ss_sp = partdist_segv_altstack;
+        ss.ss_size = sizeof(partdist_segv_altstack);
+        ss.ss_flags = 0;
+        if (sigaltstack(&ss, NULL) != 0)
+            elog(WARNING, "pg_partdist: sigaltstack 失败（%m），栈溢出时将打不出回溯");
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = partdist_segv_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGILL,  &sa, NULL);
     }
 #endif
 

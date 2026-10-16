@@ -47,6 +47,7 @@
 /* ---- GUC ---- */
 
 static char *tso_conninfo = NULL;	/* 空 = 遗留模式（不取号，ts=0） */
+static int	commit_debug_delay_ms = 0;	/* P7-N92 回归用：取到 commit_ts 后停多久 */
 
 /* ---- 本节点活跃快照集合（共享内存，每后端一槽） ---- */
 
@@ -160,6 +161,16 @@ TsoClientDefineGUCs(void)
 		"",
 		PGC_SIGHUP,
 		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.commit_debug_delay_ms",
+		"调试：写过分片的事务取到 commit_ts 之后停多久再继续提交（毫秒）。",
+		"P7-N92 回归用：人为拉长\"提交中\"窗口（平时这段是等复制确认，约 1 秒）。0 = 不停。",
+		&commit_debug_delay_ms,
+		0, 0, 600000,
+		PGC_SUSET,
+		GUC_UNIT_MS,
 		NULL, NULL, NULL);
 }
 
@@ -496,7 +507,21 @@ TsoStashCommitTs(void)
 {
 	if (cur_commit_ts != 0 || !tso_configured())
 		return;
+	/*
+	 * P7-N92：取号**之前**先把本事务的分片条目标成"提交中"。顺序是正确性所在：
+	 * 快照读看到条目还没标 ⇒ 本号一定在它的 start_ts 之后才发 ⇒ 不用等；
+	 * 先取号后标记，就会有"号已早于读者快照、读者却当它还在执行"的窗口。
+	 */
+	ShardXidPublishCommitTs(-1);
 	cur_commit_ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "commit_ts");
+	ShardXidPublishCommitTs(cur_commit_ts);
+
+	if (commit_debug_delay_ms > 0 && ShardXidXactCount() > 0)
+	{
+		(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 commit_debug_delay_ms, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+	}
 }
 
 /* 收集钩子/落账读取暂存（临界区内安全：纯内存读） */
@@ -586,6 +611,7 @@ PartDistTsoDtxDecisionTs(void)
 		return 0;
 	ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "dtx_decision_ts");
 	cur_commit_ts = ts;
+	ShardXidPublishCommitTs(ts);	/* P7-N92：只会变大，读者按新号重判 */
 	return ts;
 }
 
