@@ -10,6 +10,8 @@
 --           /work/pg-install/bin/psql -h /tmp -p 5432 -U postgres
 --   终端 W：宿主机上的 shell，跑持续写入脚本 txn_demo_writer.sh —— 第 3 步做完再启动，第 6 步做完按 Ctrl+C 停
 -- 每段前面的【窗口 A】/【窗口 B】/【终端 W】表示这段在哪里做。
+-- ⚠ 反斜杠开头的命令（\pset、\dt 等）要单独一行输入、回车，不要和下面的 SQL 一起粘贴：
+--   多行一起粘贴时终端会把它们当成一整行，反斜杠命令会把后面的 SQL 都当成自己的参数（报 extra argument ... ignored）。
 --
 -- 写入脚本轮流做三种写入，每条都是不开事务的单条 INSERT，每条数据都不同：
 --   ① 只插客户表  ② 只插订单表（给它建过的客户下单）  ③ 新客户 + 他的订单（两条 INSERT，同一仓库）
@@ -94,6 +96,7 @@ SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS work
 -- 【终端 W】启动写入脚本，每完成一条打一行；让它一直跑，不用等它
 --           bash ~/shardpg-ddl-work/pg-partdist-src/demo/txn_demo_writer.sh
 -- 【窗口 B】写入进行中，每秒查一次客户数和订单数，查 10 次（只显示数据行）：两个数一直在涨
+--           分三次输入：\pset tuples_only on 回车；SELECT 两行（以 \watch 结尾）回车；\pset tuples_only off 回车
 \pset tuples_only on
 SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
   FROM (SELECT count(*) AS n FROM customer) c, (SELECT count(*) AS n FROM orders) o \watch i=1 c=10
@@ -247,7 +250,7 @@ SELECT c.n AS customers, o.n AS orders
   FROM (SELECT count(*) AS n FROM customer WHERE c_d_id = 9) c, (SELECT count(*) AS n FROM orders WHERE o_d_id = 9) o;
 
 -- ════ 第 7 步：删表 ════
--- 一条 DROP：删表的同时自动拆 Raft 组、删各节点副本表、删主从登记
+-- 一条 DROP：删表的同时自动拆 Raft 组、删各节点副本表、删主从登记（下面三条分三次输入，\dt 那行单独回车）
 -- 【窗口 A】
 DROP TABLE orders, customer;
 \dt customer
