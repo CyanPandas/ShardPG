@@ -297,6 +297,12 @@ CREATE OR REPLACE FUNCTION pg_raft_append_entries_batch(
 COMMENT ON FUNCTION pg_raft_append_entries_batch(bigint, integer, bigint, bigint, bigint, bigint, bigint[], bigint, text[], text[]) IS
     'P7-N41 批量 AppendEntries：数据组一批 parwal 记录一条 RPC、对端一次 fsync。';
 
+-- 2026-10-17：节点级有序复制流的接收端 —— 一条二进制消息装着 leader 发给本节点的多个组的条目，
+-- 全部组一次 fsync、随本语句事务一次提交后回 "gid term ok last;..."。
+CREATE OR REPLACE FUNCTION pg_raft_stream_apply(p_msg bytea)
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_stream_apply';
+
 CREATE OR REPLACE FUNCTION pg_raft_apply_committed()
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_apply_committed';

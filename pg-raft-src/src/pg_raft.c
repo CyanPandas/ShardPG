@@ -1041,6 +1041,15 @@ register_topology_worker(void)
     snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_raft_maintenance_main");
     snprintf(worker.bgw_name, BGW_MAXLEN, "pg_raft maintenance");
     RegisterBackgroundWorker(&worker);
+
+    /* 2026-10-17：节点级有序复制流的管理进程（见 raft_consensus.c pg_raft_stream_main） */
+    if (pg_raft_raft_enabled && pg_raft_replicate_stream)
+    {
+        snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_raft_stream_main");
+        snprintf(worker.bgw_name, BGW_MAXLEN, "pg_raft stream");
+        worker.bgw_restart_time = 1;
+        RegisterBackgroundWorker(&worker);
+    }
 }
 
 void
@@ -1128,12 +1137,56 @@ _PG_init(void)
                              &pg_raft_single_member_fast_commit, false,
                              PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomBoolVariable("pg_raft.replicate_many",
+                             "一笔事务触达的全部数据组合成一轮复制，各组拿到多数派即返回（默认 on）。",
+                             "每个副本节点一条多语句请求（对端一次事务提交）；没回的副本留作在途、"
+                             "不在提交路径里同步追平，落后的副本在下一轮按 next_index 补发缺口。"
+                             "关掉退回逐分区、等全部副本的老路径。",
+                             &pg_raft_replicate_many, true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.replicate_pipeline",
+                             "多组复制走流水线（试验性，默认 off）：发送与等多数派解耦。",
+                             "提交路径只在追加条目、发出请求的那一小段持有组的复制认领位，发完即放；"
+                             "等待改为看组的提交点是否已覆盖本事务的记录（同 PG 同步复制等 LSN）。"
+                             "同一组可有多轮在途，follower 按 prev 顺序收。关掉退回"
+                             "\"持着认领位等多数派\"的一轮一轮模式。",
+                             &pg_raft_replicate_pipeline, false,
+                             PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.replicate_stream",
+                             "数据组复制走节点级有序复制流（默认 on）。",
+                             "每个节点一个复制管理进程，对每个副本节点一条长连接（libpq 管道模式、严格按序），"
+                             "把本节点当主的各组的新条目打成一批连续发送；副本端一个会话按到达顺序处理，"
+                             "一批（多个组）一次 fsync、一次提交。提交的后端只追加条目、登记、等组提交点覆盖。"
+                             "关掉退回一轮一轮模式。",
+                             &pg_raft_replicate_stream, true,
+                             PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.stream_batch_entries",
+                            "复制流每批每组最多发几条。",
+                            NULL, &pg_raft_stream_batch_entries, 512, 1, 4096,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.stream_inflight",
+                            "复制流每个副本最多几批在途（管道深度）。",
+                            NULL, &pg_raft_stream_inflight, 8, 1, 32,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.data_hardstate_lazy",
+                             "数据组 hardstate 只在任期 / 投票 / 压缩基点变化时 fsync（默认 on）。",
+                             "Raft 只要求 currentTerm / votedFor 持久；commit_index 由 raft_log.committed 列"
+                             "（随 WAL 持久）与 leader 的心跳恢复，last_applied 陈旧只会让幂等的 apply 重做一遍。"
+                             "打开后这两项变化时文件每组每秒至多重写一次、不 fsync。控制面组不受影响。",
+                             &pg_raft_data_hardstate_lazy, true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.replicate_batch_max",
                             "Max parwal records replicated per data-group AppendEntries batch (group commit).",
                             "P7-N41: records queued behind the replication claim are shipped in one "
                             "multi-entry AppendEntries to all members concurrently, and each follower "
                             "fsyncs once per batch. 1 = legacy one-record-per-round path.",
-                            &pg_raft_replicate_batch_max, 32, 1, 100,
+                            &pg_raft_replicate_batch_max, 128, 1, 1000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.probe_interval_ms",
@@ -1179,6 +1232,9 @@ _PG_init(void)
         void **rv = find_rendezvous_variable("partdist_partwal_replicate_hook");
 
         *rv = (void *) pg_raft_partwal_replicate;
+        /* 2026-10-16：一笔事务触达的全部分区一轮复制（多数派即返回，见 raft_consensus.c） */
+        rv = find_rendezvous_variable("partdist_partwal_replicate_many_hook");
+        *rv = (void *) pg_raft_partwal_replicate_many;
     }
 
     DefineCustomBoolVariable("pg_raft.dtx_2pc_enabled",

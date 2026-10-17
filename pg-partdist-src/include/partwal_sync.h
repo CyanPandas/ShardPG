@@ -90,7 +90,25 @@ typedef struct PartWALCkptCacheEnt
     RelFileNumber  relfilenode;
     XLogRecPtr     last_wal_lsn;
     uint64         last_part_lsn;
+    /*
+     * 2026-10-16 多副本组提交（pg_partdist.partwal_group_fsync）：
+     *   synced_part_lsn —— 已 fsync 的最大编号（≤ last_part_lsn）。复制挂钩只送到这里，
+     *                     leader 计自己那一票的前提是字节已落盘。
+     *   lo/hi_segno     —— 尚未 fsync 的写入落在哪几个段（lo = 0 表示没有欠账）。
+     */
+    uint64         synced_part_lsn;
+    XLogSegNo      lo_unsynced_segno;
+    XLogSegNo      hi_segno;
+    TimestampTz    file_ts;         /* 上次把缓存值写回 checkpoint 文件（不 fsync，仅作重启提示）的时刻 */
+    int            sync_inflight;   /* 已接手欠账、fsync 还没做完的组提交者个数（期间 synced 不许被"无欠账"推进） */
+    uint32         trunc_gen;       /* 编号每回退（截断）一次 +1：组提交者 fsync 期间若变过，不推进 synced、不写提示 */
 } PartWALCkptCacheEnt;
+
+/*
+ * 分区段文件组提交 fsync 的串行锁（按分区号散列）。拿着它的 backend 一次 fsync 把
+ * 别人写下、尚未落盘的字节一并带走；排在后面的醒来发现 synced 已越过自己就直接返回。
+ */
+#define PARTWAL_PARTSYNC_LOCKS 64
 
 /*
  * 单副本快速提交：分片 clog 判决写入不再逐笔 fsync，只登记"脏段"，由心跳工作者每轮

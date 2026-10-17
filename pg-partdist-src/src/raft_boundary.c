@@ -59,6 +59,7 @@
 #include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
+#include "partwal_recent.h"		/* 2026-10-16：按 plsn 回读的内存快路径 */
 
 PG_FUNCTION_INFO_V1(pg_partdist_get_partition_flush_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_get_follower_applied_part_lsn);
@@ -70,7 +71,12 @@ pg_partdist_get_partition_flush_lsn(PG_FUNCTION_ARGS)
 	Oid		partition_id = PG_GETARG_OID(0);
 	uint64	last_lsn;
 
-	last_lsn = GetLastWrittenPartitionLSN(partition_id);
+	/*
+	 * 2026-10-16：返回**已落盘**的编号（多副本组提交模式下段文件出锁后才 fsync）。
+	 * 复制挂钩、追平、升主前置都按它决定送到哪 —— 只许送已持久的字节。
+	 * 非组提交模式 / 单副本快速模式下与 GetLastWrittenPartitionLSN 相同。
+	 */
+	last_lsn = PartWALDurablePartitionLSN(partition_id);
 	PG_RETURN_INT64((int64) last_lsn);
 }
 
@@ -294,6 +300,90 @@ pg_partdist_partwal_notify_primary_switch(PG_FUNCTION_ARGS)
 static bool partwal_find_record(Oid partition_id, uint64 target,
 								PartWALRecord *out_rec, char **out_data);
 
+/*
+ * 按 dtxid 在分区流里找 DTX_PREPARE（plsn ≤ upto）：全部段一遍顺序扫，1 MB 块 pread，
+ * 不按 plsn 逐条回读（那样每条都可能退化成整流扫描）。多条命中取 plsn 最大的。
+ * 只在内存缓存里没找到时用。
+ */
+#define PREP_SCAN_BUF (1024 * 1024)
+
+static void
+partwal_scan_dtx_prepare(Oid partition_id, int64 dtxid, int64 upto,
+						 uint64 *hit_plsn, GlobalTransactionId *hdr_gxid)
+{
+	char			dirpath[MAXPGPATH];
+	PartWALSegName *segfiles;
+	int				nfiles = 0;
+	int				i;
+	char		   *buf;
+
+	snprintf(dirpath, MAXPGPATH, "%s/%s/%u", DataDir, PARTITION_WAL_DIR, partition_id);
+	segfiles = PartWALListSegments(partition_id, &nfiles);
+	if (nfiles == 0)
+		return;
+	buf = palloc(PREP_SCAN_BUF);
+
+	/* 段名倒序：要找的通常在最新的段里；不依赖段序的正确性（全扫完才算没有） */
+	for (i = nfiles - 1; i >= 0; i--)
+	{
+		char		filepath[MAXPGPATH];
+		int			fd;
+		off_t		off = 0;
+		off_t		buf_off = 0;
+		ssize_t		buf_len = 0;
+		bool		found_here = false;
+
+		snprintf(filepath, MAXPGPATH, "%s/%s", dirpath, segfiles[i]);
+		fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+			continue;
+		for (;;)
+		{
+			PartWALRecord rec;
+
+			/* 记录头 + DtxRecordPayload 都要在缓冲里 */
+			if (off < buf_off ||
+				off + (off_t) sizeof(PartWALRecord) + (off_t) sizeof(DtxRecordPayload) >
+				buf_off + buf_len)
+			{
+				do {
+					buf_len = pread(fd, buf, PREP_SCAN_BUF, off);
+				} while (buf_len < 0 && errno == EINTR);
+				buf_off = off;
+				if (buf_len < (ssize_t) sizeof(PartWALRecord))
+					break;
+			}
+			memcpy(&rec, buf + (off - buf_off), sizeof(PartWALRecord));
+			if (rec.magic != PARTWAL_MAGIC)
+				break;
+			if (rec.partition_id == partition_id &&
+				rec.partition_lsn <= (uint64) upto &&
+				(rec.flags & PARTWAL_FLAG_DTX) != 0 &&
+				rec.info == DTX_PREPARE &&
+				rec.data_len >= sizeof(DtxRecordPayload) &&
+				off + (off_t) sizeof(PartWALRecord) + (off_t) sizeof(DtxRecordPayload) <=
+				buf_off + buf_len)
+			{
+				DtxRecordPayload pl;
+
+				memcpy(&pl, buf + (off - buf_off) + sizeof(PartWALRecord), sizeof(pl));
+				if (pl.dtxid == (uint64) dtxid && rec.partition_lsn > *hit_plsn)
+				{
+					*hit_plsn = rec.partition_lsn;
+					*hdr_gxid = rec.gxid;
+					found_here = true;
+				}
+			}
+			off += (off_t) sizeof(PartWALRecord) + (off_t) rec.data_len;
+			CHECK_FOR_INTERRUPTS();
+		}
+		CloseTransientFile(fd);
+		if (found_here)
+			break;			/* 命中段里取最大的那条即可 */
+	}
+	pfree(buf);
+}
+
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_prepare_sxid);
 PG_FUNCTION_INFO_V1(pg_partdist_shard_verdict_apply);
 
@@ -316,14 +406,22 @@ pg_partdist_partwal_prepare_sxid(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("partwal_prepare_sxid: 返回类型必须是 record")));
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	/* 1) 找 DTX_PREPARE(dtxid) 的头部 gxid */
-	for (p = 1; p <= (uint64) upto && hit_plsn == 0; p++)
+	/*
+	 * 1) 找 DTX_PREPARE(dtxid) 的头部 gxid。
+	 *
+	 * 2026-10-16：先从流尾往回、只在内存缓存里找 —— 调用方（ROLLBACK PREPARED 的收尾、
+	 * 升主前置的 in-doubt 闭合）要找的几乎都是刚写下的那条。原来从 plsn 1 起逐条按号回读
+	 * 文件，装载后的流有几十万条，一次 ROLLBACK PREPARED 跑几分钟（三副本 TPC-C 实测），
+	 * 期间该事务的锁一直挂着。缓存里没有（太老、缓存关闭）再走下面的一遍顺序扫。
+	 * 同一 dtxid 若有多条 DTX_PREPARE（孤儿重提），它们头部 gxid 相同，取哪条都一样。
+	 */
+	for (p = (uint64) upto; p >= 1 && hit_plsn == 0; p--)
 	{
 		PartWALRecord	rec;
 		char		   *data = NULL;
 
-		if (!partwal_find_record(partition_id, p, &rec, &data))
-			continue;
+		if (!PartWALRecentLookup(partition_id, p, &rec, &data))
+			break;
 		if ((rec.flags & PARTWAL_FLAG_DTX) != 0 && data != NULL &&
 			rec.data_len >= sizeof(DtxRecordPayload) &&
 			rec.info == DTX_PREPARE &&
@@ -334,8 +432,9 @@ pg_partdist_partwal_prepare_sxid(PG_FUNCTION_ARGS)
 		}
 		if (data != NULL)
 			pfree(data);
-		CHECK_FOR_INTERRUPTS();
 	}
+	if (hit_plsn == 0)
+		partwal_scan_dtx_prepare(partition_id, dtxid, upto, &hit_plsn, &hdr_gxid);
 
 	/* 2) 其后 64 条内找同 gxid、带分片 xid 尾的 MARKER */
 	for (p = hit_plsn + 1; hit_plsn != 0 && p <= hit_plsn + 64 && p <= (uint64) upto &&
@@ -481,12 +580,72 @@ pg_partdist_partwal_defer_sync_end(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pg_partdist_follower_set_applied_part_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_partwal_truncate_to);
 
+/* 读段文件第一条记录头的 partition_lsn。段为空 / 头不合法 / 不属于本分区 → false。 */
+static bool
+partwal_seg_first_plsn(Oid partition_id, const char *segname, uint64 *plsn)
+{
+	char			filepath[MAXPGPATH];
+	int				fd;
+	PartWALRecord	rec;
+	bool			ok = false;
+
+	snprintf(filepath, MAXPGPATH, "%s/%s/%u/%s",
+			 DataDir, PARTITION_WAL_DIR, partition_id, segname);
+	fd = OpenTransientFile(filepath, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		return false;
+	if (read(fd, &rec, sizeof(PartWALRecord)) == (ssize_t) sizeof(PartWALRecord) &&
+		rec.magic == PARTWAL_MAGIC && rec.partition_id == partition_id)
+	{
+		*plsn = rec.partition_lsn;
+		ok = true;
+	}
+	CloseTransientFile(fd);
+	return ok;
+}
+
+/*
+ * 按段首记录二分：返回"首条记录 plsn ≤ target"的最后一段的下标（target 比第一段首条
+ * 还小时返回 0）。任何一次探测读不出合法记录头 ⇒ 返回 -1，调用方从第一段读起。
+ *
+ * 依据与稀疏索引相同的不变式：段文件名升序即 plsn 升序（见 partition_wal_writer.c
+ * 的段号规则，回放与 verify 也按此读）。2026-10-15：三副本 TPC-C 装载里，冷索引 /
+ * 查不中时的全扫描按 40 字节记录头逐条 read + lseek，一条约 40 万记录、117 段的流
+ * 扫一遍要近百万次系统调用；一笔 PREPARE 的复制补发因此跑了 28 分钟。二分只开
+ * log2(段数) 个文件，再读一个段（约 1 MB）。
+ */
+static int
+partwal_seg_search(Oid partition_id, PartWALSegName *segs, int nsegs, uint64 target)
+{
+	int				lo = 0;
+	int				hi = nsegs - 1;
+	int				best = 0;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+		uint64		first;
+
+		if (!partwal_seg_first_plsn(partition_id, segs[mid], &first))
+			return -1;
+		if (first <= target)
+		{
+			best = mid;
+			lo = mid + 1;
+		}
+		else
+			hi = mid - 1;
+	}
+	return best;
+}
+
 /*
  * 在 pg_parwal/<partition_id>/ 的段文件里定位 partition_lsn == target 的记录。
  * 命中则填充 *out_rec 并把原始字节 palloc 到 *out_data，返回 true。
  *
- * 这是**全扫描**实现（列目录 → 段名排序 → 从第一段开头逐条读），单次 O(n)。
- * P7-N4 之后它只作为 partwal_find_record 的兜底，见下方稀疏索引。
+ * 这是 partwal_find_record 的兜底，见下方稀疏索引。先按段首记录二分出 target 应在的
+ * 段，从那里读起；没读到再**绕回**读完其余各段 —— 覆盖的段与原来的全扫描完全相同，
+ * 只是顺序变了，所以即便不变式意外不成立，结果仍与全扫描一致（只是慢）。
  */
 static bool
 partwal_find_record_scan(Oid partition_id, uint64 target,
@@ -495,7 +654,8 @@ partwal_find_record_scan(Oid partition_id, uint64 target,
 	char			dirpath[MAXPGPATH];
 	PartWALSegName *segfiles;
 	int				nfiles = 0;
-	int				i;
+	int				start;
+	int				k;
 	bool			found = false;
 
 	snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
@@ -509,8 +669,13 @@ partwal_find_record_scan(Oid partition_id, uint64 target,
 	if (nfiles == 0)
 		return false;
 
-	for (i = 0; i < nfiles && !found; i++)
+	start = partwal_seg_search(partition_id, segfiles, nfiles, target);
+	if (start < 0)
+		start = 0;
+
+	for (k = 0; k < nfiles && !found; k++)
 	{
+		int				i = (start + k) % nfiles;
 		char			filepath[MAXPGPATH];
 		int				fd;
 		PartWALRecord	rec;
@@ -589,7 +754,11 @@ partwal_find_record_scan(Oid partition_id, uint64 target,
  * 内有效（TopMemoryContext），不进共享内存，不需要任何跨进程失效通知。
  */
 #define PWIDX_STRIDE		32
-#define PWIDX_MAX_PARTS		8
+/*
+ * 2026-10-15：8 → 32。多副本 TPC-C 下事务函数下推到 worker，一个内部后端要写本机
+ * 2 个分片 × 8 张表 = 16 个分区；8 个槽按 LRU 轮换，每次换入都从头重建索引。
+ */
+#define PWIDX_MAX_PARTS		32
 #define PWIDX_MAX_POINTS	131072		/* ≈ 420 万条记录；满了不再加点，仍从最后一点往后读 */
 /* 2026-10-12：段表不再有 256 段上限（PartWALListSegments），原来过了 256 段的记录快慢两条路都找不到 */
 
@@ -735,9 +904,22 @@ pwidx_refresh_segs(PwIdx *ix)
  * 快路径。返回 1 = 命中（已填 out）；0 = 没找到（调用方退回全扫描）；
  * -1 = 索引失效（已丢弃，调用方退回全扫描）。
  */
+static int partwal_find_record_indexed_pos(Oid partition_id, uint64 target,
+										   PartWALRecord *out_rec, char **out_data,
+										   int *seg_out, off_t *off_out);
+
 static int
 partwal_find_record_indexed(Oid partition_id, uint64 target,
 							PartWALRecord *out_rec, char **out_data)
+{
+	return partwal_find_record_indexed_pos(partition_id, target, out_rec, out_data, NULL, NULL);
+}
+
+/* 同上；找到时另给出"紧跟这条记录之后"的位置（段下标、偏移），供顺序读游标续读 */
+static int
+partwal_find_record_indexed_pos(Oid partition_id, uint64 target,
+								PartWALRecord *out_rec, char **out_data,
+								int *seg_out, off_t *off_out)
 {
 	PwIdx	   *ix = pwidx_get(partition_id);
 	int			seg = 0;
@@ -804,8 +986,16 @@ partwal_find_record_indexed(Oid partition_id, uint64 target,
 	}
 	else
 	{
+		/*
+		 * 冷索引：从 target 所在段读起，而不是从流开头（长流上建一次索引就是一次全扫描；
+		 * 后端多、分区多时，每个后端每个分区都要付一次）。索引从该段首条记录开始覆盖，
+		 * 更早的 target 落在首个检查点之前 ⇒ 上面返回 0 ⇒ 由按段二分的兜底扫描去找。
+		 */
+		int			s = partwal_seg_search(partition_id, ix->segs, ix->nsegs, target);
+
+		seg = (s > 0) ? s : 0;
 		extend = true;
-		since = PWIDX_STRIDE;	/* 流里第一条记录也记成检查点 */
+		since = PWIDX_STRIDE;	/* 读到的第一条记录也记成检查点 */
 	}
 
 	for (;;)
@@ -870,6 +1060,10 @@ partwal_find_record_indexed(Oid partition_id, uint64 target,
 					CloseTransientFile(fd);
 					*out_rec = rec;
 					*out_data = buf;
+					if (seg_out != NULL)
+						*seg_out = seg;
+					if (off_out != NULL)
+						*off_out = off;
 					return 1;
 				}
 				if (rec.partition_lsn > target)
@@ -893,6 +1087,9 @@ static bool
 partwal_find_record(Oid partition_id, uint64 target,
 					PartWALRecord *out_rec, char **out_data)
 {
+	/* 2026-10-16：刚写下的记录先查节点级内存缓存（partwal_recent.c） */
+	if (PartWALRecentLookup(partition_id, target, out_rec, out_data))
+		return true;
 	if (partwal_record_index &&
 		partwal_find_record_indexed(partition_id, target, out_rec, out_data) == 1)
 		return true;
@@ -948,6 +1145,200 @@ pg_partdist_partwal_read_record(PG_FUNCTION_ARGS)
 		pfree(data);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
+ * 2026-10-17：给 pg_raft 复制流（pg_raft.replicate_stream）的 C 层读记录入口。
+ * 复制管理进程与持认领位的追加者按 plsn 取记录头与字节，不经 SQL：先查节点级内存缓存
+ * （partwal_recent.c），查不中回读段文件（与 partwal_read_record 同一个 partwal_find_record）。
+ * 经 rendezvous variable "partdist_partwal_read_hook" 导出；data 分配在调用方的内存上下文。
+ */
+/*
+ * 顺序读游标（每后端每分区一个）：复制流管理进程按 plsn 递增连续回读，上一条读完时记下
+ * "下一条在哪个段、哪个偏移"，下一次直接 lseek 过去读头 —— 不再每条都开文件、核对稀疏索引
+ * 检查点、再向后扫最多 PWIDX_STRIDE 个记录头（装载时落后的记录早已不在内存缓存里，
+ * 原来每轮要读几千条，管理进程一轮循环拖到好几秒）。每次读都重新 open（截断重写后拿到的是
+ * 新文件），并核对记录头的分区号 / 编号；分区编号回退过（截断）就作废游标。
+ */
+#define PW_CURSOR_MAX 32
+typedef struct PwCursor
+{
+	Oid			part;
+	uint64		next_plsn;
+	int			seg;
+	off_t		off;
+	uint32		gen;
+} PwCursor;
+static PwCursor pw_cursors[PW_CURSOR_MAX];
+static int	pw_cursor_clock = 0;
+
+static PwCursor *
+pw_cursor_find(Oid part)
+{
+	int i;
+
+	for (i = 0; i < PW_CURSOR_MAX; i++)
+		if (pw_cursors[i].part == part)
+			return &pw_cursors[i];
+	return NULL;
+}
+
+static void
+pw_cursor_set(Oid part, uint64 next_plsn, int seg, off_t off)
+{
+	PwCursor   *c = pw_cursor_find(part);
+
+	if (c == NULL)
+	{
+		c = &pw_cursors[pw_cursor_clock];
+		pw_cursor_clock = (pw_cursor_clock + 1) % PW_CURSOR_MAX;
+	}
+	c->part = part;
+	c->next_plsn = next_plsn;
+	c->seg = seg;
+	c->off = off;
+	c->gen = PartWALTruncGen(part);
+}
+
+/* 按游标读 target；成功则推进游标。任何不符返回 false（调用方走常规查找） */
+static bool
+pw_cursor_read(PwCursor *c, uint64 target, PartWALRecord *out_rec, char **out_data)
+{
+	PwIdx	   *ix = pwidx_get(c->part);
+	int			tries;
+
+	if (ix == NULL || c->gen != PartWALTruncGen(c->part))
+		return false;
+	for (tries = 0; tries < 2; tries++)
+	{
+		char		filepath[MAXPGPATH];
+		int			fd;
+		PartWALRecord rec;
+		ssize_t		nb;
+
+		if (c->seg >= ix->nsegs && !pwidx_refresh_segs(ix))
+			return false;
+		if (c->seg >= ix->nsegs)
+			return false;
+		snprintf(filepath, MAXPGPATH, "%s/%s/%u/%s", DataDir,
+				 PARTITION_WAL_DIR, c->part, ix->segs[c->seg]);
+		fd = open(filepath, O_RDONLY | PG_BINARY, 0);
+		if (fd < 0)
+			return false;
+		if (lseek(fd, c->off, SEEK_SET) != c->off)
+		{
+			close(fd);
+			return false;
+		}
+		nb = read(fd, &rec, sizeof(PartWALRecord));
+		if (nb == 0 || (nb == (ssize_t) sizeof(PartWALRecord) && rec.magic != PARTWAL_MAGIC))
+		{
+			/* 本段到头：下一段从头读 */
+			close(fd);
+			c->seg++;
+			c->off = 0;
+			continue;
+		}
+		if (nb != (ssize_t) sizeof(PartWALRecord) ||
+			rec.partition_id != c->part || rec.partition_lsn != target ||
+			rec.data_len > 64 * 1024 * 1024)
+		{
+			close(fd);
+			return false;
+		}
+		{
+			char	   *buf = NULL;
+
+			if (rec.data_len > 0)
+			{
+				buf = (char *) palloc(rec.data_len);
+				if (read(fd, buf, rec.data_len) != (ssize_t) rec.data_len)
+				{
+					pfree(buf);
+					close(fd);
+					return false;
+				}
+			}
+			close(fd);
+			*out_rec = rec;
+			*out_data = buf;
+			c->off += (off_t) sizeof(PartWALRecord) + (off_t) rec.data_len;
+			c->next_plsn = target + 1;
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * 2026-10-17：给 pg_raft 复制流（pg_raft.replicate_stream）的 C 层读记录入口。
+ * 复制管理进程与持认领位的追加者按 plsn 取记录头与字节，不经 SQL：先查节点级内存缓存
+ * （partwal_recent.c），再试顺序读游标，最后走稀疏索引 / 全扫描（与 partwal_read_record
+ * 同一套查找）。经 rendezvous variable "partdist_partwal_read_hook" 导出；data 分配在调用方的内存上下文。
+ */
+static bool
+partdist_partwal_read_c(Oid partition_id, uint64 plsn, XLogRecPtr *orig_lsn,
+						int *rmid, int *info, int *flags, int64 *gxid,
+						char **data, uint32 *data_len)
+{
+	PartWALRecord	rec;
+	char		   *d = NULL;
+	bool			found = false;
+
+	if (plsn == 0)
+		return false;
+	if (PartWALRecentLookup(partition_id, plsn, &rec, &d))
+		found = true;
+	if (!found)
+	{
+		PwCursor   *c = pw_cursor_find(partition_id);
+
+		if (c != NULL && c->next_plsn == plsn && pw_cursor_read(c, plsn, &rec, &d))
+			found = true;
+		else if (c != NULL)
+			c->part = InvalidOid;
+	}
+	if (!found && partwal_record_index)
+	{
+		int			seg = -1;
+		off_t		off = 0;
+
+		if (partwal_find_record_indexed_pos(partition_id, plsn, &rec, &d, &seg, &off) == 1)
+		{
+			found = true;
+			if (seg >= 0)
+				pw_cursor_set(partition_id, plsn + 1, seg, off);
+		}
+	}
+	if (!found)
+		found = partwal_find_record_scan(partition_id, plsn, &rec, &d);
+	if (!found)
+		return false;
+	*orig_lsn = rec.orig_lsn;
+	*rmid = rec.rmid;
+	*info = rec.info;
+	*flags = rec.flags;
+	*gxid = (int64) PartWALRecordGxid(&rec);
+	*data = d;
+	*data_len = rec.data_len;
+	return true;
+}
+
+extern void PartWALRegisterReadHook(void);
+static void partdist_partwal_follower_append_batch(Oid partition_id, int n, const int64 *plsn,
+												   const XLogRecPtr *orig_lsn, const int *rmid,
+												   const int *info, const int *flags,
+												   const int64 *gxid, char *const *data,
+												   const uint32 *data_len, const bool *fresh);
+
+void
+PartWALRegisterReadHook(void)
+{
+	void	  **p = find_rendezvous_variable("partdist_partwal_read_hook");
+
+	*p = (void *) partdist_partwal_read_c;
+	p = find_rendezvous_variable("partdist_partwal_follower_append_batch_hook");
+	*p = (void *) partdist_partwal_follower_append_batch;
 }
 
 PG_FUNCTION_INFO_V1(pg_partdist_shard_absorb_tail_xids);
@@ -1080,6 +1471,207 @@ pg_partdist_partwal_follower_append_fresh(PG_FUNCTION_ARGS)
 	return follower_append_impl(fcinfo, true);
 }
 
+/*
+ * 一条 follower 记录的落盘核心（调用方持 PartWALCtl->lock、*writerp 已建好）。
+ * 冲突截断时会重建写入器（*writerp 随之更新）。返回是否真落下了一条别的 leader 写的 DATA/MARKER。
+ * 2026-10-17 从 follower_append_impl 抽出，复制流的按组批量落盘也用它。
+ */
+static bool
+follower_append_one(Oid partition_id, PartitionWALWriter **writerp, int64 partition_lsn,
+					XLogRecPtr orig_lsn, int32 rmid, int32 info, int32 flags, int64 gxid,
+					char *data_ptr, uint32 data_len, bool fresh_append)
+{
+	bool		foreign = false;
+
+	/*
+	 * ★★ R-P4-13 的真根因（2026-09-13 定因）：**去重只按编号、不看内容**。
+	 *
+	 * AppendPartWALRecordAt 对 `plsn <= 本地已有最大编号` 一律当"重传"丢弃。
+	 * 可本地那一条未必是这一条：
+	 *   · 某节点当 leader 时写了本地 DATA（[A] 先落盘），提案却没提交
+	 *     （失多数派 / 丢了领导权）—— discard_uncommitted_entry 按设计
+	 *     **不截 parwal 字节**（"留作孤儿等重推"，防误截并发事务的记录）；
+	 *   · 新 leader 的日志是完整的（Leader Completeness），它把同一个
+	 *     plsn 分给了**另一条**已提交的记录（实测是 DTX 判决）；
+	 *   · 复制到旧 leader 这里：编号 <= 本地最大 ⇒ 判"重传" ⇒ 丢弃。
+	 *   于是**副本流里躺着一条从未提交的 DATA，冒充那条已提交的判决**。
+	 *   apply 照推游标，按 plsn 去读判决却读到 DATA，决议行从此登记不上 ——
+	 *   这就是 R-P4-13 "日志游标齐平、本地却无决议行、且无任何告警"。
+	 *   实测现场：:5433（分片本体）的 plsn=15 是 flags=1 info=0，而 raft
+	 *   日志说 plsn=15 是 flags=8 info=2。
+	 *
+	 *   决议行缺失只是露出来的症状；同一机制下，被顶替的若是 DATA，
+	 *   回放就会在副本上重放一条从未提交的物理变更。
+	 *
+	 * 修法：编号已存在时**逐字段核对**。一致 ⇒ 真重传，照旧去重；不一致 ⇒
+	 * 本地那条是孤儿，按已提交的这条为准：截到 plsn-1 再写。
+	 *
+	 * 为什么"以传进来的为准"一定对：新 leader 日志完整，它能把这个编号分给
+	 * 别的记录，说明**没有任何已提交记录用过这个编号** —— 本地那条必然未提交。
+	 * （这与 raft 日志冲突截断时同步截 parwal 是同一条规则，只是那条路径只在
+	 * 日志里真的有冲突条目时才会触发，而孤儿字节对应的日志条目早已被 discard。）
+	 */
+	if ((uint64) partition_lsn <= (*writerp)->last_partition_lsn)
+	{
+		PartWALRecord	old;
+		char		   *old_data = NULL;
+		bool			same = false;
+
+		if (partwal_find_record(partition_id, (uint64) partition_lsn,
+								&old, &old_data))
+		{
+			same = (old.flags == (uint8) flags &&
+					old.info == (uint8) info &&
+					old.rmid == (uint8) rmid &&
+					old.orig_lsn == orig_lsn &&
+					old.data_len == (uint32) data_len &&
+					(old.data_len == 0 ||
+					 memcmp(old_data, data_ptr, old.data_len) == 0));
+			if (old_data != NULL)
+				pfree(old_data);
+		}
+
+		/*
+		 * ★★ 只有**新追加**时才许截（2026-09-13 实测纠正第一版）。
+		 *
+		 * 第一版不分情形一律"截到 plsn-1 再写"。那**只截了分区流、没截
+		 * raft 日志**：若这条是 leader 的**重传**（条目本来就在本节点
+		 * raft 日志里），流里更靠后的记录可能是已提交、已 ack 的 ——
+		 * 截掉之后 leader 按 match_index 不会重发，那段字节就永久丢了。
+		 * 实测：一次重传 plsn=2 触发替换，把 3..51 一并截掉，
+		 * dtx_replay_tx1 由 83/0 掉到 76/7。
+		 *
+		 * 两种情形分开处置：
+		 *   · 新追加：本节点 raft 日志里没有比它更靠后的条目，分区流里
+		 *     更靠后的记录**必然**是孤儿（它们对应的日志条目早被 discard）
+		 *     ⇒ 截掉是安全的。R-P4-13 正是这一种。
+		 *   · 重传：不截。本地字节与已提交记录不一致是**已经发生**的分叉
+		 *     （改动前它会被静默去重吞掉），标记分叉交给既有修复路径
+		 *     （重做物理基线会清标），并照常 ack —— 不 ack 只会让 leader
+		 *     无限重试同一条，复制卡死。
+		 */
+		if (!same && !fresh_append)
+		{
+			char reason[256];
+
+			snprintf(reason, sizeof(reason),
+					 "follower_append: plsn=%lld 本地字节（flags=%u info=%u）与重传的已提交记录"
+					 "（flags=%d info=%d）不一致",
+					 (long long) partition_lsn, (unsigned) old.flags,
+					 (unsigned) old.info, flags, info);
+			ShardMarkDiverged(partition_id, reason);
+			ereport(WARNING,
+					(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 与重传的已提交记录不一致，"
+							"已标记分叉（不截断）", partition_id, (long long) partition_lsn),
+					 errdetail("%s", reason),
+					 errhint("该副本需重做物理基线（partdist.repair_diverged_shards()）。")));
+		}
+		else if (!same)
+		{
+			ereport(WARNING,
+					(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 本地是孤儿记录"
+							"（flags=%u info=%u），被已提交的记录（flags=%d info=%d）取代",
+							partition_id, (long long) partition_lsn,
+							(unsigned) old.flags, (unsigned) old.info,
+							flags, info),
+					 errdetail("新追加：本节点 raft 日志里没有更靠后的条目，分区流里 %lld 之后"
+							   "的记录必然是未提交提案留下的孤儿；按已提交记录为准截断重写。",
+							   (long long) partition_lsn - 1)));
+			DestroyPartitionWALWriter(*writerp);
+			*writerp = NULL;
+			if (!TruncatePartWALTo(partition_id, (RelFileNumber) partition_id,
+								   (uint64) partition_lsn - 1))
+				ereport(ERROR,
+						(errmsg("partwal_follower_append: 分区 %u 截到 %lld 失败，拒绝 ack",
+								partition_id, (long long) partition_lsn - 1)));
+			*writerp = CreatePartitionWALWriter(partition_id,
+											  (RelFileNumber) partition_id);
+			if (*writerp == NULL)
+				ereport(ERROR,
+						(errmsg("partwal_follower_append: 截断后无法为分区 %u 重建写入器",
+								partition_id)));
+		}
+	}
+
+	/*
+	 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。
+	 *
+	 * 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一个
+	 * pg_parwal 目录树下既有本地 demux 写入、也有 follower 收到的复制流。
+	 * 若 follower 用本地计数器，编号空间会和 leader 的永久错位，
+	 * applied_part_lsn 指向的记录在本地根本不存在。
+	 *
+	 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
+	 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
+	 */
+	/*
+	 * ★ P7-N23：返回值 = 是否真的落了字节（重传去重返回 false）。真落下的一条
+	 * DATA/MARKER 必然是**别的 leader** 写的 —— 本节点自己当主时的记录走 demux
+	 * 本地落盘，从不经这里。CTRL/DTX 不算：它们不改堆也不改提交状态，
+	 * dtx_close_indoubt 直接从流里读 DTX。
+	 */
+	if (AppendPartWALRecordAt(*writerp,
+							  (uint64) partition_lsn,
+							  orig_lsn,
+							  (uint8) rmid,
+							  (uint8) info,
+							  data_ptr,
+							  (uint32) data_len,
+							  (GlobalTransactionId) gxid,
+							  (uint8) flags) &&
+		(flags & (PARTWAL_FLAG_CTRL | PARTWAL_FLAG_DTX)) == 0)
+		foreign = true;
+
+	/*
+	 * ★ P7-N18（2026-09-18，shardpg-test 线解冻）：**在 append 时就抬发号水位**。
+	 *
+	 * 缺陷：leader 把它的发号水位（HAS_ALLOC_WM）/分片 xid（HAS_SHARD_XID）盖在
+	 * MARKER 尾块里，但原来只有 redo 侧（shard_replay.c）读它抬水位。升主前置的追平
+	 * 上界只到本节点 applied_part_lsn（get_follower_applied_part_lsn）—— 2 vCPU 饱和、
+	 * in_txn_replication 跳过推进、或 p_force 兜底放行时，[applied+1, flush] 这截
+	 * **已复制、未 apply** 的尾巴里的分片 xid 没进水位；新主 ShardXidClaimOnPromote 取
+	 * Max(水位, 影子) 仍是陈旧值 ⇒ 重发旧主已用过、已提交的分片 xid ⇒ 分片 clog 撞号、
+	 * 判决落错事务 ⇒ 2PC 跨分片原子性破坏、切主后总额漂移（N18 正例 N12 run 5 +2）。
+	 *
+	 * 修法（候选①的落点）：这条记录此刻已按 leader 编号落盘、马上要 fsync 后 ack，
+	 * 与字节**同等持久**。就在这里把它尾块携带的发号水位接住 —— 未 apply 的尾巴由此
+	 * 一并覆盖，ClaimOnPromote 无需改动即正确。RaiseAllocWatermark 只增不减、幂等，
+	 * 只在真正抬高时才落盘（≈ 每个新分片 xid 一次，与 leader 发号同频），重传/去重路径
+	 * 上重复调用无副作用。锁序：本处持 PartWALCtl->lock，内部另取 ShardXidCtl->lock，
+	 * 无反向嵌套（发号路径取 ShardXidCtl 后即释放再写 parwal）。
+	 */
+	if ((flags & PARTWAL_FLAG_MARKER) != 0)
+	{
+		char   *mbody = data_ptr;
+		Size	mlen = data_len;
+
+		if (mlen >= sizeof(TxnMarkerPayload))
+		{
+			TxnMarkerPayload *m = (TxnMarkerPayload *) mbody;
+
+			if (mlen >= TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))
+			{
+				if ((m->flags & PARTWAL_MARKER_HAS_ALLOC_WM) != 0)
+				{
+					TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
+
+					if (TransactionIdIsNormal(wm))
+						ShardXidRaiseAllocWatermark(partition_id, wm);
+				}
+				else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
+				{
+					TransactionId sx = (TransactionId) *TxnMarkerShardXidPtr(m);
+
+					if (TransactionIdIsNormal(sx))
+						ShardXidRaiseAllocWatermark(partition_id, sx + 1);
+				}
+			}
+		}
+	}
+
+	return foreign;
+}
+
 static Datum
 follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 {
@@ -1115,191 +1707,10 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 			ereport(ERROR,
 					(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
 							partition_id)));
-
-		/*
-		 * ★★ R-P4-13 的真根因（2026-09-13 定因）：**去重只按编号、不看内容**。
-		 *
-		 * AppendPartWALRecordAt 对 `plsn <= 本地已有最大编号` 一律当"重传"丢弃。
-		 * 可本地那一条未必是这一条：
-		 *   · 某节点当 leader 时写了本地 DATA（[A] 先落盘），提案却没提交
-		 *     （失多数派 / 丢了领导权）—— discard_uncommitted_entry 按设计
-		 *     **不截 parwal 字节**（"留作孤儿等重推"，防误截并发事务的记录）；
-		 *   · 新 leader 的日志是完整的（Leader Completeness），它把同一个
-		 *     plsn 分给了**另一条**已提交的记录（实测是 DTX 判决）；
-		 *   · 复制到旧 leader 这里：编号 <= 本地最大 ⇒ 判"重传" ⇒ 丢弃。
-		 *   于是**副本流里躺着一条从未提交的 DATA，冒充那条已提交的判决**。
-		 *   apply 照推游标，按 plsn 去读判决却读到 DATA，决议行从此登记不上 ——
-		 *   这就是 R-P4-13 "日志游标齐平、本地却无决议行、且无任何告警"。
-		 *   实测现场：:5433（分片本体）的 plsn=15 是 flags=1 info=0，而 raft
-		 *   日志说 plsn=15 是 flags=8 info=2。
-		 *
-		 *   决议行缺失只是露出来的症状；同一机制下，被顶替的若是 DATA，
-		 *   回放就会在副本上重放一条从未提交的物理变更。
-		 *
-		 * 修法：编号已存在时**逐字段核对**。一致 ⇒ 真重传，照旧去重；不一致 ⇒
-		 * 本地那条是孤儿，按已提交的这条为准：截到 plsn-1 再写。
-		 *
-		 * 为什么"以传进来的为准"一定对：新 leader 日志完整，它能把这个编号分给
-		 * 别的记录，说明**没有任何已提交记录用过这个编号** —— 本地那条必然未提交。
-		 * （这与 raft 日志冲突截断时同步截 parwal 是同一条规则，只是那条路径只在
-		 * 日志里真的有冲突条目时才会触发，而孤儿字节对应的日志条目早已被 discard。）
-		 */
-		if ((uint64) partition_lsn <= writer->last_partition_lsn)
-		{
-			PartWALRecord	old;
-			char		   *old_data = NULL;
-			bool			same = false;
-
-			if (partwal_find_record(partition_id, (uint64) partition_lsn,
-									&old, &old_data))
-			{
-				same = (old.flags == (uint8) flags &&
-						old.info == (uint8) info &&
-						old.rmid == (uint8) rmid &&
-						old.orig_lsn == orig_lsn &&
-						old.data_len == (uint32) VARSIZE_ANY_EXHDR(data) &&
-						(old.data_len == 0 ||
-						 memcmp(old_data, VARDATA_ANY(data), old.data_len) == 0));
-				if (old_data != NULL)
-					pfree(old_data);
-			}
-
-			/*
-			 * ★★ 只有**新追加**时才许截（2026-09-13 实测纠正第一版）。
-			 *
-			 * 第一版不分情形一律"截到 plsn-1 再写"。那**只截了分区流、没截
-			 * raft 日志**：若这条是 leader 的**重传**（条目本来就在本节点
-			 * raft 日志里），流里更靠后的记录可能是已提交、已 ack 的 ——
-			 * 截掉之后 leader 按 match_index 不会重发，那段字节就永久丢了。
-			 * 实测：一次重传 plsn=2 触发替换，把 3..51 一并截掉，
-			 * dtx_replay_tx1 由 83/0 掉到 76/7。
-			 *
-			 * 两种情形分开处置：
-			 *   · 新追加：本节点 raft 日志里没有比它更靠后的条目，分区流里
-			 *     更靠后的记录**必然**是孤儿（它们对应的日志条目早被 discard）
-			 *     ⇒ 截掉是安全的。R-P4-13 正是这一种。
-			 *   · 重传：不截。本地字节与已提交记录不一致是**已经发生**的分叉
-			 *     （改动前它会被静默去重吞掉），标记分叉交给既有修复路径
-			 *     （重做物理基线会清标），并照常 ack —— 不 ack 只会让 leader
-			 *     无限重试同一条，复制卡死。
-			 */
-			if (!same && !fresh_append)
-			{
-				char reason[256];
-
-				snprintf(reason, sizeof(reason),
-						 "follower_append: plsn=%lld 本地字节（flags=%u info=%u）与重传的已提交记录"
-						 "（flags=%d info=%d）不一致",
-						 (long long) partition_lsn, (unsigned) old.flags,
-						 (unsigned) old.info, flags, info);
-				ShardMarkDiverged(partition_id, reason);
-				ereport(WARNING,
-						(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 与重传的已提交记录不一致，"
-								"已标记分叉（不截断）", partition_id, (long long) partition_lsn),
-						 errdetail("%s", reason),
-						 errhint("该副本需重做物理基线（partdist.repair_diverged_shards()）。")));
-			}
-			else if (!same)
-			{
-				ereport(WARNING,
-						(errmsg("partwal_follower_append: 分区 %u 的 plsn=%lld 本地是孤儿记录"
-								"（flags=%u info=%u），被已提交的记录（flags=%d info=%d）取代",
-								partition_id, (long long) partition_lsn,
-								(unsigned) old.flags, (unsigned) old.info,
-								flags, info),
-						 errdetail("新追加：本节点 raft 日志里没有更靠后的条目，分区流里 %lld 之后"
-								   "的记录必然是未提交提案留下的孤儿；按已提交记录为准截断重写。",
-								   (long long) partition_lsn - 1)));
-				DestroyPartitionWALWriter(writer);
-				if (!TruncatePartWALTo(partition_id, (RelFileNumber) partition_id,
-									   (uint64) partition_lsn - 1))
-					ereport(ERROR,
-							(errmsg("partwal_follower_append: 分区 %u 截到 %lld 失败，拒绝 ack",
-									partition_id, (long long) partition_lsn - 1)));
-				writer = CreatePartitionWALWriter(partition_id,
-												  (RelFileNumber) partition_id);
-				if (writer == NULL)
-					ereport(ERROR,
-							(errmsg("partwal_follower_append: 截断后无法为分区 %u 重建写入器",
-									partition_id)));
-			}
-		}
-
-		/*
-		 * **按 leader 指定的 partition_lsn 落盘**，而不是本地自增。
-		 *
-		 * 本节点同时是若干分区的 primary、又是另一些分区的 secondary，同一个
-		 * pg_parwal 目录树下既有本地 demux 写入、也有 follower 收到的复制流。
-		 * 若 follower 用本地计数器，编号空间会和 leader 的永久错位，
-		 * applied_part_lsn 指向的记录在本地根本不存在。
-		 *
-		 * 返回值：真正写入返回该编号；重传去重（已落过盘）也返回该编号 ——
-		 * 对调用方而言"这条已持久化"是同一个结论，都应当 ack。
-		 */
-		/*
-		 * ★ P7-N23：返回值 = 是否真的落了字节（重传去重返回 false）。真落下的一条
-		 * DATA/MARKER 必然是**别的 leader** 写的 —— 本节点自己当主时的记录走 demux
-		 * 本地落盘，从不经这里。CTRL/DTX 不算：它们不改堆也不改提交状态，
-		 * dtx_close_indoubt 直接从流里读 DTX。
-		 */
-		if (AppendPartWALRecordAt(writer,
-								  (uint64) partition_lsn,
-								  orig_lsn,
-								  (uint8) rmid,
-								  (uint8) info,
-								  VARDATA_ANY(data),
-								  (uint32) VARSIZE_ANY_EXHDR(data),
-								  (GlobalTransactionId) gxid,
-								  (uint8) flags) &&
-			(flags & (PARTWAL_FLAG_CTRL | PARTWAL_FLAG_DTX)) == 0)
+		if (follower_append_one(partition_id, &writer, partition_lsn, orig_lsn, rmid, info,
+								flags, gxid, VARDATA_ANY(data),
+								(uint32) VARSIZE_ANY_EXHDR(data), fresh_append))
 			foreign_heap_rec = true;
-
-		/*
-		 * ★ P7-N18（2026-09-18，shardpg-test 线解冻）：**在 append 时就抬发号水位**。
-		 *
-		 * 缺陷：leader 把它的发号水位（HAS_ALLOC_WM）/分片 xid（HAS_SHARD_XID）盖在
-		 * MARKER 尾块里，但原来只有 redo 侧（shard_replay.c）读它抬水位。升主前置的追平
-		 * 上界只到本节点 applied_part_lsn（get_follower_applied_part_lsn）—— 2 vCPU 饱和、
-		 * in_txn_replication 跳过推进、或 p_force 兜底放行时，[applied+1, flush] 这截
-		 * **已复制、未 apply** 的尾巴里的分片 xid 没进水位；新主 ShardXidClaimOnPromote 取
-		 * Max(水位, 影子) 仍是陈旧值 ⇒ 重发旧主已用过、已提交的分片 xid ⇒ 分片 clog 撞号、
-		 * 判决落错事务 ⇒ 2PC 跨分片原子性破坏、切主后总额漂移（N18 正例 N12 run 5 +2）。
-		 *
-		 * 修法（候选①的落点）：这条记录此刻已按 leader 编号落盘、马上要 fsync 后 ack，
-		 * 与字节**同等持久**。就在这里把它尾块携带的发号水位接住 —— 未 apply 的尾巴由此
-		 * 一并覆盖，ClaimOnPromote 无需改动即正确。RaiseAllocWatermark 只增不减、幂等，
-		 * 只在真正抬高时才落盘（≈ 每个新分片 xid 一次，与 leader 发号同频），重传/去重路径
-		 * 上重复调用无副作用。锁序：本处持 PartWALCtl->lock，内部另取 ShardXidCtl->lock，
-		 * 无反向嵌套（发号路径取 ShardXidCtl 后即释放再写 parwal）。
-		 */
-		if ((flags & PARTWAL_FLAG_MARKER) != 0)
-		{
-			char   *mbody = VARDATA_ANY(data);
-			Size	mlen = VARSIZE_ANY_EXHDR(data);
-
-			if (mlen >= sizeof(TxnMarkerPayload))
-			{
-				TxnMarkerPayload *m = (TxnMarkerPayload *) mbody;
-
-				if (mlen >= TxnMarkerPayloadSizeEx(m->nsubxacts, m->flags))
-				{
-					if ((m->flags & PARTWAL_MARKER_HAS_ALLOC_WM) != 0)
-					{
-						TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
-
-						if (TransactionIdIsNormal(wm))
-							ShardXidRaiseAllocWatermark(partition_id, wm);
-					}
-					else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
-					{
-						TransactionId sx = (TransactionId) *TxnMarkerShardXidPtr(m);
-
-						if (TransactionIdIsNormal(sx))
-							ShardXidRaiseAllocWatermark(partition_id, sx + 1);
-					}
-				}
-			}
-		}
 
 		/* 必须在 ack 之前落盘：多数派 ack == 多数派字节已持久化 */
 		FlushPartitionWALWriter(writer, true);
@@ -1317,6 +1728,56 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 		ShardReplicaNoteForeignAppend(partition_id);
 
 	PG_RETURN_INT64(partition_lsn);
+}
+
+/*
+ * 2026-10-17：复制流的按组批量落盘 —— 同一分区的一串记录只取一次 PartWALCtl->lock、
+ * 建一个写入器、最后 flush 一次（批内延迟模式下 fsync 推迟到整条消息末尾）。
+ * 逐条语义与 partwal_follower_append(_fresh) 完全相同（follower_append_one）。
+ * 经 rendezvous variable "partdist_partwal_follower_append_batch_hook" 导出给 pg_raft。
+ * 任何一条失败即 ERROR（整条消息不 ack）。
+ */
+static void
+partdist_partwal_follower_append_batch(Oid partition_id, int n, const int64 *plsn,
+									   const XLogRecPtr *orig_lsn, const int *rmid,
+									   const int *info, const int *flags, const int64 *gxid,
+									   char *const *data, const uint32 *data_len,
+									   const bool *fresh)
+{
+	PartitionWALWriter *writer = NULL;
+	volatile bool		foreign_heap_rec = false;
+	int					i;
+
+	if (n <= 0)
+		return;
+	if (PartWALCtl != NULL)
+		LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+	PG_TRY();
+	{
+		writer = CreatePartitionWALWriter(partition_id, (RelFileNumber) partition_id);
+		if (writer == NULL)
+			ereport(ERROR,
+					(errmsg("partwal_follower_append: 无法为分区 %u 创建写入器",
+							partition_id)));
+		for (i = 0; i < n; i++)
+		{
+			if (follower_append_one(partition_id, &writer, plsn[i], orig_lsn[i], rmid[i],
+									info[i], flags[i], gxid[i], data[i], data_len[i],
+									fresh[i]))
+				foreign_heap_rec = true;
+		}
+		FlushPartitionWALWriter(writer, true);
+		DestroyPartitionWALWriter(writer);
+	}
+	PG_FINALLY();
+	{
+		if (PartWALCtl != NULL)
+			LWLockRelease(PartWALCtl->lock);
+	}
+	PG_END_TRY();
+
+	if (foreign_heap_rec)
+		ShardReplicaNoteForeignAppend(partition_id);
 }
 
 /*
@@ -1487,9 +1948,8 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 								? MakeGlobalXid(PartDistLocalNodeId(), xid)
 								: InvalidGlobalXid,
 							PARTWAL_FLAG_DTX);
-		FlushPartitionWALWriter(writer, true);
-		assigned = writer->last_partition_lsn;
-		DestroyPartitionWALWriter(writer);
+		/* 2026-10-16 组提交模式：锁内只 write()，出锁后再落盘；否则 flush + fsync */
+		assigned = PartWALWriterFinishLazy(writer);
 	}
 	PG_FINALLY();
 	{
@@ -1498,6 +1958,9 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 	}
 	PG_END_TRY();
 	pfree(payload);
+
+	/* 返回即已落盘（与原语义相同）：调用方随后按 get_partition_flush_lsn 复制 */
+	PartWALSyncPartitionUpTo(partition_id, assigned);
 
 	return assigned;
 }

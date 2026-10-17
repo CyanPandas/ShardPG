@@ -57,6 +57,8 @@ extern int  pg_raft_probe_interval_ms;
 extern int  pg_raft_self_connect_timeout_s;   /* P7-N8：连回本节点的建连超时 */
 extern bool pg_raft_loopback_node_names;      /* TPC-C 分支：单机测试拓扑的节点名回环映射 */
 extern int  pg_raft_peer_connect_timeout_s;   /* TPC-C 分支：连别的节点的建连超时 */
+#define RAFT_HS_LOCKS 64
+extern bool pg_raft_data_hardstate_lazy;      /* 数据组 hardstate 只在 term/vote/base 变化时 fsync */
 extern bool pg_raft_single_member_fast_commit;  /* 单副本快速提交：单成员数据组 hardstate 不 fsync */
 extern int  pg_raft_replicate_batch_max;      /* P7-N41：group commit 每批记录上限（1 = 逐条） */
 extern int  pg_raft_probe_fail_threshold;
@@ -84,6 +86,13 @@ extern void pg_raft_consensus_apply_pending(void);
 extern void pg_raft_consensus_apply_all_data(void);
 /* prepare 接线：PartWALFlush 经 rendezvous "partdist_partwal_replicate_hook" 调用 */
 extern void pg_raft_partwal_replicate(Oid partition_id);
+extern void pg_raft_partwal_replicate_many(const Oid *parts, int nparts, bool *failed_out);   /* 2026-10-16 多组一轮复制 */
+extern bool pg_raft_replicate_many;
+extern bool pg_raft_replicate_pipeline;
+extern bool pg_raft_replicate_stream;         /* 2026-10-17 节点级有序复制流 */
+extern int  pg_raft_stream_batch_entries;
+extern int  pg_raft_stream_inflight;
+extern void pg_raft_stream_main(Datum main_arg);
 
 /* 后台追平通道（计划文档 §12.4 #5）：TopologyMonitor 经 libpq 自连触发 */
 extern int  pg_raft_catchup_interval_ms;

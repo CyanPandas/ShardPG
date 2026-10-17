@@ -7,6 +7,7 @@ OBJS = \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
 	src/wal/partwal_sync.o \
+	src/wal/partwal_recent.o \
 	src/wal/shard_fileset.o \
 	src/worker/demux_worker.o \
 	src/replay/enhanced_clog.o \

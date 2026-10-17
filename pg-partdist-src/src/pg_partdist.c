@@ -41,6 +41,8 @@
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "tcop/utility.h"
+#include "partwal_recent.h"
+extern void PartWALRegisterReadHook(void);   /* raft_boundary.c */
 
 PG_MODULE_MAGIC;
 
@@ -635,6 +637,7 @@ PartDistMaybeInstallUsr2Backtrace(void)
 void
 _PG_init(void)
 {
+    PartWALRegisterReadHook();   /* 2026-10-17：pg_raft 复制流按 plsn 读记录（C 层） */
     if (!process_shared_preload_libraries_in_progress)
         return;
 
@@ -689,6 +692,18 @@ _PG_init(void)
         0,
         NULL, NULL, NULL
     );
+    DefineCustomIntVariable(
+        "pg_partdist.partwal_recent_cache_mb",
+        "最近写下的分区流记录的节点级内存缓存大小（MB，0 = 关，默认 256）。",
+        "复制按 plsn 取刚落盘的记录、DTX 收尾按 dtxid 找刚写的 DTX_PREPARE 都先查它，"
+        "查不中才回读段文件。只缓存已写进段文件的记录；任何分区截断时整体作废。",
+        &partwal_recent_cache_mb,
+        256, 0, 8192,
+        PGC_POSTMASTER,
+        GUC_UNIT_MB,
+        NULL, NULL, NULL
+    );
+
     /* P7-N4/N7：分区流按 plsn 查记录的稀疏索引开关（逃生口 + 正确性对照用） */
     DefineCustomBoolVariable(
         "pg_partdist.partwal_record_index",
@@ -733,6 +748,17 @@ _PG_init(void)
         &partwal_fast_commit,
         false,
         PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
+        "pg_partdist.partwal_group_fsync",
+        "多副本：分区段文件出全局锁后组提交 fsync，checkpoint 以节点级缓存为准（默认 on）。",
+        "关掉退回原路径：每个写入器关闭时在 PartWALCtl->lock 之下 fsync 段文件并写 checkpoint 文件"
+        "再 fsync。打开时复制只送已 fsync 的前缀，多数派语义不变。单副本快速模式下不起作用。",
+        &partwal_group_fsync,
+        true,
+        PGC_POSTMASTER,
         0,
         NULL, NULL, NULL
     );

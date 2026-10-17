@@ -37,6 +37,14 @@
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
+#include "libpq/pqformat.h"          /* 2026-10-17 复制流：二进制批消息 */
+#include "port/pg_bswap.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/condition_variable.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_namespace.h"
 #include "access/shard_stamp.h"	/* 补丁 0014：shard_elr_inhibit */
@@ -44,6 +52,7 @@
 #include "utils/lsyscache.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "access/xact.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -52,6 +61,7 @@
 #include "utils/guc.h"               /* application_name：MX 闸门（T4.4） */
 
 #include <sys/select.h>              /* R-P4-7：有界 RPC 的 select 轮询 */
+#include <poll.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -67,7 +77,13 @@
 
 /* 1 coordinator + 16 worker 拓扑共 17 个 group0 成员；parse_peers 超限会静默丢弃 */
 #define RAFT_MAX_PEERS     32
-#define RAFT_LOG_CAPACITY  128
+/*
+ * 2026-10-16：128 → 1024。数据组一条分区 WAL 记录就是一个条目，一笔 NewOrder 在 order_line
+ * 组里就有十来条；128 条的环只装得下十来笔事务，三副本下慢的那个副本落后两三轮就出了环窗口，
+ * 提交路径补发不了，只能靠后台追平通道持着认领位同步追（实测提交整组排队）。
+ * 代价：每组 1024 × ~0.8 KB ≈ 0.8 MB 共享内存（64 组约 53 MB）。
+ */
+#define RAFT_LOG_CAPACITY  1024
 
 /* data_entry_apply 返回 false 的原因（写进 RaftLogShmem.last_apply_fail） */
 #define RAFT_APPLYFAIL_NONE       0
@@ -75,6 +91,20 @@
 #define RAFT_APPLYFAIL_NO_SPI     2   /* 拿不到 SPI */
 #define RAFT_APPLYFAIL_SPI_EXEC   3   /* follower_set_applied_part_lsn 执行失败 */
 #define RAFT_OP_LEN        32
+
+/* 2026-10-16 诊断：认领位用途（写进 shmem，等太久时连同持有者一起打日志） */
+#define RAFT_CLAIM_UNKNOWN      0
+#define RAFT_CLAIM_COMMIT_MANY  1
+#define RAFT_CLAIM_CATCHUP      2
+#define RAFT_CLAIM_DTX_DECIDE   3
+#define RAFT_CLAIM_DTX_STATUS   4
+#define RAFT_CLAIM_DTX_ACK      5
+#define RAFT_CLAIM_DTX_FORGET   6
+#define RAFT_CLAIM_COMMIT_ONE   7
+static int raft_claim_purpose = RAFT_CLAIM_UNKNOWN;
+static const char *const raft_claim_purpose_name[] =
+    {"unknown", "commit(many)", "catchup", "dtx_decide", "dtx_status", "dtx_ack", "dtx_forget", "commit(one)"};
+
 #define RAFT_PAYLOAD_MAX   768
 
 /*
@@ -170,6 +200,11 @@ typedef struct RaftLogEntry
 {
     int64  index;
     int64  term;
+    /*
+     * 2026-10-16：把这条写进本节点 raft_log 的事务（follower 批量收条目时置位，其余为
+     * Invalid）。同组下一批流水线到达时据此等前一批的事务提交 —— 见 rm_wait_predecessor。
+     */
+    TransactionId pxid;
     char   op_type[RAFT_OP_LEN];
     char   payload[RAFT_PAYLOAD_MAX];
 } RaftLogEntry;
@@ -203,6 +238,10 @@ typedef struct RaftLogShmem
                                                  * fail 晚于 ack ⇒ 判死，停机的 follower 一个
                                                  * 心跳周期内就能判出，不用等时间窗过期 */
     bool         repl_inited;
+    uint64       trunc_gen;         /* 2026-10-16：环尾每被截掉一次 +1（迟到的复制回执据此判作废） */
+    int64        leader_durable_index;  /* 2026-10-17 流水线：leader 自己的 raft_log 行已提交落盘到的 index（自投票上限） */
+    int64        leader_self_hole;      /* 2026-10-17 流水线：自写行失败的最小 index（0 = 无；修好前自投票不越过它） */
+    int64        want_plsn;             /* 2026-10-17 复制流：提交者登记的"要追加到"的 plsn（管理进程替排不上认领位的人追加） */
     int          apply_owner_pid;   /* 串行化 apply 的认领（0 = 无人持有），
                                      * 保证 N 先于 N+1 生效。
                                      *
@@ -275,6 +314,11 @@ typedef struct RaftGroupState
     int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
     bool                replicate_in_progress; /* 本组的 prepare 复制正在进行（串行化，见 replicate_claim） */
     int                 replicate_pid;         /* 持有者 backend PID；持有者消失时由等待者回收 */
+    TimestampTz         last_rm_round;         /* 提交路径（replicate_many）最近一轮完成的时刻（后台追平据此避让） */
+    int64               committed_plsn;        /* 流水线：已提交（多数派）的最大数据 plsn（缓存，见 rm_committed_plsn） */
+    int64               committed_plsn_idx;    /* 上面那个值是按哪个 commit_index 算的 */
+    int                 replicate_purpose;     /* 持有者拿认领位的用途（RAFT_CLAIM_*，诊断用） */
+    TimestampTz         replicate_since;       /* 持有者拿到认领位的时刻（诊断用） */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
 
@@ -315,6 +359,16 @@ typedef struct RaftGroupState
     int                 hs_saved_vote;
     int64               hs_saved_commit;
     int64               hs_saved_applied;
+    /*
+     * 2026-10-16（pg_raft.data_hardstate_lazy）：上一次 **fsync 过** 的 term / vote / 压缩基点。
+     * 数据组这三项与它相同、只有 commit / applied 变化时，文件每秒至多重写一次且不 fsync。
+     * 受 cons.mutex 保护；文件写入本身由 pg_raft_hardstate 锁按组串行化。
+     */
+    bool                hs_dur_valid;
+    int64               hs_dur_term;
+    int                 hs_dur_vote;
+    int64               hs_dur_base;
+    TimestampTz         hs_lazy_ts;
     /*
      * P7-N41：raft_log.committed 已标到哪。原来每条心跳都跑一次
      * UPDATE ... WHERE committed=false（百组 × 每秒），绝大多数一行都不改。
@@ -358,6 +412,14 @@ typedef struct RaftGroupTable
     int64           tomb_gid[64];
     TimestampTz     tomb_at[64];
     int             tomb_next;
+    /* 2026-10-17 复制流：管理进程（pg_raft_stream_main）的 pid / latch，提交者等待的条件变量 */
+    pid_t           stream_pid;
+    Latch          *stream_latch;
+    ConditionVariable stream_cv;
+    pid_t           stream_in_pid[64];  /* 副本端：来自各 leader（按节点号取模）的当前复制流会话 pid */
+    pg_atomic_uint64 stream_wait_n;     /* 提交路径等复制提交：次数 / 合计微秒 / 最大微秒（管理进程每 10 s 清零） */
+    pg_atomic_uint64 stream_wait_us;
+    pg_atomic_uint64 stream_wait_max;
     RaftGroupState  groups[FLEXIBLE_ARRAY_MEMBER];
 } RaftGroupTable;
 
@@ -436,12 +498,34 @@ static bool raft_group_ensure(int64 group_id, const int *members, int n_members,
 static bool group_membership_known(RaftGroupCtx *ctx);
 static bool group_resolve_membership(RaftGroupCtx *ctx);
 static void replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
+static bool rs_stream_active(void);       /* 2026-10-17 复制流 */
+static bool rs_stream_data(RaftGroupCtx *ctx);
+static void rs_replicate_claimed(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id);
+static void pg_raft_partwal_replicate_stream(const Oid *parts, int nparts, bool *failed_out);
+#define RS_MSG_MAGIC 0x52535431          /* "RST1"：复制流批消息 */
 static void restore_groups_if_needed(void);
 static char *data_entry_fetch_hex(RaftGroupCtx *ctx, int64 partition_lsn);
 static bool data_entry_present_locally(RaftGroupCtx *ctx, const char *payload);
 static bool data_entry_store(RaftGroupCtx *ctx, const char *payload,
                              const char *data_hex, bool fresh_append);
 static int64 group_local_partition(RaftGroupCtx *ctx);
+
+/*
+ * 2026-10-16：follower 批量收条目（pg_raft_append_entries_batch）期间的批内状态。
+ * 原来每条条目各自跑七八条 SPI（查本地分片号 ×3、查本地流末尾、写 raft_log 行、标 committed、
+ * apply 推进……），每条都要过一遍 Citus 规划器，实测每条约 10 ms —— 这就是三副本下每个组
+ * 每秒只能复制约一百条记录的天花板。批内：本地分片号与本地流末尾各查一次后在批内维护，
+ * raft_log 行攒到批尾一条多行 INSERT，hardstate / 标 committed / apply 在批尾各做一次。
+ * 只在本函数自己的调用栈内有效，出口（含 ERROR）一律清掉。
+ */
+static bool   raft_batch_active = false;
+static int64  raft_batch_lp_gid = 0;
+static int64  raft_batch_lp_oid = 0;
+static int64  raft_batch_flush = -1;        /* 本地流已写到的 plsn（批内维护，-1 = 未知） */
+static int    raft_batch_nrows = 0;
+static int64  raft_batch_row_idx[RAFT_LOG_CAPACITY];
+static char  *raft_batch_row_pl[RAFT_LOG_CAPACITY];
+static int64  raft_batch_row_term = 0;
 
 /*
  * 「当前是否处于 SPI 可用的语境」。两处依赖它：
@@ -535,6 +619,8 @@ raft_group_init_slot(RaftGroupState *g, int64 group_id,
     memset(g->log.peer_last_fail, 0, sizeof(g->log.peer_last_fail));
 
     g->last_data_plsn = 0;
+    g->committed_plsn = 0;
+    g->committed_plsn_idx = 0;
     g->replicate_in_progress = false;
     g->replicate_pid = 0;
 }
@@ -553,6 +639,10 @@ pg_raft_consensus_shmem_init(void)
         SpinLockInit(&RaftGroups->mutex);
         RaftGroups->max_groups = pg_raft_max_groups;
         RaftGroups->n_groups = 0;
+        ConditionVariableInit(&RaftGroups->stream_cv);
+        pg_atomic_init_u64(&RaftGroups->stream_wait_n, 0);
+        pg_atomic_init_u64(&RaftGroups->stream_wait_us, 0);
+        pg_atomic_init_u64(&RaftGroups->stream_wait_max, 0);
         /* 控制面组恒存在，且成员为全体 peers（members 留空表示全体） */
         raft_group_init_slot(&RaftGroups->groups[0], RAFT_CONTROL_GROUP, NULL, 0);
         RaftGroups->n_groups = 1;
@@ -1201,6 +1291,9 @@ group_local_partition(RaftGroupCtx *ctx)
     bool           isnull;
     int64          local_oid = 0;
 
+    if (raft_batch_active && raft_batch_lp_gid == ctx->group_id && raft_batch_lp_oid > 0)
+        return raft_batch_lp_oid;
+
     if (!raft_persist_spi_begin(&spi_owned))
         return 0;
 
@@ -1218,6 +1311,11 @@ group_local_partition(RaftGroupCtx *ctx)
     }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
+    if (raft_batch_active && local_oid > 0)
+    {
+        raft_batch_lp_gid = ctx->group_id;
+        raft_batch_lp_oid = local_oid;
+    }
     return local_oid;
 }
 
@@ -1277,8 +1375,12 @@ data_local_flush_plsn(RaftGroupCtx *ctx)
 {
     StringInfoData sql;
     bool           spi_owned;
-    int64          local_oid = group_local_partition(ctx);
+    int64          local_oid;
     int64          v = -1;
+
+    if (raft_batch_active && raft_batch_flush >= 0)
+        return raft_batch_flush;
+    local_oid = group_local_partition(ctx);
 
     if (local_oid <= 0 || !raft_persist_spi_begin(&spi_owned))
         return -1;
@@ -1294,6 +1396,8 @@ data_local_flush_plsn(RaftGroupCtx *ctx)
     }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
+    if (raft_batch_active)
+        raft_batch_flush = v;
     return v;
 }
 
@@ -1357,6 +1461,103 @@ data_entry_present_locally(RaftGroupCtx *ctx, const char *payload)
 }
 
 /*
+ * 2026-10-17 复制流：副本端按组攒记录、批尾一次落盘（pg_partdist 的按组批量入口，
+ * 一次 PartWALCtl->lock、一个写入器）。逐条走 SQL 入口时每条都要单独抢那把全节点排他锁，
+ * 本节点自己的提交也在抢 —— 复制流在副本上是单会话顺序处理，这些等待会全部串行累加。
+ * 攒着的记录在三种时刻必须先落下：批尾（ack 之前）、批内 apply 之前、冲突截断之前。
+ */
+typedef void (*PartWALFollowerAppendBatchFn) (Oid partition_id, int n, const int64 *plsn,
+                                              const XLogRecPtr *orig_lsn, const int *rmid,
+                                              const int *info, const int *flags,
+                                              const int64 *gxid, char *const *data,
+                                              const uint32 *data_len, const bool *fresh);
+static PartWALFollowerAppendBatchFn rs_dq_hook = NULL;
+static bool         rs_dq_active = false;
+static Oid          rs_dq_oid = InvalidOid;
+static int          rs_dq_n = 0;
+static int          rs_dq_cap = 0;
+static int64       *rs_dq_plsn;
+static XLogRecPtr  *rs_dq_orig;
+static int         *rs_dq_rmid, *rs_dq_info, *rs_dq_flags;
+static int64       *rs_dq_gxid;
+static char       **rs_dq_data;
+static uint32      *rs_dq_len;
+static bool        *rs_dq_fresh;
+
+static bool
+rs_dq_begin(void)
+{
+    if (rs_dq_hook == NULL)
+    {
+        void **p = find_rendezvous_variable("partdist_partwal_follower_append_batch_hook");
+
+        rs_dq_hook = (PartWALFollowerAppendBatchFn) *p;
+    }
+    rs_dq_n = 0;
+    rs_dq_oid = InvalidOid;
+    rs_dq_active = (rs_dq_hook != NULL);
+    return rs_dq_active;
+}
+
+static void
+rs_dq_flush(void)
+{
+    int n = rs_dq_n;
+
+    if (!rs_dq_active || n == 0)
+        return;
+    rs_dq_n = 0;
+    rs_dq_hook(rs_dq_oid, n, rs_dq_plsn, rs_dq_orig, rs_dq_rmid, rs_dq_info, rs_dq_flags,
+               rs_dq_gxid, rs_dq_data, rs_dq_len, rs_dq_fresh);
+}
+
+static void
+rs_dq_end(void)
+{
+    rs_dq_active = false;
+    rs_dq_n = 0;
+    rs_dq_oid = InvalidOid;
+}
+
+static void
+rs_dq_push(Oid part, int64 plsn, XLogRecPtr orig, int rmid, int info, int flags, int64 gxid,
+           char *data, uint32 len, bool fresh)
+{
+    if (rs_dq_n > 0 && part != rs_dq_oid)
+        rs_dq_flush();
+    if (rs_dq_n >= rs_dq_cap)
+    {
+        int nc = Max(rs_dq_cap * 2, 256);
+
+#define RS_DQ_GROW(arr, T) \
+        arr = (T *) (rs_dq_cap == 0 ? MemoryContextAlloc(TopMemoryContext, sizeof(T) * nc) \
+                                    : repalloc(arr, sizeof(T) * nc))
+        RS_DQ_GROW(rs_dq_plsn, int64);
+        RS_DQ_GROW(rs_dq_orig, XLogRecPtr);
+        RS_DQ_GROW(rs_dq_rmid, int);
+        RS_DQ_GROW(rs_dq_info, int);
+        RS_DQ_GROW(rs_dq_flags, int);
+        RS_DQ_GROW(rs_dq_gxid, int64);
+        RS_DQ_GROW(rs_dq_data, char *);
+        RS_DQ_GROW(rs_dq_len, uint32);
+        RS_DQ_GROW(rs_dq_fresh, bool);
+#undef RS_DQ_GROW
+        rs_dq_cap = nc;
+    }
+    rs_dq_oid = part;
+    rs_dq_plsn[rs_dq_n] = plsn;
+    rs_dq_orig[rs_dq_n] = orig;
+    rs_dq_rmid[rs_dq_n] = rmid;
+    rs_dq_info[rs_dq_n] = info;
+    rs_dq_flags[rs_dq_n] = flags;
+    rs_dq_gxid[rs_dq_n] = gxid;
+    rs_dq_data[rs_dq_n] = data;
+    rs_dq_len[rs_dq_n] = len;
+    rs_dq_fresh[rs_dq_n] = fresh;
+    rs_dq_n++;
+}
+
+/*
  * Follower 侧：把随 AppendEntries 收到的字节原样落盘到**本节点自己的**
  * pg_parwal/<local_oid>/（local_oid 与 leader 不同，由 P0 映射解析）。
  * 返回 false 表示未能落盘 —— 此时不得 ack。
@@ -1365,7 +1566,6 @@ static bool
 data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex,
                  bool fresh_append)
 {
-    StringInfoData sql;
     bool           spi_owned;
     bool           ok = false;
     int64          local_oid;
@@ -1412,40 +1612,93 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex,
     if (p != NULL && (p = strchr(p, ':')) != NULL)
         (void) sscanf(p + 1, " %lld", &gxid);
 
+    /* 复制流批内：攒起来，批尾按组一次落盘（见 rs_dq_*） */
+    if (rs_dq_active)
+    {
+        size_t      hlen = (data_hex != NULL) ? strlen(data_hex) : 0;
+        char       *raw = (char *) palloc(hlen / 2 + 1);
+        int64       sp = entry_partition_lsn(payload);
+
+        if (hlen > 0)
+            (void) hex_decode(data_hex, hlen, raw);
+        rs_dq_push((Oid) local_oid, sp,
+                   DatumGetLSN(DirectFunctionCall1(pg_lsn_in, CStringGetDatum(orig_lsn))),
+                   rmid, info, flags, (int64) gxid, raw, (uint32) (hlen / 2), fresh_append);
+        if (raft_batch_active && raft_batch_flush >= 0 && (fresh_append || sp > raft_batch_flush))
+            raft_batch_flush = sp;
+        return true;
+    }
+
     if (!raft_persist_spi_begin(&spi_owned))
         return false;
 
-    initStringInfo(&sql);
     /*
      * 必须把 leader 指定的 partition_lsn 一并传下去：follower 按该编号落盘，
      * 否则本地自增计数器会和 leader 的编号空间错位（本节点同一 pg_parwal 树下
      * 还有它作为 primary 的本地 demux 写入），applied_part_lsn 将指向本地
      * 不存在的记录。
-     */
-    /*
+     *
      * T7.24（R-P4-13 根因）：新追加走 _fresh 入口。编号被本地孤儿记录占住时，
      * 只有新追加才许在 parwal 侧截断重写 —— 本节点 raft 日志里没有更靠后的
      * 条目，流里更靠后的记录必然是孤儿；重传则只标分叉、不截断
      * （截了 raft 日志却没截，leader 不会重发，那段字节就丢了）。
+     *
+     * 2026-10-16：改用按后端缓存的预备计划 + 参数（字节在 C 里解十六进制）。原来每条
+     * 条目拼一条 SQL 文本、过一遍解析与 Citus 规划器，是 follower 每条约 1 ms 的大头。
      */
-    appendStringInfo(&sql,
-                     "SELECT partdist.%s("
-                     "%u::oid, %lld::bigint, %s::pg_lsn, %d, %d, %d, %lld::bigint, "
-                     "decode(%s, 'hex'))",
-                     fresh_append ? "partwal_follower_append_fresh"
-                                  : "partwal_follower_append",
-                     (unsigned) local_oid,
-                     (long long) entry_partition_lsn(payload),
-                     quote_literal_cstr(orig_lsn),
-                     rmid, info, flags, gxid,
-                     quote_literal_cstr(data_hex != NULL ? data_hex : ""));
-    ok = (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0);
-    pfree(sql.data);
+    {
+        static SPIPlanPtr des_plan[2] = {NULL, NULL};
+        int         which = fresh_append ? 1 : 0;
+        Datum       vals[8];
+        char        nulls[9] = "        ";
+        size_t      hlen = (data_hex != NULL) ? strlen(data_hex) : 0;
+        bytea      *raw = (bytea *) palloc(VARHDRSZ + hlen / 2);
+
+        SET_VARSIZE(raw, VARHDRSZ + hlen / 2);
+        if (hlen > 0)
+            (void) hex_decode(data_hex, hlen, VARDATA(raw));
+        if (des_plan[which] == NULL)
+        {
+            Oid         argtypes[8] = {OIDOID, INT8OID, PG_LSNOID, INT4OID, INT4OID,
+                                       INT4OID, INT8OID, BYTEAOID};
+            SPIPlanPtr  pl;
+
+            pl = SPI_prepare(which
+                             ? "SELECT partdist.partwal_follower_append_fresh($1, $2, $3, $4, $5, $6, $7, $8)"
+                             : "SELECT partdist.partwal_follower_append($1, $2, $3, $4, $5, $6, $7, $8)",
+                             8, argtypes);
+            if (pl == NULL)
+                elog(ERROR, "pg_raft: 预备 follower 落盘语句失败：%s",
+                     SPI_result_code_string(SPI_result));
+            if (SPI_keepplan(pl) != 0)
+                elog(ERROR, "pg_raft: 保存 follower 落盘计划失败");
+            des_plan[which] = pl;
+        }
+        vals[0] = ObjectIdGetDatum((Oid) local_oid);
+        vals[1] = Int64GetDatum(entry_partition_lsn(payload));
+        vals[2] = DirectFunctionCall1(pg_lsn_in, CStringGetDatum(orig_lsn));
+        vals[3] = Int32GetDatum(rmid);
+        vals[4] = Int32GetDatum(info);
+        vals[5] = Int32GetDatum(flags);
+        vals[6] = Int64GetDatum((int64) gxid);
+        vals[7] = PointerGetDatum(raw);
+        ok = (SPI_execute_plan(des_plan[which], vals, nulls, false, 1) == SPI_OK_SELECT &&
+              SPI_processed > 0);
+        pfree(raw);
+    }
     raft_persist_spi_end(spi_owned);
 
     if (!ok)
         elog(WARNING, "pg_raft: group %lld parwal 落盘失败，拒绝 ack",
              (long long) ctx->group_id);
+    else if (raft_batch_active && raft_batch_flush >= 0)
+    {
+        int64 sp = entry_partition_lsn(payload);
+
+        /* 新追加：流尾就是它（_fresh 可能截掉了更靠后的孤儿）；重传：去重 no-op，只升不降 */
+        if (fresh_append || sp > raft_batch_flush)
+            raft_batch_flush = sp;
+    }
     return ok;
 }
 
@@ -1697,9 +1950,24 @@ hard_state_path(RaftGroupCtx *ctx, char *path, size_t pathlen)
                  (long long) ctx->group_id);
 }
 
+/*
+ * 2026-10-16：数据组 lazy hardstate 的提示文件。term / vote / 压缩基点没变、只有 commit /
+ * applied 前移时写这里（不 fsync）；主文件只在 fsync 后才被替换。崩溃（含掉电）最坏丢掉
+ * 提示 —— commit / applied 退回主文件里的值，Raft 本就允许；term / vote 不会因为一次未
+ * fsync 的 rename 而丢。重启时提示只在与主文件同 term / vote / 基点时采信。
+ */
+static void
+hard_state_hint_path(RaftGroupCtx *ctx, char *path, size_t pathlen)
+{
+    char base[MAXPGPATH];
+
+    hard_state_path(ctx, base, sizeof(base));
+    snprintf(path, pathlen, "%s.hint", base);
+}
+
 static bool
-persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
-                          int64 commit_index, int64 last_applied)
+persist_hard_state_values_ex(RaftGroupCtx *ctx, int64 current_term, int voted_for,
+                             int64 commit_index, int64 last_applied, bool do_fsync)
 {
     char              path[MAXPGPATH];
     char              tmppath[MAXPGPATH];
@@ -1707,7 +1975,10 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
     int               fd;
     ssize_t           written;
 
-    hard_state_path(ctx, path, sizeof(path));
+    if (!do_fsync && ctx->group_id != RAFT_CONTROL_GROUP)
+        hard_state_hint_path(ctx, path, sizeof(path));
+    else
+        hard_state_path(ctx, path, sizeof(path));
 
     /*
      * 临时文件名必须**按进程唯一**。
@@ -1758,7 +2029,8 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
      * （last_applied 必须跟上，否则重启后环被判满），但不 fsync —— 每次提交一次。
      * 控制面组与多成员组不受影响。
      */
-    if (!(pg_raft_single_member_fast_commit && ctx->group_id != RAFT_CONTROL_GROUP &&
+    if (do_fsync &&
+        !(pg_raft_single_member_fast_commit && ctx->group_id != RAFT_CONTROL_GROUP &&
           group_cluster_size(ctx) == 1) &&
         pg_fsync(fd) != 0)
     {
@@ -1777,7 +2049,26 @@ persist_hard_state_values(RaftGroupCtx *ctx, int64 current_term, int voted_for,
         return false;
     }
 
+    /* 主文件已带着最新的 commit / applied 落盘：旧提示作废（否则重启时可能被它的更大值盖过） */
+    if (do_fsync && ctx->group_id != RAFT_CONTROL_GROUP)
+    {
+        char hpath[MAXPGPATH];
+
+        hard_state_hint_path(ctx, hpath, sizeof(hpath));
+        (void) unlink(hpath);
+    }
+
     return true;
+}
+
+static LWLockPadded *raft_hs_locks = NULL;
+
+static LWLock *
+raft_hs_lock(int64 group_id)
+{
+    if (raft_hs_locks == NULL)
+        raft_hs_locks = GetNamedLWLockTranche("pg_raft_hardstate");
+    return &raft_hs_locks[(uint64) group_id % RAFT_HS_LOCKS].lock;
 }
 
 static void
@@ -1787,7 +2078,21 @@ persist_hard_state_unlocked(RaftGroupCtx *ctx)
     int   voted_for;
     int64 commit_index;
     int64 last_applied;
+    int64 base_index;
     bool  ok;
+    bool  lazy = false;
+    LWLock *lk;
+    TimestampTz now = 0;
+
+    /*
+     * 2026-10-16：文件写入按组串行化，且**持锁后才读值** —— term / commit / applied 都单调，
+     * 于是文件内容随写入顺序单调，不会出现"后 rename 的是旧值"（原先并发写者只能靠
+     * hs_overlap 作废记账，文件本身仍可能被旧值覆盖）。
+     */
+    if (pg_raft_data_hardstate_lazy && ctx->group_id != RAFT_CONTROL_GROUP)
+        now = GetCurrentTimestamp();
+    lk = raft_hs_lock(ctx->group_id);
+    LWLockAcquire(lk, LW_EXCLUSIVE);
 
     SpinLockAcquire(&ctx->cons->mutex);
     current_term = ctx->cons->current_term;
@@ -1797,44 +2102,78 @@ persist_hard_state_unlocked(RaftGroupCtx *ctx)
     SpinLockAcquire(&ctx->log->mutex);
     commit_index = ctx->log->commit_index;
     last_applied = ctx->log->last_applied;
+    base_index = ctx->log->base_index;
     SpinLockRelease(&ctx->log->mutex);
 
-    /* P7-N41：文件里已经是这组值、且此刻没有别的写者 ⇒ 不必再 fsync 一次 */
+    /* P7-N41：文件里已经是这组值 ⇒ 不必再写 */
     SpinLockAcquire(&ctx->cons->mutex);
-    if (ctx->g->hs_saved_valid && ctx->g->hs_writers == 0 &&
+    if (ctx->g->hs_saved_valid &&
         ctx->g->hs_saved_term == current_term &&
         ctx->g->hs_saved_vote == voted_for &&
         ctx->g->hs_saved_commit == commit_index &&
         ctx->g->hs_saved_applied == last_applied)
     {
         SpinLockRelease(&ctx->cons->mutex);
+        LWLockRelease(lk);
         return;
     }
 
-    if (ctx->g->hs_writers > 0)
-        ctx->g->hs_overlap = true;
-    ctx->g->hs_writers++;
+    /*
+     * 数据组：term / vote / 压缩基点与上次 fsync 的相同 ⇒ 只有 commit / applied 变了。
+     * Raft 只要求前三项持久（commitIndex 本是易失量，重启后由 raft_log.committed 与 leader
+     * 心跳恢复；last_applied 陈旧只会让幂等的 apply 重做）。原来数据组每批复制在 leader
+     * 与每个 follower 上各 fsync 一到两次 hardstate，机械盘上是提交路径的大头之一。
+     */
+    if (pg_raft_data_hardstate_lazy && ctx->group_id != RAFT_CONTROL_GROUP &&
+        ctx->g->hs_dur_valid &&
+        ctx->g->hs_dur_term == current_term &&
+        ctx->g->hs_dur_vote == voted_for &&
+        ctx->g->hs_dur_base == base_index)
+    {
+        /*
+         * 每组每秒至多写一次提示；但 last_applied 前移超过环容量的 1/4 时提前写 —— 重启后
+         * applied 落后环太多，restore 灌回的条目会把环判满（last_log - applied ≥ 容量）。
+         */
+        /*
+         * 2026-10-17 复制流：副本在一个会话里顺序处理全部组，每次重写提示文件（open/rename）
+         * 在机械盘繁忙时动辄上百毫秒，会直接拖住整条流 —— 放宽到 10 s / 半个环。
+         */
+        if (!TimestampDifferenceExceeds(ctx->g->hs_lazy_ts, now,
+                                        rs_stream_active() ? 10000 : 1000) &&
+            last_applied - ctx->g->hs_saved_applied <
+            (rs_stream_active() ? RAFT_LOG_CAPACITY / 2 : RAFT_LOG_CAPACITY / 4))
+        {
+            SpinLockRelease(&ctx->cons->mutex);
+            LWLockRelease(lk);
+            return;
+        }
+        ctx->g->hs_lazy_ts = now;
+        lazy = true;
+    }
     ctx->g->hs_saved_valid = false;
     SpinLockRelease(&ctx->cons->mutex);
 
-    ok = persist_hard_state_values(ctx, current_term, voted_for, commit_index,
-                                   last_applied);
+    ok = persist_hard_state_values_ex(ctx, current_term, voted_for, commit_index,
+                                      last_applied, !lazy);
 
     SpinLockAcquire(&ctx->cons->mutex);
-    ctx->g->hs_writers--;
-    if (ctx->g->hs_writers == 0)
+    if (ok)
     {
-        if (ok && !ctx->g->hs_overlap)
+        ctx->g->hs_saved_valid = true;
+        ctx->g->hs_saved_term = current_term;
+        ctx->g->hs_saved_vote = voted_for;
+        ctx->g->hs_saved_commit = commit_index;
+        ctx->g->hs_saved_applied = last_applied;
+        if (!lazy)
         {
-            ctx->g->hs_saved_valid = true;
-            ctx->g->hs_saved_term = current_term;
-            ctx->g->hs_saved_vote = voted_for;
-            ctx->g->hs_saved_commit = commit_index;
-            ctx->g->hs_saved_applied = last_applied;
+            ctx->g->hs_dur_valid = true;
+            ctx->g->hs_dur_term = current_term;
+            ctx->g->hs_dur_vote = voted_for;
+            ctx->g->hs_dur_base = base_index;
         }
-        ctx->g->hs_overlap = false;
     }
     SpinLockRelease(&ctx->cons->mutex);
+    LWLockRelease(lk);
 }
 
 static void
@@ -1879,6 +2218,35 @@ restore_hard_state_if_needed(RaftGroupCtx *ctx)
         hs.last_applied = 0;    /* v1 没有该字段，退化为"从 0 起重放" */
     if (hs.version < 3)
         hs.base_index = hs.base_term = 0;   /* v1/v2：从未压缩过 */
+
+    /* lazy hardstate 的提示文件：同 term / vote / 基点时取其更大的 commit / applied */
+    if (ctx->group_id != RAFT_CONTROL_GROUP && hs.version == RAFT_HARDSTATE_VERSION)
+    {
+        char              hpath[MAXPGPATH];
+        RaftHardStateFile hint;
+        int               hfd;
+
+        hard_state_hint_path(ctx, hpath, sizeof(hpath));
+        hfd = open(hpath, O_RDONLY, 0);
+        if (hfd >= 0)
+        {
+            memset(&hint, 0, sizeof(hint));
+            if (read(hfd, &hint, sizeof(hint)) == (ssize_t) sizeof(hint) &&
+                hint.magic == RAFT_HARDSTATE_MAGIC &&
+                hint.version == RAFT_HARDSTATE_VERSION &&
+                hint.current_term == hs.current_term &&
+                hint.voted_for == hs.voted_for &&
+                hint.base_index == hs.base_index &&
+                hint.base_term == hs.base_term)
+            {
+                if (hint.commit_index > hs.commit_index)
+                    hs.commit_index = hint.commit_index;
+                if (hint.last_applied > hs.last_applied)
+                    hs.last_applied = hint.last_applied;
+            }
+            close(hfd);
+        }
+    }
 
     SpinLockAcquire(&ctx->cons->mutex);
     if (hs.current_term > ctx->cons->current_term)
@@ -2085,6 +2453,7 @@ log_get_entry_sql(RaftGroupCtx *ctx, int64 index, RaftLogEntry *out)
         char     *payload;
 
         out->index = index;
+        out->pxid = InvalidTransactionId;
         out->term = DatumGetInt64(SPI_getbinval(tup, desc, 1, &isnull));
         op = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
         payload = TextDatumGetCString(SPI_getbinval(tup, desc, 3, &isnull));
@@ -2242,6 +2611,9 @@ wait_for_log_room(RaftGroupCtx *ctx)
     }
 }
 
+/* 非 Invalid 时 log_append_locked 把它记进新条目（仅 follower 批量收条目期间置位） */
+static TransactionId raft_append_pxid = InvalidTransactionId;
+
 static int64
 log_append_locked(RaftGroupCtx *ctx, int64 term, const char *op_type,
                   const char *payload)
@@ -2260,6 +2632,7 @@ log_append_locked(RaftGroupCtx *ctx, int64 term, const char *op_type,
     e = log_slot(ctx, idx);
     e->index = idx;
     e->term = term;
+    e->pxid = raft_append_pxid;
     strlcpy(e->op_type, op_type, RAFT_OP_LEN);
     strlcpy(e->payload, payload, RAFT_PAYLOAD_MAX);
     ctx->log->last_log_index = idx;
@@ -2270,7 +2643,10 @@ static void
 log_truncate_after_locked(RaftGroupCtx *ctx, int64 index)
 {
     if (index < ctx->log->last_log_index)
+    {
         ctx->log->last_log_index = index;
+        ctx->log->trunc_gen++;
+    }
     if (ctx->log->commit_index > index)
         ctx->log->commit_index = index;
     if (ctx->log->last_applied > index)
@@ -2546,6 +2922,19 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
     StringInfoData sql;
     bool           spi_owned;
 
+    /* follower 批内：攒到批尾一条多行 INSERT（同组、同任期、OP_PARWAL、未提交、index 递增） */
+    if (raft_batch_active && !committed && strcmp(op_type, RAFT_OP_PARWAL) == 0 &&
+        raft_batch_nrows < RAFT_LOG_CAPACITY &&
+        (raft_batch_nrows == 0 || (term == raft_batch_row_term &&
+                                   index > raft_batch_row_idx[raft_batch_nrows - 1])))
+    {
+        raft_batch_row_term = term;
+        raft_batch_row_idx[raft_batch_nrows] = index;
+        raft_batch_row_pl[raft_batch_nrows] = pstrdup(payload);
+        raft_batch_nrows++;
+        return;
+    }
+
     if (!raft_persist_spi_begin(&spi_owned))
         return;
 
@@ -2648,18 +3037,38 @@ mark_log_committed_sql(RaftGroupCtx *ctx, int64 upto_index)
     }
 
     initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "UPDATE partdist.raft_log SET committed = true "
-                     "WHERE group_id = %lld AND log_index > %lld AND log_index <= %lld "
-                     "AND committed = false",
-                     (long long) ctx->group_id,
-                     /*
-                      * 下界：sql_marked_upto 以下已全部标记（删行/回滚时水位随之退回，
-                      * 见 P7-N41 各处）。原先没有下界，每次提交都把本组全部历史日志
-                      * 沿 (group_id, log_index) 扫一遍——组里几万条时单次 >10 ms 且持续变慢。
-                      */
-                     (long long) Max(ctx->g->sql_marked_upto, 0),
-                     (long long) upto_index);
+    /*
+     * 下界：sql_marked_upto 以下已全部标记（删行/回滚时水位随之退回，见 P7-N41 各处）。
+     * 原先没有下界，每次提交都把本组全部历史日志沿 (group_id, log_index) 扫一遍——
+     * 组里几万条时单次 >10 ms 且持续变慢。
+     */
+    if (ctx->group_id != RAFT_CONTROL_GROUP)
+    {
+        /*
+         * 2026-10-16：数据组标 committed 不等行锁（SKIP LOCKED）。这一列只是重启恢复时抬
+         * commit_index 的提示（权威在 hardstate；只有 restore 读它），而 follower 上同组并发的
+         * 几批 AppendEntries 事务会互相 upsert / 标记对方的行 —— 普通 UPDATE 在这里与 upsert
+         * 成环，实测副本端报 deadlock detected、整批失败。被跳过的行就留着 false。
+         */
+        appendStringInfo(&sql,
+                         "UPDATE partdist.raft_log r SET committed = true "
+                         "FROM (SELECT log_index FROM partdist.raft_log "
+                         "      WHERE group_id = %lld AND log_index > %lld AND log_index <= %lld "
+                         "      AND committed = false FOR UPDATE SKIP LOCKED) c "
+                         "WHERE r.group_id = %lld AND r.log_index = c.log_index",
+                         (long long) ctx->group_id,
+                         (long long) Max(ctx->g->sql_marked_upto, 0),
+                         (long long) upto_index,
+                         (long long) ctx->group_id);
+    }
+    else
+        appendStringInfo(&sql,
+                         "UPDATE partdist.raft_log SET committed = true "
+                         "WHERE group_id = %lld AND log_index > %lld AND log_index <= %lld "
+                         "AND committed = false",
+                         (long long) ctx->group_id,
+                         (long long) Max(ctx->g->sql_marked_upto, 0),
+                         (long long) upto_index);
     if (SPI_execute(sql.data, false, 0) == SPI_OK_UPDATE &&
         upto_index > ctx->g->sql_marked_upto)
         ctx->g->sql_marked_upto = upto_index;
@@ -2816,6 +3225,7 @@ restore_persistent_log_if_needed(RaftGroupCtx *ctx)
         e = log_slot(ctx, idx);
         e->index = idx;
         e->term = term;
+        e->pxid = InvalidTransactionId;
         strlcpy(e->op_type, op, RAFT_OP_LEN);
         strlcpy(e->payload, payload, RAFT_PAYLOAD_MAX);
 
@@ -3501,6 +3911,8 @@ init_leader_replication(RaftGroupCtx *ctx)
         ctx->log->peer_match_index[i] = 0;
     }
     ctx->log->repl_inited = true;
+    ctx->log->leader_durable_index = ctx->log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+    ctx->log->leader_self_hole = 0;
     SpinLockRelease(&ctx->log->mutex);
 }
 
@@ -4246,7 +4658,21 @@ compute_new_commit_index(RaftGroupCtx *ctx, int64 current_term)
     int64 idx;
     RaftLogEntry e;
 
-    matches[n++] = ctx->log->last_log_index;
+    /*
+     * 2026-10-17 流水线：数据组 leader 的自投票只算到自己的 raft_log 行已提交落盘的位置。
+     * 流水线把 leader 行放到独立连接里自提交（rm_pipe_send），这之前那些条目只在环里，
+     * leader 崩溃重启就没了 —— 不能算它一票。
+     */
+    if ((pg_raft_replicate_pipeline && ctx->group_id != RAFT_CONTROL_GROUP) || rs_stream_data(ctx))
+    {
+        int64 self = Min(ctx->log->leader_durable_index, ctx->log->last_log_index);
+
+        if (ctx->log->leader_self_hole > 0 && self >= ctx->log->leader_self_hole)
+            self = ctx->log->leader_self_hole - 1;
+        matches[n++] = self;
+    }
+    else
+        matches[n++] = ctx->log->last_log_index;
     for (i = 0; i < n_peers; i++)
     {
         if (!peer_in_group(ctx, i))
@@ -4396,6 +4822,8 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
             ctx->log->peer_match_index[j] = 0;
         }
         ctx->log->repl_inited = true;
+        ctx->log->leader_durable_index = ctx->log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+        ctx->log->leader_self_hole = 0;
     }
     repl_ready = ctx->log->repl_inited;
     leader_commit = ctx->log->commit_index;
@@ -4562,9 +4990,15 @@ replicate_to_peer(RaftGroupCtx *ctx, int peer_slot)
             ctx->log->peer_match_index[peer_slot] = entry.index;
             ctx->log->peer_next_index[peer_slot] = entry.index + 1;
         }
-        else
-            ctx->log->peer_match_index[peer_slot] = prev_idx;
+        else if (!(pg_raft_replicate_pipeline && ctx->group_id != RAFT_CONTROL_GROUP) &&
+                 !rs_stream_data(ctx))
+            ctx->log->peer_match_index[peer_slot] = prev_idx;   /* 流水线下数据组心跳不抬 match（见 hb_apply_one） */
         SpinLockRelease(&ctx->log->mutex);
+    }
+    else if (!has_entry && rs_stream_data(ctx))
+    {
+        /* 复制流：心跳的 prev 是乐观推进后的 next-1（那一批可能还在路上），被拒不说明对端缺什么；
+         * 回退由复制流按回包处理 */
     }
     else
     {
@@ -4672,10 +5106,16 @@ hb_apply_one(int slot, const HbItem *it, bool responded, int64 rt, int ok)
     SpinLockAcquire(&ctx.log->mutex);
     if (ok)
     {
-        if (it->prev_idx > ctx.log->peer_match_index[slot])
+        /*
+         * 2026-10-17：流水线下数据组的心跳回执不抬 match —— 心跳的 prev 是乐观推进后的 next-1，
+         * 对端只要环里有就回 ok，而那一批可能还没在对端提交落盘。match 只认带条目的批量回执。
+         */
+        if (it->prev_idx > ctx.log->peer_match_index[slot] &&
+            !(pg_raft_replicate_pipeline && ctx.group_id != RAFT_CONTROL_GROUP) &&
+            !rs_stream_data(&ctx))
             ctx.log->peer_match_index[slot] = it->prev_idx;
     }
-    else if (it->prev_idx > 0 && ctx.log->peer_next_index[slot] > 1)
+    else if (it->prev_idx > 0 && ctx.log->peer_next_index[slot] > 1 && !rs_stream_data(&ctx))
         ctx.log->peer_next_index[slot]--;   /* P7-N45：prev=0 的保活被拒不说明日志位置 */
     SpinLockRelease(&ctx.log->mutex);
 }
@@ -6307,6 +6747,8 @@ sync_replicate_index(RaftGroupCtx *ctx, int64 idx, int64 term)
             ctx->log->peer_match_index[j] = 0;
         }
         ctx->log->repl_inited = true;
+        ctx->log->leader_durable_index = ctx->log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+        ctx->log->leader_self_hole = 0;
     }
     SpinLockRelease(&ctx->log->mutex);
 
@@ -6395,8 +6837,12 @@ flush_replication(RaftGroupCtx *ctx, int64 idx, int64 term)
     }
 }
 
+/*
+ * expect_term > 0：只丢该任期的条目（调用方释放锁之后才来丢，期间本节点若已失主、
+ * 环尾换成了新任期的条目，就不许动它）。0 = 不核对（原调用方）。
+ */
 static void
-discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
+discard_uncommitted_entry_term(RaftGroupCtx *ctx, int64 idx, int64 expect_term)
 {
     int   i;
 
@@ -6405,6 +6851,16 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
 
 
     SpinLockAcquire(&ctx->log->mutex);
+    if (expect_term > 0)
+    {
+        RaftLogEntry *te = log_slot(ctx, idx);
+
+        if (te->index != idx || te->term != expect_term)
+        {
+            SpinLockRelease(&ctx->log->mutex);
+            return;
+        }
+    }
     if (idx > ctx->log->commit_index && idx == ctx->log->last_log_index)
     {
         RaftLogEntry dropped;
@@ -6465,6 +6921,12 @@ discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
 
     delete_log_entry_sql(ctx, idx);
     persist_hard_state_unlocked(ctx);
+}
+
+static void
+discard_uncommitted_entry(RaftGroupCtx *ctx, int64 idx)
+{
+    discard_uncommitted_entry_term(ctx, idx, 0);
 }
 
 static int64
@@ -6855,6 +7317,7 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      */
     if (has_entry && strcmp(entry_op, RAFT_OP_PARWAL) == 0 && entry_data_hex == NULL)
     {
+        rs_dq_flush();
         if (!data_entry_present_locally(ctx, entry_payload))
         {
             elog(LOG, "pg_raft: group %lld 数据条目 idx=%lld 没带字节、本节点流里也没有同一条，不收不 ack",
@@ -7010,6 +7473,14 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
             SpinLockRelease(&ctx->log->mutex);
             persist_log_entry_sql(ctx, entry_idx, entry_term, entry_op, entry_payload, false);
             SpinLockAcquire(&ctx->log->mutex);
+            /* 行由本事务重写过：批量路径下改记本事务（原写入者可能已中止） */
+            if (TransactionIdIsValid(raft_append_pxid))
+            {
+                RaftLogEntry *x = log_slot(ctx, entry_idx);
+
+                if (x->index == entry_idx)
+                    x->pxid = raft_append_pxid;
+            }
         }
         else
         {
@@ -7039,7 +7510,10 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      * 旧字节当成"已落盘"而跳过，物理回放就会重放被截断的内容。
      */
     if (conflict_plsn > 0)
+    {
+        rs_dq_flush();
         data_group_truncate_parwal(ctx, conflict_plsn - 1);
+    }
 
     /*
      * 数据组：**先把字节落盘 fsync，再 ack**。落盘失败就不 ack，leader 便无法
@@ -7073,13 +7547,19 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
                 }
                 SpinLockRelease(&ctx->log->mutex);
                 if (undone)
+                {
+                    if (raft_batch_active && raft_batch_nrows > 0 &&
+                        raft_batch_row_idx[raft_batch_nrows - 1] == entry_idx)
+                        raft_batch_nrows--;     /* 攒着还没写的那一行也撤掉 */
                     delete_log_entry_sql(ctx, entry_idx);
+                }
             }
             return true;
         }
     }
 
-    persist_hard_state_unlocked(ctx);
+    if (!raft_batch_active)
+        persist_hard_state_unlocked(ctx);
 
     /*
      * P7-N41：合并心跳里不标 committed。这一列只是重启恢复的提示（权威在 hardstate），
@@ -7087,12 +7567,12 @@ handle_append_entries(RaftGroupCtx *ctx, int64 in_term, int leader_id,
      * 里排在后面的组全被它挡住，对端超时改选（演示二灌数据时实测两组因此换主、整笔提交失败）。
      * 标记交给带条目的 AppendEntries / propose 路径去做。
      */
-    if (commit_to_mark > 0 && !raft_in_hb_multi)
+    if (commit_to_mark > 0 && !raft_in_hb_multi && !raft_batch_active)
         mark_log_committed_sql(ctx, commit_to_mark);
 
     *success = 1;
     /* P7-N41：合并心跳里数据组不在这里 apply（同理撞行锁）；topology monitor 周期性 apply_all_data 会做 */
-    if (!raft_in_hb_multi || ctx->group_id == RAFT_CONTROL_GROUP)
+    if ((!raft_in_hb_multi || ctx->group_id == RAFT_CONTROL_GROUP) && !raft_batch_active)
         group_apply_pending(ctx);
     return true;
 }
@@ -7151,10 +7631,21 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
         entry_data_hex[len * 2] = '\0';
     }
 
-    (void) handle_append_entries(&ctx, in_term, leader_id, prev_idx, prev_term,
-                                 leader_commit, entry_idx, entry_term,
-                                 entry_op, entry_payload, entry_data_hex,
-                                 &out_term, &success);
+    /* 带条目时记下本事务（见 rm_wait_predecessor）；纯心跳不必分配 xid */
+    if (entry_op != NULL && ctx.group_id != RAFT_CONTROL_GROUP)
+        raft_append_pxid = GetTopTransactionId();
+    PG_TRY();
+    {
+        (void) handle_append_entries(&ctx, in_term, leader_id, prev_idx, prev_term,
+                                     leader_commit, entry_idx, entry_term,
+                                     entry_op, entry_payload, entry_data_hex,
+                                     &out_term, &success);
+    }
+    PG_FINALLY();
+    {
+        raft_append_pxid = InvalidTransactionId;
+    }
+    PG_END_TRY();
 
     if (entry_op)
         pfree(entry_op);
@@ -7172,6 +7663,100 @@ pg_raft_append_entries(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pg_raft_append_entries_batch);
 
 /*
+ * 等同组前一批在本节点落定：prev 已进环，（数据组）本地流已落到 first_plsn-1，且写 prev 那条
+ * raft_log 行的事务已经结束。至多 500 ms；等不到返回 false（调用方拒收）。
+ *
+ * 最后一条是 2026-10-16 审查补的：前一批（另一条连接、另一个会话）的 raft_log 行还没提交时，
+ * 本批若照常处理并 ack，leader 会按本批的 last 推进 match_index —— 那等于替前一批也 ack 了；
+ * 本节点此刻崩溃，前一批的行随未提交事务消失，日志出现空洞，而 leader 已据此计过多数派。
+ * 所以等它的事务结束：提交了 ⇒ 前缀持久；中止了 ⇒ 让本事务按环把那一段补写回去（随本事务
+ * 提交才持久，ack 在提交之后）。
+ */
+static bool
+rm_wait_predecessor(RaftGroupCtx *ctx, int64 prev_idx, int64 first_plsn, bool may_wait)
+{
+    TimestampTz start = 0;
+
+    restore_hard_state_if_needed(ctx);
+    restore_persistent_log_if_needed(ctx);
+    for (;;)
+    {
+        int64           last;
+        TransactionId   pxid = InvalidTransactionId;
+        bool            ring_ok;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        last = ctx->log->last_log_index;
+        if (last >= prev_idx && prev_idx > 0)
+        {
+            RaftLogEntry *pe = log_slot(ctx, prev_idx);
+
+            if (pe->index == prev_idx)
+                pxid = pe->pxid;
+        }
+        SpinLockRelease(&ctx->log->mutex);
+        ring_ok = (last >= prev_idx &&
+                   (first_plsn <= 1 || data_local_flush_plsn(ctx) >= first_plsn - 1));
+        if (ring_ok)
+        {
+            if (!TransactionIdIsNormal(pxid) ||
+                TransactionIdEquals(pxid, GetTopTransactionIdIfAny()))
+                return true;
+            /*
+             * 早于 clog 截断点的 xid 查不了状态（会 ERROR）。那么老的写入者必然早已结束；
+             * 若是中止，logtrack 的 abort 回调早就立过补写标记。
+             */
+            if (TransactionIdPrecedes(pxid, ShmemVariableCache->oldestClogXid))
+                return true;
+            if (!TransactionIdIsInProgress(pxid))
+            {
+                if (TransactionIdDidCommit(pxid))
+                {
+                    /* 已提交：清掉，免得这条在环里一直挂着 xid 直到 clog 被截 */
+                    SpinLockAcquire(&ctx->log->mutex);
+                    {
+                        RaftLogEntry *pe = log_slot(ctx, prev_idx);
+
+                        if (pe->index == prev_idx && TransactionIdEquals(pe->pxid, pxid))
+                            pe->pxid = InvalidTransactionId;
+                    }
+                    SpinLockRelease(&ctx->log->mutex);
+                    return true;
+                }
+
+                /*
+                 * 前一批的事务中止了：它写的 raft_log 行随之消失，环里的条目还在。让本事务
+                 * 按环把这一段补写回去（P7-N46 的补写机制，persist 时触发），本事务提交即
+                 * 持久 —— 与 abort 回调立的标记相同，只是不等那个回调（它在事务退出 ProcArray
+                 * 之后才跑）。补写区间取环能覆盖的最大范围，多写的行是幂等的 upsert。
+                 */
+                SpinLockAcquire(&ctx->log->mutex);
+                {
+                    int64         from = Max(prev_idx - RAFT_LOG_CAPACITY + 1, 1);
+                    RaftLogEntry *pe = log_slot(ctx, prev_idx);
+
+                    if (ctx->g->repersist_from == 0 || from < ctx->g->repersist_from)
+                        ctx->g->repersist_from = from;
+                    if (pe->index == prev_idx && TransactionIdEquals(pe->pxid, pxid))
+                        pe->pxid = InvalidTransactionId;
+                }
+                SpinLockRelease(&ctx->log->mutex);
+                return true;
+            }
+        }
+        /* 复制流按序到达：前驱不在就是真缺（前一批被拒 / 没提交），不等，立即拒收让 leader 回退 */
+        if (!may_wait)
+            return false;
+        if (start == 0)
+            start = GetCurrentTimestamp();
+        else if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 500))
+            return false;       /* 等不到：拒收，leader 退回从缺口补发 */
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(1000L);
+    }
+}
+
+/*
  * pg_raft_append_entries_batch(term, leader_id, prev_idx, prev_term, leader_commit, group_id,
  *                              idx bigint[], entry_term bigint, payloads text[], data_hex text[]) → "term ok"
  *
@@ -7181,6 +7766,193 @@ PG_FUNCTION_INFO_V1(pg_raft_append_entries_batch);
  * 任何一条被拒（prev 不符、环满、落盘失败）⇒ ok=0；已落下的前缀无害（下次重传按"已持有"处理）。
  * fsync 失败 ⇒ ERROR ⇒ RPC 失败 ⇒ 不 ack。
  */
+/*
+ * 一组一批的收条目核心（2026-10-17 从 pg_raft_append_entries_batch 抽出，复制流也用它）。
+ * own_defer = true 时自己开 / 收"批内延迟 fsync"（单组接口）；复制流在外层对整条消息只开收一次。
+ * 返回是否整批收下；*out_term 填本节点任期。
+ */
+/* 2026-10-17 复制流副本端分段计时（微秒；pg_raft_stream_apply 每条消息清零、慢批时打印） */
+static int64 rs_t_hae = 0, rs_t_dq = 0, rs_t_rows = 0, rs_t_tail = 0, rs_t_pre = 0;
+static int64 rs_t_hs = 0, rs_t_mark = 0, rs_t_apply = 0;
+
+static bool
+rs_batch_core(RaftGroupCtx *ctx, int64 in_term, int leader_id, int64 prev_idx, int64 prev_term,
+              int64 leader_commit, int n, const int64 *idx, int64 entry_term,
+              char **pl, char **hx, int64 *out_term_p, bool own_defer, int *n_acc)
+{
+    int          k = 0;
+    int64        out_term = 0;
+    int          success = 0;
+    bool         deferred = false;
+    bool         spi_owned;
+    TimestampTz  t_start = GetCurrentTimestamp();
+
+    /*
+     * 2026-10-16 流水线：同组下一批可能比上一批先到本节点（不同连接、不同会话）。prev 还没进环、
+     * 或前一批的字节 / raft_log 行还没落定时短等它。只在本任期 leader 发来时等。
+     * （复制流按序到达，前一批要么已提交、要么就在本事务里，这里直接通过。）
+     */
+    if (prev_idx > 0 && n > 0)
+    {
+        int64       first_plsn = entry_partition_lsn(pl[0]);
+        int64       cur_term;
+
+        SpinLockAcquire(&ctx->cons->mutex);
+        cur_term = ctx->cons->current_term;
+        SpinLockRelease(&ctx->cons->mutex);
+        if (n_acc != NULL)
+            *n_acc = 0;
+        if (in_term >= cur_term && !rm_wait_predecessor(ctx, prev_idx, first_plsn, own_defer))
+        {
+            *out_term_p = cur_term;
+            return false;
+        }
+    }
+
+    /*
+     * 环里放不下这一批：先把已提交的 apply 掉腾地方（2026-10-17）。批内 apply 推迟到批尾之后，
+     * follower 的 last_applied 只在"本批至少收下一条"时才前移；环一满就再也收不下、也就再也
+     * 不 apply —— 实测流水线下数据组整组卡死（follower last_log - last_applied = 1023）。
+     */
+    {
+        int64 room;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        room = RAFT_LOG_CAPACITY - 1 - (ctx->log->last_log_index - ctx->log->last_applied);
+        SpinLockRelease(&ctx->log->mutex);
+        if (room < n)
+            group_apply_pending(ctx);
+    }
+    rs_t_pre += GetCurrentTimestamp() - t_start;
+
+    /* 本批进环（或重写了行）的条目记下本事务，同组后一批据此等我们提交（见 rm_wait_predecessor） */
+    raft_append_pxid = GetTopTransactionId();
+    raft_batch_active = true;
+    raft_batch_lp_gid = 0;
+    raft_batch_lp_oid = 0;
+    raft_batch_flush = -1;
+    raft_batch_nrows = 0;
+    PG_TRY();
+    {
+        if (own_defer && raft_persist_spi_begin(&spi_owned))
+        {
+            deferred = (SPI_execute("SELECT partdist.partwal_defer_sync_begin()", false, 1) == SPI_OK_SELECT);
+            raft_persist_spi_end(spi_owned);
+        }
+        if (!own_defer)
+            (void) rs_dq_begin();
+
+        for (k = 0; k < n; k++)
+        {
+            /*
+             * 2026-10-17 复制流：批里条目多、环剩的地方不够时，按已知提交点就地 apply 腾地方
+             * （攒着的 raft_log 行是拷贝，不受环槽位复用影响）。
+             */
+            if (!own_defer)
+            {
+                int64 room;
+
+                SpinLockAcquire(&ctx->log->mutex);
+                room = RAFT_LOG_CAPACITY - 1 - (ctx->log->last_log_index - ctx->log->last_applied);
+                SpinLockRelease(&ctx->log->mutex);
+                if (room <= 0)
+                {
+                    rs_dq_flush();
+                    group_apply_pending(ctx);
+                }
+            }
+            success = 0;
+            {
+                TimestampTz th = GetCurrentTimestamp();
+
+                (void) handle_append_entries(ctx, in_term, leader_id, prev_idx, prev_term,
+                                             leader_commit, idx[k], entry_term,
+                                             RAFT_OP_PARWAL, pl[k], hx[k], &out_term, &success);
+                rs_t_hae += GetCurrentTimestamp() - th;
+            }
+            if (!success)
+                break;
+            prev_idx = idx[k];
+            prev_term = entry_term;
+        }
+
+        /* 批尾：攒下的字节按组一次落盘；raft_log 行一条多行 INSERT，hardstate / 标 committed / apply 各一次 */
+        {
+            TimestampTz t1 = GetCurrentTimestamp();
+
+            rs_dq_flush();
+            rs_t_dq += GetCurrentTimestamp() - t1;
+        }
+        rs_dq_end();
+        raft_batch_active = false;
+        if (raft_batch_nrows > 0)
+        {
+            TimestampTz t1 = GetCurrentTimestamp();
+
+            persist_log_entries_sql_batch(ctx, raft_batch_nrows, raft_batch_row_idx,
+                                          raft_batch_row_term, RAFT_OP_PARWAL,
+                                          raft_batch_row_pl, false);
+            raft_batch_nrows = 0;
+            rs_t_rows += GetCurrentTimestamp() - t1;
+        }
+        /* 一条都没收下（环满 / 拒收）也照样 apply，否则环满时永远腾不出地方 */
+        {
+            int64 commit_now;
+            TimestampTz t1 = GetCurrentTimestamp();
+
+            TimestampTz t2;
+
+            if (k > 0)
+                persist_hard_state_unlocked(ctx);
+            t2 = GetCurrentTimestamp();
+            rs_t_hs += t2 - t1;
+            SpinLockAcquire(&ctx->log->mutex);
+            commit_now = ctx->log->commit_index;
+            SpinLockRelease(&ctx->log->mutex);
+            /*
+             * 复制流（!own_defer）下不逐行标 committed：这一列只是重启时抬 commit_index 的提示
+             * （Raft 里 commitIndex 本是易失量，重启后由 leader 心跳重新推进，hardstate 里也有近似值），
+             * 而这条 UPDATE 要先给每行加锁再改、每步都过分区 WAL 的插入钩子，实测单批 1–3 s。
+             */
+            if (k > 0 && commit_now > 0 && own_defer)
+                mark_log_committed_sql(ctx, commit_now);
+            rs_t_mark += GetCurrentTimestamp() - t2;
+            t2 = GetCurrentTimestamp();
+            group_apply_pending(ctx);
+            rs_t_apply += GetCurrentTimestamp() - t2;
+            rs_t_tail += GetCurrentTimestamp() - t1;
+        }
+    }
+    PG_FINALLY();
+    {
+        raft_append_pxid = InvalidTransactionId;
+        raft_batch_active = false;
+        raft_batch_nrows = 0;
+        rs_dq_end();
+    }
+    PG_END_TRY();
+
+    /* 全批一次 fsync；失败即 ERROR（不 ack） */
+    if (deferred && raft_persist_spi_begin(&spi_owned))
+    {
+        if (SPI_execute("SELECT partdist.partwal_defer_sync_end()", false, 1) != SPI_OK_SELECT)
+            ereport(ERROR, (errmsg("pg_raft: 批量落盘 fsync 失败")));
+        raft_persist_spi_end(spi_owned);
+    }
+
+    {
+        long ms = (long) ((GetCurrentTimestamp() - t_start) / 1000);
+
+        if (ms > 2000)
+            elog(LOG, "pg_raft: group %lld 批量收 %d 条用了 %ld ms（落下 %d 条）",
+                 (long long) ctx->group_id, n, ms, k);
+    }
+    *out_term_p = out_term;
+    if (n_acc != NULL)
+        *n_acc = k;
+    return (k == n && success);
+}
+
 Datum
 pg_raft_append_entries_batch(PG_FUNCTION_ARGS)
 {
@@ -7198,12 +7970,12 @@ pg_raft_append_entries_batch(PG_FUNCTION_ARGS)
     bool        *n_idx, *n_pl, *n_hex;
     int          n, n2, n3, k;
     int64        out_term = 0;
-    int          success = 0;
-    bool         deferred = false;
-    bool         spi_owned;
+    bool         ok;
     char         out[64];
     RaftGroupCtx ctx;
-    TimestampTz  t_start = GetCurrentTimestamp();
+    int64       *idx;
+    char       **pl;
+    char       **hx;
 
     if (RaftGroups == NULL || !pg_raft_raft_enabled || group_id <= 0)
         PG_RETURN_TEXT_P(cstring_to_text("0 0"));
@@ -7218,54 +7990,206 @@ pg_raft_append_entries_batch(PG_FUNCTION_ARGS)
     if (n <= 0 || n != n2 || n != n3)
         ereport(ERROR, (errmsg("pg_raft: 批量 AppendEntries 数组长度不一致（%d/%d/%d）", n, n2, n3)));
 
+    idx = (int64 *) palloc(sizeof(int64) * n);
+    pl = (char **) palloc(sizeof(char *) * n);
+    hx = (char **) palloc(sizeof(char *) * n);
+    for (k = 0; k < n; k++)
+    {
+        if (n_idx[k] || n_pl[k] || n_hex[k])
+            break;
+        idx[k] = DatumGetInt64(d_idx[k]);
+        pl[k] = TextDatumGetCString(d_pl[k]);
+        hx[k] = TextDatumGetCString(d_hex[k]);
+    }
+    n = k;
+
+    ok = rs_batch_core(&ctx, in_term, leader_id, prev_idx, prev_term, leader_commit,
+                       n, idx, entry_term, pl, hx, &out_term, true, NULL);
+    snprintf(out, sizeof(out), "%lld %d", (long long) out_term, (ok && n > 0) ? 1 : 0);
+    PG_RETURN_TEXT_P(cstring_to_text(out));
+}
+
+/*
+ * pg_raft_stream_apply(msg bytea) → text —— 复制流的接收端（2026-10-17）。
+ *
+ * 一条消息装着 leader 本轮要发给本节点的全部组的条目（二进制，见 rs_build_batch）：
+ *   int32 magic, int32 leader_id, int32 ngroups,
+ *   每组：int64 gid, term, prev_idx, prev_term, leader_commit, entry_term; int32 n;
+ *        每条：int64 idx; int32 len + payload; int32 len + 原始记录字节
+ * 逐组走 rs_batch_core（与单组批量接口同一套语义），整条消息只开收一次"批内延迟 fsync"：
+ * 全部组的字节写完一次 fsync，随本语句的事务一次提交 —— 回包在提交之后。
+ * 复制流按序到达（同一连接、同一会话），不存在"后一批先到"。
+ * 返回每组一段 "gid term ok last_log_index acc;"（acc = 本批收下的前缀的最后一条 index，0 = 一条没收）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_stream_apply);
+
+Datum
+pg_raft_stream_apply(PG_FUNCTION_ARGS)
+{
+    bytea          *raw = PG_GETARG_BYTEA_PP(0);
+    StringInfoData  msg;
+    StringInfoData  out;
+    int             magic, leader_id, ngroups, gi;
+    bool            spi_owned;
+    bool            deferred = false;
+    TimestampTz     t0 = GetCurrentTimestamp();
+    TimestampTz     t_sync = 0;
+    int             nent = 0;
+
+    rs_t_hae = rs_t_dq = rs_t_rows = rs_t_tail = rs_t_pre = 0;
+    rs_t_hs = rs_t_mark = rs_t_apply = 0;
+
+    initStringInfo(&out);
+    if (RaftGroups == NULL || !pg_raft_raft_enabled)
+        PG_RETURN_TEXT_P(cstring_to_text(""));
+    parse_peers();
+
+    msg.data = VARDATA_ANY(raw);
+    msg.len = VARSIZE_ANY_EXHDR(raw);
+    msg.maxlen = msg.len;
+    msg.cursor = 0;
+    magic = pq_getmsgint(&msg, 4);
+    if (magic != RS_MSG_MAGIC)
+        ereport(ERROR, (errmsg("pg_raft: 复制流消息格式不认识（magic %x）", magic)));
+    leader_id = pq_getmsgint(&msg, 4);
+    ngroups = pq_getmsgint(&msg, 4);
+
+    /*
+     * 同一 leader 只许一条复制流会话在干活：leader 一批超时就断开重连，而本节点上旧会话还在跑
+     * （要等到回结果时才发现客户端没了），它持着的行会把新会话卡住、一路连锁。新会话第一批到来时
+     * 把旧会话终止（其未提交的部分随之回滚；环里留下的条目由前驱检查按"中止"补写，见 rm_wait_predecessor）。
+     */
+    {
+        int     slot_i = (leader_id & 63);
+        pid_t   oldpid;
+
+        SpinLockAcquire(&RaftGroups->mutex);
+        oldpid = RaftGroups->stream_in_pid[slot_i];
+        RaftGroups->stream_in_pid[slot_i] = MyProcPid;
+        SpinLockRelease(&RaftGroups->mutex);
+        if (oldpid != 0 && oldpid != MyProcPid && BackendPidGetProc(oldpid) != NULL)
+        {
+            int waited = 0;
+
+            elog(LOG, "pg_raft: 来自节点 %d 的新复制流会话接手，终止旧会话 %d", leader_id, (int) oldpid);
+            (void) kill(oldpid, SIGTERM);
+            while (BackendPidGetProc(oldpid) != NULL && waited < 5000)
+            {
+                CHECK_FOR_INTERRUPTS();
+                pg_usleep(10000L);
+                waited += 10;
+            }
+        }
+    }
+
     if (raft_persist_spi_begin(&spi_owned))
     {
         deferred = (SPI_execute("SELECT partdist.partwal_defer_sync_begin()", false, 1) == SPI_OK_SELECT);
         raft_persist_spi_end(spi_owned);
     }
 
-    for (k = 0; k < n; k++)
+    for (gi = 0; gi < ngroups; gi++)
     {
-        int64  eidx;
-        char  *pl;
-        char  *hx;
+        int64        gid = pq_getmsgint64(&msg);
+        int64        term = pq_getmsgint64(&msg);
+        int64        prev_idx = pq_getmsgint64(&msg);
+        int64        prev_term = pq_getmsgint64(&msg);
+        int64        leader_commit = pq_getmsgint64(&msg);
+        int64        entry_term = pq_getmsgint64(&msg);
+        int          n = pq_getmsgint(&msg, 4);
+        int64       *idx = (int64 *) palloc(sizeof(int64) * Max(n, 1));
+        char       **pl = (char **) palloc(sizeof(char *) * Max(n, 1));
+        char       **hx = (char **) palloc(sizeof(char *) * Max(n, 1));
+        int          k;
+        RaftGroupCtx ctx;
+        int64        out_term = 0;
+        int64        last = -1;
+        bool         ok = false;
+        int          nacc = 0;
 
-        if (n_idx[k] || n_pl[k] || n_hex[k])
-            break;
-        eidx = DatumGetInt64(d_idx[k]);
-        pl = TextDatumGetCString(d_pl[k]);
-        hx = TextDatumGetCString(d_hex[k]);
-        success = 0;
-        (void) handle_append_entries(&ctx, in_term, leader_id, prev_idx, prev_term,
-                                     leader_commit, eidx, entry_term,
-                                     RAFT_OP_PARWAL, pl, hx, &out_term, &success);
+        nent += n;
+
+        for (k = 0; k < n; k++)
+        {
+            int         plen, dlen;
+            const char *pp, *dp;
+
+            idx[k] = pq_getmsgint64(&msg);
+            plen = pq_getmsgint(&msg, 4);
+            pp = pq_getmsgbytes(&msg, plen);
+            pl[k] = pnstrdup(pp, plen);
+            dlen = pq_getmsgint(&msg, 4);
+            dp = pq_getmsgbytes(&msg, dlen);
+            hx[k] = (char *) palloc((Size) dlen * 2 + 1);
+            (void) hex_encode(dp, dlen, hx[k]);
+            hx[k][(Size) dlen * 2] = '\0';
+        }
+        if (gid > 0 && n > 0 && raft_group_ensure(gid, NULL, 0, &ctx, true))
+        {
+            (void) group_resolve_membership(&ctx);
+            ok = rs_batch_core(&ctx, term, leader_id, prev_idx, prev_term, leader_commit,
+                               n, idx, entry_term, pl, hx, &out_term, false, &nacc);
+            SpinLockAcquire(&ctx.log->mutex);
+            last = ctx.log->last_log_index;
+            SpinLockRelease(&ctx.log->mutex);
+        }
+        appendStringInfo(&out, "%lld %lld %d %lld %lld;", (long long) gid, (long long) out_term,
+                         ok ? 1 : 0, (long long) last,
+                         (long long) (nacc > 0 ? idx[nacc - 1] : 0));
+        for (k = 0; k < n; k++)
+        {
+            pfree(pl[k]);
+            pfree(hx[k]);
+        }
+        pfree(idx);
         pfree(pl);
         pfree(hx);
-        if (!success)
-            break;
-        prev_idx = eidx;
-        prev_term = entry_term;
     }
 
-    /* 全批一次 fsync；失败即 ERROR（不 ack） */
+    /* 全部组一次 fsync；失败即 ERROR（整条消息不 ack） */
+    t_sync = GetCurrentTimestamp();
     if (deferred && raft_persist_spi_begin(&spi_owned))
     {
         if (SPI_execute("SELECT partdist.partwal_defer_sync_end()", false, 1) != SPI_OK_SELECT)
-            ereport(ERROR, (errmsg("pg_raft: 批量落盘 fsync 失败")));
+            ereport(ERROR, (errmsg("pg_raft: 复制流批量落盘 fsync 失败")));
         raft_persist_spi_end(spi_owned);
     }
-
     {
-        long ms = (long) ((GetCurrentTimestamp() - t_start) / 1000);
+        TimestampTz now = GetCurrentTimestamp();
+        long ms = (long) ((now - t0) / 1000);
+        static TimestampTz st_at = 0;
+        static int64 st_n = 0, st_sum = 0, st_max = 0, st_ent = 0, st_sync = 0;
 
-        if (ms > 2000)
-            elog(LOG, "pg_raft: group %lld 批量收 %d 条用了 %ld ms（落下 %d 条）",
-                 (long long) group_id, n, ms, k);
+        st_n++;
+        st_sum += now - t0;
+        st_ent += nent;
+        st_sync += now - t_sync;
+        if (now - t0 > st_max)
+            st_max = now - t0;
+        if (st_at == 0)
+            st_at = now;
+        else if (TimestampDifferenceExceeds(st_at, now, 10000))
+        {
+            elog(LOG, "pg_raft: 复制流接收（来自节点 %d）10 s：%lld 批 %lld 条，均 %lld ms（其中 fsync 均 %lld ms），最大 %lld ms",
+                 leader_id, (long long) st_n, (long long) st_ent,
+                 (long long) (st_sum / st_n / 1000), (long long) (st_sync / st_n / 1000),
+                 (long long) (st_max / 1000));
+            st_at = now;
+            st_n = st_sum = st_max = st_ent = st_sync = 0;
+        }
+
+        if (ms > 1000)
+            elog(LOG, "pg_raft: 复制流一批（来自节点 %d，%d 组 %d 条，%d 字节）处理用了 %ld ms："
+                 "前置 %lld / 逐条收 %lld / 落字节 %lld / 写日志行 %lld / 提交点+apply %lld"
+                 "（hardstate %lld / 标记 %lld / apply %lld）/ fsync %lld ms",
+                 leader_id, ngroups, nent, msg.len, ms,
+                 (long long) rs_t_pre / 1000, (long long) rs_t_hae / 1000,
+                 (long long) rs_t_dq / 1000, (long long) rs_t_rows / 1000,
+                 (long long) rs_t_tail / 1000, (long long) rs_t_hs / 1000,
+                 (long long) rs_t_mark / 1000, (long long) rs_t_apply / 1000,
+                 (long long) (now - t_sync) / 1000);
     }
-
-    snprintf(out, sizeof(out), "%lld %d", (long long) out_term,
-             (k == n && success) ? 1 : 0);
-    PG_RETURN_TEXT_P(cstring_to_text(out));
+    PG_RETURN_TEXT_P(cstring_to_text(out.data));
 }
 PG_FUNCTION_INFO_V1(pg_raft_heartbeat_multi);
 
@@ -7768,6 +8692,8 @@ pg_raft_group_drop(PG_FUNCTION_ARGS)
      * 连同 HardState 文件一起删除：否则 group_id 被回收重建时会继承旧 term，
      * 新组一上来就带着历史任期。
      */
+    hard_state_hint_path(&ctx, path, sizeof(path));
+    (void) unlink(path);
     hard_state_path(&ctx, path, sizeof(path));
     if (unlink(path) != 0 && errno != ENOENT)
         elog(WARNING, "pg_raft: 删除 hardstate 文件 \"%s\" 失败: %m", path);
@@ -8477,6 +9403,8 @@ gc_replicate_batch(RaftGroupCtx *ctx, int64 term, int64 first, int n,
             ctx->log->peer_match_index[j] = 0;
         }
         ctx->log->repl_inited = true;
+        ctx->log->leader_durable_index = ctx->log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+        ctx->log->leader_self_hole = 0;
     }
     SpinLockRelease(&ctx->log->mutex);
 
@@ -8997,6 +9925,7 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
         RaftGroupCtx    ctx;
         int             state;
         int             round;
+        bool            hot;
 
         if (!g->in_use)
             continue;
@@ -9015,6 +9944,38 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
         if (!group_membership_known(&ctx))
             continue;
 
+        /*
+         * 2026-10-17：复制流管着的数据组整组不碰 —— 这里会抢认领位（挡住提交者追加）、按副本自报的
+         * last 下调 next_index（打乱复制流的乐观推进）、再用单条 RPC 补发（副本上与复制流会话抢同一组
+         * 的行锁，实测互相卡住 400 s）。落后（环内或环外）一律由复制流按序补。
+         */
+        if (rs_stream_data(&ctx))
+            continue;
+
+        /*
+         * 2026-10-16：有提交流量的组（提交路径最近 3 s 内跑过一轮）由提交路径自己补发落后
+         * 副本（窗口内按 next_index 补缺口），这里只管它补不到的 —— 落后超出窗口的成员。
+         * 原来不分冷热：慢副本按设计总落后几批（多数派只等快的那个），本通道每 5 s 把每个
+         * 主组的认领位拿去做同步 RPC 追平，提交路径整组排队（三副本实测 25 tps）。
+         */
+        hot = (g->last_rm_round != 0 &&
+               !TimestampDifferenceExceeds(g->last_rm_round, GetCurrentTimestamp(), 3000));
+        if (hot)
+        {
+            bool far_behind = false;
+            int  p1;
+
+            SpinLockAcquire(&ctx.log->mutex);
+            for (p1 = 0; p1 < n_peers; p1++)
+                if (peer_in_group(&ctx, p1) &&
+                    ctx.log->peer_next_index[p1] + RAFT_LOG_CAPACITY / 2 <= ctx.log->last_log_index)
+                    far_behind = true;
+            SpinLockRelease(&ctx.log->mutex);
+            if (!far_behind)
+                continue;
+        }
+
+        raft_claim_purpose = RAFT_CLAIM_CATCHUP;
         if (!replicate_try_claim(&ctx))
             continue;
 
@@ -9041,8 +10002,8 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
              */
             group_apply_pending(&ctx);
 
-            /* 先按对端自报的 last_log_index 给 next_index 一个起点（只降不升） */
-            for (p0 = 0; p0 < n_peers; p0++)
+            /* 先按对端自报的 last_log_index 给 next_index 一个起点（只降不升；热组不问，见上） */
+            for (p0 = 0; p0 < n_peers && !hot; p0++)
             {
                 int64 hint;
                 int64 cur_next;
@@ -9067,7 +10028,8 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
                 SpinLockRelease(&ctx.log->mutex);
             }
 
-            for (round = 0; round < RAFT_CATCHUP_MAX_ROUNDS; round++)
+            /* 热组：提交路径在排队等这把认领位，至多两轮就放手（落后窗口外的成员慢慢追） */
+            for (round = 0; round < (hot ? 2 : RAFT_CATCHUP_MAX_ROUNDS); round++)
             {
                 int64 last_idx;
                 bool  any_behind = false;
@@ -9096,6 +10058,15 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
                     SpinLockRelease(&ctx.log->mutex);
 
                     if (before >= last_idx)
+                        continue;
+                    /* 热组：窗口内的落后由提交路径补，这里不碰 */
+                    if (hot && next_before + RAFT_LOG_CAPACITY / 2 > last_idx)
+                        continue;
+                    /*
+                     * 复制流管着的数据组：落后（环内或环外）一律由复制流按序补 —— 两条连接同时补
+                     * 同一组，副本上两个会话会抢同一组的行锁，实测把复制流单批拖到十几秒。
+                     */
+                    if (rs_stream_data(&ctx))
                         continue;
 
                     any_behind = true;
@@ -9128,8 +10099,9 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
                     break;
             }
 
-            /* 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派 */
-            leader_replicate_and_commit(&ctx);
+            /* 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派（热组由提交路径推进） */
+            if (!hot)
+                leader_replicate_and_commit(&ctx);
             group_apply_pending(&ctx);
         }
         PG_FINALLY();
@@ -9281,7 +10253,7 @@ pg_raft_data_group_role(int64 group_id, bool *is_leader, int64 *term,
  * 复制路径上会嵌套（基线/交接广播里再触发一次复制），事务 ERROR 后也可能留下
  * "shmem 记着我、本后端却已经不在那段代码里"的残留。两种情形都不该等自己。
  */
-#define RAFT_MAX_SELF_CLAIMS 8
+#define RAFT_MAX_SELF_CLAIMS 64    /* 2026-10-16：多组一轮复制一次要同时持有一笔事务触达的全部组 */
 static struct { int64 gid; int depth; } raft_self_claims[RAFT_MAX_SELF_CLAIMS];
 
 static int *
@@ -9308,6 +10280,9 @@ static void
 replicate_claim(RaftGroupCtx *ctx)
 {
     long waited_us = 0;
+    int  last_holder = 0;
+    int  holder_purpose = 0;
+    TimestampTz holder_since = 0;
     int  timeout_ms = raft_in_control_apply ? RAFT_REPLICATE_CLAIM_APPLY_MS
                                             : RAFT_REPLICATE_CLAIM_TIMEOUT_MS;
     int *depth = self_claim_depth(ctx->group_id, false);
@@ -9323,16 +10298,22 @@ replicate_claim(RaftGroupCtx *ctx)
         bool got = false;
         int  holder = 0;
 
+        TimestampTz now_ts = GetCurrentTimestamp();
+
         SpinLockAcquire(&RaftGroups->mutex);
         if (!ctx->g->replicate_in_progress)
         {
             ctx->g->replicate_in_progress = true;
             ctx->g->replicate_pid = MyProcPid;
+            ctx->g->replicate_purpose = raft_claim_purpose;
+            ctx->g->replicate_since = now_ts;
             got = true;
         }
         else
         {
             holder = ctx->g->replicate_pid;
+            holder_purpose = ctx->g->replicate_purpose;
+            holder_since = ctx->g->replicate_since;
             if (holder == MyProcPid)
             {
                 /* shmem 记着我、本后端却没有在册深度 ⇒ 上一笔事务 ERROR 后的残留，收回继续用 */
@@ -9347,8 +10328,25 @@ replicate_claim(RaftGroupCtx *ctx)
             depth = self_claim_depth(ctx->group_id, true);
             if (depth != NULL)
                 *depth = 1;
+            if (waited_us >= 500000L)
+            {
+                static TimestampTz last_log = 0;
+
+                if (last_log == 0 ||
+                    TimestampDifferenceExceeds(last_log, GetCurrentTimestamp(), 2000))
+                {
+                    last_log = GetCurrentTimestamp();
+                    elog(LOG, "pg_raft: [claim] 组 %lld 等认领位 %ld ms（用途 %s）；最后看到的持有者 pid %d 用途 %s、已持有 %ld ms",
+                         (long long) ctx->group_id, waited_us / 1000,
+                         raft_claim_purpose_name[raft_claim_purpose],
+                         last_holder, raft_claim_purpose_name[holder_purpose],
+                         holder_since ? (long) ((GetCurrentTimestamp() - holder_since) / 1000) : -1L);
+                }
+            }
             return;
         }
+        if (holder != 0)
+            last_holder = holder;
 
         /* 持有者还活着吗？（出锁后做：BackendPidGetProc 会取 ProcArrayLock） */
         if (holder != 0 && holder != MyProcPid &&
@@ -9406,14 +10404,44 @@ replicate_try_claim(RaftGroupCtx *ctx)
         return true;
     }
 
-    SpinLockAcquire(&RaftGroups->mutex);
-    if (!ctx->g->replicate_in_progress || ctx->g->replicate_pid == MyProcPid)
     {
-        ctx->g->replicate_in_progress = true;
-        ctx->g->replicate_pid = MyProcPid;
-        got = true;
+        TimestampTz now = GetCurrentTimestamp();
+        int         holder = 0;
+
+        SpinLockAcquire(&RaftGroups->mutex);
+        if (!ctx->g->replicate_in_progress || ctx->g->replicate_pid == MyProcPid)
+        {
+            ctx->g->replicate_in_progress = true;
+            ctx->g->replicate_pid = MyProcPid;
+            ctx->g->replicate_purpose = raft_claim_purpose;
+            ctx->g->replicate_since = now;
+            got = true;
+        }
+        else
+            holder = ctx->g->replicate_pid;
+        SpinLockRelease(&RaftGroups->mutex);
+
+        /*
+         * 2026-10-17：持有者已经不在了（FATAL 退出不走 PG_FINALLY）就收回 —— 与阻塞版
+         * replicate_claim 同一判据。流水线提交路径只用这个非阻塞版，不收回的话死者留下的
+         * 认领位会让该组此后每笔提交都等满超时。
+         */
+        if (!got && holder != 0 && BackendPidGetProc(holder) == NULL)
+        {
+            SpinLockAcquire(&RaftGroups->mutex);
+            if (ctx->g->replicate_in_progress && ctx->g->replicate_pid == holder)
+            {
+                ctx->g->replicate_pid = MyProcPid;
+                ctx->g->replicate_purpose = raft_claim_purpose;
+                ctx->g->replicate_since = now;
+                got = true;
+            }
+            SpinLockRelease(&RaftGroups->mutex);
+            if (got)
+                elog(WARNING, "pg_raft: 组 %lld 的复制认领位由已消失的 backend %d 持有，已回收",
+                     (long long) ctx->group_id, holder);
+        }
     }
-    SpinLockRelease(&RaftGroups->mutex);
 
     if (got)
     {
@@ -9483,6 +10511,13 @@ replicate_group_upto(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
     {
         if (cur_plsn > ctx->g->last_data_plsn)
             ctx->g->last_data_plsn = cur_plsn;
+        return;
+    }
+
+    /* 2026-10-17 复制流：追加进环、交管理进程发送、等组提交点覆盖 */
+    if (rs_stream_active())
+    {
+        rs_replicate_claimed(ctx, cur_plsn, partition_id);
         return;
     }
 
@@ -9735,6 +10770,7 @@ pg_raft_partwal_replicate(Oid partition_id)
      * 但"写下去"发生在 flushed_upto 推进之前，所以到这里 cur 已经覆盖它们。
      * 因此"复制到 cur"是覆盖本事务的安全上界（DTX_2PC_DESIGN.md §9.1）。
      */
+    raft_claim_purpose = RAFT_CLAIM_COMMIT_ONE;
     replicate_claim(&ctx);
     in_txn_replication = true;
     PG_TRY();
@@ -9751,6 +10787,4375 @@ pg_raft_partwal_replicate(Oid partition_id)
         replicate_release(&ctx);
     }
     PG_END_TRY();
+}
+
+/* ================================================================== */
+/* 2026-10-16：多组一轮复制（多副本提交路径）                          */
+/* ================================================================== */
+
+/*
+ * 原路径（pg_raft_partwal_replicate，逐分区）：一笔事务触达 G 个分区组，就按顺序做 G 次
+ * "认领 → SPI 查组号 / 读记录 / 写 raft_log → 对每个副本一条 RPC → 等**全部**副本回 →
+ * 写 hardstate / 标 committed / apply → flush_replication 同步追平未回的副本"。延迟是
+ * G × 最慢副本的一轮，且最慢的副本（机械盘、同机还有别的节点）决定一切。
+ *
+ * 这里把一笔事务的全部组合成**一轮**：
+ *   · 按组号顺序认领（多组持有不会互相死锁）；SPI 合并成 4 次（查组 / 读记录 / 写日志行 /
+ *     标 committed），与组数无关；
+ *   · 发给每个副本节点的是**一条**多语句请求（各组一条 append_entries_batch，同一隐式事务，
+ *     对端一次 WAL 提交）—— RPC 数 = 副本节点数，与分区数无关；
+ *   · 各组拿到**多数派**即提交（RF=3 等 1 个副本，RF=5 等 2 个），没回的副本留作在途，
+ *     本后端下次用这条连接时再收尾并据此推进 match_index；
+ *   · 不再在提交路径里同步追平慢副本（flush_replication）。落后的副本在下一轮里按它的
+ *     next_index 补发缺口（窗口内、同任期），超出窗口交后台追平通道。
+ * 语义不变：多数派 ack ⇔ 多数派已持久化（对端整批 fsync + 事务提交后才回）；
+ * 凑不齐多数派的组按原规则丢弃未提交尾巴、本事务 ERROR 中止。
+ */
+#define RM_MAX_GROUPS   64
+#define RM_CONNS        2
+#define RM_CATCHUP_WIN  (RAFT_LOG_CAPACITY - 8)
+#define RM_STALE_MS     60000       /* 在途请求这么久没回：判失败、重连（对端卡死时别永远占着连接） */
+
+typedef struct RmPendGroup
+{
+    int64   gid;
+    int64   first;          /* 本次发给该对端的第一条 index */
+    int64   last;
+    int64   term;
+    uint64  gen;            /* 发出时该组的 trunc_gen：其后环尾被截过 ⇒ 这条回执作废 */
+    int     gslot;          /* 本轮 RmGroup 下标（-1 = 已不属于进行中的一轮） */
+} RmPendGroup;
+
+typedef struct RmConn
+{
+    PGconn     *conn;
+    bool        busy;           /* 有在途请求，结果未取完 */
+    bool        current;        /* 属于本后端正在进行的一轮 */
+    TimestampTz sent_at;        /* 在途请求的发出时刻 */
+    int         ngroups;
+    RmPendGroup groups[RM_MAX_GROUPS];
+    int         nres;
+    bool        any_error;
+    int64       rterm[RM_MAX_GROUPS];
+    int         rok[RM_MAX_GROUPS];
+} RmConn;
+
+static RmConn rm_conns[RAFT_MAX_PEERS][RM_CONNS];
+
+static void
+rm_conn_fail(RmConn *c, int slot)
+{
+    if (c->conn != NULL)
+        PQfinish(c->conn);
+    c->conn = NULL;
+    c->busy = false;
+    c->any_error = true;
+    peer_mark_result(&peers[slot], false);
+}
+
+/*
+ * 收一条在途请求的结果。block=false 只收已到的；返回 true = 已收完（或已判失败）。
+ * 多语句请求：每条语句一个结果，最后 NULL（ReadyForQuery，对端隐式事务已提交）。
+ */
+static bool
+rm_conn_poll(RmConn *c, int slot, bool block, TimestampTz deadline)
+{
+    if (!c->busy)
+        return true;
+    for (;;)
+    {
+        int             sock;
+        struct pollfd   pfd;
+        long            remain_ms;
+
+        if (!PQconsumeInput(c->conn))
+        {
+            rm_conn_fail(c, slot);
+            return true;
+        }
+        while (!PQisBusy(c->conn))
+        {
+            PGresult   *r = PQgetResult(c->conn);
+
+            if (r == NULL)
+            {
+                c->busy = false;
+                return true;
+            }
+            if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1 &&
+                c->nres < c->ngroups)
+            {
+                int64   rt = 0;
+                int     ok = 0;
+
+                if (!parse_resp2(PQgetvalue(r, 0, 0), &rt, &ok))
+                {
+                    ok = 0;
+                    c->any_error = true;
+                }
+                c->rterm[c->nres] = rt;
+                c->rok[c->nres] = ok;
+                c->nres++;
+            }
+            else
+            {
+                static TimestampTz last_warn = 0;
+
+                if (PQresultStatus(r) == PGRES_FATAL_ERROR &&
+                    (last_warn == 0 ||
+                     TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 10000)))
+                {
+                    last_warn = GetCurrentTimestamp();
+                    elog(WARNING, "pg_raft: 多组复制到节点 %d 出错：%s",
+                         peers[slot].node_id, PQresultErrorMessage(r));
+                }
+                c->any_error = true;
+            }
+            PQclear(r);
+        }
+        if (!block)
+            return false;
+        remain_ms = (long) ((deadline - GetCurrentTimestamp()) / 1000);
+        if (remain_ms <= 0)
+        {
+            static TimestampTz last_warn = 0;
+
+            if (last_warn == 0 ||
+                TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 10000))
+            {
+                last_warn = GetCurrentTimestamp();
+                elog(WARNING, "pg_raft: 多组复制到节点 %d 超时，按该成员未确认处理",
+                     peers[slot].node_id);
+            }
+            rm_conn_fail(c, slot);
+            return true;
+        }
+        sock = PQsocket(c->conn);
+        if (sock < 0)
+        {
+            rm_conn_fail(c, slot);
+            return true;
+        }
+        /* poll 而不是 select：后端开着大量文件时 libpq 套接字号可能超过 FD_SETSIZE */
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        (void) poll(&pfd, 1, (int) Min(remain_ms, 100));
+        CHECK_FOR_INTERRUPTS();
+    }
+}
+
+/*
+ * 已收完的请求：把各组的确认 / 拒绝落进共享的 match / next_index。
+ *
+ * 回执可能迟到很久（留作在途的请求由本后端下一次用这条连接时才收尾），期间本节点可能已经
+ * 丢了 leader、换了任期，环里同一 index 上也可能已是别的条目。所以只在"仍是发出时那个任期的
+ * leader、且 match 指向的环内条目正是那个任期的"时才采信 —— 否则这条确认对当前日志没有意义。
+ */
+static void
+rm_conn_apply(RmConn *c, int slot)
+{
+    int i;
+
+    for (i = 0; i < c->ngroups; i++)
+    {
+        RmPendGroup *pg = &c->groups[i];
+        RaftGroupCtx ctx;
+        bool         ok = (!c->any_error && i < c->nres && c->rok[i]);
+        int64        rt = (i < c->nres) ? c->rterm[i] : 0;
+        bool         same_term;
+
+        if (!raft_group_ctx(pg->gid, &ctx))
+            continue;
+        if (rt > pg->term)
+        {
+            step_down_if_higher(&ctx, rt);
+            continue;
+        }
+        SpinLockAcquire(&ctx.cons->mutex);
+        same_term = (ctx.cons->state == RAFT_LEADER && ctx.cons->current_term == pg->term);
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!same_term)
+            continue;
+
+        SpinLockAcquire(&ctx.log->mutex);
+        if (ok)
+        {
+            int64         m = Min(pg->last, ctx.log->last_log_index);
+            RaftLogEntry *le = (m > 0) ? log_slot(&ctx, m) : NULL;
+
+            /*
+             * 同任期里 leader 自己丢过尾巴（多数派不足）之后，同一 index 可能已换成别的条目
+             * （同任期的 CONFIG 等）：只看 term 分不出来，靠截断代数分。
+             */
+            if (le != NULL && le->index == m && le->term == pg->term &&
+                ctx.log->trunc_gen == pg->gen)
+            {
+                if (m > ctx.log->peer_match_index[slot])
+                    ctx.log->peer_match_index[slot] = m;
+                if (ctx.log->peer_next_index[slot] < m + 1)
+                    ctx.log->peer_next_index[slot] = m + 1;
+            }
+        }
+        else if (ctx.log->peer_next_index[slot] > pg->first)
+            ctx.log->peer_next_index[slot] = pg->first;     /* 下一轮从缺口补发 */
+        SpinLockRelease(&ctx.log->mutex);
+        peer_stamp(&ctx, slot, i < c->nres);
+    }
+    if (!c->any_error)
+        peer_mark_result(&peers[slot], true);
+    c->ngroups = 0;
+    c->nres = 0;
+    c->any_error = false;
+    c->current = false;
+}
+
+/*
+ * 取一条空闲的复制连接（顺手收掉已完成 / 超时的在途请求）。
+ * 全在途时：block=false 返回 NULL 并置 *all_busy；block=true 等最早发出的那条收完（或到
+ * deadline 判失败）再用它。连不上返回 NULL。
+ */
+static RmConn *
+rm_conn_get(int slot, bool block, TimestampTz deadline, bool *all_busy)
+{
+    int         k;
+    char        conninfo[512];
+    TimestampTz now = GetCurrentTimestamp();
+    RmConn     *c = NULL;
+
+    *all_busy = false;
+    for (k = 0; k < RM_CONNS; k++)
+    {
+        RmConn *x = &rm_conns[slot][k];
+
+        if (!x->busy)
+            continue;
+        if (rm_conn_poll(x, slot, false, 0))
+            rm_conn_apply(x, slot);
+        else if (TimestampDifferenceExceeds(x->sent_at, now, RM_STALE_MS))
+        {
+            elog(WARNING, "pg_raft: 多组复制到节点 %d 的在途请求 %d s 未回，判失败并重连",
+                 peers[slot].node_id, RM_STALE_MS / 1000);
+            rm_conn_fail(x, slot);
+            rm_conn_apply(x, slot);
+        }
+    }
+    for (k = 0; k < RM_CONNS && c == NULL; k++)
+        if (!rm_conns[slot][k].busy)
+            c = &rm_conns[slot][k];
+    if (c == NULL)
+    {
+        if (!block)
+        {
+            *all_busy = true;
+            return NULL;
+        }
+        c = &rm_conns[slot][0];
+        for (k = 1; k < RM_CONNS; k++)
+            if (rm_conns[slot][k].sent_at < c->sent_at)
+                c = &rm_conns[slot][k];
+        (void) rm_conn_poll(c, slot, true, deadline);       /* 收完，或判超时、断开 */
+        rm_conn_apply(c, slot);
+        if (c->conn == NULL)
+            return NULL;        /* 等到本轮截止都没回：本轮不再给它发（新请求也赶不上） */
+    }
+    if (c->ngroups > 0)
+        rm_conn_apply(c, slot);         /* 失败收尾留下的账 */
+    if (c->conn != NULL && PQstatus(c->conn) == CONNECTION_OK)
+        return c;
+    if (c->conn != NULL)
+        PQfinish(c->conn);
+    c->conn = NULL;
+    snprintf(conninfo, sizeof(conninfo),
+             "host=%s port=%d dbname=postgres user=postgres "
+             "connect_timeout=%d application_name=pg_raft_repl",
+             peers[slot].host, peers[slot].port, pg_raft_peer_connect_timeout_s);
+    c->conn = PQconnectdb(conninfo);
+    if (PQstatus(c->conn) != CONNECTION_OK)
+    {
+        PQfinish(c->conn);
+        c->conn = NULL;
+        peer_mark_result(&peers[slot], false);
+        return NULL;
+    }
+    return c;
+}
+
+typedef struct RmGroup
+{
+    Oid          part;              /* 本地分区 oid */
+    int64        gid;
+    int64        cur;               /* 已落盘上界（get_partition_flush_lsn） */
+    RaftGroupCtx ctx;
+    int          majority;
+    int64        done_plsn;         /* 本调用里已确认多数派持久的 plsn 上界（失主后不再推进共享游标） */
+    /* 本轮 */
+    bool         active;
+    int64        lo, hi;            /* 本轮新提的 plsn 区间 */
+    int64        read_lo;           /* 补发段读字节的起点（= lo 表示没有补发段） */
+    int64        cread_hi;          /* 补发段读字节的终点（read_lo..cread_hi，均 < lo） */
+    int64        send_upto;         /* 流水线：本轮要追加到的上界（≥ cur，认领后刷新） */
+    int64        term0;             /* 流水线：门禁时的任期；等待期间任期变了 / 失主 ⇒ 失败 */
+    bool         done;              /* 流水线：已在 term0 内确认覆盖 */
+    bool         resend;            /* 流水线：本轮只补发（没有新记录，落后成员按 match 重发） */
+    int64        seen_commit;       /* 流水线：上次看到的 commit_index（判"有没有进展"） */
+    TimestampTz  progress_at;       /* 流水线：commit_index 最近一次前移（或开始等）的时刻 */
+    int64        self_from;         /* 流水线：本轮 leader 自写 raft_log 行的起点（0 = 本轮没写） */
+    int64        catchup_from[RAFT_MAX_PEERS];  /* 0 = 不发；否则发给该对端的第一条 index */
+    int64        catchup_to[RAFT_MAX_PEERS];    /* 0 = 发到本轮 last；否则只补到这条（分段补发） */
+    int64        term;
+    int64        first, last;       /* 本轮新条目的 index 区间 */
+    int64        leader_commit;
+    int          nnew;
+    char       **desc;              /* 新条目描述符，按 plsn - lo 下标 */
+    char       **hex;               /* 新条目字节，按 plsn - lo 下标 */
+    int          nhex;
+    char       **chex;              /* 补发段字节，按 plsn - read_lo 下标（plsn < lo） */
+    int          nchex;
+    int          nsent;             /* 本轮发出了请求的副本数 */
+    int          acks;
+    bool         failed;
+    int64        fail_plsn;
+} RmGroup;
+
+static int
+rm_group_cmp(const void *a, const void *b)
+{
+    int64 x = ((const RmGroup *) a)->gid;
+    int64 y = ((const RmGroup *) b)->gid;
+
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/* 与 replicate_group_upto 相同：重启后运行期游标为 0 时从环内最后一条 OP_PARWAL 回推 */
+static int64
+rm_last_data_plsn(RaftGroupCtx *ctx)
+{
+    int64 last = ctx->g->last_data_plsn;
+
+    if (last == 0)
+    {
+        int64 p;
+
+        SpinLockAcquire(&ctx->log->mutex);
+        for (p = ctx->log->last_log_index; p > 0 &&
+             p > ctx->log->last_log_index - RAFT_LOG_CAPACITY; p--)
+        {
+            RaftLogEntry e;
+
+            if (log_get_entry_locked(ctx, p, &e) &&
+                strcmp(e.op_type, RAFT_OP_PARWAL) == 0)
+            {
+                last = entry_partition_lsn(e.payload);
+                break;
+            }
+        }
+        SpinLockRelease(&ctx->log->mutex);
+        if (last > 0)
+            ctx->g->last_data_plsn = last;
+    }
+    return last;
+}
+
+/*
+ * 落后副本 slot 的补发起点：next_index 落在本轮新条目之前、窗口内、中间全是本任期的
+ * OP_PARWAL 且 prev 可取证 ⇒ 返回 next_index，并把 *plsn 置为那条的 partition_lsn；
+ * 否则返回 0（交后台追平）。调用方持 log->mutex。
+ */
+static int64
+rm_catchup_start_locked(RaftGroupCtx *ctx, int slot, int64 first_new, int64 term,
+                        int64 *plsn)
+{
+    int64        nx = ctx->log->peer_next_index[slot];
+    int64        i;
+    RaftLogEntry e;
+
+    if (nx <= 0 || nx >= first_new)
+        return 0;
+    if (first_new - nx > RM_CATCHUP_WIN)
+        return 0;
+    if (nx - 1 > 0 && nx - 1 != ctx->log->base_index)
+    {
+        if (!log_get_entry_locked(ctx, nx - 1, &e))
+            return 0;
+    }
+    /* 环窗口可达上千条：锁下逐条只看槽位（不拷整条） */
+    for (i = nx; i < first_new; i++)
+    {
+        RaftLogEntry *x = log_slot(ctx, i);
+
+        if (x->index != i || x->term != term ||
+            strcmp(x->op_type, RAFT_OP_PARWAL) != 0)
+            return 0;
+        if (i == nx)
+            *plsn = entry_partition_lsn(x->payload);
+    }
+    return nx;
+}
+
+/*
+ * ⑧ 给副本 slot 发本轮各组的条目：一条多语句请求（各组一条 append_entries_batch，组号升序）。
+ * 返回 1 = 已发出；0 = 没有要发的 / 连不上 / 发送失败；-1 = 本后端到它的连接全在途
+ * （仅 block=false）。
+ */
+static int
+rm_send_slot(RmGroup *gs, int ng, int slot, bool block, TimestampTz deadline,
+             StringInfo sql)
+{
+    RmConn *c = NULL;
+    int     nreq = 0;
+    int     i;
+    int     q;
+
+    resetStringInfo(sql);
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int64    st;
+        int64    end;
+        int64    prev_idx, prev_term = 0;
+        int      n, j;
+        int64   *idx;
+        char   **pl;
+        char   **hx;
+        RaftLogEntry *ents;         /* 补发段条目在锁下拷出（锁下不许 palloc） */
+        bool     ok = true;
+
+        if (!g->active || !peer_in_group(&g->ctx, slot))
+            continue;
+        st = g->catchup_from[slot];
+        if (st <= 0 || st > g->first)
+            continue;           /* 落后太多：交后台追平 */
+        end = (g->catchup_to[slot] > 0) ? g->catchup_to[slot] : g->last;
+        if (end < st)
+            continue;           /* 只补发的一轮里本就同步的成员：没东西可发 */
+        if (c == NULL)
+        {
+            bool all_busy;
+
+            c = rm_conn_get(slot, block, deadline, &all_busy);
+            if (c == NULL)
+                return all_busy ? -1 : 0;
+            c->ngroups = 0;
+            c->nres = 0;
+            c->any_error = false;
+        }
+        n = (int) (end - st + 1);
+        idx = (int64 *) palloc(sizeof(int64) * n);
+        pl = (char **) palloc(sizeof(char *) * n);
+        hx = (char **) palloc(sizeof(char *) * n);
+        ents = (st < g->first)
+            ? (RaftLogEntry *) palloc(sizeof(RaftLogEntry) * (g->first - st)) : NULL;
+        prev_idx = st - 1;
+        SpinLockAcquire(&g->ctx.log->mutex);
+        if (prev_idx > 0)
+        {
+            RaftLogEntry *pe = log_slot(&g->ctx, prev_idx);
+
+            if (pe->index == prev_idx)
+                prev_term = pe->term;
+            else if (prev_idx == g->ctx.log->base_index)
+                prev_term = g->ctx.log->base_term;
+            else
+                ok = false;
+        }
+        for (j = 0; ok && j < n; j++)
+        {
+            int64        ix = st + j;
+            int64        plsn;
+            RaftLogEntry e;
+
+            idx[j] = ix;
+            if (ix >= g->first)
+            {
+                pl[j] = g->desc[ix - g->first];
+                plsn = g->lo + (ix - g->first);
+            }
+            else
+            {
+                /* 补发段整批按本任期发出：环里那条必须仍是本任期的（④ 之后环可能被新 leader 改写） */
+                if (!log_get_entry_locked(&g->ctx, ix, &e) || e.term != g->term)
+                {
+                    ok = false;
+                    break;
+                }
+                ents[j] = e;
+                pl[j] = ents[j].payload;
+                plsn = entry_partition_lsn(e.payload);
+            }
+            if (plsn >= g->lo && plsn - g->lo < g->nhex)
+                hx[j] = g->hex[plsn - g->lo];
+            else if (plsn >= g->read_lo && plsn < g->lo &&
+                     plsn - g->read_lo < g->nchex)
+                hx[j] = g->chex[plsn - g->read_lo];
+            else
+                ok = false;     /* 补发段读不全：本轮不发它 */
+        }
+        if (ok && g->ctx.log->peer_next_index[slot] >= st &&
+            g->ctx.log->peer_next_index[slot] <= end)
+            g->ctx.log->peer_next_index[slot] = end + 1;       /* 乐观推进（流水线） */
+        c->groups[nreq].gen = g->ctx.log->trunc_gen;
+        SpinLockRelease(&g->ctx.log->mutex);
+        if (!ok)
+            continue;
+        gc_build_batch_sql(sql, &g->ctx, g->term, prev_idx, prev_term,
+                           g->leader_commit, n, idx, g->term,
+                           (const char *const *) pl, (const char *const *) hx);
+        appendStringInfoString(sql, ";");
+        c->groups[nreq].gid = g->gid;
+        c->groups[nreq].first = st;
+        c->groups[nreq].last = end;
+        c->groups[nreq].term = g->term;
+        c->groups[nreq].gslot = i;
+        nreq++;
+    }
+    if (c == NULL || nreq == 0)
+        return 0;
+    c->ngroups = nreq;
+    if (PQsendQuery(c->conn, sql->data) != 1)
+    {
+        rm_conn_fail(c, slot);
+        rm_conn_apply(c, slot);         /* 乐观推进的 next_index 退回 */
+        return 0;
+    }
+    c->busy = true;
+    c->current = true;
+    c->sent_at = GetCurrentTimestamp();
+    for (q = 0; q < nreq; q++)
+        if (c->groups[q].last >= gs[c->groups[q].gslot].last)
+            gs[c->groups[q].gslot].nsent++;
+    return 1;
+}
+
+/*
+ * 2026-10-16：多组一次性认领（全有或全无）。本后端对其中任何一组已有重入深度时不走这里
+ * （返回 false，调用方按组号顺序逐个认领）。拿到返回 true，并按 replicate_claim 的约定记好
+ * 自持深度。
+ */
+static bool
+rm_try_claim_all(RmGroup *gs, int ng)
+{
+    int     i;
+    bool    all_free = true;
+
+    for (i = 0; i < ng; i++)
+        if (self_claim_depth(gs[i].ctx.group_id, false) != NULL)
+            return false;
+    SpinLockAcquire(&RaftGroups->mutex);
+    for (i = 0; i < ng && all_free; i++)
+        if (gs[i].ctx.g->replicate_in_progress && gs[i].ctx.g->replicate_pid != MyProcPid)
+            all_free = false;
+    if (all_free)
+    {
+        TimestampTz now = GetCurrentTimestamp();
+
+        for (i = 0; i < ng; i++)
+        {
+            gs[i].ctx.g->replicate_in_progress = true;
+            gs[i].ctx.g->replicate_pid = MyProcPid;
+            gs[i].ctx.g->replicate_purpose = RAFT_CLAIM_COMMIT_MANY;
+            gs[i].ctx.g->replicate_since = now;
+        }
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+    if (!all_free)
+        return false;
+    for (i = 0; i < ng; i++)
+    {
+        int *depth = self_claim_depth(gs[i].ctx.group_id, true);
+
+        if (depth != NULL)
+            *depth = 1;
+    }
+    return true;
+}
+
+/* 本次要送的记录是否已全部被别人那一轮送到多数派（组提交：那就不用认领了） */
+static bool
+rm_all_covered(RmGroup *gs, int ng)
+{
+    int i;
+
+    for (i = 0; i < ng; i++)
+        if (Max(rm_last_data_plsn(&gs[i].ctx), gs[i].done_plsn) < gs[i].cur)
+            return false;
+    return true;
+}
+
+/* ================================================================== */
+/* 2026-10-17：流水线复制（pg_raft.replicate_pipeline）                  */
+/* ================================================================== */
+
+/*
+ * 一轮一轮模式（上面的 pg_raft_partwal_replicate_many 主体）在整轮复制期间——包括等对端
+ * 落盘回 ack 的那一两百毫秒——持着组的复制认领位，同一组同一时刻只能有一轮在途；一笔
+ * 事务碰 4–5 个组，组集合两两重叠，实测每"车道"每秒只走几笔事务（三副本 TPC-C ~700 tpmC，
+ * 同机 Citus + 流复制 10 万+）。
+ *
+ * 这里改成同步复制的老办法：
+ *   · 发送：认领位只罩住"刷新上界 → 读记录 → 追加进环 → 写 raft_log 行 → 发出请求"这一段，
+ *     发完即放（不等回包）。下一个人马上能发下一轮 —— 同组多轮在途，follower 按 prev
+ *     顺序收（rm_wait_predecessor）。刷新上界让这一轮把排队者的记录一并带走（组提交）。
+ *   · 等待：本事务只看"组的提交点（多数派）是否已覆盖本事务的记录"（rm_committed_plsn ≥ cur）。
+ *     谁收到回包谁推进提交点（Raft 原规则 compute_new_commit_index：按各成员 match_index、
+ *     只提交本任期条目），所有等待者共用。
+ *   · 自己发出的请求自己收：连接按后端私有，回包只能由发出者处理；发出者自己的记录就在
+ *     那一轮里，它本来就要等，不会撂下别人。
+ *   · 失败：不再"丢未提交尾巴"（尾巴后面可能已有别人的在途轮）。等到超时或本节点失主仍没
+ *     覆盖 ⇒ ERROR，事务中止 —— 那几条条目若之后仍被提交，属于原设计"标记那一轮失败"
+ *     同一类（中止路径的 ABORT 标记已落盘、随下一轮送出）。
+ */
+#define RM_PIPE_WAIT_MS 30000
+
+/* 环尾最后一条数据条目的 plsn（= 已追加的上界）；环里没有数据条目时退回运行期游标 */
+static int64
+rm_appended_plsn(RaftGroupCtx *ctx)
+{
+    int64 p;
+    int64 last = 0;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    for (p = ctx->log->last_log_index; p > 0 &&
+         p > ctx->log->last_log_index - RAFT_LOG_CAPACITY; p--)
+    {
+        RaftLogEntry *x = log_slot(ctx, p);
+
+        if (x->index != p)
+            break;
+        if (strcmp(x->op_type, RAFT_OP_PARWAL) == 0)
+        {
+            last = entry_partition_lsn(x->payload);
+            break;
+        }
+    }
+    SpinLockRelease(&ctx->log->mutex);
+    if (last == 0)
+        last = ctx->g->last_data_plsn;
+    return last;
+}
+
+/* 已提交（多数派持久）的最大数据 plsn：从 commit_index 往回找最近一条数据条目，按 commit_index 缓存 */
+static int64
+rm_committed_plsn(RaftGroupCtx *ctx)
+{
+    int64 ci;
+    int64 p;
+    int64 v = 0;
+    int64 floor_idx;
+
+    SpinLockAcquire(&ctx->log->mutex);
+    ci = ctx->log->commit_index;
+    if (ci == ctx->g->committed_plsn_idx)
+    {
+        v = ctx->g->committed_plsn;
+        SpinLockRelease(&ctx->log->mutex);
+        return v;
+    }
+    floor_idx = Max(ci - RAFT_LOG_CAPACITY, 0);
+    if (ctx->g->committed_plsn_idx < ci && ctx->g->committed_plsn_idx > floor_idx)
+        floor_idx = ctx->g->committed_plsn_idx;
+    for (p = ci; p > floor_idx; p--)
+    {
+        RaftLogEntry *x = log_slot(ctx, p);
+
+        if (x->index != p)
+            break;
+        if (strcmp(x->op_type, RAFT_OP_PARWAL) == 0)
+        {
+            v = entry_partition_lsn(x->payload);
+            break;
+        }
+    }
+    if (v > ctx->g->committed_plsn)
+        ctx->g->committed_plsn = v;
+    ctx->g->committed_plsn_idx = ci;
+    v = ctx->g->committed_plsn;
+    SpinLockRelease(&ctx->log->mutex);
+    /* last_data_plsn 仍是"已复制（多数派）"游标（老路径 / DTX 决议路径按它取下界），只随提交前移 */
+    if (v > ctx->g->last_data_plsn)
+        ctx->g->last_data_plsn = v;
+    return v;
+}
+
+/* 按各成员 match_index 推进提交点（仍是本任期 leader 时）；推进了就标记 / apply / hardstate */
+static void
+rm_pipe_advance(RaftGroupCtx *ctx)
+{
+    bool    leader;
+    int64   term;
+    int64   nc;
+    bool    advanced = false;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    leader = (ctx->cons->state == RAFT_LEADER);
+    term = ctx->cons->current_term;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (!leader)
+        return;
+    SpinLockAcquire(&ctx->log->mutex);
+    nc = compute_new_commit_index(ctx, term);
+    if (nc > ctx->log->commit_index)
+    {
+        ctx->log->commit_index = nc;
+        advanced = true;
+    }
+    SpinLockRelease(&ctx->log->mutex);
+    if (!advanced)
+        return;
+    persist_hard_state_unlocked(ctx);
+    mark_log_committed_sql(ctx, nc);
+    group_apply_pending(ctx);
+}
+
+/*
+ * 收本后端全部连接上已到的回包：落进 match / next_index，再对涉及的组推进提交点。
+ * wait_ms > 0 且有在途请求时先 poll 等最多这么久。
+ */
+static void
+rm_pipe_harvest(int wait_ms, bool advance)
+{
+    struct pollfd pfds[RAFT_MAX_PEERS * RM_CONNS];
+    int         npfd = 0;
+    int         slot, k, q;
+    TimestampTz now;
+
+    if (wait_ms > 0)
+    {
+        for (slot = 0; slot < n_peers; slot++)
+            for (k = 0; k < RM_CONNS; k++)
+            {
+                RmConn *c = &rm_conns[slot][k];
+
+                if (c->busy && c->conn != NULL && PQsocket(c->conn) >= 0)
+                {
+                    pfds[npfd].fd = PQsocket(c->conn);
+                    pfds[npfd].events = POLLIN;
+                    pfds[npfd].revents = 0;
+                    npfd++;
+                }
+            }
+        if (npfd > 0)
+            (void) poll(pfds, npfd, wait_ms);
+        else
+            pg_usleep((long) wait_ms * 1000L);
+    }
+
+    now = GetCurrentTimestamp();
+    for (slot = 0; slot < n_peers; slot++)
+        for (k = 0; k < RM_CONNS; k++)
+        {
+            RmConn *c = &rm_conns[slot][k];
+            int64   gids[RM_MAX_GROUPS];
+            int     ngid = 0;
+
+            if (c->busy)
+            {
+                if (!rm_conn_poll(c, slot, false, 0))
+                {
+                    if (!TimestampDifferenceExceeds(c->sent_at, now, RAFT_RPC_EXEC_TIMEOUT_MS * 4))
+                        continue;
+                    elog(WARNING, "pg_raft: 流水线复制到节点 %d 的请求 %d s 未回，判失败并重连",
+                         peers[slot].node_id, RAFT_RPC_EXEC_TIMEOUT_MS * 4 / 1000);
+                    rm_conn_fail(c, slot);
+                }
+            }
+            if (c->ngroups == 0)
+                continue;
+            for (q = 0; q < c->ngroups && ngid < RM_MAX_GROUPS; q++)
+                gids[ngid++] = c->groups[q].gid;
+            rm_conn_apply(c, slot);
+            for (q = 0; q < ngid && advance; q++)
+            {
+                RaftGroupCtx gctx;
+
+                if (raft_group_ctx(gids[q], &gctx))
+                    rm_pipe_advance(&gctx);
+            }
+        }
+}
+
+/* ---- leader 自写 raft_log 行的本地独立连接（每后端一条） ---- */
+static PGconn *rm_self_conn = NULL;
+static bool    rm_self_busy = false;
+static bool    rm_self_ok = false;
+
+static bool rm_self_wait(void);
+
+static bool
+rm_self_send(const char *sqltext)
+{
+    if (rm_self_busy)
+        (void) rm_self_wait();
+    if (rm_self_conn != NULL && PQstatus(rm_self_conn) != CONNECTION_OK)
+    {
+        PQfinish(rm_self_conn);
+        rm_self_conn = NULL;
+    }
+    if (rm_self_conn == NULL)
+    {
+        char conninfo[256];
+
+        snprintf(conninfo, sizeof(conninfo),
+                 "host=127.0.0.1 port=%d dbname=postgres user=postgres "
+                 "connect_timeout=%d application_name=pg_raft_self",
+                 PostPortNumber, pg_raft_peer_connect_timeout_s);
+        rm_self_conn = PQconnectdb(conninfo);
+        if (PQstatus(rm_self_conn) != CONNECTION_OK)
+        {
+            elog(WARNING, "pg_raft: 流水线 leader 自写连接建不起来：%s", PQerrorMessage(rm_self_conn));
+            PQfinish(rm_self_conn);
+            rm_self_conn = NULL;
+            return false;
+        }
+    }
+    if (PQsendQuery(rm_self_conn, sqltext) != 1)
+    {
+        PQfinish(rm_self_conn);
+        rm_self_conn = NULL;
+        return false;
+    }
+    rm_self_busy = true;
+    rm_self_ok = true;
+    return true;
+}
+
+/* 等自写那条语句提交完（最多 30 s）。返回是否成功 */
+static bool
+rm_self_wait(void)
+{
+    TimestampTz start = GetCurrentTimestamp();
+
+    while (rm_self_busy)
+    {
+        struct pollfd pfd;
+
+        if (!PQconsumeInput(rm_self_conn))
+        {
+            rm_self_ok = false;
+            rm_self_busy = false;
+            PQfinish(rm_self_conn);
+            rm_self_conn = NULL;
+            break;
+        }
+        while (rm_self_busy && !PQisBusy(rm_self_conn))
+        {
+            PGresult *r = PQgetResult(rm_self_conn);
+
+            if (r == NULL)
+            {
+                rm_self_busy = false;
+                break;
+            }
+            if (PQresultStatus(r) != PGRES_COMMAND_OK)
+            {
+                static TimestampTz last_warn = 0;
+
+                rm_self_ok = false;
+                if (last_warn == 0 ||
+                    TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 10000))
+                {
+                    last_warn = GetCurrentTimestamp();
+                    elog(WARNING, "pg_raft: 流水线 leader 自写 raft_log 行失败：%s",
+                         PQresultErrorMessage(r));
+                }
+            }
+            PQclear(r);
+        }
+        if (!rm_self_busy)
+            break;
+        if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 30000))
+        {
+            elog(WARNING, "pg_raft: 流水线 leader 自写 raft_log 行 30 s 未完成，断开重连");
+            rm_self_ok = false;
+            rm_self_busy = false;
+            PQfinish(rm_self_conn);
+            rm_self_conn = NULL;
+            break;
+        }
+        pfd.fd = PQsocket(rm_self_conn);
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        (void) poll(&pfd, 1, 50);
+        CHECK_FOR_INTERRUPTS();
+    }
+    return rm_self_ok;
+}
+
+/* 自写失败：本轮各组从本轮第一条起记为洞（自投票不越过它，下一轮从洞补写） */
+static void
+rm_self_mark_hole(RmGroup *gs, int ng)
+{
+    int i;
+
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int64    from;
+
+        if (!g->active || g->nnew <= 0)
+            continue;
+        from = g->self_from > 0 ? g->self_from : g->first;
+        SpinLockAcquire(&g->ctx.log->mutex);
+        if (g->ctx.log->leader_self_hole == 0 || from < g->ctx.log->leader_self_hole)
+            g->ctx.log->leader_self_hole = from;
+        SpinLockRelease(&g->ctx.log->mutex);
+    }
+}
+
+/*
+ * 发一轮：对 claimed[] 标出的组（调用方已持认领位）刷新上界 → 读 → 追加 → 写日志行 → 发出。
+ * 不等回包。返回发出了请求的组数。
+ */
+static int
+rm_pipe_send(RmGroup *gs, int ng, const bool *claimed, MemoryContext rcxt, StringInfo sql,
+             int *fail_out)
+{
+    int             i, k, slot;
+    bool            spi_owned;
+    MemoryContext   spicxt;
+    int             spi_rc;
+    int             nactive = 0;
+    int             maxn = 0;
+    int             timeout_ms;
+    TimestampTz     deadline;
+    bool            busy_skip[RAFT_MAX_PEERS];
+    TimestampTz     t0 = GetCurrentTimestamp();
+    bool            self_sent = false;
+
+    MemoryContextReset(rcxt);
+    MemoryContextSwitchTo(rcxt);
+
+    /* 刷新上界：把排队者已落盘的记录一并带走（组提交） */
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        resetStringInfo(sql);
+        appendStringInfoString(sql, "SELECT u.o::int, partdist.get_partition_flush_lsn(u.p) FROM unnest(ARRAY[");
+        k = 0;
+        for (i = 0; i < ng; i++)
+            if (claimed[i])
+                appendStringInfo(sql, "%s%u", k++ ? "," : "", (unsigned) gs[i].part);
+        appendStringInfoString(sql, "]::oid[], ARRAY[");
+        k = 0;
+        for (i = 0; i < ng; i++)
+            if (claimed[i])
+                appendStringInfo(sql, "%s%d", k++ ? "," : "", i + 1);
+        appendStringInfoString(sql, "]::int[]) u(p, o)");
+        if (SPI_execute(sql->data, true, 0) == SPI_OK_SELECT)
+        {
+            uint64 r;
+
+            for (r = 0; r < SPI_processed; r++)
+            {
+                bool    n1, n2;
+                Datum   d1 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &n1);
+                Datum   d2 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &n2);
+                int     o;
+
+                if (n1 || n2)
+                    continue;
+                o = DatumGetInt32(d1) - 1;
+                if (o >= 0 && o < ng && DatumGetInt64(d2) > gs[o].send_upto)
+                    gs[o].send_upto = DatumGetInt64(d2);
+            }
+        }
+        raft_persist_spi_end(spi_owned);
+        MemoryContextSwitchTo(rcxt);
+    }
+
+    /* ④ 本轮区间与落后副本的补发起点（同一轮一轮模式） */
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int64    last;
+        bool     is_leader;
+        int64    first_new, kmax;
+        int64    big_st[RAFT_MAX_PEERS];
+        int64    big_plsn[RAFT_MAX_PEERS];
+
+        g->active = false;
+        g->nsent = 0;
+        g->nnew = 0;
+        if (!claimed[i])
+            continue;
+        last = rm_appended_plsn(&g->ctx);
+        if (last >= g->send_upto && !g->resend)
+            continue;
+        if (last < g->send_upto && !wait_for_log_room(&g->ctx))
+            continue;
+        SpinLockAcquire(&g->ctx.cons->mutex);
+        is_leader = (g->ctx.cons->state == RAFT_LEADER);
+        g->term = g->ctx.cons->current_term;
+        SpinLockRelease(&g->ctx.cons->mutex);
+        if (!is_leader)
+            continue;
+        g->lo = last + 1;
+        g->hi = (last < g->send_upto)
+            ? Min(g->send_upto, g->lo + pg_raft_replicate_batch_max - 1)
+            : last;                 /* 只补发：没有新记录（hi < lo，新记录区间为空） */
+        g->read_lo = g->lo;
+        g->cread_hi = g->lo - 1;
+        g->active = true;
+        nactive++;
+
+        SpinLockAcquire(&g->ctx.log->mutex);
+        if (!g->ctx.log->repl_inited)
+        {
+            int64 nx = g->ctx.log->last_log_index + 1;
+            int   j;
+
+            for (j = 0; j < RAFT_MAX_PEERS; j++)
+            {
+                g->ctx.log->peer_next_index[j] = nx;
+                g->ctx.log->peer_match_index[j] = 0;
+            }
+            g->ctx.log->repl_inited = true;
+            g->ctx.log->leader_durable_index = g->ctx.log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+            g->ctx.log->leader_self_hole = 0;
+        }
+        /*
+         * 只补发（等了一阵提交点不动）：落后成员的 next_index 退回 match + 1 重发 —— 那一段可能
+         * 在途丢了（对端拒收 / 连接失败 / 乐观推进后请求没发成）。重复送到的条目对端按"已持有"处理。
+         */
+        if (g->resend)
+        {
+            for (slot = 0; slot < n_peers; slot++)
+                if (peer_in_group(&g->ctx, slot) &&
+                    g->ctx.log->peer_match_index[slot] < g->ctx.log->last_log_index &&
+                    g->ctx.log->peer_next_index[slot] > g->ctx.log->peer_match_index[slot] + 1)
+                    g->ctx.log->peer_next_index[slot] = g->ctx.log->peer_match_index[slot] + 1;
+        }
+        first_new = g->ctx.log->last_log_index + 1;
+        kmax = (int64) pg_raft_replicate_batch_max * 2;
+        for (slot = 0; slot < n_peers; slot++)
+        {
+            int64 plsn = 0;
+            int64 nx;
+            int64 st;
+
+            g->catchup_from[slot] = 0;
+            g->catchup_to[slot] = 0;
+            big_st[slot] = 0;
+            big_plsn[slot] = 0;
+            if (!peer_in_group(&g->ctx, slot))
+                continue;
+            nx = g->ctx.log->peer_next_index[slot];
+            if (nx >= first_new)
+            {
+                g->catchup_from[slot] = first_new;
+                continue;
+            }
+            st = rm_catchup_start_locked(&g->ctx, slot, first_new, g->term, &plsn);
+            if (st <= 0 || plsn <= 0 || plsn >= g->lo)
+                continue;
+            if (g->hi - plsn + 1 <= kmax)
+            {
+                g->catchup_from[slot] = st;
+                if (plsn < g->read_lo)
+                    g->read_lo = plsn;
+            }
+            else
+            {
+                big_st[slot] = st;
+                big_plsn[slot] = plsn;
+            }
+        }
+        if (g->read_lo == g->lo)
+        {
+            int64 base = 0;
+
+            for (slot = 0; slot < n_peers; slot++)
+            {
+                if (big_st[slot] <= 0 || (base != 0 && big_plsn[slot] != base))
+                    continue;
+                base = big_plsn[slot];
+                g->catchup_from[slot] = big_st[slot];
+                g->catchup_to[slot] = Min(big_st[slot] + kmax - 1, first_new - 1);
+                g->read_lo = base;
+                g->cread_hi = Min(base + kmax - 1, g->lo - 1);
+            }
+        }
+        else
+            g->cread_hi = g->lo - 1;
+        SpinLockRelease(&g->ctx.log->mutex);
+    }
+    if (nactive == 0)
+        return 0;
+
+    /* ⑤ 一次 SPI 读出各组 [read_lo, cread_hi] ∪ [lo, hi] 的描述与字节 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        ereport(ERROR, (errmsg("pg_raft: 流水线复制拿不到 SPI")));
+    spicxt = MemoryContextSwitchTo(rcxt);
+    resetStringInfo(sql);
+    appendStringInfoString(sql,
+                           "SELECT g.k, s, r.orig_lsn::text, r.rmid, r.info, r.gxid, "
+                           "       length(r.data), r.flags, encode(r.data, 'hex') "
+                           "FROM (VALUES ");
+    k = 0;
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+
+        if (!g->active)
+            continue;
+        if (g->read_lo < g->lo)
+            appendStringInfo(sql, "%s(%d, %u::oid, %lld::bigint, %lld::bigint)",
+                             k++ ? "," : "", i, (unsigned) g->part,
+                             (long long) g->read_lo, (long long) g->cread_hi);
+        appendStringInfo(sql, "%s(%d, %u::oid, %lld::bigint, %lld::bigint)",
+                         k++ ? "," : "", i, (unsigned) g->part,
+                         (long long) g->lo, (long long) g->hi);
+        g->nhex = 0;
+        g->nchex = 0;
+        g->nnew = 0;
+        g->hex = (char **) palloc0(sizeof(char *) * Max(g->hi - g->lo + 1, 1));
+        g->desc = (char **) palloc0(sizeof(char *) * Max(g->hi - g->lo + 1, 1));
+        g->chex = (g->lo > g->read_lo)
+            ? (char **) palloc0(sizeof(char *) * (g->cread_hi - g->read_lo + 1)) : NULL;
+    }
+    appendStringInfoString(sql,
+                           ") g(k, o, lo, hi) "
+                           "CROSS JOIN LATERAL generate_series(g.lo, g.hi) s "
+                           "LEFT JOIN LATERAL partdist.partwal_read_record(g.o, s) r ON true "
+                           "ORDER BY g.k, s");
+    spi_rc = SPI_execute(sql->data, true, 0);
+    MemoryContextSwitchTo(rcxt);
+    if (spi_rc == SPI_OK_SELECT)
+    {
+        uint64      r;
+        TupleDesc   td = SPI_tuptable->tupdesc;
+
+        for (r = 0; r < SPI_processed; r++)
+        {
+            HeapTuple   tup = SPI_tuptable->vals[r];
+            bool        isnull;
+            int         gi = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
+            int64       plsn = DatumGetInt64(SPI_getbinval(tup, td, 2, &isnull));
+            RmGroup    *g = &gs[gi];
+            Datum       d;
+            char       *orig;
+            int         rmid, info, flags;
+            int64       gxid, nbytes;
+            StringInfoData pl;
+
+            if (plsn < g->lo ? (plsn != g->read_lo + g->nchex || plsn > g->cread_hi)
+                             : (plsn != g->lo + g->nhex))
+                continue;
+            d = SPI_getbinval(tup, td, 3, &isnull);
+            if (isnull)
+                continue;
+            orig = TextDatumGetCString(d);
+            d = SPI_getbinval(tup, td, 4, &isnull);  rmid = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tup, td, 5, &isnull);  info = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tup, td, 6, &isnull);  gxid = isnull ? 0 : DatumGetInt64(d);
+            d = SPI_getbinval(tup, td, 7, &isnull);  nbytes = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tup, td, 8, &isnull);  flags = isnull ? PARTWAL_FLAG_DATA : DatumGetInt32(d);
+            d = SPI_getbinval(tup, td, 9, &isnull);
+            if (isnull)
+                continue;
+            if (plsn < g->lo)
+            {
+                g->chex[g->nchex++] = TextDatumGetCString(d);
+                continue;
+            }
+            g->hex[g->nhex++] = TextDatumGetCString(d);
+            initStringInfo(&pl);
+            appendStringInfo(&pl,
+                             "{\"partition_lsn\":%lld,\"orig_lsn\":\"%s\",\"rmid\":%d,"
+                             "\"info\":%d,\"flags\":%d,\"gxid\":%lld,\"nbytes\":%lld}",
+                             (long long) plsn, orig, rmid, info, flags,
+                             (long long) gxid, (long long) nbytes);
+            g->desc[g->nnew++] = pl.data;
+        }
+    }
+    MemoryContextSwitchTo(spicxt);
+    raft_persist_spi_end(spi_owned);
+
+    /* ⑥ 追加进环；推进"已追加"游标 */
+    raft_append_pxid = GetTopTransactionId();
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int      j;
+        int      room;
+        bool     still;
+
+        if (!g->active)
+            continue;
+        SpinLockAcquire(&g->ctx.cons->mutex);
+        still = (g->ctx.cons->state == RAFT_LEADER && g->ctx.cons->current_term == g->term);
+        SpinLockRelease(&g->ctx.cons->mutex);
+        if (!still)
+        {
+            g->active = false;
+            continue;
+        }
+        if (g->hi < g->lo)
+        {
+            /* 只补发：不追加新条目，补发段照常按 catchup_from 发 */
+            SpinLockAcquire(&g->ctx.log->mutex);
+            g->first = g->ctx.log->last_log_index + 1;
+            g->last = g->ctx.log->last_log_index;
+            g->leader_commit = g->ctx.log->commit_index;
+            SpinLockRelease(&g->ctx.log->mutex);
+            continue;
+        }
+        if (g->nnew == 0)
+        {
+            g->active = false;
+            elog(WARNING, "pg_raft: 组 %lld 读不到本地 parwal 记录 plsn=%lld（local_oid=%u）",
+                 (long long) g->gid, (long long) g->lo, g->part);
+            if (fail_out != NULL)
+                *fail_out = i;          /* 与一轮一轮模式相同：立即失败，不原地空转 */
+            continue;
+        }
+        SpinLockAcquire(&g->ctx.log->mutex);
+        room = (int) (RAFT_LOG_CAPACITY - 1 -
+                      (g->ctx.log->last_log_index - g->ctx.log->last_applied));
+        if (g->nnew > room)
+            g->nnew = room;
+        if (g->ctx.log->last_log_index > 0)
+        {
+            RaftLogEntry *te = log_slot(&g->ctx, g->ctx.log->last_log_index);
+
+            if (te->index == g->ctx.log->last_log_index && te->term > g->term)
+                g->nnew = 0;
+        }
+        g->first = g->ctx.log->last_log_index + 1;
+        for (j = 0; j < g->nnew; j++)
+            if (log_append_locked(&g->ctx, g->term, RAFT_OP_PARWAL, g->desc[j]) <= 0)
+                break;
+        g->nnew = j;
+        g->last = g->first + g->nnew - 1;
+        g->leader_commit = g->ctx.log->commit_index;
+        SpinLockRelease(&g->ctx.log->mutex);
+        if (g->nnew <= 0)
+        {
+            g->active = false;
+            continue;
+        }
+        if (g->nnew > maxn)
+            maxn = g->nnew;
+    }
+    raft_append_pxid = InvalidTransactionId;
+
+    /*
+     * ⑦ leader 的 raft_log 行：走独立的本地连接、自己提交（2026-10-17）。
+     * 以前写在用户事务里 —— 流水线下这笔事务可能还要等别的组几十秒、也可能中止，期间别人的
+     * 提交已经把这些条目算上了 leader 一票；leader 一崩，行没了，那一票就是假的。还会与其它
+     * 在途事务互等行锁。现在与下面发给副本的请求并行写、在放认领位之前等它提交，成功了才把
+     * leader_durable_index（自投票上限）推到本轮末尾；失败记"洞"，下一轮从洞开始补写。
+     */
+    {
+        bool    ready = false;
+        bool    first_row = true;
+
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            ready = raft_log_table_ready();
+            raft_persist_spi_end(spi_owned);
+            MemoryContextSwitchTo(rcxt);
+        }
+        resetStringInfo(sql);
+        appendStringInfoString(sql,
+                               "INSERT INTO partdist.raft_log "
+                               "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+        for (i = 0; ready && i < ng; i++)
+        {
+            RmGroup *g = &gs[i];
+            int64    hole;
+            int64    ix;
+
+            g->self_from = 0;
+            if (!g->active || g->nnew <= 0)
+                continue;
+            SpinLockAcquire(&g->ctx.log->mutex);
+            hole = g->ctx.log->leader_self_hole;
+            SpinLockRelease(&g->ctx.log->mutex);
+            g->self_from = (hole > 0 && hole < g->first) ? hole : g->first;
+            for (ix = g->self_from; ix <= g->last; ix++)
+            {
+                RaftLogEntry e;
+                bool         got = true;
+                const char  *pl;
+                int64        et;
+
+                if (ix >= g->first)
+                {
+                    pl = g->desc[ix - g->first];
+                    et = g->term;
+                }
+                else
+                {
+                    SpinLockAcquire(&g->ctx.log->mutex);
+                    got = log_get_entry_locked(&g->ctx, ix, &e);
+                    SpinLockRelease(&g->ctx.log->mutex);
+                    if (!got)
+                        continue;
+                    pl = e.payload;
+                    et = e.term;
+                }
+                appendStringInfo(sql, "%s(%lld, %lld, %lld, %s, %s::jsonb, %s)",
+                                 first_row ? "" : ", ",
+                                 (long long) g->gid, (long long) ix,
+                                 (long long) et, quote_literal_cstr(got && ix < g->first ? e.op_type : RAFT_OP_PARWAL),
+                                 quote_literal_cstr(pl),
+                                 g->majority == 1 ? "true" : "false");
+                first_row = false;
+            }
+        }
+        appendStringInfoString(sql,
+                               " ON CONFLICT (group_id, log_index) DO UPDATE SET "
+                               "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
+                               "payload = EXCLUDED.payload, "
+                               "committed = partdist.raft_log.committed OR EXCLUDED.committed");
+        self_sent = (!first_row && rm_self_send(sql->data));
+        if (!first_row && !self_sent)
+            rm_self_mark_hole(gs, ng);
+    }
+
+    /* ⑧ 发出（不等回包）。到某副本的连接全在途且有组因此一个都没发出去时，等一条空出来再发 */
+    timeout_ms = Min(RAFT_RPC_EXEC_TIMEOUT_MS + 300 * maxn, 30000);
+    deadline = GetCurrentTimestamp() + (int64) timeout_ms * 1000;
+    for (slot = 0; slot < n_peers; slot++)
+    {
+        busy_skip[slot] = false;
+        if (peers[slot].node_id == pg_raft_node_id || peer_in_backoff(&peers[slot]))
+            continue;
+        busy_skip[slot] = (rm_send_slot(gs, ng, slot, false, deadline, sql) < 0);
+    }
+    for (slot = 0; slot < n_peers; slot++)
+    {
+        bool need = false;
+
+        if (!busy_skip[slot])
+            continue;
+        for (i = 0; i < ng && !need; i++)
+            if (gs[i].active && peer_in_group(&gs[i].ctx, slot) &&
+                gs[i].nsent + 1 < gs[i].majority)
+                need = true;
+        if (need)
+            (void) rm_send_slot(gs, ng, slot, true, deadline, sql);
+    }
+    /* leader 自写的 raft_log 行：放认领位之前等它提交（同组的自写因此按轮次顺序落定） */
+    if (self_sent)
+    {
+        if (rm_self_wait())
+        {
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+
+                if (!g->active || g->nnew <= 0 || g->self_from <= 0)
+                    continue;
+                SpinLockAcquire(&g->ctx.log->mutex);
+                if (g->ctx.log->leader_self_hole > 0 && g->ctx.log->leader_self_hole >= g->self_from)
+                    g->ctx.log->leader_self_hole = 0;
+                if (g->last > g->ctx.log->leader_durable_index)
+                    g->ctx.log->leader_durable_index = g->last;
+                SpinLockRelease(&g->ctx.log->mutex);
+            }
+        }
+        else
+            rm_self_mark_hole(gs, ng);
+    }
+
+    /* 发出的请求不属于"本轮计票"（流水线下回包统一由 rm_pipe_harvest 收） */
+    for (slot = 0; slot < n_peers; slot++)
+        for (k = 0; k < RM_CONNS; k++)
+            rm_conns[slot][k].current = false;
+
+    k = 0;
+    for (i = 0; i < ng; i++)
+        if (gs[i].active)
+        {
+            gs[i].ctx.g->last_rm_round = GetCurrentTimestamp();
+            k++;
+        }
+    if (TimestampDifferenceExceeds(t0, GetCurrentTimestamp(), 200))
+    {
+        static TimestampTz last_log = 0;
+
+        if (last_log == 0 || TimestampDifferenceExceeds(last_log, GetCurrentTimestamp(), 2000))
+        {
+            last_log = GetCurrentTimestamp();
+            elog(LOG, "pg_raft: [pipe-send] %d 组 共 %ld ms", k,
+                 (long) ((GetCurrentTimestamp() - t0) / 1000));
+        }
+    }
+    return k;
+}
+
+static void
+pg_raft_partwal_replicate_pipe(const Oid *parts, int nparts, bool *failed_out)
+{
+    RmGroup        *gs;
+    int             ng = 0;
+    int             i, k;
+    StringInfoData  sql;
+    bool            spi_owned;
+    MemoryContext   rmcxt;
+    MemoryContext   rcxt;
+    MemoryContext   oldcxt;
+    bool           *claimed;
+    volatile bool   normal_exit = false;
+    TimestampTz     start = GetCurrentTimestamp();
+    TimestampTz     t_log = start;
+    const char     *fail_why = NULL;
+    int             fail_i = -1;
+
+    rmcxt = AllocSetContextCreate(CurrentMemoryContext, "pg_raft replicate_pipe",
+                                  ALLOCSET_DEFAULT_SIZES);
+    rcxt = AllocSetContextCreate(rmcxt, "pg_raft replicate_pipe round",
+                                 ALLOCSET_DEFAULT_SIZES);
+    oldcxt = MemoryContextSwitchTo(rmcxt);
+    gs = (RmGroup *) palloc0(sizeof(RmGroup) * nparts);
+    claimed = (bool *) palloc0(sizeof(bool) * nparts);
+
+    /* ① 一次 SPI：组号与已落盘上界（同一轮一轮模式） */
+    initStringInfo(&sql);
+    if (!raft_persist_spi_begin(&spi_owned))
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    appendStringInfoString(&sql,
+                           "SELECT u.p, partdist.global_id_for_partition(u.p)::bigint, "
+                           "       partdist.get_partition_flush_lsn(u.p) "
+                           "FROM unnest(ARRAY[");
+    for (i = 0; i < nparts; i++)
+        appendStringInfo(&sql, "%s%u", i ? "," : "", (unsigned) parts[i]);
+    appendStringInfoString(&sql, "]::oid[]) WITH ORDINALITY u(p, o) ORDER BY u.o");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+    {
+        uint64 r;
+
+        for (r = 0; r < SPI_processed; r++)
+        {
+            bool    n1, n2, n3;
+            Datum   d1 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &n1);
+            Datum   d2 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &n2);
+            Datum   d3 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &n3);
+
+            if (n1 || n2 || DatumGetInt64(d2) <= 0)
+                continue;
+            gs[ng].part = DatumGetObjectId(d1);
+            gs[ng].gid = DatumGetInt64(d2);
+            gs[ng].cur = n3 ? 0 : DatumGetInt64(d3);
+            ng++;
+        }
+    }
+    raft_persist_spi_end(spi_owned);
+    MemoryContextSwitchTo(rmcxt);
+
+    /* ② 逐组门禁（同一轮一轮模式；被拒的分区标进 failed_out） */
+    k = 0;
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int      state = -1;
+        bool     known;
+
+        if (!raft_group_ctx(g->gid, &g->ctx))
+            continue;
+        known = group_resolve_membership(&g->ctx);
+        if (known)
+        {
+            restore_hard_state_if_needed(&g->ctx);
+            restore_persistent_log_if_needed(&g->ctx);
+            SpinLockAcquire(&g->ctx.cons->mutex);
+            state = g->ctx.cons->state;
+            SpinLockRelease(&g->ctx.cons->mutex);
+        }
+        if ((!known || state != RAFT_LEADER) && failed_out != NULL)
+        {
+            int p;
+
+            for (p = 0; p < nparts; p++)
+                if (parts[p] == g->part)
+                    failed_out[p] = true;
+        }
+        if (!known)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的成员集未知，写入被拒",
+                            g->part, (long long) g->gid)));
+        if (state != RAFT_LEADER)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的本地写入被拒：本节点不是该分区组的 leader",
+                            g->part, (long long) g->gid),
+                     errdetail("分区主副本可能已切换，请经路由层重试。")));
+        if (g->cur <= 0)
+            continue;
+        g->majority = cluster_majority(&g->ctx);
+        g->send_upto = g->cur;
+        SpinLockAcquire(&g->ctx.cons->mutex);
+        g->term0 = g->ctx.cons->current_term;
+        SpinLockRelease(&g->ctx.cons->mutex);
+        g->progress_at = GetCurrentTimestamp();
+        if (k != i)
+            gs[k] = *g;
+        k++;
+    }
+    ng = k;
+    if (ng == 0)
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    qsort(gs, ng, sizeof(RmGroup), rm_group_cmp);
+
+    PG_TRY();
+    {
+        in_txn_replication = true;
+        for (;;)
+        {
+            bool    all_done = true;
+            int     nclaim = 0;
+
+            /* 收回包、推进提交点 */
+            rm_pipe_harvest(0, true);
+
+            /*
+             * 覆盖了没有。先确认仍是门禁时那个任期的 leader，再信提交点 —— 失主后本节点的环尾会被
+             * 新 leader 截掉、同一批 plsn 换成别人的记录，提交点越过它们不代表本事务的记录在多数派上。
+             * 在 term0 内确认过覆盖的组记为 done，之后任期再变也不影响（那时已多数派持久化）。
+             */
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+                bool     ok_term;
+                int64    ci;
+
+                if (g->done)
+                    continue;
+                SpinLockAcquire(&g->ctx.cons->mutex);
+                ok_term = (g->ctx.cons->state == RAFT_LEADER &&
+                           g->ctx.cons->current_term == g->term0);
+                SpinLockRelease(&g->ctx.cons->mutex);
+                if (!ok_term)
+                {
+                    all_done = false;
+                    fail_why = "本节点已不是该分区组的 leader（或任期已变）";
+                    fail_i = i;
+                    continue;
+                }
+                /* 回包可能是别的后端收的（它只落了 match_index 就走了）：自己按 match_index 推一把 */
+                rm_pipe_advance(&g->ctx);
+                if (rm_committed_plsn(&g->ctx) >= g->cur)
+                {
+                    SpinLockAcquire(&g->ctx.cons->mutex);
+                    ok_term = (g->ctx.cons->state == RAFT_LEADER &&
+                               g->ctx.cons->current_term == g->term0);
+                    SpinLockRelease(&g->ctx.cons->mutex);
+                    if (ok_term)
+                    {
+                        g->done = true;
+                        continue;
+                    }
+                }
+                all_done = false;
+                SpinLockAcquire(&g->ctx.log->mutex);
+                ci = g->ctx.log->commit_index;
+                SpinLockRelease(&g->ctx.log->mutex);
+                if (ci != g->seen_commit)
+                {
+                    g->seen_commit = ci;
+                    g->progress_at = GetCurrentTimestamp();
+                }
+            }
+            if (all_done || fail_why != NULL)
+                break;
+            if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), RM_PIPE_WAIT_MS))
+            {
+                fail_why = "等多数派确认超时";
+                for (i = 0; i < ng; i++)
+                    if (!gs[i].done)
+                        fail_i = i;
+                break;
+            }
+
+            /*
+             * 还没追加到 cur 的组：认领位空着就拿下（不等），发一轮，发完即放。
+             * 已追加、但提交点 300 ms 没动的组：发一轮"只补发"（那一段可能在途丢了 / 被拒收）。
+             */
+            for (i = 0; i < ng; i++)
+            {
+                claimed[i] = false;
+                gs[i].resend = false;
+                if (gs[i].done)
+                    continue;
+                if (rm_appended_plsn(&gs[i].ctx) >= gs[i].cur)
+                {
+                    if (!TimestampDifferenceExceeds(gs[i].progress_at, GetCurrentTimestamp(), 300))
+                        continue;
+                    gs[i].resend = true;
+                }
+                if (self_claim_depth(gs[i].ctx.group_id, false) != NULL)
+                    continue;
+                raft_claim_purpose = RAFT_CLAIM_COMMIT_MANY;
+                if (replicate_try_claim(&gs[i].ctx))
+                {
+                    claimed[i] = true;
+                    nclaim++;
+                    if (gs[i].resend)
+                        gs[i].progress_at = GetCurrentTimestamp();     /* 下一次补发至少再隔 300 ms */
+                }
+            }
+            if (nclaim > 0)
+            {
+                int send_fail = -1;
+
+                PG_TRY(2);
+                {
+                    (void) rm_pipe_send(gs, ng, claimed, rcxt, &sql, &send_fail);
+                }
+                PG_FINALLY(2);
+                {
+                    raft_append_pxid = InvalidTransactionId;
+                    for (i = ng - 1; i >= 0; i--)
+                        if (claimed[i])
+                        {
+                            replicate_release(&gs[i].ctx);
+                            claimed[i] = false;
+                        }
+                    MemoryContextSwitchTo(rmcxt);
+                }
+                PG_END_TRY(2);
+                if (send_fail >= 0)
+                {
+                    fail_why = "读不到本地 parwal 记录";
+                    fail_i = send_fail;
+                    break;
+                }
+            }
+
+            /* 等回包（有在途请求就 poll，最多 2 ms） */
+            rm_pipe_harvest(2, true);
+            CHECK_FOR_INTERRUPTS();
+
+            if (TimestampDifferenceExceeds(t_log, GetCurrentTimestamp(), 5000))
+            {
+                t_log = GetCurrentTimestamp();
+                elog(LOG, "pg_raft: [pipe-wait] 已等 %ld ms，%d 组",
+                     (long) ((t_log - start) / 1000), ng);
+            }
+        }
+        normal_exit = true;
+    }
+    PG_FINALLY();
+    {
+        /*
+         * 异常退出：本后端发出、还没收的回包别人可能正等着（连接是本后端私有的）。在限时
+         * 内把它们收掉，只落 match / next_index（错误处理途中不跑 SQL；提交点由等待者自己
+         * 按 match_index 推进）。
+         */
+        if (!normal_exit)
+        {
+            TimestampTz h0 = GetCurrentTimestamp();
+            int         slot2, k2;
+            bool        any;
+
+            do
+            {
+                rm_pipe_harvest(5, false);
+                any = false;
+                for (slot2 = 0; slot2 < n_peers; slot2++)
+                    for (k2 = 0; k2 < RM_CONNS; k2++)
+                        if (rm_conns[slot2][k2].busy)
+                            any = true;
+            } while (any && !TimestampDifferenceExceeds(h0, GetCurrentTimestamp(), 1000));
+        }
+        if (!normal_exit && failed_out != NULL)
+            for (i = 0; i < ng; i++)
+                if (!gs[i].done)
+                    for (k = 0; k < nparts; k++)
+                        if (parts[k] == gs[i].part)
+                            failed_out[k] = true;
+        in_txn_replication = false;
+        MemoryContextSwitchTo(oldcxt);
+    }
+    PG_END_TRY();
+
+    if (fail_why != NULL && fail_i >= 0)
+    {
+        Oid     fp = gs[fail_i].part;
+        int64   fg = gs[fail_i].gid;
+        int64   fc = gs[fail_i].cur;
+
+        if (failed_out != NULL)
+            for (i = 0; i < ng; i++)
+                if (!gs[i].done)
+                    for (k = 0; k < nparts; k++)
+                        if (parts[k] == gs[i].part)
+                            failed_out[k] = true;
+        MemoryContextDelete(rmcxt);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派（%s）",
+                        fp, (long long) fg, (long long) fc, fail_why)));
+    }
+    MemoryContextDelete(rmcxt);
+}
+
+/* ================================================================== */
+/* 2026-10-17：节点级有序复制流（pg_raft.replicate_stream）               */
+/* ================================================================== */
+
+/*
+ * 结构（与 PostgreSQL 流复制同一思路，每个分片组仍是独立的 Raft 组）：
+ *
+ *   提交的后端：分区流落盘 → 认领位空着就把本组新记录追加进内存环（只罩住追加）→
+ *               登记 want_plsn → 唤醒复制管理进程 → 睡在条件变量上，等各组提交点覆盖自己。
+ *   复制管理进程（每节点一个，pg_raft_stream_main）：
+ *     · 对每个副本节点一条长连接（libpq 管道模式，严格按序），把本节点当主的各组从
+ *       next_index 起的新条目打成一批（pg_raft_stream_apply 的二进制消息）不停地发；
+ *     · 收回包（同一连接上按序回来）→ 落 match / next_index → 按 Raft 规则推进各组提交点
+ *       （leader 自投票只算到 leader_durable_index）→ 广播条件变量；
+ *     · leader 自己的 raft_log 行在本进程的独立事务里写、提交落盘后才推进 leader_durable_index；
+ *     · 提交点前移后做 hardstate / 标 committed / apply。
+ *   副本：每条流一个会话、按到达顺序逐批处理，一批（含多个组）一次分区流 fsync + 一次提交。
+ *
+ * 认领位只用来串行化"往环里追加"（保证同组条目按 plsn 连续）：提交的后端、决议路径
+ * （持认领位调 replicate_group_upto）、管理进程谁拿到谁追加；发送不需要认领位。
+ */
+#define RS_QMAX             32
+#define RS_ROWS_MAX         16384
+#define RS_MSG_MAX_ENTRIES  2048            /* 一条消息（全部组合计）最多几条：副本按序处理，太大会拖住整条流 */
+#define RS_MSG_MAX_BYTES    (4 * 1024 * 1024)
+#define RS_PEER_MAX_INFLIGHT_BYTES (32 * 1024 * 1024)   /* 每副本在途字节上限：慢副本不读时 libpq 输出缓冲会成倍扩张 */
+#define RS_LOCAL_OID_CAP    1024
+
+typedef bool (*PartWALReadHookFn) (Oid partition_id, uint64 plsn, XLogRecPtr *orig_lsn,
+                                   int *rmid, int *info, int *flags, int64 *gxid,
+                                   char **data, uint32 *data_len);
+static PartWALReadHookFn rs_read_hook = NULL;
+
+static bool
+rs_read_record(Oid part, uint64 plsn, XLogRecPtr *orig, int *rmid, int *info, int *flags,
+               int64 *gxid, char **data, uint32 *len)
+{
+    if (rs_read_hook == NULL)
+    {
+        void **p = find_rendezvous_variable("partdist_partwal_read_hook");
+
+        rs_read_hook = (PartWALReadHookFn) *p;
+        if (rs_read_hook == NULL)
+            return false;
+    }
+    return rs_read_hook(part, plsn, orig, rmid, info, flags, gxid, data, len);
+}
+
+/*
+ * 管理进程的"本轮记录缓存"：同一轮循环里追加时读过的记录、发给第一个副本时读过的字节，
+ * 发给另一个副本时直接复用。只在管理进程里启用（rs_rc_cxt 非空），每轮开头清空。
+ */
+typedef struct RsRecKey
+{
+    Oid         part;
+    uint64      plsn;
+} RsRecKey;
+
+typedef struct RsRecEnt
+{
+    RsRecKey    key;
+    XLogRecPtr  orig;
+    int         rmid, info, flags;
+    int64       gxid;
+    char       *data;
+    uint32      len;
+} RsRecEnt;
+
+static HTAB         *rs_rc = NULL;
+static MemoryContext rs_rc_cxt = NULL;
+
+static void
+rs_rc_reset(MemoryContext cxt)
+{
+    HASHCTL ctl;
+
+    rs_rc_cxt = cxt;
+    memset(&ctl, 0, sizeof(ctl));
+    ctl.keysize = sizeof(RsRecKey);
+    ctl.entrysize = sizeof(RsRecEnt);
+    ctl.hcxt = cxt;
+    rs_rc = hash_create("pg_raft stream record cache", 4096, &ctl,
+                        HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/* 读一条记录（管理进程里走本轮缓存）。*data 归缓存所有时 *owned = false，调用方不得释放 */
+static bool
+rs_read_record_c(Oid part, uint64 plsn, XLogRecPtr *orig, int *rmid, int *info, int *flags,
+                 int64 *gxid, char **data, uint32 *len, bool *owned)
+{
+    RsRecKey    key;
+    RsRecEnt   *e;
+    bool        found;
+
+    *owned = true;
+    if (rs_rc == NULL)
+        return rs_read_record(part, plsn, orig, rmid, info, flags, gxid, data, len);
+    memset(&key, 0, sizeof(key));
+    key.part = part;
+    key.plsn = plsn;
+    e = (RsRecEnt *) hash_search(rs_rc, &key, HASH_FIND, &found);
+    if (!found)
+    {
+        MemoryContext old = MemoryContextSwitchTo(rs_rc_cxt);
+        XLogRecPtr  o;
+        int         rm, inf, fl;
+        int64       gx;
+        char       *d = NULL;
+        uint32      l = 0;
+        bool        ok = rs_read_record(part, plsn, &o, &rm, &inf, &fl, &gx, &d, &l);
+
+        MemoryContextSwitchTo(old);
+        if (!ok)
+            return false;
+        e = (RsRecEnt *) hash_search(rs_rc, &key, HASH_ENTER, &found);
+        e->orig = o;
+        e->rmid = rm;
+        e->info = inf;
+        e->flags = fl;
+        e->gxid = gx;
+        e->data = d;
+        e->len = l;
+    }
+    *orig = e->orig;
+    *rmid = e->rmid;
+    *info = e->info;
+    *flags = e->flags;
+    *gxid = e->gxid;
+    *data = e->data;
+    *len = e->len;
+    *owned = false;
+    return true;
+}
+
+/* 复制流是否在用：开关开着且管理进程活着 */
+static bool
+rs_stream_active(void)
+{
+    return pg_raft_replicate_stream && RaftGroups != NULL && RaftGroups->stream_pid != 0;
+}
+
+/* 数据组且复制流在用：心跳不碰 match/next，leader 自投票只算到 leader_durable_index */
+static bool
+rs_stream_data(RaftGroupCtx *ctx)
+{
+    return ctx->group_id != RAFT_CONTROL_GROUP && rs_stream_active();
+}
+
+static void
+rs_kick(void)
+{
+    if (RaftGroups != NULL && RaftGroups->stream_pid != 0 && RaftGroups->stream_latch != NULL)
+        SetLatch(RaftGroups->stream_latch);
+}
+
+/*
+ * 持认领位调用：把本组 (已追加, upto] 的记录追加进环（读记录走 pg_partdist 的 C 钩子）。
+ * 只追加本节点仍是 term 任期 leader 时；环满就追加到满为止。返回追加到的 plsn。
+ */
+static int64
+rs_append_upto(RaftGroupCtx *ctx, Oid local_oid, int64 upto, int64 term)
+{
+    int64       appended = rm_appended_plsn(ctx);
+    int64       p;
+    int         n = 0;
+    int         i;
+    char      **desc;
+    bool        leader;
+    int64       room;
+
+    /* 组提交：把已登记的别人的记录一并带上 */
+    SpinLockAcquire(&ctx->log->mutex);
+    if (ctx->log->want_plsn > upto)
+        upto = ctx->log->want_plsn;
+    SpinLockRelease(&ctx->log->mutex);
+    if (appended >= upto || local_oid == InvalidOid)
+        return appended;
+    SpinLockAcquire(&ctx->cons->mutex);
+    leader = (ctx->cons->state == RAFT_LEADER && ctx->cons->current_term == term);
+    SpinLockRelease(&ctx->cons->mutex);
+    if (!leader)
+        return appended;
+
+    desc = (char **) palloc(sizeof(char *) * pg_raft_stream_batch_entries);
+    for (p = appended + 1; p <= upto && n < pg_raft_stream_batch_entries; p++)
+    {
+        XLogRecPtr  orig;
+        int         rmid, info, flags;
+        int64       gxid;
+        char       *data = NULL;
+        uint32      len = 0;
+        bool        owned;
+
+        if (!rs_read_record_c(local_oid, (uint64) p, &orig, &rmid, &info, &flags, &gxid,
+                              &data, &len, &owned))
+            break;
+        desc[n++] = psprintf("{\"partition_lsn\":%lld,\"orig_lsn\":\"%X/%X\",\"rmid\":%d,"
+                             "\"info\":%d,\"flags\":%d,\"gxid\":%lld,\"nbytes\":%lld}",
+                             (long long) p, LSN_FORMAT_ARGS(orig), rmid, info, flags,
+                             (long long) gxid, (long long) len);
+        if (data != NULL && owned)
+            pfree(data);
+    }
+    if (n == 0)
+    {
+        pfree(desc);
+        return appended;
+    }
+
+    SpinLockAcquire(&ctx->log->mutex);
+    room = RAFT_LOG_CAPACITY - 1 - (ctx->log->last_log_index - ctx->log->last_applied);
+    if (n > room)
+        n = (int) Max(room, 0);
+    /* 当选后复制状态还没初始化：初始化时把环里已有的条目视为 leader 已落盘，先别往里追加 */
+    if (!ctx->log->repl_inited)
+        n = 0;
+    if (ctx->log->last_log_index > 0)
+    {
+        RaftLogEntry *te = log_slot(ctx, ctx->log->last_log_index);
+
+        if (te->index == ctx->log->last_log_index && te->term > term)
+            n = 0;
+    }
+    for (i = 0; i < n; i++)
+        if (log_append_locked(ctx, term, RAFT_OP_PARWAL, desc[i]) <= 0)
+            break;
+    n = i;
+    SpinLockRelease(&ctx->log->mutex);
+    pfree(desc);
+    return appended + n;
+}
+
+/* 组提交点（多数派）是否已覆盖 cur，且本节点仍是 term0 任期 leader。*why 填失败原因 */
+static int
+rs_covered(RaftGroupCtx *ctx, int64 cur, int64 term0)
+{
+    bool ok_term;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    ok_term = (ctx->cons->state == RAFT_LEADER && ctx->cons->current_term == term0);
+    SpinLockRelease(&ctx->cons->mutex);
+    if (!ok_term)
+        return -1;                      /* 失主 / 换任期 */
+    if (rm_committed_plsn(ctx) < cur)
+        return 0;
+    SpinLockAcquire(&ctx->cons->mutex);
+    ok_term = (ctx->cons->state == RAFT_LEADER && ctx->cons->current_term == term0);
+    SpinLockRelease(&ctx->cons->mutex);
+    return ok_term ? 1 : -1;
+}
+
+static void
+rs_register_want(RaftGroupCtx *ctx, int64 cur)
+{
+    SpinLockAcquire(&ctx->log->mutex);
+    if (cur > ctx->log->want_plsn)
+        ctx->log->want_plsn = cur;
+    SpinLockRelease(&ctx->log->mutex);
+    ctx->g->last_rm_round = GetCurrentTimestamp();
+}
+
+/*
+ * 持认领位的老路径（replicate_group_upto：DTX 决议、逐分区复制）在复制流下的走法：
+ * 自己把记录追加进环、登记、等覆盖。失败 ERROR（与老路径"未达多数派"同一报错）。
+ */
+static void
+rs_replicate_claimed(RaftGroupCtx *ctx, int64 cur_plsn, Oid partition_id)
+{
+    int64       term0;
+    bool        leader;
+    TimestampTz start = GetCurrentTimestamp();
+    int         st = 0;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    leader = (ctx->cons->state == RAFT_LEADER);
+    term0 = ctx->cons->current_term;
+    SpinLockRelease(&ctx->cons->mutex);
+    if (!leader)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派（本节点已不是 leader）",
+                        partition_id, (long long) ctx->group_id, (long long) cur_plsn)));
+    while (rm_appended_plsn(ctx) < cur_plsn)
+    {
+        int64 before = rm_appended_plsn(ctx);
+
+        if (rs_append_upto(ctx, partition_id, cur_plsn, term0) <= before)
+            break;
+    }
+    rs_register_want(ctx, cur_plsn);
+    rs_kick();
+
+    ConditionVariablePrepareToSleep(&RaftGroups->stream_cv);
+    for (;;)
+    {
+        st = rs_covered(ctx, cur_plsn, term0);
+        if (st != 0)
+            break;
+        if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), RM_PIPE_WAIT_MS))
+            break;
+        /* 环满时这里追加不全：再试一把（apply 已推进就能接着追加） */
+        if (rm_appended_plsn(ctx) < cur_plsn)
+        {
+            (void) rs_append_upto(ctx, partition_id, cur_plsn, term0);
+            rs_kick();
+        }
+        (void) ConditionVariableTimedSleep(&RaftGroups->stream_cv, 20, PG_WAIT_EXTENSION);
+        CHECK_FOR_INTERRUPTS();
+    }
+    ConditionVariableCancelSleep();
+    if (st != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派（%s）",
+                        partition_id, (long long) ctx->group_id, (long long) cur_plsn,
+                        st < 0 ? "本节点已不是该分区组的 leader（或任期已变）" : "等多数派确认超时")));
+}
+
+/* 提交路径（多组）在复制流下的走法 */
+static void
+pg_raft_partwal_replicate_stream(const Oid *parts, int nparts, bool *failed_out)
+{
+    RmGroup        *gs;
+    int             ng = 0;
+    int             i, k;
+    StringInfoData  sql;
+    bool            spi_owned;
+    MemoryContext   rmcxt;
+    MemoryContext   oldcxt;
+    TimestampTz     start = GetCurrentTimestamp();
+    const char     *fail_why = NULL;
+    int             fail_i = -1;
+
+    rmcxt = AllocSetContextCreate(CurrentMemoryContext, "pg_raft replicate_stream",
+                                  ALLOCSET_DEFAULT_SIZES);
+    oldcxt = MemoryContextSwitchTo(rmcxt);
+    gs = (RmGroup *) palloc0(sizeof(RmGroup) * nparts);
+
+    /* ① 一次 SPI：组号与已落盘上界（同一轮一轮模式） */
+    initStringInfo(&sql);
+    if (!raft_persist_spi_begin(&spi_owned))
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    appendStringInfoString(&sql,
+                           "SELECT u.p, partdist.global_id_for_partition(u.p)::bigint, "
+                           "       partdist.get_partition_flush_lsn(u.p) "
+                           "FROM unnest(ARRAY[");
+    for (i = 0; i < nparts; i++)
+        appendStringInfo(&sql, "%s%u", i ? "," : "", (unsigned) parts[i]);
+    appendStringInfoString(&sql, "]::oid[]) WITH ORDINALITY u(p, o) ORDER BY u.o");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+    {
+        uint64 r;
+
+        for (r = 0; r < SPI_processed; r++)
+        {
+            bool    n1, n2, n3;
+            Datum   d1 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &n1);
+            Datum   d2 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &n2);
+            Datum   d3 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &n3);
+
+            if (n1 || n2 || DatumGetInt64(d2) <= 0)
+                continue;
+            gs[ng].part = DatumGetObjectId(d1);
+            gs[ng].gid = DatumGetInt64(d2);
+            gs[ng].cur = n3 ? 0 : DatumGetInt64(d3);
+            ng++;
+        }
+    }
+    raft_persist_spi_end(spi_owned);
+    MemoryContextSwitchTo(rmcxt);
+
+    /* ② 逐组门禁（同一轮一轮模式；被拒的分区标进 failed_out） */
+    k = 0;
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int      state = -1;
+        bool     known;
+
+        if (!raft_group_ctx(g->gid, &g->ctx))
+            continue;
+        known = group_resolve_membership(&g->ctx);
+        if (known)
+        {
+            restore_hard_state_if_needed(&g->ctx);
+            restore_persistent_log_if_needed(&g->ctx);
+            SpinLockAcquire(&g->ctx.cons->mutex);
+            state = g->ctx.cons->state;
+            g->term0 = g->ctx.cons->current_term;
+            SpinLockRelease(&g->ctx.cons->mutex);
+        }
+        if ((!known || state != RAFT_LEADER) && failed_out != NULL)
+        {
+            int p;
+
+            for (p = 0; p < nparts; p++)
+                if (parts[p] == g->part)
+                    failed_out[p] = true;
+        }
+        if (!known)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的成员集未知，写入被拒",
+                            g->part, (long long) g->gid)));
+        if (state != RAFT_LEADER)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的本地写入被拒：本节点不是该分区组的 leader",
+                            g->part, (long long) g->gid),
+                     errdetail("分区主副本可能已切换，请经路由层重试。")));
+        if (g->cur <= 0)
+            continue;
+        if (k != i)
+            gs[k] = *g;
+        k++;
+    }
+    ng = k;
+    if (ng == 0)
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    qsort(gs, ng, sizeof(RmGroup), rm_group_cmp);
+
+    /* ③ 能拿到认领位就自己追加（只罩住追加），拿不到交给持有者 / 管理进程；登记、唤醒 */
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+
+        if (rm_appended_plsn(&g->ctx) < g->cur)
+        {
+            raft_claim_purpose = RAFT_CLAIM_COMMIT_MANY;
+            if (replicate_try_claim(&g->ctx))
+            {
+                PG_TRY();
+                {
+                    (void) rs_append_upto(&g->ctx, g->part, g->cur, g->term0);
+                }
+                PG_FINALLY();
+                {
+                    replicate_release(&g->ctx);
+                }
+                PG_END_TRY();
+            }
+        }
+        rs_register_want(&g->ctx, g->cur);
+    }
+    rs_kick();
+
+    /* ④ 等各组提交点覆盖本事务的记录 */
+    ConditionVariablePrepareToSleep(&RaftGroups->stream_cv);
+    for (;;)
+    {
+        bool all_done = true;
+
+        for (i = 0; i < ng; i++)
+        {
+            int st;
+
+            if (gs[i].done)
+                continue;
+            st = rs_covered(&gs[i].ctx, gs[i].cur, gs[i].term0);
+            if (st == 1)
+            {
+                gs[i].done = true;
+                continue;
+            }
+            all_done = false;
+            if (st < 0)
+            {
+                fail_why = "本节点已不是该分区组的 leader（或任期已变）";
+                fail_i = i;
+            }
+        }
+        if (all_done || fail_why != NULL)
+            break;
+        if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), RM_PIPE_WAIT_MS))
+        {
+            fail_why = "等多数派确认超时";
+            for (i = 0; i < ng; i++)
+                if (!gs[i].done)
+                    fail_i = i;
+            break;
+        }
+        (void) ConditionVariableTimedSleep(&RaftGroups->stream_cv, 20, PG_WAIT_EXTENSION);
+        CHECK_FOR_INTERRUPTS();
+    }
+    ConditionVariableCancelSleep();
+    {
+        uint64 us = (uint64) (GetCurrentTimestamp() - start);
+        uint64 mx = pg_atomic_read_u64(&RaftGroups->stream_wait_max);
+
+        pg_atomic_fetch_add_u64(&RaftGroups->stream_wait_n, 1);
+        pg_atomic_fetch_add_u64(&RaftGroups->stream_wait_us, us);
+        while (us > mx && !pg_atomic_compare_exchange_u64(&RaftGroups->stream_wait_max, &mx, us))
+            ;
+    }
+
+    if (fail_why != NULL && fail_i >= 0)
+    {
+        Oid     fp = gs[fail_i].part;
+        int64   fg = gs[fail_i].gid;
+        int64   fc = gs[fail_i].cur;
+
+        if (failed_out != NULL)
+            for (i = 0; i < ng; i++)
+                if (!gs[i].done)
+                    for (k = 0; k < nparts; k++)
+                        if (parts[k] == gs[i].part)
+                            failed_out[k] = true;
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派（%s）",
+                        fp, (long long) fg, (long long) fc, fail_why)));
+    }
+    MemoryContextSwitchTo(oldcxt);
+    MemoryContextDelete(rmcxt);
+}
+
+/* ---------------------------- 复制管理进程 ---------------------------- */
+
+typedef struct RsSent
+{
+    int64       gid;
+    int64       first;
+    int64       last;
+    int64       term;           /* 发出时的 leader 任期 */
+    int64       eterm;          /* 这一段条目的任期 */
+    uint64      gen;            /* 发出时的截断代数 */
+} RsSent;
+
+typedef struct RsBatchQ
+{
+    int         ng;
+    int         bytes;
+    RsSent     *s;
+    TimestampTz sent_at;
+    bool        stmt_done;
+    bool        null_seen;
+    bool        failed;
+    char       *ack;            /* 语句结果（"gid term ok last;..."）；等 Sync（隐式事务提交）回来才生效 */
+} RsBatchQ;
+
+typedef struct RsPeerSt
+{
+    PGconn     *conn;
+    int         state;          /* 0 = 未连，1 = 连接中，2 = 就绪 */
+    TimestampTz retry_at;
+    RsBatchQ    q[RS_QMAX];
+    int         qh;
+    int         qn;
+    int64       qbytes;         /* 在途批的字节合计 */
+    int64       st_n, st_sum_us, st_max_us, st_ent;    /* 10 s 统计：批数、往返合计 / 最大、条数 */
+} RsPeerSt;
+
+static RsPeerSt     rs_peers[RAFT_MAX_PEERS];
+static MemoryContext rs_cxt = NULL;
+static int64        rs_oid_gid[RS_LOCAL_OID_CAP];
+static Oid          rs_oid_val[RS_LOCAL_OID_CAP];
+
+static Oid
+rs_local_oid(int gidx, int64 gid)
+{
+    if (gidx < 0 || gidx >= RS_LOCAL_OID_CAP)
+        return InvalidOid;
+    return (rs_oid_gid[gidx] == gid) ? rs_oid_val[gidx] : InvalidOid;
+}
+
+static void
+rs_on_exit(int code, Datum arg)
+{
+    if (RaftGroups != NULL && RaftGroups->stream_pid == MyProcPid)
+    {
+        RaftGroups->stream_pid = 0;
+        RaftGroups->stream_latch = NULL;
+    }
+}
+
+/* 某副本连接失败：在途批次的组 next_index 退回 match+1，断开，过一会儿重连 */
+static void
+rs_peer_fail(int slot, const char *why)
+{
+    RsPeerSt   *ps = &rs_peers[slot];
+    static TimestampTz last_warn = 0;
+
+    if (last_warn == 0 || TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 5000))
+    {
+        last_warn = GetCurrentTimestamp();
+        elog(WARNING, "pg_raft: 复制流到节点 %d 断开（%s），重连后从 match+1 重发",
+             peers[slot].node_id, why);
+    }
+    while (ps->qn > 0)
+    {
+        RsBatchQ   *b = &ps->q[ps->qh];
+        int         j;
+
+        for (j = 0; j < b->ng; j++)
+        {
+            RaftGroupCtx ctx;
+
+            if (!raft_group_ctx(b->s[j].gid, &ctx))
+                continue;
+            SpinLockAcquire(&ctx.log->mutex);
+            if (ctx.log->peer_next_index[slot] > ctx.log->peer_match_index[slot] + 1)
+                ctx.log->peer_next_index[slot] = ctx.log->peer_match_index[slot] + 1;
+            SpinLockRelease(&ctx.log->mutex);
+        }
+        if (b->s != NULL)
+            pfree(b->s);
+        b->s = NULL;
+        if (b->ack != NULL)
+            pfree(b->ack);
+        b->ack = NULL;
+        ps->qh = (ps->qh + 1) % RS_QMAX;
+        ps->qn--;
+    }
+    if (ps->conn != NULL)
+        PQfinish(ps->conn);
+    ps->conn = NULL;
+    ps->state = 0;
+    ps->qh = 0;
+    ps->qbytes = 0;
+    ps->retry_at = GetCurrentTimestamp() + 500 * 1000;
+}
+
+/* 连接状态机（非阻塞建连，挂掉的副本不拖住别的副本） */
+static void
+rs_peer_connect(int slot)
+{
+    RsPeerSt   *ps = &rs_peers[slot];
+
+    if (ps->state == 0)
+    {
+        char conninfo[512];
+
+        if (GetCurrentTimestamp() < ps->retry_at)
+            return;
+        snprintf(conninfo, sizeof(conninfo),
+                 "host=%s port=%d dbname=postgres user=postgres "
+                 "connect_timeout=%d application_name=pg_raft_stream",
+                 peers[slot].host, peers[slot].port, pg_raft_peer_connect_timeout_s);
+        ps->conn = PQconnectStart(conninfo);
+        if (ps->conn == NULL || PQstatus(ps->conn) == CONNECTION_BAD)
+        {
+            rs_peer_fail(slot, "建连失败");
+            return;
+        }
+        ps->state = 1;
+        ps->retry_at = GetCurrentTimestamp() + (int64) pg_raft_peer_connect_timeout_s * 1000000;
+    }
+    if (ps->state == 1)
+    {
+        PostgresPollingStatusType st = PQconnectPoll(ps->conn);
+
+        if (st == PGRES_POLLING_OK)
+        {
+            if (PQsetnonblocking(ps->conn, 1) != 0 || PQenterPipelineMode(ps->conn) != 1)
+            {
+                rs_peer_fail(slot, "进入管道模式失败");
+                return;
+            }
+            ps->state = 2;
+        }
+        else if (st == PGRES_POLLING_FAILED ||
+                 GetCurrentTimestamp() > ps->retry_at)
+            rs_peer_fail(slot, PQerrorMessage(ps->conn));
+    }
+}
+
+/* 一条回包落到一组上 */
+static void
+rs_apply_ack(int slot, const RsSent *s, int64 rt, int ok, int64 flast, int64 acc)
+{
+    RaftGroupCtx ctx;
+    bool         same;
+
+    if (!raft_group_ctx(s->gid, &ctx))
+        return;
+    peer_stamp(&ctx, slot, true);
+    if (rt > s->term)
+    {
+        step_down_if_higher(&ctx, rt);
+        return;
+    }
+    SpinLockAcquire(&ctx.cons->mutex);
+    same = (ctx.cons->state == RAFT_LEADER && ctx.cons->current_term == s->term);
+    SpinLockRelease(&ctx.cons->mutex);
+    if (!same)
+        return;
+    SpinLockAcquire(&ctx.log->mutex);
+    /* 只收下了前缀（环满 / 中途被拒）：前缀照常算确认，next 退到前缀之后 */
+    if (!ok && acc >= s->first && acc < s->last)
+    {
+        int64         m = Min(acc, ctx.log->last_log_index);
+        RaftLogEntry *le = (m > 0) ? log_slot(&ctx, m) : NULL;
+        bool          out_of_ring = (le != NULL && le->index != m &&
+                                     m <= ctx.log->last_log_index - RAFT_LOG_CAPACITY + 1 &&
+                                     m <= ctx.log->last_applied);
+
+        if (le != NULL && (out_of_ring || (le->index == m && le->term == s->eterm)) &&
+            ctx.log->trunc_gen == s->gen && m > ctx.log->peer_match_index[slot])
+            ctx.log->peer_match_index[slot] = m;
+        if (ctx.log->peer_next_index[slot] > acc + 1)
+            ctx.log->peer_next_index[slot] = Max(acc + 1, ctx.log->peer_match_index[slot] + 1);
+    }
+    else if (ok)
+    {
+        int64         m = Min(s->last, ctx.log->last_log_index);
+        RaftLogEntry *le = (m > 0) ? log_slot(&ctx, m) : NULL;
+        /* 环外回读续发的那段：在 leader 上已 apply（已提交），槽位早已复用，不必再比任期 */
+        bool          out_of_ring = (le != NULL && le->index != m &&
+                                     m <= ctx.log->last_log_index - RAFT_LOG_CAPACITY + 1 &&
+                                     m <= ctx.log->last_applied);
+
+        if (le != NULL && (out_of_ring || (le->index == m && le->term == s->eterm)) &&
+            ctx.log->trunc_gen == s->gen)
+        {
+            if (m > ctx.log->peer_match_index[slot])
+                ctx.log->peer_match_index[slot] = m;
+            if (ctx.log->peer_next_index[slot] < m + 1)
+                ctx.log->peer_next_index[slot] = m + 1;
+        }
+    }
+    else if (flast < 0)
+    {
+        /* 这一批没送达 / 没提交（语句或提交报错）：从这一批开头重发 */
+        int64 nn = Max(ctx.log->peer_match_index[slot] + 1, s->first);
+
+        if (ctx.log->peer_next_index[slot] > nn)
+            ctx.log->peer_next_index[slot] = nn;
+    }
+    else
+    {
+        int64 nn = Max(ctx.log->peer_match_index[slot] + 1, Min(flast + 1, s->first));
+
+        if (nn >= s->first)
+            nn = Max(ctx.log->peer_match_index[slot] + 1, s->first - 32);
+        if (nn < 1)
+            nn = 1;
+        if (ctx.log->peer_next_index[slot] > nn)
+            ctx.log->peer_next_index[slot] = nn;
+    }
+    SpinLockRelease(&ctx.log->mutex);
+}
+
+/* 收某副本已到的回包（按序） */
+static void
+rs_peer_receive(int slot)
+{
+    RsPeerSt   *ps = &rs_peers[slot];
+
+    if (ps->state != 2 || ps->qn == 0)
+        return;
+    if (!PQconsumeInput(ps->conn))
+    {
+        rs_peer_fail(slot, PQerrorMessage(ps->conn));
+        return;
+    }
+    while (ps->qn > 0)
+    {
+        RsBatchQ   *b = &ps->q[ps->qh];
+        PGresult   *r;
+        ExecStatusType st;
+
+        if (PQisBusy(ps->conn))
+            break;
+        r = PQgetResult(ps->conn);
+        if (r == NULL)
+        {
+            if (b->stmt_done && !b->null_seen)
+            {
+                b->null_seen = true;
+                continue;
+            }
+            break;
+        }
+        st = PQresultStatus(r);
+        if (st == PGRES_PIPELINE_SYNC)
+        {
+            /*
+             * Sync 回来 = 副本上隐式事务已提交（raft_log 行随 WAL 落盘；分区流字节在语句里已 fsync）。
+             * 结果行在 Sync 之前就到了，那时还没提交 —— 只能到这里才算确认。
+             */
+            int j;
+
+            PQclear(r);
+            if (!b->failed && b->ack != NULL)
+            {
+                const char *v = b->ack;
+
+                j = 0;
+                while (*v && j < b->ng)
+                {
+                    long long gid, rt, last, acc;
+                    int       ok, used = 0;
+
+                    if (sscanf(v, "%lld %lld %d %lld %lld;%n", &gid, &rt, &ok, &last, &acc, &used) != 5 || used == 0)
+                        break;
+                    v += used;
+                    if (gid == b->s[j].gid)
+                        rs_apply_ack(slot, &b->s[j], rt, ok, last, acc);
+                    j++;
+                }
+            }
+            else
+            {
+                for (j = 0; j < b->ng; j++)
+                    rs_apply_ack(slot, &b->s[j], 0, 0, -1, 0);
+            }
+            {
+                int64 rtt = GetCurrentTimestamp() - b->sent_at;
+                int   jj;
+
+                ps->st_n++;
+                ps->st_sum_us += rtt;
+                if (rtt > ps->st_max_us)
+                    ps->st_max_us = rtt;
+                for (jj = 0; jj < b->ng && b->s != NULL; jj++)
+                    ps->st_ent += b->s[jj].last - b->s[jj].first + 1;
+            }
+            if (b->ack != NULL)
+                pfree(b->ack);
+            b->ack = NULL;
+            if (b->s != NULL)
+                pfree(b->s);
+            b->s = NULL;
+            ps->qbytes -= b->bytes;
+            ps->qh = (ps->qh + 1) % RS_QMAX;
+            ps->qn--;
+            continue;
+        }
+        if (st == PGRES_TUPLES_OK && !b->stmt_done && PQntuples(r) == 1)
+        {
+            b->stmt_done = true;
+            b->ack = MemoryContextStrdup(rs_cxt, PQgetvalue(r, 0, 0));
+        }
+        else
+        {
+            static TimestampTz last_warn = 0;
+
+            b->stmt_done = true;
+            b->failed = true;
+            if (last_warn == 0 || TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 5000))
+            {
+                last_warn = GetCurrentTimestamp();
+                elog(WARNING, "pg_raft: 复制流到节点 %d 的一批失败（%s）：%s",
+                     peers[slot].node_id, PQresStatus(st), PQresultErrorMessage(r));
+            }
+        }
+        PQclear(r);
+    }
+    if (ps->qn > 0 &&
+        TimestampDifferenceExceeds(ps->q[ps->qh].sent_at, GetCurrentTimestamp(), 15000))
+        rs_peer_fail(slot, "一批 15 s 未回");
+}
+
+/*
+ * 副本落后到内存环之外：从 leader 自己的 raft_log 行回读 [nx-1, nx+maxn-1]（同 PG 流复制
+ * 从磁盘上的 WAL 段回读给慢备库）。只取从 nx 起连续、同任期、全是数据条目的一段；
+ * *prev_term 填 nx-1 那条的任期。返回条数（0 = 这回取不到）。在本进程自己的短事务里做。
+ */
+static int
+rs_fetch_sql(int64 gid, int64 nx, int maxn, int64 *prev_term, int64 *eterm,
+             int64 *eidx, char **epl)
+{
+    MemoryContext   old = CurrentMemoryContext;
+    StringInfoData  sql;
+    int             n = 0;
+    uint64          r;
+
+    StartTransactionCommand();
+    PushActiveSnapshot(GetTransactionSnapshot());
+    if (SPI_connect() != SPI_OK_CONNECT)
+    {
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+        MemoryContextSwitchTo(old);
+        return 0;
+    }
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT log_index, term, op_type, payload::text FROM partdist.raft_log "
+                     "WHERE group_id = %lld AND log_index >= %lld AND log_index <= %lld "
+                     "ORDER BY log_index",
+                     (long long) gid, (long long) Max(nx - 1, 1), (long long) (nx + maxn - 1));
+    *prev_term = 0;
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+    {
+        int64 expect = (nx > 1) ? nx - 1 : nx;
+
+        for (r = 0; r < SPI_processed; r++)
+        {
+            HeapTuple   tup = SPI_tuptable->vals[r];
+            TupleDesc   td = SPI_tuptable->tupdesc;
+            bool        isnull;
+            int64       li = DatumGetInt64(SPI_getbinval(tup, td, 1, &isnull));
+            int64       te = DatumGetInt64(SPI_getbinval(tup, td, 2, &isnull));
+            char       *op = SPI_getvalue(tup, td, 3);
+            char       *pl = SPI_getvalue(tup, td, 4);
+
+            if (li != expect)
+                break;          /* 不连续（行缺）：取到这里为止 */
+            expect++;
+            if (li == nx - 1)
+            {
+                *prev_term = te;
+                continue;
+            }
+            if (op == NULL || pl == NULL || strcmp(op, RAFT_OP_PARWAL) != 0 ||
+                (n > 0 && te != *eterm) || strlen(pl) >= RAFT_PAYLOAD_MAX)
+                break;
+            if (n == 0)
+                *eterm = te;
+            eidx[n] = li;
+            epl[n] = MemoryContextStrdup(old, pl);
+            n++;
+        }
+        /* nx-1 那条必须在（nx = 1 时没有 prev） */
+        if (nx > 1 && *prev_term == 0)
+            n = 0;
+    }
+    pfree(sql.data);
+    SPI_finish();
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+    MemoryContextSwitchTo(old);
+    return n;
+}
+
+/* 给某副本打一批并发出 */
+static void
+rs_peer_send(int slot)
+{
+    RsPeerSt       *ps = &rs_peers[slot];
+    StringInfoData  msg;
+    RsSent         *sent;
+    int             ng = 0;
+    int             gi, gstep;
+    int             ngroups_pos;
+    int             msg_entries = 0;
+    int             batch_max = Min(pg_raft_stream_batch_entries, RAFT_LOG_CAPACITY / 2);
+    int             nsql = 0;
+    static int      rr = 0;
+
+    if (ps->state != 2 || ps->qn >= Min(pg_raft_stream_inflight, RS_QMAX) ||
+        ps->qbytes >= RS_PEER_MAX_INFLIGHT_BYTES)
+        return;
+
+    initStringInfo(&msg);
+    pq_sendint32(&msg, RS_MSG_MAGIC);
+    pq_sendint32(&msg, pg_raft_node_id);
+    ngroups_pos = msg.len;
+    pq_sendint32(&msg, 0);
+    sent = (RsSent *) MemoryContextAlloc(rs_cxt, sizeof(RsSent) * RAFT_MAX_GROUPS);
+
+    rr = (rr + 1) % Max(RAFT_MAX_GROUPS, 1);       /* 轮转起点：消息装满时别总饿着排在后面的组 */
+    for (gstep = 0; gstep < RAFT_MAX_GROUPS; gstep++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[(rr + gstep) % RAFT_MAX_GROUPS];
+        RaftGroupCtx    ctx;
+        int64           term;
+        bool            leader;
+        int64           last, nx, end, prev_idx, prev_term = 0, eterm = 0, floor_idx, commit_now;
+        int64           k, cnt;
+        int64          *eidx;
+        char          **epl;
+        Oid             loid;
+        uint64          gen;
+        bool            ok = true;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        SpinLockAcquire(&ctx.cons->mutex);
+        leader = (ctx.cons->state == RAFT_LEADER);
+        term = ctx.cons->current_term;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!leader || !peer_in_group(&ctx, slot))
+            continue;
+        gi = (rr + gstep) % RAFT_MAX_GROUPS;
+        loid = rs_local_oid(gi, g->group_id);
+        if (loid == InvalidOid)
+            continue;
+
+        SpinLockAcquire(&ctx.log->mutex);
+        if (!ctx.log->repl_inited)
+        {
+            int64 nxi = ctx.log->last_log_index + 1;
+            int   j;
+
+            for (j = 0; j < RAFT_MAX_PEERS; j++)
+            {
+                ctx.log->peer_next_index[j] = nxi;
+                ctx.log->peer_match_index[j] = 0;
+            }
+            ctx.log->repl_inited = true;
+            ctx.log->leader_durable_index = ctx.log->last_log_index;
+            ctx.log->leader_self_hole = 0;
+        }
+        last = ctx.log->last_log_index;
+        nx = ctx.log->peer_next_index[slot];
+        commit_now = ctx.log->commit_index;
+        SpinLockRelease(&ctx.log->mutex);
+        if (msg_entries >= RS_MSG_MAX_ENTRIES || msg.len >= RS_MSG_MAX_BYTES)
+            break;
+        if (nx > last || nx <= 0)
+            continue;
+        floor_idx = last - RAFT_LOG_CAPACITY + 2;
+        prev_idx = nx - 1;
+        if (nx < floor_idx)
+        {
+            /*
+             * 落后超出内存环：从 leader 的 raft_log 行回读续发（同 PG 流复制从 WAL 段回读给慢备库）。
+             * 每条消息至多带一组、≤256 条这样的回读：副本按序处理整条消息，追历史的大段会挡在新提交前面。
+             * 环外的条目在 leader 上必然已 apply（环槽位要 apply 后才复用），即已提交，不会再被截。
+             */
+            if (nsql >= 1)
+                continue;
+            nsql++;
+            cnt = Min(Min(batch_max, 256), RS_MSG_MAX_ENTRIES - msg_entries);
+            if (cnt <= 0)
+                continue;
+            eidx = (int64 *) palloc(sizeof(int64) * cnt);
+            epl = (char **) palloc(sizeof(char *) * cnt);
+            SpinLockAcquire(&ctx.log->mutex);
+            gen = ctx.log->trunc_gen;
+            SpinLockRelease(&ctx.log->mutex);
+            cnt = rs_fetch_sql(g->group_id, nx, (int) cnt, &prev_term, &eterm, eidx, epl);
+            if (cnt <= 0)
+                continue;
+        }
+        else
+        {
+            /*
+             * 窗口：不发超出"提交点 + 环容量 - 64"的条目。副本只能按它知道的提交点 apply 腾环
+             * （批内环满时就地 apply），发得再靠前它的环会满、只能拒收。
+             */
+            end = Min(last, nx + batch_max - 1);
+            end = Min(end, Max(commit_now, ctx.log->last_applied) + RAFT_LOG_CAPACITY - 64);
+            end = Min(end, nx + (RS_MSG_MAX_ENTRIES - msg_entries) - 1);
+            if (end < nx)
+                continue;
+            cnt = end - nx + 1;
+            eidx = (int64 *) palloc(sizeof(int64) * cnt);
+            epl = (char **) palloc(sizeof(char *) * cnt);
+            for (k = 0; k < cnt; k++)
+                epl[k] = (char *) palloc(RAFT_PAYLOAD_MAX);
+
+            /* 锁下按槽位拷：同任期、全是数据条目的一段（遇到别的就停） */
+            SpinLockAcquire(&ctx.log->mutex);
+            gen = ctx.log->trunc_gen;
+            if (prev_idx > 0)
+            {
+                RaftLogEntry *pe = log_slot(&ctx, prev_idx);
+
+                if (pe->index == prev_idx)
+                    prev_term = pe->term;
+                else if (prev_idx == ctx.log->base_index)
+                    prev_term = ctx.log->base_term;
+                else
+                    ok = false;
+            }
+            for (k = 0; ok && k < cnt; k++)
+            {
+                RaftLogEntry *x = log_slot(&ctx, nx + k);
+
+                if (x->index != nx + k || strcmp(x->op_type, RAFT_OP_PARWAL) != 0)
+                    break;
+                if (k == 0)
+                    eterm = x->term;
+                else if (x->term != eterm)
+                    break;
+                eidx[k] = x->index;
+                strlcpy(epl[k], x->payload, RAFT_PAYLOAD_MAX);
+            }
+            cnt = ok ? k : 0;
+            SpinLockRelease(&ctx.log->mutex);
+            if (cnt <= 0)
+                continue;
+        }
+
+        /* 字节：按 plsn 从缓存 / 段文件取；取不到就截在那里 */
+        {
+            int64   startpos = msg.len;
+            int64   wrote = 0;
+
+            pq_sendint64(&msg, g->group_id);
+            pq_sendint64(&msg, term);
+            pq_sendint64(&msg, prev_idx);
+            pq_sendint64(&msg, prev_term);
+            {
+                int64 lc;
+
+                SpinLockAcquire(&ctx.log->mutex);
+                lc = ctx.log->commit_index;
+                SpinLockRelease(&ctx.log->mutex);
+                pq_sendint64(&msg, lc);
+            }
+            pq_sendint64(&msg, eterm);
+            {
+                int npos = msg.len;
+
+                pq_sendint32(&msg, 0);
+                for (k = 0; k < cnt; k++)
+                {
+                    XLogRecPtr  orig;
+                    int         rmid, info, flags;
+                    int64       gxid;
+                    char       *data = NULL;
+                    uint32      dlen = 0;
+                    int64       plsn = entry_partition_lsn(epl[k]);
+                    int         plen = (int) strlen(epl[k]);
+                    bool        owned = true;
+
+                    if (plsn <= 0 ||
+                        !rs_read_record_c(loid, (uint64) plsn, &orig, &rmid, &info, &flags,
+                                          &gxid, &data, &dlen, &owned))
+                        break;
+                    /* 防御：一条记录不该大过 64 MB（读到坏长度时宁可这一轮不发） */
+                    if (dlen > 64 * 1024 * 1024)
+                    {
+                        static TimestampTz last_warn = 0;
+
+                        if (last_warn == 0 ||
+                            TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 10000))
+                        {
+                            last_warn = GetCurrentTimestamp();
+                            elog(WARNING, "pg_raft: 复制流读到组 %lld plsn=%lld 的记录长度 %u 不合理，这一轮不发",
+                                 (long long) g->group_id, (long long) plsn, (unsigned) dlen);
+                        }
+                        if (data != NULL && owned)
+                            pfree(data);
+                        break;
+                    }
+                    pq_sendint64(&msg, eidx[k]);
+                    pq_sendint32(&msg, plen);
+                    pq_sendbytes(&msg, epl[k], plen);
+                    pq_sendint32(&msg, (int) dlen);
+                    if (dlen > 0)
+                        pq_sendbytes(&msg, data, (int) dlen);
+                    if (data != NULL && owned)
+                        pfree(data);
+                    wrote++;
+                    if (msg.len >= RS_MSG_MAX_BYTES)
+                        break;
+                }
+                if (wrote == 0)
+                {
+                    msg.len = (int) startpos;       /* 一条都没取到：撤掉这一组 */
+                    msg.data[msg.len] = '\0';
+                    continue;
+                }
+                {
+                    uint32 nbe = pg_hton32((uint32) wrote);
+
+                    memcpy(msg.data + npos, &nbe, 4);
+                }
+            }
+            sent[ng].gid = g->group_id;
+            sent[ng].first = nx;
+            sent[ng].last = nx + wrote - 1;
+            sent[ng].term = term;
+            sent[ng].eterm = eterm;
+            sent[ng].gen = gen;
+            ng++;
+            msg_entries += (int) wrote;
+            /* 乐观推进：管道里后面的批接着往后发 */
+            SpinLockAcquire(&ctx.log->mutex);
+            if (ctx.log->peer_next_index[slot] == nx)
+                ctx.log->peer_next_index[slot] = nx + wrote;
+            SpinLockRelease(&ctx.log->mutex);
+        }
+    }
+
+    if (ng == 0)
+    {
+        pfree(sent);
+        pfree(msg.data);
+        return;
+    }
+    {
+        uint32 nbe = pg_hton32((uint32) ng);
+
+        memcpy(msg.data + ngroups_pos, &nbe, 4);
+    }
+    {
+        const char *vals[1];
+        int         lens[1];
+        int         fmts[1];
+        Oid         types[1];
+        RsBatchQ   *b;
+
+        if (msg.len > 2 * RS_MSG_MAX_BYTES)
+            elog(LOG, "pg_raft: 复制流到节点 %d 的一批 %d 字节（%d 组），超过预期上限",
+                 peers[slot].node_id, msg.len, ng);
+        vals[0] = msg.data;
+        lens[0] = msg.len;
+        fmts[0] = 1;
+        types[0] = BYTEAOID;
+        if (PQsendQueryParams(ps->conn, "SELECT partdist.pg_raft_stream_apply($1)", 1,
+                              types, vals, lens, fmts, 0) != 1 ||
+            PQpipelineSync(ps->conn) != 1)
+        {
+            int j;
+
+            /* 没发出去：乐观推进退回 */
+            for (j = 0; j < ng; j++)
+            {
+                RaftGroupCtx ctx;
+
+                if (!raft_group_ctx(sent[j].gid, &ctx))
+                    continue;
+                SpinLockAcquire(&ctx.log->mutex);
+                if (ctx.log->peer_next_index[slot] > sent[j].first)
+                    ctx.log->peer_next_index[slot] = sent[j].first;
+                SpinLockRelease(&ctx.log->mutex);
+            }
+            pfree(sent);
+            rs_peer_fail(slot, PQerrorMessage(ps->conn));
+            return;
+        }
+        b = &ps->q[(ps->qh + ps->qn) % RS_QMAX];
+        b->ng = ng;
+        b->s = sent;
+        b->sent_at = GetCurrentTimestamp();
+        b->stmt_done = false;
+        b->null_seen = false;
+        b->failed = false;
+        b->ack = NULL;
+        b->bytes = msg.len;
+        ps->qbytes += msg.len;
+        ps->qn++;
+    }
+    pfree(msg.data);
+}
+
+/* 本节点当主的数据组：推进提交点（leader 自投票只算到 leader_durable_index）。返回推进了的组数 */
+static int
+rs_advance_all(bool *advanced)
+{
+    int gi;
+    int n = 0;
+
+    for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        RaftGroupCtx    ctx;
+        bool            leader;
+        int64           term, nc;
+
+        advanced[gi] = false;
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        SpinLockAcquire(&ctx.cons->mutex);
+        leader = (ctx.cons->state == RAFT_LEADER);
+        term = ctx.cons->current_term;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!leader)
+            continue;
+        SpinLockAcquire(&ctx.log->mutex);
+        nc = compute_new_commit_index(&ctx, term);
+        if (nc > ctx.log->commit_index)
+        {
+            ctx.log->commit_index = nc;
+            advanced[gi] = true;
+            n++;
+        }
+        SpinLockRelease(&ctx.log->mutex);
+    }
+    if (n > 0)
+        ConditionVariableBroadcast(&RaftGroups->stream_cv);
+    return n;
+}
+
+/*
+ * 本进程的本地事务：补本地分区号、把 leader 自己的 raft_log 行写下并提交（之后才推进
+ * leader_durable_index）、对提交点前移 / apply 落后的组做 hardstate、标记与 apply。
+ */
+static void
+rs_local_work(const bool *advanced)
+{
+    int             gi;
+    int             nrows = 0;
+    int64          *row_to;
+    int64          *row_term_chk;
+    bool            spi_owned;
+    Datum          *d_gid, *d_idx, *d_term, *d_op, *d_pl;
+    static SPIPlanPtr rows_plan = NULL;
+
+    row_to = (int64 *) palloc0(sizeof(int64) * RAFT_MAX_GROUPS);
+    row_term_chk = (int64 *) palloc0(sizeof(int64) * RAFT_MAX_GROUPS);
+    d_gid = (Datum *) palloc(sizeof(Datum) * RS_ROWS_MAX);
+    d_idx = (Datum *) palloc(sizeof(Datum) * RS_ROWS_MAX);
+    d_term = (Datum *) palloc(sizeof(Datum) * RS_ROWS_MAX);
+    d_op = (Datum *) palloc(sizeof(Datum) * RS_ROWS_MAX);
+    d_pl = (Datum *) palloc(sizeof(Datum) * RS_ROWS_MAX);
+
+    StartTransactionCommand();
+    (void) set_config_option("lock_timeout", "500", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_LOCAL, true, 0, false);
+    PushActiveSnapshot(GetTransactionSnapshot());
+    if (!groups_restored)
+        restore_groups_if_needed();
+    if (!raft_persist_spi_begin(&spi_owned) || !raft_log_table_ready())
+    {
+        if (spi_owned)
+            raft_persist_spi_end(spi_owned);
+        PopActiveSnapshot();
+        CommitTransactionCommand();
+        return;
+    }
+    raft_persist_spi_end(spi_owned);
+
+    for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        RaftGroupCtx    ctx;
+        bool            leader;
+        int64           from, to, ix;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        SpinLockAcquire(&ctx.cons->mutex);
+        leader = (ctx.cons->state == RAFT_LEADER);
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!leader)
+            continue;
+        if (gi < RS_LOCAL_OID_CAP && rs_oid_gid[gi] != g->group_id)
+        {
+            int64 lo = group_local_partition(&ctx);
+
+            if (lo > 0)
+            {
+                rs_oid_gid[gi] = g->group_id;
+                rs_oid_val[gi] = (Oid) lo;
+            }
+        }
+        SpinLockAcquire(&ctx.log->mutex);
+        if (!ctx.log->repl_inited)
+        {
+            SpinLockRelease(&ctx.log->mutex);
+            continue;               /* 发送阶段会初始化（并把当选时的日志视为已落盘） */
+        }
+        from = (ctx.log->leader_self_hole > 0) ? ctx.log->leader_self_hole
+                                               : ctx.log->leader_durable_index + 1;
+        to = ctx.log->last_log_index;
+        if (from < to - RAFT_LOG_CAPACITY + 2)
+            from = to - RAFT_LOG_CAPACITY + 2;
+        if (to - from + 1 > RS_ROWS_MAX - nrows)
+            to = from + (RS_ROWS_MAX - nrows) - 1;
+        SpinLockRelease(&ctx.log->mutex);
+        for (ix = from; ix <= to; ix++)
+        {
+            RaftLogEntry e;
+            bool         got;
+
+            SpinLockAcquire(&ctx.log->mutex);
+            got = log_get_entry_locked(&ctx, ix, &e);
+            SpinLockRelease(&ctx.log->mutex);
+            if (!got)
+                break;
+            d_gid[nrows] = Int64GetDatum(g->group_id);
+            d_idx[nrows] = Int64GetDatum(ix);
+            d_term[nrows] = Int64GetDatum(e.term);
+            d_op[nrows] = CStringGetTextDatum(e.op_type);
+            d_pl[nrows] = CStringGetTextDatum(e.payload);
+            nrows++;
+            row_to[gi] = ix;
+            row_term_chk[gi] = e.term;
+        }
+        if (nrows >= RS_ROWS_MAX)
+            break;
+    }
+    /* 预备语句 + 数组参数：解析 / 规划成本与行数无关（原来拼一条几千行的 VALUES 文本，单次上百毫秒） */
+    if (nrows > 0 && raft_persist_spi_begin(&spi_owned))
+    {
+        Datum   vals[5];
+        char    nulls[6] = "     ";
+
+        if (rows_plan == NULL)
+        {
+            Oid         argtypes[5] = {INT8ARRAYOID, INT8ARRAYOID, INT8ARRAYOID,
+                                       TEXTARRAYOID, TEXTARRAYOID};
+            SPIPlanPtr  pl = SPI_prepare("INSERT INTO partdist.raft_log "
+                                         "(group_id, log_index, term, op_type, payload, committed) "
+                                         "SELECT u.g, u.i, u.t, u.o, u.p::jsonb, false "
+                                         "FROM unnest($1, $2, $3, $4, $5) AS u(g, i, t, o, p) "
+                                         "ON CONFLICT (group_id, log_index) DO UPDATE SET "
+                                         "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
+                                         "payload = EXCLUDED.payload, "
+                                         "committed = partdist.raft_log.committed OR EXCLUDED.committed",
+                                         5, argtypes);
+
+            if (pl == NULL || SPI_keepplan(pl) != 0)
+                elog(ERROR, "pg_raft: 复制流预备 leader 日志行语句失败");
+            rows_plan = pl;
+        }
+        vals[0] = PointerGetDatum(construct_array(d_gid, nrows, INT8OID, 8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+        vals[1] = PointerGetDatum(construct_array(d_idx, nrows, INT8OID, 8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+        vals[2] = PointerGetDatum(construct_array(d_term, nrows, INT8OID, 8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+        vals[3] = PointerGetDatum(construct_array(d_op, nrows, TEXTOID, -1, false, TYPALIGN_INT));
+        vals[4] = PointerGetDatum(construct_array(d_pl, nrows, TEXTOID, -1, false, TYPALIGN_INT));
+        if (SPI_execute_plan(rows_plan, vals, nulls, false, 0) != SPI_OK_INSERT)
+            elog(ERROR, "pg_raft: 复制流写 leader 日志行失败");
+        raft_persist_spi_end(spi_owned);
+    }
+    PopActiveSnapshot();
+    CommitTransactionCommand();         /* 落盘：此后这些行才算 leader 自己的一票 */
+
+    for (gi = 0; nrows > 0 && gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        RaftLogEntry   *le;
+
+        if (row_to[gi] <= 0 || !g->in_use)
+            continue;
+        SpinLockAcquire(&g->log.mutex);
+        le = &g->log.ring[(row_to[gi] - 1) % RAFT_LOG_CAPACITY];
+        if (le->index == row_to[gi] && le->term == row_term_chk[gi])
+        {
+            if (row_to[gi] > g->log.leader_durable_index)
+                g->log.leader_durable_index = row_to[gi];
+            g->log.leader_self_hole = 0;
+        }
+        SpinLockRelease(&g->log.mutex);
+    }
+
+    /* 提交点前移 / apply 落后的组：hardstate、标 committed、apply */
+    {
+        bool any = false;
+
+        for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+        {
+            RaftGroupState *g = &RaftGroups->groups[gi];
+
+            if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+                continue;
+            if (advanced[gi] || g->log.last_applied < g->log.commit_index)
+            {
+                any = true;
+                break;
+            }
+        }
+        if (!any)
+            return;
+    }
+    /*
+     * 每组一个短事务，且**绝不等行锁**（lock_timeout）：leader 的 apply 会登记 DTX 决议行，
+     * 而写同一行的发起事务此刻可能正等着本进程推进提交点 —— 在这里等它就是互等（实测管理进程
+     * 卡满 30 s、整节点所有组的复制随之停摆）。撞锁就跳过这一组，下一轮再来；提交点的推进
+     * 不依赖 apply（只有环满才依赖），那个事务提交后锁自然放开。
+     *
+     * 这一段只写可恢复的东西（hardstate 里的 commit/applied、raft_log.committed 标记、apply 游标）：
+     * 丢了由 leader 心跳 / 幂等 apply 补回（同 data_hardstate_lazy 的论证），提交不必等 WAL fsync。
+     * leader 自己的日志行在上一个事务里、照常同步提交。副本组的 apply 由复制流会话自己做。
+     */
+    for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        RaftGroupCtx    ctx;
+        int64           ci;
+        bool            leader;
+        MemoryContext   oldcxt = CurrentMemoryContext;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        SpinLockAcquire(&ctx.cons->mutex);
+        leader = (ctx.cons->state == RAFT_LEADER);
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!leader)
+            continue;
+        SpinLockAcquire(&ctx.log->mutex);
+        ci = ctx.log->commit_index;
+        SpinLockRelease(&ctx.log->mutex);
+        if (!advanced[gi] && ctx.log->last_applied >= ci)
+            continue;
+        /*
+         * leader 自己的日志行还没落到提交点：先别 apply（apply 之后环槽位就可能被复用，
+         * 那几条还没写进 raft_log 的条目就再也写不进去了）。多数派可以只靠两个副本凑齐，
+         * 所以提交点可能跑在 leader 自己的落盘点前面。
+         */
+        if (ctx.log->leader_durable_index < ci)
+            continue;
+        PG_TRY();
+        {
+            StartTransactionCommand();
+            (void) set_config_option("synchronous_commit", "off", PGC_USERSET, PGC_S_SESSION,
+                                     GUC_ACTION_LOCAL, true, 0, false);
+            (void) set_config_option("lock_timeout", "50", PGC_USERSET, PGC_S_SESSION,
+                                     GUC_ACTION_LOCAL, true, 0, false);
+            PushActiveSnapshot(GetTransactionSnapshot());
+            if (advanced[gi])
+                persist_hard_state_unlocked(&ctx);      /* 不逐行标 committed，理由同副本端（rs_batch_core） */
+            /*
+             * leader 自己的 apply 不写 follower_partition_map.applied_part_lsn（同老路径在提交事务里
+             * apply 时的 in_txn_replication 语义）：那一列是"本节点作为副本收到并回放到哪"，写在主上
+             * 会让本节点日后的升主前置误判"收了分区 WAL 却没有回放槽位"而拒绝升主（实测建组首轮选举
+             * 原主被拒、换别的节点当选，共置分片的主从此不在同一节点）。
+             */
+            in_txn_replication = true;
+            PG_TRY(2);
+            {
+                group_apply_pending(&ctx);
+            }
+            PG_FINALLY(2);
+            {
+                in_txn_replication = false;
+            }
+            PG_END_TRY(2);
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+        }
+        PG_CATCH();
+        {
+            static TimestampTz last_warn = 0;
+            ErrorData  *ed;
+
+            MemoryContextSwitchTo(oldcxt);
+            ed = CopyErrorData();
+            FlushErrorState();
+            AbortCurrentTransaction();
+            if (last_warn == 0 || TimestampDifferenceExceeds(last_warn, GetCurrentTimestamp(), 5000))
+            {
+                last_warn = GetCurrentTimestamp();
+                elog(LOG, "pg_raft: 复制流管理进程 apply 组 %lld 未成（下一轮重试）：%s",
+                     (long long) g->group_id, ed->message);
+            }
+            FreeErrorData(ed);
+        }
+        PG_END_TRY();
+        MemoryContextSwitchTo(oldcxt);
+    }
+}
+
+/* 管理进程替排不上认领位的提交者追加（want_plsn 已登记、还没进环的） */
+static void
+rs_append_wanted(void)
+{
+    int gi;
+
+    for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        RaftGroupCtx    ctx;
+        bool            leader;
+        int64           term, want;
+        Oid             loid;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP)
+            continue;
+        ctx.group_id = g->group_id;
+        ctx.g = g;
+        ctx.cons = &g->cons;
+        ctx.log = &g->log;
+        SpinLockAcquire(&ctx.cons->mutex);
+        leader = (ctx.cons->state == RAFT_LEADER);
+        term = ctx.cons->current_term;
+        SpinLockRelease(&ctx.cons->mutex);
+        if (!leader)
+            continue;
+        SpinLockAcquire(&ctx.log->mutex);
+        want = ctx.log->want_plsn;
+        SpinLockRelease(&ctx.log->mutex);
+        if (want <= 0 || rm_appended_plsn(&ctx) >= want)
+            continue;
+        loid = rs_local_oid(gi, g->group_id);
+        if (loid == InvalidOid)
+            continue;
+        raft_claim_purpose = RAFT_CLAIM_COMMIT_MANY;
+        if (!replicate_try_claim(&ctx))
+            continue;
+        PG_TRY();
+        {
+            (void) rs_append_upto(&ctx, loid, want, term);
+        }
+        PG_FINALLY();
+        {
+            replicate_release(&ctx);
+        }
+        PG_END_TRY();
+    }
+}
+
+/* 每 10 s 一行：各副本连接 / 在途批数，以及提交点落后最多的几组（诊断用） */
+static void
+rs_status_log(void)
+{
+    static TimestampTz last = 0;
+    StringInfoData     b;
+    int                slot, gi, k;
+    int64              worst_lag[3] = {0, 0, 0};
+    int                worst_gi[3] = {-1, -1, -1};
+
+    if (last != 0 && !TimestampDifferenceExceeds(last, GetCurrentTimestamp(), 10000))
+        return;
+    last = GetCurrentTimestamp();
+    initStringInfo(&b);
+    for (slot = 0; slot < n_peers; slot++)
+        if (peers[slot].node_id != pg_raft_node_id)
+        {
+            RsPeerSt *ps = &rs_peers[slot];
+
+            appendStringInfo(&b, "节点%d:%s/在途%d/批%lld 条%lld 往返均%lldms 最大%lldms ",
+                             peers[slot].node_id,
+                             ps->state == 2 ? "就绪" : ps->state == 1 ? "连接中" : "断开",
+                             ps->qn, (long long) ps->st_n, (long long) ps->st_ent,
+                             (long long) (ps->st_n > 0 ? ps->st_sum_us / ps->st_n / 1000 : 0),
+                             (long long) (ps->st_max_us / 1000));
+            ps->st_n = ps->st_sum_us = ps->st_max_us = ps->st_ent = 0;
+        }
+    for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+    {
+        RaftGroupState *g = &RaftGroups->groups[gi];
+        int64           lag;
+
+        if (!g->in_use || g->group_id == RAFT_CONTROL_GROUP || g->cons.state != RAFT_LEADER)
+            continue;
+        lag = g->log.last_log_index - g->log.commit_index;
+        for (k = 0; k < 3; k++)
+            if (lag > worst_lag[k])
+            {
+                int j;
+
+                for (j = 2; j > k; j--)
+                {
+                    worst_lag[j] = worst_lag[j - 1];
+                    worst_gi[j] = worst_gi[j - 1];
+                }
+                worst_lag[k] = lag;
+                worst_gi[k] = gi;
+                break;
+            }
+    }
+    for (k = 0; k < 3; k++)
+    {
+        RaftGroupState *g;
+
+        if (worst_gi[k] < 0)
+            continue;
+        g = &RaftGroups->groups[worst_gi[k]];
+        appendStringInfo(&b, "| 组%lld last=%lld commit=%lld applied=%lld durable=%lld want=%lld",
+                         (long long) g->group_id, (long long) g->log.last_log_index,
+                         (long long) g->log.commit_index, (long long) g->log.last_applied,
+                         (long long) g->log.leader_durable_index, (long long) g->log.want_plsn);
+        for (slot = 0; slot < n_peers; slot++)
+            if (peers[slot].node_id != pg_raft_node_id && g->log.peer_match_index[slot] > 0)
+                appendStringInfo(&b, " n%d:m%lld/n%lld", peers[slot].node_id,
+                                 (long long) g->log.peer_match_index[slot],
+                                 (long long) g->log.peer_next_index[slot]);
+    }
+    {
+        uint64 wn = pg_atomic_exchange_u64(&RaftGroups->stream_wait_n, 0);
+        uint64 wus = pg_atomic_exchange_u64(&RaftGroups->stream_wait_us, 0);
+        uint64 wmx = pg_atomic_exchange_u64(&RaftGroups->stream_wait_max, 0);
+
+        appendStringInfo(&b, "| 提交等复制 %llu 次 均%llums 最大%llums",
+                         (unsigned long long) wn,
+                         (unsigned long long) (wn > 0 ? wus / wn / 1000 : 0),
+                         (unsigned long long) (wmx / 1000));
+    }
+    elog(LOG, "pg_raft: 复制流状态 %s", b.data);
+    pfree(b.data);
+}
+
+PGDLLEXPORT void pg_raft_stream_main(Datum main_arg);
+
+void
+pg_raft_stream_main(Datum main_arg)
+{
+    MemoryContext   iter_cxt;
+    bool           *advanced;
+
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
+    pqsignal(SIGTERM, die);
+    BackgroundWorkerUnblockSignals();
+    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+
+    rs_cxt = AllocSetContextCreate(TopMemoryContext, "pg_raft stream", ALLOCSET_DEFAULT_SIZES);
+    iter_cxt = AllocSetContextCreate(TopMemoryContext, "pg_raft stream iter", ALLOCSET_DEFAULT_SIZES);
+    advanced = (bool *) MemoryContextAllocZero(rs_cxt, sizeof(bool) * Max(RAFT_MAX_GROUPS, 1));
+    memset(rs_peers, 0, sizeof(rs_peers));
+    memset(rs_oid_gid, 0, sizeof(rs_oid_gid));
+    on_shmem_exit(rs_on_exit, (Datum) 0);
+    RaftGroups->stream_latch = MyLatch;
+    pg_write_barrier();
+    RaftGroups->stream_pid = MyProcPid;
+    elog(LOG, "pg_raft: 复制流管理进程启动（每副本一批最多 %d 条/组，在途 %d 批）",
+         pg_raft_stream_batch_entries, pg_raft_stream_inflight);
+
+    for (;;)
+    {
+        int     slot;
+        bool    inflight = false;
+        MemoryContext old;
+
+        for (slot = 0; slot < n_peers; slot++)
+            if (rs_peers[slot].qn > 0)
+                inflight = true;
+        (void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         inflight ? 1 : 20, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        CHECK_FOR_INTERRUPTS();
+        if (ConfigReloadPending)
+        {
+            ConfigReloadPending = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
+        if (!pg_raft_raft_enabled)
+            continue;
+
+        rs_rc = NULL;
+        MemoryContextReset(iter_cxt);
+        old = MemoryContextSwitchTo(iter_cxt);
+        rs_rc_reset(iter_cxt);
+        PG_TRY();
+        {
+            parse_peers();
+            rs_status_log();
+            /* 收回包 → 推进 */
+            for (slot = 0; slot < n_peers; slot++)
+            {
+                if (peers[slot].node_id == pg_raft_node_id)
+                    continue;
+                rs_peer_connect(slot);
+                rs_peer_receive(slot);
+            }
+            (void) rs_advance_all(advanced);
+            /* 替排不上认领位的提交者追加；发 */
+            rs_append_wanted();
+            for (slot = 0; slot < n_peers; slot++)
+            {
+                if (peers[slot].node_id == pg_raft_node_id)
+                    continue;
+                rs_peer_send(slot);
+                if (rs_peers[slot].state == 2 && PQflush(rs_peers[slot].conn) < 0)
+                    rs_peer_fail(slot, PQerrorMessage(rs_peers[slot].conn));
+            }
+            /* leader 自写日志行（落盘后才推进自投票上限）、apply；再推进一次 */
+            {
+                bool *adv2 = (bool *) palloc0(sizeof(bool) * Max(RAFT_MAX_GROUPS, 1));
+                int   gi;
+
+                rs_local_work(advanced);
+                (void) rs_advance_all(adv2);
+                for (gi = 0; gi < RAFT_MAX_GROUPS; gi++)
+                    advanced[gi] = adv2[gi];
+            }
+        }
+        PG_CATCH();
+        {
+            MemoryContextSwitchTo(iter_cxt);
+            EmitErrorReport();
+            FlushErrorState();
+            AbortCurrentTransaction();
+            raft_append_pxid = InvalidTransactionId;
+            raft_batch_active = false;
+            raft_batch_nrows = 0;
+            pg_usleep(100000L);
+        }
+        PG_END_TRY();
+        MemoryContextSwitchTo(old);
+    }
+}
+
+
+void
+pg_raft_partwal_replicate_many(const Oid *parts, int nparts, bool *failed_out)
+{
+    RmGroup        *gs;
+    int             ng = 0;
+    int             i, k, slot;
+    StringInfoData  sql;
+    bool            spi_owned;
+    bool            any_failed = false;
+    Oid             fail_part = InvalidOid;
+    int64           fail_gid = 0;
+    int64           fail_plsn = 0;
+    MemoryContext   rmcxt;
+    MemoryContext   rcxt;
+    MemoryContext   oldcxt;
+    MemoryContext   spicxt;
+    int             spi_rc;
+    volatile int    nclaimed = 0;
+    volatile bool   normal_exit = false;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL || nparts <= 0)
+        return;
+    parse_peers();
+    if (n_peers == 0)
+        return;
+    restore_groups_if_needed();
+
+    /* 单副本快速模式 / 关闭 / 超大触达集：逐分区的老路径 */
+    if (pg_raft_single_member_fast_commit || !pg_raft_replicate_many ||
+        nparts > RM_MAX_GROUPS)
+    {
+        for (i = 0; i < nparts; i++)
+        {
+            if (failed_out != NULL)
+                failed_out[i] = true;       /* 失败时 ERROR 出去，标的就是这一个 */
+            pg_raft_partwal_replicate(parts[i]);
+            if (failed_out != NULL)
+                failed_out[i] = false;
+        }
+        return;
+    }
+
+    if (rs_stream_active())
+    {
+        pg_raft_partwal_replicate_stream(parts, nparts, failed_out);
+        return;
+    }
+    if (pg_raft_replicate_pipeline)
+    {
+        pg_raft_partwal_replicate_pipe(parts, nparts, failed_out);
+        return;
+    }
+
+    rmcxt = AllocSetContextCreate(CurrentMemoryContext, "pg_raft replicate_many",
+                                  ALLOCSET_DEFAULT_SIZES);
+    /* 每轮的读出字节、描述符、请求数组都在这里，轮首整体重置（一笔事务可能跑很多轮） */
+    rcxt = AllocSetContextCreate(rmcxt, "pg_raft replicate_many round",
+                                 ALLOCSET_DEFAULT_SIZES);
+    oldcxt = MemoryContextSwitchTo(rmcxt);
+    gs = (RmGroup *) palloc0(sizeof(RmGroup) * nparts);
+
+    /*
+     * ① 一次 SPI：组号与已落盘上界。
+     * 内存纪律：本函数的一切分配都在 rmcxt / rcxt 里（SPI 连接期间 CurrentMemoryContext 是
+     * SPI 的过程上下文，SPI_finish 时整个释放），所以 SPI 期间的分配先切回自己的上下文。
+     */
+    initStringInfo(&sql);
+    if (!raft_persist_spi_begin(&spi_owned))
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    appendStringInfoString(&sql,
+                           "SELECT u.p, partdist.global_id_for_partition(u.p)::bigint, "
+                           "       partdist.get_partition_flush_lsn(u.p) "
+                           "FROM unnest(ARRAY[");
+    for (i = 0; i < nparts; i++)
+        appendStringInfo(&sql, "%s%u", i ? "," : "", (unsigned) parts[i]);
+    appendStringInfoString(&sql, "]::oid[]) WITH ORDINALITY u(p, o) ORDER BY u.o");
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+    {
+        uint64 r;
+
+        for (r = 0; r < SPI_processed; r++)
+        {
+            bool    n1, n2, n3;
+            Datum   d1 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &n1);
+            Datum   d2 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &n2);
+            Datum   d3 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &n3);
+
+            if (n1 || n2 || DatumGetInt64(d2) <= 0)
+                continue;           /* 非全局分片：不纳管 */
+            gs[ng].part = DatumGetObjectId(d1);
+            gs[ng].gid = DatumGetInt64(d2);
+            gs[ng].cur = n3 ? 0 : DatumGetInt64(d3);
+            ng++;
+        }
+    }
+    raft_persist_spi_end(spi_owned);
+
+    /*
+     * ② 逐组门禁：与 pg_raft_partwal_replicate 相同的写栅栏与成员集要求。
+     * 在这里被拒的分区与老路径一样标进 failed_out（调用方据此打分叉标记）。
+     */
+    k = 0;
+    for (i = 0; i < ng; i++)
+    {
+        RmGroup *g = &gs[i];
+        int      state = -1;
+        bool     known;
+
+        if (!raft_group_ctx(g->gid, &g->ctx))
+            continue;               /* 无数据组：行为与接线前一致 */
+        known = group_resolve_membership(&g->ctx);
+        if (known)
+        {
+            restore_hard_state_if_needed(&g->ctx);
+            restore_persistent_log_if_needed(&g->ctx);
+            SpinLockAcquire(&g->ctx.cons->mutex);
+            state = g->ctx.cons->state;
+            SpinLockRelease(&g->ctx.cons->mutex);
+        }
+        if ((!known || state != RAFT_LEADER) && failed_out != NULL)
+        {
+            int p;
+
+            for (p = 0; p < nparts; p++)
+                if (parts[p] == g->part)
+                    failed_out[p] = true;
+        }
+        if (!known)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的成员集未知，写入被拒",
+                            g->part, (long long) g->gid),
+                     errdetail("数据组的多数派必须按真实副本集计算；partition_map 中没有该分区的登记，"
+                               "无法确定副本集。")));
+        if (state != RAFT_LEADER)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_raft: 分区 %u(组 %lld)的本地写入被拒：本节点不是该分区组的 leader",
+                            g->part, (long long) g->gid),
+                     errdetail("分区主副本可能已切换，请经路由层重试。")));
+        if (g->cur <= 0)
+            continue;
+        g->majority = cluster_majority(&g->ctx);
+        if (k != i)
+            gs[k] = *g;
+        k++;
+    }
+    ng = k;
+    if (ng == 0)
+    {
+        MemoryContextSwitchTo(oldcxt);
+        MemoryContextDelete(rmcxt);
+        return;
+    }
+    qsort(gs, ng, sizeof(RmGroup), rm_group_cmp);
+
+    PG_TRY();
+    {
+        /*
+         * ③ 认领（2026-10-16 改）：
+         *   · 排队期间不断看一眼"我的记录是否已被别人那一轮送到多数派"——组提交下这是
+         *     常态，命中就一把认领位都不拿，直接返回；
+         *   · 认领全有或全无：不再"拿着前几组、等后几组"（那会把只需要前几组的人也挡住，
+         *     实测排队 0.5–1 s）；
+         *   · 200 ms 还凑不齐就退回按组号顺序逐个认领（防饥饿；顺序认领不会互相死锁）。
+         */
+        {
+            long    waited_us = 0;
+            bool    covered = false;
+
+            for (;;)
+            {
+                if (rm_all_covered(gs, ng))
+                {
+                    covered = true;
+                    break;
+                }
+                if (rm_try_claim_all(gs, ng))
+                {
+                    nclaimed = ng;
+                    break;
+                }
+                if (waited_us >= 200000L)
+                {
+                    for (i = 0; i < ng; i++)
+                    {
+                        raft_claim_purpose = RAFT_CLAIM_COMMIT_MANY;
+                        replicate_claim(&gs[i].ctx);
+                        nclaimed++;
+                    }
+                    break;
+                }
+                CHECK_FOR_INTERRUPTS();
+                pg_usleep(500L);        /* 全局组表自旋锁上几百个后端轮询：别太密 */
+                waited_us += 500L;
+            }
+            if (covered)
+            {
+                normal_exit = true;
+                goto rm_done;
+            }
+        }
+        in_txn_replication = true;
+
+        /*
+         * ③b 拿到认领位之后把上界刷新到此刻的落盘点（2026-10-16，组提交）。
+         * ① 里的 cur 是排队之前取的；排队期间别的后端又写下了记录，它们正排在后面等同一把
+         * 认领位。原来每个后端只送到自己那个陈旧的 cur，于是一个接一个各跑一轮，组提交
+         * 摊不开（实测每组每秒十来条记录、认领位排队上秒）。刷新后这一轮把积压一并送走，
+         * 后面的人拿到认领位发现 last ≥ 自己的 cur，直接返回。上界只升不降；多送的是
+         * 已在本地流里落盘的记录，语义与别人送它们完全相同。
+         */
+        if (raft_persist_spi_begin(&spi_owned))
+        {
+            resetStringInfo(&sql);
+            appendStringInfoString(&sql,
+                                   "SELECT u.o::int, partdist.get_partition_flush_lsn(u.p) "
+                                   "FROM unnest(ARRAY[");
+            for (i = 0; i < ng; i++)
+                appendStringInfo(&sql, "%s%u", i ? "," : "", (unsigned) gs[i].part);
+            appendStringInfoString(&sql, "]::oid[]) WITH ORDINALITY u(p, o)");
+            if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+            {
+                uint64 r;
+
+                for (r = 0; r < SPI_processed; r++)
+                {
+                    bool    n1, n2;
+                    Datum   d1 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &n1);
+                    Datum   d2 = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &n2);
+                    int     o;
+
+                    if (n1 || n2)
+                        continue;
+                    o = DatumGetInt32(d1) - 1;
+                    if (o >= 0 && o < ng && DatumGetInt64(d2) > gs[o].cur)
+                        gs[o].cur = DatumGetInt64(d2);
+                }
+            }
+            raft_persist_spi_end(spi_owned);
+        }
+
+        for (;;)
+        {
+            int     nactive = 0;
+            int     maxn = 0;
+            int     timeout_ms;
+            TimestampTz deadline;
+            bool    busy_skip[RAFT_MAX_PEERS];
+            TimestampTz t0 = GetCurrentTimestamp();
+            TimestampTz t_read = 0, t_persist = 0, t_send = 0, t_wait = 0;
+            int     nent_round = 0;
+
+            MemoryContextReset(rcxt);
+            MemoryContextSwitchTo(rcxt);
+
+            /* ④ 本轮区间与落后副本的补发起点 */
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+                int64    last = Max(rm_last_data_plsn(&g->ctx), g->done_plsn);
+                bool     is_leader;
+
+                g->active = false;
+                g->acks = 0;
+                g->nsent = 0;
+                if (g->failed || last >= g->cur)
+                    continue;
+                if (!wait_for_log_room(&g->ctx))
+                {
+                    g->failed = true;
+                    g->fail_plsn = last + 1;
+                    continue;
+                }
+                SpinLockAcquire(&g->ctx.cons->mutex);
+                is_leader = (g->ctx.cons->state == RAFT_LEADER);
+                g->term = g->ctx.cons->current_term;
+                SpinLockRelease(&g->ctx.cons->mutex);
+                if (!is_leader)
+                {
+                    g->failed = true;
+                    g->fail_plsn = last + 1;
+                    continue;
+                }
+                g->lo = last + 1;
+                g->hi = Min(g->cur, g->lo + pg_raft_replicate_batch_max - 1);
+                g->read_lo = g->lo;
+                g->active = true;
+                nactive++;
+
+                SpinLockAcquire(&g->ctx.log->mutex);
+                if (!g->ctx.log->repl_inited)
+                {
+                    int64 nx = g->ctx.log->last_log_index + 1;
+                    int   j;
+
+                    for (j = 0; j < RAFT_MAX_PEERS; j++)
+                    {
+                        g->ctx.log->peer_next_index[j] = nx;
+                        g->ctx.log->peer_match_index[j] = 0;
+                    }
+                    g->ctx.log->repl_inited = true;
+                    g->ctx.log->leader_durable_index = g->ctx.log->last_log_index;   /* 当选时日志里已有的条目视为已落盘 */
+                    g->ctx.log->leader_self_hole = 0;
+                }
+                g->cread_hi = g->lo - 1;
+                {
+                    int64 big_st[RAFT_MAX_PEERS];
+                    int64 big_plsn[RAFT_MAX_PEERS];
+                    int64 first_new = g->ctx.log->last_log_index + 1;
+                    int64 kmax = (int64) pg_raft_replicate_batch_max * 2;
+
+                    for (slot = 0; slot < n_peers; slot++)
+                    {
+                        int64 plsn = 0;
+                        int64 nx;
+                        int64 st;
+
+                        g->catchup_from[slot] = 0;
+                        g->catchup_to[slot] = 0;
+                        big_st[slot] = 0;
+                        big_plsn[slot] = 0;
+                        if (!peer_in_group(&g->ctx, slot))
+                            continue;
+                        nx = g->ctx.log->peer_next_index[slot];
+                        if (nx >= first_new)
+                        {
+                            g->catchup_from[slot] = first_new;  /* 同步中（含乐观推进） */
+                            continue;
+                        }
+                        st = rm_catchup_start_locked(&g->ctx, slot, first_new, g->term, &plsn);
+                        if (st <= 0 || plsn <= 0 || plsn >= g->lo)
+                            continue;           /* 环窗口外 / 夹着别的条目：交后台追平 */
+                        if (g->hi - plsn + 1 <= kmax)
+                        {
+                            /* 缺口小：补发段连同本轮新条目一起发（补发段一直读到 lo-1） */
+                            g->catchup_from[slot] = st;
+                            if (plsn < g->read_lo)
+                                g->read_lo = plsn;
+                        }
+                        else
+                        {
+                            big_st[slot] = st;
+                            big_plsn[slot] = plsn;
+                        }
+                    }
+
+                    /*
+                     * 缺口大（2026-10-16）：只补 kmax 条老条目、不带本轮新条目 —— 这条请求的确认
+                     * 不计入本轮多数派，但慢副本每轮都能往前追一段，不再被甩出环窗口、落到后台
+                     * 追平通道（那条通道要持着认领位做同步 RPC）。为不在一轮里读两段不相连的字节，
+                     * 本轮已有小缺口补发时不做；否则只给读起点相同的那些落后副本做。
+                     */
+                    if (g->read_lo == g->lo)
+                    {
+                        int64 base = 0;
+
+                        for (slot = 0; slot < n_peers; slot++)
+                        {
+                            if (big_st[slot] <= 0 || (base != 0 && big_plsn[slot] != base))
+                                continue;
+                            base = big_plsn[slot];
+                            g->catchup_from[slot] = big_st[slot];
+                            g->catchup_to[slot] = Min(big_st[slot] + kmax - 1, first_new - 1);
+                            g->read_lo = base;
+                            g->cread_hi = Min(base + kmax - 1, g->lo - 1);
+                        }
+                    }
+                    else
+                        g->cread_hi = g->lo - 1;
+                }
+                SpinLockRelease(&g->ctx.log->mutex);
+            }
+            if (nactive == 0)
+                break;
+
+            /* ⑤ 一次 SPI 读出各组 [read_lo, hi] 的描述与字节 */
+            if (!raft_persist_spi_begin(&spi_owned))
+                ereport(ERROR, (errmsg("pg_raft: 多组复制拿不到 SPI")));
+            spicxt = MemoryContextSwitchTo(rcxt);
+            resetStringInfo(&sql);
+            appendStringInfoString(&sql,
+                                   "SELECT g.k, s, r.orig_lsn::text, r.rmid, r.info, r.gxid, "
+                                   "       length(r.data), r.flags, encode(r.data, 'hex') "
+                                   "FROM (VALUES ");
+            k = 0;
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+
+                if (!g->active)
+                    continue;
+                /* 补发段（read_lo..cread_hi）与本轮新条目（lo..hi）各一行，可能不相连 */
+                if (g->read_lo < g->lo)
+                    appendStringInfo(&sql, "%s(%d, %u::oid, %lld::bigint, %lld::bigint)",
+                                     k++ ? "," : "", i, (unsigned) g->part,
+                                     (long long) g->read_lo, (long long) g->cread_hi);
+                appendStringInfo(&sql, "%s(%d, %u::oid, %lld::bigint, %lld::bigint)",
+                                 k++ ? "," : "", i, (unsigned) g->part,
+                                 (long long) g->lo, (long long) g->hi);
+                g->nhex = 0;
+                g->nchex = 0;
+                g->nnew = 0;
+                g->hex = (char **) palloc0(sizeof(char *) * (g->hi - g->lo + 1));
+                g->desc = (char **) palloc0(sizeof(char *) * (g->hi - g->lo + 1));
+                g->chex = (g->lo > g->read_lo)
+                    ? (char **) palloc0(sizeof(char *) * (g->cread_hi - g->read_lo + 1)) : NULL;
+            }
+            appendStringInfoString(&sql,
+                                   ") g(k, o, lo, hi) "
+                                   "CROSS JOIN LATERAL generate_series(g.lo, g.hi) s "
+                                   "LEFT JOIN LATERAL partdist.partwal_read_record(g.o, s) r ON true "
+                                   "ORDER BY g.k, s");
+            spi_rc = SPI_execute(sql.data, true, 0);
+            /*
+             * 2026-10-16 修：SPI_execute 返回时把当前内存上下文切回了 SPI 的过程上下文，
+             * 下面拷出的十六进制载荷与描述 JSON 若分配在那里，raft_persist_spi_end() 一放
+             * 就成了悬空指针 —— 随后写环、写 raft_log、发副本用的全是被覆写的内存
+             * （实测："gxid":5629499534716# 截断、FILESET 交接广播 JSON 报错、副本回放全断）。
+             */
+            MemoryContextSwitchTo(rcxt);
+            if (spi_rc == SPI_OK_SELECT)
+            {
+                uint64      r;
+                TupleDesc   td = SPI_tuptable->tupdesc;
+
+                for (r = 0; r < SPI_processed; r++)
+                {
+                    HeapTuple   tup = SPI_tuptable->vals[r];
+                    bool        isnull;
+                    int         gi = DatumGetInt32(SPI_getbinval(tup, td, 1, &isnull));
+                    int64       plsn = DatumGetInt64(SPI_getbinval(tup, td, 2, &isnull));
+                    RmGroup    *g = &gs[gi];
+                    Datum       d;
+                    char       *orig;
+                    int         rmid, info, flags;
+                    int64       gxid, nbytes;
+                    StringInfoData pl;
+
+                    /* 补发段与新条目各自要求从起点连续，前面断了后面的不算 */
+                    if (plsn < g->lo ? (plsn != g->read_lo + g->nchex || plsn > g->cread_hi)
+                                     : (plsn != g->lo + g->nhex))
+                        continue;
+                    d = SPI_getbinval(tup, td, 3, &isnull);
+                    if (isnull)
+                        continue;           /* 记录不存在：本组到此为止 */
+                    orig = TextDatumGetCString(d);
+                    d = SPI_getbinval(tup, td, 4, &isnull);  rmid = isnull ? 0 : DatumGetInt32(d);
+                    d = SPI_getbinval(tup, td, 5, &isnull);  info = isnull ? 0 : DatumGetInt32(d);
+                    d = SPI_getbinval(tup, td, 6, &isnull);  gxid = isnull ? 0 : DatumGetInt64(d);
+                    d = SPI_getbinval(tup, td, 7, &isnull);  nbytes = isnull ? 0 : DatumGetInt32(d);
+                    d = SPI_getbinval(tup, td, 8, &isnull);  flags = isnull ? PARTWAL_FLAG_DATA : DatumGetInt32(d);
+                    d = SPI_getbinval(tup, td, 9, &isnull);
+                    if (isnull)
+                        continue;
+                    if (plsn < g->lo)
+                    {
+                        g->chex[g->nchex++] = TextDatumGetCString(d);
+                        continue;
+                    }
+                    g->hex[g->nhex++] = TextDatumGetCString(d);
+                    {
+                        initStringInfo(&pl);
+                        appendStringInfo(&pl,
+                                         "{\"partition_lsn\":%lld,\"orig_lsn\":\"%s\",\"rmid\":%d,"
+                                         "\"info\":%d,\"flags\":%d,\"gxid\":%lld,\"nbytes\":%lld}",
+                                         (long long) plsn, orig, rmid, info, flags,
+                                         (long long) gxid, (long long) nbytes);
+                        g->desc[g->nnew++] = pl.data;
+                    }
+                }
+            }
+            MemoryContextSwitchTo(spicxt);
+            raft_persist_spi_end(spi_owned);
+            t_read = GetCurrentTimestamp();
+
+            /*
+             * ⑥ 追加进环（同组认领下 index 连续）；读不到新记录 / 已不是本任期 leader 的组本轮失败。
+             * 新条目记下本事务（raft_log 行随它提交）：本节点日后降为 follower、同组下一批以这些
+             * 条目为 prev 到达时，rm_wait_predecessor 据此等它结束。
+             */
+            raft_append_pxid = GetTopTransactionId();
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+                int      j;
+                int      room;
+                bool     still;
+
+                if (!g->active)
+                    continue;
+                if (g->nnew == 0)
+                {
+                    g->active = false;
+                    g->failed = true;
+                    g->fail_plsn = g->lo;
+                    elog(WARNING, "pg_raft: 组 %lld 读不到本地 parwal 记录 plsn=%lld（local_oid=%u）",
+                         (long long) g->gid, (long long) g->lo, g->part);
+                    continue;
+                }
+                SpinLockAcquire(&g->ctx.cons->mutex);
+                still = (g->ctx.cons->state == RAFT_LEADER &&
+                         g->ctx.cons->current_term == g->term);
+                SpinLockRelease(&g->ctx.cons->mutex);
+                if (!still)
+                {
+                    g->active = false;
+                    g->failed = true;
+                    g->fail_plsn = g->lo;
+                    continue;
+                }
+                SpinLockAcquire(&g->ctx.log->mutex);
+                room = (int) (RAFT_LOG_CAPACITY - 1 -
+                              (g->ctx.log->last_log_index - g->ctx.log->last_applied));
+                if (g->nnew > room)
+                    g->nnew = room;
+                /* 上面核对任期之后若已失主、环尾进了新任期的条目，不许再接旧任期的 */
+                if (g->ctx.log->last_log_index > 0)
+                {
+                    RaftLogEntry *te = log_slot(&g->ctx, g->ctx.log->last_log_index);
+
+                    if (te->index == g->ctx.log->last_log_index && te->term > g->term)
+                        g->nnew = 0;
+                }
+                g->first = g->ctx.log->last_log_index + 1;
+                for (j = 0; j < g->nnew; j++)
+                    if (log_append_locked(&g->ctx, g->term, RAFT_OP_PARWAL, g->desc[j]) <= 0)
+                        break;
+                g->nnew = j;
+                g->last = g->first + g->nnew - 1;
+                g->leader_commit = g->ctx.log->commit_index;
+                /* 新条目之前的同步副本：next_index 恰为 first（④ 记的是追加前的 first_new） */
+                SpinLockRelease(&g->ctx.log->mutex);
+                if (g->nnew <= 0)
+                {
+                    g->active = false;
+                    g->failed = true;
+                    g->fail_plsn = g->lo;
+                    continue;
+                }
+                if (g->nnew > maxn)
+                    maxn = g->nnew;
+            }
+
+            raft_append_pxid = InvalidTransactionId;
+
+            /* ⑦ 一次 SPI 写全部组的 raft_log 行（随本事务提交；回滚时由环补写，P7-N46） */
+            if (!raft_persist_spi_begin(&spi_owned))
+                ereport(ERROR, (errmsg("pg_raft: 多组复制拿不到 SPI")));
+            if (raft_log_table_ready())
+            {
+                bool first_row = true;
+
+                resetStringInfo(&sql);
+                appendStringInfoString(&sql,
+                                       "INSERT INTO partdist.raft_log "
+                                       "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+                for (i = 0; i < ng; i++)
+                {
+                    RmGroup *g = &gs[i];
+                    int      j;
+
+                    if (!g->active)
+                        continue;
+                    if (g->ctx.g->repersist_from > 0)
+                        repersist_from_ring(&g->ctx);
+                    for (j = 0; j < g->nnew; j++)
+                    {
+                        logtrack_note(g->gid, g->first + j);
+                        appendStringInfo(&sql, "%s(%lld, %lld, %lld, %s, %s::jsonb, %s)",
+                                         first_row ? "" : ", ",
+                                         (long long) g->gid, (long long) (g->first + j),
+                                         (long long) g->term, quote_literal_cstr(RAFT_OP_PARWAL),
+                                         quote_literal_cstr(g->desc[j]),
+                                         g->majority == 1 ? "true" : "false");
+                        first_row = false;
+                    }
+                }
+                appendStringInfoString(&sql,
+                                       " ON CONFLICT (group_id, log_index) DO UPDATE SET "
+                                       "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
+                                       "payload = EXCLUDED.payload, "
+                                       "committed = partdist.raft_log.committed OR EXCLUDED.committed");
+                if (!first_row)
+                    (void) SPI_execute(sql.data, false, 0);
+            }
+            raft_persist_spi_end(spi_owned);
+            t_persist = GetCurrentTimestamp();
+
+            /*
+             * ⑧ 每个副本节点一条多语句请求。到某副本的连接全在途（它比多数派慢）就先跳过它；
+             * 跳过之后若有组一个请求都没发出去、凑不齐多数派，再回头等一条连接空出来发给它 ——
+             * 宁可等慢副本，也不让本可成功的提交因为"没发"而失败（失败会打分叉标记、触发重做基线）。
+             */
+            timeout_ms = Min(RAFT_RPC_EXEC_TIMEOUT_MS + 300 * maxn, 30000);
+            deadline = GetCurrentTimestamp() + (int64) timeout_ms * 1000;
+            for (slot = 0; slot < n_peers; slot++)
+            {
+                busy_skip[slot] = false;
+                if (peers[slot].node_id == pg_raft_node_id || peer_in_backoff(&peers[slot]))
+                    continue;
+                busy_skip[slot] = (rm_send_slot(gs, ng, slot, false, deadline, &sql) < 0);
+            }
+            for (slot = 0; slot < n_peers; slot++)
+            {
+                bool need = false;
+
+                if (!busy_skip[slot])
+                    continue;
+                for (i = 0; i < ng && !need; i++)
+                    if (gs[i].active && peer_in_group(&gs[i].ctx, slot) &&
+                        gs[i].nsent + 1 < gs[i].majority)
+                        need = true;
+                if (need)
+                    (void) rm_send_slot(gs, ng, slot, true, deadline, &sql);
+            }
+            t_send = GetCurrentTimestamp();
+
+            /* ⑨ 等到每组都有多数派（或全部回齐 / 超时）；没回的副本留作在途 */
+            for (;;)
+            {
+                bool    all_ok = true;
+                bool    any_busy = false;
+                struct pollfd pfds[RAFT_MAX_PEERS * RM_CONNS];
+                int     npfd = 0;
+
+                for (i = 0; i < ng; i++)
+                    if (gs[i].active && gs[i].acks + 1 < gs[i].majority)
+                        all_ok = false;
+                if (all_ok)
+                    break;
+
+                for (slot = 0; slot < n_peers; slot++)
+                    for (k = 0; k < RM_CONNS; k++)
+                    {
+                        RmConn *c = &rm_conns[slot][k];
+
+                        if (!c->current)
+                            continue;
+                        if (c->busy && !rm_conn_poll(c, slot, false, 0))
+                        {
+                            int sock = PQsocket(c->conn);
+
+                            if (GetCurrentTimestamp() >= deadline)
+                            {
+                                (void) rm_conn_poll(c, slot, true, deadline);   /* 判超时、重置连接 */
+                            }
+                            else if (sock >= 0)
+                            {
+                                pfds[npfd].fd = sock;
+                                pfds[npfd].events = POLLIN;
+                                pfds[npfd].revents = 0;
+                                npfd++;
+                                any_busy = true;
+                                continue;
+                            }
+                        }
+                        /* 已收完：本轮计票，再落进共享状态 */
+                        {
+                            int q;
+
+                            for (q = 0; q < c->ngroups; q++)
+                            {
+                                int gi = c->groups[q].gslot;
+
+                                if (gi >= 0 && gi < ng && gs[gi].active &&
+                                    c->groups[q].last >= gs[gi].last &&    /* 分段补发不计票 */
+                                    !c->any_error && q < c->nres && c->rok[q] &&
+                                    c->rterm[q] <= gs[gi].term)
+                                    gs[gi].acks++;
+                            }
+                            rm_conn_apply(c, slot);
+                        }
+                    }
+                if (!any_busy)
+                    break;
+                (void) poll(pfds, npfd, 50);
+                CHECK_FOR_INTERRUPTS();
+            }
+            t_wait = GetCurrentTimestamp();
+            /* 本轮没回的请求留作在途：以后不再计入本轮 */
+            for (slot = 0; slot < n_peers; slot++)
+                for (k = 0; k < RM_CONNS; k++)
+                {
+                    RmConn *c = &rm_conns[slot][k];
+                    int     q;
+
+                    if (!c->current)
+                        continue;
+                    c->current = false;
+                    for (q = 0; q < c->ngroups; q++)
+                        c->groups[q].gslot = -1;
+                }
+
+            /* ⑩ 逐组提交 / 丢尾 */
+            for (i = 0; i < ng; i++)
+            {
+                RmGroup *g = &gs[i];
+                int64    committed_upto = 0;
+                bool     quorum = (g->acks + 1 >= g->majority);
+                bool     still;
+
+                if (!g->active)
+                    continue;
+                g->ctx.g->last_rm_round = GetCurrentTimestamp();
+
+                /*
+                 * 本轮途中丢了 leader 身份 / 换了任期：环与提交点已归新任期管，这里既不推提交点
+                 * 也不丢尾巴（丢的可能是新 leader 写进来的条目）。本轮拿到的多数派确认仍然成立
+                 * —— 本任期的条目已在多数派持久化，按 Raft 就是已提交 —— 只是不再碰共享状态；
+                 * 没拿到的按失败处理。
+                 */
+                SpinLockAcquire(&g->ctx.cons->mutex);
+                still = (g->ctx.cons->state == RAFT_LEADER &&
+                         g->ctx.cons->current_term == g->term);
+                SpinLockRelease(&g->ctx.cons->mutex);
+                if (still)
+                {
+                    RaftLogEntry *le;
+
+                    SpinLockAcquire(&g->ctx.log->mutex);
+                    le = log_slot(&g->ctx, g->last);
+                    if (g->ctx.log->last_log_index < g->last ||
+                        le->index != g->last || le->term != g->term)
+                        still = false;
+                    else
+                    {
+                        if (quorum && g->last > g->ctx.log->commit_index)
+                            g->ctx.log->commit_index = g->last;
+                        else
+                        {
+                            int64 nc = compute_new_commit_index(&g->ctx, g->term);
+
+                            if (nc > g->ctx.log->commit_index)
+                                g->ctx.log->commit_index = nc;
+                        }
+                        committed_upto = g->ctx.log->commit_index;
+                    }
+                    SpinLockRelease(&g->ctx.log->mutex);
+                }
+                if (!still)
+                {
+                    if (quorum)
+                        g->done_plsn = g->lo + (g->last - g->first);
+                    else
+                    {
+                        g->failed = true;
+                        g->fail_plsn = g->lo;
+                    }
+                    continue;
+                }
+                persist_hard_state_unlocked(&g->ctx);
+
+                if (committed_upto < g->last)
+                {
+                    int64 j;
+                    int64 keep = Max(committed_upto, g->first - 1);
+
+                    elog(LOG,
+                         "pg_raft: group %lld 多组复制 idx=%lld..%lld term=%lld 多数派不足（%d/%d），丢弃未提交的尾巴",
+                         (long long) g->gid, (long long) g->first, (long long) g->last,
+                         (long long) g->term, g->acks + 1, g->majority);
+                    for (j = g->last; j > keep; j--)
+                        discard_uncommitted_entry_term(&g->ctx, j, g->term);
+                    if (committed_upto < g->first)
+                    {
+                        g->failed = true;
+                        g->fail_plsn = g->lo;
+                        continue;
+                    }
+                    g->last = committed_upto;
+                }
+                if (g->majority == 1)
+                {
+                    if (g->last > g->ctx.g->sql_marked_upto)
+                        g->ctx.g->sql_marked_upto = g->last;
+                }
+                else
+                    mark_log_committed_sql(&g->ctx, g->last);
+                g->done_plsn = g->lo + (g->last - g->first);
+                if (g->done_plsn > g->ctx.g->last_data_plsn)
+                    g->ctx.g->last_data_plsn = g->done_plsn;
+                group_apply_pending(&g->ctx);
+            }
+
+            /* 诊断：慢轮的分段耗时（每后端每 2 s 至多一条） */
+            {
+                TimestampTz t_end = GetCurrentTimestamp();
+
+                for (i = 0; i < ng; i++)
+                    if (gs[i].active)
+                        nent_round += gs[i].nnew;
+                if (TimestampDifferenceExceeds(t0, t_end, 300))
+                {
+                    static TimestampTz last_log = 0;
+
+                    if (last_log == 0 || TimestampDifferenceExceeds(last_log, t_end, 2000))
+                    {
+                        last_log = t_end;
+                        elog(LOG, "pg_raft: [round] %d 组 %d 条 共 %ld ms：读 %ld / 写日志行 %ld / 发 %ld / 等多数派 %ld / 提交 %ld",
+                             nactive, nent_round, (long) ((t_end - t0) / 1000),
+                             (long) ((t_read - t0) / 1000), (long) ((t_persist - t_read) / 1000),
+                             (long) ((t_send - t_persist) / 1000), (long) ((t_wait - t_send) / 1000),
+                             (long) ((t_end - t_wait) / 1000));
+                    }
+                }
+            }
+
+            for (i = 0; i < ng; i++)
+                if (gs[i].failed)
+                {
+                    any_failed = true;
+                    fail_part = gs[i].part;
+                    fail_gid = gs[i].gid;
+                    fail_plsn = gs[i].fail_plsn;
+                    if (failed_out != NULL)
+                        for (k = 0; k < nparts; k++)
+                            if (parts[k] == gs[i].part)
+                                failed_out[k] = true;
+                }
+            if (any_failed)
+                break;
+        }
+        normal_exit = true;
+rm_done:
+        ;
+    }
+    PG_FINALLY();
+    {
+        /* 本轮异常退出时，挂着的请求也不再属于任何一轮 */
+        for (slot = 0; slot < RAFT_MAX_PEERS; slot++)
+            for (k = 0; k < RM_CONNS; k++)
+            {
+                int q;
+
+                if (!rm_conns[slot][k].current)
+                    continue;
+                rm_conns[slot][k].current = false;
+                for (q = 0; q < rm_conns[slot][k].ngroups; q++)
+                    rm_conns[slot][k].groups[q].gslot = -1;
+            }
+        /*
+         * 异常退出（取消、SPI 出错……）：还没复制到 cur 的分区与老路径一样标进 failed_out ——
+         * 它们的字节已在本地流里，调用方据此判断要不要打分叉标记。
+         */
+        if (!normal_exit && failed_out != NULL)
+            for (i = 0; i < ng; i++)
+                if (Max(rm_last_data_plsn(&gs[i].ctx), gs[i].done_plsn) < gs[i].cur)
+                    for (k = 0; k < nparts; k++)
+                        if (parts[k] == gs[i].part)
+                            failed_out[k] = true;
+        raft_append_pxid = InvalidTransactionId;
+        in_txn_replication = false;
+        for (i = nclaimed - 1; i >= 0; i--)
+            replicate_release(&gs[i].ctx);
+        MemoryContextSwitchTo(oldcxt);
+    }
+    PG_END_TRY();
+    MemoryContextDelete(rmcxt);
+
+    if (any_failed)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 分区 %u(组 %lld) record %lld 未达多数派",
+                        fail_part, (long long) fail_gid, (long long) fail_plsn)));
 }
 
 /*
@@ -9788,6 +15193,8 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
         ctx.cons = &g->cons;
         ctx.log = &g->log;
 
+        hard_state_hint_path(&ctx, path, sizeof(path));
+        (void) unlink(path);
         hard_state_path(&ctx, path, sizeof(path));
         if (unlink(path) != 0 && errno != ENOENT)
             elog(WARNING, "pg_raft: 删除 hardstate 文件 \"%s\" 失败: %m", path);
@@ -10096,6 +15503,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
         : 0;
     parts_sql = dtx_participants_sql(parts);
 
+    raft_claim_purpose = RAFT_CLAIM_DTX_DECIDE;
     replicate_claim(&ctx);
     in_txn_replication = true;
     PG_TRY();
@@ -10304,6 +15712,7 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
         PG_RETURN_INT32(existing);
 
     parts_sql = dtx_participants_sql(NULL);
+    raft_claim_purpose = RAFT_CLAIM_DTX_STATUS;
     replicate_claim(&ctx);
     in_txn_replication = true;
     PG_TRY();
@@ -11184,6 +16593,7 @@ pg_raft_dtx_ack(PG_FUNCTION_ARGS)
 
     if (row_exists && complete)
     {
+        raft_claim_purpose = RAFT_CLAIM_DTX_ACK;
         replicate_claim(&ctx);
         in_txn_replication = true;
         PG_TRY();
@@ -11414,6 +16824,7 @@ dtx_forget_sweep(void)
         if (!dtx_coord_ctx_soft(coords[i], &ctx, &local_oid))
             continue;           /* 不是这组的 leader：由现任 leader 负责 */
 
+        raft_claim_purpose = RAFT_CLAIM_DTX_FORGET;
         replicate_claim(&ctx);
         in_txn_replication = true;
         PG_TRY();

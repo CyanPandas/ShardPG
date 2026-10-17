@@ -15,6 +15,10 @@ for w in $(seq 1 "$WAREHOUSES"); do
     echo "SELECT tpcc.load_orders($w, $d)"
   done
 done > "$tasks"
+# 打乱顺序：按仓库顺序排时，xargs 同时取到的几块几乎都属于同一个仓库 ⇒ 同一组分片。
+# 多副本下每块提交都要占该分片组的复制认领位，同组的块只能一个个过，并行度退化成 1。
+# 块之间没有依赖（无外键，区的 d_next_o_id 由 load_warehouse 直接写定），打乱是安全的。
+shuf -o "$tasks" "$tasks"
 
 n=$(wc -l < "$tasks")
 log "$n 个装载块"

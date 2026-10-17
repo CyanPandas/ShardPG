@@ -34,6 +34,7 @@ typedef struct PartitionWALWriter
     char            buffer[PARWAL_WRITER_BUFFER_SIZE];
     int             buf_used;            /* bytes currently in buffer */
 
+    XLogSegNo       first_segno;         /* 本写入器打开过的最小段号（组提交 fsync 的欠账下界），0 = 未开过 */
     bool            enospc_stalled;      /* true while disk is full */
     TimestampTz     last_stall_time;     /* when enospc_stalled was last set */
 } PartitionWALWriter;
@@ -136,6 +137,7 @@ extern void WritePartWALCheckpoint(Oid partition_id,
  * ReadPartWALCheckpoint — read the checkpoint file for a partition.
  * Returns false if the file does not exist or has invalid magic.
  */
+extern uint32 PartWALTruncGen(Oid partition_id);   /* 2026-10-17 */
 extern bool ReadPartWALCheckpoint(Oid partition_id,
                                   PartWALCheckpointFile *out);
 
@@ -145,5 +147,26 @@ extern bool ReadPartWALCheckpoint(Oid partition_id,
  * Reads PartWALRecord headers; skips variable-length data portions.
  */
 extern uint64 GetLastWrittenPartitionLSN(Oid partition_id);
+
+/*
+ * 2026-10-16 多副本组提交（pg_partdist.partwal_group_fsync，默认 on；单副本快速模式不走这里）。
+ *
+ * 原来每个写入器关闭时都"fsync 段文件 + 写 checkpoint 文件再 fsync"，全在节点级
+ * PartWALCtl->lock 之下：一笔 NewOrder 触达 5 个分区、数据与提交标记各一轮，就是
+ * 20 次 fsync 串在全节点唯一一把锁上（机械盘上每次 5–10 ms ⇒ 全节点每秒十来笔提交）。
+ * 现在：
+ *   · 锁内只 write()，编号与段欠账记进节点级 checkpoint 缓存（缓存即权威，文件随缓存
+ *     未命中时以"文件 / 扫段"二者取大重建，与单副本快速模式同一套规则）；
+ *   · 出锁后 PartWALSyncPartitionUpTo 按分区组提交 fsync —— 一次 fsync 带走并发事务
+ *     写下的全部字节，排队者醒来发现已越过自己的编号就直接返回；
+ *   · 复制只送"已 fsync"的前缀（get_partition_flush_lsn 返回 synced），leader 自己那一票
+ *     仍然意味着本地已落盘，"多数派 ack ⇔ 多数派已持久化"不变。
+ */
+extern bool   partwal_group_fsync;
+extern bool   PartWALLazySync(void);
+extern uint64 PartWALWriterFinishLazy(PartitionWALWriter *writer);
+extern void   PartWALSyncPartitionUpTo(Oid partition_id, uint64 target_plsn);
+extern uint64 PartWALDurablePartitionLSN(Oid partition_id);
+extern uint64 PartWALCachedLastPLSN(Oid partition_id);
 
 #endif /* PARTITION_WAL_WRITER_H */

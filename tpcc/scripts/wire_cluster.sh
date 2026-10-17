@@ -47,7 +47,7 @@ for i in "${!NODE_IDS[@]}"; do
   [[ "$ts" =~ ^[0-9]+$ ]] || die "${NODE_HOSTS[$i]}:${NODE_PORTS[$i]} 取 TSO 失败：$ts"
 done
 sts=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 120); do   # 新起的 TSO master 头一个租约期（60 s）内 GlobalSafeTs 按设计为 0
   sts=$(QV "$COORD_HOST" "$COORD_PORT" "SELECT partdist.partdist_global_safe_ts()" 2>/dev/null)
   [[ -n "$sts" && "$sts" != "0" ]] && break
   sleep 1

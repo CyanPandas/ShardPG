@@ -38,11 +38,15 @@ typedef struct TsoState
 	int64		counter;		/* 下一个待发；从 1 起，0 保留为"无 ts" */
 	int64		safe_ts;		/* T3.5 GlobalSafeTs：单调不减（§6.2） */
 	bool		served;			/* 本次启动是否已服务过（boot 标记已落盘） */
-	bool		boot_blocked;	/* 启动时检测到 boot 标记 ⇒ 拒发号 */
+	bool		boot_blocked;	/* 启动时检测到 boot 标记且无高水位文件 ⇒ 拒发号 */
+	int64		hwm;			/* 已持久预留的上界（发出的号都 < hwm）；0 = 尚未预留 */
+	TimestampTz boot_time;		/* 本次启动时刻：GlobalSafeTs 在一个租约期内不前进 */
 	TsoNodeEntry nodes[TSO_MAX_NODES];
 } TsoState;
 
 static TsoState *TsoCtl = NULL;
+
+static int64 tso_read_hwm(void);
 
 void
 TsoDefineGUCs(void)
@@ -95,6 +99,8 @@ TsoShmemInit(void)
 		TsoCtl->counter = 1;
 		TsoCtl->safe_ts = 0;
 		TsoCtl->served = false;
+		TsoCtl->hwm = 0;
+		TsoCtl->boot_time = GetCurrentTimestamp();
 		for (i = 0; i < TSO_MAX_NODES; i++)
 		{
 			TsoCtl->nodes[i].node_id = -1;
@@ -109,8 +115,77 @@ TsoShmemInit(void)
 		 */
 		snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_BOOT_MARKER);
 		TsoCtl->boot_blocked = (stat(path, &st) == 0);
+
+		/*
+		 * 2026-10-16：有高水位文件 ⇒ 上个纪元发出的号全都小于它，从这里接着发，
+		 * 单调性成立，不再拦。读不出合法值则维持 boot 标记的判断（fail-closed）。
+		 */
+		{
+			int64		h = tso_read_hwm();
+
+			if (h > 0)
+			{
+				TsoCtl->counter = h;
+				TsoCtl->hwm = h;	/* 本纪元的第一个号就要求再预留一批 */
+				TsoCtl->boot_blocked = false;
+			}
+		}
 	}
 	LWLockRelease(AddinShmemInitLock);
+}
+
+/* 读高水位文件；不存在或内容非法返回 0 */
+static int64
+tso_read_hwm(void)
+{
+	char		path[MAXPGPATH];
+	char		buf[64];
+	FILE	   *fp;
+	long long	v = 0;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_HWM_FILE);
+	fp = fopen(path, "r");		/* postmaster 启动期也会调，不走 fd.c 记账 */
+	if (fp == NULL)
+		return 0;
+	if (fgets(buf, sizeof(buf), fp) == NULL || sscanf(buf, "%lld", &v) != 1 || v <= 0)
+		v = 0;
+	fclose(fp);
+	return (int64) v;
+}
+
+/*
+ * 持久预留新上界：临时文件写入 + fsync，durable_rename 换上（目录也 fsync）。
+ * 须持 TSO 排它锁；失败 ERROR（宁可不发号也不越过未持久的上界）。
+ */
+static void
+tso_persist_hwm(int64 hwm)
+{
+	char		path[MAXPGPATH];
+	char		tmp[MAXPGPATH];
+	char		buf[32];
+	int			fd;
+	int			len;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_HWM_FILE);
+	snprintf(tmp, sizeof(tmp), "%s/%s.tmp", DataDir, TSO_HWM_FILE);
+	len = snprintf(buf, sizeof(buf), INT64_FORMAT "\n", hwm);
+	fd = OpenTransientFile(tmp, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法创建 TSO 高水位文件 \"%s\": %m", tmp)));
+	if (write(fd, buf, len) != len || pg_fsync(fd) != 0)
+	{
+		int			save_errno = errno;
+
+		CloseTransientFile(fd);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: TSO 高水位文件写入失败: %m")));
+	}
+	CloseTransientFile(fd);
+	(void) durable_rename(tmp, path, ERROR);
 }
 
 /*
@@ -179,6 +254,14 @@ tso_next_locked(void)
 	{
 		tso_write_boot_marker();
 		TsoCtl->served = true;
+	}
+	/* 2026-10-16：要发的号够到已持久的上界 ⇒ 先持久预留下一批（约每百万个号一次） */
+	if (TsoCtl->counter >= TsoCtl->hwm)
+	{
+		int64		next = TsoCtl->counter + TSO_HWM_BATCH;
+
+		tso_persist_hwm(next);
+		TsoCtl->hwm = next;
 	}
 	return TsoCtl->counter++;
 }
@@ -285,6 +368,15 @@ tso_compute_safe_locked(void)
 	if (cand == 0)
 		cand = TsoCtl->counter;
 
+	/*
+	 * 2026-10-16：重启后一个租约期内不前进。master 能重启了，而 worker 上跨重启
+	 * 存活的快照要等下一次心跳才重新登记；在那之前"全无活跃 ⇒ counter"会把
+	 * 安全线一下推到新纪元的起点，vacuum 就可能越过这些快照。
+	 */
+	if (GetCurrentTimestamp() <
+		TimestampTzPlusMilliseconds(TsoCtl->boot_time, tso_lease_ms))
+		return TsoCtl->safe_ts;
+
 	if (cand >= TsoCtl->safe_ts)
 		TsoCtl->safe_ts = cand;
 	else
@@ -380,9 +472,9 @@ partdist_tso_status(PG_FUNCTION_ARGS)
 
 	initStringInfo(&buf);
 	LWLockAcquire(TsoCtl->lock, LW_SHARED);
-	appendStringInfo(&buf, "counter=" INT64_FORMAT " safe=" INT64_FORMAT
-					 " served=%c blocked=%c",
-					 TsoCtl->counter, TsoCtl->safe_ts,
+	appendStringInfo(&buf, "counter=" INT64_FORMAT " hwm=" INT64_FORMAT
+					 " safe=" INT64_FORMAT " served=%c blocked=%c",
+					 TsoCtl->counter, TsoCtl->hwm, TsoCtl->safe_ts,
 					 TsoCtl->served ? 't' : 'f',
 					 TsoCtl->boot_blocked ? 't' : 'f');
 	for (i = 0; i < TSO_MAX_NODES; i++)

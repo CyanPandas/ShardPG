@@ -27,6 +27,13 @@
 
 #define TSO_MAX_NODES		64
 #define TSO_BOOT_MARKER		"pg_tso_boot"
+/*
+ * 2026-10-16：时间戳高水位文件。内容 = 已持久预留的上界（十进制 int64），
+ * 发出的每个号都严格小于它。重启后从这里接着发，单调性跨重启成立 —— 有了它，
+ * boot 标记不再意味着"单调性失守"，master 可以重启（换库、宕机恢复都需要）。
+ */
+#define TSO_HWM_FILE		"pg_tso_hwm"
+#define TSO_HWM_BATCH		INT64CONST(1000000)	/* 每次预留的号数（只影响落盘频率与重启跳号） */
 
 extern void TsoDefineGUCs(void);
 extern void RequestTsoShmem(void);

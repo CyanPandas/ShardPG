@@ -63,6 +63,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
+#include "partwal_recent.h"
 
 /* ================================================================== */
 /* Shared memory (minimal: no LSN hash needed; queue handles it)       */
@@ -641,6 +642,7 @@ ResetPartitionWALState(Oid partition_id)
     /* Delete all segment files and the checkpoint file */
     snprintf(dirpath, MAXPGPATH, "%s/%s/%u",
              DataDir, PARTITION_WAL_DIR, partition_id);
+    PartWALRecentInvalidateAll();
 
     dir = opendir(dirpath);
     if (dir == NULL)
