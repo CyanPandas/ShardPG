@@ -31,18 +31,18 @@ step() { printf '\n[%s] %s\n' "$1" "$2"; }
 WORKERS=$(q "SELECT string_agg(nodeport::text, ' ' ORDER BY nodeport) FROM pg_dist_node WHERE noderole='primary' AND groupid<>0 AND isactive")
 NW=$(wc -w <<<"$WORKERS")
 
-# 各 worker 上指定分片号的 Raft 组 / 物理表 / 登记；master 登记 + 清理队列
+# 各 worker 上指定分片号的 Raft 组 / 物理表 / 登记 / 副本回放登记（P7-N98）；master 登记 + 清理队列
 residue() {   # $1 = 逗号分隔分片号  $2 = 逗号分隔物理表名
     local p out all=""
     for p in $WORKERS; do
-        out=$(q "SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN ($1)) || '|' || (SELECT count(*) FROM unnest(string_to_array('$2', ',')) t WHERE to_regclass(t) IS NOT NULL) || '|' || (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN ($1))" "$p")
+        out=$(q "SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN ($1)) || '|' || (SELECT count(*) FROM unnest(string_to_array('$2', ',')) t WHERE to_regclass(t) IS NOT NULL) || '|' || (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN ($1)) || '|' || (SELECT count(*) FROM partdist.follower_partition_map WHERE global_shard_id IN ($1))" "$p")
         all="$all :$p=$out"
     done
     all="$all master=$(q "SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN ($1)")"
     all="$all queue=$(q "SELECT count(*) FROM partdist.shardpg_drop_queue WHERE shardid IN ($1)")"
     printf '%s' "$all"
 }
-clean_expect() { local w e=""; for w in $WORKERS; do e="$e :$w=0|0|0"; done; printf '%s master=0 queue=0' "$e"; }
+clean_expect() { local w e=""; for w in $WORKERS; do e="$e :$w=0|0|0|0"; done; printf '%s master=0 queue=0' "$e"; }
 
 ids_of()   { q "SELECT string_agg(shardid::text, ',' ORDER BY shardid) FROM pg_dist_shard WHERE logicalrelid IN ($1)"; }
 names_of() { q "SELECT string_agg(shard_name(logicalrelid, shardid), ',' ORDER BY shardid) FROM pg_dist_shard WHERE logicalrelid IN ($1)"; }

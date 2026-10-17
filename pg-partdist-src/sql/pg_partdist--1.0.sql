@@ -2475,7 +2475,20 @@ EXCEPTION WHEN OTHERS THEN
     RETURN 'error: ' || SQLERRM;
 END $fn$;
 
--- 清理已删表留下的 Raft 组、副本表、主从登记。不抛错，返回摘要。
+-- P7-N98：删掉本节点 follower_partition_map 里本地表已经不在的行（删表、重供基线换了表之后留下的）。
+-- 按 OID 查 pg_class，并在函数里关掉 Citus 的分片表隐藏（N86 就是被它藏起分片表、误删活账）。返回删除行数。
+CREATE OR REPLACE FUNCTION partdist.follower_map_gc_orphans()
+RETURNS integer LANGUAGE sql
+SET citus.override_table_visibility = off
+AS $fn$
+    WITH d AS (
+        DELETE FROM partdist.follower_partition_map f
+         WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = f.partition_id)
+        RETURNING 1)
+    SELECT count(*)::integer FROM d
+$fn$;
+
+-- 清理已删表留下的 Raft 组、副本表、主从登记、副本回放登记。不抛错，返回摘要。
 -- 只处理已经不在 pg_dist_shard 里的分片 —— 重复执行、在删表提交前执行都不会误伤。
 CREATE OR REPLACE FUNCTION partdist.shardpg_cleanup_dropped()
 RETURNS text LANGUAGE plpgsql AS $fn$
@@ -2535,27 +2548,31 @@ BEGIN
             RAISE NOTICE '清理：已删除各节点上的副本表';
         END IF;
 
-        -- ③ 删主从登记（master 与各 worker），回收打标登记与回放槽位
+        -- ③ 删主从登记（master 与各 worker）、副本回放登记（P7-N98），回收打标登记与回放槽位
         DELETE FROM partdist.partition_map WHERE partition_id::bigint = ANY (v_ids);
         PERFORM pg_catalog.run_command_on_workers(format(
             'DELETE FROM partdist.partition_map WHERE partition_id::bigint IN (%s)', v_list));
+        PERFORM pg_catalog.run_command_on_workers(format(
+            'DELETE FROM partdist.follower_partition_map WHERE global_shard_id IN (%s)', v_list));
+        PERFORM pg_catalog.run_command_on_workers('SELECT partdist.follower_map_gc_orphans()');
         PERFORM pg_catalog.run_command_on_workers('SELECT partdist.shard_mvcc_gc_orphans()');
         PERFORM pg_catalog.run_command_on_workers('SELECT slots_freed FROM partdist.replay_reclaim_stale(0)');
         IF v_round = 1 THEN
             RAISE NOTICE '清理：已删除主从登记，回收残留';
         END IF;
 
-        -- ④ 核对：每台 worker 上 Raft 组 / 物理表 / 登记都应为 0
+        -- ④ 核对：每台 worker 上 Raft 组 / 物理表 / 登记 / 副本回放登记都应为 0
         v_left := '';
         FOR r IN SELECT nodeport, success, result FROM pg_catalog.run_command_on_workers(format(
             $q$SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN (%1$s)) || '|' ||
                       (SELECT count(*) FROM unnest(%2$L::text[]) t WHERE pg_catalog.to_regclass(t) IS NOT NULL) || '|' ||
-                      (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN (%1$s))$q$,
+                      (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN (%1$s)) || '|' ||
+                      (SELECT count(*) FROM partdist.follower_partition_map WHERE global_shard_id IN (%1$s))$q$,
             v_list, v_names)) ORDER BY 1
         LOOP
-            IF NOT r.success OR r.result <> '0|0|0' THEN
+            IF NOT r.success OR r.result <> '0|0|0|0' THEN
                 v_left := v_left || format(' :%s(%s)', r.nodeport,
-                                           CASE WHEN r.success THEN '组|表|登记=' || r.result ELSE '连不上' END);
+                                           CASE WHEN r.success THEN '组|表|登记|副本登记=' || r.result ELSE '连不上' END);
             END IF;
         END LOOP;
         EXIT WHEN v_left = '';
