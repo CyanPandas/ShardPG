@@ -297,6 +297,45 @@ CREATE OR REPLACE FUNCTION pg_raft_append_entries_batch(
 COMMENT ON FUNCTION pg_raft_append_entries_batch(bigint, integer, bigint, bigint, bigint, bigint, bigint[], bigint, text[], text[]) IS
     'P7-N41 批量 AppendEntries：数据组一批 parwal 记录一条 RPC、对端一次 fsync。';
 
+-- 2026-10-17（路线 A）：节点地址覆盖。节点号不变、物理地址随切主迁移（备库提升接替原节点号）。
+-- 只由控制面 OP_NODE_ADDRESS 的 apply 写入；pg_raft 把它套到 pg_raft.peers 上（共享内存，维护进程定期重灌）。
+CREATE TABLE IF NOT EXISTS node_address (
+    node_id    integer PRIMARY KEY,
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    tli        integer NOT NULL DEFAULT 0   -- 接替者（被提升备库）的 WAL 时间线；旧主据此自我隔离
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_set_node_address(p_node_id integer, p_host text, p_port integer)
+    RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_set_node_address';
+
+CREATE OR REPLACE FUNCTION pg_raft_sync_node_addresses()
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_sync_node_addresses';
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_address(p_node_id integer, p_host text, p_port integer,
+                                                        p_tli integer DEFAULT 0)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_address';
+
+-- 2026-10-17（路线 A）：各节点的物理备库登记。只由控制面 OP_NODE_STANDBY 的 apply 写入；
+-- 控制面 leader 的切主控制器（pg_raft.auto_failover）据此探测主库、挑备库提升。
+CREATE TABLE IF NOT EXISTS node_standby (
+    node_id    integer NOT NULL,
+    name       text    NOT NULL,     -- 复制槽名 = application_name
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, name)
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_standby(p_node_id integer, p_name text, p_host text,
+                                                        p_port integer, p_remove boolean)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_standby';
+
 -- 2026-10-17：节点级有序复制流的接收端 —— 一条二进制消息装着 leader 发给本节点的多个组的条目，
 -- 全部组一次 fsync、随本语句事务一次提交后回 "gid term ok last;..."。
 CREATE OR REPLACE FUNCTION pg_raft_stream_apply(p_msg bytea)

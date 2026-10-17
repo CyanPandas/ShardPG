@@ -162,6 +162,7 @@ typedef struct PartWALCtlData
     int32          reprov_target[PARTWAL_REPROV_QUEUE_MAX];
 
     pg_atomic_uint32 clog_drop_gen;  /* 分片 clog 被 DROP 回收的代次：后端据此作废段描述符缓存 */
+    pg_atomic_uint64 relmap_gen;     /* 2026-10-17：relfilenode→分区映射的代次（登记一次 +1），后端据此作废本地缓存 */
     slock_t        clog_dirty_mutex;
     int            clog_ndirty;
     ShardClogDirtyEnt clog_dirty[PARTWAL_CLOG_DIRTY_MAX];
@@ -407,5 +408,7 @@ extern void  PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid,
 extern XLogRecPtr ScanWALRangeForPartition(PartitionWALWriter *writer,
                                             XLogRecPtr start_lsn,
                                             XLogRecPtr end_lsn);
+
+extern bool PartWALXactNonShardWrite;   /* 2026-10-17：本事务写过非分片数据块（提前放锁据此禁用） */
 
 #endif /* PARTWAL_SYNC_H */

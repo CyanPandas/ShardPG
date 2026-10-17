@@ -38,6 +38,13 @@
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"          /* 2026-10-17 复制流：二进制批消息 */
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xloginsert.h"
+#include "access/xlogreader.h"
+#include "replication/syncrep.h"
+#include "replication/walsender.h"
+#include "replication/walsender_private.h"
 #include "port/pg_bswap.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -417,6 +424,16 @@ typedef struct RaftGroupTable
     Latch          *stream_latch;
     ConditionVariable stream_cv;
     pid_t           stream_in_pid[64];  /* 副本端：来自各 leader（按节点号取模）的当前复制流会话 pid */
+    /*
+     * 2026-10-17（路线 A）：节点地址覆盖表。节点号不变、物理地址随切主迁移（备库提升后接替原节点号）。
+     * pg_raft.peers 是启动参数改不了，这里按节点号覆盖其地址；addr_gen 每改一次 +1，parse_peers 据此重套。
+     * 受 mutex 保护。内容来自 partdist.node_address（控制面 OP_NODE_ADDRESS 写入，维护进程定期同步）。
+     */
+    uint32          addr_gen;
+    int             addr_n;
+    int             addr_node[RAFT_MAX_PEERS];
+    int             addr_port[RAFT_MAX_PEERS];
+    char            addr_host[RAFT_MAX_PEERS][256];
     pg_atomic_uint64 stream_wait_n;     /* 提交路径等复制提交：次数 / 合计微秒 / 最大微秒（管理进程每 10 s 清零） */
     pg_atomic_uint64 stream_wait_us;
     pg_atomic_uint64 stream_wait_max;
@@ -1939,6 +1956,127 @@ data_group_truncate_parwal(RaftGroupCtx *ctx, int64 keep_upto_plsn)
     raft_persist_spi_end(spi_owned);
 }
 
+/* ---------------- 2026-10-17（路线 A）：pg_raft 的 WAL 资源管理器 ---------------- */
+#define RAFT_RMGR_ID            148
+#define RAFT_RMGR_NAME          "pg_raft"
+#define XLOG_RAFT_HARDSTATE     0x00
+
+typedef struct xl_raft_hardstate
+{
+    int64               group_id;
+    RaftHardStateFile   hs;
+} xl_raft_hardstate;
+
+static void
+raft_hs_path_for(int64 group_id, char *path, size_t pathlen)
+{
+    if (group_id == RAFT_CONTROL_GROUP)
+        snprintf(path, pathlen, "%s/pg_raft_hardstate", DataDir);
+    else
+        snprintf(path, pathlen, "%s/pg_raft_hardstate.%lld", DataDir, (long long) group_id);
+}
+
+static bool
+raft_wal_wait_durable(XLogRecPtr lsn)
+{
+    XLogRecPtr flushed;
+    bool       defined;
+
+    XLogFlush(lsn);
+    if (!SyncRepRequested() || WalSndCtl == NULL)
+        return true;
+    defined = (((volatile WalSndCtlData *) WalSndCtl)->sync_standbys_status & SYNC_STANDBY_DEFINED) != 0;
+    if (!defined)
+        return true;
+    HOLD_INTERRUPTS();
+    SyncRepWaitForLSN(lsn, false);
+    RESUME_INTERRUPTS();
+    LWLockAcquire(SyncRepLock, LW_SHARED);
+    flushed = ((volatile WalSndCtlData *) WalSndCtl)->lsn[SYNC_REP_WAIT_FLUSH];
+    LWLockRelease(SyncRepLock);
+    return flushed >= lsn;
+}
+
+static void
+raft_wal_log_hardstate(int64 group_id, const RaftHardStateFile *hs)
+{
+    xl_raft_hardstate xl;
+    XLogRecPtr        lsn;
+
+    if (RecoveryInProgress() || !XLogInsertAllowed())
+        return;
+    memset(&xl, 0, sizeof(xl));
+    xl.group_id = group_id;
+    xl.hs = *hs;
+    XLogBeginInsert();
+    XLogRegisterData((char *) &xl, sizeof(xl));
+    lsn = XLogInsert(RAFT_RMGR_ID, XLOG_RAFT_HARDSTATE);
+    if (!raft_wal_wait_durable(lsn))
+        elog(WARNING, "pg_raft: 组 %lld 的 hardstate WAL 未确认到达同步备库",
+             (long long) group_id);
+}
+
+static void
+raft_rmgr_redo(XLogReaderState *record)
+{
+    uint8               info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+    xl_raft_hardstate  *xl = (xl_raft_hardstate *) XLogRecGetData(record);
+    char                path[MAXPGPATH];
+    char                tmppath[MAXPGPATH];
+    int                 fd;
+
+    if (info != XLOG_RAFT_HARDSTATE)
+        elog(PANIC, "raft_rmgr_redo: unknown op code %u", info);
+    raft_hs_path_for(xl->group_id, path, sizeof(path));
+    snprintf(tmppath, sizeof(tmppath), "%s.redo", path);
+    fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+    {
+        elog(WARNING, "pg_raft: 回放 hardstate 打不开 \"%s\": %m", tmppath);
+        return;
+    }
+    if (write(fd, &xl->hs, sizeof(xl->hs)) != (ssize_t) sizeof(xl->hs) || pg_fsync(fd) != 0)
+    {
+        elog(WARNING, "pg_raft: 回放 hardstate 写入失败 \"%s\": %m", tmppath);
+        close(fd);
+        unlink(tmppath);
+        return;
+    }
+    close(fd);
+    if (rename(tmppath, path) != 0)
+        elog(WARNING, "pg_raft: 回放 hardstate 改名失败 \"%s\": %m", path);
+}
+
+static void
+raft_rmgr_desc(StringInfo buf, XLogReaderState *record)
+{
+    xl_raft_hardstate *xl = (xl_raft_hardstate *) XLogRecGetData(record);
+
+    appendStringInfo(buf, "group %lld term %lld vote %d base %lld/%lld",
+                     (long long) xl->group_id, (long long) xl->hs.current_term,
+                     xl->hs.voted_for, (long long) xl->hs.base_index,
+                     (long long) xl->hs.base_term);
+}
+
+static const char *
+raft_rmgr_identify(uint8 info)
+{
+    return ((info & ~XLR_INFO_MASK) == XLOG_RAFT_HARDSTATE) ? "HARDSTATE" : NULL;
+}
+
+static const RmgrData raft_rmgr = {
+    .rm_name = RAFT_RMGR_NAME,
+    .rm_redo = raft_rmgr_redo,
+    .rm_desc = raft_rmgr_desc,
+    .rm_identify = raft_rmgr_identify,
+};
+
+void
+pg_raft_register_rmgr(void)
+{
+    RegisterCustomRmgr(RAFT_RMGR_ID, &raft_rmgr);
+}
+
 static void
 hard_state_path(RaftGroupCtx *ctx, char *path, size_t pathlen)
 {
@@ -2057,6 +2195,14 @@ persist_hard_state_values_ex(RaftGroupCtx *ctx, int64 current_term, int voted_fo
         hard_state_hint_path(ctx, hpath, sizeof(hpath));
         (void) unlink(hpath);
     }
+
+    /*
+     * 2026-10-17（路线 A）：持久的 hardstate（任期 / 投票 / 压缩基点）也记一条 WAL，并等它到达
+     * 同步备库之后才返回（调用方随后才回复投票 / 推进任期）。物理备库回放时写出同样的文件，
+     * 备库提升接替本节点号时等同于"本节点重启"，不会在已投过票的任期里再投一次。
+     */
+    if (do_fsync)
+        raft_wal_log_hardstate(ctx->group_id, &hs);
 
     return true;
 }
@@ -3918,6 +4064,49 @@ init_leader_replication(RaftGroupCtx *ctx)
 
 /* ---- peers ---- */
 
+static void peer_conn_reset(int slot);
+static uint32 peers_addr_gen = 0;
+
+/* 把共享内存里的节点地址覆盖套到 peers[] 上（地址变了的槽位丢掉缓存连接） */
+static bool addr_initial_parse = false;   /* 进程首次解析 peers：覆盖照套，但不逐个后端打日志 */
+
+static void
+apply_addr_overrides(void)
+{
+    uint32  gen;
+    int     n, i, j;
+    int     node[RAFT_MAX_PEERS];
+    int     port[RAFT_MAX_PEERS];
+    char    host[RAFT_MAX_PEERS][256];
+
+    if (RaftGroups == NULL)
+        return;
+    SpinLockAcquire(&RaftGroups->mutex);
+    gen = RaftGroups->addr_gen;
+    n = Min(RaftGroups->addr_n, RAFT_MAX_PEERS);
+    for (i = 0; i < n; i++)
+    {
+        node[i] = RaftGroups->addr_node[i];
+        port[i] = RaftGroups->addr_port[i];
+        strlcpy(host[i], RaftGroups->addr_host[i], sizeof(host[i]));
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+    if (gen == peers_addr_gen)
+        return;
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n_peers; j++)
+            if (peers[j].node_id == node[i] &&
+                (peers[j].port != port[i] || strcmp(peers[j].host, host[i]) != 0))
+            {
+                elog(addr_initial_parse ? DEBUG1 : LOG, "pg_raft: 节点 %d 的地址 %s:%d → %s:%d（节点地址覆盖）",
+                     node[i], peers[j].host, peers[j].port, host[i], port[i]);
+                strlcpy(peers[j].host, host[i], sizeof(peers[j].host));
+                peers[j].port = port[i];
+                peer_conn_reset(j);
+            }
+    peers_addr_gen = gen;
+}
+
 static void
 parse_peers(void)
 {
@@ -3926,7 +4115,11 @@ parse_peers(void)
     char *saveptr = NULL;
 
     if (peers_parsed)
+    {
+        if (RaftGroups != NULL && RaftGroups->addr_gen != peers_addr_gen)
+            apply_addr_overrides();
         return;
+    }
 
     n_peers = 0;
     if (pg_raft_peers == NULL || pg_raft_peers[0] == '\0')
@@ -3954,6 +4147,141 @@ parse_peers(void)
     }
     pfree(buf);
     peers_parsed = true;
+    peers_addr_gen = 0;
+    addr_initial_parse = true;
+    apply_addr_overrides();
+    addr_initial_parse = false;
+}
+
+/* 本节点共享内存里设一条节点地址覆盖（幂等；地址没变不涨代数） */
+void
+pg_raft_set_node_address_internal(int node_id, const char *host, int port)
+{
+    int i;
+    bool changed = false;
+
+    if (RaftGroups == NULL || node_id <= 0 || host == NULL || host[0] == '\0' || port <= 0)
+        return;
+    SpinLockAcquire(&RaftGroups->mutex);
+    for (i = 0; i < RaftGroups->addr_n; i++)
+        if (RaftGroups->addr_node[i] == node_id)
+            break;
+    if (i == RaftGroups->addr_n && i < RAFT_MAX_PEERS)
+    {
+        RaftGroups->addr_n++;
+        RaftGroups->addr_node[i] = node_id;
+        RaftGroups->addr_host[i][0] = '\0';
+        RaftGroups->addr_port[i] = 0;
+    }
+    if (i < RAFT_MAX_PEERS &&
+        (RaftGroups->addr_port[i] != port || strcmp(RaftGroups->addr_host[i], host) != 0))
+    {
+        strlcpy(RaftGroups->addr_host[i], host, sizeof(RaftGroups->addr_host[i]));
+        RaftGroups->addr_port[i] = port;
+        RaftGroups->addr_gen++;
+        changed = true;
+    }
+    SpinLockRelease(&RaftGroups->mutex);
+    if (changed)
+        parse_peers();
+}
+
+/* 本节点：按 partdist.node_address 重灌地址覆盖（调用方在事务里；维护进程定期调，重启后也能恢复） */
+int
+pg_raft_sync_node_addresses_internal(void)
+{
+    bool spi_owned;
+    int  n = 0;
+    uint64 r;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    if (SPI_execute("SELECT node_id, host, port FROM partdist.node_address "
+                    "WHERE to_regclass('partdist.node_address') IS NOT NULL", true, 0) == SPI_OK_SELECT)
+    {
+        int     ids[RAFT_MAX_PEERS];
+        int     ports[RAFT_MAX_PEERS];
+        char   *hosts[RAFT_MAX_PEERS];
+        int     k;
+
+        for (r = 0; r < SPI_processed && n < RAFT_MAX_PEERS; r++)
+        {
+            bool  isnull;
+            char *h;
+
+            ids[n] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &isnull));
+            h = SPI_getvalue(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2);
+            ports[n] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &isnull));
+            if (h == NULL)
+                continue;
+            hosts[n] = pstrdup(h);
+            n++;
+        }
+        raft_persist_spi_end(spi_owned);
+        for (k = 0; k < n; k++)
+            pg_raft_set_node_address_internal(ids[k], hosts[k], ports[k]);
+        return n;
+    }
+    raft_persist_spi_end(spi_owned);
+    return 0;
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_set_node_address);
+/* pg_raft_set_node_address(node_id, host, port)：只改本节点（表 + 共享内存）。正常经控制面 OP_NODE_ADDRESS 走。 */
+Datum
+pg_raft_set_node_address(PG_FUNCTION_ARGS)
+{
+    int     node_id = PG_GETARG_INT32(0);
+    char   *host = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    int     port = PG_GETARG_INT32(2);
+    bool    spi_owned;
+    StringInfoData sql;
+
+    if (raft_persist_spi_begin(&spi_owned))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.node_address (node_id, host, port, updated_at) "
+                         "VALUES (%d, %s, %d, now()) ON CONFLICT (node_id) DO UPDATE SET "
+                         "host = EXCLUDED.host, port = EXCLUDED.port, updated_at = now(); "
+                         "UPDATE partdist.node_map SET hostname = %s, port = %d WHERE node_id = %d",
+                         node_id, quote_literal_cstr(host), port,
+                         quote_literal_cstr(host), port, node_id);
+        (void) SPI_execute(sql.data, false, 0);
+        raft_persist_spi_end(spi_owned);
+    }
+    pg_raft_set_node_address_internal(node_id, host, port);
+    PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_sync_node_addresses);
+Datum
+pg_raft_sync_node_addresses(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_INT32(pg_raft_sync_node_addresses_internal());
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_propose_node_address);
+/* pg_raft_propose_node_address(node_id, host, port)：经控制面日志改节点地址（须在控制面 leader 上调） */
+Datum
+pg_raft_propose_node_address(PG_FUNCTION_ARGS)
+{
+    int     node_id = PG_GETARG_INT32(0);
+    char   *host = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    int     port = PG_GETARG_INT32(2);
+    int     tli = (PG_NARGS() > 3) ? PG_GETARG_INT32(3) : 0;
+    StringInfoData payload;
+    int64   idx;
+
+    initStringInfo(&payload);
+    appendStringInfo(&payload, "{\"node_id\": %d, \"host\": \"%s\", \"port\": %d, \"tli\": %d}",
+                     node_id, host, port, tli);
+    idx = pg_raft_consensus_propose(PG_RAFT_OP_NODE_ADDRESS, payload.data);
+    if (idx <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_raft: 节点地址提议失败（本节点不是控制面 leader，或无多数派）")));
+    PG_RETURN_INT64(idx);
 }
 
 /*
@@ -16304,7 +16632,21 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
                  * 2PC 段作废、登记失去载体），而多等一轮只是延迟——两害相权，
                  * 宁可慢，不可丢。ABORT 不需要 ts，照常闭合。
                  */
-                if (verdict == 1 && dcts <= 0)
+                /*
+                 * 2026-10-17：Citus 原生 gid、本节点没有登记任何分片写集（coord_gsid 为 0、
+                 * mygsids 为空）—— 例如 citus_set_coordinator_host / citus_update_node 这类
+                 * 只改 Citus 目录的分布式事务。它没有分片 xid 要落判决，也就不需要 commit_ts；
+                 * 按 Citus 规则（pg_dist_transaction）问到的 COMMIT 直接闭合。
+                 * 原来这里同样"取不到 commit_ts ⇒ 本轮不闭合"，而这类事务永远取不到，
+                 * prepared 连同目录行锁永久滞留（协调者切主实验里 pg_dist_node 被锁死）。
+                 */
+                if (verdict == 1 && dcts <= 0 && coord_gsid <= 0 && nmygsids == 0)
+                {
+                    elog(LOG,
+                         "pg_raft: dtx 恢复：dtxid=%lld 无分片写集（Citus 目录事务），按 Citus 决议直接闭合",
+                         (long long) dtxid);
+                }
+                else if (verdict == 1 && dcts <= 0)
                 {
                     elog(LOG,
                          "pg_raft: dtx 恢复：dtxid=%lld 取不到 commit_ts，"

@@ -28,6 +28,7 @@
  * segments and writes data_len>0 records for any records missed at runtime.
  */
 #include "postgres.h"
+#include "access/shard_stamp.h"   /* 2026-10-17：写非分片块即禁用提前放锁 */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -112,6 +113,12 @@ static HTAB    *PartWALRelHash = NULL;
  * Passed implicitly to PartWALFlush() when upto_lsn == InvalidXLogRecPtr.
  */
 static XLogRecPtr partwal_my_max_lsn = InvalidXLogRecPtr;
+/*
+ * 2026-10-17：本事务是否写过不属于任何被跟踪分片（含其索引 / TOAST）的数据块。
+ * 提前放锁（补丁 0014/0016）只许用在全部写入都落在分片表上的事务：分片表的读者等判决，
+ * 判决在刷盘与同步复制之后才写；普通表的读者没有这道闸，放锁即可见。事务结束清零。
+ */
+bool PartWALXactNonShardWrite = false;
 
 /*
  * 本事务已由 PartWALFlush 落盘的最大 LSN。partwal_my_max_lsn 在 flush 结束时
@@ -310,6 +317,7 @@ PartWALSyncShmemInit(void)
         SpinLockInit(&PartWALCtl->ckpt_mutex);
         SpinLockInit(&PartWALCtl->clog_dirty_mutex);
         pg_atomic_init_u32(&PartWALCtl->clog_drop_gen, 0);
+        pg_atomic_init_u64(&PartWALCtl->relmap_gen, 1);
         PartWALCtl->clog_ndirty       = 0;
         PartWALCtl->ckpt_n            = 0;
     }
@@ -343,8 +351,63 @@ PartWALSyncRegister(Oid partition_id, RelFileNumber relfilenode)
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
     entry = (PartWALRelEntry *)
         hash_search(PartWALRelHash, &relfilenode, HASH_ENTER, &found);
+    if (!found || entry->partition_id != partition_id)
+        pg_atomic_fetch_add_u64(&PartWALCtl->relmap_gen, 1);
     entry->partition_id = partition_id;
     LWLockRelease(PartWALCtl->lock);
+}
+
+/*
+ * 2026-10-17：relfilenode→分区映射的后端本地缓存（直接映射，1024 槽）。
+ *
+ * 快速提交模式下每一条 WAL 记录都要查一次映射。原来每次都拿 PartWALCtl->lock 的共享模式，
+ * 而这把全局锁同时被 2PC 标记写入等路径以排它模式持有、并在锁内做分区 WAL 文件 I/O ——
+ * 于是全节点的写入都排在别人的文件 I/O 后面（256 终端实测：一台 worker 约 1/5 的活跃会话
+ * 等在这把锁上）。映射只增不删（只有登记会改它），登记时代次 +1；后端看到代次变了就整表作废。
+ * 命中时完全不碰全局锁。
+ *
+ * 不分配内存（静态数组）：WAL 插入钩子常在临界区里被调。读到代次之后、查共享表之前有新登记
+ * 进来，等价于这条记录早于登记写下（与下面共享锁预筛同一个论证），下一次调用就会作废重查。
+ */
+#define PARTWAL_RELMAP_CACHE 1024
+
+typedef struct PartWALRelMapCacheEnt
+{
+    RelFileNumber rfn;              /* 0 = 空槽 */
+    Oid           part;             /* InvalidOid = 不属于任何被跟踪分区 */
+} PartWALRelMapCacheEnt;
+
+static PartWALRelMapCacheEnt partwal_relmap_cache[PARTWAL_RELMAP_CACHE];
+static uint64 partwal_relmap_cache_gen = 0;
+
+static bool
+partwal_relmap_lookup(RelFileNumber rfn, Oid *part_out)
+{
+    uint64      gen = pg_atomic_read_u64(&PartWALCtl->relmap_gen);
+    PartWALRelMapCacheEnt *e;
+
+    if (gen != partwal_relmap_cache_gen)
+    {
+        memset(partwal_relmap_cache, 0, sizeof(partwal_relmap_cache));
+        partwal_relmap_cache_gen = gen;
+    }
+    e = &partwal_relmap_cache[((uint32) rfn * 2654435761U) >> 22];
+    if (e->rfn != rfn || !RelFileNumberIsValid(e->rfn))
+    {
+        PartWALRelEntry *se;
+        bool        found = false;
+        Oid         part = InvalidOid;
+
+        LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+        se = (PartWALRelEntry *) hash_search(PartWALRelHash, &rfn, HASH_FIND, &found);
+        if (found)
+            part = se->partition_id;
+        LWLockRelease(PartWALCtl->lock);
+        e->rfn = rfn;
+        e->part = part;
+    }
+    *part_out = e->part;
+    return OidIsValid(e->part);
 }
 
 bool
@@ -420,19 +483,18 @@ PartWALInsert(XLogRecPtr end_lsn,
 
         if (nblocks == 0)
             return;             /* SMGR（截断等）：只有副本在乎 */
-        LWLockAcquire(PartWALCtl->lock, LW_SHARED);
         for (i = 0; i < nblocks; i++)
         {
-            entry = (PartWALRelEntry *)
-                hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
-                            HASH_FIND, &found);
-            if (found)
+            Oid         p;
+
+            if (partwal_relmap_lookup(blocks[i].rlocator.relNumber, &p))
             {
-                part = entry->partition_id;
-                break;
+                if (!OidIsValid(part))
+                    part = p;
             }
+            else
+                { PartWALXactNonShardWrite = true; shard_elr_inhibit = true; }
         }
-        LWLockRelease(PartWALCtl->lock);
         if (OidIsValid(part))
             PartWALNoteTouched(part);
         return;
@@ -459,9 +521,17 @@ PartWALInsert(XLogRecPtr end_lsn,
             (void) hash_search(PartWALRelHash, &smgr_loc.relNumber, HASH_FIND, &any);
         else
         {
-            for (i = 0; i < nblocks && !any; i++)
+            for (i = 0; i < nblocks; i++)
+            {
+                bool f = false;
+
                 (void) hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
-                                   HASH_FIND, &any);
+                                   HASH_FIND, &f);
+                if (f)
+                    any = true;
+                else
+                    { PartWALXactNonShardWrite = true; shard_elr_inhibit = true; }
+            }
         }
         LWLockRelease(PartWALCtl->lock);
         if (!any)

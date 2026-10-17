@@ -9,6 +9,7 @@
 #include "lib/stringinfo.h"
 
 #include "dtx_pending.h"
+#include "shard_wal.h"				/* 2026-10-17：判决记 WAL */
 #include "shard_clog.h"
 #include "gxid.h"					/* T7.1：从 gxid 还原本地 xid */
 #include "partwal_sync.h"			/* T7.1：判决标记补发 */
@@ -64,6 +65,12 @@ typedef struct DtxPendingCtl
 	 */
 	int64		gx[DTX_PENDING_MAX];
 	int64		dx[DTX_PENDING_MAX];
+	/*
+	 * 2026-10-17（路线 A）：判决已落槽位、判决 WAL 的 LSN（0 = 还没落）。前台路径（决议广播、
+	 * 读者问到）落完不等同步备库，登记留着；清扫看到这里非 0 就不再问协调组，只等这条 WAL
+	 * 持久后注销。不进持久日志：重启后登记重放、判决由清扫重新问来。
+	 */
+	XLogRecPtr	vlsn[DTX_PENDING_MAX];
 	DtxPendingEntry e[DTX_PENDING_MAX];
 	int			recent_next;
 	DtxRecentEnt recent[DTX_RECENT_MAX];
@@ -215,6 +222,7 @@ pending_insert_locked(const DtxPendingEntry *ent)
 	*slot = *ent;
 	PendingCtl->gx[slot - PendingCtl->e] = ent->gxid;
 	PendingCtl->dx[slot - PendingCtl->e] = ent->dtxid;
+	PendingCtl->vlsn[slot - PendingCtl->e] = InvalidXLogRecPtr;
 	return PENDING_INS_OK;
 }
 
@@ -906,17 +914,50 @@ DtxRecentVerdict(int64 gxid, int64 *cts_out)
 	return verdict;
 }
 
+/* 记下某登记的判决 WAL 位置（清扫据此只等持久、不再问询） */
+static void
+pending_note_vlsn(int64 gxid, XLogRecPtr lsn)
+{
+	DtxPendingEntry *slot;
+
+	if (PendingCtl == NULL || XLogRecPtrIsInvalid(lsn))
+		return;
+	SpinLockAcquire(&PendingCtl->mutex);
+	slot = pending_find_locked(gxid);
+	if (slot != NULL)
+		PendingCtl->vlsn[slot - PendingCtl->e] = lsn;
+	SpinLockRelease(&PendingCtl->mutex);
+}
+
+/*
+ * wait = false：前台路径（决议广播的接收端、读者问到判决）。判决照样先记 WAL、落槽位
+ * （本机立即可见 —— 切主后新主凭 PREPARED 槽 + 登记问到的是同一决议，可见性一致），
+ * 但不在这里等同步备库：广播在协调者的提交路径上，读者还持着缓冲区锁。没确认就不注销
+ * 登记（不回执、协调组不 FORGET），由后台清扫等持久后注销。
+ */
 static bool
-dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
+dtx_pending_apply_verdict_ex(const DtxPendingEntry *ent, int verdict, int64 cts, bool wait)
 {
 	int			i;
 	int			nbad = 0;
+	XLogRecPtr	vlsn;
+	bool		durable;
 
+	/*
+	 * 2026-10-17（路线 A）：先记判决 WAL，再落槽位（本机可见），再等它到达同步备库；
+	 * 没确认到就不注销未决登记 —— 登记在，本节点就不回执，协调组就不会 FORGET 决议，
+	 * 切主后新主还能凭 PREPARED 槽 + 登记问到它（见 shard_wal.h）。
+	 */
+	vlsn = ShardWalLogVerdict(ent->gxid, verdict == 1, verdict == 1 ? cts : 0,
+							  ent->nxids, ent->pairs);
 	for (i = 0; i < ent->nxids; i++)
 		ShardClogSetVerdict((Oid) ent->pairs[2 * i],
 							(TransactionId) ent->pairs[2 * i + 1],
 							verdict == 1, verdict == 1 ? cts : 0);
 	dtx_recent_remember(ent->gxid, verdict, cts);	/* P7-N86 */
+	durable = wait ? ShardWalWaitDurable(vlsn) : ShardWalIsDurable(vlsn);
+	if (!durable)
+		pending_note_vlsn(ent->gxid, vlsn);
 
 	/* P7-N86 诊断：落完立刻回读，槽位没变成终局就说出来 */
 	for (i = 0; i < ent->nxids; i++)
@@ -932,8 +973,21 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 	if (!dtx_replicate_verdict(ent, verdict, cts))
 		return false;
 
+	if (!durable)
+	{
+		if (wait)
+			elog(LOG, "pg_partdist: gxid=%lld 的判决 WAL 未确认到达同步备库，暂不注销未决登记（清扫重试）",
+				 (long long) ent->gxid);
+		return false;
+	}
 	DtxPendingFinalized(ent->gxid);
 	return true;
+}
+
+static bool
+dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
+{
+	return dtx_pending_apply_verdict_ex(ent, verdict, cts, false);
 }
 
 /* ---- 清扫（backend 语境） ---- */
@@ -943,6 +997,7 @@ DtxPendingSweep(void)
 {
 	/* 堆上：每项约 2 KB，整表拷贝放栈上会爆（容量已从 128 提到 1024） */
 	DtxPendingEntry *snap = (DtxPendingEntry *) palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
+	XLogRecPtr *slsn = (XLogRecPtr *) palloc(sizeof(XLogRecPtr) * DTX_PENDING_MAX);
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;
@@ -953,19 +1008,34 @@ DtxPendingSweep(void)
 	SpinLockAcquire(&PendingCtl->mutex);
 	for (i = 0; i < DTX_PENDING_MAX; i++)
 		if (PendingCtl->gx[i] != 0)
+		{
+			slsn[nsnap] = PendingCtl->vlsn[i];
 			snap[nsnap++] = PendingCtl->e[i];
+		}
 	SpinLockRelease(&PendingCtl->mutex);
 
 	for (i = 0; i < nsnap; i++)
 	{
 		int64		cts = 0;
-		int			verdict = dtx_inquire_core(snap[i].coord_gsid,
-											   snap[i].dtxid, &cts);
+		int			verdict;
 
+		/* 判决已由前台落过槽位、只差 WAL 持久：等它（后台，可以等），不再问协调组 */
+		if (!XLogRecPtrIsInvalid(slsn[i]))
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (ShardWalWaitDurable(slsn[i]))
+			{
+				DtxPendingFinalized(snap[i].gxid);
+				ndone++;
+			}
+			continue;
+		}
+
+		verdict = dtx_inquire_core(snap[i].coord_gsid, snap[i].dtxid, &cts);
 		CHECK_FOR_INTERRUPTS();
 		if (verdict != 0)
 		{
-			if (dtx_pending_apply_verdict(&snap[i], verdict, cts))
+			if (dtx_pending_apply_verdict_ex(&snap[i], verdict, cts, true))
 				ndone++;
 			else if (dtx_pending_responsibility_moved(&snap[i]))
 			{
@@ -1166,6 +1236,12 @@ dtx_reader_selfconn(void)
 int
 DtxReaderResolve(int64 gxid, int64 *cts_out)
 {
+	return DtxReaderResolveEx(gxid, cts_out, false);
+}
+
+int
+DtxReaderResolveEx(int64 gxid, int64 *cts_out, bool retry_undecided)
+{
 	DtxReaderMemo *memo;
 	DtxPendingEntry ent;
 	char		sql[192];
@@ -1183,7 +1259,8 @@ DtxReaderResolve(int64 gxid, int64 *cts_out)
 		*cts_out = memo->cts;
 		return memo->verdict;
 	}
-	if (memo != NULL && memo->fail_epoch == xact_epoch)
+	if (memo != NULL && memo->fail_epoch == xact_epoch &&
+		!(retry_undecided && !memo->noanswer))
 		return memo->noanswer ? 4 : 0;	/* 本事务已问过未果——不重试（限流） */
 
 	/*

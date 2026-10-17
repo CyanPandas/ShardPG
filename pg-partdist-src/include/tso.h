@@ -36,6 +36,7 @@
 #define TSO_HWM_BATCH		INT64CONST(1000000)	/* 每次预留的号数（只影响落盘频率与重启跳号） */
 
 extern void TsoDefineGUCs(void);
+extern void TsoRedoHwm(int64 hwm);	/* 2026-10-17：备库回放高水位记录 */
 extern void RequestTsoShmem(void);
 extern void TsoShmemInit(void);
 

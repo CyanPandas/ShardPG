@@ -4,7 +4,7 @@ COPY fix-src.tar.gz /tmp/fix-src.tar.gz
 RUN set -eu; rm -rf /work/pg-partdist-src /work/pg-raft-src /work/tpcc; \
     tar -xzf /tmp/fix-src.tar.gz -C /work; \
     cd /work/postgres-src; \
-    for p in /work/pg-partdist-src/patches/0012-*.patch /work/pg-partdist-src/patches/0013-*.patch /work/pg-partdist-src/patches/0014-*.patch /work/pg-partdist-src/patches/0015-*.patch; do \
+    for p in /work/pg-partdist-src/patches/0012-*.patch /work/pg-partdist-src/patches/0013-*.patch /work/pg-partdist-src/patches/0014-*.patch /work/pg-partdist-src/patches/0015-*.patch /work/pg-partdist-src/patches/0016-*.patch; do \
       [ -f "$p" ] || continue; patch -p1 --forward < "$p"; done; \
     make -j16 >/tmp/pg-build.log 2>&1 || { tail -40 /tmp/pg-build.log; exit 1; }; \
     make install >/dev/null; \

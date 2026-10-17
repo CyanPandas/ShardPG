@@ -17,6 +17,7 @@ OBJS = \
 	src/replay/replay_worker.o \
 	src/dtx/dtx_participant.o \
 	src/dtx_pending.o \
+	src/shard_wal.o \
 	src/shard_guard.o \
 	src/raft_boundary.o \
 	src/shard_xid.o \

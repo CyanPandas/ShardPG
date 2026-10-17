@@ -1069,6 +1069,7 @@ _PG_init(void)
     /* POSTMASTER GUC 只能在 shared_preload 阶段注册；CREATE EXTENSION 会再次加载 .so */
     if (process_shared_preload_libraries_in_progress)
     {
+        pg_raft_register_rmgr();   /* 2026-10-17（路线 A）：hardstate 记 WAL，备库回放 */
         DefineCustomIntVariable("pg_raft.node_id",
                                 "Local node id for control-plane Raft.",
                                 NULL, &pg_raft_node_id, 1, 1, 65534,
@@ -1212,6 +1213,21 @@ _PG_init(void)
     DefineCustomIntVariable("pg_raft.coordinator_node_id",
                             "Coordinator node id: preferred group-0 leader; excluded from data groups (0=none).",
                             NULL, &pg_raft_coordinator_node_id, 1, 0, 65534,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.auto_failover",
+                            "Route A: control-plane leader promotes a registered physical standby when a node's primary is down.",
+                            NULL, &pg_raft_auto_failover, false,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.failover_probe_ms",
+                            "Route A: primary probe interval for automatic failover (ms).",
+                            NULL, &pg_raft_failover_probe_ms, 2000, 200, 60000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.failover_fail_threshold",
+                            "Route A: consecutive failed primary probes before failover.",
+                            NULL, &pg_raft_failover_fail_threshold, 3, 1, 100,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.heartbeat_ms",

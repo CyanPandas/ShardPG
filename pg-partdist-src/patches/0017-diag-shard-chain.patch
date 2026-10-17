@@ -1,0 +1,75 @@
+diff -ruN a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+--- a/src/backend/access/heap/heapam_handler.c	2026-10-17 12:37:09.379024571 +0000
++++ b/src/backend/access/heap/heapam_handler.c	2026-10-17 12:37:47.101918559 +0000
+@@ -359,6 +359,35 @@
+ 	return result;
+ }
+ 
++/*
++ * patch 0017（诊断）：分片表 EPQ 顺更新链时以 TM_Deleted 放弃（行被当成已删除跳过）的现场。
++ * 每后端最多 40 条，只打分片表。
++ */
++static void
++shard_chain_diag(Relation relation, const char *why, HeapTuple tuple,
++				 TransactionId priorXmax)
++{
++	static int	n = 0;
++
++	if (n >= 40)
++		return;
++	n++;
++	if (tuple->t_data == NULL)
++		elog(LOG, "pg_partdist[diag] 顺链放弃(%s) rel=%u tid=(%u,%u) priorXmax=%u（槽位空：行指针非 NORMAL）",
++			 why, RelationGetRelid(relation),
++			 ItemPointerGetBlockNumber(&tuple->t_self), ItemPointerGetOffsetNumber(&tuple->t_self),
++			 priorXmax);
++	else
++		elog(LOG, "pg_partdist[diag] 顺链放弃(%s) rel=%u tid=(%u,%u) priorXmax=%u xmin=%u xmax=%u infomask=%04x infomask2=%04x ctid=(%u,%u)",
++			 why, RelationGetRelid(relation),
++			 ItemPointerGetBlockNumber(&tuple->t_self), ItemPointerGetOffsetNumber(&tuple->t_self),
++			 priorXmax,
++			 HeapTupleHeaderGetRawXmin(tuple->t_data), HeapTupleHeaderGetRawXmax(tuple->t_data),
++			 tuple->t_data->t_infomask, tuple->t_data->t_infomask2,
++			 ItemPointerGetBlockNumber(&tuple->t_data->t_ctid),
++			 ItemPointerGetOffsetNumber(&tuple->t_data->t_ctid));
++}
++
+ static TM_Result
+ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+ 				  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+@@ -456,6 +485,8 @@
+ 											 HeapTupleHeaderGetXmin(tuple->t_data),
+ 											 priorXmax))
+ 					{
++						if (shard_rel)
++							shard_chain_diag(relation, "dirty可见但xmin不接链", tuple, priorXmax);
+ 						ReleaseBuffer(buffer);
+ 						return TM_Deleted;
+ 					}
+@@ -548,6 +579,8 @@
+ 				if (tuple->t_data == NULL)
+ 				{
+ 					Assert(!BufferIsValid(buffer));
++					if (shard_rel)
++						shard_chain_diag(relation, "槽位空", tuple, priorXmax);
+ 					return TM_Deleted;
+ 				}
+ 
+@@ -559,6 +592,8 @@
+ 										 HeapTupleHeaderGetXmin(tuple->t_data),
+ 										 priorXmax))
+ 				{
++					if (shard_rel)
++						shard_chain_diag(relation, "dirty不可见且xmin不接链", tuple, priorXmax);
+ 					ReleaseBuffer(buffer);
+ 					return TM_Deleted;
+ 				}
+@@ -580,6 +615,8 @@
+ 				if (ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid))
+ 				{
+ 					/* deleted, so forget about it */
++					if (shard_rel)
++						shard_chain_diag(relation, "dirty不可见且链尾", tuple, priorXmax);
+ 					ReleaseBuffer(buffer);
+ 					return TM_Deleted;
+ 				}

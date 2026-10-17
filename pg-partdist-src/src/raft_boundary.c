@@ -59,7 +59,8 @@
 #include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
-#include "partwal_recent.h"		/* 2026-10-16：按 plsn 回读的内存快路径 */
+#include "partwal_recent.h"
+#include "shard_wal.h"			/* 2026-10-17：判决记 WAL */		/* 2026-10-16：按 plsn 回读的内存快路径 */
 
 PG_FUNCTION_INFO_V1(pg_partdist_get_partition_flush_lsn);
 PG_FUNCTION_INFO_V1(pg_partdist_get_follower_applied_part_lsn);
@@ -499,6 +500,13 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 
 	if (ShardClogReadSlot(partition_id, sxid, &slot))
 		sts = (int64) slot.start_ts;
+	{
+		uint32		pv[2];
+
+		pv[0] = (uint32) partition_id;
+		pv[1] = (uint32) sxid;
+		(void) ShardWalLogVerdict(0, committed, committed ? cts : 0, 1, pv);	/* 2026-10-17 */
+	}
 	ShardClogSetVerdict(partition_id, sxid, committed, committed ? cts : 0);
 	touched_before = PartWALTouchedCount();
 

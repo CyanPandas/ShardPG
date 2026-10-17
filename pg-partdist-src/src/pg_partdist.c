@@ -21,6 +21,7 @@
 #include "shard_xid.h"
 #include "shard_visibility.h"
 #include "tso.h"
+#include "shard_wal.h"
 
 #include "storage/bufmgr.h"
 
@@ -151,7 +152,10 @@ PartWALXactCallback(XactEvent event, void *arg)
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT ||
         event == XACT_EVENT_PARALLEL_ABORT || event == XACT_EVENT_PARALLEL_COMMIT ||
         event == XACT_EVENT_PREPARE)
+    {
         PartWALDeferSyncReset();
+        PartWALXactNonShardWrite = false;
+    }
 
     switch (event)
     {
@@ -640,6 +644,7 @@ _PG_init(void)
     PartWALRegisterReadHook();   /* 2026-10-17：pg_raft 复制流按 plsn 读记录（C 层） */
     if (!process_shared_preload_libraries_in_progress)
         return;
+    ShardWalRegisterRmgr();      /* 2026-10-17：分片账本 WAL（PREPARED / 判决），路线 A 备库重建用；只能在预加载时注册 */
 
     /*
      * T6.3c：副本壳表的本地访问闸门的逃生口。

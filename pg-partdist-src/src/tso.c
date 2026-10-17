@@ -8,7 +8,9 @@
 #include <unistd.h>
 
 #include "tso.h"
+#include "shard_wal.h"
 
+#include "access/xlog.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -189,6 +191,44 @@ tso_persist_hwm(int64 hwm)
 }
 
 /*
+ * 2026-10-17（路线 A：协调者也有物理备库）：高水位只写本地文件的话，备库提升成新协调者后
+ * 读到的是它当初从主库拷来的旧值，会把旧主已经发过的号再发一遍 —— 全局 MVCC 的单调性失守。
+ * 所以每次预留新上界还要记一条 WAL，并等它到达同步备库后才发这一批里的号。
+ * 失败 ERROR（不发号）。只在已有同步备库时才真的等（单机部署不受影响）。
+ */
+static void
+tso_log_hwm(int64 hwm)
+{
+	XLogRecPtr	lsn = ShardWalLogTsoHwm(hwm);
+
+	if (!ShardWalWaitDurable(lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("pg_partdist: TSO 高水位 " INT64_FORMAT " 未能在同步备库上持久", hwm),
+				 errhint("fail-closed：备库确认之前不发这一批号。")));
+}
+
+/*
+ * 备库回放高水位记录（startup 进程）：文件持久落盘 + 共享内存跟上，
+ * 提升之后第一个号就从旧主预留过的上界之后发。只前进不后退。
+ */
+void
+TsoRedoHwm(int64 hwm)
+{
+	if (TsoCtl == NULL || hwm <= 0)
+		return;
+	if (hwm <= TsoCtl->hwm)
+		return;
+	tso_persist_hwm(hwm);
+	LWLockAcquire(TsoCtl->lock, LW_EXCLUSIVE);
+	if (hwm > TsoCtl->hwm)
+		TsoCtl->hwm = hwm;
+	if (TsoCtl->counter < TsoCtl->hwm)
+		TsoCtl->counter = TsoCtl->hwm;	/* 提升后先再预留一批才发号 */
+	LWLockRelease(TsoCtl->lock);
+}
+
+/*
  * 首次服务前把 boot 标记 durably 落盘（文件 + 目录都 fsync）。
  * 顺序铁律：标记持久 **先于** 第一个号发出——崩在两者之间只会多一次
  * "误拦重启"（删标记即恢复），绝不会出现"发过号却检测不到"。
@@ -237,6 +277,12 @@ tso_service_gate(void)
 				 errmsg("本节点不是 TSO master（pg_partdist.tso_master=off）"),
 				 errhint("v1 只有 master 发号；请连接 master 节点。")));
 
+	/* 2026-10-17：备库也继承了 tso_master=on 的配置；恢复中一律不发号（提升后才服务） */
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("本节点处于恢复（备库）状态，不提供 TSO 服务")));
+
 	if (TsoCtl->boot_blocked)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -254,6 +300,12 @@ tso_next_locked(void)
 	{
 		tso_write_boot_marker();
 		TsoCtl->served = true;
+		/*
+		 * 2026-10-17：GlobalSafeTs 的"启动后一个租约期不前进"从第一次服务算起 ——
+		 * 备库提升成协调者时 shmem 是它当备库时初始化的，boot_time 早已过期，
+		 * 而各 worker 的活跃快照还没向新协调者登记。
+		 */
+		TsoCtl->boot_time = GetCurrentTimestamp();
 	}
 	/* 2026-10-16：要发的号够到已持久的上界 ⇒ 先持久预留下一批（约每百万个号一次） */
 	if (TsoCtl->counter >= TsoCtl->hwm)
@@ -261,6 +313,7 @@ tso_next_locked(void)
 		int64		next = TsoCtl->counter + TSO_HWM_BATCH;
 
 		tso_persist_hwm(next);
+		tso_log_hwm(next);		/* 2026-10-17：同步备库确认后才发这一批 */
 		TsoCtl->hwm = next;
 	}
 	return TsoCtl->counter++;

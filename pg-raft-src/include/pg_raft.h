@@ -41,6 +41,11 @@ pg_raft_spi_end(bool must_finish)
 /* ★ P7-N39：新 leader 上任提的**本任期空条目**（Raft 标准动作），没有任何副作用，
  * 存在的唯一目的是把上一任期继承来的尾巴一起带上提交点。*/
 #define PG_RAFT_OP_NOOP              "OP_NOOP"
+/* 2026-10-17（路线 A）：节点地址迁移（备库提升接替原节点号）。payload = {"node_id":N,"host":"H","port":P} */
+#define PG_RAFT_OP_NODE_ADDRESS      "OP_NODE_ADDRESS"
+/* 2026-10-17（路线 A）：节点的物理备库登记（自动切主用）。
+ * payload = {"node_id":N,"name":"S","host":"H","port":P,"remove":0|1} */
+#define PG_RAFT_OP_NODE_STANDBY      "OP_NODE_STANDBY"
 
 #define PG_RAFT_MAX_HOSTNAME 256
 
@@ -90,6 +95,16 @@ extern void pg_raft_partwal_replicate_many(const Oid *parts, int nparts, bool *f
 extern bool pg_raft_replicate_many;
 extern bool pg_raft_replicate_pipeline;
 extern bool pg_raft_replicate_stream;         /* 2026-10-17 节点级有序复制流 */
+extern void pg_raft_set_node_address_internal(int node_id, const char *host, int port);
+extern int  pg_raft_sync_node_addresses_internal(void);
+extern void pg_raft_register_rmgr(void);   /* 2026-10-17：hardstate 记 WAL */
+/* 2026-10-17（路线 A）：自动切主（raft_failover.c） */
+extern bool pg_raft_auto_failover;
+extern int  pg_raft_failover_probe_ms;
+extern int  pg_raft_failover_fail_threshold;
+extern void pg_raft_routea_failover_tick(void);
+extern void pg_raft_routea_reconcile_tso(void);
+extern void pg_raft_routea_fence_check(void);
 extern int  pg_raft_stream_batch_entries;
 extern int  pg_raft_stream_inflight;
 extern void pg_raft_stream_main(Datum main_arg);

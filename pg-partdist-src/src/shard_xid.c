@@ -25,6 +25,7 @@
 
 #include "access/shard_stamp.h"
 #include "access/twophase_rmgr.h"
+#include "shard_wal.h"			/* 2026-10-17：PREPARED / 判决记 WAL */
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "executor/spi.h"
@@ -45,6 +46,8 @@
 #include "access/relation.h"		/* T7.30：relation_open */
 #include "storage/bufmgr.h"			/* T7.30：RelationGetNumberOfBlocks */
 #include "utils/builtins.h"			/* T7.30：cstring_to_text */
+
+bool		shard_diag_visibility = false;	/* 2026-10-17 诊断：见 pg_partdist.diag_visibility */
 
 /*
  * 回卷护栏：P1 不处理 32 位分片 xid 回卷（设计 §7 推 P5），逼近上限直接
@@ -1828,6 +1831,15 @@ ShardXidDefineGUCs(void)
 		0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"pg_partdist.diag_visibility",
+		"诊断：把分片表 Dirty / 更新判定里\"判不可见、TM_Invisible、当作已删除\"的决定打进日志（每后端每类限 30 条）。",
+		NULL,
+		&shard_diag_visibility,
+		false,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"pg_partdist.rc_update_recheck",
 		"READ COMMITTED 事务改分片表时，遇并发已提交的新版本按原生 EPQ 重评（默认 off）。",
 		"off = 快照隔离 first-committer-wins：目标行在本事务快照之后被改过即 40001。"
@@ -2411,6 +2423,12 @@ shard_at_prepare_impl(void)
 		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
 	}
 
+	/*
+	 * 2026-10-17（路线 A）：PREPARED 落账也记一条 WAL，排在 PREPARE 记录之前，随 EndPrepare
+	 * 的刷盘与同步复制等待一起持久。物理备库据此重建槽位与未决登记，切主后仍能问决议。
+	 */
+	(void) ShardWalLogPrepared(gxid, p->coord_gsid, p->dtxid, sts, xact_map_n, p->pairs);
+
 	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
 	pfree(p);
 }
@@ -2493,6 +2511,14 @@ shard_twophase_postabort_impl(TransactionId xid, uint16 info,
 
 	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
+	/* 2026-10-17（路线 A）：中止判决也记 WAL（备库回放 ROLLBACK PREPARED 不会调本回调） */
+	{
+		uint32	   *pairs = (uint32 *) palloc((Size) hdr.nxids * 2 * sizeof(uint32));
+
+		memcpy(pairs, pairs_base, (Size) hdr.nxids * 2 * sizeof(uint32));
+		(void) ShardWalLogVerdict(hdr.gxid, false, 0, hdr.nxids, pairs);
+		pfree(pairs);
+	}
 	for (i = 0; i < hdr.nxids; i++)
 	{
 		uint32		pv[2];

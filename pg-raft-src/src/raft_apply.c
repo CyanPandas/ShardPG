@@ -461,6 +461,61 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         return true;
     }
 
+    if (strcmp(op_type, PG_RAFT_OP_NODE_ADDRESS) == 0)
+    {
+        /* 2026-10-17（路线 A）：节点地址迁移 —— 落表（重启后由维护进程重灌）+ 立即改本节点共享内存 */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "WITH j AS (SELECT %s::jsonb AS j), "
+                         "a AS (INSERT INTO partdist.node_address (node_id, host, port, updated_at, tli) "
+                         "      SELECT (j->>'node_id')::int, j->>'host', (j->>'port')::int, now(), "
+                         "             coalesce((j->>'tli')::int, 0) FROM j "
+                         "      ON CONFLICT (node_id) DO UPDATE SET host = EXCLUDED.host, "
+                         "      port = EXCLUDED.port, updated_at = now(), tli = EXCLUDED.tli RETURNING 1) "
+                         "UPDATE partdist.node_map m SET hostname = j->>'host', port = (j->>'port')::int "
+                         "  FROM j WHERE m.node_id = (j->>'node_id')::int",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, false, 0);
+        ok = (ret == SPI_OK_UPDATE || ret == SPI_OK_UPDATE_RETURNING || ret >= 0);
+        pfree(sql.data);
+        if (ok)
+        {
+            int  nid = 0, port = 0;
+            char host[256];
+            const char *p = strstr(payload_json, "\"node_id\"");
+            const char *h = strstr(payload_json, "\"host\"");
+            const char *q = strstr(payload_json, "\"port\"");
+
+            host[0] = '\0';
+            if (p) (void) sscanf(strchr(p, ':') + 1, " %d", &nid);
+            if (q) (void) sscanf(strchr(q, ':') + 1, " %d", &port);
+            if (h) (void) sscanf(strchr(h, ':') + 1, " \"%255[^\"]\"", host);
+            pg_raft_set_node_address_internal(nid, host, port);
+        }
+        raft_spi_end(spi_owned);
+        return ok;
+    }
+    if (strcmp(op_type, PG_RAFT_OP_NODE_STANDBY) == 0)
+    {
+        /* 2026-10-17（路线 A）：备库登记 / 注销（切主控制器读这张表） */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "WITH j AS (SELECT %s::jsonb AS j), "
+                         "d AS (DELETE FROM partdist.node_standby s USING j "
+                         "      WHERE coalesce((j->>'remove')::int, 0) <> 0 "
+                         "        AND s.node_id = (j->>'node_id')::int AND s.name = j->>'name' RETURNING 1) "
+                         "INSERT INTO partdist.node_standby (node_id, name, host, port, updated_at) "
+                         "SELECT (j->>'node_id')::int, j->>'name', j->>'host', (j->>'port')::int, now() FROM j "
+                         " WHERE coalesce((j->>'remove')::int, 0) = 0 "
+                         "ON CONFLICT (node_id, name) DO UPDATE SET host = EXCLUDED.host, "
+                         "port = EXCLUDED.port, updated_at = now()",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, false, 0);
+        ok = (ret >= 0);
+        pfree(sql.data);
+        raft_spi_end(spi_owned);
+        return ok;
+    }
     if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
     {
         initStringInfo(&sql);
