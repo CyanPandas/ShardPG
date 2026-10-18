@@ -12231,6 +12231,50 @@ typedef struct DtxConnCacheEntry
 static DtxConnCacheEntry dtx_conns[DTX_CONN_CACHE_MAX];
 static int               dtx_nconns = 0;
 
+/*
+ * ★ P7-N105（2026-10-18）：缓存连接复用前探活。PQstatus 只是 libpq 上次读写时看到的状态：
+ * 对端重启过（或那个后端被终止）之后，缓存里的连接仍显示 CONNECTION_OK，直到第一次用它
+ * 才读到 FATAL + EOF ⇒ 本事务的 2PC 探针 / 判决下发直接 ERROR、整个事务回滚。现场：用户同一个
+ * psql 会话跨过一次 worker 重启（高可用演示第 4 步停 :5433），之后 add_node 提交时报
+ * "DTX 驱动在 localhost:5433 上执行失败 / SSL SYSCALL error: EOF detected"。
+ * 空闲的缓存连接上本不该有待读数据：套接字可读就读掉，读到 EOF / 出错即判死，
+ * 只是通知之类就接着用。不能改成"执行失败后重试"：dtx_decide 半途断开时可能已经执行过。
+ */
+static bool
+dtx_conn_usable(PGconn *conn)
+{
+    int i;
+
+    if (PQstatus(conn) != CONNECTION_OK || PQtransactionStatus(conn) != PQTRANS_IDLE)
+        return false;
+    for (i = 0; i < 8; i++)
+    {
+        int            sock = PQsocket(conn);
+        fd_set         rf;
+        struct timeval tv;
+        int            rc;
+
+        if (sock < 0)
+            return false;
+        FD_ZERO(&rf);
+        FD_SET(sock, &rf);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        rc = select(sock + 1, &rf, NULL, NULL, &tv);
+        if (rc == 0)
+            return true;
+        if (rc < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (!PQconsumeInput(conn) || PQstatus(conn) != CONNECTION_OK)
+            return false;
+    }
+    return PQstatus(conn) == CONNECTION_OK;
+}
+
 static PGconn *
 dtx_get_conn(const char *host, int port)
 {
@@ -12247,8 +12291,10 @@ dtx_get_conn(const char *host, int port)
 
     if (slot >= 0)
     {
-        if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
+        if (dtx_conn_usable(dtx_conns[slot].conn))
             return dtx_conns[slot].conn;
+        if (dtx_conns[slot].conn != NULL)
+            elog(LOG, "pg_raft: DTX 驱动到 %s:%d 的缓存连接已断开（对端重启过或连接被终止），重连", host, port);
         PQreset(dtx_conns[slot].conn);
         if (PQstatus(dtx_conns[slot].conn) == CONNECTION_OK)
             return dtx_conns[slot].conn;

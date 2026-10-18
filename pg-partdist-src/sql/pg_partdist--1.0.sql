@@ -3062,8 +3062,12 @@ DECLARE
     t0          timestamptz := clock_timestamp();
     ts          timestamptz;
     v_id        integer;
+    v_me        text;                                   -- 新节点在 pg_raft.peers 里的写法：<id>@<host>:<port>
     v_peers     text := current_setting('pg_raft.peers');
     v_new_peers text;
+    v_list      text[];
+    v_old_n     integer;                                -- 新节点之外的现有节点数
+    v_todo      integer := 0;                           -- ② 里这次真正追加的节点数
     v_v         text;
     r           record;
     v_n         integer;
@@ -3072,59 +3076,96 @@ DECLARE
     i           integer;
 BEGIN
     -- ① 新节点：连得上、三个扩展装好了、pg_raft.peers = 现有列表 + 它自己
+    -- ★ P7-N105：可以续做。①–③ 是在各节点上单独执行的（ALTER SYSTEM、控制面提案），函数中途出错回滚时
+    --   撤不掉（现场：④ citus_add_node 提交时出错，重跑就报"节点号已经在集群里"）⇒ 按现状判断哪几步已经做过，
+    --   做过的跳过，从没做完的那步接着做
     ts := clock_timestamp();
     v_v := partdist.addr_exec(p_host, p_port, 'SHOW pg_raft.node_id');
     v_id := v_v::integer;
-    IF EXISTS (SELECT 1 FROM partdist.node_map WHERE node_id = v_id) THEN
-        RAISE EXCEPTION '节点号 % 已经在集群里（node_map）', v_id;
+    v_me := v_id || '@' || p_host || ':' || p_port;
+    SELECT format('%s:%s', hostname, port) INTO v_v FROM partdist.node_map
+     WHERE node_id = v_id AND (hostname <> p_host OR port <> p_port);
+    IF FOUND THEN
+        RAISE EXCEPTION '节点号 % 已被别的节点占用（node_map 里登记的是 %）', v_id, v_v;
+    END IF;
+    SELECT node_id::text INTO v_v FROM partdist.node_map
+     WHERE node_id <> v_id AND hostname = p_host AND port = p_port;
+    IF FOUND THEN
+        RAISE EXCEPTION '%:% 在 node_map 里登记的是节点 %，新节点报的是 %', p_host, p_port, v_v, v_id;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_dist_node WHERE nodeport = p_port) THEN
-        RAISE EXCEPTION '端口 % 已经是 Citus 节点', p_port;
+        IF EXISTS (SELECT 1 FROM partdist.node_map WHERE node_id = v_id) THEN
+            step := '完成'; secs := 0;
+            detail := format('节点 %s（%s:%s）已经在集群里，不用再加', v_id, p_host, p_port);
+            RETURN NEXT;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION '端口 % 已经是 Citus 节点，但 node_map 里没有节点 %', p_port, v_id;
     END IF;
+    v_list := string_to_array(v_peers, ',');
+    IF v_list[array_length(v_list, 1)] = v_me THEN
+        -- 上次已经做过 ②（master 自己的 peers 以新节点结尾）：v_peers 还原成追加前的列表
+        v_new_peers := v_peers;
+        v_peers := array_to_string(v_list[1:array_length(v_list, 1) - 1], ',');
+    ELSIF EXISTS (SELECT 1 FROM unnest(v_list) e
+                   WHERE split_part(e, '@', 1) = v_id::text OR split_part(e, ':', 2) = p_port::text) THEN
+        RAISE EXCEPTION '节点号 % 或端口 % 已在 pg_raft.peers 里，但不是最后一个：%', v_id, p_port, v_peers;
+    ELSE
+        v_new_peers := v_peers || ',' || v_me;
+    END IF;
+    SELECT count(*) INTO v_old_n FROM partdist.node_map WHERE node_id <> v_id;
     v_v := partdist.addr_exec(p_host, p_port,
         'SELECT string_agg(extname, '','' ORDER BY extname) FROM pg_extension WHERE extname IN (''citus'', ''pg_partdist'', ''pg_raft'')');
     IF v_v IS DISTINCT FROM 'citus,pg_partdist,pg_raft' THEN
         RAISE EXCEPTION '新节点 %:% 的扩展不全（有：%），先在它上面 CREATE EXTENSION citus / pg_partdist / pg_raft', p_host, p_port, v_v;
     END IF;
-    v_new_peers := v_peers || ',' || v_id || '@' || p_host || ':' || p_port;
     v_v := partdist.addr_exec(p_host, p_port, 'SHOW pg_raft.peers');
     IF v_v <> v_new_peers THEN
         RAISE EXCEPTION '新节点的 pg_raft.peers 应为 %，现为 %', v_new_peers, v_v;
     END IF;
     step := '新节点就绪'; secs := round(extract(epoch FROM clock_timestamp() - ts));
     detail := format('节点 %s（%s:%s），扩展齐全，pg_raft.peers 含现有 %s 个节点 + 它自己',
-                     v_id, p_host, p_port, (SELECT count(*) FROM partdist.node_map));
+                     v_id, p_host, p_port, v_old_n);
     RETURN NEXT;
 
     -- ② 各节点 pg_raft.peers 末尾追加新节点：ALTER SYSTEM + reload，不重启（只许追加一个，见 pg_raft_peers_check_hook）
+    --   已经是新列表的节点（上次做过）跳过
     ts := clock_timestamp();
-    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map ORDER BY node_id LOOP
+    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map WHERE node_id <> v_id ORDER BY node_id LOOP
         v_v := partdist.addr_exec(r.hostname, r.port, 'SHOW pg_raft.peers');
         IF v_v <> v_peers AND v_v <> v_new_peers THEN
             RAISE EXCEPTION '节点 %（%:%）的 pg_raft.peers 与 master 不一致：%', r.node_id, r.hostname, r.port, v_v;
         END IF;
     END LOOP;
-    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map ORDER BY node_id LOOP
-        PERFORM partdist.addr_exec(r.hostname, r.port, format('ALTER SYSTEM SET pg_raft.peers = %L', v_new_peers));
-        PERFORM partdist.addr_exec(r.hostname, r.port, 'SELECT pg_reload_conf()');
+    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map WHERE node_id <> v_id ORDER BY node_id LOOP
+        IF partdist.addr_exec(r.hostname, r.port, 'SHOW pg_raft.peers') <> v_new_peers THEN
+            PERFORM partdist.addr_exec(r.hostname, r.port, format('ALTER SYSTEM SET pg_raft.peers = %L', v_new_peers));
+            PERFORM partdist.addr_exec(r.hostname, r.port, 'SELECT pg_reload_conf()');
+            v_todo := v_todo + 1;
+        END IF;
     END LOOP;
     FOR i IN 1..30 LOOP
         SELECT count(*) INTO v_n FROM partdist.node_map nm
-         WHERE partdist.addr_exec(nm.hostname, nm.port, 'SHOW pg_raft.peers', false) IS DISTINCT FROM v_new_peers;
+         WHERE nm.node_id <> v_id
+           AND partdist.addr_exec(nm.hostname, nm.port, 'SHOW pg_raft.peers', false) IS DISTINCT FROM v_new_peers;
         EXIT WHEN v_n = 0;
         PERFORM pg_catalog.pg_sleep(1);
     END LOOP;
     IF v_n > 0 THEN
         RAISE EXCEPTION '% 个节点 reload 之后 pg_raft.peers 仍是旧值（看各节点日志里 pg_raft.peers 的报错）', v_n;
     END IF;
-    PERFORM pg_catalog.pg_sleep(2);     -- 等各节点的 Raft 进程在下一次 tick 换上新表
+    IF v_todo > 0 THEN
+        PERFORM pg_catalog.pg_sleep(2);     -- 等各节点的 Raft 进程在下一次 tick 换上新表
+    END IF;
     step := '各节点追加 pg_raft.peers'; secs := round(extract(epoch FROM clock_timestamp() - ts));
-    detail := format('%s 个节点热加载完成；控制面组 0 成员 %s → %s，多数派 %s',
-                     (SELECT count(*) FROM partdist.node_map), (SELECT count(*) FROM partdist.node_map),
-                     (SELECT count(*) FROM partdist.node_map) + 1, ((SELECT count(*) FROM partdist.node_map) + 1) / 2 + 1);
+    detail := format('%s 个节点热加载完成%s；控制面组 0 成员 %s → %s，多数派 %s',
+                     v_old_n,
+                     CASE WHEN v_todo < v_old_n THEN format('（其中 %s 个上次已经追加过）', v_old_n - v_todo) ELSE '' END,
+                     v_old_n, v_old_n + 1, (v_old_n + 1) / 2 + 1);
     RETURN NEXT;
 
     -- ③ 控制面登记新节点地址（各节点的 node_map 按日志序同时学到），等新节点追上控制面日志
+    --   登记是 upsert，续做时再提一次也无妨（顺带拿到一个要等新节点追到的 index）
     ts := clock_timestamp();
     FOR i IN 1..30 LOOP
         SELECT leader_node_id INTO v_g0 FROM partdist.pg_raft_group_status() WHERE group_id = 0;
@@ -3176,7 +3217,7 @@ BEGIN
     RETURN NEXT;
 END $fn$;
 COMMENT ON FUNCTION shardpg.add_node(text, integer) IS
-    'P7-N102：新 worker 入簇（不重启）。前提：新节点已按 scripts/new_worker_node.sh 准备好（配置里 pg_raft.peers = 现有列表 + 它自己、建好 citus / pg_partdist / pg_raft 扩展、已启动）。';
+    'P7-N102：新 worker 入簇（不重启）。前提：新节点已按 scripts/new_worker_node.sh 准备好（配置里 pg_raft.peers = 现有列表 + 它自己、建好 citus / pg_partdist / pg_raft 扩展、已启动）。P7-N105：中途失败后直接重跑即可，做过的步骤自动跳过。';
 
 CREATE OR REPLACE FUNCTION shardpg.move_replica(p_shard text, p_from_port integer, p_to_port integer)
 RETURNS TABLE (step text, detail text, secs integer) LANGUAGE plpgsql AS $fn$

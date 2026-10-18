@@ -257,6 +257,7 @@ SELECT c.c_first, c.c_last, o.o_id, o.o_ol_cnt,
 --      控制面组 0 的成员就是这张表，5 → 6 个，多数派 3 → 4；一次只加一个，新旧两个多数派必然相交，各节点先后 reload 的几秒里不会脑裂
 --   ② 经控制面日志登记新节点地址（各节点 node_map 按日志序同时学到），等新节点追上控制面日志（落后太多直接装快照）
 --   ③ Citus citus_add_node：同步元数据，各分布表的外壳建到新节点上（这时它上面还没有分片）
+--   中途报错的话，排除原因后直接再执行一次：做过的步骤会自动跳过（P7-N105）
 SELECT * FROM shardpg.add_node('127.0.0.1', 5437);
 
 -- 6.3 六台都认了新成员：pg_raft.peers 6 项，控制面组 0 成员 6、提交位置一致
@@ -266,7 +267,9 @@ SELECT nodeport, result FROM run_command_on_workers($$
     FROM partdist.pg_raft_group_status() WHERE group_id = 0$$) ORDER BY 1;
 
 -- 6.4 把仓库 1 这一段的一份从副本迁到新节点：customer 和共置的 orders 一起搬（同一段的组成员必须相同，主才对得齐）。
---     源节点取这一段的第二个从副本
+--     源节点取这一段的第二个从副本。:c1 / :o1 是 3.1 记下的分片名，中途重开过 psql 的话变量没了，下面第一句重新取一遍（没重开过也可以照样执行）
+SELECT shard_name('customer', get_shard_id_for_distribution_column('customer', 1)) AS c1,
+       shard_name('orders',   get_shard_id_for_distribution_column('orders', 1))   AS o1 \gset
 SELECT ltrim(split_part(replicas, ',', 2), ':')::int AS from_port FROM shardpg.shards WHERE shard_name = :'c1' \gset
 SELECT * FROM shardpg.move_replica(:'c1', :from_port, 5437);
 --   ① 新节点入组：先在新节点上建组，再由 leader 走 Raft 日志加成员（单节点成员变更，3 → 4 个成员）
