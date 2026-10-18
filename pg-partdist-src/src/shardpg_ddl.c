@@ -90,11 +90,12 @@ ShardpgDdlDefineGucs(void)
 	DefineCustomBoolVariable("shardpg.auto_global_txn",
 							 "跨分片事务自动加入全局事务（统一 gxid 与快照时间戳）。",
 							 "Citus 开每个远程事务分支时，master 把本事务的全局事务号和 start_ts 随同一条 BEGIN "
-							 "交代过去（P7-N91）。关掉后一个事务写多个分片会在 PREPARE 时被拒。",
+							 "交代过去（P7-N91）；不在事务块里的多分片 SELECT 也开远程事务块、各分片用同一份快照"
+							 "（P7-N100，需 Citus 补丁 citus-0003）。关掉后一个事务写多个分片会在 PREPARE 时被拒。",
 							 &shardpg_auto_global_txn,
 							 true,
 							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
+							 NULL, ShardpgAutoGlobalTxnAssign, NULL);
 	MarkGUCPrefixReserved("shardpg");
 }
 

@@ -270,6 +270,53 @@ pg_raft_self_trigger_reprovision_sweep(void)
     PQclear(res);
 }
 
+/*
+ * ★ P7-N94（2026-10-17）：共置分片对齐主。同一哈希段的共置分片（customer_X 与 orders_Y）是两个
+ * 独立的 Raft 组、成员相同，宕机后各自选主，新主可能落在不同 worker 上；Citus 仍把共置连接整条
+ * 发到其中一台，另一张表在那台只是副本壳表 ⇒ 报错。只有 master 知道共置关系（Citus 元数据），
+ * 所以只在 master（pg_raft.coordinator_node_id）上跑：经常驻自连调 partdist.align_colocated_leaders()，
+ * 请其余分片的现任主把领导权转交到锚分片的主所在节点（目标先预热回放、基线收尾才转）。函数没装就什么都不做。
+ */
+static PGconn *align_conn = NULL;
+
+static void
+pg_raft_self_trigger_colocation_align(void)
+{
+    PGresult *res;
+
+    if (align_conn != NULL && PQstatus(align_conn) != CONNECTION_OK)
+    {
+        PQfinish(align_conn);
+        align_conn = NULL;
+    }
+    if (align_conn == NULL)
+    {
+        char conninfo[256];
+
+        pg_raft_format_conninfo("127.0.0.1", PostPortNumber, conninfo, sizeof(conninfo));
+        align_conn = PQconnectdb(conninfo);
+        if (PQstatus(align_conn) != CONNECTION_OK)
+        {
+            elog(DEBUG1, "pg_raft: 共置对齐自连接失败: %s", PQerrorMessage(align_conn));
+            PQfinish(align_conn);
+            align_conn = NULL;
+            return;
+        }
+    }
+    res = PQexec(align_conn,
+                 "SELECT CASE WHEN to_regprocedure('partdist.align_colocated_leaders()') IS NULL "
+                 "             OR to_regclass('pg_catalog.pg_dist_partition') IS NULL THEN 0 "
+                 "ELSE partdist.align_colocated_leaders() END");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        elog(LOG, "pg_raft: 共置对齐执行失败: %s", PQerrorMessage(align_conn));
+        PQfinish(align_conn);
+        align_conn = NULL;
+    }
+    else if (PQntuples(res) > 0 && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+        elog(LOG, "pg_raft: 共置对齐转交了 %s 个分片的主", PQgetvalue(res, 0, 0));
+    PQclear(res);
+}
 
 void
 pg_raft_maintenance_main(Datum main_arg)
@@ -278,6 +325,7 @@ pg_raft_maintenance_main(Datum main_arg)
     TimestampTz last_dtx_recover = 0;
     TimestampTz last_catchup = 0;
     TimestampTz last_sweep = 0;
+    TimestampTz last_align = 0;
 
     (void) main_arg;
 
@@ -352,6 +400,18 @@ pg_raft_maintenance_main(Datum main_arg)
             {
                 pg_raft_self_trigger_reprovision_sweep();
                 last_sweep = GetCurrentTimestamp();
+            }
+        }
+
+        /* 共置对齐（P7-N94）：只在 master 上、每 5 s 一轮 */
+        if (pg_raft_coordinator_node_id > 0 && pg_raft_node_id == pg_raft_coordinator_node_id)
+        {
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_align == 0 || now - last_align >= 5 * 1000000L)
+            {
+                pg_raft_self_trigger_colocation_align();
+                last_align = GetCurrentTimestamp();
             }
         }
 

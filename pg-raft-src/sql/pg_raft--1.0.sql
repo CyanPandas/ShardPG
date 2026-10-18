@@ -295,6 +295,13 @@ CREATE OR REPLACE FUNCTION pg_raft_group_campaign(p_group_id bigint)
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_campaign';
 
+-- ★ P7-N94/N102（2026-10-17）：计划内领导权转交，在**现任主**上调用：拿住本组复制认领位（新提交排队）
+-- → 把目标追平到本节点日志末尾 → 请目标竞选 → 等本节点被新任期替下。目标是否能顶上由调用方先核对。
+CREATE OR REPLACE FUNCTION pg_raft_group_transfer_leader(
+    p_group_id bigint, p_target integer, p_timeout_ms integer DEFAULT 10000
+) RETURNS text LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_transfer_leader';
+
 -- T7.20（P7-R1）：成员变更的**安全路径**。
 -- 在此之前唯一的办法是在每个节点上各自重调 pg_raft_group_create(gid, 新成员集) ——
 -- 那是没有协调的：变更期间不同节点持有不同成员集，同一个组因此有两套不相交的

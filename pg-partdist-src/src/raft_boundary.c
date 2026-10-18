@@ -394,6 +394,7 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 	uint32			payload_len = 0;
 	bool			ok = false;
 	int				touched_before;
+	volatile int	prev_no_diverge = -1;
 
 	if (!OidIsValid(partition_id) || !TransactionIdIsNormal(sxid))
 		PG_RETURN_BOOL(false);
@@ -410,13 +411,17 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 									   committed ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT,
 									   payload, payload_len, sxid);
 		PartWALNoteTouchedPartition(partition_id);
+		/* P7-N97：判决标记复制失败不打分叉标记（没有物理改动） */
+		prev_no_diverge = PartWALSetNoDivergeFrom(touched_before);
 		PartWALFlush(InvalidXLogRecPtr, false);
+		PartWALSetNoDivergeFrom(prev_no_diverge);
 		ok = true;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *ed;
 
+		PartWALSetNoDivergeFrom(prev_no_diverge);
 		MemoryContextSwitchTo(TopMemoryContext);
 		ed = CopyErrorData();
 		FlushErrorState();

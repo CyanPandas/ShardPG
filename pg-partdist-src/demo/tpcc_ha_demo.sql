@@ -1,15 +1,15 @@
 -- ════════════════════════════════════════════════════════════════════════════
 -- ShardPG 演示（二）：高可用与内部机制 —— 全部在 psql 里敲
 --   1 定义观察函数 → 2 一次写入在 Raft 里的样子 → 3 停掉一个 worker：切主、读写
---   → 4 把它拉起来：重新加入 Raft 组 → 5 手动切主 → 6 删表：内部清理
---   文末：加节点 / 副本迁移的现状
+--   → 4 把它拉起来：重新加入 Raft 组 → 5 手动切主 → 6 加一台 worker、把副本迁过去 → 7 删表：内部清理
+--   文末：重复演示前怎么把加的节点去掉
 --
 -- 前提：tpcc_demo.sql 第 1–3 步做完（customer / orders 已建好、有数据）。
 -- 一个 psql 连 master（:5432），下面所有命令都在这一个窗口里敲：
 --     docker exec -it -e PGCLIENTENCODING=UTF8 -u postgres pg-test-container \
 --         /work/pg-install/bin/psql -h /tmp -p 5432 -U postgres
 -- 节点：master :5432；worker :5433 / :5434 / :5435 / :5436，
---       数据目录 /work/pg-cluster-data/worker1 … worker4（端口减 5432 就是编号）。
+--       数据目录 /work/pg-cluster-data/worker1 … worker4（端口减 5432 就是编号）；第 6 步新加 :5437（worker5）。
 -- ⚠ \c 这类反斜杠命令要单独一行回车，不要和 SQL 一起粘贴；\watch、\gset 跟在查询末尾、和查询一起粘贴没问题。
 --
 -- 背景（这次要看的东西）：
@@ -159,7 +159,7 @@ SELECT shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_nam
 
 -- （可选）另开一个终端跑持续写入脚本，停机期间能看到写到仓库 1 的那些失败约半分钟、其余照常：
 --     bash pg-partdist-src/demo/txn_demo_writer.sh
---     第 6 步删表之前一定要 Ctrl+C 停掉它
+--     第 7 步删表之前一定要 Ctrl+C 停掉它
 
 -- 3.2 直接停掉 :5433。-m immediate 不做 checkpoint，等同断电。
 --     COPY … TO PROGRAM 在 master 所在机器上以 postgres 用户执行命令（要超级用户），worker 都在同一个容器里
@@ -173,8 +173,11 @@ SELECT c_w_id, c_id, c_first, c_balance FROM customer WHERE c_w_id = 2 AND c_d_i
 --     ① 从收不到心跳，等满选举超时（pg_raft.election_timeout_ms = 15 s）后发起选举，拿到多数票当选；
 --     ② 新主先把还没回放的日志回放进表（升主前置）—— 惰性回放的账在这里付，积压一千多条约 5–20 s；
 --     ③ 向控制面（组 0）登记新主，master 的路由（partition_map、pg_dist_placement）随之切换。
---     实测从停机到能读写 30–45 s。两个分片各自选举，谁先切完不一定
-SELECT clock_timestamp()::time(0) AS t, shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_name IN (:'c1', :'o1') \watch i=3 c=25
+--     实测从停机到能读写 30–45 s。两个分片是两个独立的 Raft 组，各自选举，新主可能落在不同 worker 上；
+--     master 每 5 s 检查一次共置关系，登记稳定 15 s 后，请 orders 的现任主把领导权转交给 customer 的主所在节点
+--     （先挡住新写入、把那台追平，再让它竞选），所以有时会看到 orders 的 term 再加 1、primary 变成和 customer 一样。
+--     两行 primary 相同、term 不再变就可以 Ctrl+C（最多 2 分钟）
+SELECT clock_timestamp()::time(0) AS t, shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_name IN (:'c1', :'o1') \watch i=3 c=40
 
 -- 3.5 Raft 视角：:5433 连不上；剩下两个成员里一个当选 leader，term 加 1；
 --     新主的 table_bytes 不再是 0（升主时回放进了表文件）
@@ -196,13 +199,13 @@ UPDATE customer SET c_balance = c_balance + 10 WHERE c_w_id = 2 AND c_d_id = 3 A
 COMMIT;
 SELECT c_w_id, c_first, c_last, c_balance FROM customer WHERE c_d_id = 3 ORDER BY c_w_id;
 
--- 3.7 共置连接：同一仓库的客户和订单在同一个节点上连接
-SELECT c.c_first, c.c_last, o.o_id, o.o_ol_cnt
+-- 3.7 共置连接：同一仓库的客户和订单在同一个节点上连接（Citus 把整条连接发给一台 worker，两张表的主必须在同一台）
+SELECT c.c_first, c.c_last, o.o_id, o.o_ol_cnt, ':' || current_setting('port') AS worker
   FROM customer c JOIN orders o ON o.o_w_id = c.c_w_id AND o.o_d_id = c.c_d_id AND o.o_c_id = c.c_id
  WHERE c.c_w_id = 1 AND c.c_d_id = 3;
--- ⚠ 已知问题（P7-N94）：两个组各自选主，customer 和 orders 的新主可能落在不同 worker 上（3.4 里两行 primary 不一样）。
---    这时 Citus 仍当它们共置，把连接整条发给其中一台，另一张表在那台上只是副本壳表，于是报
---    "不允许在本节点上对副本壳表执行查询"。单表读写、跨分片事务不受影响；第 5 步手动切主可以把它们对齐。
+-- 对齐之前（3.4 里两行 primary 还不一样的那十几秒）做这条连接会报"不允许在本节点上对副本壳表执行查询"
+-- —— 另一张表在那台上只是副本壳表；单表读写、跨分片事务不受影响。对齐的记录在 master 上：
+SELECT * FROM partdist.colocation_align_attempt ORDER BY attempted_at DESC LIMIT 4;
 
 
 -- ════ 第 4 步：把 :5433 拉起来 —— 重新加入 Raft 组 ════
@@ -212,11 +215,10 @@ COPY (SELECT 1) TO PROGRAM '/work/pg-install/bin/pg_ctl -D /work/pg-cluster-data
 SELECT node_id, ':' || port AS worker, status FROM partdist.node_map ORDER BY node_id;
 
 -- 4.2 它回来时以 follower 身份进组，认了新主的 term，不会回来抢主（PreVote）；
---     它停机期间缺的日志由新主补发，:5433 的 last_index 追上 leader；
+--     它停机期间缺的日志由新主补发（只补缺的那段：新主记着它停机前确认到哪），:5433 的 last_index 追上 leader；
 --     如果它这份数据从没当过从（本地没有回放槽位，replica_ok = f），新主还会给它重做一次物理基线，之后变 t。
 --     每 15 秒查一次，最多 7 分半；:5433 两行的 last_index 和 leader 一样、replica_ok 是 t 就可以 Ctrl+C。
---     ⚠ 实测追平要 1–5 分钟（P7-N96：新主有时把整组日志从头重发）；追平期间 leader 要等它确认，
---       它所在组的写入会变慢甚至停住（P7-N99）—— 开着写入脚本的话能看到它停顿
+--     补发是后台通道一批批做的，有写入在排队时它每批之间让路，所以追平期间写入照常（开着写入脚本可以看）
 SELECT clock_timestamp()::time(0) AS t, shard, worker, role, term, last_index, commit_index, replica_ok
   FROM ha.raft_status('customer', 1)
 UNION ALL
@@ -227,15 +229,16 @@ SELECT clock_timestamp()::time(0), shard, worker, role, term, last_index, commit
 SELECT * FROM ha.raft_status('customer');
 
 
--- ════ 第 5 步：手动切主（计划内切换，比如维护前把主挪走、或把共置的两个分片对齐） ════
--- 在想当主的那台 worker 上调用 pg_raft_group_campaign(组号)：它不等超时、马上发起选举，1 s 内当选；
--- 但它同样要先把积压的日志回放进表再登记，所以路由切过来还要 15–25 s，这段时间写这个分片会报"不是主"。
--- 这里把仓库 1 的两个分片都切回 :5433（第 4 步里 :5433 追平之后再做）。
-SELECT get_shard_id_for_distribution_column('customer', 1) AS cg, get_shard_id_for_distribution_column('orders', 1) AS og \gset
-\c - - - 5433
-SELECT partdist.pg_raft_group_campaign(:cg) AS customer, partdist.pg_raft_group_campaign(:og) AS orders;
-\c - - - 5432
-SELECT clock_timestamp()::time(0) AS t, shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_name IN (:'c1', :'o1') \watch i=3 c=15
+-- ════ 第 5 步：手动切主（计划内切换，比如维护前把主挪走） ════
+-- 把仓库 1 的两个分片（customer 和共置的 orders 一起）切回 :5433（第 4 步里 :5433 追平之后再做）。
+-- shardpg.move_primary 对每个分片做一次 Raft 领导权转交：
+--   ① 先在目标节点上把副本预热回放到已提交的位置（基线收尾、能顶上才转）；
+--   ② 现任主拿住这个组的复制认领位 —— 新的提交在门口排队，日志不再增长；
+--   ③ 现任主把目标追平到自己的日志末尾，请目标竞选：目标的日志和主一样新，必然当选（term 加 1）；
+--   ④ 新主把还没回放的日志回放进表、向控制面登记，路由切过来。排队的那几笔提交报"不是主"、重试即可。
+-- 不直接在目标上强制竞选（pg_raft_group_campaign）：持续写入时目标的日志总比主短一点，选不上反而把主拉下来、整组重选。
+SELECT shardpg.move_primary(:'c1', 5433);
+SELECT shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_name IN (:'c1', :'o1');
 -- term 再加 1，两个分片的主都回到 :5433；共置连接正常
 SELECT c.c_first, c.c_last, o.o_id, o.o_ol_cnt,
        c.tableoid::regclass::text AS c_shard, o.tableoid::regclass::text AS o_shard, ':' || current_setting('port') AS worker
@@ -243,35 +246,74 @@ SELECT c.c_first, c.c_last, o.o_id, o.o_ol_cnt,
  WHERE c.c_w_id = 1 AND c.c_d_id = 3;
 
 
--- ════ 第 6 步：删表 —— 看内部清理 ════
+-- ════ 第 6 步：加一台 worker，把一份副本迁过去 ════
+-- 6.1 操作系统层准备新节点：initdb → 照 worker4 复制配置（改端口、节点号，pg_raft.peers = 现有 5 个 + 它自己）
+--     → 启动 → 建 citus / pg_partdist / pg_raft 扩展 → node_map 种子。新节点号 6、端口 5437、数据目录 worker5。
+--     \! 在 psql 所在的机器上执行 shell 命令（这里 psql 就在容器里、以 postgres 用户运行），约 20 s
+\! bash /work/pg-partdist-src/scripts/new_worker_node.sh 6 5437
+
+-- 6.2 入簇，不重启任何节点（约 20 s）：
+--   ① 各节点的 pg_raft.peers 末尾追加新节点：这个参数可以热加载（ALTER SYSTEM + pg_reload_conf），只许一次追加一个。
+--      控制面组 0 的成员就是这张表，5 → 6 个，多数派 3 → 4；一次只加一个，新旧两个多数派必然相交，各节点先后 reload 的几秒里不会脑裂
+--   ② 经控制面日志登记新节点地址（各节点 node_map 按日志序同时学到），等新节点追上控制面日志（落后太多直接装快照）
+--   ③ Citus citus_add_node：同步元数据，各分布表的外壳建到新节点上（这时它上面还没有分片）
+SELECT * FROM shardpg.add_node('127.0.0.1', 5437);
+
+-- 6.3 六台都认了新成员：pg_raft.peers 6 项，控制面组 0 成员 6、提交位置一致
+SELECT nodeport, result FROM run_command_on_workers($$
+  SELECT 'peers ' || array_length(string_to_array(current_setting('pg_raft.peers'), ','), 1)
+      || '，组 0 成员 ' || cluster_size || '，commit ' || commit_index
+    FROM partdist.pg_raft_group_status() WHERE group_id = 0$$) ORDER BY 1;
+
+-- 6.4 把仓库 1 这一段的一份从副本迁到新节点：customer 和共置的 orders 一起搬（同一段的组成员必须相同，主才对得齐）。
+--     源节点取这一段的第二个从副本
+SELECT ltrim(split_part(replicas, ',', 2), ':')::int AS from_port FROM shardpg.shards WHERE shard_name = :'c1' \gset
+SELECT * FROM shardpg.move_replica(:'c1', :from_port, 5437);
+--   ① 新节点入组：先在新节点上建组，再由 leader 走 Raft 日志加成员（单节点成员变更，3 → 4 个成员）
+--   ② 供副本：leader 到新节点建副本表，发物理基线（经 Raft 复制），配回放位置；新节点追上日志
+--   ③ 源节点出组（4 → 3），控制面改登记的从副本集
+--   ④ 清理源节点上这两个组、副本表、回放登记
+--   源节点要是主，会先把主切走（共置分片一起切）。实测 1–5 分钟（前面几步刚切过主、后台还在重供基线时偏慢）；全程可读写
+
+-- 6.5 新节点上有了这两个分片的副本：日志位置与 leader 一致、replica_ok = t；源节点的行没了
+SELECT * FROM ha.raft_status('customer', 1);
+SELECT * FROM ha.raft_status('orders', 1);
+
+-- 6.6 让新节点当主（和第 5 步一样的领导权转交，共置分片一起切），在它上面读写、做共置连接
+SELECT shardpg.move_primary(:'c1', 5437);
+SELECT shard_name, "primary", replicas, term FROM shardpg.shards WHERE shard_name IN (:'c1', :'o1');
+UPDATE customer SET c_balance = c_balance + 1 WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
+SELECT c.c_first, c.c_balance, o.o_id, c.tableoid::regclass::text AS c_shard, o.tableoid::regclass::text AS o_shard,
+       ':' || current_setting('port') AS worker
+  FROM customer c JOIN orders o ON o.o_w_id = c.c_w_id AND o.o_d_id = c.c_d_id AND o.o_c_id = c.c_id
+ WHERE c.c_w_id = 1 AND c.c_d_id = 3;
+
+
+-- ════ 第 7 步：删表 —— 看内部清理 ════
 -- （可选的写入脚本此时必须已经停掉）
--- 6.1 先记下两张表的全部分片号（= Raft 组号）
+-- 7.1 先记下两张表的全部分片号（= Raft 组号）
 SELECT array_agg(shardid ORDER BY shardid) AS sids FROM pg_dist_shard WHERE logicalrelid IN ('customer'::regclass, 'orders'::regclass) \gset
 SELECT nodeport, result AS before_drop FROM run_command_on_workers(format($$
   SELECT 'Raft 组 ' || (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id = ANY (%1$L::bigint[]))
       || '，分片表 ' || (SELECT count(*) FROM unnest(%1$L::bigint[]) s, LATERAL (VALUES ('customer_' || s), ('orders_' || s)) t(name)
                          WHERE to_regclass(t.name) IS NOT NULL)$$, :'sids'));
 
--- 6.2 删表：一条 DROP，拆 Raft 组、删各节点上的分片表和副本壳表、删主从登记
+-- 7.2 删表：一条 DROP，拆 Raft 组、删各节点上的分片表和副本壳表、删主从登记
 DROP TABLE orders, customer;
 
--- 6.3 核对：master 上的主从登记、各 worker 上的 Raft 组和分片表（含副本壳表）都没了
+-- 7.3 核对：master 上的主从登记、各 worker（含新加的 :5437）上的 Raft 组和分片表（含副本壳表）都没了
 SELECT count(*) AS partition_map_rows FROM partdist.partition_map WHERE partition_id::bigint = ANY (:'sids'::bigint[]);
 SELECT nodeport, result AS after_drop FROM run_command_on_workers(format($$
   SELECT 'Raft 组 ' || (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id = ANY (%1$L::bigint[]))
       || '，分片表 ' || (SELECT count(*) FROM unnest(%1$L::bigint[]) s, LATERAL (VALUES ('customer_' || s), ('orders_' || s)) t(name)
                          WHERE to_regclass(t.name) IS NOT NULL)$$, :'sids'));
 
--- 6.4 收尾：删掉观察函数（会同步删各 worker 上的 ha 模式）
+-- 7.4 收尾：删掉观察函数（会同步删各 worker 上的 ha 模式）
 DROP SCHEMA ha CASCADE;
 
 
--- ════ 文末：加节点 / 副本迁移的现状 ════
--- 现在没有"加一台 worker、把某个分片的副本从 A 搬到 B"的一步命令，只有零件：
---   · partdist.pg_raft_group_change_member(组号, 节点号, true/false)：Raft 单节点成员变更（一次加或减一个，非联合共识），
---     只改 Raft 成员，不搬数据、不改 partition_map / pg_dist_placement；只在一个不带数据的测试组上验证过。
---   · partdist.provision_shard_replica(分片号, 目标节点号)：从主向目标节点做一次物理基线（新主给归队的旧主重做基线用的就是它）。
---   · partdist.pg_raft_group_campaign(组号)：组内换主（第 5 步）。
---   · Citus 自己的 citus_move_shard_placement / rebalance_table_shards / citus_drain_node 等在 Raft 表上被拦截。
--- 加一台新 worker 还要改所有节点的 pg_raft.peers（postmaster 级参数）并整簇重启，
--- 而有打标数据时 master 不能重启（TSO 纪元会断），所以有数据的集群目前加不了节点。
+-- ════ 文末：重复演示前去掉第 6 步加的节点 ════
+-- pg_raft.peers 只许热加载追加、不许热删除（各节点的复制游标按它的槽位存）；去掉节点要整簇重启一次 ——
+-- master 的 TSO 发号上限现在落盘（$PGDATA/pg_tso_hwm），有数据也能重启。宿主机上执行（第 7 步删表之后）：
+--     bash pg-partdist-src/demo/ha_demo_reset.sh          # 去掉 :5437：citus_remove_node → 各节点 peers 还原 → 整簇重启 → 删数据目录
+-- 之后从 tpcc_demo.sql 第 1 步重新建表即可。

@@ -162,4 +162,10 @@ extern bool IsMainDBCommandInXact;
 typedef void (*remote_transaction_begin_hook_type) (StringInfo command);
 extern PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook;
 
+/*
+ * ShardPG（citus-0003）：为 true 时，不在事务块里的多分片只读查询也开远程事务块
+ * （BEGIN … COMMIT），让上面的钩子有机会给每个分支带上同一份快照。缺省 false = 原版行为。
+ */
+extern PGDLLEXPORT bool remote_transaction_multi_shard_read_blocks;
+
 #endif /* REMOTE_TRANSACTION_H */

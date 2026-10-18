@@ -464,15 +464,45 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
     if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
     {
         initStringInfo(&sql);
+        /*
+         * ★ P7-N102：条目可以带 hostname/port（加节点时 shardpg.add_node 登记真实地址，各节点
+         * 按日志序同一时刻学到）；不带的（探测器的状态更新）照旧只改 status，新行用占位地址。
+         */
         appendStringInfo(&sql,
                          "INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) "
-                         "SELECT (j->>'node_id')::int, 'node' || (j->>'node_id'), 5432, j->>'status', now() "
+                         "SELECT (j->>'node_id')::int, COALESCE(j->>'hostname', 'node' || (j->>'node_id')), "
+                         "       COALESCE((j->>'port')::int, 5432), j->>'status', now() "
                          "FROM (SELECT %s::jsonb AS j) s "
                          "ON CONFLICT (node_id) DO UPDATE SET "
-                         "status = EXCLUDED.status, last_heartbeat = now()",
+                         "status = EXCLUDED.status, last_heartbeat = now(), "
+                         "hostname = CASE WHEN %s::jsonb ? 'hostname' THEN EXCLUDED.hostname ELSE node_map.hostname END, "
+                         "port = CASE WHEN %s::jsonb ? 'port' THEN EXCLUDED.port ELSE node_map.port END",
+                         quote_literal_cstr(payload_json),
+                         quote_literal_cstr(payload_json),
                          quote_literal_cstr(payload_json));
         ret = SPI_execute(sql.data, false, 0);
         ok = (ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
+        pfree(sql.data);
+    }
+    else if (strcmp(op_type, PG_RAFT_OP_PARTITION_SECONDARIES) == 0)
+    {
+        /*
+         * ★ P7-N102：副本迁移后改登记的从副本集（主、任期都不变）。主权登记的任期栅栏把
+         * "同任期同主"的条目当重复丢掉，而成员变更不换任期，所以单开一个条目。
+         * 只认当前任期：期间若已换主，新任期的登记带着它自己的从副本集，这条作废。
+         */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "UPDATE partdist.partition_map m SET "
+                         "  secondary_nodes = COALESCE((SELECT array_agg(t::int ORDER BY o) "
+                         "                     FROM jsonb_array_elements_text(j->'secondary_nodes') WITH ORDINALITY x(t, o)), '{}'), "
+                         "  updated_at = now() "
+                         "FROM (SELECT %s::jsonb AS j) s "
+                         "WHERE m.partition_id = (j->>'partition_id')::oid "
+                         "  AND m.primary_term = (j->>'primary_term')::bigint",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, false, 0);
+        ok = (ret == SPI_OK_UPDATE);
         pfree(sql.data);
     }
     else if (strcmp(op_type, PG_RAFT_OP_PARTITION_PRIMARY_BATCH) == 0)

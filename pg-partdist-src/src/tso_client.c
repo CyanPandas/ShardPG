@@ -899,6 +899,23 @@ partdist_remote_txn_begin(StringInfo command)
 					 cur_gxid, ts, cur_coord_gsid);
 }
 
+/*
+ * ★ P7-N100：不在事务块里的多分片只读查询（一条 SELECT count(*) 之类）原来不开远程事务，
+ * 上面的钩子没机会介入，各 worker 各自懒取快照 —— 同一条 SELECT 在不同分片上读到的不是同一个
+ * 时间点，碰上并发的跨分片提交会看到一边已提交、一边还没提交。补丁 citus-0003 加了开关
+ * remote_transaction_multi_shard_read_blocks：打开后这类查询也开远程事务块，各分支随 BEGIN
+ * 带上同一份 (gxid, start_ts)，结束时普通 COMMIT（只读不走 2PC）。开关跟着 shardpg.auto_global_txn。
+ */
+static bool *citus_multi_shard_read_blocks = NULL;
+
+void
+ShardpgAutoGlobalTxnAssign(bool newval, void *extra)
+{
+	(void) extra;
+	if (citus_multi_shard_read_blocks != NULL)
+		*citus_multi_shard_read_blocks = newval;
+}
+
 void
 TsoClientInstallRemoteBeginHook(void)
 {
@@ -914,4 +931,12 @@ TsoClientInstallRemoteBeginHook(void)
 	}
 	prev_remote_begin_hook = *hookp;
 	*hookp = partdist_remote_txn_begin;
+
+	citus_multi_shard_read_blocks = (bool *) dlsym(RTLD_DEFAULT, "remote_transaction_multi_shard_read_blocks");
+	if (citus_multi_shard_read_blocks == NULL)
+		ereport(LOG,
+				(errmsg("pg_partdist: citus.so 没有 remote_transaction_multi_shard_read_blocks（未打补丁 citus-0003），"
+						"不在事务块里的多分片 SELECT 各分片各取快照")));
+	else
+		*citus_multi_shard_read_blocks = shardpg_auto_global_txn;
 }

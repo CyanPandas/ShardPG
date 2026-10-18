@@ -1,0 +1,71 @@
+From 37e8f2a80c8e5c03b770b3b3ce7b0ccb255502c6 Mon Sep 17 00:00:00 2001
+From: build <build@local>
+Date: Sat, 17 Oct 2026 16:02:40 +0000
+Subject: [PATCH] ShardPG citus-0003: multi-shard autocommit reads open remote
+ transaction blocks
+
+---
+ .../distributed/executor/adaptive_executor.c       | 14 ++++++++++++++
+ .../distributed/transaction/remote_transaction.c   |  5 +++++
+ src/include/distributed/remote_transaction.h       |  6 ++++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/src/backend/distributed/executor/adaptive_executor.c b/src/backend/distributed/executor/adaptive_executor.c
+index 895f01a..4499b79 100644
+--- a/src/backend/distributed/executor/adaptive_executor.c
++++ b/src/backend/distributed/executor/adaptive_executor.c
+@@ -845,6 +845,20 @@ AdaptiveExecutor(CitusScanState *scanState)
+ 	TransactionProperties xactProperties = DecideTransactionPropertiesForTaskList(
+ 		distributedPlan->modLevel, taskList, excludeFromXact);
+ 
++	/*
++	 * ShardPG（citus-0003）：不在事务块里的多分片只读查询，原版各分支裸发语句、不开事务，
++	 * 每台 worker 各取各的快照，一条 SELECT 跨分片读到的不是同一个时间点。扩展打开开关后，
++	 * 这类查询也开远程事务块：BEGIN 时走 remote_transaction_begin_hook，各分支带上同一份快照；
++	 * 只读不触发 2PC，结束时各分支普通 COMMIT。单分片查询（一个任务）不受影响。
++	 */
++	if (remote_transaction_multi_shard_read_blocks &&
++		xactProperties.useRemoteTransactionBlocks == TRANSACTION_BLOCKS_ALLOWED &&
++		distributedPlan->modLevel == ROW_MODIFY_READONLY &&
++		list_length(taskList) > 1)
++	{
++		xactProperties.useRemoteTransactionBlocks = TRANSACTION_BLOCKS_REQUIRED;
++	}
++
+ 	/*
+ 	 * In some rare cases, we have prepared statements that pass a parameter
+ 	 * and never used in the query, mark such parameters' type as Invalid(0),
+diff --git a/src/backend/distributed/transaction/remote_transaction.c b/src/backend/distributed/transaction/remote_transaction.c
+index 79b9687..72b5826 100644
+--- a/src/backend/distributed/transaction/remote_transaction.c
++++ b/src/backend/distributed/transaction/remote_transaction.c
+@@ -89,6 +89,11 @@ MultiConnection *MainDBConnection = NULL;
+  */
+ PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook = NULL;
+ 
++/*
++ * ShardPG（citus-0003）：不在事务块里的多分片只读查询是否也开远程事务块。见 adaptive_executor.c。
++ */
++PGDLLEXPORT bool remote_transaction_multi_shard_read_blocks = false;
++
+ /*
+  * IsMainDBCommand is true if this is a query in the Citus main database that is started
+  * by a query from a different database.
+diff --git a/src/include/distributed/remote_transaction.h b/src/include/distributed/remote_transaction.h
+index 8e84cb6..68fc8ac 100644
+--- a/src/include/distributed/remote_transaction.h
++++ b/src/include/distributed/remote_transaction.h
+@@ -162,4 +162,10 @@ extern bool IsMainDBCommandInXact;
+ typedef void (*remote_transaction_begin_hook_type) (StringInfo command);
+ extern PGDLLEXPORT remote_transaction_begin_hook_type remote_transaction_begin_hook;
+ 
++/*
++ * ShardPG（citus-0003）：为 true 时，不在事务块里的多分片只读查询也开远程事务块
++ * （BEGIN … COMMIT），让上面的钩子有机会给每个分支带上同一份快照。缺省 false = 原版行为。
++ */
++extern PGDLLEXPORT bool remote_transaction_multi_shard_read_blocks;
++
+ #endif /* REMOTE_TRANSACTION_H */
+-- 
+2.34.1
+

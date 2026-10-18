@@ -2419,6 +2419,10 @@ BEGIN
         RETURN format('%s 没有分片', p_tbl);
     END IF;
 
+    -- P7-N95：主分片关 autovacuum（副本由 provision_shard_replica 关）。打标表的硬盾不许 autovacuum 碰它，
+    -- 不关的话 autovacuum 每分钟撞一次盾、日志刷 ERROR。Citus 把 ALTER 传到每个分片；此时还没建组、没打标
+    EXECUTE format('ALTER TABLE %s SET (autovacuum_enabled = off, toast.autovacuum_enabled = off)', p_tbl);
+
     -- 建组 + 选主 + 供副本：placement 先当选、副本再入组、逐个供；每批 32 个，没过的单独重跑（最多 4 轮）
     -- 内部过程的 NOTICE（第几轮、临时表）对建表的人没用，先压到 WARNING，出函数前还原
     v_cmm := current_setting('client_min_messages');
@@ -2618,3 +2622,770 @@ RETURNS text LANGUAGE sql AS $fn$
 $fn$;
 COMMENT ON FUNCTION shardpg.cleanup_dropped() IS
     'P7-N88：清理已删分片表留下的 Raft 组、副本表、主从登记（在事务块里 DROP 的表提交后执行；自动清理没清干净时再执行）。';
+
+-- ============================================================================
+-- P7-N94 / P7-N102（2026-10-17）：共置分片对齐主、在线加节点、副本迁移、计划内切主
+--
+--   SELECT * FROM shardpg.add_node('127.0.0.1', 5437);
+--       新 worker 入簇：各节点 pg_raft.peers 热加载追加它（不重启任何节点）→ 控制面登记地址 →
+--       等它追上控制面日志 → Citus citus_add_node。新节点的操作系统层准备（initdb、配置、
+--       建扩展、启动）见 scripts/new_worker_node.sh
+--   SELECT * FROM shardpg.move_replica('customer_111208', 5434, 5437);
+--       把分片的一份副本从 :5434 搬到 :5437；同一哈希段的共置分片（orders_111212 …）一起搬
+--   SELECT shardpg.move_primary('customer_111208', 5435);
+--       计划内切主，共置分片一起切
+--   partdist.align_colocated_leaders()
+--       master 的 pg_raft maintenance 每 5 s 调一次：共置分片的主不在同一台时，
+--       把领导权转交到锚分片（该哈希段分片号最小的那个）的主上（P7-N94）
+-- ============================================================================
+
+-- 在指定地址的节点上执行一条 SQL：经 Citus 的 master_run_on_worker 单开连接、自动提交
+-- （ALTER SYSTEM 这类不能进事务块的命令也能执行）。返回结果文本；失败时 p_strict 抛错，否则返回 NULL
+CREATE OR REPLACE FUNCTION partdist.addr_exec(p_host text, p_port integer, p_cmd text, p_strict boolean DEFAULT true)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    r record;
+BEGIN
+    SELECT * INTO r FROM pg_catalog.master_run_on_worker(ARRAY[p_host], ARRAY[p_port], ARRAY[p_cmd], false);
+    IF r.success THEN
+        RETURN r.result;
+    END IF;
+    IF p_strict THEN
+        RAISE EXCEPTION '%:% 上执行失败：%', p_host, p_port, r.result;
+    END IF;
+    RETURN NULL;
+END $fn$;
+
+-- 同上，按 Raft 节点号（地址取 partdist.node_map）
+CREATE OR REPLACE FUNCTION partdist.node_exec(p_node integer, p_cmd text, p_strict boolean DEFAULT true)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    h text;
+    p integer;
+BEGIN
+    SELECT hostname, port INTO h, p FROM partdist.node_map WHERE node_id = p_node;
+    IF h IS NULL THEN
+        IF p_strict THEN
+            RAISE EXCEPTION 'node_map 里没有节点 %', p_node;
+        END IF;
+        RETURN NULL;
+    END IF;
+    RETURN partdist.addr_exec(h, p, p_cmd, p_strict);
+END $fn$;
+
+CREATE TABLE IF NOT EXISTS partdist.reprovision_hold (
+    group_id bigint PRIMARY KEY,
+    until    timestamptz NOT NULL,
+    reason   text
+);
+COMMENT ON TABLE partdist.reprovision_hold IS
+    'P7-N102：登记在这里（until 之前）的组暂停自动重供 —— 归队扫尾与新主登记后的 P7-N25 归队都跳过。shardpg.move_replica 迁移期间在各节点登记、结束删除；until 是函数中途死掉时的兜底。';
+
+-- 【在 worker 上执行】惰性回放的"预热"：把本节点组 p_gid 的副本回放到本节点已提交的数据位点，
+-- 再看它能不能顶上（基线收尾、索引不是空壳）。返回 ready 或没就绪的原因。
+-- 转交领导权前、迁移完成前都要过这一关：基线半途而废的副本能赢选举，却在升主前置里一直报
+-- "全量物理基线未收尾"，占着 leader、整组写不进去（2026-10-17 预演实测）。
+CREATE OR REPLACE FUNCTION partdist.replica_warmup(p_gid bigint, p_timeout_ms integer DEFAULT 5000)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    loc   oid;
+    ok    boolean;
+    app   bigint;
+    bound bigint;
+BEGIN
+    loc := partdist.local_partition_for_shard(p_gid);
+    IF loc IS NULL THEN
+        RETURN 'no_local_shard';
+    END IF;
+    SELECT armed AND state <> 'failed', applied INTO ok, app FROM partdist.replay_status() WHERE shard = loc;
+    IF NOT coalesce(ok, false) THEN
+        RETURN 'replica_not_armed';
+    END IF;
+    IF partdist.shard_divergence(loc) IS NOT NULL THEN
+        RETURN 'diverged';
+    END IF;
+    bound := partdist.pg_raft_group_committed_plsn(p_gid);
+    IF coalesce(bound, 0) > coalesce(app, 0) THEN
+        BEGIN
+            PERFORM partdist.replay_catchup(loc::regclass, bound, p_timeout_ms);
+        EXCEPTION WHEN OTHERS THEN
+            RETURN 'replaying: ' || left(SQLERRM, 160);
+        END;
+    END IF;
+    IF partdist.shard_baseline_pending(loc) THEN
+        RETURN 'baseline_pending';
+    END IF;
+    IF partdist.shard_local_copy_broken(loc) THEN
+        RETURN 'copy_broken';
+    END IF;
+    RETURN 'ready';
+END $fn$;
+
+-- 节点 p_node 上组 p_gid 的一列状态（pg_raft_group_status 的列名）；没有这个组 / 连不上返回 NULL
+CREATE OR REPLACE FUNCTION partdist.node_group_status(p_node integer, p_gid bigint, p_col text)
+RETURNS text LANGUAGE sql AS $fn$
+    SELECT nullif(partdist.node_exec(p_node, format(
+        'SELECT %I::text FROM partdist.pg_raft_group_status() WHERE group_id = %s', p_col, p_gid), false), '')
+$fn$;
+
+-- 组 p_gid 现在的 Raft leader（节点号）：先问 partition_map 登记的主，再问其余成员；都不是返回 NULL
+CREATE OR REPLACE FUNCTION partdist.group_leader_now(p_gid bigint, p_extra integer[] DEFAULT '{}')
+RETURNS integer LANGUAGE plpgsql AS $fn$
+DECLARE
+    m record;
+    n integer;
+BEGIN
+    SELECT primary_node, secondary_nodes INTO m FROM partdist.partition_map WHERE partition_id = p_gid::oid;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    FOREACH n IN ARRAY (ARRAY[m.primary_node] || m.secondary_nodes || p_extra) LOOP
+        IF partdist.node_group_status(n, p_gid, 'state') = 'leader' THEN
+            RETURN n;
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END $fn$;
+
+-- 一个分片（名字或分片号）所在的共置哈希段：共置组号、哈希下界、段内全部分片号与分片表名
+CREATE OR REPLACE FUNCTION partdist.colocated_bucket(p_shard text,
+    OUT colocationid integer, OUT minv integer, OUT sids bigint[], OUT names text[])
+LANGUAGE sql STABLE AS $fn$
+    WITH me AS (
+        SELECT s.shardid, p.colocationid, s.shardminvalue
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_partition p ON p.logicalrelid = s.logicalrelid AND p.partmethod = 'h'
+         WHERE s.shardid::text = p_shard
+            OR pg_catalog.shard_name(s.logicalrelid, s.shardid) = p_shard
+         LIMIT 1)
+    SELECT me.colocationid::integer, me.shardminvalue::integer,
+           array_agg(s.shardid ORDER BY s.shardid),
+           array_agg(pg_catalog.shard_name(s.logicalrelid, s.shardid) ORDER BY s.shardid)
+      FROM me
+      JOIN pg_catalog.pg_dist_partition p ON p.colocationid = me.colocationid AND p.partmethod = 'h'
+      JOIN pg_catalog.pg_dist_shard s ON s.logicalrelid = p.logicalrelid AND s.shardminvalue = me.shardminvalue
+     GROUP BY me.colocationid, me.shardminvalue
+$fn$;
+
+-- 在组 p_gid 的 leader 上做一次成员变更（加 / 减一个节点）。leader 刚换、或上一个变更还没提交时重试，最多 p_timeout_s 秒
+CREATE OR REPLACE FUNCTION partdist.group_change_member(p_gid bigint, p_node integer, p_add boolean,
+                                                        p_extra integer[] DEFAULT '{}', p_timeout_s integer DEFAULT 60)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    t0       timestamptz := clock_timestamp();
+    v_leader integer;
+    v_res    text;
+    v_err    text := '';
+BEGIN
+    LOOP
+        v_leader := partdist.group_leader_now(p_gid, p_extra);
+        IF v_leader IS NOT NULL THEN
+            BEGIN
+                v_res := partdist.node_exec(v_leader, format(
+                    'SELECT partdist.pg_raft_group_change_member(%s, %s, %s)', p_gid, p_node,
+                    CASE WHEN p_add THEN 'true' ELSE 'false' END));
+                IF v_res LIKE 'group %' THEN
+                    RETURN v_res;
+                END IF;
+                v_err := v_res;
+            EXCEPTION WHEN OTHERS THEN
+                v_err := SQLERRM;
+            END;
+        END IF;
+        IF clock_timestamp() - t0 > make_interval(secs => p_timeout_s) THEN
+            RAISE EXCEPTION '组 % %节点 % 失败：%', p_gid, CASE WHEN p_add THEN '加入' ELSE '移出' END, p_node, v_err;
+        END IF;
+        PERFORM pg_catalog.pg_sleep(1);
+    END LOOP;
+END $fn$;
+
+-- 本节点（须是该组 leader）到节点 p_node 的组 p_gid 是否就绪：日志不短于 p_min_index、回放槽位 armed、未 failed、无分叉
+CREATE OR REPLACE FUNCTION partdist.node_replica_ready(p_node integer, p_gid bigint, p_min_index bigint)
+RETURNS boolean LANGUAGE sql AS $fn$
+    SELECT coalesce(partdist.node_exec(p_node, format($q$
+        SELECT coalesce((SELECT last_log_index >= %2$s FROM partdist.pg_raft_group_status() WHERE group_id = %1$s), false)
+           AND coalesce((SELECT armed AND state <> 'failed' AND partdist.shard_divergence(shard) IS NULL
+                           FROM partdist.replay_status()
+                          WHERE shard = partdist.local_partition_for_shard(%1$s)), false)$q$,
+        p_gid, p_min_index), false), 'f') = 't'
+$fn$;
+
+-- 节点 p_node 上组 p_gid 的副本预热回放后能不能顶上（partdist.replica_warmup 返回 ready）
+CREATE OR REPLACE FUNCTION partdist.node_replica_warm(p_node integer, p_gid bigint)
+RETURNS text LANGUAGE sql AS $fn$
+    SELECT coalesce(partdist.node_exec(p_node, format('SELECT partdist.replica_warmup(%s, 5000)', p_gid), false), '连不上')
+$fn$;
+
+-- 计划内把组 p_gid 的主交给节点 p_target：先在目标上预热回放（基线收尾、能顶上才行），再请现任主
+-- 转交领导权（pg_raft_group_transfer_leader：挡住新提交、把目标追平、请它竞选、等自己被替下）。
+-- 不用"在目标上强制竞选"：持续写入时目标的日志总比主短一点，选不上还会把主拉下来、整组重选。
+-- 返回 transferred… / already_leader / 没转成的原因
+CREATE OR REPLACE FUNCTION partdist.raft_transfer_leader(p_gid bigint, p_target integer)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    v        text;
+    v_leader integer;
+BEGIN
+    v_leader := partdist.group_leader_now(p_gid, ARRAY[p_target]);
+    IF v_leader IS NULL THEN
+        RETURN 'no_leader';
+    END IF;
+    IF v_leader = p_target THEN
+        RETURN 'already_leader';
+    END IF;
+    v := partdist.node_replica_warm(p_target, p_gid);
+    IF v <> 'ready' THEN
+        RETURN v;
+    END IF;
+    RETURN coalesce(partdist.node_exec(v_leader, format(
+        'SELECT partdist.pg_raft_group_transfer_leader(%s, %s, 10000)', p_gid, p_target), false), 'leader_unreachable');
+END $fn$;
+
+-- 在各 worker 上登记 / 撤销这些组的"暂停自动重供"（partdist.reprovision_hold，30 分钟兜底过期）
+CREATE OR REPLACE FUNCTION partdist.reprovision_hold_set(p_sids bigint[], p_on boolean, p_reason text DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql AS $fn$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT node_id FROM partdist.node_map
+              WHERE node_id <> current_setting('pg_raft.coordinator_node_id')::integer LOOP
+        IF p_on THEN
+            PERFORM partdist.node_exec(r.node_id, format(
+                'INSERT INTO partdist.reprovision_hold (group_id, until, reason) '
+                'SELECT g, now() + interval ''30 minutes'', %L FROM unnest(%L::bigint[]) g '
+                'ON CONFLICT (group_id) DO UPDATE SET until = EXCLUDED.until, reason = EXCLUDED.reason',
+                p_reason, p_sids), false);
+        ELSE
+            PERFORM partdist.node_exec(r.node_id, format(
+                'DELETE FROM partdist.reprovision_hold WHERE group_id = ANY (%L::bigint[])', p_sids), false);
+        END IF;
+    END LOOP;
+END $fn$;
+
+-- 把一组共置分片的主切到节点 p_target：逐个请现任主转交领导权（partdist.raft_transfer_leader），
+-- 再等控制面登记全部指向目标（新主先把积压回放进表再登记）
+CREATE OR REPLACE FUNCTION partdist.move_bucket_primary(p_sids bigint[], p_target integer, p_timeout_s integer DEFAULT 180)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    t0       timestamptz := clock_timestamp();
+    sid      bigint;
+    v_left   integer;
+    v_state  text;
+    v_res    text;
+    v_note   text := '';
+BEGIN
+    LOOP
+        v_left := 0;
+        FOREACH sid IN ARRAY p_sids LOOP
+            v_state := partdist.node_group_status(p_target, sid, 'state');
+            CONTINUE WHEN v_state = 'leader' AND
+                (SELECT primary_node FROM partdist.partition_map WHERE partition_id = sid::oid) = p_target;
+            v_left := v_left + 1;
+            CONTINUE WHEN v_state = 'leader';           -- 已当选，等它回放完、登记
+            v_res := partdist.raft_transfer_leader(sid, p_target);
+            v_note := format('分片 %s：%s', sid, v_res);
+        END LOOP;
+        EXIT WHEN v_left = 0;
+        IF clock_timestamp() - t0 > make_interval(secs => p_timeout_s) THEN
+            RAISE EXCEPTION '切主超时（% s）：还有 % 个分片的主没到节点 %（最近一次：%）', p_timeout_s, v_left, p_target, v_note;
+        END IF;
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+    RETURN format('%s 个分片的主都在节点 %s（%s s）', cardinality(p_sids), p_target,
+                  round(extract(epoch FROM clock_timestamp() - t0)));
+END $fn$;
+
+-- 组 p_gid 当前（已提交）的 Raft 成员集：leader 本地 raft_group.members（成员变更提交时落盘）；问不到就用 partition_map 登记
+CREATE OR REPLACE FUNCTION partdist.group_raft_members(p_gid bigint, p_extra integer[] DEFAULT '{}')
+RETURNS integer[] LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_leader integer := partdist.group_leader_now(p_gid, p_extra);
+    v        text;
+BEGIN
+    IF v_leader IS NOT NULL THEN
+        v := partdist.node_exec(v_leader, format(
+            'SELECT members::text FROM partdist.raft_group WHERE group_id = %s AND cardinality(members) > 0', p_gid), false);
+        IF coalesce(v, '') <> '' THEN
+            RETURN v::integer[];
+        END IF;
+    END IF;
+    RETURN (SELECT ARRAY[primary_node] || secondary_nodes FROM partdist.partition_map WHERE partition_id = p_gid::oid);
+END $fn$;
+
+-- 删掉节点 p_node 上这些分片的副本：关回放槽、拆 Raft 组（拆两遍，在途消息会把组建回来）、删副本表、
+-- 删副本回放登记 / 分片身份 / 打标登记、回收回放槽位。调用前该节点须已移出这些组（成员变更已提交）。
+-- 返回残留（组|表|副本登记），'0|0|0' = 干净。shardpg.move_replica 的最后一步；中途失败时可单独重跑
+CREATE OR REPLACE FUNCTION partdist.drop_local_replicas(p_node integer, p_sids bigint[], p_names text[])
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_list text := array_to_string(p_sids, ',');
+    v_left text;
+    i      integer;
+BEGIN
+    FOR i IN 1..5 LOOP
+        PERFORM partdist.node_exec(p_node, format(
+            $q$SELECT count(partdist.replay_disable(pg_catalog.to_regclass(t)))
+                 FROM unnest(%L::text[]) t WHERE pg_catalog.to_regclass(t) IS NOT NULL$q$, p_names), false);
+        PERFORM partdist.node_exec(p_node, format(
+            'SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id IN (%s)', v_list), false);
+        PERFORM pg_catalog.pg_sleep(3);
+        PERFORM partdist.node_exec(p_node, format(
+            'SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id IN (%s)', v_list), false);
+        -- 副本表名是 Citus 的分片名，worker 上 Citus 把它当分片、不许直接删：本语句内放开
+        PERFORM partdist.node_exec(p_node, format(
+            $o$DO $$ DECLARE t text; BEGIN
+                 PERFORM set_config('citus.enable_ddl_propagation', 'off', true);
+                 PERFORM set_config('citus.enable_manual_changes_to_shards', 'on', true);
+                 FOREACH t IN ARRAY %L::text[] LOOP
+                   BEGIN
+                     IF pg_catalog.to_regclass(t) IS NOT NULL THEN
+                       EXECUTE 'DROP TABLE IF EXISTS ' || t;
+                     END IF;
+                   EXCEPTION WHEN OTHERS THEN
+                     RAISE WARNING 'drop_local_replicas：删 %% 失败：%%', t, SQLERRM;
+                   END;
+                 END LOOP; END $$$o$, p_names), false);
+        PERFORM partdist.node_exec(p_node, format(
+            'DELETE FROM partdist.follower_partition_map WHERE global_shard_id IN (%s)', v_list), false);
+        PERFORM partdist.node_exec(p_node, format(
+            'DELETE FROM partdist.shard_identity WHERE global_shard_id IN (%s)', v_list), false);
+        PERFORM partdist.node_exec(p_node, 'SELECT partdist.follower_map_gc_orphans()', false);
+        PERFORM partdist.node_exec(p_node, 'SELECT partdist.shard_mvcc_gc_orphans()', false);
+        PERFORM partdist.node_exec(p_node, 'SELECT slots_freed FROM partdist.replay_reclaim_stale(0)', false);
+        v_left := partdist.node_exec(p_node, format(
+            $q$SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN (%1$s)) || '|' ||
+                      (SELECT count(*) FROM unnest(%2$L::text[]) t WHERE pg_catalog.to_regclass(t) IS NOT NULL) || '|' ||
+                      (SELECT count(*) FROM partdist.follower_partition_map WHERE global_shard_id IN (%1$s))$q$,
+            v_list, p_names), false);
+        EXIT WHEN v_left = '0|0|0';
+        PERFORM pg_catalog.pg_sleep(3);
+    END LOOP;
+    RETURN coalesce(v_left, '连不上');
+END $fn$;
+
+-- ---- P7-N94：共置分片对齐主 ----
+CREATE TABLE IF NOT EXISTS partdist.colocation_align_attempt (
+    shardid      bigint PRIMARY KEY,
+    target       integer,
+    attempted_at timestamptz,
+    result       text
+);
+COMMENT ON TABLE partdist.colocation_align_attempt IS
+    'P7-N94：共置对齐最近一次对某分片的尝试（限流：转交成功的 60 s 内不再试，没转成的 10 s 后再试）。只在 master 上有内容。';
+
+CREATE OR REPLACE FUNCTION partdist.align_colocated_leaders()
+RETURNS integer LANGUAGE plpgsql AS $fn$
+DECLARE
+    r      record;
+    v_res  text;
+    n      integer := 0;
+BEGIN
+    FOR r IN
+        WITH sh AS (
+            SELECT s.shardid, p.colocationid, s.shardminvalue::integer AS minv,
+                   m.primary_node, m.secondary_nodes, m.updated_at
+              FROM pg_catalog.pg_dist_shard s
+              JOIN pg_catalog.pg_dist_partition p ON p.logicalrelid = s.logicalrelid AND p.partmethod = 'h'
+              JOIN partdist.partition_map m ON m.partition_id::bigint = s.shardid
+             WHERE m.primary_term > 0
+        ), b AS (
+            SELECT colocationid, minv,
+                   (array_agg(shardid ORDER BY shardid))[1] AS anchor,
+                   (array_agg(primary_node ORDER BY shardid))[1] AS anchor_primary,
+                   count(DISTINCT primary_node) AS nprim,
+                   max(updated_at) AS last_change
+              FROM sh GROUP BY colocationid, minv HAVING count(*) > 1
+        )
+        SELECT sh.shardid, sh.primary_node, b.anchor, b.anchor_primary, b.colocationid, b.minv
+          FROM b JOIN sh USING (colocationid, minv)
+         WHERE b.nprim > 1
+           AND sh.primary_node <> b.anchor_primary
+           AND b.anchor_primary = ANY (sh.secondary_nodes)          -- 锚的主也是它的成员（共置组成员相同）
+           AND b.last_change < now() - interval '15 seconds'         -- 这一段的登记已稳定 15 s（刚切主的别急着动）
+           AND NOT EXISTS (SELECT 1 FROM partdist.colocation_align_attempt a
+                            WHERE a.shardid = sh.shardid
+                              AND a.attempted_at > now() - CASE WHEN a.result LIKE 'transferred%'
+                                                                THEN interval '60 seconds'
+                                                                ELSE interval '10 seconds' END)
+         ORDER BY sh.shardid
+    LOOP
+        -- 迁移 / 手动切主正在处理这一段（持有段锁）就不插手
+        CONTINUE WHEN NOT pg_catalog.pg_try_advisory_xact_lock(r.colocationid, r.minv);
+        v_res := partdist.raft_transfer_leader(r.shardid, r.anchor_primary);
+        INSERT INTO partdist.colocation_align_attempt AS a (shardid, target, attempted_at, result)
+        VALUES (r.shardid, r.anchor_primary, now(), v_res)
+        ON CONFLICT (shardid) DO UPDATE SET target = EXCLUDED.target, attempted_at = EXCLUDED.attempted_at,
+                                            result = EXCLUDED.result;
+        IF v_res LIKE 'transferred%' THEN
+            n := n + 1;
+            RAISE LOG 'shardpg: 共置对齐 —— 分片 % 的主由节点 % 交给节点 %（与锚分片 % 同机，P7-N94）',
+                r.shardid, r.primary_node, r.anchor_primary, r.anchor;
+        END IF;
+    END LOOP;
+    RETURN n;
+END $fn$;
+COMMENT ON FUNCTION partdist.align_colocated_leaders() IS
+    'P7-N94：共置分片的主不在同一台时（各组各自选主的结果），请其余分片的现任主把领导权转交给锚分片（同一哈希段里分片号最小的）的主所在节点；目标先预热回放、基线收尾才转。master 的 pg_raft maintenance 每 5 s 调一次。返回本轮转交成功的个数。';
+
+-- ---- 面向用户的入口 ----
+
+CREATE OR REPLACE FUNCTION shardpg.move_primary(p_shard text, p_to_port integer)
+RETURNS text LANGUAGE plpgsql AS $fn$
+DECLARE
+    b    record;
+    v_to integer;
+    sid  bigint;
+BEGIN
+    SELECT * INTO b FROM partdist.colocated_bucket(p_shard);
+    IF b.sids IS NULL THEN
+        RAISE EXCEPTION '找不到分片 %', p_shard;
+    END IF;
+    SELECT node_id INTO v_to FROM partdist.node_map WHERE port = p_to_port;
+    IF v_to IS NULL THEN
+        RAISE EXCEPTION 'node_map 里没有端口 % 的节点', p_to_port;
+    END IF;
+    FOREACH sid IN ARRAY b.sids LOOP
+        IF NOT EXISTS (SELECT 1 FROM partdist.partition_map
+                        WHERE partition_id = sid::oid AND v_to = ANY (ARRAY[primary_node] || secondary_nodes)) THEN
+            RAISE EXCEPTION ':% 上没有分片 % 的副本，不能当它的主', p_to_port, sid;
+        END IF;
+    END LOOP;
+    PERFORM pg_catalog.pg_advisory_xact_lock(b.colocationid, b.minv);
+    RETURN array_to_string(b.names, ', ') || '：' || partdist.move_bucket_primary(b.sids, v_to, 180);
+END $fn$;
+COMMENT ON FUNCTION shardpg.move_primary(text, integer) IS
+    'P7-N94/N102：计划内切主 —— 把分片（及同一哈希段的共置分片）的主切到指定端口的 worker（它必须已有副本）。';
+
+CREATE OR REPLACE FUNCTION shardpg.add_node(p_host text, p_port integer)
+RETURNS TABLE (step text, detail text, secs integer) LANGUAGE plpgsql AS $fn$
+DECLARE
+    t0          timestamptz := clock_timestamp();
+    ts          timestamptz;
+    v_id        integer;
+    v_peers     text := current_setting('pg_raft.peers');
+    v_new_peers text;
+    v_v         text;
+    r           record;
+    v_n         integer;
+    v_g0        integer;
+    v_idx       bigint := 0;
+    i           integer;
+BEGIN
+    -- ① 新节点：连得上、三个扩展装好了、pg_raft.peers = 现有列表 + 它自己
+    ts := clock_timestamp();
+    v_v := partdist.addr_exec(p_host, p_port, 'SHOW pg_raft.node_id');
+    v_id := v_v::integer;
+    IF EXISTS (SELECT 1 FROM partdist.node_map WHERE node_id = v_id) THEN
+        RAISE EXCEPTION '节点号 % 已经在集群里（node_map）', v_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_dist_node WHERE nodeport = p_port) THEN
+        RAISE EXCEPTION '端口 % 已经是 Citus 节点', p_port;
+    END IF;
+    v_v := partdist.addr_exec(p_host, p_port,
+        'SELECT string_agg(extname, '','' ORDER BY extname) FROM pg_extension WHERE extname IN (''citus'', ''pg_partdist'', ''pg_raft'')');
+    IF v_v IS DISTINCT FROM 'citus,pg_partdist,pg_raft' THEN
+        RAISE EXCEPTION '新节点 %:% 的扩展不全（有：%），先在它上面 CREATE EXTENSION citus / pg_partdist / pg_raft', p_host, p_port, v_v;
+    END IF;
+    v_new_peers := v_peers || ',' || v_id || '@' || p_host || ':' || p_port;
+    v_v := partdist.addr_exec(p_host, p_port, 'SHOW pg_raft.peers');
+    IF v_v <> v_new_peers THEN
+        RAISE EXCEPTION '新节点的 pg_raft.peers 应为 %，现为 %', v_new_peers, v_v;
+    END IF;
+    step := '新节点就绪'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('节点 %s（%s:%s），扩展齐全，pg_raft.peers 含现有 %s 个节点 + 它自己',
+                     v_id, p_host, p_port, (SELECT count(*) FROM partdist.node_map));
+    RETURN NEXT;
+
+    -- ② 各节点 pg_raft.peers 末尾追加新节点：ALTER SYSTEM + reload，不重启（只许追加一个，见 pg_raft_peers_check_hook）
+    ts := clock_timestamp();
+    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map ORDER BY node_id LOOP
+        v_v := partdist.addr_exec(r.hostname, r.port, 'SHOW pg_raft.peers');
+        IF v_v <> v_peers AND v_v <> v_new_peers THEN
+            RAISE EXCEPTION '节点 %（%:%）的 pg_raft.peers 与 master 不一致：%', r.node_id, r.hostname, r.port, v_v;
+        END IF;
+    END LOOP;
+    FOR r IN SELECT node_id, hostname, port FROM partdist.node_map ORDER BY node_id LOOP
+        PERFORM partdist.addr_exec(r.hostname, r.port, format('ALTER SYSTEM SET pg_raft.peers = %L', v_new_peers));
+        PERFORM partdist.addr_exec(r.hostname, r.port, 'SELECT pg_reload_conf()');
+    END LOOP;
+    FOR i IN 1..30 LOOP
+        SELECT count(*) INTO v_n FROM partdist.node_map nm
+         WHERE partdist.addr_exec(nm.hostname, nm.port, 'SHOW pg_raft.peers', false) IS DISTINCT FROM v_new_peers;
+        EXIT WHEN v_n = 0;
+        PERFORM pg_catalog.pg_sleep(1);
+    END LOOP;
+    IF v_n > 0 THEN
+        RAISE EXCEPTION '% 个节点 reload 之后 pg_raft.peers 仍是旧值（看各节点日志里 pg_raft.peers 的报错）', v_n;
+    END IF;
+    PERFORM pg_catalog.pg_sleep(2);     -- 等各节点的 Raft 进程在下一次 tick 换上新表
+    step := '各节点追加 pg_raft.peers'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('%s 个节点热加载完成；控制面组 0 成员 %s → %s，多数派 %s',
+                     (SELECT count(*) FROM partdist.node_map), (SELECT count(*) FROM partdist.node_map),
+                     (SELECT count(*) FROM partdist.node_map) + 1, ((SELECT count(*) FROM partdist.node_map) + 1) / 2 + 1);
+    RETURN NEXT;
+
+    -- ③ 控制面登记新节点地址（各节点的 node_map 按日志序同时学到），等新节点追上控制面日志
+    ts := clock_timestamp();
+    FOR i IN 1..30 LOOP
+        SELECT leader_node_id INTO v_g0 FROM partdist.pg_raft_group_status() WHERE group_id = 0;
+        IF v_g0 IS NOT NULL AND v_g0 > 0 THEN
+            BEGIN
+                v_idx := partdist.node_exec(v_g0, format(
+                    'SELECT partdist.pg_raft_group_propose(0, ''OP_NODE_STATUS'', %L)',
+                    json_build_object('node_id', v_id, 'status', 'active', 'hostname', p_host, 'port', p_port)::text))::bigint;
+            EXCEPTION WHEN OTHERS THEN
+                v_idx := 0;
+            END;
+        END IF;
+        EXIT WHEN v_idx > 0;
+        PERFORM pg_catalog.pg_sleep(1);
+    END LOOP;
+    IF v_idx <= 0 THEN
+        RAISE EXCEPTION '控制面登记新节点失败（组 0 leader = %）', v_g0;
+    END IF;
+    FOR i IN 1..180 LOOP
+        v_v := partdist.addr_exec(p_host, p_port,
+            'SELECT last_applied FROM partdist.pg_raft_group_status() WHERE group_id = 0', false);
+        EXIT WHEN coalesce(nullif(v_v, '')::bigint, 0) >= v_idx
+              AND EXISTS (SELECT 1 FROM partdist.node_map WHERE node_id = v_id AND port = p_port);
+        PERFORM pg_catalog.pg_sleep(1);
+    END LOOP;
+    IF coalesce(nullif(v_v, '')::bigint, 0) < v_idx THEN
+        RAISE EXCEPTION '新节点 3 分钟内没追上控制面日志（它在 %，要到 %）', v_v, v_idx;
+    END IF;
+    -- 新节点的 node_map 以 master 为准（控制面快照里的旧占位地址一并纠正）
+    PERFORM partdist.addr_exec(p_host, p_port, format(
+        'INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) '
+        'SELECT * FROM jsonb_populate_recordset(NULL::partdist.node_map, %L::jsonb) '
+        'ON CONFLICT (node_id) DO UPDATE SET hostname = EXCLUDED.hostname, port = EXCLUDED.port',
+        (SELECT json_agg(nm)::text FROM partdist.node_map nm)));
+    step := '加入控制面'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('组 0 日志 index %s 登记 %s:%s，新节点已追上', v_idx, p_host, p_port);
+    RETURN NEXT;
+
+    -- ④ Citus 加 worker：同步元数据，各分布表的外壳建到新节点上
+    ts := clock_timestamp();
+    PERFORM pg_catalog.citus_add_node(p_host, p_port);
+    PERFORM partdist.addr_exec(p_host, p_port, 'SELECT partdist.rebuild_shard_identity()');
+    step := 'Citus 加入 worker'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('citus_add_node(%L, %s)；新节点上还没有分片，用 shardpg.move_replica 把副本搬过来', p_host, p_port);
+    RETURN NEXT;
+
+    step := '完成'; secs := round(extract(epoch FROM clock_timestamp() - t0));
+    detail := format('节点 %s（:%s）已入簇，没有重启任何节点', v_id, p_port);
+    RETURN NEXT;
+END $fn$;
+COMMENT ON FUNCTION shardpg.add_node(text, integer) IS
+    'P7-N102：新 worker 入簇（不重启）。前提：新节点已按 scripts/new_worker_node.sh 准备好（配置里 pg_raft.peers = 现有列表 + 它自己、建好 citus / pg_partdist / pg_raft 扩展、已启动）。';
+
+CREATE OR REPLACE FUNCTION shardpg.move_replica(p_shard text, p_from_port integer, p_to_port integer)
+RETURNS TABLE (step text, detail text, secs integer) LANGUAGE plpgsql AS $fn$
+DECLARE
+    t0        timestamptz := clock_timestamp();
+    ts        timestamptz;
+    b         record;
+    v_from    integer;
+    v_to      integer;
+    v_coord   integer := current_setting('pg_raft.coordinator_node_id')::integer;
+    sid       bigint;
+    k         integer;
+    i         integer;
+    v_members integer[];
+    v_common  integer[];
+    v_leader  integer;
+    v_res     text;
+    v_need    bigint[] := '{}';
+    v_pending integer;
+    v_newp    integer;
+    v_g0      integer;
+    v_idx     bigint;
+    v_note    timestamptz;
+    v_left    text;
+    v_raft    integer[];
+    v_done    boolean := true;
+BEGIN
+    SELECT * INTO b FROM partdist.colocated_bucket(p_shard);
+    IF b.sids IS NULL THEN
+        RAISE EXCEPTION '找不到分片 %（用 shardpg.shards 里的 shard_name）', p_shard;
+    END IF;
+    SELECT node_id INTO v_from FROM partdist.node_map WHERE port = p_from_port;
+    SELECT node_id INTO v_to FROM partdist.node_map WHERE port = p_to_port;
+    IF v_from IS NULL OR v_to IS NULL THEN
+        RAISE EXCEPTION 'node_map 里找不到端口 % 或 %（新节点先 shardpg.add_node）', p_from_port, p_to_port;
+    END IF;
+    IF v_to = v_coord OR v_from = v_coord THEN
+        RAISE EXCEPTION 'master 不存数据';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_node WHERE nodeport = p_to_port AND noderole = 'primary' AND isactive) THEN
+        RAISE EXCEPTION ':% 还不是 Citus worker（先 shardpg.add_node）', p_to_port;
+    END IF;
+    FOREACH sid IN ARRAY b.sids LOOP
+        SELECT ARRAY[primary_node] || secondary_nodes INTO v_members FROM partdist.partition_map WHERE partition_id = sid::oid;
+        IF v_members IS NULL THEN
+            RAISE EXCEPTION '分片 % 没有主从登记（不是 Raft 管理的表）', sid;
+        END IF;
+        v_raft := partdist.group_raft_members(sid, ARRAY[v_to]);
+        IF v_from = ANY (v_members) OR v_from = ANY (v_raft) THEN
+            v_done := false;            -- 还没搬完（重跑时接着做）
+        ELSIF NOT v_to = ANY (v_raft) THEN
+            RAISE EXCEPTION ':% 上没有分片 % 的副本', p_from_port, sid;
+        END IF;
+        IF v_to = ANY (v_members) AND v_from = ANY (v_members) THEN
+            RAISE EXCEPTION ':% 上已经有分片 % 的副本', p_to_port, sid;
+        END IF;
+        v_common := CASE WHEN v_common IS NULL THEN v_members
+                         ELSE ARRAY(SELECT unnest(v_common) INTERSECT SELECT unnest(v_members)) END;
+    END LOOP;
+    -- 挡住共置对齐（P7-N94）：迁移期间这一段的主由本函数安排
+    PERFORM pg_catalog.pg_advisory_xact_lock(b.colocationid, b.minv);
+    step := '核对'; secs := 0;
+    detail := format('同一哈希段的 %s 个分片（%s）：副本从 :%s（节点 %s）搬到 :%s（节点 %s）%s',
+                     cardinality(b.sids), array_to_string(b.names, ', '), p_from_port, v_from, p_to_port, v_to,
+                     CASE WHEN v_done THEN '——已经搬过，只补做清理' ELSE '' END);
+    RETURN NEXT;
+
+    -- 迁移期间这些组暂停自动重供（归队扫尾 / P7-N25）：新成员由本函数供副本，别人再插一脚就是重复基线，
+    -- 而移出源节点时那条重复基线会半途失败、在新节点上留下收不了尾的"基线半程"。结束（或出错）时撤销
+    PERFORM partdist.reprovision_hold_set(b.sids, true, format('move_replica %s→%s', v_from, v_to));
+    BEGIN
+
+    IF NOT v_done THEN
+    -- ① 新节点入组：先在新节点上建组（成员 = 现有成员 + 它），再由 leader 走 Raft 日志加成员（一次一个）
+    ts := clock_timestamp();
+    FOREACH sid IN ARRAY b.sids LOOP
+        v_raft := partdist.group_raft_members(sid, ARRAY[v_to]);
+        CONTINUE WHEN v_to = ANY (v_raft);          -- 上次已经加进去了
+        PERFORM partdist.node_exec(v_to, format('SELECT partdist.pg_raft_group_create(%s, %L::integer[])', sid, v_raft || v_to));
+        PERFORM partdist.group_change_member(sid, v_to, true);
+    END LOOP;
+    step := '新节点入组'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('%s 个 Raft 组各加成员 %s（成员变更走 Raft 日志，一次一个；这时每组 4 个成员、多数派 3）', cardinality(b.sids), v_to);
+    RETURN NEXT;
+
+    -- ② 供副本：leader 先到新节点建副本表，再发物理基线（经 Raft 复制），配回放位置、arm
+    ts := clock_timestamp();
+    FOREACH sid IN ARRAY b.sids LOOP
+        v_leader := partdist.group_leader_now(sid, ARRAY[v_to]);
+        IF v_leader IS NULL THEN
+            RAISE EXCEPTION '分片 % 现在没有主（正在选举？），稍后重试', sid;
+        END IF;
+        IF NOT partdist.node_replica_ready(v_to, sid, 0) THEN
+            v_note := clock_timestamp();
+            v_res := partdist.node_exec(v_leader, format('SELECT partdist.provision_shard_replica(%s, %s)', sid, v_to));
+            IF v_res NOT LIKE 'shard=%' THEN
+                RAISE EXCEPTION '分片 % 供副本失败：%', sid, v_res;
+            END IF;
+            RAISE LOG 'move_replica: 分片 % 在节点 % 上供副本用了 % s（leader 节点 %）', sid, v_to,
+                round(extract(epoch FROM clock_timestamp() - v_note), 1), v_leader;
+        END IF;
+        v_need := v_need || partdist.node_group_status(v_leader, sid, 'last_log_index')::bigint;
+    END LOOP;
+    -- ③ 等新副本收齐：日志追到基线之后、回放槽位 armed（主的追平通道每 5 s 补发一批），
+    --    再在新节点上预热回放到已提交位点：基线收尾、索引不是空壳，这份副本才真能顶上
+    v_note := clock_timestamp();
+    FOR i IN 1..300 LOOP
+        v_pending := 0;
+        v_res := '';
+        FOR k IN 1..cardinality(b.sids) LOOP
+            IF NOT partdist.node_replica_ready(v_to, b.sids[k], v_need[k]) THEN
+                v_pending := v_pending + 1;
+                v_res := '日志未追平';
+            ELSE
+                v_res := partdist.node_replica_warm(v_to, b.sids[k]);
+                IF v_res <> 'ready' THEN
+                    v_pending := v_pending + 1;
+                END IF;
+            END IF;
+        END LOOP;
+        EXIT WHEN v_pending = 0;
+        IF clock_timestamp() - v_note > interval '15 seconds' THEN
+            RAISE NOTICE '等新副本追平：还有 % 个分片（已 % s，%）', v_pending,
+                round(extract(epoch FROM clock_timestamp() - ts)), v_res;
+            v_note := clock_timestamp();
+        END IF;
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+    IF v_pending > 0 THEN
+        RAISE EXCEPTION '新副本 10 分钟内没追平（% 个分片，%）；新节点已在组里，查明原因后重跑本函数会接着做', v_pending, v_res;
+    END IF;
+    step := '供副本、追平'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := '新副本收到物理基线和之后的日志，预热回放后基线收尾、可以顶上';
+    RETURN NEXT;
+
+    -- ④ 源节点若是主，先把这一段的主切到另一个老成员（共置分片一起切）
+    IF EXISTS (SELECT 1 FROM partdist.partition_map WHERE partition_id::bigint = ANY (b.sids) AND primary_node = v_from) THEN
+        ts := clock_timestamp();
+        SELECT min(x) INTO v_newp FROM unnest(v_common) x WHERE x NOT IN (v_from, v_to, v_coord);
+        IF v_newp IS NULL THEN
+            v_newp := v_to;
+        END IF;
+        -- 被拉下来的旧主本来会被新主自动重供成副本（P7-N25）；迁移期间暂停自动重供，它马上就被移出
+        v_res := partdist.move_bucket_primary(b.sids, v_newp, 180);
+        step := '切主'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+        detail := format('源节点原来是主，先切到节点 %s：%s', v_newp, v_res);
+        RETURN NEXT;
+    END IF;
+
+    -- ⑤ 源副本出组（成员变更走日志）
+    ts := clock_timestamp();
+    FOREACH sid IN ARRAY b.sids LOOP
+        CONTINUE WHEN NOT v_from = ANY (partdist.group_raft_members(sid, ARRAY[v_to]));
+        PERFORM partdist.group_change_member(sid, v_from, false, ARRAY[v_to]);
+    END LOOP;
+    -- ⑥ 控制面改登记的从副本集（主、任期不变）
+    FOREACH sid IN ARRAY b.sids LOOP
+        FOR i IN 1..20 LOOP
+            SELECT leader_node_id INTO v_g0 FROM partdist.pg_raft_group_status() WHERE group_id = 0;
+            v_idx := 0;
+            BEGIN
+                v_idx := partdist.node_exec(v_g0, format(
+                    'SELECT partdist.pg_raft_group_propose(0, ''OP_PARTITION_SECONDARIES'', %L)',
+                    (SELECT json_build_object('partition_id', sid, 'primary_term', m.primary_term,
+                                              'secondary_nodes', to_json(ARRAY(
+                                                  SELECT DISTINCT x FROM unnest(m.secondary_nodes || v_to) x
+                                                   WHERE x NOT IN (v_from, m.primary_node) ORDER BY x)))::text
+                       FROM partdist.partition_map m WHERE m.partition_id = sid::oid)))::bigint;
+            EXCEPTION WHEN OTHERS THEN
+                v_idx := 0;
+            END;
+            EXIT WHEN v_idx > 0;
+            PERFORM pg_catalog.pg_sleep(1);
+        END LOOP;
+    END LOOP;
+    FOR i IN 1..30 LOOP
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM partdist.partition_map
+                               WHERE partition_id::bigint = ANY (b.sids)
+                                 AND (v_from = ANY (ARRAY[primary_node] || secondary_nodes)
+                                      OR NOT v_to = ANY (ARRAY[primary_node] || secondary_nodes)));
+        PERFORM pg_catalog.pg_sleep(1);
+    END LOOP;
+    step := '源节点出组'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := format('%s 个 Raft 组移出成员 %s；控制面登记的从副本改为 %s', cardinality(b.sids), v_from,
+                     (SELECT string_agg(':' || nm.port, ',' ORDER BY nm.port) FROM partdist.partition_map m, partdist.node_map nm
+                       WHERE m.partition_id = b.sids[1]::oid AND nm.node_id = ANY (m.secondary_nodes)));
+    RETURN NEXT;
+
+    END IF;     -- NOT v_done
+
+    -- ⑦ 清理源节点：关回放槽、拆组（拆两遍，在途消息会把组建回来）、删副本表与各项登记
+    ts := clock_timestamp();
+    v_left := partdist.drop_local_replicas(v_from, b.sids, b.names);
+
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM partdist.reprovision_hold_set(b.sids, false);
+        RAISE;
+    END;
+    PERFORM partdist.reprovision_hold_set(b.sids, false);
+    step := '清理源节点'; secs := round(extract(epoch FROM clock_timestamp() - ts));
+    detail := CASE WHEN v_left = '0|0|0'
+                   THEN format(':%s 上这 %s 个分片的 Raft 组、副本表、回放登记都已删除', p_from_port, cardinality(b.sids))
+                   ELSE format(':%s 上还有残留（组|表|副本登记 = %s），稍后再执行一次本函数（会只做清理）', p_from_port, v_left) END;
+    RETURN NEXT;
+
+    step := '完成'; secs := round(extract(epoch FROM clock_timestamp() - t0));
+    detail := (SELECT string_agg(format('%s 主 %s 从 %s', sh.shard_name, sh."primary", sh.replicas), '；' ORDER BY sh.shard_name)
+                 FROM shardpg.shards sh WHERE sh.shard_name = ANY (b.names));
+    RETURN NEXT;
+END $fn$;
+COMMENT ON FUNCTION shardpg.move_replica(text, integer, integer) IS
+    'P7-N102：在线把分片的一份副本从一个 worker 搬到另一个（同一哈希段的共置分片一起搬）：新节点入组 → 供副本、追平 → 源节点是主就先切主 → 源节点出组 → 改控制面登记 → 清理源节点。全程可读写。';

@@ -4,8 +4,8 @@
  * v1 = master（coordinator）上的共享内存 int64 单调逻辑计数器：
  *   - 从 1 起发号，0 保留为"无 ts"（P2 历史判决 ts=0 在 §4.1 判据下恒可见，
  *     兼容红利，P3_PRECHECK 结论一）；
- *   - 不做水位持久化、不做 TSO 自身 HA（§2.4：master/TSO 重启 = 单调性失守
- *     = 整簇重建）；
+ *   - 不做 TSO 自身 HA（§2.4）；★ P7-N101 起发号上限落盘（$PGDATA/pg_tso_hwm，与 gxid
+ *     水位同构），master 重启后从上限接着发，有数据也能重启；
  *   - **boot 防呆**（§2.4 配套 2）：首次服务前把 $PGDATA/pg_tso_boot 标记
  *     durably 落盘；启动时检测到标记 ⇒ 本次启动一切发号请求 ERROR（响亮
  *     停摆），重建流程删标记后重启即恢复全新纪元；
@@ -27,6 +27,7 @@
 
 #define TSO_MAX_NODES		64
 #define TSO_BOOT_MARKER		"pg_tso_boot"
+#define TSO_HWM_FILE		"pg_tso_hwm"	/* P7-N101：发号上限（高水位）+ GlobalSafeTs 下界 */
 
 extern void TsoDefineGUCs(void);
 extern void RequestTsoShmem(void);
@@ -53,6 +54,7 @@ extern int64 TsoCurrentGxid(void);		/* 0 = 未加入全局事务 */
 /* P7-N91：跨分片事务自动加入全局事务（Citus 补丁 citus-0002 的钩子） */
 extern bool shardpg_auto_global_txn;
 extern void TsoClientInstallRemoteBeginHook(void);
+extern void ShardpgAutoGlobalTxnAssign(bool newval, void *extra);	/* P7-N100：跟着开关拨 citus-0003 */
 extern int64 TsoCurrentCoordGsid(void);	/* 0 = 未知 */
 
 /* T5.2：worker 侧取 GlobalSafeTs（经 RPC；失败返回 0 = 不清，安全方向） */

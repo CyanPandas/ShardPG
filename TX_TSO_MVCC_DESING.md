@@ -164,6 +164,14 @@ start_ts)，**然后**才返回新号。一次 RPC，原子，无竞态窗口。
 3. **范围边界**：本裁定只豁免 **TSO 自身**的故障。§6.2 GlobalSafeTs 的双通道/租约/
    栅栏针对的是 **worker 失联**（vacuum 正确性依赖），不在豁免之列，仍属 v1。
 
+> **★ 2026-10-17 P7-N101：发号上限落盘，master 可以带数据重启。** 上面"配套 1"的运行纪律
+> （master 重启 = 整簇重建）在有数据的集群上等于"master 永远不能重启"，部署和加节点都卡在这里。
+> 现在 TSO 与 gxid 水位同构：发号前保证 `counter < reserved`，`reserved` 每次推 100000、先落盘
+> （`$PGDATA/pg_tso_hwm`，写临时文件 + fsync + durable_rename）再发号；重启时从 `reserved` 接着发，
+> 跳过一段号无害、绝不重发；boot 标记只在没有上限文件时才拦（老版本发过号、不知道发到哪）。
+> GlobalSafeTs 的下界一并落盘，重启后冻结一个租约周期再前进（各节点最老快照的登记只在内存里）。
+> 这只解决 **TSO 进程重启**，不是 TSO 的 HA（master 宕机期间照样不能发号）；HA 方向仍按下文留档。
+
 > **★ 2026-09-09 T7.5 修复（R-P6-20）：TSO 客户端的 RPC 必须写全限定名。**
 >
 > `tso_client.c` 此前发的是**裸函数名**（`SELECT partdist_tso_start_ts(...)` 等

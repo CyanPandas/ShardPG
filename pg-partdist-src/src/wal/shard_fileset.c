@@ -2189,6 +2189,26 @@ typedef struct ReprovisionArgs
 } ReprovisionArgs;
 
 /*
+ * ★ P7-N102：该组是否暂停自动重供（partdist.reprovision_hold 里有未过期的登记）。
+ * shardpg.move_replica 迁移期间在各节点登记：迁移自己会给新成员供副本，归队扫尾 / P7-N25
+ * 再插一脚就是重复发基线；而迁移中途移出成员时，那条重复基线会半途失败、在目标上留下
+ * 永远收不了尾的"基线半程"（2026-10-17 预演实测：目标当选后升主前置一直报基线未收尾）。
+ * 调用方须已 SPI_connect。表不存在（老版本 SQL）时返回 false。
+ */
+static bool
+reprovision_held(int64 gsid)
+{
+    char sql[256];
+
+    if (prov_query_text("SELECT to_regclass('partdist.reprovision_hold')::text") == NULL)
+        return false;
+    snprintf(sql, sizeof(sql),
+             "SELECT 'held' FROM partdist.reprovision_hold WHERE group_id = %lld AND until > now()",
+             (long long) gsid);
+    return prov_query_text(sql) != NULL;
+}
+
+/*
  * 检查一个成员：有 armed 回放槽位 ⇒ "not_needed"；连不上 / 查不到 ⇒ "retry: …"；
  * 否则 provision_shard_replica 替它重供 ⇒ "done: …"。返回调用方上下文里的串。
  * 调用前本节点须已确认是该组 leader（provision 自己也会再查一遍）。
@@ -2207,6 +2227,27 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
 
     if (SPI_connect() != SPI_OK_CONNECT)
         return MemoryContextStrdup(caller_cxt, "retry: SPI_connect 失败");
+
+    /*
+     * ★ P7-N102：目标必须还是本组的 Raft 成员。副本迁移把源节点移出组（成员变更已提交、
+     * 本节点 raft_group.members 已不含它）之后，排在队里的重供请求不能再给它发基线 ——
+     * 那会在源节点上重建刚被清掉的副本表。raft_group 行为空成员集（建组时由 partition_map
+     * 导出）时不据此下结论，照旧往下查。
+     */
+    snprintf(sql, sizeof(sql),
+             "SELECT CASE WHEN cardinality(members) > 0 AND NOT (%d = ANY (members)) THEN 'not_member' END "
+             "FROM partdist.raft_group WHERE group_id = %lld", target, (long long) gsid);
+    if (prov_query_text(sql) != NULL)
+    {
+        SPI_finish();
+        return psprintf("not_needed(%d 已不是本组成员)", target);
+    }
+    if (reprovision_held(gsid))
+    {
+        SPI_finish();
+        return psprintf("not_needed(%d：迁移中，暂停自动重供)", target);
+    }
+
     snprintf(sql, sizeof(sql),
              "SELECT hostname||':'||port FROM partdist.node_map WHERE node_id = %d", target);
     host = prov_query_text(sql);
@@ -2467,6 +2508,8 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
     int             nbad = 0;
     int             launched = 0;
     int             i;
+    const char     *hold_filter;
+    StringInfoData  sweep_sql;
 
     if (!superuser())
         ereport(ERROR,
@@ -2479,7 +2522,13 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
 
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errmsg("reprovision_sweep: SPI_connect 失败")));
-    if (SPI_execute(
+    /* P7-N102：迁移中的组（partdist.reprovision_hold 有未过期登记）这一轮不判 */
+    hold_filter = (prov_query_text("SELECT to_regclass('partdist.reprovision_hold')::text") != NULL)
+        ? "   AND NOT EXISTS (SELECT 1 FROM partdist.reprovision_hold h "
+          "                    WHERE h.group_id = s.group_id AND h.until > now()) "
+        : "";
+    initStringInfo(&sweep_sql);
+    appendStringInfo(&sweep_sql,
             "SELECT s.group_id, m.node_id, n.hostname, n.port::text, "
             "       partdist.local_partition_for_shard(s.group_id)::text "
             "  FROM partdist.pg_raft_group_status() s "
@@ -2489,7 +2538,9 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
             "  JOIN partdist.node_map n ON n.node_id = m.node_id "
             " WHERE s.group_id <> 0 AND s.state = 'leader' "
             "   AND m.node_id <> current_setting('pg_raft.node_id')::int "
-            " ORDER BY m.node_id, s.group_id", true, 0) == SPI_OK_SELECT &&
+            "%s"
+            " ORDER BY m.node_id, s.group_id", hold_filter);
+    if (SPI_execute(sweep_sql.data, true, 0) == SPI_OK_SELECT &&
         SPI_processed > 0)
     {
         MemoryContext old = MemoryContextSwitchTo(caller_cxt);

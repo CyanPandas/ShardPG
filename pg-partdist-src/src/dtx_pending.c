@@ -690,6 +690,7 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 	bool			appended = false;
 	bool			ok = true;
 	int				touched_before;
+	volatile int	prev_no_diverge = -1;
 
 	if (ent->nxids <= 0 || (verdict != 1 && verdict != 2))
 		return true;
@@ -739,13 +740,19 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		 * 最后一笔事务，恰恰是最需要它的那笔）。
 		 */
 		if (appended)
+		{
+			/* P7-N97：只有判决标记的那几个分区，复制失败（如刚失去领导权）不打分叉标记 */
+			prev_no_diverge = PartWALSetNoDivergeFrom(touched_before);
 			PartWALFlush(InvalidXLogRecPtr, false);
+			PartWALSetNoDivergeFrom(prev_no_diverge);
+		}
 		replicate_fail_streak = 0;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *ed;
 
+		PartWALSetNoDivergeFrom(prev_no_diverge);
 		MemoryContextSwitchTo(TopMemoryContext);
 		ed = CopyErrorData();
 		FlushErrorState();

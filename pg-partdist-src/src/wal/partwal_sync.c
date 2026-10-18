@@ -247,6 +247,26 @@ PartWALSetBestEffortCtrl(bool on)
     partwal_ctrl_best_effort = on;
 }
 
+/*
+ * ★ P7-N97：判决标记（MARKER）的复制失败同样不会分叉 —— 它只是流里的一条账，没有物理改动。
+ * 计划内切主时旧主上排着的判决标记被拒（"本节点不是该分区组的 leader"），原来照样打分叉标记，
+ * 这份副本被当坏副本，新主扫尾两轮（约 2 分钟）后才重供基线自愈。
+ *
+ * 不用 PartWALSetBestEffortCtrl 的整体开关：判决可能在调用方自己的事务里闭合（读者解 in-doubt），
+ * touched 表里排在前面的是调用方自己触达的分区，它们可能带着真正的物理改动（剪枝等），
+ * 复制失败照旧要打标记。所以只豁免"本次追加判决标记时才登进来"的那一段（下标 >= idx）。
+ */
+static int partwal_no_diverge_from = -1;
+
+int
+PartWALSetNoDivergeFrom(int idx)
+{
+    int prev = partwal_no_diverge_from;
+
+    partwal_no_diverge_from = idx;
+    return prev;
+}
+
 void
 PartWALNoteTouchedPartition(Oid partition_id)
 {
@@ -1250,7 +1270,8 @@ PartWALReplicateTouched(void)
              * 原来照样打分叉标记 ⇒ 心跳工作者自动 repair_diverged_shards() 重做物理基线 ——
              * 128 组建组期间组主一漂，每个分区每分钟都被误判一次，平白多出成批的重供。
              */
-            if (!partwal_ctrl_best_effort)
+            if (!partwal_ctrl_best_effort &&
+                !(partwal_no_diverge_from >= 0 && i >= partwal_no_diverge_from))
                 ShardMarkDiverged(part, "复制挂钩失败：本事务已中止，但 leader 侧的"
                                   "物理截断不随回滚撤销，副本可能已分叉（§13 约束 13）");
             PG_RE_THROW();

@@ -38,7 +38,9 @@ typedef struct TsoState
 	int64		counter;		/* 下一个待发；从 1 起，0 保留为"无 ts" */
 	int64		safe_ts;		/* T3.5 GlobalSafeTs：单调不减（§6.2） */
 	bool		served;			/* 本次启动是否已服务过（boot 标记已落盘） */
-	bool		boot_blocked;	/* 启动时检测到 boot 标记 ⇒ 拒发号 */
+	bool		boot_blocked;	/* 启动时检测到 boot 标记、又没有发号上限文件 ⇒ 拒发号 */
+	int64		reserved;		/* P7-N101：已落盘的发号上限，发出的号都 < 它 */
+	TimestampTz safe_freeze_until;	/* P7-N101：重启后一个租约周期内 GlobalSafeTs 不前进 */
 	TsoNodeEntry nodes[TSO_MAX_NODES];
 } TsoState;
 
@@ -70,6 +72,91 @@ TsoDefineGUCs(void)
 		NULL, NULL, NULL);
 }
 
+/*
+ * ★ P7-N101：发号上限落盘（高水位）。
+ *
+ * 原设计（§2.4 v1 裁定）TSO 只是内存计数器，master 一重启就"单调性失守"，只能整簇重建；
+ * boot 标记把它变成"重启后拒发号"。实际后果是**有数据时 master 不能重启**：删标记重启
+ * 就从 1 重新发号，旧提交全部不可见；不删就一直拒发号。部署、加节点都卡在这上面。
+ *
+ * 做法与 gxid 水位（gxid.c）同构：发号前保证 counter < reserved，reserved 先落盘
+ * （写临时文件 → fsync → durable_rename）再发号；每次预留 TSO_RESERVE_STEP 个号。
+ * 重启时 counter 从文件里的 reserved 接着发 —— 跳过一段号无害（时间戳只要求单调），
+ * 绝不会重发。文件里同时存当时的 GlobalSafeTs（一个下界，重启后从它起步）。
+ *
+ * GlobalSafeTs 重启后的空窗：各节点登记的最老活跃快照只在内存里，重启后清空；若马上按
+ * "无人登记 ⇒ safe = counter"算，会越过还活着的远端快照、让 vacuum 清掉它要读的版本。
+ * 所以重启后冻结一个租约周期（tso_lease_ms）不前进 —— 期间各节点心跳会重新登记；
+ * 租约到期还没心跳的节点，其快照本就被栅栏作废（§6.2），与没重启时同一套规则。
+ */
+#define TSO_RESERVE_STEP	100000
+
+static bool
+tso_read_hwm(int64 *reserved, int64 *safe)
+{
+	char		path[MAXPGPATH];
+	char		buf[128];
+	int			fd;
+	int			n;
+	long long	r = 0,
+				sf = 0;
+
+	snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_HWM_FILE);
+	fd = open(path, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		return false;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	buf[n] = '\0';
+	if (sscanf(buf, "%lld %lld", &r, &sf) < 1 || r <= 0)
+		return false;
+	*reserved = (int64) r;
+	*safe = (sf > 0 && sf <= r) ? (int64) sf : 0;
+	return true;
+}
+
+/* 先落盘后发号（fail-closed）：写不下去就 ERROR，这个号不发 */
+static void
+tso_persist_hwm(int64 reserved, int64 safe)
+{
+	char		tmppath[MAXPGPATH];
+	char		path[MAXPGPATH];
+	char		buf[128];
+	int			fd;
+	int			len;
+
+	snprintf(tmppath, sizeof(tmppath), "%s/%s.tmp", DataDir, TSO_HWM_FILE);
+	snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_HWM_FILE);
+	len = snprintf(buf, sizeof(buf), INT64_FORMAT " " INT64_FORMAT "\n", reserved, safe);
+
+	fd = OpenTransientFile(tmppath, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法创建 TSO 发号上限文件 \"%s\": %m", tmppath)));
+	errno = 0;
+	if (write(fd, buf, len) != len)
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: 无法写 TSO 发号上限文件 \"%s\": %m", tmppath)));
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_partdist: TSO 发号上限文件 fsync 失败: %m")));
+	}
+	CloseTransientFile(fd);
+	durable_rename(tmppath, path, ERROR);
+}
+
 void
 RequestTsoShmem(void)
 {
@@ -92,9 +179,14 @@ TsoShmemInit(void)
 		struct stat st;
 		char		path[MAXPGPATH];
 
+		int64		hwm = 0;
+		int64		hwm_safe = 0;
+
 		TsoCtl->counter = 1;
 		TsoCtl->safe_ts = 0;
 		TsoCtl->served = false;
+		TsoCtl->reserved = 0;
+		TsoCtl->safe_freeze_until = 0;
 		for (i = 0; i < TSO_MAX_NODES; i++)
 		{
 			TsoCtl->nodes[i].node_id = -1;
@@ -104,11 +196,22 @@ TsoShmemInit(void)
 		TsoCtl->lock = &GetNamedLWLockTranche("pg_partdist_tso")[0].lock;
 
 		/*
-		 * boot 防呆（§2.4 配套 2）：标记在 = 上个纪元服务过 = 单调性公理
-		 * 已不可信。postmaster 启动期单线程读一次即可。
+		 * P7-N101：有发号上限文件 ⇒ 从上限接着发（上次发出的号都比它小），boot 标记不再拦。
+		 * 没有上限文件、却有 boot 标记 ⇒ 上个纪元是老版本发的号（不知道发到了哪），
+		 * 照旧拒发号（§2.4 配套 2）；要接续，先手工写上限文件（见 tso_status 的提示）。
 		 */
 		snprintf(path, sizeof(path), "%s/%s", DataDir, TSO_BOOT_MARKER);
-		TsoCtl->boot_blocked = (stat(path, &st) == 0);
+		if (tso_read_hwm(&hwm, &hwm_safe))
+		{
+			TsoCtl->counter = hwm;
+			TsoCtl->reserved = hwm;		/* 第一个号发出前先把上限再推一段并落盘 */
+			TsoCtl->safe_ts = hwm_safe;
+			TsoCtl->safe_freeze_until =
+				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), tso_lease_ms);
+			TsoCtl->boot_blocked = false;
+		}
+		else
+			TsoCtl->boot_blocked = (stat(path, &st) == 0);
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -168,7 +271,9 @@ tso_service_gate(void)
 				 errmsg("TSO 检测到上个纪元的 boot 标记（%s），拒绝发号", TSO_BOOT_MARKER),
 				 errdetail("master/TSO 重启后单调性公理失守，时间戳序不再可信"
 						   "（设计 §2.4 运行纪律）。"),
-				 errhint("整簇重建后删除 $PGDATA/%s 再重启本节点。", TSO_BOOT_MARKER)));
+				 errhint("整簇重建后删除 $PGDATA/%s 再重启本节点；要保留数据接着发号，"
+						 "把一个大于上次发出的最大号的数写进 $PGDATA/%s 再重启（P7-N101）。",
+						 TSO_BOOT_MARKER, TSO_HWM_FILE)));
 }
 
 /* 发一个号（须持排它锁；首次服务顺带落 boot 标记） */
@@ -179,6 +284,14 @@ tso_next_locked(void)
 	{
 		tso_write_boot_marker();
 		TsoCtl->served = true;
+	}
+	/* P7-N101：号用到上限就先把上限推一段、落盘，再发 */
+	if (TsoCtl->counter >= TsoCtl->reserved)
+	{
+		int64		new_res = TsoCtl->counter + TSO_RESERVE_STEP;
+
+		tso_persist_hwm(new_res, TsoCtl->safe_ts);
+		TsoCtl->reserved = new_res;
 	}
 	return TsoCtl->counter++;
 }
@@ -267,6 +380,10 @@ tso_compute_safe_locked(void)
 	TimestampTz now = GetCurrentTimestamp();
 	int64		cand = 0;
 	int			i;
+
+	/* P7-N101：重启后一个租约周期内不前进（各节点的最老快照登记还没重新报上来） */
+	if (TsoCtl->safe_freeze_until != 0 && now < TsoCtl->safe_freeze_until)
+		return TsoCtl->safe_ts;
 
 	for (i = 0; i < TSO_MAX_NODES; i++)
 	{
@@ -381,10 +498,11 @@ partdist_tso_status(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	LWLockAcquire(TsoCtl->lock, LW_SHARED);
 	appendStringInfo(&buf, "counter=" INT64_FORMAT " safe=" INT64_FORMAT
-					 " served=%c blocked=%c",
+					 " served=%c blocked=%c reserved=" INT64_FORMAT,
 					 TsoCtl->counter, TsoCtl->safe_ts,
 					 TsoCtl->served ? 't' : 'f',
-					 TsoCtl->boot_blocked ? 't' : 'f');
+					 TsoCtl->boot_blocked ? 't' : 'f',
+					 TsoCtl->reserved);
 	for (i = 0; i < TSO_MAX_NODES; i++)
 		if (TsoCtl->nodes[i].node_id != -1)
 			appendStringInfo(&buf, " node%d=" INT64_FORMAT,

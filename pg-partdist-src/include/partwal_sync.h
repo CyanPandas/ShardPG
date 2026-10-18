@@ -295,6 +295,8 @@ extern int   PartWALCopyTouched(Oid *out, int max);
 /* P7-N43：尽力而为 CTRL 发射失败后撤回 touched 登记；发射期间复制失败不打分叉标记 */
 extern void PartWALTouchedTruncate(int n);
 extern void PartWALSetBestEffortCtrl(bool on);
+/* P7-N97：touched 表里下标 >= idx 的分区复制失败时不打分叉标记（-1 = 关）；返回原值，调用方用完还原 */
+extern int   PartWALSetNoDivergeFrom(int idx);
 extern int   PartWALTouchedCount(void);
 extern void  PartWALNoteTouchedPartition(Oid partition_id);
 

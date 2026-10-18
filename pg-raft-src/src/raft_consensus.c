@@ -271,6 +271,7 @@ typedef struct RaftGroupState
     int64               last_data_plsn; /* 本组已成功 propose 的最大 partition_lsn（prepare 接线的增量下界；重启后从环回推，幂等兜底） */
     bool                replicate_in_progress; /* 本组的 prepare 复制正在进行（串行化，见 replicate_claim） */
     int                 replicate_pid;         /* 持有者 backend PID；持有者消失时由等待者回收 */
+    TimestampTz         replicate_wait_seen;   /* P7-N99：最近一次有人在 replicate_claim 里排队的时刻（追平通道见到就让路） */
     int                 n_members;
     int                 members[RAFT_MAX_PEERS];
 
@@ -404,6 +405,7 @@ static RaftGroupTable *RaftGroups = NULL;
 static RaftPeer peers[RAFT_MAX_PEERS];
 static int      n_peers = 0;
 static bool     peers_parsed = false;
+static char    *peers_parsed_src = NULL;   /* P7-N102：上次解析的 pg_raft.peers 原文（变了才重解析） */
 static bool     groups_restored = false;
 
 PG_FUNCTION_INFO_V1(pg_raft_rpc);
@@ -474,8 +476,11 @@ static void  data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid,
 static int entry_record_flags(const char *payload);
 static int entry_record_info(const char *payload);
 static void data_group_try_report(RaftGroupCtx *ctx);
+static void replicate_claim(RaftGroupCtx *ctx);
 static bool replicate_try_claim(RaftGroupCtx *ctx);
 static void replicate_release(RaftGroupCtx *ctx);
+static bool replicate_has_waiter(RaftGroupCtx *ctx);
+static bool catchup_batch_to_peer(RaftGroupCtx *ctx, int slot);
 static void step_down_if_higher(RaftGroupCtx *ctx, int64 their_term);
 static void control_maybe_compact(RaftGroupCtx *ctx);
 
@@ -3424,41 +3429,171 @@ init_leader_replication(RaftGroupCtx *ctx)
 
 /* ---- peers ---- */
 
-static void
-parse_peers(void)
+/*
+ * 把 'id@host:port,...' 解析进 out[]；格式错、编号重复、超上限返回 false 并给出原因。
+ * parse_peers 与 GUC 检查钩子共用（P7-N102）。
+ */
+static bool
+raft_parse_peer_list(const char *src, RaftPeer *out, int *n_out, char *why, int why_len)
 {
     char *buf;
     char *tok;
     char *saveptr = NULL;
+    int   n = 0;
+    bool  ok = true;
 
-    if (peers_parsed)
-        return;
+    *n_out = 0;
+    if (src == NULL || src[0] == '\0')
+        return true;
 
-    n_peers = 0;
-    if (pg_raft_peers == NULL || pg_raft_peers[0] == '\0')
-    {
-        peers_parsed = true;
-        return;
-    }
-
-    buf = pstrdup(pg_raft_peers);
+    buf = pstrdup(src);
     for (tok = strtok_r(buf, ",", &saveptr);
-         tok != NULL && n_peers < RAFT_MAX_PEERS;
+         tok != NULL;
          tok = strtok_r(NULL, ",", &saveptr))
     {
         int  id = 0;
         int  port = 0;
         char host[256];
+        int  j;
 
-        if (sscanf(tok, " %d@%255[^:]:%d", &id, host, &port) == 3)
+        if (sscanf(tok, " %d@%255[^:]:%d", &id, host, &port) != 3 || id <= 0 || port <= 0)
         {
-            peers[n_peers].node_id = id;
-            strlcpy(peers[n_peers].host, host, sizeof(peers[n_peers].host));
-            peers[n_peers].port = port;
-            n_peers++;
+            snprintf(why, why_len, "条目 \"%s\" 不是 id@host:port", tok);
+            ok = false;
+            break;
         }
+        if (n >= RAFT_MAX_PEERS)
+        {
+            snprintf(why, why_len, "节点数超过上限 %d", RAFT_MAX_PEERS);
+            ok = false;
+            break;
+        }
+        for (j = 0; j < n; j++)
+            if (out[j].node_id == id)
+                break;
+        if (j < n)
+        {
+            snprintf(why, why_len, "节点号 %d 出现了两次", id);
+            ok = false;
+            break;
+        }
+        out[n].node_id = id;
+        strlcpy(out[n].host, host, sizeof(out[n].host));
+        out[n].port = port;
+        n++;
     }
     pfree(buf);
+    *n_out = ok ? n : 0;
+    return ok;
+}
+
+/*
+ * 新列表是不是旧列表"末尾追加"：前 n_old 个条目逐个相同（编号、地址、端口、顺序都不变）。
+ * 复制游标、对端连接、退避窗口都按槽位下标存，已有节点换了位置就全乱了。
+ */
+static bool
+raft_peers_append_only(const RaftPeer *old, int n_old, const RaftPeer *nw, int n_new,
+                       char *why, int why_len)
+{
+    int i;
+
+    if (n_new < n_old)
+    {
+        snprintf(why, why_len, "只允许在末尾追加节点，不能删除（原有 %d 个，新值 %d 个）", n_old, n_new);
+        return false;
+    }
+    for (i = 0; i < n_old; i++)
+        if (old[i].node_id != nw[i].node_id || old[i].port != nw[i].port ||
+            strcmp(old[i].host, nw[i].host) != 0)
+        {
+            snprintf(why, why_len, "第 %d 项由 %d@%s:%d 变成了 %d@%s:%d；只允许在末尾追加节点",
+                     i + 1, old[i].node_id, old[i].host, old[i].port,
+                     nw[i].node_id, nw[i].host, nw[i].port);
+            return false;
+        }
+    return true;
+}
+
+/*
+ * ★ P7-N102：pg_raft.peers 改为 SIGHUP 级，只允许在末尾追加节点（加节点不再整簇重启）。
+ *
+ * 为什么只许追加：① 复制游标（peer_next_index / peer_match_index）、对端连接、退避窗口都按
+ * peers[] 的槽位下标存，已有节点的位置一变就对不上；② 控制面组 0 的成员就是这张表，一次只加
+ * 一个节点时新旧两个多数派必然相交（5 个里的 3 个与 6 个里的 4 个至少共用一个），各节点
+ * 先后 reload 的那几秒里不会出现两个互不相交的多数派 —— 与数据组的单节点成员变更同一道理。
+ * 一次加多个、删节点、改地址都拒绝（保留旧值，日志里说明原因）。
+ */
+bool
+pg_raft_peers_check_hook(char **newval, void **extra, GucSource source)
+{
+    RaftPeer *nw;
+    RaftPeer *old;
+    int       n_new = 0;
+    int       n_old = 0;
+    char      why[256];
+    bool      ok;
+
+    (void) extra;
+    (void) source;
+    nw = palloc(sizeof(RaftPeer) * RAFT_MAX_PEERS);
+    old = palloc(sizeof(RaftPeer) * RAFT_MAX_PEERS);
+    why[0] = '\0';
+    ok = raft_parse_peer_list(*newval, nw, &n_new, why, sizeof(why));
+    if (ok && pg_raft_peers != NULL && pg_raft_peers[0] != '\0' &&
+        strcmp(pg_raft_peers, *newval ? *newval : "") != 0)
+    {
+        if (raft_parse_peer_list(pg_raft_peers, old, &n_old, why, sizeof(why)))
+        {
+            ok = raft_peers_append_only(old, n_old, nw, n_new, why, sizeof(why));
+            if (ok && n_new > n_old + 1)
+            {
+                snprintf(why, sizeof(why), "一次只能加一个节点（原有 %d 个，新值 %d 个）", n_old, n_new);
+                ok = false;
+            }
+        }
+        else
+            ok = true;          /* 旧值本身就不合法（不该发生）：不拿它挡新值 */
+    }
+    pfree(nw);
+    pfree(old);
+    if (!ok)
+        GUC_check_errdetail("pg_raft.peers: %s", why);
+    return ok;
+}
+
+static void
+parse_peers(void)
+{
+    const char *src = (pg_raft_peers != NULL) ? pg_raft_peers : "";
+    RaftPeer   *nw;
+    int         n_new = 0;
+    char        why[256];
+
+    if (peers_parsed && peers_parsed_src != NULL && strcmp(src, peers_parsed_src) == 0)
+        return;
+
+    nw = palloc(sizeof(RaftPeer) * RAFT_MAX_PEERS);
+    if (!raft_parse_peer_list(src, nw, &n_new, why, sizeof(why)) ||
+        (peers_parsed && !raft_peers_append_only(peers, n_peers, nw, n_new, why, sizeof(why))))
+    {
+        /* 检查钩子已经挡过；万一漏网（如直接改 shmem 外的变量），保留旧表，不让槽位错位 */
+        if (!peers_parsed)
+            n_peers = 0;
+        elog(LOG, "pg_raft: 忽略新的 pg_raft.peers（%s），沿用原有 %d 个节点", why, n_peers);
+    }
+    else
+    {
+        if (peers_parsed && n_new > n_peers)
+            elog(LOG, "pg_raft: pg_raft.peers 新增 %d 个节点（%d → %d），控制面组多数派随之变为 %d",
+                 n_new - n_peers, n_peers, n_new, n_new / 2 + 1);
+        memcpy(peers, nw, sizeof(RaftPeer) * n_new);
+        n_peers = n_new;
+    }
+    pfree(nw);
+
+    if (peers_parsed_src != NULL)
+        pfree(peers_parsed_src);
+    peers_parsed_src = MemoryContextStrdup(TopMemoryContext, src);
     peers_parsed = true;
 }
 
@@ -7744,6 +7879,171 @@ pg_raft_group_campaign(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(armed);
 }
 
+/*
+ * ★ P7-N94/N102（2026-10-17）：计划内领导权转交 —— 在**现任主**上调用。
+ *
+ * 只用 pg_raft_group_campaign（在目标上强制竞选）做计划内切主，持续写入时是在碰运气：
+ * 从核对"目标日志不短于现任主"到目标真正发起竞选之间，主又写进几条，目标日志就比主和
+ * 另一个从都短，投票被拒；而强制竞选跳过预选、抬了任期，现任主见到更高任期先退位 ——
+ * 整组重新选举、在途提交被丢弃、新任期登记又触发归队检查给目标重发基线（2026-10-17
+ * 演示预演实测：orders 分片任期 4 → 8，写入断了 3 分钟）。
+ *
+ * 这里按 Raft 论文 §3.10 的做法：
+ *   ① 拿住本组的复制认领位 —— 新的提交都在 replicate_claim 门口排队，日志不再增长；
+ *   ② 把目标追平到本节点日志末尾（match_index == last_log_index）；
+ *   ③ 请目标在下一个 tick 竞选（它的日志和本节点一样新，另外的成员不可能更新，必然当选）；
+ *   ④ 等本节点被新任期替下（或超时），再放开认领位 —— 排队的提交此时发现本节点已不是主，
+ *      报"不是该分区组的 leader"（与任何一次切主时在途提交的结局相同）。
+ * 目标要能顶上（回放槽位就绪、基线收尾）由调用方先核对（partdist.replica_warmup）。
+ * 返回 transferred… 或没转成的原因；认领位一定归还。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_group_transfer_leader);
+
+Datum
+pg_raft_group_transfer_leader(PG_FUNCTION_ARGS)
+{
+    int64        group_id = PG_GETARG_INT64(0);
+    int          target = PG_GETARG_INT32(1);
+    int          timeout_ms = PG_ARGISNULL(2) ? 10000 : PG_GETARG_INT32(2);
+    RaftGroupCtx ctx;
+    int          slot = -1;
+    int          i;
+    int64        term0;
+    int64        last = 0;
+    int64        match = 0;
+    volatile bool caught_up = false;
+    volatile bool sent = false;
+    volatile bool stepped = false;
+    TimestampTz  start;
+    char        *result;
+
+    if (!pg_raft_raft_enabled || RaftGroups == NULL)
+        ereport(ERROR, (errmsg("pg_raft: Raft 没有开启")));
+    if (group_id == RAFT_CONTROL_GROUP)
+        ereport(ERROR, (errmsg("pg_raft: 控制面组 0 不走领导权转交")));
+    if (timeout_ms < 100)
+        timeout_ms = 100;
+
+    parse_peers();
+    restore_groups_if_needed();
+    if (!raft_group_ctx(group_id, &ctx))
+        ereport(ERROR, (errmsg("pg_raft: 本节点没有组 %lld", (long long) group_id)));
+    if (target == pg_raft_node_id)
+        PG_RETURN_TEXT_P(cstring_to_text("already_leader"));
+
+    SpinLockAcquire(&ctx.cons->mutex);
+    term0 = ctx.cons->current_term;
+    i = ctx.cons->state;
+    SpinLockRelease(&ctx.cons->mutex);
+    if (i != RAFT_LEADER)
+        ereport(ERROR,
+                (errmsg("pg_raft: 本节点不是组 %lld 的 leader，转交要在现任主上调用", (long long) group_id)));
+    if (!group_has_member(&ctx, target))
+        ereport(ERROR,
+                (errmsg("pg_raft: 节点 %d 不是组 %lld 的成员", target, (long long) group_id)));
+    for (i = 0; i < n_peers; i++)
+        if (peers[i].node_id == target)
+            slot = i;
+    if (slot < 0)
+        ereport(ERROR, (errmsg("pg_raft: pg_raft.peers 里没有节点 %d", target)));
+
+    replicate_claim(&ctx);              /* ① 挡住本组新的提交 */
+    raft_spi_ctx = true;
+    start = GetCurrentTimestamp();
+    PG_TRY();
+    {
+        restore_persistent_log_if_needed(&ctx);
+
+        /* ② 追平目标 */
+        while (!TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+        {
+            int64 m0;
+            int64 n0;
+            int64 n1;
+            bool  leader;
+
+            SpinLockAcquire(&ctx.cons->mutex);
+            leader = (ctx.cons->state == RAFT_LEADER && ctx.cons->current_term == term0);
+            SpinLockRelease(&ctx.cons->mutex);
+            if (!leader)
+                break;
+
+            SpinLockAcquire(&ctx.log->mutex);
+            last = ctx.log->last_log_index;
+            m0 = match = ctx.log->peer_match_index[slot];
+            n0 = ctx.log->peer_next_index[slot];
+            SpinLockRelease(&ctx.log->mutex);
+            if (match >= last)
+            {
+                caught_up = true;
+                break;
+            }
+            if (!catchup_batch_to_peer(&ctx, slot))
+                replicate_to_peer(&ctx, slot);
+
+            SpinLockAcquire(&ctx.log->mutex);
+            match = ctx.log->peer_match_index[slot];
+            n1 = ctx.log->peer_next_index[slot];
+            SpinLockRelease(&ctx.log->mutex);
+            if (match == m0 && n1 == n0)
+                pg_usleep(50 * 1000L);      /* 没进展（对端忙 / 退避中）：别空转 */
+            CHECK_FOR_INTERRUPTS();
+        }
+
+        /* ③ 请目标竞选 */
+        if (caught_up)
+        {
+            PGconn   *conn = peer_conn_get(&peers[slot]);
+            char      sql[128];
+            PGresult *res;
+
+            snprintf(sql, sizeof(sql), "SELECT partdist.pg_raft_group_campaign(%lld)::text",
+                     (long long) group_id);
+            res = (conn != NULL) ? pq_exec_bounded(conn, sql) : NULL;
+            if (res == NULL)
+                peer_conn_reset(slot);
+            else
+            {
+                sent = (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+                        strcmp(PQgetvalue(res, 0, 0), "true") == 0);
+                PQclear(res);
+            }
+        }
+
+        /* ④ 等本节点被新任期替下 */
+        while (sent && !TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout_ms))
+        {
+            SpinLockAcquire(&ctx.cons->mutex);
+            stepped = (ctx.cons->state != RAFT_LEADER || ctx.cons->current_term != term0);
+            SpinLockRelease(&ctx.cons->mutex);
+            if (stepped)
+                break;
+            pg_usleep(20 * 1000L);
+            CHECK_FOR_INTERRUPTS();
+        }
+    }
+    PG_FINALLY();
+    {
+        raft_spi_ctx = false;
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+
+    if (stepped)
+        result = psprintf("transferred: 组 %lld 交给节点 %d（日志追平到 %lld，用时 %ld ms）",
+                          (long long) group_id, target, (long long) last,
+                          (long) ((GetCurrentTimestamp() - start) / 1000));
+    else if (!caught_up)
+        result = psprintf("target_lagging %lld/%lld", (long long) match, (long long) last);
+    else if (!sent)
+        result = pstrdup("campaign_not_sent");
+    else
+        result = pstrdup("timeout_still_leader");
+    ereport(LOG,
+            (errmsg("pg_raft: 组 %lld 领导权转交给节点 %d：%s", (long long) group_id, target, result)));
+    PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
 Datum
 pg_raft_group_propose(PG_FUNCTION_ARGS)
 {
@@ -7961,6 +8261,13 @@ pg_raft_group_status(PG_FUNCTION_ARGS)
         ctx.g = g;
         ctx.cons = &g->cons;
         ctx.log = &g->log;
+
+        /*
+         * ★ P7-N96：先把落盘的 hardstate / 日志灌回来再报数。重启后组槽位是这里惰性建出来的，
+         * 不灌就报 last_log_index = 0 —— leader 的追平通道拿它当起点，整组从 index 1 重发。
+         */
+        restore_hard_state_if_needed(&ctx);
+        restore_persistent_log_if_needed(&ctx);
 
         SpinLockAcquire(&ctx.cons->mutex);
         state = ctx.cons->state;
@@ -8902,6 +9209,7 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
         RaftGroupCtx    ctx;
         int             state;
         int             round;
+        bool            yielded = false;
 
         if (!g->in_use)
             continue;
@@ -8966,13 +9274,21 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
                 if (hint < 0)
                     continue;
 
+                /*
+                 * ★ P7-N96：提示被 match_index 托底。对端在本任期里确认过的位置不会丢
+                 * （日志落盘，重启也在；只有更高任期的 leader 才可能截它），比它还低的提示
+                 * 只可能是对端还没把落盘日志灌回内存（重启后 group_status 曾报 0）——
+                 * 照着压下去就是整组从 index 1 重发（实测 1425 条、约 3 分钟）。
+                 */
                 SpinLockAcquire(&ctx.log->mutex);
+                if (hint < ctx.log->peer_match_index[p0])
+                    hint = ctx.log->peer_match_index[p0];
                 if (ctx.log->peer_next_index[p0] > hint + 1)
                     ctx.log->peer_next_index[p0] = hint + 1;
                 SpinLockRelease(&ctx.log->mutex);
             }
 
-            for (round = 0; round < RAFT_CATCHUP_MAX_ROUNDS; round++)
+            for (round = 0; round < RAFT_CATCHUP_MAX_ROUNDS && !yielded; round++)
             {
                 int64 last_idx;
                 bool  any_behind = false;
@@ -8994,6 +9310,16 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
 
                     if (!peer_in_group(&ctx, p))
                         continue;
+
+                    /*
+                     * P7-N99：有写入在等认领位就让路，剩下的下一次追平（5 s 后）接着补。
+                     * 第一轮不让：每次调用至少给每个落后成员发一批，持续写入时追平也不至于停住。
+                     */
+                    if (round > 0 && replicate_has_waiter(&ctx))
+                    {
+                        yielded = true;
+                        break;
+                    }
 
                     SpinLockAcquire(&ctx.log->mutex);
                     before = ctx.log->peer_match_index[p];
@@ -9033,9 +9359,15 @@ pg_raft_catchup(PG_FUNCTION_ARGS)
                     break;
             }
 
-            /* 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派 */
-            leader_replicate_and_commit(&ctx);
-            group_apply_pending(&ctx);
+            /*
+             * 补齐后重算提交点：落后成员归队可能让更老的条目刚刚够多数派。
+             * 让路时跳过 —— 等着的那笔提交自己就会推进提交点。
+             */
+            if (!yielded)
+            {
+                leader_replicate_and_commit(&ctx);
+                group_apply_pending(&ctx);
+            }
         }
         PG_FINALLY();
         {
@@ -9212,7 +9544,11 @@ self_claim_depth(int64 group_id, bool create)
 static void
 replicate_claim(RaftGroupCtx *ctx)
 {
-    long waited_us = 0;
+    /*
+     * ★ P7-N99：超时按墙钟算。原来按 1 ms 睡眠的次数累计（waited_us += 1000），
+     * 2 vCPU 满载时一次 1 ms 睡眠墙钟要 2.7–2.9 ms，"60 s" 实际要等 3 分钟。
+     */
+    TimestampTz wait_start = GetCurrentTimestamp();
     int  timeout_ms = raft_in_control_apply ? RAFT_REPLICATE_CLAIM_APPLY_MS
                                             : RAFT_REPLICATE_CLAIM_TIMEOUT_MS;
     int *depth = self_claim_depth(ctx->group_id, false);
@@ -9227,6 +9563,7 @@ replicate_claim(RaftGroupCtx *ctx)
     {
         bool got = false;
         int  holder = 0;
+        TimestampTz now = GetCurrentTimestamp();
 
         SpinLockAcquire(&RaftGroups->mutex);
         if (!ctx->g->replicate_in_progress)
@@ -9244,6 +9581,8 @@ replicate_claim(RaftGroupCtx *ctx)
                 ctx->g->replicate_in_progress = true;
                 got = true;
             }
+            else
+                ctx->g->replicate_wait_seen = now;   /* P7-N99：告诉追平通道有人在等 */
         }
         SpinLockRelease(&RaftGroups->mutex);
 
@@ -9280,7 +9619,7 @@ replicate_claim(RaftGroupCtx *ctx)
             }
         }
 
-        if (waited_us >= (long) timeout_ms * 1000L)
+        if (TimestampDifferenceExceeds(wait_start, now, timeout_ms))
             ereport(ERROR,
                     (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
                      errmsg("pg_raft: 等待组 %lld 的复制认领位超过 %d ms，%s",
@@ -9291,8 +9630,23 @@ replicate_claim(RaftGroupCtx *ctx)
 
         CHECK_FOR_INTERRUPTS();
         pg_usleep(1000L);       /* 1ms */
-        waited_us += 1000L;
     }
+}
+
+/*
+ * ★ P7-N99：追平通道要不要把认领位让出来——最近 200 ms 内有人在 replicate_claim 里排队
+ * （提交路径、交接广播）。追平是尽力而为的后台活，原来一拿就把整组追平（最多 256 轮）做完才放手，
+ * 归队节点要从头重发时一条单分片 INSERT 被拖了 3 分钟。现在每轮之间看一眼，有人等就收手。
+ */
+static bool
+replicate_has_waiter(RaftGroupCtx *ctx)
+{
+    TimestampTz seen;
+
+    SpinLockAcquire(&RaftGroups->mutex);
+    seen = ctx->g->replicate_wait_seen;
+    SpinLockRelease(&RaftGroups->mutex);
+    return seen != 0 && !TimestampDifferenceExceeds(seen, GetCurrentTimestamp(), 200);
 }
 
 /*

@@ -1061,10 +1061,15 @@ _PG_init(void)
                                  NULL, &pg_raft_raft_enabled, false,
                                  PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
+        /*
+         * ★ P7-N102：SIGHUP 级、只许在末尾追加一个节点（检查钩子把关，理由见
+         * pg_raft_peers_check_hook）—— 加节点时各节点 ALTER SYSTEM + reload 即可，不用整簇重启。
+         */
         DefineCustomStringVariable("pg_raft.peers",
                                    "Raft cluster members: 'id@host:port,...' (include self).",
-                                   NULL, &pg_raft_peers, "",
-                                   PGC_POSTMASTER, 0, NULL, NULL, NULL);
+                                   "Reloadable; only appending one node at a time is allowed.",
+                                   &pg_raft_peers, "",
+                                   PGC_SIGHUP, 0, pg_raft_peers_check_hook, NULL, NULL);
 
         /*
          * T7.23（P7-R2）：每节点 Raft 组数上限（含控制面组）。决定共享内存里

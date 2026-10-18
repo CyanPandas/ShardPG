@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "executor/spi.h"
 #include "storage/lwlock.h"
+#include "utils/guc.h"
 #include "utils/timestamp.h"
 
 /* SQL 可调用函数里再次进入 SPI 时，可能返回 SPI_ERROR_CONNECT（表示已经连接）。 */
@@ -41,6 +42,8 @@ pg_raft_spi_end(bool must_finish)
 /* ★ P7-N39：新 leader 上任提的**本任期空条目**（Raft 标准动作），没有任何副作用，
  * 存在的唯一目的是把上一任期继承来的尾巴一起带上提交点。*/
 #define PG_RAFT_OP_NOOP              "OP_NOOP"
+/* ★ P7-N102：只改某分区登记的从副本集（副本迁移用）；payload = {"partition_id":P,"primary_term":T,"secondary_nodes":[...]} */
+#define PG_RAFT_OP_PARTITION_SECONDARIES "OP_PARTITION_SECONDARIES"
 
 #define PG_RAFT_MAX_HOSTNAME 256
 
@@ -64,6 +67,7 @@ extern int  pg_raft_coordinator_node_id;
 /* 纯 C Raft 选举共识（raft_consensus.c） */
 extern bool  pg_raft_raft_enabled;
 extern char *pg_raft_peers;
+extern bool  pg_raft_peers_check_hook(char **newval, void **extra, GucSource source);   /* P7-N102 */
 extern int   pg_raft_election_timeout_ms;
 extern int   pg_raft_propose_wait_ms;
 extern int   pg_raft_heartbeat_ms;
