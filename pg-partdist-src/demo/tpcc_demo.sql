@@ -105,12 +105,17 @@ SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
 -- ════ 第 5 步：分布式事务（一个事务写多个分片），写入脚本仍在跑 ════
 -- 一个事务写多个分片时，系统自动把它作为一个全局事务（统一的事务号和快照时间戳），写法和普通 PostgreSQL 一样
 -- 增删改语句本身带不出分片和 worker（Citus 不许 RETURNING 里有非 IMMUTABLE 函数），所以改完、提交前查一次
+-- 5.0 先认人：演示操作的 12 个客户（区域号 9 是写入脚本插的，不列）。后面每条增删改的注释都写明改的是谁
+-- 【窗口 A】
+SELECT c_first || ' ' || c_last AS name, c_w_id, c_d_id, c_id,
+       tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker
+  FROM customer WHERE c_d_id <> 9 ORDER BY c_w_id, c_d_id, c_id;
 -- 【窗口 B】写入还在继续
 SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
   FROM (SELECT count(*) AS n FROM customer) c, (SELECT count(*) AS n FROM orders) o;
--- 5.1 准备：12 个演示客户每人 1000 元。不带分片键的 UPDATE 发给全部 4 个分片，一条语句就是一个全局事务
+-- 5.1 准备：5.0 列出的 12 个客户每人 1000 元。不带分片键的 UPDATE 发给全部 4 个分片，一条语句就是一个全局事务
 -- 【窗口 A】
-UPDATE customer SET c_balance = 1000 WHERE c_d_id IN (1, 2);
+UPDATE customer SET c_balance = 1000 WHERE c_d_id IN (1, 2);      -- 12 人全改
 SELECT count(*) AS customers, sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 这条 UPDATE 改到了哪：按分片汇总
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, count(*) AS rows, sum(c_balance) AS balance
@@ -118,9 +123,9 @@ SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS work
 -- 5.2 提交：仓库 1 的 Tom 转 300 元给仓库 2 的 Lucy，同时给 Tom 下一张订单（三个写操作，跨两个分片、两台 worker）
 -- 【窗口 A】
 BEGIN;
-UPDATE customer SET c_balance = c_balance - 300 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
-UPDATE customer SET c_balance = c_balance + 300 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;
-INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 1, 5);
+UPDATE customer SET c_balance = c_balance - 300 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;   -- Tom  −300
+UPDATE customer SET c_balance = c_balance + 300 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;   -- Lucy +300
+INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 1, 5);   -- Tom 的订单：订单号 (1, 1, 1)，客户号 1，5 行
 -- 提交前看这个事务改到了哪：两个客户在两个分片、两台 worker；订单和 Tom 在同一台 worker（共置）
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 2) ORDER BY c_w_id;
@@ -132,29 +137,34 @@ SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 5.3 回滚：仓库 3 的 Ken 转 500 给仓库 2 的 Lucy（跨两个分片），事务里看得到修改，ROLLBACK 之后两边都恢复
 -- 【窗口 A】
 BEGIN;
-UPDATE customer SET c_balance = c_balance - 500 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 1;
-UPDATE customer SET c_balance = c_balance + 500 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;
+UPDATE customer SET c_balance = c_balance - 500 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 1;   -- Ken  −500
+UPDATE customer SET c_balance = c_balance + 500 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;   -- Lucy +500
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (2, 3) ORDER BY c_w_id;
 ROLLBACK;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (2, 3) ORDER BY 1;
--- 5.4 中途出错：两笔余额已改，第三条插入的订单号重复 → 整个事务作废，COMMIT 实际执行的是 ROLLBACK
---     报错里的 localhost:5433 就是订单所在分片的主
--- 【窗口 A】
+-- 5.4 中途出错：仓库 1 的 Amy 转 200 元给仓库 3 的 Ann，同时给 Amy 下一张订单；
+--     两笔余额已改，第三条插入的订单号和 5.2 Tom 那张重复 → 整个事务作废，COMMIT 实际执行的是 ROLLBACK
+--     报错里的 localhost:端口 就是订单所在分片的主（下面查询的 worker 列）
+-- 【窗口 A】先看订单表里已有的订单（区域 9 是写入脚本的，不看）：(1, 1, 1) 已经有了 —— 5.2 给 Tom 下的那张，
+--           所以下面事务里第三条 INSERT 的订单 (1, 1, 1) 会和它重复
+SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt
+  FROM orders WHERE o_d_id <> 9 ORDER BY o_w_id, o_d_id, o_id;
 BEGIN;
-UPDATE customer SET c_balance = c_balance - 200 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 2;
-UPDATE customer SET c_balance = c_balance + 200 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 2;
-INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 2, 3);
+UPDATE customer SET c_balance = c_balance - 200 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 2;   -- Amy −200
+UPDATE customer SET c_balance = c_balance + 200 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 2;   -- Ann +200
+INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 2, 3);   -- Amy 的订单：订单号 (1, 1, 1) 已被 Tom 那张占用 → 报错
 COMMIT;
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 2 AND c_w_id IN (1, 3) ORDER BY c_w_id;
 SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 5.5 隔离：A 改了还没提交，B 看不见；B 开着的事务只看开始那一刻的快照 ——
 --     A 提交了、写入脚本也一直在插，B 的事务里查到的都不变
+--     A 做的是：仓库 1 的 Tom 转 100 元给仓库 4 的 Ivy
 -- 【窗口 A】
 BEGIN;
-UPDATE customer SET c_balance = c_balance - 100 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
-UPDATE customer SET c_balance = c_balance + 100 WHERE c_w_id = 4 AND c_d_id = 1 AND c_id = 1;
+UPDATE customer SET c_balance = c_balance - 100 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;   -- Tom −100
+UPDATE customer SET c_balance = c_balance + 100 WHERE c_w_id = 4 AND c_d_id = 1 AND c_id = 1;   -- Ivy +100
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY c_w_id;
 -- 【窗口 B】A 还没提交：看到的是旧值；然后开一个事务，记下此刻的客户数和订单数
@@ -173,13 +183,13 @@ COMMIT;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY 1;
 SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
   FROM (SELECT count(*) AS n FROM customer) c, (SELECT count(*) AS n FROM orders) o;
--- 5.6 写写冲突：A、B 同时改同一个客户（同一个分片上的同一行），B 被挡住；A 提交后 B 报错（先提交者胜），B 只能重试
+-- 5.6 写写冲突：A、B 同时改仓库 2 的 Jack（同一个分片上的同一行），B 被挡住；A 提交后 B 报错（先提交者胜），B 只能重试
 -- 【窗口 A】
 BEGIN;
-UPDATE customer SET c_balance = c_balance + 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
+UPDATE customer SET c_balance = c_balance + 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;   -- A：Jack +7
 -- 【窗口 B】最后这条 UPDATE 会卡住（在等 A），不用等它，回到窗口 A
 BEGIN;
-UPDATE customer SET c_balance = c_balance - 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
+UPDATE customer SET c_balance = c_balance - 7 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;   -- B：Jack −7
 -- 【窗口 A】提交
 COMMIT;
 -- 【窗口 B】卡住的 UPDATE 返回报错 could not serialize access due to concurrent update，回滚后看结果
@@ -192,16 +202,16 @@ SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 【窗口 B】写入还在继续
 SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
   FROM (SELECT count(*) AS n FROM customer) c, (SELECT count(*) AS n FROM orders) o;
--- 6.1 增：仓库 1 新来一个客户，给他下两张订单（客户和订单在同一仓库 → 同一台 worker）
+-- 6.1 增：仓库 1 新来一个客户 Nina He（区域 3、客户号 1），给 Nina 下两张订单（客户和订单在同一仓库 → 同一台 worker）
 -- 【窗口 A】
-INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last, c_balance) VALUES (1, 3, 1, 'Nina', 'He', 500);
-INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 3, 1, 1, 4), (1, 3, 2, 1, 6);
+INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last, c_balance) VALUES (1, 3, 1, 'Nina', 'He', 500);   -- 新客户 Nina
+INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 3, 1, 1, 4), (1, 3, 2, 1, 6);   -- Nina 的订单 1、2
 -- 增到了哪：客户进了 customer 的分片、订单进了 orders 的分片，两个分片在同一台 worker
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_ol_cnt
   FROM orders WHERE o_w_id = 1 AND o_d_id = 3 ORDER BY o_id;
--- 6.2 查：按主键查一个客户；EXPLAIN 看它只发给一个节点（Task Count: 1，Node 就是上面那台 worker）
+-- 6.2 查：按主键查一个客户（Nina）；EXPLAIN 看它只发给一个节点（Task Count: 1，Node 就是上面那台 worker）
 SELECT * FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 EXPLAIN (COSTS OFF) SELECT * FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 -- 查仓库 1 的演示客户：都在同一个分片、同一台 worker（区域号 9 是写入脚本插的，不列）
@@ -216,22 +226,22 @@ SELECT c.c_w_id, c.c_d_id, c.c_id, c.c_first, count(o.o_id) AS orders
   JOIN orders o ON o.o_w_id = c.c_w_id AND o.o_d_id = c.c_d_id AND o.o_c_id = c.c_id
  WHERE c.c_d_id <> 9
  GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3;
--- 6.3 改：改一个客户（单分片，直接改），改完看改的是哪个分片
-UPDATE customer SET c_balance = c_balance + 50, c_last = 'Huang' WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
+-- 6.3 改：改一个客户 Nina：余额 +50、姓改成 Huang（单分片，直接改），改完看改的是哪个分片
+UPDATE customer SET c_balance = c_balance + 50, c_last = 'Huang' WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;   -- Nina
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first, c_last, c_balance
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
--- 一次改多个仓库：一条语句改到 3 个分片、3 台 worker
-UPDATE customer SET c_last = upper(c_last) WHERE c_d_id = 2;
+-- 一次改多个仓库：区域 2 的 Bob、Mary、Leo、Eva 姓改成大写，一条语句改到 3 个分片、3 台 worker
+UPDATE customer SET c_last = upper(c_last) WHERE c_d_id = 2;   -- Bob、Mary、Leo、Eva
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first, c_last
   FROM customer WHERE c_d_id = 2 ORDER BY c_w_id;
--- 6.4 删：先看要删的在哪（都在仓库 1 的分片里），再删一张订单、这个客户的其余订单和客户本人
+-- 6.4 删：先看要删的在哪（都在仓库 1 的分片里），再删 Nina 的订单 2、Nina 的其余订单和 Nina 本人
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_c_id
   FROM orders WHERE o_w_id = 1 AND o_d_id = 3 ORDER BY o_id;
 SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
-DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_id = 2;
-DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_c_id = 1;
-DELETE FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
+DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_id = 2;     -- Nina 的订单 2
+DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_c_id = 1;   -- Nina 的其余订单（订单 1）
+DELETE FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;   -- Nina 本人
 SELECT count(*) AS customers FROM customer WHERE c_d_id <> 9;
 SELECT count(*) AS orders FROM orders WHERE o_d_id = 3;
 -- 停掉持续写入（删表之前必须停）
