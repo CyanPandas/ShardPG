@@ -1,0 +1,21 @@
+# 原版 Citus 对照镜像（云上现做）：单机镜像（Ubuntu 22.04 + PGDG postgresql-16）+ 从源码编译的原版 Citus。
+# 源码包由 build_citus_image.sh 核对 sha256 后放进构建目录（citus.tar.gz）。lab 的 Citus 对照
+# （yyt/citus-tpcc-c01:13.1.0-pg16.14）= 官方 postgres:16.14 + 同一份 Citus 13.1.0 源码。
+ARG NATIVE_IMG
+FROM ${NATIVE_IMG}
+ARG PG_VERSION
+COPY citus.tar.gz /usr/src/citus.tar.gz
+# postgresql-server-dev-16 依赖 clang / llvm-dev，后者要 universe 里的包（单机镜像只配了 main，这里补上）
+RUN set -eux; \
+    sed -i '/jammy-pgdg/!s/ main$/ main universe/' /etc/apt/sources.list; \
+    apt-get update; \
+    v=$(apt-cache madison postgresql-server-dev-16 | awk -v want="$PG_VERSION" '$3 ~ "^" want "-" { print $3; exit }'); \
+    [ -n "$v" ]; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential "postgresql-server-dev-16=$v" libcurl4-openssl-dev liblz4-dev libzstd-dev libssl-dev libkrb5-dev; \
+    mkdir /usr/src/citus; tar xzf /usr/src/citus.tar.gz -C /usr/src/citus --strip-components=1; \
+    cd /usr/src/citus; ./configure; make -j"$(nproc)"; make install; \
+    test -f /usr/lib/postgresql/16/lib/citus.so; \
+    cd /; rm -rf /usr/src/citus /usr/src/citus.tar.gz /var/lib/apt/lists/*
+# 入口脚本以本目录这份为准（修正过 HOME），不依赖底层单机镜像构建时的版本
+COPY entrypoint-native.sh /usr/local/bin/entrypoint-native.sh

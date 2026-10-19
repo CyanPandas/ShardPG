@@ -31,6 +31,10 @@ for i in "${!NODE_IDS[@]}"; do
   if [[ -n "${NODE_CONF_EXTRA:-}" ]]; then
     { echo; echo "# ---- 覆盖段：$NODE_CONF_EXTRA ----"; cat "$NODE_CONF_EXTRA"; } >> "$out/node$id.conf"
   fi
+  # 只给协调者的覆盖段（在 NODE_CONF_EXTRA 之后）：协调者与 worker 同机时压它的缓冲池等
+  if [[ "${NODE_ROLES[$i]}" == coordinator && -n "${COORD_CONF_EXTRA:-}" ]]; then
+    { echo; echo "# ---- 协调者覆盖段：$COORD_CONF_EXTRA ----"; cat "$COORD_CONF_EXTRA"; } >> "$out/node$id.conf"
+  fi
   echo "node$id（${NODE_ROLES[$i]} ${NODE_HOSTS[$i]}:${NODE_PORTS[$i]}）→ $out/node$id.conf"
 done
 cat <<'TXT'

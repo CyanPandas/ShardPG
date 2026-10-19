@@ -1,0 +1,21 @@
+# 单机 PG 对照镜像（云上现做，拉不到官方 postgres 镜像时用）：Ubuntu 22.04 + PGDG 的 postgresql-16，
+# 小版本与 ShardPG 内核相同（构建参数 PG_VERSION，由 build_runtime_image.sh 从 pg-install 里取）。
+# 官方 postgres:16 镜像装的也是 PGDG 包。entrypoint 只实现 deploy_native.sh 用到的那部分官方镜像接口。
+FROM sp-base:jammy
+ARG MIRROR
+ARG PGDG_MIRROR
+ARG PG_VERSION
+COPY pgdg.asc /usr/share/keyrings/pgdg.asc
+RUN printf 'deb %s jammy main\ndeb %s jammy-updates main\ndeb %s jammy-security main\ndeb [signed-by=/usr/share/keyrings/pgdg.asc] %s jammy-pgdg main\n' \
+      "$MIRROR" "$MIRROR" "$MIRROR" "$PGDG_MIRROR" > /etc/apt/sources.list \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-common \
+ && sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf \
+ && v=$(apt-cache madison postgresql-16 | awk -v want="$PG_VERSION" '$3 ~ "^" want "-" { print $3; exit }') \
+ && [ -n "$v" ] || { echo "PGDG 源里没有 postgresql-16 $PG_VERSION" >&2; exit 1; } \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16="$v" postgresql-client-16="$v" \
+ && rm -rf /var/lib/apt/lists/*
+COPY entrypoint-native.sh /usr/local/bin/entrypoint-native.sh
+ENV PATH=/usr/lib/postgresql/16/bin:$PATH PGDATA=/var/lib/postgresql/data
+ENTRYPOINT ["/usr/local/bin/entrypoint-native.sh"]
+CMD ["postgres"]

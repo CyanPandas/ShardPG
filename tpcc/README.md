@@ -20,7 +20,9 @@ tpcc/
     ├── wire_cluster.sh     装扩展 + node_map + Citus 接线 + 核对 TSO
     ├── build_db.sh         建库（调用 load.sh）+ 行数与一致性核对
     ├── run.sh              预热 + 正式压测 + 计算 tpmC + 收尾一致性检查
-    └── monitor.sh          长跑监控（run.sh 自动起）
+    ├── monitor.sh          长跑监控（run.sh 自动起）
+    └── make_native.sh      由本套件生成单机原生 PG 对照套件（同一份事务函数）
+cloud/                      云上三机（4 核 8 GB）单副本 ShardPG 对单机 PG 的部署 / 压测 / 汇总，见 cloud/README.md
 ```
 
 ## 1. 拓扑

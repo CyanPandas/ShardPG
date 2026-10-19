@@ -22,12 +22,17 @@ for i in "${!NODE_IDS[@]}"; do
         ('max_connections','max_prepared_transactions','shared_buffers','synchronous_commit','work_mem')
       ORDER BY 1" > "$OUT/settings_node${NODE_IDS[$i]}.tsv" 2>&1
 done
-QC -f "$TPCC_DIR/sql/90_consistency.sql" > "$OUT/consistency_before.txt" 2>&1
+# CONSISTENCY_EACH=0：本轮前后不做一致性检查（要扫大表、会冲掉缓存，短窗口时改为全部跑完后做一次）
+[[ "${CONSISTENCY_EACH:-1}" == 1 ]] && QC -f "$TPCC_DIR/sql/90_consistency.sql" > "$OUT/consistency_before.txt" 2>&1
 
-log "起监控（每 60 s）"
-bash "$TPCC_DIR/scripts/monitor.sh" "$OUT" 60 &
-MON=$!
-trap 'kill $MON 2>/dev/null' EXIT
+# MONITOR=0：不起监控（monitor.sh 每分钟 count(*) history 等，本身在扫表）
+MON=""
+if [[ "${MONITOR:-1}" == 1 ]]; then
+  log "起监控（每 60 s）"
+  bash "$TPCC_DIR/scripts/monitor.sh" "$OUT" 60 &
+  MON=$!
+fi
+trap '[[ -n "$MON" ]] && kill $MON 2>/dev/null' EXIT
 
 TOTAL=$((RAMPUP_S + DURATION_S))
 log "起 pgbench：$TERMINALS 终端、$WAREHOUSES 仓、总时长 ${TOTAL}s（预热 ${RAMPUP_S}s）"
@@ -53,13 +58,17 @@ sleep "$DURATION_S"
 S2=$(snap); T2=$(date +%s)
 log "测量窗口结束：sum(d_next_o_id)=$S2"
 wait "$PGB"; PGB_RC=$?
-kill "$MON" 2>/dev/null
+[[ -n "$MON" ]] && kill "$MON" 2>/dev/null
 
 MIN=$(awk -v a="$T1" -v b="$T2" 'BEGIN{printf "%.2f", (b-a)/60}')
 TPMC=$(awk -v a="$S1" -v b="$S2" -v m="$MIN" 'BEGIN{printf "%.1f", (b-a)/m}')
-QC -f "$TPCC_DIR/sql/90_consistency.sql" > "$OUT/consistency_after.txt" 2>&1
-VIOL=$(grep -A2 'violations' "$OUT/consistency_after.txt" | grep -E '^ *[0-9]+ *$' | awk '{s+=$1} END{print s+0}')
-ABORTED=$(grep -c 'client [0-9]* aborted' "$OUT/pgbench.err" || true)
+if [[ "${CONSISTENCY_EACH:-1}" == 1 ]]; then
+  QC -f "$TPCC_DIR/sql/90_consistency.sql" > "$OUT/consistency_after.txt" 2>&1
+  VIOL=$(grep -A2 'violations' "$OUT/consistency_after.txt" | grep -E '^ *[0-9]+ *$' | awk '{s+=$1} END{print s+0}')
+else
+  VIOL="未检查（CONSISTENCY_EACH=0，见全部跑完后的收尾检查）"
+fi
+ABORTED=$(grep -cE 'client [0-9]+ (script [0-9]+ )?aborted' "$OUT/pgbench.err" || true)   # PG16：client N script M aborted
 
 {
   echo "== ShardPG TPC-C 结果 =="
