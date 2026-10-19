@@ -144,14 +144,16 @@ CREATE OR REPLACE FUNCTION dtx_decide(
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_decide';
 
 COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
-    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
+    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT 3=COMMIT 待发起方确认）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。发起方在本地提交之前只能写 3（2026-10-18 方案 B）：本节点记下这笔事务的 prepared 事务作锚点，锚点提交 / 回滚即判决生效；本节点已无它的 prepared 事务则改判 ABORT。';
 
 -- TPC-C 分支：只有一个参与节点时，master 一次往返在该节点上做完
 -- "取写集 → 选协调组 → 下发协调组 → 决议"（同一事务、一次提交）。
 -- 原来是三次往返、两次提交（note_coord 与决议各一次 fsync），夹在
 -- master 持有热行锁的提交路径里。
--- 返回：1/2 = 决议；0 = 本节点在该事务里没写纳管分片（无需决议）；
---       -1 = 本节点不是协调组 leader（调用方回落到常规路径）。
+-- 2026-10-18（方案 B）：决议只写 verdict=3（COMMIT 待发起方确认），发起方本地提交
+-- 持久之后才生效（锚点 = 本节点这笔事务的 prepared 事务，见 partdist.dtx_verdict_effective）。
+-- 返回：3 = 待确认 COMMIT 已记下；2 = 已有 ABORT 决议；0 = 本节点在该事务里没写纳管分片
+--       （无需决议）；本节点不是协调组 leader 时报错（调用方回落到常规路径）。
 CREATE OR REPLACE FUNCTION dtx_local_note_decide(p_dtxid bigint, p_commit_ts bigint)
 RETURNS integer LANGUAGE plpgsql VOLATILE AS $fn$
 DECLARE
@@ -166,7 +168,7 @@ BEGIN
     -- 与 master 侧 parts[dtxid % nparts]（qsort 升序）同一选法
     coord := parts[(p_dtxid % cardinality(parts)) + 1];
     PERFORM partdist.dtx_note_coord(p_dtxid, coord);
-    v := partdist.dtx_decide(coord, p_dtxid, 1, parts, p_commit_ts);
+    v := partdist.dtx_decide(coord, p_dtxid, 3, parts, p_commit_ts);
     IF v IS NULL THEN
         RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'dtx_local_note_decide: not coord leader';
     END IF;
@@ -240,7 +242,7 @@ COMMENT ON FUNCTION dtx_close_indoubt(oid) IS
     '对本节点该分区的 parwal 流做 in-doubt 闭合：找出有 DTX_PREPARE 而无闭合记录的 dtxid，按 登记协调组 → 本地决议索引 → 广播 peers → citus 前缀规则 的顺序全网求决议，找到即补写 DTX_COMMIT/ABORT 标记。找不到的保持 in-doubt（NOTICE 报数）。返回闭合数。升主序列在追平之后、对外服务之前调用。';
 
 COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
-    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';
+    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。决议是待发起方确认的 COMMIT 且锚点仍 prepared 时，问发起方本地事务的结局（pg_dist_transaction 的行），问到返回 1/2 并推送给参与方（不写回决议行，判决随锚点生效），问不到返回 0（保持未决）。本节点不是协调组 leader 时返回 NULL。';
 
 COMMENT ON FUNCTION pg_raft_report_data_leader(bigint, integer, bigint, integer[]) IS
     '数据组新任 leader 的登记入口（须在 group 0 leader 上执行）：过任期栅栏后把 '

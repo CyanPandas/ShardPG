@@ -25,6 +25,7 @@
 #include "pg_raft.h"
 
 #include "access/xact.h"             /* 内核补丁 0004：pre_record_commit_hook */
+#include "access/transam.h"          /* 2026-10-18 方案 B：锚点 full xid */
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -472,6 +473,9 @@ bool  pg_raft_raft_enabled = false;
 bool  pg_raft_dtx_2pc_enabled = true;
 int   pg_raft_dtx_recover_interval_ms = 10000;
 int   pg_raft_dtx_recover_timeout_ms  = 30000;
+/* 2026-10-18：原子性验证用的暂停点（默认关；见 dtx_test_pause_after_decide） */
+int   pg_raft_dtx_test_pause_point    = 0;
+int   pg_raft_dtx_test_pause_ms       = 0;
 /* 升主前置：每 tick 最多推进多久 / 多久之后按可用性优先放行（见 data_group_promote_prepare） */
 int   pg_raft_promote_catchup_slice_ms    = 2000;
 int   pg_raft_promote_catchup_deadline_ms = 60000;
@@ -15563,7 +15567,7 @@ static struct
 static int64
 dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
                    int32 verdict, uint64 commit_ts,
-                   const char *participants_sql)
+                   const char *participants_sql, int64 anchor_xid)
 {
     StringInfoData sql;
     bool  spi_owned;
@@ -15607,12 +15611,12 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
         initStringInfo(&sql);
         appendStringInfo(&sql,
                          "INSERT INTO partdist.dtx_decision"
-                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
-                         "VALUES (%lld, %lld, %d, %llu, %s, %lld) "
+                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn, anchor_xid) "
+                         "VALUES (%lld, %lld, %d, %llu, %s, %lld, %lld) "
                          "ON CONFLICT (dtxid) DO NOTHING",
                          (long long) dtxid, (long long) ctx->group_id, verdict,
                          (unsigned long long) commit_ts, participants_sql,
-                         (long long) plsn);
+                         (long long) plsn, (long long) anchor_xid);
         (void) SPI_execute(sql.data, false, 0);
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
@@ -15628,7 +15632,12 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
 
         if (bcast_rv == NULL)
             bcast_rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
-        if (*bcast_rv != NULL)
+        /*
+         * 2026-10-18（方案 B）：待发起方确认的 COMMIT（verdict=3）不广播 —— 它此刻还不是
+         * 判决。生效后由协调组节点上的 COMMIT PREPARED 钩子推送（PartDistDtxOnFinishPrepared），
+         * 或由恢复守护问到发起方后经 dtx_status 推送。
+         */
+        if (*bcast_rv != NULL && (verdict == 1 || verdict == 2))
         {
             /*
              * ★ TPC-C 分支：不在这里发 —— 调用方此刻还持着协调组的复制认领位，
@@ -15683,7 +15692,11 @@ dtx_flush_pending_broadcast(void)
     }
 }
 
-/* 查已有决议；返回 verdict，0 = 尚无决议 */
+/*
+ * 查已有决议；返回**有效** verdict：0 = 尚无决议，1/2 = COMMIT/ABORT，
+ * 3 = 待发起方确认的 COMMIT 尚未生效（2026-10-18 方案 B：verdict=3 按锚点
+ * prepared 事务的结局折算，见 partdist.dtx_verdict_effective）。
+ */
 static int32
 dtx_lookup_decision(int64 dtxid)
 {
@@ -15696,18 +15709,59 @@ dtx_lookup_decision(int64 dtxid)
         return 0;
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                     "SELECT partdist.dtx_verdict_effective(verdict, anchor_xid) "
+                     "  FROM partdist.dtx_decision WHERE dtxid = %lld",
                      (long long) dtxid);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
     {
         Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
                                 1, &isnull);
         if (!isnull)
-            verdict = DatumGetInt16(d);
+            verdict = DatumGetInt32(d);
     }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
     return verdict;
+}
+
+/*
+ * 2026-10-18（方案 B）：待确认 COMMIT 的锚点 —— 本节点上这笔分布式事务的 prepared
+ * 事务（full xid）。协调组取自远端参与者的写集，它的 leader 就是写了该组分片、
+ * 正持着 prepared 事务的那台节点。多条连接（多个 gid）时优先取写过协调组的那条，
+ * 同一节点上的几条由 Citus 一起 COMMIT / ROLLBACK PREPARED，取哪条结局都一样。
+ * xid 取自参与登记（PREPARE 时由 prepare 的那个后端顺手记下，见 pg_raft_dtx_note_participant），
+ * 不扫 pg_prepared_xacts —— 这里在发起方持热行锁的提交路径上、还占着协调组认领位。
+ * 只认仍在进行中（= 还 prepared 着）的：已被回滚的不能当锚点。
+ * 返回 0 = 本节点没有这笔事务的 prepared 事务（调用方按 ABORT 处理）。
+ */
+static int64
+dtx_local_anchor_xid(int64 dtxid, int64 coord_gsid)
+{
+    StringInfoData sql;
+    bool           spi_owned;
+    int64          anchor = 0;
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "SELECT p.local_xid FROM partdist.dtx_participant p "
+                     " WHERE p.dtxid = %lld AND p.local_xid > 0 "
+                     "   AND pg_catalog.pg_xact_status(p.local_xid::text::xid8) = 'in progress' "
+                     " ORDER BY (%lld = ANY (p.gsids)) DESC, p.gid LIMIT 1",
+                     (long long) dtxid, (long long) coord_gsid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                1, &isnull);
+
+        if (!isnull)
+            anchor = DatumGetInt64(d);
+    }
+    pfree(sql.data);
+    raft_persist_spi_end(spi_owned);
+    return anchor;
 }
 
 /*
@@ -15790,6 +15844,12 @@ dtx_participants_sql(ArrayType *arr)
  *
  * **决议槽一次性**：若该 dtxid 已有决议（例如恢复守护抢先写了 ABORT），
  * 直接返回已有的那个，不覆盖。这是推定中止与正常提交路径并发时的收敛点。
+ *
+ * 2026-10-18（方案 B）：verdict=3 = COMMIT 待发起方确认。发起方在本地提交记录之前
+ * 只能写这一档（写 1 正是原子性缺陷的成因）。记下本节点这笔事务的 prepared 事务作
+ * 锚点后返回 3；本节点已经没有它的 prepared 事务（被恢复守护按推定中止回滚了）就
+ * 写 ABORT 并返回 2，发起方随之中止。verdict=1 的直接 COMMIT 只留给机制测试的
+ * 自造 gid（发起方没有本地写）。
  */
 PG_FUNCTION_INFO_V1(pg_raft_dtx_decide);
 
@@ -15807,11 +15867,12 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     int32        existing;
     char        *parts_sql;
     uint64       commit_ts;
+    int64        anchor_xid = 0;
 
-    if (verdict != 1 && verdict != 2)
+    if (verdict != 1 && verdict != 2 && verdict != 3)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("pg_raft: verdict 必须是 1(COMMIT) 或 2(ABORT)")));
+                 errmsg("pg_raft: verdict 必须是 1(COMMIT)、2(ABORT) 或 3(COMMIT 待发起方确认)")));
 
     if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
         PG_RETURN_NULL();
@@ -15826,7 +15887,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
      * 未配置 TSO 的遗留路径 p_commit_ts = 0：沿用协调者本地时钟（§9.8），
      * 行为与换源前逐字节一致。决议的原子性来自 Raft 多数派，不依赖时间戳。
      */
-    commit_ts = (verdict == 1)
+    commit_ts = (verdict == 1 || verdict == 3)
         ? (p_commit_ts > 0 ? (uint64) p_commit_ts : (uint64) GetCurrentTimestamp())
         : 0;
     parts_sql = dtx_participants_sql(parts);
@@ -15838,9 +15899,25 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     {
         /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
         existing = dtx_lookup_decision(dtxid);
+        if (existing == 0 && verdict == 3)
+        {
+            /*
+             * 锚点在认领位里取：恢复守护的推定中止（dtx_status）也要先拿认领位、
+             * 先写 ABORT 才回滚 prepared，所以这里看得到 prepared ⇒ 它不会再被
+             * 推定中止回滚；看不到 ⇒ 已被回滚（或从未存在），只能 ABORT。
+             */
+            anchor_xid = dtx_local_anchor_xid(dtxid, coord_gsid);
+            if (anchor_xid <= 0)
+            {
+                elog(LOG, "pg_raft: dtx %lld 在协调组 %lld 的节点上找不到 prepared 事务，判 ABORT",
+                     (long long) dtxid, (long long) coord_gsid);
+                verdict = 2;
+                commit_ts = 0;
+            }
+        }
         if (existing == 0)
             (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
-                                      commit_ts, parts_sql);
+                                      commit_ts, parts_sql, anchor_xid);
         else
             verdict = existing;
     }
@@ -15942,9 +16019,10 @@ pg_raft_group_peer_decision(PG_FUNCTION_ARGS)
             PQfinish(conn);
             continue;           /* 不可达就问下一个 */
         }
+        /* 待确认的 COMMIT 在对端按它自己的锚点折算（2026-10-18 方案 B） */
         snprintf(qry, sizeof(qry),
-                 "SELECT verdict, commit_ts FROM partdist.dtx_decision "
-                 " WHERE dtxid = %lld", (long long) dtxid);
+                 "SELECT partdist.dtx_verdict_effective(verdict, anchor_xid), commit_ts "
+                 "  FROM partdist.dtx_decision WHERE dtxid = %lld", (long long) dtxid);
         res = PQexec(conn, qry);
         if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
             !PQgetisnull(res, 0, 0))
@@ -16020,6 +16098,165 @@ pg_raft_group_drain_apply(PG_FUNCTION_ARGS)
     PG_RETURN_INT64(applied);
 }
 
+/*
+ * 2026-10-18（方案 B）：问发起方（2PC 驱动者）它那笔本地事务的结局。
+ *
+ * Citus gid = citus_<group>_<pid>_<txn>_<conn>：group 定位发起节点（pg_dist_node，
+ * 切主后由 citus_update_node 改到新主），pid + txn 定位发起 backend 上的那笔分布式事务。
+ *   1) 那笔事务还在跑（get_all_active_transactions 里有 pid + txn）⇒ 0（未决）；
+ *   2) 否则**另起语句**看本地 pg_dist_transaction 里这笔事务的行：Citus 在发起方本地
+ *      事务里写这些行，行与本地提交同生共死 —— 在 ⇒ 1（COMMIT），不在 ⇒ 2（ABORT）。
+ *   先 1 后 2 是正确性的一部分：反过来就有"查行时还没提交、查活跃时刚提交完"的窗口，
+ *   会把已提交答成 ABORT。行的 GC（dtx_gc_dist_transaction）只删全网已无该 gid
+ *   prepared 事务的行，而来问的协调组节点正持着这笔事务的 prepared 事务，答复前删不掉。
+ * 答 COMMIT 之前，在同一会话里提交一笔带 xid 的空事务（同步提交）：它的提交记录排在
+ * 发起方那条之后，刷盘 / 同步备库确认了它，发起方的提交也就持久了 —— 不会把一笔随后
+ * 因切主丢失的提交答成 COMMIT。
+ * 连不上、超时、任何失败 ⇒ 0：调用方保持未决，下轮再问，绝不擅自决定。
+ */
+/* 持久化栅栏期间收到 WARNING（同步复制等待被取消：本地已提交、未必已复制）就不算数 */
+static void
+dtx_notice_warned(void *arg, const PGresult *res)
+{
+    const char *sev = PQresultErrorField(res, PG_DIAG_SEVERITY_NONLOCALIZED);
+
+    if (sev != NULL && strcmp(sev, "WARNING") == 0)
+        *(bool *) arg = true;
+}
+
+static int
+dtx_ask_driver(long long g_group, long long g_pid, long long g_txn)
+{
+    StringInfoData sql;
+    bool      spi_owned;
+    bool      have_node = false;
+    char      host[NAMEDATALEN];
+    int       port = 0;
+    char      conninfo[512];
+    char      qry[256];
+    PGconn   *conn;
+    PGresult *res;
+    int       verdict = 0;
+    bool      active = true;
+    bool      warned = false;
+    long long nrows = -1;
+
+    if (g_group < 0 || g_pid <= 0 || g_txn <= 0)
+        return 0;
+
+    /* 1) 发起节点地址 */
+    if (!raft_persist_spi_begin(&spi_owned))
+        return 0;
+    if (SPI_execute("SELECT to_regclass('pg_catalog.pg_dist_node') IS NOT NULL",
+                    true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        bool  isnull;
+        Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+        have_node = !isnull && DatumGetBool(d);
+    }
+    if (have_node)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "SELECT nodename, nodeport FROM pg_catalog.pg_dist_node "
+                         " WHERE groupid = %lld AND noderole = 'primary' "
+                         " ORDER BY isactive DESC, nodeid LIMIT 1", g_group);
+        have_node = false;
+        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+        {
+            char *h = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            char *pt = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+
+            if (h != NULL && pt != NULL && atoi(pt) > 0)
+            {
+                strlcpy(host, h, sizeof(host));
+                port = atoi(pt);
+                have_node = true;
+            }
+        }
+        pfree(sql.data);
+    }
+    raft_persist_spi_end(spi_owned);
+    if (!have_node)
+        return 0;
+
+    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+    strlcat(conninfo, " options='-c statement_timeout=5000'", sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+
+    /* 2) 还在跑吗（查不动 get_all_active_transactions 就退回 pid 存活，保守方向） */
+    snprintf(qry, sizeof(qry),
+             "SELECT count(*) FROM get_all_active_transactions() "
+             " WHERE process_id = %lld AND transaction_number = %lld",
+             g_pid, g_txn);
+    res = PQexec(conn, qry);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        PQclear(res);
+        snprintf(qry, sizeof(qry),
+                 "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld", g_pid);
+        res = PQexec(conn, qry);
+    }
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+        !PQgetisnull(res, 0, 0))
+        active = (atoll(PQgetvalue(res, 0, 0)) > 0);
+    PQclear(res);
+    if (active)
+    {
+        PQfinish(conn);
+        return 0;
+    }
+
+    /* 3) 本地行在不在（新快照）；答 COMMIT 前先过一道持久化栅栏 */
+    res = PQexec(conn, "BEGIN ISOLATION LEVEL READ COMMITTED");
+    if (PQresultStatus(res) == PGRES_COMMAND_OK)
+    {
+        PQclear(res);
+        snprintf(qry, sizeof(qry),
+                 "SELECT count(*) FROM pg_catalog.pg_dist_transaction "
+                 " WHERE gid LIKE 'citus\\_%lld\\_%lld\\_%lld\\_%%'",
+                 g_group, g_pid, g_txn);
+        res = PQexec(conn, qry);
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+            !PQgetisnull(res, 0, 0))
+            nrows = atoll(PQgetvalue(res, 0, 0));
+        PQclear(res);
+        if (nrows > 0)
+        {
+            res = PQexec(conn, "SELECT pg_current_xact_id()");
+            if (PQresultStatus(res) != PGRES_TUPLES_OK)
+                nrows = -1;
+            PQclear(res);
+        }
+        (void) PQsetNoticeReceiver(conn, dtx_notice_warned, &warned);
+        res = PQexec(conn, "COMMIT");
+        if (PQresultStatus(res) == PGRES_COMMAND_OK && nrows >= 0 && !warned)
+            verdict = (nrows > 0) ? 1 : 2;
+    }
+    PQclear(res);
+    PQfinish(conn);
+
+    if (verdict != 0)
+        elog(LOG, "pg_raft: dtx 问发起方（组 %lld、pid %lld、txn %lld）：本地事务%s",
+             g_group, g_pid, g_txn, (verdict == 1) ? "已提交 ⇒ COMMIT" : "未提交 ⇒ ABORT");
+    return verdict;
+}
+
+/* dtxid 打包的是 citus gid 的前三段（group 8 位 | pid 22 位 | txn 33 位，见 dtx_dtxid_from_gid） */
+static int
+dtx_ask_driver_of_dtxid(int64 dtxid)
+{
+    return dtx_ask_driver((long long) ((((uint64) dtxid) >> 55) & 0xFF),
+                          (long long) ((((uint64) dtxid) >> 33) & 0x3FFFFF),
+                          (long long) (((uint64) dtxid) & 0x1FFFFFFFFLL));
+}
+
 PG_FUNCTION_INFO_V1(pg_raft_dtx_status);
 
 Datum
@@ -16036,6 +16273,60 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
         PG_RETURN_NULL();
 
     existing = dtx_lookup_decision(dtxid);
+    if (existing == 3)
+    {
+        /*
+         * 2026-10-18（方案 B）：待发起方确认的 COMMIT 迟迟没生效（锚点 prepared 事务还在）
+         * —— 发起方崩溃、或 COMMIT PREPARED 没送到。问发起方本地事务的结局，问到就返回
+         * 并推给参与方；问不到返回 0，恢复守护保持 prepared，下轮再问。
+         *
+         * ★ 结论**不写回决议行**。初版在这里 UPDATE 成 1/2，实测自死锁：恢复守护一轮
+         * 在同一个事务里先调本函数（行锁一直持到这轮结束），再经 libpq 连回本机调
+         * dtx_ack 改同一行 —— 两个会话互等，PG 的死锁检测看不见，守护从此卡死、
+         * 后面的 in-doubt 全没人收尾。不写回也不丢正确性：本节点的锚点 prepared 事务
+         * 随后由恢复守护按这个结论提交 / 回滚，判决随锚点生效；锚点有结局之前，发起方
+         * pg_dist_transaction 里这笔事务的行回收不掉（见 dtx_ask_driver），再问还是同一个答案。
+         */
+        int v = dtx_ask_driver_of_dtxid(dtxid);
+
+        if (v != 1 && v != 2)
+            PG_RETURN_INT32(0);
+        elog(LOG, "pg_raft: dtx %lld 待确认判决经问发起方定为 %s（协调组 %lld）",
+             (long long) dtxid, (v == 1) ? "COMMIT" : "ABORT", (long long) coord_gsid);
+        {
+            StringInfoData qsql;
+            bool           spi_owned;
+            int64          cts = 0;
+
+            if (v == 1 && raft_persist_spi_begin(&spi_owned))
+            {
+                initStringInfo(&qsql);
+                appendStringInfo(&qsql,
+                                 "SELECT commit_ts FROM partdist.dtx_decision WHERE dtxid = %lld",
+                                 (long long) dtxid);
+                if (SPI_execute(qsql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+                {
+                    bool  isnull;
+                    Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                            1, &isnull);
+
+                    if (!isnull)
+                        cts = DatumGetInt64(d);
+                }
+                pfree(qsql.data);
+                raft_persist_spi_end(spi_owned);
+            }
+            if (v == 2 || cts > 0)
+            {
+                pending_bcast.set = true;
+                pending_bcast.dtxid = dtxid;
+                pending_bcast.verdict = v;
+                pending_bcast.commit_ts = (v == 1) ? cts : 0;
+                dtx_flush_pending_broadcast();
+            }
+        }
+        PG_RETURN_INT32(v);
+    }
     if (existing != 0)
         PG_RETURN_INT32(existing);
 
@@ -16049,9 +16340,11 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
         if (existing == 0)
         {
             (void) dtx_write_decision(&ctx, local_oid, dtxid, 2 /* ABORT */,
-                                      0, parts_sql);
+                                      0, parts_sql, 0);
             existing = 2;
         }
+        else if (existing == 3)
+            existing = 0;       /* 等待认领位期间发起方刚写下待确认 COMMIT：本轮按未决答 */
     }
     PG_FINALLY();
     {
@@ -16205,100 +16498,19 @@ dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
 static int
 dtx_ask_citus_coordinator(const char *gid)
 {
-    int       slot = -1;
-    int       i;
-    int       verdict = 0;
-    char      conninfo[256];
-    PGconn   *conn;
-    PGresult *res;
-    char     *quoted;
-    StringInfoData qry;
-
-    if (pg_raft_coordinator_node_id <= 0)
-        return 0;
-
-    for (i = 0; i < n_peers; i++)
-        if (peers[i].node_id == pg_raft_coordinator_node_id)
-        {
-            slot = i;
-            break;
-        }
-    if (slot < 0)
-        return 0;
-
-    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
-                            conninfo, sizeof(conninfo));
-    conn = PQconnectdb(conninfo);
-    if (PQstatus(conn) != CONNECTION_OK)
-    {
-        PQfinish(conn);
-        return 0;
-    }
+    long long g_group = 0, g_pid = 0, g_txn = 0, g_conn = 0;
 
     /*
-     * ★ initiator 存活栅栏（2026-08-04 审查补上）。
-     *
-     * pg_dist_transaction 的行在 master **本地提交之前不可见**。若 master 只是
-     * 慢（发起 backend 还活着、尚未走到本地提交），凭"行不可见"就推定中止，
-     * 会把一笔 master 随后会成功提交的事务在参与者上回滚 —— 分叉提交。
-     * Citus 自己的恢复靠共享内存里的活跃分布式事务号拦这个窗口；我们按 §9.4
-     * 把它关掉了，就必须自己补等价物：gid 里恰好编着发起 backend 的 pid
-     * （citus_<group>_<pid>_<txn>_<conn>），它还在 master 的 pg_stat_activity
-     * 里就先不动，下轮再看。pid 复用只会造成多等一轮，是保守方向。
-     *
-     * ★ 顺序敏感：必须**先**查 pid、**后**查行。pid 已消失意味着
-     * "若它曾提交，提交必先于退出"，随后的行查询必然看得见该提交；
-     * 反过来先查行再查 pid，就存在"查行时未提交、查 pid 前刚提交并退出"
-     * 的窗口 —— 行不可见 + pid 不在 ⇒ 误判 ABORT，丢一笔已提交事务。
+     * 2026-10-18（方案 B）：改为问**发起节点**（gid 第一段的 group），不再固定问
+     * Citus 协调者。函数下推后 2PC 由 worker 驱动，pg_dist_transaction 的行写在那台
+     * worker 本地；原来去协调者上查 pid 与行，pid 栅栏查错了机器、行也永远查不到 ——
+     * 发起方只是慢（还没走到下发协调组）时会被误判 ABORT 回滚，发起方随后照常提交，
+     * 就是一半提交。存活栅栏也从"pid 还在"改成"那笔分布式事务还在跑"（池化连接的
+     * backend 常驻不退，按 pid 判会让收尾一直拖着）。顺序与持久化栅栏见 dtx_ask_driver。
      */
-    {
-        long long g_group = 0, g_pid = 0, g_txn = 0, g_conn = 0;
-
-        if (sscanf(gid, "citus_%lld_%lld_%lld_%lld",
-                   &g_group, &g_pid, &g_txn, &g_conn) == 4 && g_pid > 0)
-        {
-            char alive_qry[128];
-            bool alive = false;
-
-            snprintf(alive_qry, sizeof(alive_qry),
-                     "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld",
-                     g_pid);
-            res = PQexec(conn, alive_qry);
-            if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
-                !PQgetisnull(res, 0, 0))
-                alive = (atoi(PQgetvalue(res, 0, 0)) > 0);
-            else
-                alive = true;   /* 查不动就当活着：保守方向，下轮再来 */
-            PQclear(res);
-
-            if (alive)
-            {
-                PQfinish(conn);
-                return 0;
-            }
-        }
-    }
-
-    quoted = PQescapeLiteral(conn, gid, strlen(gid));
-    if (quoted == NULL)
-    {
-        PQfinish(conn);
+    if (sscanf(gid, "citus_%lld_%lld_%lld_%lld", &g_group, &g_pid, &g_txn, &g_conn) != 4)
         return 0;
-    }
-    initStringInfo(&qry);
-    appendStringInfo(&qry,
-                     "SELECT count(*) FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
-                     quoted);
-    PQfreemem(quoted);
-
-    res = PQexec(conn, qry.data);
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
-        !PQgetisnull(res, 0, 0))
-        verdict = (atoi(PQgetvalue(res, 0, 0)) > 0) ? 1 : 2;
-    PQclear(res);
-    pfree(qry.data);
-    PQfinish(conn);
-    return verdict;
+    return dtx_ask_driver(g_group, g_pid, g_txn);
 }
 
 /*
@@ -16916,7 +17128,8 @@ pg_raft_dtx_ack(PG_FUNCTION_ARGS)
                      " (SELECT coalesce(array_agg(DISTINCT t.x ORDER BY t.x), '{}'::bigint[]) "
                      "    FROM unnest(acked || %s) AS t(x)) "
                      " WHERE dtxid = %lld "
-                     " RETURNING acked @> participants AND participants <> '{}'::bigint[]",
+                     " RETURNING acked @> participants AND participants <> '{}'::bigint[] "
+                     "       AND partdist.dtx_verdict_effective(verdict, anchor_xid) IN (1, 2)",
                      gsids_sql, (long long) dtxid);
     if (SPI_execute(sql.data, false, 1) == SPI_OK_UPDATE_RETURNING &&
         SPI_processed > 0)
@@ -17134,6 +17347,7 @@ dtx_forget_sweep(void)
     appendStringInfoString(&sql,
         "SELECT dtxid, coord_gsid FROM partdist.dtx_decision "
         " WHERE participants <> '{}'::bigint[] AND acked @> participants "
+        "   AND partdist.dtx_verdict_effective(verdict, anchor_xid) IN (1, 2) "
         " LIMIT 8");
     if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
     {
@@ -17397,8 +17611,10 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
     if (raft_persist_spi_begin(&spi_owned))
     {
         initStringInfo(&sql);
+        /* 待确认的 COMMIT（verdict=3）按锚点折算，锚点就在本节点（2026-10-18 方案 B） */
         appendStringInfo(&sql,
-                         "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                         "SELECT partdist.dtx_verdict_effective(verdict, anchor_xid) "
+                         "  FROM partdist.dtx_decision WHERE dtxid = %lld",
                          (long long) dtxid);
         if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
         {
@@ -17407,7 +17623,7 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
                                     1, &isnull);
 
             if (!isnull)
-                verdict = (int) DatumGetInt16(d);
+                verdict = DatumGetInt32(d);
         }
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
@@ -17419,7 +17635,7 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
     for (j = 0; j < n_peers; j++)
     {
         char      conninfo[256];
-        char      qry[128];
+        char      qry[192];
         PGconn   *conn;
         PGresult *res;
 
@@ -17434,7 +17650,8 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
             continue;
         }
         snprintf(qry, sizeof(qry),
-                 "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
+                 "SELECT partdist.dtx_verdict_effective(verdict, anchor_xid) "
+                 "  FROM partdist.dtx_decision WHERE dtxid = %lld",
                  (long long) dtxid);
         res = PQexec(conn, qry);
         if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
@@ -17446,65 +17663,12 @@ dtx_resolve_verdict_anywhere(int64 dtxid, int64 reg_coord)
             return verdict;
     }
 
-    /* d) citus 形态：按 gid 前缀问 master（只认 COMMIT） */
-    {
-        long long g_group = (long long) ((((uint64) dtxid) >> 55) & 0xFF);
-        long long g_pid = (long long) ((((uint64) dtxid) >> 33) & 0x3FFFFF);
-        long long g_txn = (long long) (((uint64) dtxid) & 0x1FFFFFFFFLL);
-
-        if (g_pid > 0 && g_txn > 0 && pg_raft_coordinator_node_id > 0)
-        {
-            int       slot = -1;
-            char      conninfo[256];
-            char      qry[256];
-            PGconn   *conn;
-            PGresult *res;
-
-            for (j = 0; j < n_peers; j++)
-                if (peers[j].node_id == pg_raft_coordinator_node_id)
-                {
-                    slot = j;
-                    break;
-                }
-            if (slot >= 0)
-            {
-                pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
-                                        conninfo, sizeof(conninfo));
-                conn = PQconnectdb(conninfo);
-                if (PQstatus(conn) == CONNECTION_OK)
-                {
-                    bool alive = true;
-
-                    /* 发起者存活栅栏（先查 pid 后查行，顺序敏感，§9.4） */
-                    snprintf(qry, sizeof(qry),
-                             "SELECT count(*) FROM pg_stat_activity WHERE pid = %lld",
-                             g_pid);
-                    res = PQexec(conn, qry);
-                    if (PQresultStatus(res) == PGRES_TUPLES_OK &&
-                        PQntuples(res) == 1 && !PQgetisnull(res, 0, 0))
-                        alive = (atoi(PQgetvalue(res, 0, 0)) > 0);
-                    PQclear(res);
-
-                    if (!alive)
-                    {
-                        snprintf(qry, sizeof(qry),
-                                 "SELECT count(*) FROM pg_catalog.pg_dist_transaction "
-                                 " WHERE gid LIKE 'citus\\_%lld\\_%lld\\_%lld\\_%%'",
-                                 g_group, g_pid, g_txn);
-                        res = PQexec(conn, qry);
-                        if (PQresultStatus(res) == PGRES_TUPLES_OK &&
-                            PQntuples(res) == 1 && !PQgetisnull(res, 0, 0) &&
-                            atoi(PQgetvalue(res, 0, 0)) > 0)
-                            verdict = 1;
-                        PQclear(res);
-                    }
-                    PQfinish(conn);
-                }
-                else
-                    PQfinish(conn);
-            }
-        }
-    }
+    /*
+     * d) citus 形态：问发起节点（2026-10-18 起按 gid 的 group 定位发起方，不再固定问
+     *    Citus 协调者，见 dtx_ask_driver）。**只认 COMMIT**：走到这里的分片可能早已
+     *    COMMIT PREPARED、pg_dist_transaction 的行也已被 GC，查不到行不等于没提交。
+     */
+    verdict = (dtx_ask_driver_of_dtxid(dtxid) == 1) ? 1 : 0;
 
     return verdict;
 }
@@ -17841,6 +18005,13 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
  *   3) 到协调组现任 leader 上调 partdist.dtx_decide() —— 该决议记录在协调组
  *      达多数派持久化即为**全局提交点**，返回 COMMIT 之后本函数才放行，
  *      客户端随后收到的 COMMIT 成功因此是有多数派保证的。
+ *
+ * ★ 2026-10-18（方案 B，原子性修复）：第 3 步只写 verdict=3（"COMMIT，待发起方确认"）。
+ *   本函数跑在本地提交记录**之前**，原先在这里写 COMMIT，本节点在写提交记录前崩溃时，
+ *   参与方照判决提交、本地这一半却被回滚（云上满负载杀 worker 12 次复现 3 次）。
+ *   现在判决在本地提交持久之后才生效：Citus 随后发的 COMMIT PREPARED 让协调组节点上的
+ *   锚点 prepared 事务提交，判决随之生效；本节点崩溃则由恢复守护问本节点的
+ *   pg_dist_transaction 定结局（dtx_status → dtx_ask_driver）。不多刷盘、不多往返。
  *
  * 为什么第 2 步的下发必须严格早于第 3 步：参与者崩溃重启后只能靠
  * partdist.dtx_participant.coord_gsid 找协调组。若先决议后下发，就会出现
@@ -18199,6 +18370,55 @@ dtx_maybe_wrote_dist_transaction(void)
     return n > 0;
 }
 
+/*
+ * 2026-10-18：原子性验证用的暂停点（pg_raft.dtx_test_pause_point / _ms，超级用户、默认关）。
+ * 让 2PC 发起方停在两个崩溃窗口里，测试趁机杀掉节点，验证判决与本地提交绑定：
+ *   1 = 判决（待确认 COMMIT）已写进协调组、本地提交记录还没写 —— 杀掉后应整笔 ABORT；
+ *   2 = 本地已提交、Citus 还没发 COMMIT PREPARED —— 杀掉后应整笔 COMMIT。
+ * 第 2 点挂在本模块的事务回调上：回调后注册先调用，排在 Citus 发 COMMIT PREPARED 之前。
+ */
+static bool  dtx_test_cb_registered = false;
+static int64 dtx_test_armed_dtxid = 0;
+
+static void
+dtx_test_xact_cb(XactEvent event, void *arg)
+{
+    (void) arg;
+    if (dtx_test_armed_dtxid == 0)
+        return;
+    if (event == XACT_EVENT_COMMIT && pg_raft_dtx_test_pause_ms > 0)
+    {
+        elog(LOG, "pg_raft: [测试暂停点 2] dtx %lld 本地已提交、COMMIT PREPARED 未发，暂停 %d ms",
+             (long long) dtx_test_armed_dtxid, pg_raft_dtx_test_pause_ms);
+        pg_usleep((long) pg_raft_dtx_test_pause_ms * 1000L);
+    }
+    if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+        event == XACT_EVENT_PARALLEL_COMMIT || event == XACT_EVENT_PARALLEL_ABORT)
+        dtx_test_armed_dtxid = 0;
+}
+
+static void
+dtx_test_pause_after_decide(int64 dtxid)
+{
+    if (pg_raft_dtx_test_pause_ms <= 0)
+        return;
+    if (pg_raft_dtx_test_pause_point == 1)
+    {
+        elog(LOG, "pg_raft: [测试暂停点 1] dtx %lld 判决已写、本地提交记录未写，暂停 %d ms",
+             (long long) dtxid, pg_raft_dtx_test_pause_ms);
+        pg_usleep((long) pg_raft_dtx_test_pause_ms * 1000L);
+    }
+    else if (pg_raft_dtx_test_pause_point == 2)
+    {
+        if (!dtx_test_cb_registered)
+        {
+            RegisterXactCallback(dtx_test_xact_cb, NULL);
+            dtx_test_cb_registered = true;
+        }
+        dtx_test_armed_dtxid = dtxid;
+    }
+}
+
 static void
 dtx_master_pre_record_commit(void)
 {
@@ -18372,12 +18592,14 @@ dtx_master_pre_record_commit(void)
             PQclear(fres);
             if (fv == 0)
                 return;             /* 写集为空：不需要决议（同下面 nparts == 0） */
-            if (fv != 1)
+            /* 3 = 待确认 COMMIT 已记下（方案 B）；1 只会出现在旧版对端上 */
+            if (fv != 3 && fv != 1)
                 ereport(ERROR,
                         (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                          errmsg("pg_raft: 分布式事务 %lld 的全局决议是 ABORT", (long long) dtxid),
                          errdetail("协调组日志里已有一条 ABORT 决议（多半是恢复守护在推定中止时抢先写入）。")));
             elog(DEBUG1, "pg_raft: dtx %lld COMMIT（单参与节点快路径）", (long long) dtxid);
+            dtx_test_pause_after_decide(dtxid);
             return;
         }
         elog(DEBUG1, "pg_raft: dtx %lld 单参与节点快路径未成，回落常规路径：%s",
@@ -18546,8 +18768,9 @@ dtx_master_pre_record_commit(void)
                             (long long) coord_gsid, coord_node)));
         }
 
+        /* 3 = COMMIT 待本节点确认（方案 B）：本地提交持久之前判决不生效 */
         n = snprintf(qry, sizeof(qry),
-                     "SELECT partdist.dtx_decide(%lld, %lld, 1, ARRAY[",
+                     "SELECT partdist.dtx_decide(%lld, %lld, 3, ARRAY[",
                      (long long) coord_gsid, (long long) dtxid);
         for (i = 0; i < nparts && n < (int) sizeof(qry) - 64; i++)
             n += snprintf(qry + n, sizeof(qry) - n, "%s%lld",
@@ -18569,7 +18792,7 @@ dtx_master_pre_record_commit(void)
         pfree(r);
     }
 
-    if (verdict != 1)
+    if (verdict != 3 && verdict != 1)
         ereport(ERROR,
                 (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                  errmsg("pg_raft: 分布式事务 %lld 的全局决议是 ABORT", (long long) dtxid),
@@ -18579,6 +18802,7 @@ dtx_master_pre_record_commit(void)
 
     elog(DEBUG1, "pg_raft: dtx %lld COMMIT（协调组 %lld，参与组 %d 个）",
          (long long) dtxid, (long long) coord_gsid, nparts);
+    dtx_test_pause_after_decide(dtxid);
 }
 
 /*
@@ -18672,7 +18896,12 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
     appendStringInfoString(&sql, ", ARRAY[");
     for (i = 0; i < ngsids; i++)
         appendStringInfo(&sql, "%s%lld", (i == 0) ? "" : ",", (long long) gsids[i]);
-    appendStringInfoString(&sql, "]::bigint[])");
+    /*
+     * 2026-10-18（方案 B）：顺带记下本后端即将 prepare 的事务（full xid）—— 本节点若被选作
+     * 协调组，它就是待确认决议的锚点（dtx_local_anchor_xid），省得在提交路径上扫 pg_prepared_xacts。
+     */
+    appendStringInfo(&sql, "]::bigint[], %llu::bigint)",
+                     (unsigned long long) U64FromFullTransactionId(GetTopFullTransactionIdIfAny()));
 
     res = PQexec(conn, sql.data);
     ok = (PQresultStatus(res) == PGRES_TUPLES_OK ||

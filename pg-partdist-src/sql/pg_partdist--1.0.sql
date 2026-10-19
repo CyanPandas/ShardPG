@@ -911,16 +911,51 @@ COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGI
 CREATE TABLE IF NOT EXISTS dtx_decision (
     dtxid         BIGINT      PRIMARY KEY,
     coord_gsid    BIGINT      NOT NULL,
-    verdict       SMALLINT    NOT NULL,   -- 1=COMMIT, 2=ABORT
+    verdict       SMALLINT    NOT NULL,   -- 1=COMMIT, 2=ABORT, 3=COMMIT 待发起方确认（见下）
     commit_ts     BIGINT      NOT NULL DEFAULT 0,
     participants  BIGINT[]    NOT NULL DEFAULT '{}',
     decided_plsn  BIGINT      NOT NULL,   -- 该 DECISION 记录的 partition_lsn
     acked         BIGINT[]    NOT NULL DEFAULT '{}',  -- 已回执的参与组（GC 用）
-    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    anchor_xid    BIGINT      NOT NULL DEFAULT 0      -- verdict=3 的锚点：本节点该事务 prepared 事务的 full xid
 );
+ALTER TABLE dtx_decision ADD COLUMN IF NOT EXISTS anchor_xid BIGINT NOT NULL DEFAULT 0;
 
 COMMENT ON TABLE dtx_decision IS
     'DTX-2PC 决议索引：由协调组的 apply 路径在每个成员上维护，供 dtx_status 快速应答。权威仍是协调组日志里的 DECISION 记录。';
+
+-- ------------------------------------------------------------------
+-- 2026-10-18 原子性修复（方案 B）：判决跟发起方的本地提交绑在一起
+-- ------------------------------------------------------------------
+-- 缺陷：发起方（2PC 驱动者）在写本地提交记录**之前**就把 COMMIT 判决写进了协调组。
+-- 它恰好在两步之间崩溃时，参与方照判决提交，发起方本地那一半却因没有提交记录被回滚
+-- —— 跨节点事务一半提交（云上满负载杀 worker 12 次复现 3 次）。
+--
+-- 修法：发起方在提交前只写 verdict=3（"COMMIT，待发起方确认"）+ commit_ts，判决在
+-- 发起方本地提交持久之后才生效。生效的凭据有两个，都不需要额外写盘或往返：
+--   ① 锚点：协调组 leader 记下**本节点**这笔事务的 prepared 事务 xid（anchor_xid）。
+--      只有发起方本地提交持久后 Citus 才会发 COMMIT PREPARED；发起方中止则发
+--      ROLLBACK PREPARED。所以锚点事务的结局就是判决：已提交 ⇒ COMMIT，已回滚 ⇒ ABORT，
+--      仍 prepared ⇒ 未决。锚点结局在 pg_xact 里，随 WAL 持久、随流复制到备库。
+--   ② 发起方崩溃、COMMIT PREPARED 永远不来时，由恢复守护（dtx_status）去问发起方：
+--      发起方事务还在跑 ⇒ 未决；否则看它本地 pg_dist_transaction 里这笔事务的行
+--      （与本地提交同生共死）在不在 ⇒ COMMIT / ABORT。结论不写回本表（会与回执清扫自死锁），
+--      恢复守护按它提交 / 回滚锚点，判决随锚点生效。
+-- verdict=3 未生效期间，读者 / 清扫问到的一律是"未决"（与提交中窗口同口径）。
+CREATE OR REPLACE FUNCTION dtx_verdict_effective(p_verdict integer, p_anchor_xid bigint)
+RETURNS integer LANGUAGE sql STABLE AS $$
+    SELECT CASE
+             WHEN p_verdict IS DISTINCT FROM 3 THEN coalesce(p_verdict, 0)
+             WHEN coalesce(p_anchor_xid, 0) <= 0 THEN 3
+             ELSE CASE pg_catalog.pg_xact_status(p_anchor_xid::text::xid8)
+                    WHEN 'committed' THEN 1
+                    WHEN 'aborted'   THEN 2
+                    ELSE 3 END
+           END
+$$;
+
+COMMENT ON FUNCTION dtx_verdict_effective(integer, bigint) IS
+    '决议的有效值：verdict 1/2 原样返回；3（待发起方确认）按锚点 prepared 事务的结局折算（提交=1、回滚=2、仍 prepared 或锚点未知=3）。';
 
 -- ------------------------------------------------------------------
 -- dtx_participant：本节点在某笔分布式事务里的参与登记（§9.3 的落地形态）
@@ -946,8 +981,10 @@ CREATE TABLE IF NOT EXISTS dtx_participant (
     gsids       BIGINT[]    NOT NULL,   -- 本节点在该事务里真正写过的分区组
     coord_gsid  BIGINT,                 -- master 下发；NULL = 决议尚未可能发生
     noted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    local_xid   BIGINT      NOT NULL DEFAULT 0,  -- 2026-10-18：本节点这个 gid 的 prepared 事务 full xid（待确认决议的锚点）
     CONSTRAINT pk_dtx_participant PRIMARY KEY (dtxid, gid)
 );
+ALTER TABLE dtx_participant ADD COLUMN IF NOT EXISTS local_xid BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_dtx_participant_dtxid ON dtx_participant(dtxid);
 CREATE INDEX IF NOT EXISTS idx_dtx_participant_noted ON dtx_participant(noted_at);
 
@@ -959,19 +996,20 @@ COMMENT ON TABLE dtx_participant IS
 CREATE OR REPLACE FUNCTION dtx_note_participant(
     p_dtxid BIGINT,
     p_gid TEXT,
-    p_gsids BIGINT[]
+    p_gsids BIGINT[],
+    p_local_xid BIGINT DEFAULT 0
 ) RETURNS BOOLEAN
     LANGUAGE sql VOLATILE
 AS $$
-    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids)
-    VALUES (p_dtxid, p_gid, p_gsids)
+    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids, local_xid)
+    VALUES (p_dtxid, p_gid, p_gsids, p_local_xid)
     ON CONFLICT (dtxid, gid) DO UPDATE
-       SET gsids = EXCLUDED.gsids, noted_at = now()
+       SET gsids = EXCLUDED.gsids, noted_at = now(), local_xid = EXCLUDED.local_xid
     RETURNING true
 $$;
 
-COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[]) IS
-    '登记本节点在某笔分布式事务里写过的分区组。必须在独立事务里调用。';
+COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[], BIGINT) IS
+    '登记本节点在某笔分布式事务里写过的分区组，以及这个 gid 即将 prepare 的本地事务（full xid，待确认决议的锚点）。必须在独立事务里调用。';
 
 -- master 侧第一轮：本节点在该事务里写过的全部分区组（多个 gid 取并集）。
 CREATE OR REPLACE FUNCTION dtx_local_participant(p_dtxid BIGINT)
@@ -1601,6 +1639,7 @@ DECLARE
     v_is_leader boolean;
     v_verdict   integer;
     v_cts       bigint;
+    v_anchor    bigint;
 BEGIN
     -- R-P4-12：应答前先把**自己**的 apply 积压排空。新当选的 leader 可能
     -- 正是尚未 apply 该决议的成员（决议在多数派上、选举合法），不追平就
@@ -1614,10 +1653,24 @@ BEGIN
 
     -- ① 本地答案：仍受 leader 门控（follower 有 apply 滞后会答错）。
     IF v_is_leader THEN
-        SELECT d.verdict::integer, d.commit_ts::bigint
-          INTO v_verdict, v_cts
+        SELECT d.verdict::integer, d.commit_ts::bigint, d.anchor_xid
+          INTO v_verdict, v_cts, v_anchor
           FROM partdist.dtx_decision d WHERE d.dtxid = p_dtxid;
         IF FOUND THEN
+            -- 2026-10-18（方案 B）：待发起方确认的 COMMIT 按锚点折算；仍未生效就是
+            -- 权威的"未决"（verdict=0，读者据此等决议），不转问组员（它们手里至多也是
+            -- 同一条待确认记录）。不需要 leader_settled 前提：那道闸防的是"查无此行"
+            -- 可能落在未 apply 的日志尾巴里，这里行就在手上。
+            IF v_verdict = 3 THEN
+                v_verdict := partdist.dtx_verdict_effective(3, v_anchor);
+                IF v_verdict = 3 THEN
+                    verdict := 0; commit_ts := 0;
+                    RETURN NEXT; RETURN;
+                END IF;
+                IF v_verdict = 2 THEN
+                    v_cts := 0;
+                END IF;
+            END IF;
             verdict := v_verdict; commit_ts := v_cts;
             RETURN NEXT; RETURN;
         END IF;

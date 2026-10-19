@@ -43,6 +43,12 @@ typedef enum DtxRecordKind
 
 #define DTX_VERDICT_COMMIT  UINT32_C(1)
 #define DTX_VERDICT_ABORT   UINT32_C(2)
+/*
+ * 2026-10-18（方案 B）：COMMIT，待发起方确认。发起方在写本地提交记录之前只写这一档，
+ * 判决在发起方本地提交持久之后才生效（锚点 / 恢复守护问发起方，见
+ * pg_partdist--1.0.sql 里 dtx_verdict_effective 的说明）。流里的这条记录不是闭合记录。
+ */
+#define DTX_VERDICT_TENTATIVE UINT32_C(3)
 
 /*
  * 定长部分 32 字节；participants[] 紧随其后，仅 DECISION 记录携带。

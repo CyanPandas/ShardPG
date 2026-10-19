@@ -1676,3 +1676,60 @@ new_primary=2`），正是让 `coord_node <= 0` / `slot < 0` 成真的那类窗�
 **"在长期使用的环境上全绿"不能代替"从零复现一次"** —— 时序相关的缺陷会被
 暖环境的既有状态（已收敛的路由、已存在的 partition_map 行、稳定的 leader）
 系统性地掩盖。`reproduce-env.sh full` 应当作为发版前的固定动作。
+
+## 14. 2026-10-18 原子性修复：判决与发起方本地提交绑定（方案 B）
+
+### 14.1 缺陷
+
+云上 TPC-C 满负载下对 worker `docker kill` 12 次，3 次出现跨节点事务"一半提交"（报告
+`TPCC_CLOUD_REPORT_20261018.md` §8.3）。成因：发起方（2PC 驱动者，函数下推后是 worker）在
+`pre_record_commit_hook` 里——**本地提交记录写入之前**——就把 verdict=1（COMMIT）写进协调组并广播。
+发起方恰好在两步之间崩溃时，参与方照判决提交，发起方本地那一半没有提交记录、崩溃恢复时回滚。
+6905492 的单参与节点快路径（`dtx_local_note_decide`）与常规路径都有这个窗口；与提前放锁无关。
+§3.3 说"决议在协调组达多数派即为全局提交点"，前提是发起方本地没有写入——函数下推之后这个前提不成立。
+
+### 14.2 修法
+
+判决在发起方本地提交**持久之后**才生效，不加刷盘、不加往返：
+
+| 步骤 | 位置 | 做什么 |
+|---|---|---|
+| 1 | 发起方 `dtx_master_pre_record_commit`（提交记录之前） | 快路径 / 常规路径都只写 **verdict=3（COMMIT 待发起方确认）**，带 commit_ts；不广播 |
+| 2 | 协调组 leader `pg_raft_dtx_decide` | 记下**锚点**：本节点这笔事务的 prepared 事务 full xid（`dtx_participant.local_xid`，参与登记时由 prepare 的后端顺手写入，取锚点不扫 `pg_prepared_xacts`）。锚点已不在进行中（被推定中止回滚了）⇒ 改判 ABORT |
+| 3 | 发起方本地提交（同步提交，2PC 驱动者禁提前放锁） | 提交记录刷盘 / 同步备库确认后，Citus 才发 COMMIT PREPARED |
+| 4 | 协调组节点 `PartDistDtxOnFinishPrepared`（COMMIT / ROLLBACK PREPARED 执行前） | 本地有 verdict=3 的决议 ⇒ 按语句方向推送最终判决（本节点就地落分片 clog）。锚点随即提交 / 回滚 |
+| 5 | 任何人问判决（`dtx_peek` / `dtx_lookup_decision` / `dtx_resolve_verdict_anywhere`） | `partdist.dtx_verdict_effective(verdict, anchor_xid)`：verdict=3 按锚点折算 —— 已提交 = 1、已回滚 = 2、仍 prepared = 3（对外答"未决"，读者按 §T4.5 等决议） |
+| 6 | 恢复守护 `dtx_status`（锚点迟迟不出结局：发起方崩溃 / COMMIT PREPARED 没送到） | `dtx_ask_driver`：按 gid 的 group 找发起节点（`pg_dist_node`），先看那笔分布式事务还在不在跑（`get_all_active_transactions` 的 pid + txn），不在跑再**另起语句**看它本地 `pg_dist_transaction` 的行（与本地提交同生共死）——在 = COMMIT，不在 = ABORT。答 COMMIT 前在同一会话提交一笔带 xid 的空事务（同步提交）作持久化栅栏，期间收到 WARNING（同步复制等待被取消）就不算数 |
+
+为什么正确：
+- **锚点结局 = 发起方结局**。Citus 只在发起方本地提交持久之后发 COMMIT PREPARED，发起方中止才发
+  ROLLBACK PREPARED；恢复守护只按 `dtx_status` 的答复提交 / 回滚锚点。锚点结局在 pg_xact 里，随 WAL
+  持久、随流复制到备库（路线 A 切主后 xid 不变）。
+- **问发起方的答案稳定**。锚点有结局之前它的 gid 还 prepared 着，`dtx_gc_dist_transaction` 删不掉
+  发起方对应的 `pg_dist_transaction` 行；锚点有结局之后不再需要问发起方。
+- **推定中止不受影响**：查无决议时 `dtx_status` 照旧先写 ABORT 再答；发起方随后写 3 时撞上一次性的
+  决议槽，返回 2，发起方中止。
+
+附带修正：Citus 规则那条恢复路径（`dtx_ask_citus_coordinator`，参与登记里还没有协调组号的 prepared 事务）
+原来固定去 Citus 协调者上查 pid 和 `pg_dist_transaction`。函数下推后发起方是 worker，pid 栅栏查错了机器、行也
+永远查不到——发起方只是慢（还没走到下发协调组）时会被误判 ABORT。改为同样经 `dtx_ask_driver` 问发起节点。
+
+### 14.3 实现中踩到的坑
+
+`dtx_status` 初版把问到的结论 UPDATE 回决议行。恢复守护一轮在同一个事务里先调 `dtx_status`（行锁持到这轮结束），
+再经 libpq 连回本机调 `dtx_ack` 改同一行——两个会话互等，PG 的死锁检测看不见，守护卡死，后续 in-doubt 全部没人
+收尾（实验室确定性测试第二组即卡住，日志 "Process holding the lock: 8146. Wait queue: 8148"）。改为不写回：结论
+只返回与推送，判决随锚点生效。
+
+### 14.4 测试钩子
+
+`pg_raft.dtx_test_pause_point`（1 = 判决已写、本地提交记录未写；2 = 本地已提交、COMMIT PREPARED 未发）与
+`pg_raft.dtx_test_pause_ms`，超级用户、默认关。实验室脚本 `tpcc/lab/fixb_crashpoint.sh` 用它们让发起方停在窗口里再
+`docker kill`；`OLDPROTO=1` 把快路径临时换回写 verdict=1 的旧协议作对照组。
+
+### 14.5 验证（lab 三机，64 迷你仓，路线 A 一主两备）
+
+- 确定性崩溃（`fixb_crashpoint.sh`）：暂停点 1 → 整笔 ABORT，暂停点 2 → 整笔 COMMIT，1 个 / 2 个远程参与节点各测，两遍共 8 次全部符合；对照组（快路径换回 verdict=1）2 次都复现一半提交。
+- 满负载随机杀 worker（`fixb_killrounds.sh`）：18 次，标准一致性与跨节点不变式全部 0 违例。
+- 全新部署后自动切主（`fixb_failover.sh`）：2 次 0 违例（修复前版本 1 次即违例）。另发现与本修复无关的路线 A 缺陷：切主后分片 xid 重复发号（见 `TPCC_CLOUD_REPORT_20261018.md` 9.3）。
+- 性能：256 终端 1 分钟短测，修复前 85,506（6 轮）、修复后 83,726（8 轮），−2.1%，在轮间波动内。

@@ -1293,6 +1293,18 @@ _PG_init(void)
                             &pg_raft_dtx_recover_timeout_ms, 30000, 1000, 3600000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
+    DefineCustomIntVariable("pg_raft.dtx_test_pause_point",
+                            "（测试用）2PC 发起方的暂停点：1 = 判决已写、本地提交记录未写；2 = 本地已提交、COMMIT PREPARED 未发。",
+                            "配合 pg_raft.dtx_test_pause_ms，在崩溃窗口里杀节点验证跨节点原子性。0 = 关。",
+                            &pg_raft_dtx_test_pause_point, 0, 0, 2,
+                            PGC_SUSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.dtx_test_pause_ms",
+                            "（测试用）在 pg_raft.dtx_test_pause_point 指定的位置暂停多少毫秒。0 = 关。",
+                            NULL,
+                            &pg_raft_dtx_test_pause_ms, 0, 0, 600000,
+                            PGC_SUSET, 0, NULL, NULL, NULL);
+
     DefineCustomIntVariable("pg_raft.promote_catchup_slice_ms",
                             "升主前置每个 BGW tick 最多推进多久的物理回放追平。",
                             "切片是为了不让追平久占 tick —— 同一个 tick 还要给其余各组"

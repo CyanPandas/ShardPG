@@ -1996,10 +1996,11 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET。")));
 
 	if (kind == DTX_DECISION &&
-		verdict != (int32) DTX_VERDICT_COMMIT && verdict != (int32) DTX_VERDICT_ABORT)
+		verdict != (int32) DTX_VERDICT_COMMIT && verdict != (int32) DTX_VERDICT_ABORT &&
+		verdict != (int32) DTX_VERDICT_TENTATIVE)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("partwal_append_dtx_record: DECISION 记录的 verdict 必须是 1(COMMIT) 或 2(ABORT)，实际 %d",
+				 errmsg("partwal_append_dtx_record: DECISION 记录的 verdict 必须是 1(COMMIT)、2(ABORT) 或 3(COMMIT 待确认)，实际 %d",
 						verdict)));
 
 	if (parts != NULL)

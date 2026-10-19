@@ -387,6 +387,8 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
     TransactionId  prepared_xid = InvalidTransactionId;
     char          *fin_marker = NULL;
     uint32         fin_marker_len = 0;
+    bool           tentative = false;      /* 本节点是协调组、手里有待确认的 COMMIT */
+    int64          tentative_cts = 0;
 
     if (!pg_partdist_dtx_2pc_enabled)
         return;
@@ -401,10 +403,18 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
         pushed = true;
     }
 
+    /*
+     * 2026-10-18（方案 B）：顺带取本节点上这笔事务的决议行 —— 只有协调组 leader 有。
+     * verdict=3（COMMIT 待发起方确认）时，这条 COMMIT/ROLLBACK PREPARED 本身就是
+     * 发起方本地提交 / 中止的凭据（Citus 只在发起方本地提交持久之后发 COMMIT PREPARED），
+     * 下面据此把最终判决推给各参与方。
+     */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "SELECT coalesce(coord_gsid, 0), gsids "
-                     "  FROM partdist.dtx_participant WHERE gid = %s",
+                     "SELECT coalesce(p.coord_gsid, 0), p.gsids, d.verdict, d.commit_ts "
+                     "  FROM partdist.dtx_participant p "
+                     "  LEFT JOIN partdist.dtx_decision d ON d.dtxid = p.dtxid "
+                     " WHERE p.gid = %s",
                      quote_literal_cstr(gid));
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
     {
@@ -427,6 +437,15 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
             for (i = 0; i < n && ngsids < (int) lengthof(gsids); i++)
                 if (!nulls[i])
                     gsids[ngsids++] = DatumGetInt64(elems[i]);
+        }
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+        if (!isnull && DatumGetInt16(d) == (int16) DTX_VERDICT_TENTATIVE)
+        {
+            tentative = true;
+            d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
+            if (!isnull)
+                tentative_cts = DatumGetInt64(d);
         }
     }
     pfree(sql.data);
@@ -619,6 +638,31 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
     if (pushed)
         PopActiveSnapshot();
     SPI_finish();
+
+    /*
+     * 2026-10-18（方案 B）：协调组上的待确认 COMMIT 在这里生效 —— 按本条语句的方向把
+     * 最终判决推给各参与方（本节点就地落账、远端流水推送，失败由拉取通道兜底）。
+     * 放在 COMMIT PREPARED **执行之前**：本节点 prepared 事务放行锁之前判决已落分片 clog，
+     * 不留"锁放了、判决还没到"的窗口（原先判决在发起方提交前就广播，同样早于放锁）。
+     * 锚点 prepared 事务随后提交 / 回滚，dtx_peek 折算出的有效判决与这里推的一致。
+     */
+    if (tentative && !(committed && tentative_cts <= 0))
+    {
+        PG_TRY();
+        {
+            DtxBroadcastDecision(dtxid,
+                                 committed ? (int) DTX_VERDICT_COMMIT : (int) DTX_VERDICT_ABORT,
+                                 committed ? tentative_cts : 0);
+        }
+        PG_CATCH();
+        {
+            /* 推送是优化：落账失败也不能把 COMMIT PREPARED 带崩，清扫会按锚点问到判决 */
+            FlushErrorState();
+            elog(LOG, "pg_partdist: dtx %lld 待确认判决生效后的推送失败，留给清扫收敛",
+                 (long long) dtxid);
+        }
+        PG_END_TRY();
+    }
 
     /*
      * 尽力复制（§3.3 阶段 3 明确说"随下一次 flush 复制"，不在客户端返回的
