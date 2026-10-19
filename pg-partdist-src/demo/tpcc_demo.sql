@@ -1,6 +1,6 @@
 -- ════════════════════════════════════════════════════════════════════════════
 -- ShardPG 演示：TPC-C 客户表 customer + 订单表 orders，从建表到删表一共 7 步
---   1 建表 → 2 分片信息与主从 → 3 表和分片的对应（含共置、分区日志在磁盘上）
+--   1 建表 → 2 分片信息与主从 → 3 表和分片的对应（含用 ls 看分区日志）
 --   → 4 边写边读 → 5 分布式事务 → 6 增删改查（4–6 步期间写入脚本一直在跑）
 --   → 7 删表
 --
@@ -9,7 +9,8 @@
 --       docker exec -it -e PGCLIENTENCODING=UTF8 -u postgres pg-test-container \
 --           /work/pg-install/bin/psql -h /tmp -p 5432 -U postgres
 --   终端 W：宿主机上的 shell，跑持续写入脚本 txn_demo_writer.sh —— 第 3 步做完再启动，第 6 步做完按 Ctrl+C 停
--- 每段前面的【窗口 A】/【窗口 B】/【终端 W】表示这段在哪里做。
+--   终端 L：宿主机上的另一个 shell，第 3 步用 ls 看磁盘上的分区日志（watch 可以一直开到第 6 步）
+-- 每段前面的【窗口 A】/【窗口 B】/【终端 W】/【终端 L】表示这段在哪里做。
 -- ⚠ 反斜杠开头的命令（\pset、\dt 等）要单独一行输入、回车，不要和下面的 SQL 一起粘贴：
 --   多行一起粘贴时终端会把它们当成一整行，反斜杠命令会把后面的 SQL 都当成自己的参数（报 extra argument ... ignored）。
 --
@@ -91,85 +92,41 @@ SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS work
        string_agg('仓库' || c_w_id || ' ' || c_first, ', ' ORDER BY c_w_id, c_d_id, c_id) AS customers
   FROM customer GROUP BY 1, 2 ORDER BY 1;
 
--- ── 3.1 共置：建 orders 时为什么写 COLOCATE WITH customer ──
--- 一句话：两张表按同一把尺子切（同样的分片键类型、分片数、哈希范围），切出来的同一段放在同一批节点上 ——
--- 同一个仓库的客户和他的订单，永远在同一台 worker 上。
--- 写法：被共置的表先建；共置的表只写 SHARD KEY (列) COLOCATE WITH 表，分片数跟着走、不能再写 SHARDS。
--- 注意副本数目前不会跟着走（不写 REPLICAS 取默认 2，customer 正好也是 2），要和被共置的表写成一样（P7-N106）
--- 【窗口 A】
--- ① 元数据：两张表登记在同一个共置组（colocationid 相同）；共置是元数据里的约定，Citus 只认这个号
-SELECT logicalrelid::text AS table_name, column_to_column_name(logicalrelid, partkey) AS shard_key, colocationid,
-       (SELECT count(*) FROM pg_dist_shard s WHERE s.logicalrelid = p.logicalrelid) AS shards
-  FROM pg_dist_partition p WHERE logicalrelid IN ('customer'::regclass, 'orders'::regclass) ORDER BY 1;
--- ② 同一段哈希范围的两个分片并排看：范围一样、主一样、从一样（same_nodes 全是 t）
-SELECT c.hash_range, c.shard_name AS customer_shard, o.shard_name AS orders_shard, c."primary", c.replicas,
-       (c."primary", c.replicas) = (o."primary", o.replicas) AS same_nodes
-  FROM shardpg.shards c
-  JOIN shardpg.shards o ON o.table_name = 'orders'::regclass AND o.hash_range = c.hash_range
- WHERE c.table_name = 'customer'::regclass
- ORDER BY c.shard_name;
--- ③ 效果：客户 JOIN 订单拆成 4 个任务（每段一个），每个任务在一台 worker 上把同一段的
---    orders_X 和 customer_Y 本地连接（看每个 Task 的 Node 和两个 Seq Scan 的分片名），节点之间不搬数据
-SET citus.explain_all_tasks = on;
-EXPLAIN (COSTS OFF)
-SELECT c.c_w_id, c.c_first, count(o.o_id) AS orders
-  FROM customer c JOIN orders o ON o.o_w_id = c.c_w_id AND o.o_d_id = c.c_d_id AND o.o_c_id = c.c_id
- GROUP BY 1, 2;
-RESET citus.explain_all_tasks;
--- ④ 对照（可选，建表约 50 s）：同样 4 片、只是不写 COLOCATE WITH 的订单表 orders_nc。
---    它的分片碰巧也放在同样的节点上，但共置号不同 —— 同样的连接直接报错
---    the query contains a join that requires repartitioning；打开重分布才能跑，要 20 个任务、
---    先把两张表按连接键在节点之间重新分发一遍（MapMergeJob）。
---    不共置还有一个后果：切主、迁移时两张表各走各的，现在碰巧在一起的以后也会分开（共置对齐只管同一共置组）
-CREATE TABLE orders_nc (o_w_id int NOT NULL, o_d_id int NOT NULL, o_id int NOT NULL, o_c_id int NOT NULL,
-    PRIMARY KEY (o_w_id, o_d_id, o_id), SHARD KEY (o_w_id) SHARDS 4 REPLICAS 2);
-SELECT logicalrelid::text AS table_name, colocationid FROM pg_dist_partition
- WHERE logicalrelid IN ('customer'::regclass, 'orders'::regclass, 'orders_nc'::regclass) ORDER BY 1;
-SELECT c.c_w_id, count(o.o_id) FROM customer c JOIN orders_nc o ON o.o_w_id = c.c_w_id AND o.o_c_id = c.c_id GROUP BY 1;
-SET citus.enable_repartition_joins = on;
-EXPLAIN (COSTS OFF)
-SELECT c.c_w_id, count(o.o_id) FROM customer c JOIN orders_nc o ON o.o_w_id = c.c_w_id AND o.o_c_id = c.c_id GROUP BY 1;
-RESET citus.enable_repartition_joins;
-DROP TABLE orders_nc;
-
--- ── 3.2 分区日志（partwal）在磁盘上 ──
--- 每个分片是一个 Raft 组（组号 = 分片号），组里每个成员节点上都有：一张分片表 + 一个分区日志目录
---   $PGDATA/pg_parwal/<这个分片在该节点上本地表的 oid>/       （目录名是本地 oid，各节点不同，不是分片号）
--- 共置的两个分片是两个独立的 Raft 组、两份独立的日志，只是成员节点相同。
--- 【窗口 A】
--- ① 仓库 1 这一段的两个分片在各 worker 上的目录：三台有（1 主 2 从），一台没有
-SELECT get_shard_id_for_distribution_column('customer', 1) AS cid,
-       get_shard_id_for_distribution_column('orders', 1)   AS osid \gset
-SELECT nodeport AS worker, result AS parwal_dirs
-  FROM run_command_on_workers(format($$
-    SELECT string_agg(rpad(shard_name(t, s), 16) || coalesce(current_setting('data_directory') || '/pg_parwal/'
-                      || partdist.local_partition_for_shard(s)::oid, '（不在这台）'), E'\n' ORDER BY s)
-      FROM (VALUES ('customer'::regclass, %s::bigint), ('orders'::regclass, %s::bigint)) v(t, s)$$, :cid, :osid))
- ORDER BY 1;
--- ② 在主上 ls。\! 不认 psql 变量，所以先把两个目录取进 psql 变量、再用 \setenv 交给 shell（下面每行单独回车）
-SELECT ltrim("primary", ':')::int AS pport FROM shardpg.shards WHERE shard_name = shard_name('customer', :cid) \gset
-SELECT split_part(result, E'\n', 1) AS cdir, split_part(result, E'\n', 2) AS odir
-  FROM run_command_on_workers(format($$
-    SELECT current_setting('data_directory') || '/pg_parwal/' || partdist.local_partition_for_shard(%s)::oid || E'\n'
-        || current_setting('data_directory') || '/pg_parwal/' || partdist.local_partition_for_shard(%s)::oid$$, :cid, :osid))
- WHERE nodeport = :pport \gset
-\setenv CDIR :cdir
-\setenv ODIR :odir
--- 主上 pg_parwal 下每个分片一个子目录（这台上有主也有从，都在这里）
-\! ls -C $(dirname $CDIR)
--- 仓库 1 这一段：customer、orders 各一个目录。00000001… 是日志记录本身（沿用 pg_wal 的段文件命名）；
--- 主上还有 checkpoint（处理到哪）、fileset（这个分片的表和索引文件清单）、freeze（冻结位点）、promoted（本节点这份是升过主的）
-\! ls -l $CDIR $ODIR
--- ③ customer 这个分片在主和第一个从上的目录并排看：日志段文件一样大（记录一条不差）；
---    从上没有 promoted，多了 locmap（主上的表文件号 → 本机表文件号的对照：从收到的是主的原始 WAL，
---    升主回放时靠它落到本机的表上）和 replay_enabled（回放槽位已就绪）
-SELECT ltrim(split_part(replicas, ',', 1), ':')::int AS rport FROM shardpg.shards WHERE shard_name = shard_name('customer', :cid) \gset
-SELECT result AS rdir
-  FROM run_command_on_workers(format($$
-    SELECT current_setting('data_directory') || '/pg_parwal/' || partdist.local_partition_for_shard(%s)::oid$$, :cid))
- WHERE nodeport = :rport \gset
-\setenv RDIR :rdir
-\! ls -l $CDIR $RDIR
+-- ── 3.1 分区日志在磁盘上：用 ls 看 ──
+-- 每个分片是一个 Raft 组（组号 = 分片号），组里每个成员节点上有一张分片表和一个分区日志目录
+--   $PGDATA/pg_parwal/<这个分片在该节点上本地表的 oid>/    （目录名是本地 oid，各节点不同，不是分片号）
+-- 只看仓库 1 那个分片在 3 台上的目录。不要 ls 整个 pg_parwal：目录名看不出是哪个分片，还有老测试留下的目录。
+-- ① 【窗口 A】生成终端 L 要执行的两条命令（主排在最前；结果按列竖着显示，把 ls_cmd / watch_cmd 那一行的命令复制过去）
+WITH s AS (
+  SELECT get_shard_id_for_distribution_column('customer', 1) AS sid
+), w AS (
+  SELECT nodeport, split_part(result, ' ', 1) AS dir, split_part(result, ' ', 2) AS tbl
+    FROM s, run_command_on_workers(format($$
+      SELECT coalesce(current_setting('data_directory') || '/pg_parwal/' || partdist.local_partition_for_shard(%1$s)::oid
+                      || ' ' || current_setting('data_directory') || '/' || pg_relation_filepath(partdist.local_partition_for_shard(%1$s)), '')$$,
+      s.sid))
+   WHERE result <> ''
+), p AS (
+  SELECT ltrim("primary", ':')::int AS pport FROM s, shardpg.shards WHERE shard_name = shard_name('customer', s.sid)
+)
+SELECT string_agg(':' || nodeport || CASE WHEN nodeport = pport THEN '（主）' ELSE '（从）' END, '  '
+                  ORDER BY nodeport <> pport, nodeport) AS nodes,
+       'docker exec pg-test-container ls -l --time-style=+%T '
+         || string_agg(dir, ' ' ORDER BY nodeport <> pport, nodeport) AS ls_cmd,
+       'watch -n1 docker exec pg-test-container ls -l --time-style=+%T '
+         || string_agg(tbl || ' ' || dir, ' ' ORDER BY nodeport <> pport, nodeport) AS watch_cmd
+  FROM w, p \gx
+-- ② 【终端 L】执行 ls_cmd：三台各一个目录
+--    00000001…：日志记录本身（沿用 pg_wal 的段文件命名），三台一样大 = 每条记录三台都有
+--    主上：checkpoint（处理到哪）、fileset（这个分片的表和索引文件清单）、promoted（这份是当主的），可能还有 freeze（冻结位点）
+--    从上：locmap（主的表文件号 → 本机表文件号：从收到的是主的原始 WAL，升主回放时靠它落到本机的表上）、
+--          replay_enabled（回放槽位已就绪）
+-- ③ 【终端 L】执行 watch_cmd，每秒刷新一次。最上面三行是三台上的分片表文件，下面是三个日志目录
+--    表文件：主上有数据（8192 字节）；两个从上是 0 字节 —— 从只收日志、不回放进表，升主时才回放（惰性回放）
+--    【窗口 A】写一笔，看终端 L：三个日志段文件同一秒一起变大同样的字节数（一笔 UPDATE 实测加一两百字节，三台完全相同），
+--    表文件都不变 —— 主上的写入先进共享缓冲，检查点时才落到表文件；从上一直是 0
+UPDATE customer SET c_balance = c_balance + 1 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;
+--    终端 L 的 watch 可以一直开着：第 4 步启动写入脚本后，落在仓库 1 的写入会让三个段文件持续一起涨。演示完按 Ctrl+C 退出
 
 -- ════ 第 4 步：开始持续写入，边写边读 ════
 -- 表已经建好（第 1 步完成之后才能启动写入脚本：表还在建的时候往里写会让建表失败）
