@@ -338,17 +338,10 @@ shardpg_create(PlannedStmt *pstmt, const char *queryString,
 	if (nworkers < 1)
 		ereport(ERROR,
 				(errmsg("集群里没有可放分片的 worker")));
-	if (o.replicas == 0)
-		o.replicas = shardpg_replicas;
-	if (o.replicas > nworkers - 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("副本数 %d 超出上限：%d 台 worker 最多 1 主 %d 从",
-						o.replicas, nworkers, nworkers - 1)));
-	if (o.colocate == NULL && o.shards == 0)
-		o.shards = shardpg_shard_count > 0 ? shardpg_shard_count : nworkers;
 	if (o.colocate != NULL)
 	{
+		int			target_replicas;
+
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
 						 "SELECT p.partmethod FROM pg_catalog.pg_dist_partition p"
@@ -359,7 +352,46 @@ shardpg_create(PlannedStmt *pstmt, const char *queryString,
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_TABLE),
 					 errmsg("共置目标 %s 不存在或不是分片表", o.colocate)));
+
+		/*
+		 * ★ P7-N106（2026-10-19）：副本数也随共置表。同一段的共置分片是各自的 Raft 组，共置要成立，
+		 * 组成员必须相同 —— 共置对齐只能把主转到对方也有副本的节点，move_replica 也按整段搬。
+		 * 原来不写 REPLICAS 就取 shardpg.replicas，实测 co_a 1 从、COLOCATE WITH co_a 的 co_b 2 从。
+		 * Citus 自己的共置组也带副本因子（pg_dist_colocation.replicationfactor），但我们的副本在
+		 * Raft 层、Citus 那边一律是 1，它的这道检查不起作用，只能在这里补。
+		 */
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "SELECT pg_catalog.max(pg_catalog.cardinality(m.secondary_nodes))"
+						 " FROM partdist.partition_map m"
+						 " JOIN pg_catalog.pg_dist_shard s ON s.shardid = m.partition_id::pg_catalog.int8"
+						 " WHERE s.logicalrelid = pg_catalog.to_regclass(%s)",
+						 quote_literal_cstr(o.colocate));
+		v = spi_value(sql.data, caller);
+		target_replicas = v ? atoi(v) : 0;
+		if (target_replicas < 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("共置目标 %s 没有登记从副本，不能共置", o.colocate),
+					 errhint("共置目标要是用 SHARD KEY 建的表。")));
+		if (o.replicas == 0)
+			o.replicas = target_replicas;
+		else if (o.replicas != target_replicas)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("COLOCATE WITH 时副本数随共置表：%s 是每片 %d 从，这里写的是 REPLICAS %d",
+							o.colocate, target_replicas, o.replicas),
+					 errhint("去掉 REPLICAS，或者写成 REPLICAS %d。", target_replicas)));
 	}
+	if (o.replicas == 0)
+		o.replicas = shardpg_replicas;
+	if (o.replicas > nworkers - 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("副本数 %d 超出上限：%d 台 worker 最多 1 主 %d 从",
+						o.replicas, nworkers, nworkers - 1)));
+	if (o.colocate == NULL && o.shards == 0)
+		o.shards = shardpg_shard_count > 0 ? shardpg_shard_count : nworkers;
 
 	/* ---- 事务 1：建表 + 分布 ---- */
 	extract_shard_opts(orig, &dummy, &rest);
