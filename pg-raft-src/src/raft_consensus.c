@@ -3982,7 +3982,8 @@ control_maybe_compact(RaftGroupCtx *ctx)
                      "INSERT INTO partdist.raft_snapshot "
                      "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
                      "SELECT 1, %lld, %lld, "
-                     "COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                     "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                     "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
                      "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
                      "now() "
                      "ON CONFLICT (singleton) DO UPDATE SET "
@@ -3991,7 +3992,8 @@ control_maybe_compact(RaftGroupCtx *ctx)
                      "node_map = EXCLUDED.node_map, "
                      "partition_map = EXCLUDED.partition_map, updated_at = now() "
                      "WHERE partdist.raft_snapshot.last_included_index <= EXCLUDED.last_included_index",
-                     (long long) applied, (long long) keep_term);
+                     (long long) applied, (long long) keep_term,
+                     (long long) pg_raft_tso_snapshot_hwm());
     if (SPI_execute(sql.data, false, 0) < 0)
     {
         pfree(sql.data);
@@ -4712,7 +4714,8 @@ send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx
                              "INSERT INTO partdist.raft_snapshot "
                              "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
                              "SELECT 1, %lld, %lld, "
-                             "COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                             "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                             "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
                              "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
                              "now() "
                              "ON CONFLICT (singleton) DO UPDATE SET "
@@ -4721,7 +4724,8 @@ send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx
                              "node_map = EXCLUDED.node_map, "
                              "partition_map = EXCLUDED.partition_map, updated_at = now() "
                              "RETURNING last_included_index::text, last_included_term::text, node_map::text, partition_map::text",
-                             (long long) applied, (long long) aterm);
+                             (long long) applied, (long long) aterm,
+                             (long long) pg_raft_tso_snapshot_hwm());
             if (SPI_execute(sql.data, false, 0) == SPI_OK_INSERT_RETURNING && SPI_processed > 0)
             {
                 HeapTuple tup = SPI_tuptable->vals[0];
@@ -8693,6 +8697,29 @@ pg_raft_install_snapshot(PG_FUNCTION_ARGS)
     {
         snprintf(out, sizeof(out), "%lld 0", (long long) out_term);
         PG_RETURN_TEXT_P(cstring_to_text(out));
+    }
+
+    /*
+     * 2026-10-19：快照代替了一段日志，其中可能有 OP_TSO_HWM。发送方把截至快照点已 apply 的
+     * TSO 发号上界捎在 node_map 每一行的 "tso_hwm" 里（装表时 jsonb_populate_recordset 忽略它），
+     * 这里抬高本地上界 —— 否则本节点将来当选 leader 会从一个偏小的起点发号。
+     */
+    {
+        const PartDistTsoRaftApi *api = pg_raft_tso_api();
+        const char *p = node_map;
+        int64       hwm = 0;
+
+        while (p != NULL && (p = strstr(p, "\"tso_hwm\"")) != NULL)
+        {
+            long long v = 0;
+            const char *c = strchr(p, ':');
+
+            if (c != NULL && sscanf(c + 1, " %lld", &v) == 1 && v > hwm)
+                hwm = (int64) v;
+            p += 9;
+        }
+        if (hwm > 0 && api != NULL && api->enabled())
+            api->apply_hwm(hwm);
     }
 
     /*
@@ -16124,6 +16151,59 @@ dtx_notice_warned(void *arg, const PGresult *res)
         *(bool *) arg = true;
 }
 
+/*
+ * 2026-10-20：把 Citus 元数据里的节点地址换算成控制面里的现任地址（就地改 host / port）。
+ *
+ * worker 切主后，各节点 pg_dist_node 里那一行要等 Citus 元数据同步才会改；协调者宕着时根本
+ * 不会改，同步本身也可能卡住（lab 4 worker 实测：所有 worker 同时被标"未同步"后，Citus 后台
+ * 逐个补同步互相等，永远补不上）。而控制面的地址覆盖（OP_NODE_ADDRESS）在切主时就到了。
+ * 发起节点的 gid 只带 Citus 组号，按旧地址去问一个已经死掉的节点，悬挂的 prepared 就永远收不了尾
+ * （还锁着行）。这里按 pg_raft.peers 里的原始地址认出节点号，再取它的现任地址。
+ * 认不出（地址已是新的、或不是 peers 里的原始地址）就原样不动。
+ */
+static void
+dtx_current_node_address(char *host, size_t hostlen, int *port)
+{
+    char *buf;
+    char *tok;
+    char *save = NULL;
+    int   match = 0;
+    int   i;
+
+    if (pg_raft_peers == NULL || pg_raft_peers[0] == '\0')
+        return;
+    buf = pstrdup(pg_raft_peers);
+    for (tok = strtok_r(buf, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save))
+    {
+        int  id = 0;
+        int  p = 0;
+        char h[256];
+
+        if (sscanf(tok, " %d@%255[^:]:%d", &id, h, &p) == 3 && p == *port && strcmp(h, host) == 0)
+        {
+            match = id;
+            break;
+        }
+    }
+    pfree(buf);
+    if (match <= 0)
+        return;
+    parse_peers();
+    for (i = 0; i < n_peers; i++)
+    {
+        if (peers[i].node_id != match)
+            continue;
+        if (peers[i].port != *port || strcmp(peers[i].host, host) != 0)
+        {
+            elog(LOG, "pg_raft: dtx 恢复：发起节点 %d 已从 %s:%d 迁到 %s:%d（按控制面地址去问）",
+                 match, host, *port, peers[i].host, peers[i].port);
+            strlcpy(host, peers[i].host, hostlen);
+            *port = peers[i].port;
+        }
+        break;
+    }
+}
+
 static int
 dtx_ask_driver(long long g_group, long long g_pid, long long g_txn)
 {
@@ -16181,6 +16261,7 @@ dtx_ask_driver(long long g_group, long long g_pid, long long g_txn)
     if (!have_node)
         return 0;
 
+    dtx_current_node_address(host, sizeof(host), &port);
     pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
     strlcat(conninfo, " options='-c statement_timeout=5000'", sizeof(conninfo));
     conn = PQconnectdb(conninfo);
@@ -18928,4 +19009,566 @@ pg_raft_dtx_install_hooks(void)
 
     rv = find_rendezvous_variable("partdist_dtx_note_participant_hook");
     *rv = (void *) pg_raft_dtx_note_participant;
+}
+
+/* ======================================================================
+ * 2026-10-19：TSO 随控制面 leader 发号（pg_partdist.tso_raft = on）
+ *
+ * 原形态：只有协调者（pg_partdist.tso_master）发号，它一挂，所有事务取不到 start_ts /
+ * commit_ts，全簇不能读写 —— 协调者是数据路径上唯一的单点。
+ *
+ * 现在：控制面（组 0）的 leader 就是发号者。本节点的 TSO 管理进程（pg_raft_tso_main）：
+ *
+ *   1. 租约：每 tso_round_ms 向组 0 的其它成员问一次"你的任期是否 <= T"（T = 本节点当选的
+ *      任期）。过半数（含自己）确认，就把发号租约延到这一轮**发出时刻** + tso_lease_ms。
+ *      确认 "<= T" 的成员在回答之后才可能给更高任期投票，所以任何新 leader 都是在这一轮
+ *      发出之后才当选的。
+ *   2. 接任：当选后先等 tso_lease_ms × 1.25 + 200 ms（旧 leader 的租约必已过期、已停发），
+ *      再经控制面日志提交一条屏障（OP_TSO_HWM hwm=0）—— 前任的全部预留随之提交并在本节点
+ *      apply —— 读出已 apply 的最大上界 A0 作起点，再预留 [A0, A0 + tso_batch) 后开始发号。
+ *      前任发出的号都小于它已提交的上界 <= A0，所以号严格单调。
+ *   3. 续批：剩余号数不到半批时，预留下一批。
+ *   4. 下台 / 任期变了：立即停发（发号路径本身也按租约判，租约到期自动停）。
+ *
+ * 各节点 apply OP_TSO_HWM 时都把本地持久上界抬高（pg_partdist：文件 + WAL），压缩后靠快照
+ * （node_map 行里的 "tso_hwm"）传给落后成员，所以将来谁当选都知道从哪里起发。
+ *
+ * 发号者优先在协调者上（pg_raft.tso_prefer_coordinator）：协调者恢复并追平后，若持续不是
+ * leader，它会发起一次受控选举把领导权拿回来（换届有几秒的发号空窗，限频）。
+ * ====================================================================== */
+
+int  pg_raft_tso_lease_ms = 2000;
+int  pg_raft_tso_batch = 4000000;
+bool pg_raft_tso_prefer_coordinator = true;
+
+#define TSO_ROUND_MS            100     /* 租约确认的节奏 */
+#define TSO_ROUND_TIMEOUT_MS    400     /* 一轮收不齐就作废、重新发 */
+#define TSO_CALL_TIMEOUT_MS     15000   /* 接任 / 续批的自连调用上界 */
+#define TSO_PREFER_HOLD_MS      20000   /* 协调者追平后持续不是 leader 这么久才去拿 */
+#define TSO_PREFER_RETRY_MS     60000
+
+const PartDistTsoRaftApi *
+pg_raft_tso_api(void)
+{
+    static const PartDistTsoRaftApi *api = NULL;
+
+    if (api == NULL)
+    {
+        void **rv = find_rendezvous_variable("partdist_tso_raft_api");
+
+        api = (const PartDistTsoRaftApi *) *rv;
+    }
+    return api;
+}
+
+bool
+pg_raft_tso_enabled(void)
+{
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+
+    return api != NULL && api->enabled();
+}
+
+/* 控制面快照里捎带的 TSO 上界（未启用时 0） */
+int64
+pg_raft_tso_snapshot_hwm(void)
+{
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+
+    if (api == NULL || !api->enabled())
+        return 0;
+    return api->applied_hwm();
+}
+
+/* 本节点是否为控制面 term 的 leader */
+static bool
+tso_is_leader_in(int64 term)
+{
+    RaftGroupCtx ctx;
+    bool         r;
+
+    if (!raft_control_ctx(&ctx))
+        return false;
+    SpinLockAcquire(&ctx.cons->mutex);
+    r = (ctx.cons->state == RAFT_LEADER && ctx.cons->current_term == term);
+    SpinLockRelease(&ctx.cons->mutex);
+    return r;
+}
+
+/*
+ * pg_raft_tso_lease_check(term) → bigint：返回本节点控制面的当前任期。
+ * leader 据此判断"这个成员还没有进入比 term 更高的任期"（也就还没给别人投过更高任期的票）。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_tso_lease_check);
+Datum
+pg_raft_tso_lease_check(PG_FUNCTION_ARGS)
+{
+    RaftGroupCtx ctx;
+    int64        t;
+
+    (void) PG_GETARG_INT64(0);
+    if (RaftGroups == NULL || !raft_control_ctx(&ctx))
+        PG_RETURN_INT64(PG_INT64_MAX);      /* 说不清 = 不确认 */
+    SpinLockAcquire(&ctx.cons->mutex);
+    t = ctx.cons->current_term;
+    SpinLockRelease(&ctx.cons->mutex);
+    PG_RETURN_INT64(t);
+}
+
+/*
+ * 提交一条 OP_TSO_HWM 并等它在本节点 apply；返回 apply 之后本节点的已 apply 上界。
+ * 必须是 term 的 leader，前后各核一次。
+ */
+static int64
+tso_reserve(int64 term, int64 hwm)
+{
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+    char         payload[96];
+    int64        idx;
+    TimestampTz  start;
+
+    if (api == NULL || !api->enabled())
+        ereport(ERROR, (errmsg("pg_raft: TSO 未启用随控制面 leader 发号（pg_partdist.tso_raft）")));
+    parse_peers();
+    if (!tso_is_leader_in(term))
+        ereport(ERROR, (errmsg("pg_raft: 本节点已不是控制面任期 %lld 的 leader", (long long) term)));
+
+    snprintf(payload, sizeof(payload), "{\"term\": %lld, \"hwm\": %lld}",
+             (long long) term, (long long) hwm);
+    idx = pg_raft_consensus_propose(PG_RAFT_OP_TSO_HWM, payload);
+    if (idx <= 0)
+        ereport(ERROR, (errmsg("pg_raft: TSO 上界预留（%lld）没能在控制面提交", (long long) hwm)));
+
+    start = GetCurrentTimestamp();
+    while (pg_raft_consensus_last_applied() < idx)
+    {
+        CHECK_FOR_INTERRUPTS();
+        if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 5000))
+            ereport(ERROR, (errmsg("pg_raft: TSO 上界预留条目 %lld 已提交但 5 s 内没在本节点 apply",
+                                   (long long) idx)));
+        pg_raft_consensus_apply_pending();     /* apply 认领可能在别人手里：顺手推一把 */
+        pg_usleep(2000);
+    }
+    if (!tso_is_leader_in(term))
+        ereport(ERROR, (errmsg("pg_raft: 预留途中本节点已不是控制面任期 %lld 的 leader", (long long) term)));
+    return api->applied_hwm();
+}
+
+/*
+ * pg_raft_tso_takeover(term, batch) → bigint：新 leader 接任发号（由 TSO 管理进程在等满
+ * 租约期之后调用）。屏障 → 起点 A0 → 预留 [A0, A0+batch) → 开始发号。返回起点，失败 ERROR。
+ */
+PG_FUNCTION_INFO_V1(pg_raft_tso_takeover);
+Datum
+pg_raft_tso_takeover(PG_FUNCTION_ARGS)
+{
+    int64        term = PG_GETARG_INT64(0);
+    int64        batch = PG_GETARG_INT64(1);
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+    int64        a0;
+    int64        h;
+
+    if (batch <= 0)
+        ereport(ERROR, (errmsg("pg_raft: batch 必须 > 0")));
+    a0 = tso_reserve(term, 0);          /* 屏障：前任任期的预留全部提交并在本节点 apply */
+    {
+        int64 t, counter, hwm, lease, applied;
+
+        /* 本节点以前（同一纪元）发到过哪里：不回退。全新集群从 1 起（0 保留为"无 ts"） */
+        api->status(&t, &counter, &hwm, &lease, &applied);
+        a0 = Max(a0, Max(counter, 1));
+    }
+    h = tso_reserve(term, a0 + batch);
+    if (h < a0 + batch)
+        ereport(ERROR, (errmsg("pg_raft: TSO 预留 %lld 之后本地上界只有 %lld",
+                               (long long) (a0 + batch), (long long) h)));
+    if (!api->begin_serve(term, a0, a0 + batch))
+        ereport(ERROR, (errmsg("pg_raft: TSO 接任被拒（任期 %lld 起点 %lld）", (long long) term, (long long) a0)));
+    PG_RETURN_INT64(a0);
+}
+
+/* pg_raft_tso_extend(term, batch) → bigint：续批，返回新上界 */
+PG_FUNCTION_INFO_V1(pg_raft_tso_extend);
+Datum
+pg_raft_tso_extend(PG_FUNCTION_ARGS)
+{
+    int64        term = PG_GETARG_INT64(0);
+    int64        batch = PG_GETARG_INT64(1);
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+    int64        t, counter, hwm, lease, applied;
+    int64        want;
+
+    if (api == NULL || batch <= 0)
+        PG_RETURN_INT64(0);
+    api->status(&t, &counter, &hwm, &lease, &applied);
+    if (t != term)
+        ereport(ERROR, (errmsg("pg_raft: 本节点不在以任期 %lld 发号", (long long) term)));
+    want = Max(hwm, applied) + batch;
+    (void) tso_reserve(term, want);
+    api->extend(term, want);
+    PG_RETURN_INT64(want);
+}
+
+/* ---------------- TSO 管理进程 ---------------- */
+
+static RaftAsyncConn tso_lease_conn[RAFT_MAX_PEERS];
+static RaftAsyncConn tso_self_conn = {"TSO 接任/续批"};
+
+typedef struct TsoRound
+{
+    bool    active;
+    bool    granted;
+    int64   term;
+    int64   sent_us;        /* 单调时钟：这一轮发出（之前）的时刻 */
+    int     acks;           /* 含自己 */
+    bool    sent[RAFT_MAX_PEERS];
+    bool    done[RAFT_MAX_PEERS];
+} TsoRound;
+
+static int64 tso_peer_retry_us[RAFT_MAX_PEERS];    /* 连不上的对端：到这个时刻之前不再重连 */
+
+/*
+ * 作废这一轮：没回话的连接直接断开（不发 PQcancel —— 它是阻塞的，对端卡死时会把本进程
+ * 拖住，租约续不上，反而让一个跟随者的故障停掉全簇发号）。
+ */
+static void
+tso_round_abort(TsoRound *r)
+{
+    int i;
+
+    for (i = 0; i < RAFT_MAX_PEERS; i++)
+        if (r->sent[i] && !r->done[i] && tso_lease_conn[i].state == RAFT_ACONN_BUSY)
+            aconn_reset(&tso_lease_conn[i], false);
+    memset(r, 0, sizeof(*r));
+}
+
+static void
+tso_lease_round(RaftGroupCtx *ctx, int64 term, TsoRound *r)
+{
+    const PartDistTsoRaftApi *api = pg_raft_tso_api();
+    int64   now = api->mono_us();
+    int     majority = cluster_majority(ctx);
+    int     i;
+
+    /* 开新一轮：上一轮已出结果且过了一个节奏，或上一轮超时 */
+    if (!r->active ||
+        (r->granted && now - r->sent_us >= TSO_ROUND_MS * 1000L) ||
+        now - r->sent_us >= TSO_ROUND_TIMEOUT_MS * 1000L)
+    {
+        char sql[96];
+
+        tso_round_abort(r);
+        r->active = true;
+        r->term = term;
+        r->sent_us = now;
+        r->acks = 1;
+        snprintf(sql, sizeof(sql), "SELECT partdist.pg_raft_tso_lease_check(%lld)::text",
+                 (long long) term);
+        for (i = 0; i < n_peers && i < RAFT_MAX_PEERS; i++)
+        {
+            RaftAsyncConn *ac = &tso_lease_conn[i];
+
+            if (!peer_in_group(ctx, i))
+                continue;
+            if (ac->tag == NULL)
+                ac->tag = "TSO 租约";
+            if (ac->state == RAFT_ACONN_BUSY)
+                aconn_reset(ac, false);
+            if (ac->state == RAFT_ACONN_IDLE && now < tso_peer_retry_us[i])
+                continue;
+            {
+                int rc = aconn_ensure(ac, peers[i].host, peers[i].port, peers[i].node_id);
+
+                if (rc < 0)
+                    tso_peer_retry_us[i] = now + 10000000;  /* 10 s 后再试（宕着的对端不刷日志）；它不在也凑得够多数派 */
+                if (rc != 1)
+                    continue;               /* 还在握手 / 连不上：这一轮不算它 */
+            }
+            if (aconn_send(ac, sql, RAFT_CONTROL_GROUP, term))
+                r->sent[i] = true;
+        }
+    }
+
+    for (i = 0; i < n_peers && i < RAFT_MAX_PEERS; i++)
+    {
+        PGresult     *res = NULL;
+        RaftAconnPoll pr;
+
+        if (!r->sent[i] || r->done[i])
+            continue;
+        pr = aconn_poll(&tso_lease_conn[i], &res);
+        if (pr == RAFT_ACONN_PENDING)
+            continue;
+        r->done[i] = true;
+        if (pr == RAFT_ACONN_BROKEN)
+        {
+            aconn_reset(&tso_lease_conn[i], false);
+            continue;
+        }
+        if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1 &&
+            strtoll(PQgetvalue(res, 0, 0), NULL, 10) <= r->term)
+            r->acks++;
+        if (res != NULL)
+            PQclear(res);
+    }
+
+    if (!r->granted && r->acks >= majority && tso_is_leader_in(r->term))
+    {
+        api->set_lease(r->term, r->sent_us + (int64) pg_raft_tso_lease_ms * 1000);
+        r->granted = true;
+    }
+}
+
+/*
+ * 发一条自连语句（接任 / 续批），非阻塞收结果。返回：1 = 拿到正整数结果（*out），
+ * 0 = 在途，-1 = 失败（已记日志）。
+ */
+static int
+tso_self_call(const char *sql, int64 term, int64 *out)
+{
+    PGresult     *res = NULL;
+    RaftAconnPoll pr;
+    int           rc = -1;
+
+    if (tso_self_conn.state != RAFT_ACONN_BUSY)
+    {
+        int ec = aconn_ensure(&tso_self_conn, "127.0.0.1", PostPortNumber, pg_raft_node_id);
+
+        if (ec < 0)
+            return -1;
+        if (ec == 0)
+            return 0;
+        if (!aconn_send(&tso_self_conn, sql, RAFT_CONTROL_GROUP, term))
+            return -1;
+        return 0;
+    }
+    pr = aconn_poll(&tso_self_conn, &res);
+    if (pr == RAFT_ACONN_PENDING)
+    {
+        if (TimestampDifferenceExceeds(tso_self_conn.started, GetCurrentTimestamp(), TSO_CALL_TIMEOUT_MS))
+        {
+            elog(WARNING, "pg_raft: TSO 自连调用超过 %d ms，取消", TSO_CALL_TIMEOUT_MS);
+            aconn_reset(&tso_self_conn, true);
+            return -1;
+        }
+        return 0;
+    }
+    if (pr == RAFT_ACONN_BROKEN)
+    {
+        elog(WARNING, "pg_raft: TSO 自连连接失效：%s", PQerrorMessage(tso_self_conn.conn));
+        aconn_reset(&tso_self_conn, false);
+        return -1;
+    }
+    if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+    {
+        *out = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+        rc = (*out > 0) ? 1 : -1;
+    }
+    else
+        elog(WARNING, "pg_raft: TSO 自连调用失败：%s",
+             res != NULL ? PQresultErrorMessage(res) : "无结果");
+    if (res != NULL)
+        PQclear(res);
+    return rc;
+}
+
+/* 协调者追平后持续不是 leader：发起一次受控选举把发号者拿回来（限频） */
+static void
+tso_prefer_coordinator(RaftGroupCtx *ctx)
+{
+    static TimestampTz behind_since = 0;
+    static TimestampTz last_try = 0;
+    TimestampTz now = GetCurrentTimestamp();
+    int         state, leader;
+    int64       commit, applied;
+    TimestampTz contact;
+
+    if (!pg_raft_tso_prefer_coordinator || pg_raft_coordinator_node_id <= 0 ||
+        pg_raft_node_id != pg_raft_coordinator_node_id)
+        return;
+
+    SpinLockAcquire(&ctx->cons->mutex);
+    state = ctx->cons->state;
+    leader = ctx->cons->leader_id;
+    contact = ctx->cons->last_leader_contact;
+    SpinLockRelease(&ctx->cons->mutex);
+    SpinLockAcquire(&ctx->log->mutex);
+    commit = ctx->log->commit_index;
+    applied = ctx->log->last_applied;
+    SpinLockRelease(&ctx->log->mutex);
+
+    /* 必须是"有一个活着的 leader、本节点日志已追平"的跟随者，否则不打扰 */
+    if (state == RAFT_LEADER || leader <= 0 || leader == pg_raft_node_id ||
+        applied < commit || contact == 0 ||
+        TimestampDifferenceExceeds(contact, now, pg_raft_election_timeout_ms))
+    {
+        behind_since = 0;
+        return;
+    }
+    if (behind_since == 0)
+    {
+        behind_since = now;
+        return;
+    }
+    if (!TimestampDifferenceExceeds(behind_since, now, TSO_PREFER_HOLD_MS))
+        return;
+    if (last_try != 0 && !TimestampDifferenceExceeds(last_try, now, TSO_PREFER_RETRY_MS))
+        return;
+    last_try = now;
+    behind_since = 0;
+    SpinLockAcquire(&ctx->cons->mutex);
+    if (ctx->cons->state != RAFT_LEADER)
+        ctx->cons->campaign_pending = true;
+    SpinLockRelease(&ctx->cons->mutex);
+    elog(LOG, "pg_raft: 协调者已追平且控制面 leader 是节点 %d，发起受控选举把 TSO 发号者拿回协调者",
+         leader);
+}
+
+PGDLLEXPORT void pg_raft_tso_main(Datum main_arg);
+
+void
+pg_raft_tso_main(Datum main_arg)
+{
+    TsoRound     round;
+    int64        my_term = 0;
+    int64        leader_since_us = 0;      /* 单调时钟：本进程看到自己当选的时刻 */
+    bool         serving = false;
+    bool         call_inflight = false;
+    TimestampTz  last_call_fail = 0;
+    char         call_sql[128];
+
+    pqsignal(SIGHUP, SignalHandlerForConfigReload);
+    pqsignal(SIGTERM, die);
+    BackgroundWorkerUnblockSignals();
+    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+    memset(&round, 0, sizeof(round));
+    call_sql[0] = '\0';
+
+    for (;;)
+    {
+        const PartDistTsoRaftApi *api;
+        RaftGroupCtx ctx;
+        int          state;
+        int64        term;
+        TimestampTz  now;
+
+        (void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                         20, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        CHECK_FOR_INTERRUPTS();
+        if (ConfigReloadPending)
+        {
+            ConfigReloadPending = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
+
+        api = pg_raft_tso_api();
+        if (api == NULL || !api->enabled() || !pg_raft_raft_enabled || RaftGroups == NULL)
+        {
+            pg_usleep(1000 * 1000L);
+            continue;
+        }
+        parse_peers();
+        if (!raft_control_ctx(&ctx))
+            continue;
+
+        SpinLockAcquire(&ctx.cons->mutex);
+        state = ctx.cons->state;
+        term = ctx.cons->current_term;
+        SpinLockRelease(&ctx.cons->mutex);
+        now = GetCurrentTimestamp();
+
+        if (state != RAFT_LEADER)
+        {
+            int64 t, c, h, l, a;
+
+            api->status(&t, &c, &h, &l, &a);
+            if (my_term != 0 || t != 0)
+            {
+                api->stop();
+                tso_round_abort(&round);
+                if (call_inflight)
+                    aconn_reset(&tso_self_conn, true);
+                call_inflight = false;
+                serving = false;
+                my_term = 0;
+            }
+            tso_prefer_coordinator(&ctx);
+            continue;
+        }
+
+        if (term != my_term)
+        {
+            api->stop();
+            tso_round_abort(&round);
+            if (call_inflight)
+                aconn_reset(&tso_self_conn, true);
+            call_inflight = false;
+            serving = false;
+            my_term = term;
+            leader_since_us = api->mono_us();
+            elog(LOG, "pg_raft: 本节点当选控制面任期 %lld 的 leader，%d ms 后接任 TSO 发号",
+                 (long long) term, pg_raft_tso_lease_ms + pg_raft_tso_lease_ms / 4 + 200);
+        }
+
+        tso_lease_round(&ctx, term, &round);
+
+        if (call_inflight)
+        {
+            int64 v = 0;
+            int   rc = tso_self_call(call_sql, term, &v);
+
+            if (rc == 0)
+                continue;
+            call_inflight = false;
+            if (rc > 0 && !serving)
+            {
+                serving = true;
+                elog(LOG, "pg_raft: TSO 已在任期 %lld 接任，起点 %lld（当选后 %lld ms）",
+                     (long long) term, (long long) v,
+                     (long long) ((api->mono_us() - leader_since_us) / 1000));
+            }
+            else if (rc < 0)
+                last_call_fail = GetCurrentTimestamp();
+            continue;
+        }
+        if (last_call_fail != 0 && !TimestampDifferenceExceeds(last_call_fail, now, 500))
+            continue;
+
+        if (!serving)
+        {
+            int64 t, c, h, lease_until, a;
+
+            if (api->mono_us() - leader_since_us <
+                (int64) (pg_raft_tso_lease_ms + pg_raft_tso_lease_ms / 4 + 200) * 1000)
+                continue;           /* 旧 leader 的租约必已过期之前不接任 */
+            api->status(&t, &c, &h, &lease_until, &a);
+            if (!round.granted || round.term != term)
+                continue;           /* 先要有本任期的租约 */
+            snprintf(call_sql, sizeof(call_sql),
+                     "SELECT partdist.pg_raft_tso_takeover(%lld, %d)::text",
+                     (long long) term, pg_raft_tso_batch);
+            call_inflight = true;
+            (void) tso_self_call(call_sql, term, &(int64){0});
+        }
+        else
+        {
+            int64 t, c, h, lease_until, a;
+
+            api->status(&t, &c, &h, &lease_until, &a);
+            if (t != term)
+            {
+                serving = false;    /* 被别处停了（不应发生）：重新接任 */
+                continue;
+            }
+            if (h - c < pg_raft_tso_batch / 2)
+            {
+                snprintf(call_sql, sizeof(call_sql),
+                         "SELECT partdist.pg_raft_tso_extend(%lld, %d)::text",
+                         (long long) term, pg_raft_tso_batch);
+                call_inflight = true;
+                (void) tso_self_call(call_sql, term, &(int64){0});
+            }
+        }
+    }
 }

@@ -1602,6 +1602,11 @@ CREATE OR REPLACE FUNCTION partdist_tso_commit_ts()
 RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION partdist_tso_status()
 RETURNS text AS 'MODULE_PATHNAME', 'partdist_tso_status' LANGUAGE C STRICT;
+-- 2026-10-20：节点内 TSO 代理一个往返要一段连续的号（n = 0 返回 0、不发号）。返回这一段的第一个号。
+CREATE OR REPLACE FUNCTION partdist_tso_start_ts_n(node int, oldest bigint, n int)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_start_ts_n' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_commit_ts_n(n int)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts_n' LANGUAGE C STRICT;
 
 -- TX-TSO-MVCC（T3.2）：worker 取号通路的调试/验收入口（内部 C API 为正道）。
 CREATE OR REPLACE FUNCTION partdist_tso_client_start_ts()

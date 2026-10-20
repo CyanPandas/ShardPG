@@ -37,6 +37,15 @@
 #define XLOG_SHARD_PREPARED		0x00
 #define XLOG_SHARD_VERDICT		0x10
 #define XLOG_SHARD_TSO_HWM		0x20	/* TSO 高水位预留（协调者切主后从备库接着发号） */
+/*
+ * 2026-10-19：分片 xid 发号水位推进。水位原来只写本地文件，物理备库上是旧值；提升后
+ * 发号起点只从回放的提交 / 判决记录学到，旧主"写了数据没提交"用过的号会被重发，
+ * 那些元组随新事务提交而部分复活（lab 实测仓 54 订单 1409 与仓 14 的 Delivery 共用
+ * 分片 xid 269327）。每推进一批（SHARD_XID_BATCH 个号）记一条，备库回放时抬高水位文件。
+ */
+#define XLOG_SHARD_XID_WM		0x30
+/* 2026-10-19：TSO 随控制面 leader 发号时，本节点已 apply 的发号上界（备库提升后接得上） */
+#define XLOG_SHARD_TSO_RAFT_HWM	0x40
 
 typedef struct xl_shard_prepared
 {
@@ -63,8 +72,16 @@ typedef struct xl_tso_hwm
 	int64		hwm;			/* 已持久预留的上界：发出的号都严格小于它 */
 } xl_tso_hwm;
 
+typedef struct xl_shard_xid_wm
+{
+	Oid			shard;
+	uint32		wm;				/* 新的持久发号水位：这一批发出的号都严格小于它 */
+} xl_shard_xid_wm;
+
 extern void ShardWalRegisterRmgr(void);
 extern XLogRecPtr ShardWalLogTsoHwm(int64 hwm);
+extern XLogRecPtr ShardWalLogTsoRaftHwm(int64 hwm);
+extern XLogRecPtr ShardWalLogXidWatermark(Oid shard, uint32 wm);
 extern XLogRecPtr ShardWalLogPrepared(int64 gxid, int64 coord_gsid, int64 dtxid,
 									  int64 start_ts, int nxids, const uint32 *pairs);
 extern XLogRecPtr ShardWalLogVerdict(int64 gxid, bool committed, int64 commit_ts,

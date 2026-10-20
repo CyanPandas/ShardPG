@@ -7,6 +7,11 @@ source "$(dirname "$0")/lib.sh"
 out="$TPCC_DIR/conf/out"
 mkdir -p "$out"
 peers=$(peers_string)
+# TSO_RAFT=1：TSO 随控制面 leader 发号，连接串列出全部节点（分号分隔，客户端自己找发号者）
+tso_list=""
+for i in "${!NODE_IDS[@]}"; do
+  tso_list+="${tso_list:+;}host=${NODE_HOSTS[$i]} port=${NODE_PORTS[$i]} dbname=postgres user=postgres connect_timeout=2"
+done
 for i in "${!NODE_IDS[@]}"; do
   id=${NODE_IDS[$i]}
   master=off; [[ "${NODE_ROLES[$i]}" == coordinator ]] && master=on
@@ -26,6 +31,11 @@ for i in "${!NODE_IDS[@]}"; do
       # 持久化以 pg_wal 为准（崩溃可能丢分区流尾部）；多副本模式绝不能开。
       echo "pg_partdist.single_replica_fast_commit = on"
       echo "pg_raft.single_member_fast_commit = on"; } >> "$out/node$id.conf"
+  fi
+  if [[ "${TSO_RAFT:-0}" == 1 ]]; then
+    { echo; echo "# ---- TSO 随控制面 leader（TSO_RAFT=1）：协调者宕机后由新 leader 接着发号 ----"
+      echo "pg_partdist.tso_raft = on"
+      echo "pg_partdist.tso_conninfo = '$tso_list'"; } >> "$out/node$id.conf"
   fi
   # 可选覆盖段（后写者生效）：小机器上压内存、调超时等，不必改模板
   if [[ -n "${NODE_CONF_EXTRA:-}" ]]; then

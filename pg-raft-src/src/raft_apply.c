@@ -461,6 +461,24 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         return true;
     }
 
+    if (strcmp(op_type, PG_RAFT_OP_TSO_HWM) == 0)
+    {
+        /*
+         * 2026-10-19：TSO 发号上界。每个节点都抬高本地持久上界（文件 + WAL）——将来谁当选
+         * leader，谁就从已 apply 的最大值起发。hwm = 0 是新 leader 的屏障条目，只用来把
+         * 前任任期的条目一起带上提交点，没有要落的东西。
+         */
+        const char *h = strstr(payload_json, "\"hwm\"");
+        long long   v = 0;
+        const PartDistTsoRaftApi *api = pg_raft_tso_api();
+
+        if (h != NULL)
+            (void) sscanf(strchr(h, ':') + 1, " %lld", &v);
+        if (v > 0 && api != NULL)
+            api->apply_hwm((int64) v);
+        raft_spi_end(spi_owned);
+        return true;
+    }
     if (strcmp(op_type, PG_RAFT_OP_NODE_ADDRESS) == 0)
     {
         /* 2026-10-17（路线 A）：节点地址迁移 —— 落表（重启后由维护进程重灌）+ 立即改本节点共享内存 */

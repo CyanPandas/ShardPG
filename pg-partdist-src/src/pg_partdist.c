@@ -978,6 +978,13 @@ _PG_init(void)
         *rv = (void *) PartDistTsoDtxDecisionTs;
     }
 
+    /* 2026-10-19：TSO 随控制面 leader —— pg_raft 的 TSO 管理进程经此驱动发号（tso.h） */
+    {
+        void **rv = find_rendezvous_variable("partdist_tso_raft_api");
+
+        *rv = (void *) TsoRaftApi();
+    }
+
     /* R-P4-5：pg_raft 回执守护经此询问 TX2 未决登记，收敛完才许回执 */
     {
         void **rv = find_rendezvous_variable("partdist_dtx_pending_check_fn");
@@ -1009,6 +1016,7 @@ _PG_init(void)
     /* Register Demux background worker for crash recovery at startup */
     RegisterDemuxWorker();
     TsoRegisterHeartbeatWorker();   /* T3.5：GlobalSafeTs 心跳/续租 */
+    TsoRegisterProxyWorker();       /* 2026-10-20：节点内 TSO 代理（合批取号，一条连接） */
 
     /* Transaction callback: write PartWAL at PRE_COMMIT, discard on ABORT */
     RegisterXactCallback(PartWALXactCallback, NULL);

@@ -35,8 +35,43 @@
 #define TSO_HWM_FILE		"pg_tso_hwm"
 #define TSO_HWM_BATCH		INT64CONST(1000000)	/* 每次预留的号数（只影响落盘频率与重启跳号） */
 
+/*
+ * 2026-10-19：TSO 随控制面 leader 发号（pg_partdist.tso_raft = on）。
+ *
+ * 原形态里只有协调者能发号，协调者一挂全簇不能读写。打开后任何节点都可能是发号者，
+ * 由 pg_raft 的 TSO 管理进程（raft_consensus.c pg_raft_tso_main）驱动：
+ *   · 发号上界经控制面日志预留（OP_TSO_HWM），各节点 apply 时抬高本地持久上界
+ *     （pg_tso_raft_hwm 文件 + WAL，快照里也带着）；
+ *   · 新 leader 当选后先等满一个租约期（旧 leader 必已停发），再提交一条屏障拿到
+ *     前任全部预留里的最大值作起点，并预留新的一批，才开始发号；
+ *   · leader 每轮向对端确认"你的任期没超过我"，过半数确认就把租约延到这一轮
+ *     **发出时刻** + 租约时长；发号时租约过期即拒绝（单调时钟）。
+ * 号严格单调：前任发出的号都小于它已提交的上界，而新 leader 从这些上界的最大值起发、
+ * 且只在前任租约必然过期之后才发。
+ *
+ * pg_raft 经 rendezvous 变量 "partdist_tso_raft_api" 取下面这组函数（两扩展无编译期依赖，
+ * pg_raft.h 里有一份相同的定义，改动须两边一致）。
+ */
+typedef struct PartDistTsoRaftApi
+{
+	bool		(*enabled) (void);
+	int64		(*applied_hwm) (void);
+	void		(*apply_hwm) (int64 hwm);	/* apply OP_TSO_HWM / 装快照：只抬不降，落盘 + WAL */
+	void		(*set_lease) (int64 term, int64 until_mono_us);
+	bool		(*begin_serve) (int64 term, int64 start, int64 hwm);
+	void		(*extend) (int64 term, int64 hwm);
+	void		(*stop) (void);
+	void		(*status) (int64 *term, int64 *counter, int64 *hwm,
+						   int64 *lease_until_mono_us, int64 *applied_hwm);
+	int64		(*mono_us) (void);
+} PartDistTsoRaftApi;
+
+#define TSO_RAFT_HWM_FILE	"pg_tso_raft_hwm"
+
 extern void TsoDefineGUCs(void);
 extern void TsoRedoHwm(int64 hwm);	/* 2026-10-17：备库回放高水位记录 */
+extern void TsoRaftRedoAppliedHwm(int64 hwm);	/* 2026-10-19：备库回放已 apply 的发号上界 */
+extern const PartDistTsoRaftApi *TsoRaftApi(void);
 extern void RequestTsoShmem(void);
 extern void TsoShmemInit(void);
 
@@ -66,5 +101,8 @@ extern int64 TsoGetGlobalSafeTs(void);
 /* ---- T3.5 GlobalSafeTs（心跳 bgworker + 栅栏） ---- */
 extern void TsoRegisterHeartbeatWorker(void);
 extern PGDLLEXPORT void TsoHeartbeatWorkerMain(Datum main_arg);
+/* 2026-10-20：节点内 TSO 代理（pg_partdist.tso_proxy） */
+extern void TsoRegisterProxyWorker(void);
+extern PGDLLEXPORT void TsoProxyMain(Datum main_arg);
 
 #endif							/* PARTDIST_TSO_H */

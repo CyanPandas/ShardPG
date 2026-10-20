@@ -135,6 +135,8 @@ fo_probe_primary(const char *host, int port)
 }
 
 /* 返回是否真的提升了备库（拒绝切主时 false，下一次探测失败会再评估） */
+static bool fo_sync_citus_metadata(PGconn *coord, const char *why);
+
 static bool
 fo_do_failover(int node_id, const char *old_host, int old_port, FoStandby *sb, int nsb)
 {
@@ -305,21 +307,25 @@ fo_do_failover(int node_id, const char *old_host, int old_port, FoStandby *sb, i
             PGconn *cc;
             char    want[256];
 
-            snprintf(want, sizeof(want), "host=%s port=%d dbname=postgres user=postgres",
-                     sb[best].host, sb[best].port);
-            fo_set_tso_conninfo(sb[best].host, sb[best].port, want);
-            if (nodes != NULL)
+            /* 2026-10-19：TSO 随控制面 leader 时发号者与协调者无关，连接串由各节点按 node_map 对齐 */
+            if (!pg_raft_tso_enabled())
             {
-                int k;
-
-                for (k = 0; k < PQntuples(nodes); k++)
+                snprintf(want, sizeof(want), "host=%s port=%d dbname=postgres user=postgres",
+                         sb[best].host, sb[best].port);
+                fo_set_tso_conninfo(sb[best].host, sb[best].port, want);
+                if (nodes != NULL)
                 {
-                    if (atoi(PQgetvalue(nodes, k, 0)) == node_id)
-                        continue;
-                    fo_set_tso_conninfo(PQgetvalue(nodes, k, 1), atoi(PQgetvalue(nodes, k, 2)), want);
+                    int k;
+
+                    for (k = 0; k < PQntuples(nodes); k++)
+                    {
+                        if (atoi(PQgetvalue(nodes, k, 0)) == node_id)
+                            continue;
+                        fo_set_tso_conninfo(PQgetvalue(nodes, k, 1), atoi(PQgetvalue(nodes, k, 2)), want);
+                    }
                 }
+                pg_usleep(1000000L);    /* postmaster 处理 SIGHUP，之后新开的会话都带新连接串 */
             }
-            pg_usleep(1000000L);    /* postmaster 处理 SIGHUP，之后新开的会话都带新连接串 */
 
             cc = fo_connect(sb[best].host, sb[best].port, 3, 120000);
 
@@ -351,6 +357,8 @@ fo_do_failover(int node_id, const char *old_host, int old_port, FoStandby *sb, i
                              sb[best].host, sb[best].port, old_host, old_port);
                     if (fo_exec(cc, sql, err, sizeof(err)) == NULL)
                         elog(WARNING, "pg_raft: 协调者上改 Citus 路由失败：%s", err);
+                    else
+                        fo_sync_citus_metadata(cc, "切主后");
                     PQfinish(cc);
                 }
                 else
@@ -363,6 +371,71 @@ fo_do_failover(int node_id, const char *old_host, int old_port, FoStandby *sb, i
     elog(LOG, "pg_raft: 节点 %d 切主完成：新主 %s:%d，其余备库已改跟（%s）",
          node_id, sb[best].host, sb[best].port, others[0] ? others : "无");
     return true;
+}
+
+/*
+ * 2026-10-20：把协调者上的 Citus 元数据推给全部带元数据的 worker。
+ *
+ * citus_update_node 改的是协调者自己的 pg_dist_node；旧主已经死了，Citus 当场推不全，于是把
+ * 所有 worker 标成 metadatasynced = false，留给后台维护进程。而后台是**逐个节点**补同步，
+ * 每补一个又要求其余元数据节点都已同步 —— 全部同时"未同步"时互相等，永远补不上
+ * （lab 4 worker 实测：切主后 7 分钟仍是旧地址）。后果：从 worker 进来的查询仍路由到死掉的
+ * 旧主；2PC 恢复按旧地址问发起节点问不到，悬挂的 prepared 锁着行不放。
+ * start_metadata_sync_to_all_nodes() 一次推给全部节点，实测 0.5 s。
+ */
+static bool
+fo_sync_citus_metadata(PGconn *coord, const char *why)
+{
+    char err[256];
+
+    err[0] = '\0';
+    if (fo_exec(coord, "SELECT start_metadata_sync_to_all_nodes()", err, sizeof(err)) == NULL)
+    {
+        elog(WARNING, "pg_raft: %s把 Citus 元数据推给各 worker 失败：%s", why, err);
+        return false;
+    }
+    elog(LOG, "pg_raft: %s已把 Citus 元数据推给全部 worker", why);
+    return true;
+}
+
+/*
+ * 2026-10-20：兜底——控制面 leader 每 10 s 看一眼协调者上有没有"未同步"的 worker，有就再推一次
+ * （切主当时协调者连不上、或某个 worker 当时不可达而推失败的情形）。
+ */
+static void
+fo_reconcile_citus_metadata(void)
+{
+    static TimestampTz last = 0;
+    TimestampTz now = GetCurrentTimestamp();
+    PGconn     *self;
+    PGconn     *cc;
+    char        sql[256];
+    char       *v;
+    char        chost[256];
+    int         cport = 0;
+
+    if (pg_raft_coordinator_node_id <= 0)
+        return;
+    if (last != 0 && !TimestampDifferenceExceeds(last, now, 10000))
+        return;
+    last = now;
+    self = fo_self();
+    if (self == NULL)
+        return;
+    snprintf(sql, sizeof(sql), "SELECT hostname || ' ' || port FROM partdist.node_map WHERE node_id = %d",
+             pg_raft_coordinator_node_id);
+    v = fo_exec(self, sql, NULL, 0);
+    PQfinish(self);
+    if (v == NULL || sscanf(v, "%255s %d", chost, &cport) != 2)
+        return;
+    cc = fo_connect(chost, cport, 2, 30000);
+    if (cc == NULL)
+        return;
+    v = fo_exec(cc, "SELECT count(*) FROM pg_dist_node WHERE groupid <> 0 AND isactive "
+                    "AND hasmetadata AND NOT metadatasynced", NULL, 0);
+    if (v != NULL && atoi(v) > 0)
+        (void) fo_sync_citus_metadata(cc, "定期核对发现未同步的 worker，");
+    PQfinish(cc);
 }
 
 /* 控制面 leader 的维护进程按节流间隔调用 */
@@ -441,6 +514,7 @@ pg_raft_routea_failover_tick(void)
     }
     PQclear(r);
     PQfinish(self);
+    fo_reconcile_citus_metadata();
     MemoryContextSwitchTo(old);
 }
 
@@ -486,13 +560,50 @@ pg_raft_routea_reconcile_tso(void)
     char        sql[512];
     char       *v;
 
-    if (pg_raft_coordinator_node_id <= 0)
+    if (pg_raft_coordinator_node_id <= 0 && !pg_raft_tso_enabled())
         return;
     if (cxt == NULL)
         cxt = AllocSetContextCreate(TopMemoryContext, "pg_raft tso reconcile", ALLOCSET_SMALL_SIZES);
     MemoryContextReset(cxt);
     old = MemoryContextSwitchTo(cxt);
     c = fo_self();
+
+    /*
+     * 2026-10-19：TSO 随控制面 leader 发号时，连接串列出**全部**节点（分号分隔），客户端自己
+     * 找到当前发号者。节点地址随切主迁移（node_map 由 OP_NODE_ADDRESS 更新），这里跟着改。
+     */
+    if (c != NULL && pg_raft_tso_enabled())
+    {
+        v = fo_exec(c,
+                    "SELECT coalesce(string_agg(format('host=%s port=%s dbname=postgres user=postgres "
+                    "connect_timeout=2', hostname, port), ';' ORDER BY node_id), '') || '|' || "
+                    "coalesce(current_setting('pg_partdist.tso_conninfo', true), '') "
+                    "  FROM partdist.node_map WHERE port > 0",
+                    NULL, 0);
+        if (v != NULL && strchr(v, '|') != NULL && v[0] != '|')
+        {
+            char       *bar = strchr(v, '|');
+            const char *cur = bar + 1;
+            StringInfoData q;
+            char        err[256];
+
+            *bar = '\0';
+            if (strcmp(v, cur) != 0 && strchr(v, '\'') == NULL)
+            {
+                err[0] = '\0';
+                initStringInfo(&q);
+                appendStringInfo(&q, "ALTER SYSTEM SET pg_partdist.tso_conninfo = '%s'", v);
+                if (fo_exec(c, q.data, err, sizeof(err)) != NULL &&
+                    fo_exec(c, "SELECT pg_reload_conf()", err, sizeof(err)) != NULL)
+                    elog(LOG, "pg_raft: TSO 连接串按节点地址更新为 \"%s\"", v);
+                else
+                    elog(WARNING, "pg_raft: 改 TSO 连接串失败：%s", err);
+            }
+        }
+        PQfinish(c);
+        MemoryContextSwitchTo(old);
+        return;
+    }
     if (c != NULL)
     {
         snprintf(sql, sizeof(sql),

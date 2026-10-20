@@ -1042,6 +1042,16 @@ register_topology_worker(void)
     snprintf(worker.bgw_name, BGW_MAXLEN, "pg_raft maintenance");
     RegisterBackgroundWorker(&worker);
 
+    /* 2026-10-19：TSO 管理进程（pg_partdist.tso_raft 关着时空转，见 raft_consensus.c pg_raft_tso_main） */
+    if (pg_raft_raft_enabled)
+    {
+        snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_raft_tso_main");
+        snprintf(worker.bgw_name, BGW_MAXLEN, "pg_raft tso");
+        worker.bgw_restart_time = 1;
+        RegisterBackgroundWorker(&worker);
+        worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;
+    }
+
     /* 2026-10-17：节点级有序复制流的管理进程（见 raft_consensus.c pg_raft_stream_main） */
     if (pg_raft_raft_enabled && pg_raft_replicate_stream)
     {
@@ -1234,6 +1244,26 @@ _PG_init(void)
                             "Raft leader heartbeat interval in milliseconds.",
                             NULL, &pg_raft_heartbeat_ms, 400, 50, 10000,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    /* 2026-10-19：TSO 随控制面 leader 发号（pg_partdist.tso_raft = on 时生效，见 raft_consensus.c 末尾） */
+    DefineCustomIntVariable("pg_raft.tso_lease_ms",
+                            "TSO 发号者租约（毫秒）：过半数成员确认任期后，租约延到这一轮发出时刻 + 本值。",
+                            "新 leader 当选后先等本值 × 1.25 + 200 ms 再接任发号（旧 leader 必已停发），"
+                            "所以它也决定了换届时的发号空窗。全簇必须一致。",
+                            &pg_raft_tso_lease_ms, 2000, 500, 60000,
+                            PGC_POSTMASTER, GUC_UNIT_MS, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.tso_batch",
+                            "TSO 每次经控制面日志预留的号数（剩余不到一半就续下一批）。",
+                            NULL,
+                            &pg_raft_tso_batch, 4000000, 10000, 1000000000,
+                            PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable("pg_raft.tso_prefer_coordinator",
+                             "协调者追平后若持续不是控制面 leader，发起一次受控选举把 TSO 发号者拿回来。",
+                             "发号者在协调者上时，TSO 往返的负载不落在 worker 上。换届有几秒发号空窗，限频一分钟一次。",
+                             &pg_raft_tso_prefer_coordinator, true,
+                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     prev_shmem_request_hook = shmem_request_hook;
     shmem_request_hook = partdist_shmem_request;

@@ -1035,3 +1035,22 @@ $div$;
 
 COMMENT ON FUNCTION pg_raft_check_fastpath_divergence(OID, INTEGER) IS
     '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed。返回分叉条数，0 表示无分叉。';
+
+-- 2026-10-19：TSO 随控制面 leader 发号（pg_partdist.tso_raft = on；见 raft_consensus.c 末尾的设计说明）
+CREATE OR REPLACE FUNCTION pg_raft_tso_lease_check(p_term bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_lease_check';
+COMMENT ON FUNCTION pg_raft_tso_lease_check(bigint) IS
+'返回本节点控制面的当前任期。TSO 发号者（控制面 leader）每 100 ms 问一圈，过半数回答 <= 它的任期就续租。';
+
+CREATE OR REPLACE FUNCTION pg_raft_tso_takeover(p_term bigint, p_batch bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_takeover';
+COMMENT ON FUNCTION pg_raft_tso_takeover(bigint, bigint) IS
+'新 leader 接任发号：屏障条目 → 以已 apply 的最大预留上界为起点 → 预留一批 → 开始发号。由 TSO 管理进程在等满租约期后调用。';
+
+CREATE OR REPLACE FUNCTION pg_raft_tso_extend(p_term bigint, p_batch bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_extend';
+COMMENT ON FUNCTION pg_raft_tso_extend(bigint, bigint) IS
+'发号者续批：经控制面日志预留下一批号，返回新上界。';

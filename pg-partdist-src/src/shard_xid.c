@@ -1268,6 +1268,12 @@ shard_xid_allocate(Oid shard)
 		{
 			TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
 
+			/*
+			 * 2026-10-19（路线 A）：水位推进也记 WAL，物理备库回放时抬高它的水位文件。
+			 * 只写文件的话备库上是旧值，提升后会把旧主未提交事务用过的号重发出去
+			 * （见 shard_wal.h XLOG_SHARD_XID_WM）。记录排在这一批任何元组之前。
+			 */
+			(void) ShardWalLogXidWatermark(shard, (uint32) new_wm);
 			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm,
 										slot->trunc_before, slot->vacuum_xid);
 			slot->watermark = new_wm;
@@ -1327,6 +1333,56 @@ ShardXidRedoAdvance(Oid shard, TransactionId sxid)
 		ShardXidCtl->shadow[free_i].next_hint = sxid + 1;
 		ShardXidCtl->shadow[free_i].shard_relid = shard;
 	}
+	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
+ * 2026-10-19（路线 A）：startup 进程回放 XLOG_SHARD_XID_WM —— 主库把发号水位推到了 wm，
+ * 这一批里的号随后可能被写进元组（提交与否都在）。
+ *
+ * 影子之外还要**抬高水位文件**：影子只活在共享内存里，备库重启后从最近的重启点回放，
+ * 更早的水位记录不会再见到；文件是跨重启的持久事实。只抬不降，其余三个字段原样带回。
+ * 提升后第一次碰该分片时 shard_xid_slot_attach 取 Max(文件, 影子) 作起点，并把
+ * [claim_wm, 起点) 里仍是 RUNNING 的号判 ABORTED —— 旧主崩溃前没提交的元组从此不可见，
+ * 号也不会再发。
+ *
+ * 槽位理论上不会在恢复期存在（ShardXidEnsureClaimed 恢复期不挂槽），万一有，按同样规则抬。
+ */
+void
+ShardXidRedoRaiseWatermark(Oid shard, TransactionId wm)
+{
+	TransactionId alloc_wm,
+				claim_wm,
+				trunc_before,
+				vacuum_xid;
+	int			i;
+
+	if (ShardXidCtl == NULL || !TransactionIdIsNormal(wm))
+		return;
+
+	ShardXidRedoAdvance(shard, wm - 1);
+
+	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+	{
+		ShardXidSlot *slot = &ShardXidCtl->slots[i];
+
+		if (slot->shard_relid != shard)
+			continue;
+		if (wm > slot->watermark)
+		{
+			shard_xid_persist_watermark(shard, wm, slot->claim_wm,
+										slot->trunc_before, slot->vacuum_xid);
+			slot->watermark = wm;
+			if (slot->next_xid < wm)
+				slot->next_xid = wm;
+		}
+		LWLockRelease(ShardXidCtl->lock);
+		return;
+	}
+	shard_xid_read_wm_file(shard, &alloc_wm, &claim_wm, &trunc_before, &vacuum_xid);
+	if (wm > alloc_wm)
+		shard_xid_persist_watermark(shard, wm, claim_wm, trunc_before, vacuum_xid);
 	LWLockRelease(ShardXidCtl->lock);
 }
 
@@ -1483,6 +1539,14 @@ ShardXidEnsureClaimed(Oid shard)
 
 	if (ShardXidCtl == NULL)
 		return 0;				/* shmem 未起（防御） */
+
+	/*
+	 * 2026-10-19：物理备库（hot standby）上的读不挂槽。挂槽即认领 —— 会把主库上
+	 * 还在跑的事务的号在本地 clog 里判 ABORTED；而且槽一旦挂上，提升后就不会再按
+	 * 回放来的水位重新认领（见 ShardXidRedoRaiseWatermark）。提升后第一次碰到再挂。
+	 */
+	if (RecoveryInProgress())
+		return 0;
 
 	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
 	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)

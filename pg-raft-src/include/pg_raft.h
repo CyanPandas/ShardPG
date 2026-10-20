@@ -46,6 +46,26 @@ pg_raft_spi_end(bool must_finish)
 /* 2026-10-17（路线 A）：节点的物理备库登记（自动切主用）。
  * payload = {"node_id":N,"name":"S","host":"H","port":P,"remove":0|1} */
 #define PG_RAFT_OP_NODE_STANDBY      "OP_NODE_STANDBY"
+/* 2026-10-19：TSO 发号上界预留（TSO 随控制面 leader）。payload = {"term":T,"hwm":H}；H=0 是屏障 */
+#define PG_RAFT_OP_TSO_HWM           "OP_TSO_HWM"
+
+/*
+ * 2026-10-19：pg_partdist 经 rendezvous 变量 "partdist_tso_raft_api" 导出的 TSO 发号接口。
+ * 与 pg-partdist-src/include/tso.h 的同名定义逐字段一致，改动须两边同步。
+ */
+typedef struct PartDistTsoRaftApi
+{
+    bool        (*enabled) (void);
+    int64       (*applied_hwm) (void);
+    void        (*apply_hwm) (int64 hwm);
+    void        (*set_lease) (int64 term, int64 until_mono_us);
+    bool        (*begin_serve) (int64 term, int64 start, int64 hwm);
+    void        (*extend) (int64 term, int64 hwm);
+    void        (*stop) (void);
+    void        (*status) (int64 *term, int64 *counter, int64 *hwm,
+                           int64 *lease_until_mono_us, int64 *applied_hwm);
+    int64       (*mono_us) (void);
+} PartDistTsoRaftApi;
 
 #define PG_RAFT_MAX_HOSTNAME 256
 
@@ -108,6 +128,14 @@ extern void pg_raft_routea_fence_check(void);
 extern int  pg_raft_stream_batch_entries;
 extern int  pg_raft_stream_inflight;
 extern void pg_raft_stream_main(Datum main_arg);
+/* 2026-10-19：TSO 随控制面 leader（raft_consensus.c 末尾） */
+extern int  pg_raft_tso_lease_ms;
+extern int  pg_raft_tso_batch;
+extern bool pg_raft_tso_prefer_coordinator;
+extern const PartDistTsoRaftApi *pg_raft_tso_api(void);
+extern bool pg_raft_tso_enabled(void);
+extern int64 pg_raft_tso_snapshot_hwm(void);
+extern void pg_raft_tso_main(Datum main_arg);
 
 /* 后台追平通道（计划文档 §12.4 #5）：TopologyMonitor 经 libpq 自连触发 */
 extern int  pg_raft_catchup_interval_ms;

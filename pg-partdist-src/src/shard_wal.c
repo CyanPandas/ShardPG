@@ -90,6 +90,38 @@ ShardWalLogTsoHwm(int64 hwm)
 	return XLogInsert(SHARD_RMGR_ID, XLOG_SHARD_TSO_HWM);
 }
 
+XLogRecPtr
+ShardWalLogTsoRaftHwm(int64 hwm)
+{
+	xl_tso_hwm	xl;
+
+	if (!XLogInsertAllowed())
+		return InvalidXLogRecPtr;
+	xl.hwm = hwm;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xl, sizeof(xl));
+	return XLogInsert(SHARD_RMGR_ID, XLOG_SHARD_TSO_RAFT_HWM);
+}
+
+/*
+ * 发号水位推进。调用方持分片 xid 全局锁、在这一批的第一个号发出之前调 —— 用到这些号的
+ * 元组记录在 WAL 里必然排在它后面，备库只要见到了元组，就一定先回放过这条水位。
+ * 不等刷盘：主库自己的重启靠水位文件（发号前已 fsync），这条只给备库用。
+ */
+XLogRecPtr
+ShardWalLogXidWatermark(Oid shard, uint32 wm)
+{
+	xl_shard_xid_wm xl;
+
+	if (!XLogInsertAllowed())
+		return InvalidXLogRecPtr;
+	xl.shard = shard;
+	xl.wm = wm;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xl, sizeof(xl));
+	return XLogInsert(SHARD_RMGR_ID, XLOG_SHARD_XID_WM);
+}
+
 bool
 ShardWalWaitDurable(XLogRecPtr lsn)
 {
@@ -198,6 +230,16 @@ shard_rmgr_redo(XLogReaderState *record)
 		case XLOG_SHARD_TSO_HWM:
 			TsoRedoHwm(((xl_tso_hwm *) data)->hwm);
 			break;
+		case XLOG_SHARD_TSO_RAFT_HWM:
+			TsoRaftRedoAppliedHwm(((xl_tso_hwm *) data)->hwm);
+			break;
+		case XLOG_SHARD_XID_WM:
+			{
+				xl_shard_xid_wm *xl = (xl_shard_xid_wm *) data;
+
+				ShardXidRedoRaiseWatermark(xl->shard, (TransactionId) xl->wm);
+				break;
+			}
 		default:
 			elog(PANIC, "shard_rmgr_redo: unknown op code %u", info);
 	}
@@ -224,8 +266,11 @@ shard_rmgr_desc(StringInfo buf, XLogReaderState *record)
 						 xl->gxid, xl->committed ? "COMMIT" : "ABORT",
 						 xl->commit_ts, xl->nxids);
 	}
-	else if (info == XLOG_SHARD_TSO_HWM)
+	else if (info == XLOG_SHARD_TSO_HWM || info == XLOG_SHARD_TSO_RAFT_HWM)
 		appendStringInfo(buf, "hwm " INT64_FORMAT, ((xl_tso_hwm *) data)->hwm);
+	else if (info == XLOG_SHARD_XID_WM)
+		appendStringInfo(buf, "shard %u wm %u",
+						 ((xl_shard_xid_wm *) data)->shard, ((xl_shard_xid_wm *) data)->wm);
 }
 
 static const char *
@@ -239,6 +284,10 @@ shard_rmgr_identify(uint8 info)
 			return "VERDICT";
 		case XLOG_SHARD_TSO_HWM:
 			return "TSO_HWM";
+		case XLOG_SHARD_TSO_RAFT_HWM:
+			return "TSO_RAFT_HWM";
+		case XLOG_SHARD_XID_WM:
+			return "XID_WM";
 	}
 	return NULL;
 }

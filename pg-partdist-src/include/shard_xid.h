@@ -82,6 +82,8 @@ extern int	ShardXidClaimOnPromote(Oid shard);
 
 /* T2.5：恢复期影子推进（0007 redo 钩子逐对喂入，startup 进程调用） */
 extern void ShardXidRedoAdvance(Oid shard, TransactionId sxid);
+/* 2026-10-19：备库回放发号水位记录（XLOG_SHARD_XID_WM），抬高水位文件与影子 */
+extern void ShardXidRedoRaiseWatermark(Oid shard, TransactionId wm);
 
 /* T2.7：partition_map 驱动门控——运行时集合登记 + 水位文件预创建
  * （pg_shard_xid/ 目录 = 启动登记表，ShardXidShmemInit 扫描重建集合） */

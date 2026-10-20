@@ -28,6 +28,7 @@
 #include "shard_clog.h"
 #include "partition_wal_writer.h"
 
+#include "access/twophase.h"		/* max_prepared_xacts：按 PGPROC 总数开槽 */
 #include "fmgr.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
@@ -37,17 +38,26 @@
 #include "storage/latch.h"
 #include "utils/wait_event.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 /* ---- GUC ---- */
 
 static char *tso_conninfo = NULL;	/* 空 = 遗留模式（不取号，ts=0） */
+static int	tso_retry_ms = 20000;	/* 2026-10-19：多地址时找不到发号者的最长等待 */
+static bool tso_proxy = true;		/* 2026-10-20：节点内 TSO 代理（见下方"TSO 代理"一节） */
 
-/* ---- 本节点活跃快照集合（共享内存，每后端一槽） ---- */
-
-#define TSO_CLIENT_MAX_ACTIVE	256
+/*
+ * ---- 本节点活跃快照集合（共享内存，每个 PGPROC 一槽） ----
+ *
+ * 2026-10-20：原来是固定 256 槽、满了就不登记。384 终端时单个 worker 上同时持快照的后端
+ * 可以超过 256，没登记上的快照不在本节点上报的 oldest 里，GlobalSafeTs 可能越过它（vacuum
+ * 清掉它还要读的版本）。改成按 PGPROC 总数开槽、按 pgprocno 直接定位，不会满。
+ */
 
 typedef struct TsoActiveEntry
 {
@@ -63,18 +73,74 @@ typedef struct TsoClientState
 								 * catalog 查询（实测 SIGSEGV 循环拖垮节点），
 								 * 只读这里；未知则跳过心跳——没人取过号就
 								 * 没有快照需要续租保护。 */
+	int32		ep_hint;		/* 2026-10-19：多地址时最近一次取号成功的地址下标 */
 	TimestampTz last_beat_ok;	/* T3.5 栅栏：最近一次租约续期成功时刻
 								 * （start_ts RPC 或心跳，二者都在 master
 								 * 侧续租；commit_ts 不续租不算数） */
 	int32		lease_ms;		/* master 返回的租约时长；0=未知 */
-	TsoActiveEntry active[TSO_CLIENT_MAX_ACTIVE];
+	int32		nactive;
+	TsoActiveEntry active[FLEXIBLE_ARRAY_MEMBER];	/* 下标 = pgprocno */
 } TsoClientState;
 
 static TsoClientState *TsoClientCtl = NULL;
 
+/*
+ * ---- TSO 代理（2026-10-20） ----
+ *
+ * 原来每个取号的后端各自连一条到发号者：384 终端时发号者身上的发号连接加客户端连接超过
+ * max_connections（lab：协调者日志 1 万多次 "too many clients already"，事务取不到号失败）。
+ *
+ * 现在每个节点一个代理进程（TsoProxyMain）用**一条**连接替全节点取号：后端在自己的槽里登记
+ * 请求（start / commit）后睡在自己的 latch 上；代理每轮把已登记的请求一次取走，一个往返向
+ * 发号者要一段连续的号（partdist_tso_start_ts_n / partdist_tso_commit_ts_n），逐个分发并唤醒。
+ *
+ * 单调性：号只分给本轮 RPC 发出**之前**已登记的请求，剩下的不留。任何请求 R2 若在别的请求 R1
+ * 拿到号之后才登记，它进入的那一轮一定在登记之后才发出，发号者给它的号一定更大 —— 与逐个取号同一保证。
+ * 序号：每次请求槽内序号 +1，代理按取走时的序号回填；后端放弃（超时、被取消）后那份结果不会被误认。
+ * 代理不在（未启用 / 还没起来 / 崩了正在拉起）时，后端退回原来的直连取号。
+ */
+#define TSO_PX_IDLE		0
+#define TSO_PX_REQ		1
+#define TSO_PX_INFLIGHT	2
+#define TSO_PX_DONE		3
+#define TSO_PX_ERR		4
+#define TSO_PX_START	1
+#define TSO_PX_COMMIT	2
+
+typedef struct TsoProxySlot
+{
+	slock_t		mutex;
+	uint32		seq;			/* 发起方每次请求 +1 */
+	uint32		picked;			/* 代理取走时的序号 */
+	int8		state;
+	int8		kind;
+	int64		result;
+	Latch	   *latch;
+} TsoProxySlot;
+
+typedef struct TsoProxyState
+{
+	slock_t		mutex;
+	pid_t		pid;			/* 代理进程；0 = 不在 */
+	Latch	   *latch;
+	char		err[256];		/* 最近一次失败原因（ERR 时给后端报） */
+	int32		nslots;
+	TsoProxySlot slots[FLEXIBLE_ARRAY_MEMBER];	/* 下标 = pgprocno */
+} TsoProxyState;
+
+static TsoProxyState *TsoProxyCtl = NULL;
+
+static int
+tso_total_procs(void)
+{
+	return MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+}
+
 /* ---- 后端状态 ---- */
 
 static PGconn *tso_conn = NULL;
+static int	tso_conn_ep = -1;		/* 2026-10-19：tso_conn 连的是第几个地址 */
+static char *tso_conn_src = NULL;	/* 建连时的 tso_conninfo 原文（重载后变了就重连） */
 static int64 cur_start_ts = 0;	/* 本事务分片快照；0 = 未取 */
 static int64 cur_commit_ts = 0; /* PRE_COMMIT 暂存；0 = 未取 */
 static int64 cur_gxid = 0;		/* T4.1：join 注入的全局事务号；0 = 无 */
@@ -158,12 +224,38 @@ TsoClientDefineGUCs(void)
 		PGC_SIGHUP,
 		0,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"pg_partdist.tso_proxy",
+		"节点内 TSO 代理：本节点所有后端经一个代理进程、一条连接合批取号。",
+		"关掉则每个后端各自连发号者（原行为）；高并发时发号者的连接数会被打满。",
+		&tso_proxy,
+		true,
+		PGC_POSTMASTER,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"pg_partdist.tso_retry_ms",
+		"tso_conninfo 列了多个地址时，找不到发号者最多等多久（毫秒）。",
+		"TSO 随控制面 leader 发号（pg_partdist.tso_raft）时，发号者换人的那几秒里所有地址都会"
+		"拒绝；取号在这段时间里轮询重试，超时才报错。只有一个地址时不等（原行为）。",
+		&tso_retry_ms,
+		20000,
+		0,
+		600000,
+		PGC_SIGHUP,
+		GUC_UNIT_MS,
+		NULL, NULL, NULL);
 }
 
 void
 RequestTsoClientShmem(void)
 {
-	RequestAddinShmemSpace(MAXALIGN(sizeof(TsoClientState)));
+	RequestAddinShmemSpace(MAXALIGN(offsetof(TsoClientState, active) +
+									sizeof(TsoActiveEntry) * tso_total_procs()));
+	RequestAddinShmemSpace(MAXALIGN(offsetof(TsoProxyState, slots) +
+									sizeof(TsoProxySlot) * tso_total_procs()));
 	RequestNamedLWLockTranche("pg_partdist_tso_client", 1);
 }
 
@@ -175,15 +267,41 @@ TsoClientShmemInit(void)
 	TsoClientCtl = NULL;
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 	TsoClientCtl = ShmemInitStruct("pg_partdist_tso_client",
-								   sizeof(TsoClientState), &found);
+								   offsetof(TsoClientState, active) +
+								   sizeof(TsoActiveEntry) * tso_total_procs(), &found);
 	if (!found)
 	{
-		memset(TsoClientCtl->active, 0, sizeof(TsoClientCtl->active));
+		TsoClientCtl->nactive = tso_total_procs();
+		memset(TsoClientCtl->active, 0, sizeof(TsoActiveEntry) * TsoClientCtl->nactive);
 		TsoClientCtl->node_id = -1;
+		TsoClientCtl->ep_hint = 0;
 		TsoClientCtl->last_beat_ok = 0;
 		TsoClientCtl->lease_ms = 0;
 		TsoClientCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_tso_client")[0].lock;
+	}
+	TsoProxyCtl = ShmemInitStruct("pg_partdist_tso_proxy",
+								  offsetof(TsoProxyState, slots) +
+								  sizeof(TsoProxySlot) * tso_total_procs(), &found);
+	if (!found)
+	{
+		int			i;
+
+		SpinLockInit(&TsoProxyCtl->mutex);
+		TsoProxyCtl->pid = 0;
+		TsoProxyCtl->latch = NULL;
+		TsoProxyCtl->err[0] = '\0';
+		TsoProxyCtl->nslots = tso_total_procs();
+		for (i = 0; i < TsoProxyCtl->nslots; i++)
+		{
+			SpinLockInit(&TsoProxyCtl->slots[i].mutex);
+			TsoProxyCtl->slots[i].seq = 0;
+			TsoProxyCtl->slots[i].picked = 0;
+			TsoProxyCtl->slots[i].state = TSO_PX_IDLE;
+			TsoProxyCtl->slots[i].kind = 0;
+			TsoProxyCtl->slots[i].result = 0;
+			TsoProxyCtl->slots[i].latch = NULL;
+		}
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -208,7 +326,7 @@ tso_active_min_locked(void)
 	int64		m = 0;
 	int			i;
 
-	for (i = 0; i < TSO_CLIENT_MAX_ACTIVE; i++)
+	for (i = 0; i < TsoClientCtl->nactive; i++)
 		if (TsoClientCtl->active[i].pid != 0 &&
 			(m == 0 || TsoClientCtl->active[i].start_ts < m))
 			m = TsoClientCtl->active[i].start_ts;
@@ -219,26 +337,13 @@ static void
 tso_active_register(int64 ts)
 {
 	int			i;
-	int			free_i = -1;
 
+	if (MyProc == NULL || MyProc->pgprocno < 0 || MyProc->pgprocno >= TsoClientCtl->nactive)
+		return;
+	i = MyProc->pgprocno;
 	LWLockAcquire(TsoClientCtl->lock, LW_EXCLUSIVE);
-	for (i = 0; i < TSO_CLIENT_MAX_ACTIVE; i++)
-	{
-		if (TsoClientCtl->active[i].pid == MyProcPid)
-		{
-			TsoClientCtl->active[i].start_ts = ts;
-			LWLockRelease(TsoClientCtl->lock);
-			return;
-		}
-		if (free_i < 0 && TsoClientCtl->active[i].pid == 0)
-			free_i = i;
-	}
-	if (free_i >= 0)
-	{
-		TsoClientCtl->active[free_i].start_ts = ts;
-		TsoClientCtl->active[free_i].pid = MyProcPid;
-	}
-	/* 槽满：不登记，只影响 GlobalSafeTs 精度（偏小=安全方向），不拦事务 */
+	TsoClientCtl->active[i].start_ts = ts;
+	TsoClientCtl->active[i].pid = MyProcPid;
 	LWLockRelease(TsoClientCtl->lock);
 }
 
@@ -252,16 +357,15 @@ TsoClientClearActive(void)
 	cur_gxid = 0;
 	cur_coord_gsid = 0;
 
-	if (TsoClientCtl == NULL)
+	if (TsoClientCtl == NULL || MyProc == NULL ||
+		MyProc->pgprocno < 0 || MyProc->pgprocno >= TsoClientCtl->nactive)
 		return;
+	i = MyProc->pgprocno;
+	if (TsoClientCtl->active[i].pid != MyProcPid)
+		return;					/* 本进程没登记过（无锁读：只有本进程会写这一槽为自己的 pid） */
 	LWLockAcquire(TsoClientCtl->lock, LW_EXCLUSIVE);
-	for (i = 0; i < TSO_CLIENT_MAX_ACTIVE; i++)
-		if (TsoClientCtl->active[i].pid == MyProcPid)
-		{
-			TsoClientCtl->active[i].pid = 0;
-			TsoClientCtl->active[i].start_ts = 0;
-			break;
-		}
+	TsoClientCtl->active[i].pid = 0;
+	TsoClientCtl->active[i].start_ts = 0;
 	LWLockRelease(TsoClientCtl->lock);
 }
 
@@ -324,39 +428,137 @@ tso_disconnect(void)
 		PQfinish(tso_conn);
 		tso_conn = NULL;
 	}
+	tso_conn_ep = -1;
 }
 
-/* 执行一次取号 SQL；成功返回 ts，失败返回 -1（调用方决定重连重试） */
-static int64
-tso_rpc_once(const char *sql)
+/*
+ * 2026-10-19：tso_conninfo 可以是分号分隔的多个连接串（TSO 随控制面 leader 发号时
+ * 列出全部节点）。取第 k 个（0 起）到 buf；返回地址总数。
+ */
+static int
+tso_endpoint(int k, char *buf, size_t len)
+{
+	const char *p = tso_conninfo;
+	int			n = 0;
+
+	if (buf != NULL && len > 0)
+		buf[0] = '\0';
+	while (p != NULL && *p != '\0')
+	{
+		const char *e = strchr(p, ';');
+		size_t		l = (e != NULL) ? (size_t) (e - p) : strlen(p);
+
+		while (l > 0 && (*p == ' ' || *p == '\t'))
+		{
+			p++;
+			l--;
+		}
+		if (l > 0)
+		{
+			if (n == k && buf != NULL)
+				strlcpy(buf, p, Min(len, l + 1));
+			n++;
+		}
+		p = (e != NULL) ? e + 1 : NULL;
+	}
+	return n;
+}
+
+/*
+ * 执行一次 SQL，取第一行第一列的文本到 val；成功返回 true。失败时连接已弃，下一次换下一个地址。
+ * 2026-10-20：从 tso_rpc_once 拆出，TSO 代理一个往返要拿回两段号（文本 "a c"）。
+ */
+static bool
+tso_rpc_exec(const char *sql, char *val, size_t vlen)
 {
 	PGresult   *res;
-	int64		ts = -1;
+	int			n;
 
+	/* 连接串重载过（如发号者地址迁移）：旧连接作废 */
+	if (tso_conn != NULL &&
+		(tso_conn_src == NULL || strcmp(tso_conn_src, tso_conninfo) != 0))
+		tso_disconnect();
+
+	n = tso_endpoint(-1, NULL, 0);
 	if (tso_conn == NULL)
 	{
-		tso_conn = PQconnectdb(tso_conninfo);
+		char		ep[1024];
+		int			k;
+
+		if (n <= 0)
+		{
+			snprintf(tso_last_err, sizeof(tso_last_err), "tso_conninfo 为空");
+			return false;
+		}
+		k = (tso_conn_ep >= 0) ? tso_conn_ep : ((TsoClientCtl != NULL) ? TsoClientCtl->ep_hint : 0);
+		if (k < 0 || k >= n)
+			k = 0;
+		tso_endpoint(k, ep, sizeof(ep));
+		tso_conn = PQconnectdb(ep);
+		tso_conn_ep = k;
+		if (tso_conn_src != NULL)
+			pfree(tso_conn_src);
+		tso_conn_src = MemoryContextStrdup(TopMemoryContext, tso_conninfo);
 		if (PQstatus(tso_conn) != CONNECTION_OK)
 		{
-			snprintf(tso_last_err, sizeof(tso_last_err), "connect: %s",
-					 PQerrorMessage(tso_conn));
-			tso_disconnect();
-			return -1;
+			snprintf(tso_last_err, sizeof(tso_last_err), "connect(%d/%d): %s",
+					 k + 1, n, PQerrorMessage(tso_conn));
+			PQfinish(tso_conn);
+			tso_conn = NULL;
+			tso_conn_ep = (k + 1) % n;	/* 下一次换下一个地址 */
+			return false;
 		}
 	}
 
 	res = PQexec(tso_conn, sql);
 	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
 	{
-		ts = strtoll(PQgetvalue(res, 0, 0), NULL, 10);
+		strlcpy(val, PQgetvalue(res, 0, 0), vlen);
 		PQclear(res);
-		return (ts > 0) ? ts : -1;
+		if (TsoClientCtl != NULL && n > 1)
+			TsoClientCtl->ep_hint = tso_conn_ep;	/* 无锁写：只是下一条新连接的起点提示 */
+		return true;
 	}
-	snprintf(tso_last_err, sizeof(tso_last_err), "exec: %s",
-			 PQerrorMessage(tso_conn));
+	snprintf(tso_last_err, sizeof(tso_last_err), "exec(%d/%d): %s",
+			 tso_conn_ep + 1, n, PQerrorMessage(tso_conn));
 	PQclear(res);
-	tso_disconnect();			/* 失败即弃连接，重试走全新连接 */
-	return -1;
+	{
+		int			next = (n > 0) ? (tso_conn_ep + 1) % n : 0;
+
+		tso_disconnect();		/* 失败即弃连接，重试走全新连接 */
+		tso_conn_ep = next;		/* 下一次换下一个地址 */
+	}
+	return false;
+}
+
+/* 执行一次取号 SQL；成功返回 ts，失败返回 -1 */
+static int64
+tso_rpc_once(const char *sql)
+{
+	char		v[64];
+	int64		ts;
+
+	if (!tso_rpc_exec(sql, v, sizeof(v)))
+		return -1;
+	ts = strtoll(v, NULL, 10);
+	return (ts > 0) ? ts : -1;
+}
+
+/*
+ * 把每个地址都问一遍（不等待）；单地址时问两次（原"重连重试一次"）。
+ * 失败返回 -1。取号与心跳共用。
+ */
+static int64
+tso_rpc_sweep(const char *sql)
+{
+	int			n = tso_endpoint(-1, NULL, 0);
+	int			tries = Max(2, n);
+	int			i;
+	int64		ts = -1;
+
+	for (i = 0; i < tries && ts < 0; i++)
+		ts = tso_rpc_once(sql);
+	return ts;
 }
 
 static int64
@@ -379,10 +581,24 @@ static int64
  */
 tso_rpc(const char *sql, const char *what)
 {
-	int64		ts = tso_rpc_once(sql);
+	int64		ts = tso_rpc_sweep(sql);
 
-	if (ts < 0)
-		ts = tso_rpc_once(sql);	/* 重连重试一次 */
+	/*
+	 * 2026-10-19：多地址（发号者随控制面 leader）时，换届那几秒里每个地址都会拒绝 ——
+	 * 轮询等到新发号者上任，超过 tso_retry_ms 才报错。
+	 */
+	if (ts < 0 && tso_endpoint(-1, NULL, 0) > 1 && tso_retry_ms > 0)
+	{
+		TimestampTz start = GetCurrentTimestamp();
+
+		while (ts < 0 &&
+			   !TimestampDifferenceExceeds(start, GetCurrentTimestamp(), tso_retry_ms))
+		{
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(100 * 1000L);
+			ts = tso_rpc_sweep(sql);
+		}
+	}
 	if (ts < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -390,6 +606,113 @@ tso_rpc(const char *sql, const char *what)
 				 errdetail("conninfo=\"%s\"；%s", tso_conninfo, tso_last_err),
 				 errhint("fail-closed：绝不以本地时钟顶替（设计 §2.2 纪律 2）。")));
 	return ts;
+}
+
+/* ---- TSO 代理：后端侧 ---- */
+
+static bool
+tso_proxy_up(void)
+{
+	return tso_proxy && TsoProxyCtl != NULL && TsoProxyCtl->pid != 0 &&
+		TsoProxyCtl->latch != NULL && MyProc != NULL &&
+		MyProc->pgprocno >= 0 && MyProc->pgprocno < TsoProxyCtl->nslots &&
+		MyProcPid != TsoProxyCtl->pid;
+}
+
+/*
+ * 经代理取一个号（kind = START / COMMIT）。成功返回号；代理不在返回 -1（调用方改直连）。
+ * 代理报失败（换届超过 tso_retry_ms 等）则 ERROR，与直连一致。
+ */
+static int64
+tso_proxy_get(int kind, const char *what)
+{
+	TsoProxySlot *slot;
+	uint32		myseq;
+	TimestampTz start;
+	int64		res = 0;
+	int			st = TSO_PX_IDLE;
+	Latch	   *pl;
+
+	if (!tso_proxy_up())
+		return -1;
+	slot = &TsoProxyCtl->slots[MyProc->pgprocno];
+	SpinLockAcquire(&slot->mutex);
+	myseq = ++slot->seq;
+	slot->kind = (int8) kind;
+	slot->state = TSO_PX_REQ;
+	slot->result = 0;
+	slot->latch = MyLatch;
+	SpinLockRelease(&slot->mutex);
+	pl = TsoProxyCtl->latch;
+	if (pl != NULL)
+		SetLatch(pl);
+
+	start = GetCurrentTimestamp();
+	for (;;)
+	{
+		SpinLockAcquire(&slot->mutex);
+		if (slot->seq == myseq && (slot->state == TSO_PX_DONE || slot->state == TSO_PX_ERR))
+		{
+			st = slot->state;
+			res = slot->result;
+			slot->state = TSO_PX_IDLE;
+			SpinLockRelease(&slot->mutex);
+			break;
+		}
+		SpinLockRelease(&slot->mutex);
+
+		/* 代理在等待期间没了（崩溃、正在拉起）：撤回请求，改直连 */
+		if (TsoProxyCtl->pid == 0 ||
+			TimestampDifferenceExceeds(start, GetCurrentTimestamp(), tso_retry_ms + 10000))
+		{
+			bool		gone = (TsoProxyCtl->pid == 0);
+
+			SpinLockAcquire(&slot->mutex);
+			if (slot->seq == myseq && slot->state != TSO_PX_DONE && slot->state != TSO_PX_ERR)
+				slot->state = TSO_PX_IDLE;
+			SpinLockRelease(&slot->mutex);
+			if (gone)
+				return -1;
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("TSO 代理 %d ms 内没有回应（取 %s）", tso_retry_ms + 10000, what)));
+		}
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 100, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (st == TSO_PX_ERR || res <= 0)
+	{
+		char		err[256];
+
+		SpinLockAcquire(&TsoProxyCtl->mutex);
+		strlcpy(err, TsoProxyCtl->err, sizeof(err));
+		SpinLockRelease(&TsoProxyCtl->mutex);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("TSO 不可达或拒绝服务（取 %s 失败，经节点 TSO 代理）", what),
+				 errdetail("conninfo=\"%s\"；%s", tso_conninfo, err),
+				 errhint("fail-closed：绝不以本地时钟顶替（设计 §2.2 纪律 2）。")));
+	}
+	return res;
+}
+
+/* 取 start_ts：代理在用就经代理（oldest 由代理按全节点算），否则按 sql 直连 */
+static int64
+tso_take_start(const char *sql)
+{
+	int64		ts = tso_proxy_get(TSO_PX_START, "start_ts");
+
+	return (ts > 0) ? ts : tso_rpc(sql, "start_ts");
+}
+
+static int64
+tso_take_commit(const char *what)
+{
+	int64		ts = tso_proxy_get(TSO_PX_COMMIT, what);
+
+	return (ts > 0) ? ts : tso_rpc("SELECT partdist.partdist_tso_commit_ts()", what);
 }
 
 /* ---- 对内 API（T3.3 起被可见性/落账消费） ---- */
@@ -459,12 +782,12 @@ TsoGetStartTs(void)
 	LWLockRelease(TsoClientCtl->lock);
 
 	/* 字面量显式转型：0 会被解析成 int4 撞不上 (int, bigint) 签名 */
+	if (TsoClientCtl->node_id < 0)
+		TsoClientCtl->node_id = (int32) PartDistLocalNodeId();	/* 代理要用（它没有 catalog） */
 	snprintf(sql, sizeof(sql),
 			 "SELECT partdist.partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 (int) PartDistLocalNodeId(), oldest);
-	cur_start_ts = tso_rpc(sql, "start_ts");
-	if (TsoClientCtl->node_id < 0)
-		TsoClientCtl->node_id = (int32) PartDistLocalNodeId();
+	cur_start_ts = tso_take_start(sql);
 	tso_note_lease_renewal(0);	/* start_ts 在 master 侧即续租 */
 	tso_active_register(cur_start_ts);
 	return cur_start_ts;
@@ -494,7 +817,7 @@ TsoRefreshStartTs(void)
 	snprintf(sql, sizeof(sql),
 			 "SELECT partdist.partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 (int) PartDistLocalNodeId(), oldest);
-	ts = tso_rpc(sql, "start_ts");
+	ts = tso_take_start(sql);
 	tso_note_lease_renewal(0);
 	if (ts > cur_start_ts)
 	{
@@ -517,9 +840,18 @@ TsoRefreshStartTs(void)
 int64
 TsoGetGlobalSafeTs(void)
 {
+	int64		ts;
+
 	if (!tso_configured())
 		return 0;				/* 遗留模式：无 TSO 宇宙，不清 */
-	return tso_rpc("SELECT partdist.partdist_global_safe_ts()", "global_safe_ts");
+
+	/*
+	 * 2026-10-19：按上面的约定，取不到就返回 0（不清），不报错、也不等发号者换届。
+	 * 发号者刚上任的一个登记租约期里 GlobalSafeTs 按设计就是 0，原来走 tso_rpc 会把它
+	 * 当成失败（ts <= 0）报错；多地址重试之后更会白等满 tso_retry_ms。
+	 */
+	ts = tso_rpc_sweep("SELECT partdist.partdist_global_safe_ts()");
+	return (ts > 0) ? ts : 0;
 }
 
 /*
@@ -531,7 +863,7 @@ TsoStashCommitTs(void)
 {
 	if (cur_commit_ts != 0 || !tso_configured())
 		return;
-	cur_commit_ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "commit_ts");
+	cur_commit_ts = tso_take_commit("commit_ts");
 }
 
 /* 收集钩子/落账读取暂存（临界区内安全：纯内存读） */
@@ -619,7 +951,7 @@ PartDistTsoDtxDecisionTs(void)
 
 	if (!tso_configured())
 		return 0;
-	ts = tso_rpc("SELECT partdist.partdist_tso_commit_ts()", "dtx_decision_ts");
+	ts = tso_take_commit("dtx_decision_ts");
 	cur_commit_ts = ts;
 	return ts;
 }
@@ -675,13 +1007,9 @@ TsoHeartbeatOnce(void)
 	snprintf(sql, sizeof(sql),
 			 "SELECT partdist.partdist_tso_heartbeat(%d, CAST(" INT64_FORMAT " AS bigint))",
 			 node, oldest);
-	lease = tso_rpc_once(sql);
+	lease = tso_rpc_sweep(sql);	/* 每个地址问一遍（单地址时重连重试一次） */
 	if (lease < 0)
-	{
-		lease = tso_rpc_once(sql);	/* 重连重试一次 */
-		if (lease < 0)
-			return false;
-	}
+		return false;
 	tso_note_lease_renewal((int32) lease);
 	return true;
 }
@@ -816,6 +1144,226 @@ TsoRegisterHeartbeatWorker(void)
 	worker.bgw_restart_time = 10;	/* 常驻：异常退出 10s 重启 */
 	strlcpy(worker.bgw_library_name, "pg_partdist", BGW_MAXLEN);
 	strlcpy(worker.bgw_function_name, "TsoHeartbeatWorkerMain", BGW_MAXLEN);
+	worker.bgw_main_arg = Int32GetDatum(0);
+	worker.bgw_notify_pid = 0;
+	RegisterBackgroundWorker(&worker);
+}
+
+/* ================= TSO 代理进程（2026-10-20，设计见文件开头"TSO 代理"） ================= */
+
+static void
+tso_proxy_on_exit(int code, Datum arg)
+{
+	if (TsoProxyCtl == NULL)
+		return;
+	SpinLockAcquire(&TsoProxyCtl->mutex);
+	if (TsoProxyCtl->pid == MyProcPid)
+	{
+		TsoProxyCtl->pid = 0;
+		TsoProxyCtl->latch = NULL;
+	}
+	SpinLockRelease(&TsoProxyCtl->mutex);
+}
+
+/*
+ * 本轮一个往返：要 ns 个 start_ts、nc 个 commit_ts。成功返回 true，*fs / *fc 为两段各自的第一个号。
+ * start 的登记带全节点此刻的最老活跃快照（与后端直连时各自带的是同一张表）。
+ */
+static bool
+tso_proxy_rpc(int ns, int nc, int64 *fs, int64 *fc)
+{
+	char		sql[320];
+	char		v[128];
+	int32		node;
+	int64		oldest;
+	long long	a = 0,
+				c = 0;
+	int			n,
+				tries,
+				i;
+
+	node = TsoClientCtl->node_id;
+	if (node < 0)
+		node = partdist_node_id;
+	if (ns > 0 && node < 0)
+	{
+		snprintf(tso_last_err, sizeof(tso_last_err), "本节点号未知（还没有后端取过号，也没配 pg_partdist.node_id）");
+		return false;
+	}
+	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+	oldest = tso_active_min_locked();
+	LWLockRelease(TsoClientCtl->lock);
+
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist.partdist_tso_start_ts_n(%d, CAST(" INT64_FORMAT " AS bigint), %d)::text"
+			 " || ' ' || partdist.partdist_tso_commit_ts_n(%d)::text",
+			 node < 0 ? 0 : node, oldest, ns, nc);
+	n = tso_endpoint(-1, NULL, 0);
+	tries = Max(2, n);
+	for (i = 0; i < tries; i++)
+	{
+		if (!tso_rpc_exec(sql, v, sizeof(v)))
+			continue;
+		if (sscanf(v, "%lld %lld", &a, &c) == 2 && (ns == 0 || a > 0) && (nc == 0 || c > 0))
+		{
+			*fs = (int64) a;
+			*fc = (int64) c;
+			return true;
+		}
+		snprintf(tso_last_err, sizeof(tso_last_err), "发号者回复不对：%s", v);
+		return false;
+	}
+	return false;
+}
+
+/* 回填一批：只认取走时的那个序号（发起方放弃后又发了新请求就不碰它） */
+static void
+tso_proxy_deliver(const int *idx, const uint32 *seq, int n, int64 first, int8 state)
+{
+	int			k;
+
+	for (k = 0; k < n; k++)
+	{
+		TsoProxySlot *sl = &TsoProxyCtl->slots[idx[k]];
+		Latch	   *l = NULL;
+
+		SpinLockAcquire(&sl->mutex);
+		if (sl->seq == seq[k] && sl->state == TSO_PX_INFLIGHT)
+		{
+			sl->result = (state == TSO_PX_DONE) ? first + k : 0;
+			sl->state = state;
+			l = sl->latch;
+		}
+		SpinLockRelease(&sl->mutex);
+		if (l != NULL)
+			SetLatch(l);
+	}
+}
+
+void
+TsoProxyMain(Datum main_arg)
+{
+	int			nmax;
+	int		   *ps,
+			   *pc;
+	uint32	   *qs,
+			   *qc;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+	if (TsoProxyCtl == NULL || TsoClientCtl == NULL)
+		proc_exit(0);
+
+	nmax = TsoProxyCtl->nslots;
+	ps = (int *) MemoryContextAlloc(TopMemoryContext, sizeof(int) * nmax);
+	pc = (int *) MemoryContextAlloc(TopMemoryContext, sizeof(int) * nmax);
+	qs = (uint32 *) MemoryContextAlloc(TopMemoryContext, sizeof(uint32) * nmax);
+	qc = (uint32 *) MemoryContextAlloc(TopMemoryContext, sizeof(uint32) * nmax);
+	on_shmem_exit(tso_proxy_on_exit, (Datum) 0);
+	SpinLockAcquire(&TsoProxyCtl->mutex);
+	TsoProxyCtl->latch = MyLatch;
+	TsoProxyCtl->pid = MyProcPid;
+	SpinLockRelease(&TsoProxyCtl->mutex);
+	ereport(LOG, (errmsg("pg_partdist: TSO 代理启动（%d 个请求槽），本节点经一条连接合批取号", nmax)));
+
+	for (;;)
+	{
+		int			ns = 0,
+					nc = 0,
+					i;
+		TimestampTz t0;
+
+		if (ShutdownRequestPending)
+			proc_exit(0);
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		/* 先清 latch 再收：收完之后才来的请求会重新置位，下面的 WaitLatch 立即返回，不会漏 */
+		ResetLatch(MyLatch);
+		for (i = 0; i < nmax; i++)
+		{
+			TsoProxySlot *sl = &TsoProxyCtl->slots[i];
+
+			if (sl->state != TSO_PX_REQ)
+				continue;		/* 无锁预读：不是 REQ 的大多数槽不必拿锁 */
+			SpinLockAcquire(&sl->mutex);
+			if (sl->state == TSO_PX_REQ)
+			{
+				sl->state = TSO_PX_INFLIGHT;
+				sl->picked = sl->seq;
+				if (sl->kind == TSO_PX_START)
+				{
+					ps[ns] = i;
+					qs[ns++] = sl->seq;
+				}
+				else
+				{
+					pc[nc] = i;
+					qc[nc++] = sl->seq;
+				}
+			}
+			SpinLockRelease(&sl->mutex);
+		}
+		if (ns + nc == 0)
+		{
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 1000, PG_WAIT_EXTENSION);
+			continue;
+		}
+
+		/* 这一批的 RPC 一定在全部请求登记之后才发出（单调性的前提）；失败就在 tso_retry_ms 内重试同一批 */
+		t0 = GetCurrentTimestamp();
+		for (;;)
+		{
+			int64		fs = 0,
+						fc = 0;
+
+			if (tso_configured() && tso_proxy_rpc(ns, nc, &fs, &fc))
+			{
+				tso_proxy_deliver(ps, qs, ns, fs, TSO_PX_DONE);
+				tso_proxy_deliver(pc, qc, nc, fc, TSO_PX_DONE);
+				break;
+			}
+			if (ShutdownRequestPending ||
+				TimestampDifferenceExceeds(t0, GetCurrentTimestamp(), tso_retry_ms))
+			{
+				SpinLockAcquire(&TsoProxyCtl->mutex);
+				strlcpy(TsoProxyCtl->err, tso_configured() ? tso_last_err : "tso_conninfo 为空",
+						sizeof(TsoProxyCtl->err));
+				SpinLockRelease(&TsoProxyCtl->mutex);
+				tso_proxy_deliver(ps, qs, ns, 0, TSO_PX_ERR);
+				tso_proxy_deliver(pc, qc, nc, 0, TSO_PX_ERR);
+				break;
+			}
+			pg_usleep(100 * 1000L);
+			if (ConfigReloadPending)
+			{
+				ConfigReloadPending = false;
+				ProcessConfigFile(PGC_SIGHUP);	/* 换届时地址列表可能刚被改过 */
+			}
+		}
+	}
+}
+
+void
+TsoRegisterProxyWorker(void)
+{
+	BackgroundWorker worker;
+
+	if (!tso_proxy)
+		return;
+	memset(&worker, 0, sizeof(worker));
+	strlcpy(worker.bgw_name, "pg_partdist tso proxy", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "pg_partdist tso proxy", BGW_MAXLEN);
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 1;	/* 崩了 1 s 后拉起；期间后端退回直连 */
+	strlcpy(worker.bgw_library_name, "pg_partdist", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "TsoProxyMain", BGW_MAXLEN);
 	worker.bgw_main_arg = Int32GetDatum(0);
 	worker.bgw_notify_pid = 0;
 	RegisterBackgroundWorker(&worker);
