@@ -13,9 +13,13 @@ IMG=shardpg:prof
 # worker 名 主机 端口 容器 备库端口
 WORKERS="n2:10.77.110.145:31082:shardpg-fix-n2:31094 n3:10.77.110.147:31081:shardpg-fix-n3:31095 n4:10.77.110.148:31083:shardpg-fix-n4:31096"
 HOSTS="10.77.110.145 10.77.110.147 10.77.110.148"
+# 2026-10-20：额外的 worker（4 个 worker 部署用），格式同上，如 EXTRA_WORKERS="n5:10.77.110.147:31084:shardpg-fix-n5:31098"
+[ -n "${EXTRA_WORKERS:-}" ] && WORKERS="$WORKERS $EXTRA_WORKERS"
 # COORD_HA=1：协调者 n1（148:31080）也配两个同步备库（145 / 147 上的 31097），协调者切主实验用
 [ "${COORD_HA:-0}" = 1 ] && WORKERS="n1:10.77.110.148:31080:shardpg-fix-n1:31097 $WORKERS"
 PSQL="docker exec shardpg-fix-client /work/pg-install/bin/psql -U postgres -XAtq"
+# 2026-10-20：MEM_LIMIT（如 8g）给备库容器设内存上限并关 swap（与 node.sh 一致，模拟小内存服务器）
+MEMOPT=""; [ -n "${MEM_LIMIT:-}" ] && MEMOPT="--memory $MEM_LIMIT --memory-swap $MEM_LIMIT"
 onhost() { local h=$1; shift; if [ "$h" = 10.77.110.145 ]; then bash -c "$*"; else ssh -n $h "$*"; fi; }
 base() { [ "$1" = 10.77.110.145 ] && echo $R || echo $T; }
 # mk_standby worker名 主库host 主库port 备库host 备库port：在备库 host 上按主库做 pg_basebackup 建备库（同步执行）
@@ -28,7 +32,7 @@ mk_standby() {
     docker run --rm -v $dir:/d $IMG bash -c 'rm -rf /d/pgdata'
     docker run --rm --network host -v $dir:/d $IMG /work/pg-install/bin/pg_basebackup -h $ph -p $pp -U postgres -D /d/pgdata -X stream -S $sn -c fast
     docker run --rm -v $dir:/d $IMG bash -c \"rm -f /d/pgdata/postgresql.auto.conf.tmp; sed -i '/^primary_conninfo\|^primary_slot_name\|^synchronous_standby_names/d' /d/pgdata/postgresql.auto.conf; touch /d/pgdata/standby.signal; printf \\\"port = $sp\\nhot_standby = on\\nprimary_conninfo = 'host=$ph port=$pp user=postgres application_name=$sn'\\nprimary_slot_name = '$sn'\\nwal_receiver_timeout = 10s\\n\\\" >> /d/pgdata/postgresql.auto.conf\"
-    docker run -d --name $name --network host --shm-size 2g -v $dir:/d $IMG /work/pg-install/bin/postgres -D /d/pgdata >/dev/null
+    docker run -d --name $name --network host --shm-size 2g $MEMOPT -v $dir:/d $IMG /work/pg-install/bin/postgres -D /d/pgdata >/dev/null
     for i in \$(seq 120); do docker exec $name /work/pg-install/bin/pg_isready -h 127.0.0.1 -p $sp -q && { echo $name up; exit 0; }; sleep 1; done
     echo $name FAILED; docker logs --tail 30 $name; exit 1"
 }
@@ -53,7 +57,7 @@ standbys)
         docker run --rm -v $dir:/d $IMG bash -c 'rm -rf /d/pgdata'
         docker run --rm --network host -v $dir:/d $IMG /work/pg-install/bin/pg_basebackup -h $ph -p $pp -U postgres -D /d/pgdata -X stream -S $sn -c fast
         docker run --rm -v $dir:/d $IMG bash -c \"touch /d/pgdata/standby.signal; printf \\\"port = $sp\\nhot_standby = on\\nprimary_conninfo = 'host=$ph port=$pp user=postgres application_name=$sn'\\nprimary_slot_name = '$sn'\\nwal_receiver_timeout = 10s\\n\\\" >> /d/pgdata/postgresql.auto.conf\"
-        docker run -d --name $name --network host --shm-size 2g -v $dir:/d $IMG /work/pg-install/bin/postgres -D /d/pgdata >/dev/null
+        docker run -d --name $name --network host --shm-size 2g $MEMOPT -v $dir:/d $IMG /work/pg-install/bin/postgres -D /d/pgdata >/dev/null
         for i in \$(seq 120); do docker exec $name /work/pg-install/bin/pg_isready -h 127.0.0.1 -p $sp -q && { echo $name up; exit 0; }; sleep 1; done
         echo $name FAILED; docker logs --tail 30 $name; exit 1" &
     done
@@ -73,7 +77,7 @@ sync)
   ;;
 register)
   # 控制面 leader（group 0）上提议；各节点 apply 后 partdist.node_standby 一致
-  NODES="10.77.110.148:31080 10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083"
+  NODES="${NODES:-10.77.110.148:31080 10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083}"
   L=""
   for hp in $NODES; do
     h=${hp%:*}; p=${hp#*:}
