@@ -14,20 +14,33 @@
 #
 # 节点名就是 nodes.conf 第一列（master、worker1 …）。在 145 上执行：147、148 上的节点经 ssh 操作
 # （只有 145 能免密 ssh 到另外两台）。连 master 用本机任意一个节点容器里的 psql，口令走容器里的口令文件。
+# 容器内安装版本（在 145 的 bash 中执行；不写宿主机安装或配置目录）：
+#   SHARDPG_CONTAINER_MODE=1 bash <(docker exec shardpg-ddl-worker1 cat /work/pg-install/bin/shardpg_ctl) status
+# add-node / remove-node 在此模式下只允许本演示的 worker4（147:32436）。
 # ============================================================================
 set -uo pipefail
+CONTAINER_MODE=${SHARDPG_CONTAINER_MODE:-0}
+CONTROL=shardpg-ddl-worker1
+CONTAINER_CONF=/work/pg-install/etc/lab-nodes.conf
+if [[ "$CONTAINER_MODE" == 1 ]]; then
+    # Run on host 145, with the script/config read from our current DDL container.
+    # No host installation, nodes.conf or data directory is created or rewritten.
+    rows() { docker exec "$CONTROL" cat "$CONTAINER_CONF" | awk '!/^#/ && NF == 4'; }
+    field() { rows | awk -v n="$1" -v k="$2" '$1 == n {print $k}'; }
+    rows >/dev/null || exit 1
+else
 BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 D=$(cd "$BIN_DIR/../.." && pwd)                 # 部署目录：pg-install 的上一级
 CONF="$D/nodes.conf"
 [[ -f "$CONF" ]] || { echo "找不到 $CONF" >&2; exit 1; }
-PG=/work/pg-install/bin
-DATA_ROOT=/work/pg-cluster-data
-
 rows()      { awk '!/^#/ && NF == 4' "$CONF"; }
 field()     { awk -v n="$1" -v k="$2" '!/^#/ && NF == 4 && $1 == n {print $k}' "$CONF"; }
+fi
 need_node() { [[ -n "$(field "$1" 1)" ]] || { echo "nodes.conf 里没有节点 $1" >&2; exit 1; }; }
-MASTER_IP=$(awk '!/^#/ && NF == 4 && $2 == 1 {print $3}' "$CONF")
-MASTER_PORT=$(awk '!/^#/ && NF == 4 && $2 == 1 {print $4}' "$CONF")
+PG=/work/pg-install/bin
+DATA_ROOT=/work/pg-cluster-data
+MASTER_IP=$(rows | awk '$2 == 1 {print $3}')
+MASTER_PORT=$(rows | awk '$2 == 1 {print $4}')
 SELF_IP=""
 for ip in $(hostname -I 2>/dev/null); do
     rows | awk '{print $3}' | grep -qx "$ip" && { SELF_IP=$ip; break; }
@@ -48,7 +61,8 @@ host_dir() { on_host "$1" 'for d in /data1/yyt/shardpg-ddl-demo /home/yyt/shardp
 # 在 master 上执行 SQL：借本机任意一个在跑的节点容器里的 psql
 sql() {
     local c
-    c=$(docker ps --format '{{.Names}}' | grep '^shardpg-ddl-' | head -1)
+    if [[ "$CONTAINER_MODE" == 1 ]]; then c=$CONTROL
+    else c=$(docker ps --format '{{.Names}}' | grep '^shardpg-ddl-' | head -1); fi
     [[ -n "$c" ]] || { echo "本机没有在跑的 shardpg-ddl-* 容器" >&2; return 1; }
     docker exec -i -e PGOPTIONS='-c client_min_messages=warning' "$c" \
         $PG/psql -h "$MASTER_IP" -p "$MASTER_PORT" -U postgres -X -v ON_ERROR_STOP=1 "$@"
@@ -70,13 +84,17 @@ cmd_status() {
 cmd_stop() {
     need_node "$1"
     local ip; ip=$(field "$1" 3)
-    on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh stop $1 ${2:-immediate}"
+    if [[ "$CONTAINER_MODE" == 1 ]]; then
+        on_host "$ip" "docker exec shardpg-ddl-$1 $PG/pg_ctl -D $DATA_ROOT/$1 -m ${2:-immediate} -w -t 90 stop" </dev/null
+    else on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh stop $1 ${2:-immediate}"; fi
 }
 
 cmd_start() {
     need_node "$1"
     local ip; ip=$(field "$1" 3)
-    on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh start $1"
+    if [[ "$CONTAINER_MODE" == 1 ]]; then
+        on_host "$ip" "docker exec shardpg-ddl-$1 $PG/pg_ctl -D $DATA_ROOT/$1 -l $DATA_ROOT/$1/pg.log -w -t 90 start" </dev/null
+    else on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh start $1"; fi
 }
 
 cmd_shards() {
@@ -102,6 +120,7 @@ SQL
 }
 
 cmd_add_node() {
+    if [[ "$CONTAINER_MODE" == 1 ]]; then container_add_node "$@"; return; fi
     local name=${1:?节点名} ip=${2:?机器 IP} port=${3:?端口} id h dir peers
     if [[ -n "$(field "$name" 1)" ]]; then
         [[ "$(field "$name" 3) $(field "$name" 4)" == "$ip $port" ]] || { echo "nodes.conf 里 $name 已是别的地址" >&2; exit 1; }
@@ -145,6 +164,7 @@ cmd_move_primary() {
 }
 
 cmd_remove_node() {
+    if [[ "$CONTAINER_MODE" == 1 ]]; then container_remove_node "$@"; return; fi
     local name=${1:?节点名} id ip port n others h dir
     need_node "$name"
     id=$(field "$name" 2); ip=$(field "$name" 3); port=$(field "$name" 4)
@@ -187,6 +207,61 @@ cmd_remove_node() {
         on_host "$h" "sed -i -E '/^$name[[:space:]]/d' $(host_dir "$h")/nodes.conf"
     done
     cmd_status
+}
+
+container_add_node() {
+    [[ "${1:-} ${2:-} ${3:-}" == 'worker4 10.77.110.147 32436' ]] || {
+        echo 'Container mode allows only worker4 on 10.77.110.147:32436' >&2; return 1; }
+    local n ip port peers
+    peers=$(sql -At -c 'SHOW pg_raft.peers') || return 1
+    [[ "$peers" == '1@10.77.110.148:32432,2@10.77.110.145:32433,3@10.77.110.147:32434,4@10.77.110.148:32435' ]] || {
+        echo 'Expected the original four-node topology; inspect any partial earlier add first' >&2; return 1; }
+    # Preserve the exact original auto.conf peer setting inside each owned container.
+    while read -r n _ ip port; do
+        on_host "$ip" "docker exec shardpg-ddl-$n bash -c 'set -e; test ! -e /tmp/ddl-before-worker4.auto; cp $DATA_ROOT/$n/postgresql.auto.conf /tmp/ddl-before-worker4.auto'" </dev/null || return 1
+    done < <(rows)
+    docker exec "$CONTROL" cat /work/pg-install/bin/isolated_node.sh |
+        on_host_in 10.77.110.147 'bash -s -- create' || return 1
+    # Record it before joining so a failed join can be inspected and cleaned up.
+    docker exec "$CONTROL" bash -c "printf 'worker4 5 10.77.110.147 32436\n' >> $CONTAINER_CONF" || return 1
+    sql -c "SELECT * FROM shardpg.add_node('10.77.110.147',32436)"
+}
+
+container_remove_node() {
+    [[ "${1:-}" == worker4 ]] || { echo 'Container mode removes only its own worker4' >&2; return 1; }
+    need_node worker4
+    [[ "$(sql -At -c 'SELECT count(*) FROM partdist.partition_map WHERE 5=ANY(ARRAY[primary_node]||secondary_nodes)')" == 0 ]] || {
+        echo 'worker4 still owns shards; move them away or drop the demo tables first' >&2; return 1; }
+    local n ip port before after
+    # Guard against deleting a different container that happens to use this name.
+    [[ "$(on_host 10.77.110.147 "docker inspect -f '{{index .Config.Labels \"io.shardpg.container-demo\"}}' shardpg-ddl-worker4")" == ba76941 ]] || return 1
+    before=$(sql -At -c 'SELECT partdist.partdist_tso_client_start_ts()') || return 1
+    sql -c "SELECT citus_remove_node(nodename,nodeport) FROM pg_dist_node WHERE nodeport=32436" || return 1
+    cmd_stop worker4 fast || return 1
+    for n in worker1 worker2 worker3 master; do cmd_stop "$n" fast || return 1; done
+    while read -r n _ ip port; do
+        [[ "$n" == worker4 ]] && continue
+        # The add operation only changes pg_raft.peers; preserve all other settings.
+        on_host "$ip" "docker exec shardpg-ddl-$n bash -c 'set -e; test -f /tmp/ddl-before-worker4.auto; sed -E \"/^pg_raft\\.peers *=/d\" $DATA_ROOT/$n/postgresql.auto.conf > /tmp/ddl-after-worker4.auto; sed -n -E \"/^pg_raft\\.peers *=/p\" /tmp/ddl-before-worker4.auto >> /tmp/ddl-after-worker4.auto; cat /tmp/ddl-after-worker4.auto > $DATA_ROOT/$n/postgresql.auto.conf'" </dev/null || return 1
+    done < <(rows)
+    for n in master worker1 worker2 worker3; do cmd_start "$n" || return 1; done
+    for _ in $(seq 1 40); do
+        [[ "$(sql -At -c 'SELECT (leader_node_id>0)::int FROM partdist.pg_raft_group_status() WHERE group_id=0' 2>/dev/null)" == 1 ]] && break
+        sleep 2
+    done
+    while read -r n _ ip port; do
+        [[ "$n" == worker4 ]] && continue
+        on_host "$ip" "docker exec shardpg-ddl-$n $PG/psql -h /tmp -p $port -U postgres -X -q -v ON_ERROR_STOP=1 -c 'DELETE FROM partdist.node_map WHERE node_id=5'" </dev/null || return 1
+        on_host "$ip" "docker exec shardpg-ddl-$n rm /tmp/ddl-before-worker4.auto /tmp/ddl-after-worker4.auto" </dev/null || return 1
+    done < <(rows)
+    after=$(sql -At -c 'SELECT partdist.partdist_tso_client_start_ts()') || return 1
+    [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ && "$after" -gt "$before" ]] || { echo "TSO check failed: $before -> $after" >&2; return 1; }
+    docker exec "$CONTROL" cat /work/pg-install/bin/isolated_node.sh |
+        on_host_in 10.77.110.147 'bash -s -- destroy' || return 1
+    # The config file belongs to postgres; its installation directory may be root-owned.
+    # Write the existing file instead of sed -i, which needs directory write permission.
+    docker exec "$CONTROL" bash -c 'node_rows=$(sed "/^worker4[[:space:]]/d" "$1") && printf "%s\n" "$node_rows" > "$1"' _ "$CONTAINER_CONF" || return 1
+    echo "Removed worker4; TSO $before -> $after; original four nodes restored"
 }
 
 case "${1:-}" in

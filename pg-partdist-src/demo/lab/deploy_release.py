@@ -22,7 +22,7 @@ NODES = [(148, "master", 32432), (145, "worker1", 32433),
          (147, "worker2", 32434), (148, "worker3", 32435)]
 BIN = "/work/pg-install/bin"
 BASE = "/work/pg-cluster-data"
-FUNCTIONS = "'move_bucket_primary','move_primary','add_node','move_replica'"
+FUNCTIONS = "'partition_map_unregister','move_bucket_primary','move_primary','add_node','move_replica'"
 
 
 def command(host, args):

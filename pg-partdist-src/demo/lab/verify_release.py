@@ -36,7 +36,8 @@ def main():
         equal(f"{name} SQL", sql(node, "SELECT count(*) FROM pg_proc WHERE "
               "(proname='move_bucket_primary' AND position('primary of %s shard(s)' IN prosrc)>0) OR "
               "(proname='add_node' AND position('shardpg add worker' IN prosrc)>0) OR "
-              "(proname='move_replica' AND position('log not caught up (%s at %s' IN prosrc)>0);"), "3")
+              "(proname='move_replica' AND position('log not caught up (%s at %s' IN prosrc)>0) OR "
+              "(proname='partition_map_unregister' AND position('P7-N117' IN prosrc)>0);"), "4")
         marks[name] = int(docker(host, "exec", cname, "sh", "-c",
                                  f"wc -l < {BASE}/{name}/pg.log").decode())
     equal("test names are unused", sql(master,

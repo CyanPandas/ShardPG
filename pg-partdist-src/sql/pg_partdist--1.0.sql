@@ -2524,22 +2524,35 @@ DECLARE
     v_g0   integer;
     v_idx  bigint := 0;
     v_left integer := 0;
+    v_batch bigint[];
+    v_first integer;
     i      integer;
 BEGIN
     IF p_ids IS NULL OR cardinality(p_ids) = 0 THEN
         RETURN 0;
     END IF;
-    FOR i IN 1..20 LOOP
-        SELECT leader_node_id INTO v_g0 FROM partdist.pg_raft_group_status() WHERE group_id = 0;
-        BEGIN
-            v_idx := partdist.node_exec(v_g0, format(
-                'SELECT partdist.pg_raft_group_propose(0, ''OP_PARTITION_DROP'', %L)',
-                json_build_object('partition_ids', p_ids)::text))::bigint;
-        EXCEPTION WHEN OTHERS THEN
-            v_idx := 0;
-        END;
-        EXIT WHEN v_idx > 0;
-        PERFORM pg_catalog.pg_sleep(1);
+    -- P7-N117: RaftLogEntry.payload has 768 bytes, including the terminator.
+    -- Even 32 signed bigint values fit (< 768 bytes); one unbounded array does not.
+    -- A newly joined node can replay hundreds of pre-N112 historical registrations.
+    FOR v_first IN SELECT generate_series(array_lower(p_ids, 1), array_upper(p_ids, 1), 32) LOOP
+        v_batch := p_ids[v_first:v_first + 31];
+        v_idx := 0;
+        FOR i IN 1..20 LOOP
+            SELECT leader_node_id INTO v_g0 FROM partdist.pg_raft_group_status() WHERE group_id = 0;
+            BEGIN
+                v_idx := partdist.node_exec(v_g0, format(
+                    'SELECT partdist.pg_raft_group_propose(0, ''OP_PARTITION_DROP'', %L)',
+                    json_build_object('partition_ids', v_batch)::text))::bigint;
+            EXCEPTION WHEN OTHERS THEN
+                v_idx := 0;
+            END;
+            EXIT WHEN v_idx > 0;
+            PERFORM pg_catalog.pg_sleep(1);
+        END LOOP;
+        IF v_idx <= 0 THEN
+            -- Local absence is not proof of success: only another node may hold the rows.
+            RAISE EXCEPTION 'could not commit partition unregister batch (% ids)', cardinality(v_batch);
+        END IF;
     END LOOP;
     FOR i IN 1..30 LOOP
         SELECT count(*) INTO v_left FROM partdist.partition_map WHERE partition_id::bigint = ANY (p_ids);
