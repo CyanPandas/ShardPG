@@ -505,6 +505,22 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         ok = (ret == SPI_OK_UPDATE);
         pfree(sql.data);
     }
+    else if (strcmp(op_type, PG_RAFT_OP_PARTITION_DROP) == 0)
+    {
+        /*
+         * ★ P7-N112：删表清理经控制面日志删分区登记，各节点按日志序删本地的行。重放、装快照后再
+         * 重放都和实际一致（快照之后的这条删除会再执行一遍；删不存在的行无害，幂等）。
+         */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.partition_map "
+                         "WHERE partition_id::bigint IN "
+                         "(SELECT jsonb_array_elements_text(%s::jsonb -> 'partition_ids')::bigint)",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, false, 0);
+        ok = (ret == SPI_OK_DELETE);
+        pfree(sql.data);
+    }
     else if (strcmp(op_type, PG_RAFT_OP_PARTITION_PRIMARY_BATCH) == 0)
     {
         /*

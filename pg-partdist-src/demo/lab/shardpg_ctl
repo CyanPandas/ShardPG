@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# ============================================================================
+# shardpg_ctl —— ShardPG 演示集群的命令行工具，和 pg_ctl 并列放在 pg-install/bin
+#
+#   shardpg_ctl status                              各节点：机器、端口、容器、数据库是否在跑、控制面状态
+#   shardpg_ctl stop  <节点> [immediate|fast]       停掉节点上的 PostgreSQL（默认 immediate，等同断电）
+#   shardpg_ctl start <节点>                        启动节点上的 PostgreSQL
+#   shardpg_ctl shards [表名]                       各分片的主从（shardpg.shards）
+#   shardpg_ctl files <节点>                        这台节点上实际有哪些分片：分片表（含大小）和 Raft 组状态文件
+#   shardpg_ctl add-node <节点> <机器IP> <端口>     加一台 worker：起容器、初始化、建扩展，再入簇（不重启任何节点）
+#   shardpg_ctl move-replica <分片> <源节点> <目标节点>   把一份副本从源节点迁到目标节点（共置分片一起）
+#   shardpg_ctl move-primary <分片> <目标节点>      计划内切主（共置分片一起）
+#   shardpg_ctl remove-node <节点>                  去掉 add-node 加的节点（整簇重启一次；演示收尾用）
+#
+# 节点名就是 nodes.conf 第一列（master、worker1 …）。在 145 上执行：147、148 上的节点经 ssh 操作
+# （只有 145 能免密 ssh 到另外两台）。连 master 用本机任意一个节点容器里的 psql，口令走容器里的口令文件。
+# ============================================================================
+set -uo pipefail
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+D=$(cd "$BIN_DIR/../.." && pwd)                 # 部署目录：pg-install 的上一级
+CONF="$D/nodes.conf"
+[[ -f "$CONF" ]] || { echo "找不到 $CONF" >&2; exit 1; }
+PG=/work/pg-install/bin
+DATA_ROOT=/work/pg-cluster-data
+
+rows()      { awk '!/^#/ && NF == 4' "$CONF"; }
+field()     { awk -v n="$1" -v k="$2" '!/^#/ && NF == 4 && $1 == n {print $k}' "$CONF"; }
+need_node() { [[ -n "$(field "$1" 1)" ]] || { echo "nodes.conf 里没有节点 $1" >&2; exit 1; }; }
+MASTER_IP=$(awk '!/^#/ && NF == 4 && $2 == 1 {print $3}' "$CONF")
+MASTER_PORT=$(awk '!/^#/ && NF == 4 && $2 == 1 {print $4}' "$CONF")
+SELF_IP=""
+for ip in $(hostname -I 2>/dev/null); do
+    rows | awk '{print $3}' | grep -qx "$ip" && { SELF_IP=$ip; break; }
+done
+
+# 在节点所在的机器上执行 shell 命令（本机直接跑，其他机器 ssh）
+on_host() {
+    local h=$1; shift
+    if [[ "$h" == "$SELF_IP" ]]; then bash -c "$*"; else ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$h" "$*"; fi
+}
+# 同上，但把本地的标准输入送过去（喂 SQL 用）
+on_host_in() {
+    local h=$1; shift
+    if [[ "$h" == "$SELF_IP" ]]; then bash -c "$*"; else ssh -o BatchMode=yes -o ConnectTimeout=5 "$h" "$*"; fi
+}
+# 那台机器上的部署目录（145 在 /data1，147、148 在 /home）
+host_dir() { on_host "$1" 'for d in /data1/yyt/shardpg-ddl-demo /home/yyt/shardpg-ddl-demo; do [ -f $d/demo_node.sh ] && { echo $d; break; }; done'; }
+# 在 master 上执行 SQL：借本机任意一个在跑的节点容器里的 psql
+sql() {
+    local c
+    c=$(docker ps --format '{{.Names}}' | grep '^shardpg-ddl-' | head -1)
+    [[ -n "$c" ]] || { echo "本机没有在跑的 shardpg-ddl-* 容器" >&2; return 1; }
+    docker exec -i -e PGOPTIONS='-c client_min_messages=warning' "$c" \
+        $PG/psql -h "$MASTER_IP" -p "$MASTER_PORT" -U postgres -X -v ON_ERROR_STOP=1 "$@"
+}
+port_of() { need_node "$1"; field "$1" 4; }
+
+cmd_status() {
+    local name id ip port c pg cp vals=""
+    while read -r name id ip port; do
+        c=$(on_host "$ip" "docker ps -a --filter name=^shardpg-ddl-$name\$ --format '{{.Status}}'" 2>/dev/null </dev/null)
+        pg=$(on_host "$ip" "docker exec shardpg-ddl-$name $PG/pg_ctl status -D $DATA_ROOT/$name >/dev/null 2>&1 && echo running || echo stopped" 2>/dev/null </dev/null)
+        cp=$(sql -At -c "SELECT status FROM partdist.node_map WHERE node_id = $id" 2>/dev/null </dev/null)
+        vals="$vals${vals:+,}('$name', $id, '$ip', $port, '${c:-(no container)}', '${pg:--}', '${cp:-(not joined)}')"
+    done < <(rows)
+    # 交给 psql 排版
+    sql -q -c "SELECT * FROM (VALUES $vals) v(node, node_id, host, port, container, database, control_plane)" </dev/null
+}
+
+cmd_stop() {
+    need_node "$1"
+    local ip; ip=$(field "$1" 3)
+    on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh stop $1 ${2:-immediate}"
+}
+
+cmd_start() {
+    need_node "$1"
+    local ip; ip=$(field "$1" 3)
+    on_host "$ip" "bash $(host_dir "$ip")/demo_node.sh start $1"
+}
+
+cmd_shards() {
+    if [[ -n "${1:-}" ]]; then
+        sql -c "SELECT * FROM shardpg.shards WHERE table_name = '$1'::regclass"
+    else
+        sql -c "SELECT * FROM shardpg.shards"
+    fi
+}
+
+cmd_files() {
+    need_node "$1"
+    local ip port
+    ip=$(field "$1" 3); port=$(field "$1" 4)
+    echo "== shard tables on $1 ($ip:$port)"
+    on_host_in "$ip" "docker exec -i -e PGOPTIONS='-c citus.override_table_visibility=off' shardpg-ddl-$1 $PG/psql -h /tmp -p $port -U postgres -X -q" <<'SQL'
+SELECT s.logicalrelid::regclass AS "table", c.relname AS shard, pg_size_pretty(pg_relation_size(c.oid)) AS size
+  FROM pg_dist_shard s JOIN pg_class c ON c.relname = shard_name(s.logicalrelid, s.shardid) AND c.relkind = 'r'
+ ORDER BY 2;
+SQL
+    echo "== Raft group state files on $1 (pg_raft_hardstate.<shard id>)"
+    on_host "$ip" "docker exec shardpg-ddl-$1 sh -c 'ls $DATA_ROOT/$1 | grep -E \"^pg_raft_hardstate\\.[0-9]+\$\" || echo \"(none)\"'"
+}
+
+cmd_add_node() {
+    local name=${1:?节点名} ip=${2:?机器 IP} port=${3:?端口} id h dir peers
+    if [[ -n "$(field "$name" 1)" ]]; then
+        [[ "$(field "$name" 3) $(field "$name" 4)" == "$ip $port" ]] || { echo "nodes.conf 里 $name 已是别的地址" >&2; exit 1; }
+        id=$(field "$name" 2)
+    else
+        id=$(( $(rows | awk '{print $2}' | sort -n | tail -1) + 1 ))
+    fi
+    echo "[1/4] add $name (node id $id, $ip:$port) to nodes.conf on every host"
+    for h in $(rows | awk '{print $3}' | sort -u) "$ip"; do
+        dir=$(host_dir "$h")
+        on_host "$h" "grep -qE '^$name[[:space:]]' $dir/nodes.conf || printf '%-9s %-7s %-15s %s\n' $name $id $ip $port >> $dir/nodes.conf"
+    done
+    echo "[2/4] start container shardpg-ddl-$name on $ip, initdb, start PostgreSQL"
+    dir=$(host_dir "$ip")
+    on_host "$ip" "docker ps -a --format '{{.Names}}' | grep -qx shardpg-ddl-$name" \
+        && echo "      container already exists, skipped" \
+        || on_host "$ip" "bash $dir/demo_node.sh up $name" || exit 1
+    echo "[3/4] create extensions, seed the node table (a copy of the master's, plus itself)"
+    on_host_in "$ip" "bash $dir/demo_node.sh sql $name -q" <<SQL || exit 1
+CREATE EXTENSION IF NOT EXISTS citus;
+SET citus.enable_ddl_propagation = off;
+CREATE EXTENSION IF NOT EXISTS pg_partdist;
+CREATE EXTENSION IF NOT EXISTS pg_raft;
+$(sql -At -c "SELECT string_agg(format('INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) VALUES (%s, %L, %s, %L, now()) ON CONFLICT (node_id) DO NOTHING;', node_id, hostname, port, status), E'\n') FROM partdist.node_map")
+INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) VALUES ($id, '$ip', $port, 'active', now()) ON CONFLICT (node_id) DO NOTHING;
+SQL
+    echo "[4/4] join: append to pg_raft.peers on every node, register in the control plane, add as a ShardPG worker (no restart)"
+    sql -c "SELECT * FROM shardpg.add_node('$ip', $port)"
+}
+
+cmd_move_replica() {
+    local shard=${1:?分片名} from to
+    from=$(port_of "${2:?源节点}"); to=$(port_of "${3:?目标节点}")
+    sql -c "SELECT * FROM shardpg.move_replica('$shard', $from, $to)"
+}
+
+cmd_move_primary() {
+    local shard=${1:?分片名} to
+    to=$(port_of "${2:?目标节点}")
+    sql -At -c "SELECT shardpg.move_primary('$shard', $to)"
+}
+
+cmd_remove_node() {
+    local name=${1:?节点名} id ip port n others h dir
+    need_node "$name"
+    id=$(field "$name" 2); ip=$(field "$name" 3); port=$(field "$name" 4)
+    [[ "$id" == 1 ]] && { echo "不能去掉 master" >&2; exit 1; }
+    n=$(sql -At -c "SELECT count(*) FROM partdist.partition_map WHERE $id = ANY (ARRAY[primary_node] || secondary_nodes)")
+    [[ "$n" == 0 ]] || { echo "$name 上还有 $n 个分片的副本：先删表，或用 move-replica 迁走" >&2; exit 1; }
+    others=$(rows | awk -v n="$name" '$1 != n {print $1}')
+    echo "[1/5] ShardPG 移除 worker，各节点节点表删掉 $name"
+    sql -At -c "SELECT citus_remove_node(nodename, nodeport) FROM pg_dist_node WHERE nodeport = $port" >/dev/null
+    for o in $others; do
+        h=$(field "$o" 3)
+        on_host "$h" "bash $(host_dir "$h")/demo_node.sh sql $o -q -c 'DELETE FROM partdist.node_map WHERE node_id = $id'" </dev/null
+    done
+    sleep 4
+    echo "[2/5] 停掉 $name"
+    cmd_stop "$name" fast >/dev/null 2>&1 || true
+    # pg_raft.peers 只许热加载追加、不许热删（复制游标按槽位存），去掉节点只能整簇重启时换回原来的列表
+    echo "[3/5] 整簇停机（先 worker 后 master）→ 去掉 add-node 写进 postgresql.auto.conf 的 pg_raft.peers"
+    for o in $others; do [[ "$o" == master ]] || cmd_stop "$o" fast >/dev/null; done
+    cmd_stop master fast >/dev/null
+    for o in $others; do
+        h=$(field "$o" 3)
+        on_host "$h" "docker exec shardpg-ddl-$o sed -i -E '/^pg_raft\\.peers *=/d' $DATA_ROOT/$o/postgresql.auto.conf"
+    done
+    echo "[4/5] 整簇启动（先 master 后 worker）"
+    cmd_start master >/dev/null
+    for o in $others; do [[ "$o" == master ]] || cmd_start "$o" >/dev/null; done
+    for t in $(seq 1 30); do
+        [[ "$(sql -At -c "SELECT leader_node_id > 0 FROM partdist.pg_raft_group_status() WHERE group_id = 0" 2>/dev/null)" == t ]] && break
+        sleep 2
+    done
+    for o in $others; do
+        h=$(field "$o" 3)
+        on_host "$h" "bash $(host_dir "$h")/demo_node.sh sql $o -q -c 'DELETE FROM partdist.node_map WHERE node_id = $id'" </dev/null
+    done
+    echo "[5/5] 删容器和数据目录，nodes.conf 去掉 $name"
+    dir=$(host_dir "$ip")
+    on_host "$ip" "bash $dir/demo_node.sh destroy $name" >/dev/null
+    for h in $(rows | awk '{print $3}' | sort -u); do
+        on_host "$h" "sed -i -E '/^$name[[:space:]]/d' $(host_dir "$h")/nodes.conf"
+    done
+    cmd_status
+}
+
+case "${1:-}" in
+    status)        cmd_status ;;
+    stop)          shift; cmd_stop "${1:?节点名}" "${2:-}" ;;
+    start)         shift; cmd_start "${1:?节点名}" ;;
+    shards)        shift; cmd_shards "${1:-}" ;;
+    files)         shift; cmd_files "${1:?节点名}" ;;
+    add-node)      shift; cmd_add_node "$@" ;;
+    move-replica)  shift; cmd_move_replica "$@" ;;
+    move-primary)  shift; cmd_move_primary "$@" ;;
+    remove-node)   shift; cmd_remove_node "$@" ;;
+    *) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

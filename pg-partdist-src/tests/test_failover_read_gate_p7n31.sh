@@ -11,7 +11,7 @@
 # 断言：路由翻到 T 的那一刻 T 本地登记确实还没生效（窗口构造成功）；此后每 200 ms 读一次、
 #   共 HOLD_S+6 秒：**0 次被拒**、最终读到全部行。
 # 负向对照：NEG=1 时只在 T 上换一版不打 N31 标记的 promote_prepare_ex ⇒ 断言窗口内确有拒读（清理时换回）。
-set -u
+set -uo pipefail
 CONTAINER="${CONTAINER:-pg-test-container}"
 COORD=5432
 ROWS1="${ROWS1:-50}"; HOLD_S="${HOLD_S:-5}"; NEG="${NEG:-0}"; NEG_APPLIED=0; PPX_SQL="$(cd "$(dirname "$0")" && pwd)/.n31_ppx_$$.sql"
@@ -48,7 +48,6 @@ cleanup() {
   if [[ "$NEG_APPLIED" == 1 ]]; then
     { echo "SET citus.enable_ddl_propagation=off;"; cat "$PPX_SQL"; echo ";"; } | PSQL $B -q -v ON_ERROR_STOP=1 >/dev/null && echo "  [复原] T 上的 promote_prepare_ex 已换回带 N31 标记的版本"; rm -f "$PPX_SQL"
   fi
-  for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
   if [[ "${KEEP_ON_FAIL:-1}" == 1 && "$FAIL" -gt 0 ]]; then echo "  [保留现场] 有 FAIL，组/表未动（取证后手工清理，或 KEEP_ON_FAIL=0）"; return; fi
   # 先表后组；每条 DROP 套 statement_timeout（P7-N21）。副本残壳被路由守卫拒时，拆组后再删一遍。
   [[ -n "$SID" ]] && for p in "${WORKERS[@]}"; do Q $p "SELECT partdist.replay_disable('rn31_${SID}'::regclass)" >/dev/null 2>&1; done
@@ -56,27 +55,12 @@ cleanup() {
   Q $COORD "SELECT recover_prepared_transactions()" >/dev/null 2>&1
   # 拆组后在途 RPC 会按 hearsay 把组再建出来（实测），副本残壳又被路由守卫拒 —— 拆组/删壳交替两轮
   for r in 1 2; do
-    for p in "${WORKERS[@]}"; do Q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id<>0" >/dev/null; done; sleep 2
+    for p in "${WORKERS[@]}"; do Q $p "SELECT count(partdist.pg_raft_group_drop(group_id)) FROM partdist.pg_raft_group_status() WHERE group_id=${SID:-0} AND group_id<>0" >/dev/null; done; sleep 2
     [[ -n "$SID" ]] && for p in "${WORKERS[@]}"; do Q $p "SET statement_timeout='30s'; SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS rn31_${SID}" >/dev/null 2>&1; done
   done
   echo "  [复原] 组已拆、表已删"
 }
 trap cleanup EXIT
-build_group_on() {
-  local gid=$1 want=$2 mem=$3 t p st=""
-  for p in "${WORKERS[@]}"; do if [[ "$p" == "$want" ]]; then Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 1500" >/dev/null; else Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 9000" >/dev/null; fi; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-  for p in "${WORKERS[@]}"; do Q $p "SELECT partdist.pg_raft_group_create($gid, $mem)" >/dev/null; done
-  for t in $(seq 1 40); do st=$(Q $want "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$gid"); [[ "$st" == leader ]] && break; sleep 1; done
-  for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-  echo "$st"
-}
-# 受控切主，只动这一个组（pg_raft_group_campaign）
-switch_to() { local gid=$1 target=$2 t st=""
-  for t in $(seq 1 120); do
-    st=$(Q $target "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=$gid"); [[ "$st" == leader ]] && break
-    (( t % 5 == 1 )) && Q $target "SELECT partdist.pg_raft_group_campaign($gid)" >/dev/null
-    sleep 1
-  done; echo "$st"; }
 registered() { local gid=$1 target=$2 t
   for t in $(seq 1 90); do [[ "$(Q $COORD "SELECT primary_node FROM partdist.partition_map WHERE partition_id=$gid")" == "${NID[$target]}" ]] && { echo ok; return; }; sleep 2; done; echo "no"; }
 lo_of() { Q $1 "SELECT partdist.local_partition_for_shard($SID)"; }
@@ -110,26 +94,22 @@ verify_replica() { local tag=$1 lp=$2 rp=$3 cu a tp
   check "$tag：主键索引掩码外逐字节一致" "$(rel_cmp $lp $rp btree)" "IDENTICAL_OUTSIDE_HOLE"
 }
 
-echo "========== [1] 夹具：rn31 单分片、3 成员组 =========="
-PSQL $COORD -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
+echo "========== [1] 夹具：SHARD KEY 单分片、1 主 2 从 =========="
+# 旧夹具手工 create_distributed_table / 建组，却没有打开分片 MVCC；
+# 写入走本地可见性，切主后不能用它检验当前自动事务路径。
+ts=$(Q $COORD "SELECT partdist.partdist_tso_client_start_ts()")
+[[ "$ts" =~ ^[0-9]+$ ]] || { echo "TSO 不可用，停止测试（不重置集群配置）"; exit 1; }
+PSQL $COORD -v ON_ERROR_STOP=1 -q <<SQL >/dev/null || exit 1
 DROP TABLE IF EXISTS rn31;
-SET citus.shard_count = 1; SET citus.shard_replication_factor = 1;
-CREATE TABLE rn31(id int primary key, pad text);
-SELECT create_distributed_table('rn31', 'id', colocate_with => 'none');
+CREATE TABLE rn31(id int primary key, pad text, SHARD KEY (id) SHARDS 1 REPLICAS 2);
+INSERT INTO rn31 SELECT g, repeat('a', 100) FROM generate_series(1, $ROWS1) g;
 SQL
-read SID A < <(PSQL $COORD -Atc "SELECT s.shardid||' '||n.nodeport FROM pg_dist_shard s JOIN pg_dist_placement p ON p.shardid=s.shardid JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE s.logicalrelid='rn31'::regclass" </dev/null | tr '|' ' ')
-for p in "${WORKERS[@]}"; do [[ $p != $A ]] && { if [[ -z "$B" ]]; then B=$p; elif [[ -z "$C" ]]; then C=$p; fi; }; done
-echo "  分片 $SID：原始主 A=:$A，新主 T=:$B"
-for p in "${WORKERS[@]}"; do Q $p "SELECT partdist.rebuild_shard_identity()" >/dev/null; done
-check "组 $SID 主落在 A" "$(build_group_on $SID $A "$ALLMEM")" "leader"
-for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM SET pg_raft.election_timeout_ms = 15000" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-for p in "${WORKERS[@]}"; do [[ $p == $A ]] && continue
-  r=$(PSQL $A -Atc "SELECT partdist.provision_shard_replica(${SID}::bigint, ${NID[$p]})" </dev/null 2>&1 | tr '\n' ' ')
-  check "  副本供到 :$p" "$([[ "$r" == shard=* ]] && echo ok || echo "${r:0:100}")" "ok"; done
-for p in "${WORKERS[@]}"; do Q $p "ALTER SYSTEM RESET pg_raft.election_timeout_ms" >/dev/null; Q $p "SELECT pg_reload_conf()" >/dev/null; done
-check "登记 A 为主" "$(registered $SID $A)" "ok"
-Q $COORD "INSERT INTO rn31 SELECT g, repeat('a', 100) FROM generate_series(1, $ROWS1) g" >/dev/null
+SID=$(Q $COORD "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='rn31'::regclass")
+A=$(Q $COORD "SELECT n.port FROM partdist.partition_map m JOIN partdist.node_map n ON n.node_id=m.primary_node WHERE m.partition_id=$SID")
+read -r B C <<<"$(Q $COORD "SELECT string_agg(n.port::text, ' ' ORDER BY n.port) FROM partdist.partition_map m JOIN partdist.node_map n ON n.node_id=ANY(m.secondary_nodes) WHERE m.partition_id=$SID")"
+[[ "$SID" =~ ^[0-9]+$ && -n "$A" && -n "$B" && -n "$C" ]] || exit 1
 check "写入 $ROWS1 行" "$(Q $COORD "SELECT count(*) FROM rn31")" "$ROWS1"
+[[ "$FAIL" == 0 ]] || exit 1
 T=$B; sleep 2; catch_up $A $T >/dev/null
 
 echo "========== [2] 在 T 上持 partition_map 该行的行锁（${HOLD_S}s 墙钟），挡住 T 自己那份登记的 apply；受控切到 T =========="
@@ -192,3 +172,5 @@ echo
 echo "========== 结果：PASS=$PASS FAIL=$FAIL =========="
 [[ $FAIL -eq 0 ]] && echo "P7-N31 回归：通过" || echo "P7-N31 回归：存在 FAIL"
 exit $(( FAIL > 0 ))
+
+[[ "$FAIL" -eq 0 ]]

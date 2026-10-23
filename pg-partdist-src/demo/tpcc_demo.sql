@@ -19,7 +19,8 @@
 -- 它写的行区域号都是 9（c_d_id / o_d_id = 9）；演示里操作的是区域号 1、2 的 12 个客户（总额 12000）。
 -- 两批数据在同一张表、同样的分片里，只是主键不重叠、演示查询按区域号过滤，所以互不干扰。
 --
--- worker 端口：:5433 = worker1，:5434 = worker2，:5435 = worker3，:5436 = worker4
+-- 节点名：\dt、shardpg.shards 和各步的 worker 列都显示名字，worker1 = :5433，worker2 = :5434，worker3 = :5435，worker4 = :5436
+--         （与数据目录名一致；对照表 SELECT * FROM shardpg.nodes）
 -- ════════════════════════════════════════════════════════════════════════════
 
 -- ════ 第 1 步：建表 ════
@@ -61,8 +62,10 @@ INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last) VALUES
 SELECT c_w_id, count(*) AS customers FROM customer GROUP BY 1 ORDER BY 1;
 
 -- ════ 第 2 步：分片信息与主从 ════
--- 每个分片的物理表名、分片键、哈希范围、主、从、任期
+-- 先看节点：名字（worker1…，后面各处都用它）、地址、状态
 -- 【窗口 A】
+SELECT * FROM shardpg.nodes;
+-- 每个分片的物理表名、分片键、哈希范围、主、从、任期
 SELECT * FROM shardpg.shards WHERE table_name IN ('customer', 'orders');
 -- 按 worker 看：每台 worker 上放着哪些分片（主 / 从）
 SELECT worker, string_agg(shard_name || '（' || role || '）', ', ' ORDER BY shard_name) AS shards
@@ -74,10 +77,11 @@ SELECT worker, string_agg(shard_name || '（' || role || '）', ', ' ORDER BY sh
  GROUP BY 1 ORDER BY 1;
 
 -- ════ 第 3 步：表和分片的对应 ════
--- \dt 表名：父表一行（分片键、分片数、副本数、共置），下面逐行列出子表（分片）及其主从
+-- \dt 表名：两张表 —— List of relations 里分布式表的 Type 是 distributed_table；List of shards 逐行列出它的分片及主从
+--   （分片键、分片数、每片副本数、共置在 \d 表名 的尾行，\d+ 表名 还逐个列出分片）
 -- 【窗口 A】
 \dt customer
--- \dt+ 表名：再加每个子表的行数、大小（父表是各子表之和）
+-- \dt+ 表名：分片表再加每个分片的行数、大小（第一张表的 Size 是各分片之和）
 \dt+ customer
 -- 按模式匹配：匹配到的分布式表连同子表一起展开
 \dt customer*
@@ -86,9 +90,9 @@ SELECT worker, string_agg(shard_name || '（' || role || '）', ', ' ORDER BY sh
 \dt customer_1*
 -- 每一行在哪个分片、哪台 worker：查询里加两列（后面各步都用这两列看"改的是哪个分片上的表"）
 --   tableoid::regclass::text AS shard          这一行所在的物理分片表（名字在 worker 上取）
---   ':' || current_setting('port') AS worker   实际执行这一行的 worker（就是该分片的主）
+--   shardpg.node_name() AS worker              实际执行这一行的 worker（就是该分片的主）
 -- 12 个客户：同一仓库的客户在同一个分片；分片按仓库号的哈希分，仓库 3、4 落在同一个分片
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, count(*) AS rows,
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, count(*) AS rows,
        string_agg('仓库' || c_w_id || ' ' || c_first, ', ' ORDER BY c_w_id, c_d_id, c_id) AS customers
   FROM customer GROUP BY 1, 2 ORDER BY 1;
 
@@ -100,21 +104,21 @@ SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS work
 WITH s AS (
   SELECT get_shard_id_for_distribution_column('customer', 1) AS sid
 ), w AS (
-  SELECT nodeport, split_part(result, ' ', 1) AS dir, split_part(result, ' ', 2) AS tbl
+  SELECT n.name, n.node_id, split_part(r.result, ' ', 1) AS dir, split_part(r.result, ' ', 2) AS tbl
     FROM s, run_command_on_workers(format($$
       SELECT coalesce(current_setting('data_directory') || '/pg_parwal/' || partdist.local_partition_for_shard(%1$s)::oid
                       || ' ' || current_setting('data_directory') || '/' || pg_relation_filepath(partdist.local_partition_for_shard(%1$s)), '')$$,
-      s.sid))
-   WHERE result <> ''
+      s.sid)) r, shardpg.nodes n
+   WHERE n.port = r.nodeport AND r.result <> ''
 ), p AS (
-  SELECT ltrim("primary", ':')::int AS pport FROM s, shardpg.shards WHERE shard_name = shard_name('customer', s.sid)
+  SELECT "primary" AS pname FROM s, shardpg.shards WHERE shard_name = shard_name('customer', s.sid)
 )
-SELECT string_agg(':' || nodeport || CASE WHEN nodeport = pport THEN '（主）' ELSE '（从）' END, '  '
-                  ORDER BY nodeport <> pport, nodeport) AS nodes,
+SELECT string_agg(name || CASE WHEN name = pname THEN '（主）' ELSE '（从）' END, '  '
+                  ORDER BY name <> pname, node_id) AS nodes,
        'docker exec pg-test-container ls -l --time-style=+%T '
-         || string_agg(dir, ' ' ORDER BY nodeport <> pport, nodeport) AS ls_cmd,
+         || string_agg(dir, ' ' ORDER BY name <> pname, node_id) AS ls_cmd,
        'watch -n1 docker exec pg-test-container ls -l --time-style=+%T '
-         || string_agg(tbl || ' ' || dir, ' ' ORDER BY nodeport <> pport, nodeport) AS watch_cmd
+         || string_agg(tbl || ' ' || dir, ' ' ORDER BY name <> pname, node_id) AS watch_cmd
   FROM w, p \gx
 -- ② 【终端 L】执行 ls_cmd：三台各一个目录
 --    00000001…：日志记录本身（沿用 pg_wal 的段文件命名），三台一样大 = 每条记录三台都有
@@ -145,7 +149,7 @@ SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
 -- 5.0 先认人：演示操作的 12 个客户（区域号 9 是写入脚本插的，不列）。后面每条增删改的注释都写明改的是谁
 -- 【窗口 A】
 SELECT c_first || ' ' || c_last AS name, c_w_id, c_d_id, c_id,
-       tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker
+       tableoid::regclass::text AS shard, shardpg.node_name() AS worker
   FROM customer WHERE c_d_id <> 9 ORDER BY c_w_id, c_d_id, c_id;
 -- 【窗口 B】写入还在继续
 SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
@@ -155,7 +159,7 @@ SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
 UPDATE customer SET c_balance = 1000 WHERE c_d_id IN (1, 2);      -- 12 人全改
 SELECT count(*) AS customers, sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 这条 UPDATE 改到了哪：按分片汇总
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, count(*) AS rows, sum(c_balance) AS balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, count(*) AS rows, sum(c_balance) AS balance
   FROM customer WHERE c_d_id IN (1, 2) GROUP BY 1, 2 ORDER BY 1;
 -- 5.2 提交：仓库 1 的 Tom 转 300 元给仓库 2 的 Lucy，同时给 Tom 下一张订单（三个写操作，跨两个分片、两台 worker）
 -- 【窗口 A】
@@ -164,9 +168,9 @@ UPDATE customer SET c_balance = c_balance - 300 WHERE c_w_id = 1 AND c_d_id = 1 
 UPDATE customer SET c_balance = c_balance + 300 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;   -- Lucy +300
 INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 1, 5);   -- Tom 的订单：订单号 (1, 1, 1)，客户号 1，5 行
 -- 提交前看这个事务改到了哪：两个客户在两个分片、两台 worker；订单和 Tom 在同一台 worker（共置）
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 2) ORDER BY c_w_id;
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_id, o_c_id, o_ol_cnt
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, o_w_id, o_id, o_c_id, o_ol_cnt
   FROM orders WHERE o_w_id = 1 AND o_d_id = 1 AND o_id = 1;
 COMMIT;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 ORDER BY 1;
@@ -176,7 +180,7 @@ SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 BEGIN;
 UPDATE customer SET c_balance = c_balance - 500 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 1;   -- Ken  −500
 UPDATE customer SET c_balance = c_balance + 500 WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 1;   -- Lucy +500
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (2, 3) ORDER BY c_w_id;
 ROLLBACK;
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (2, 3) ORDER BY 1;
@@ -185,14 +189,14 @@ SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AN
 --     报错里的 localhost:端口 就是订单所在分片的主（下面查询的 worker 列）
 -- 【窗口 A】先看订单表里已有的订单（区域 9 是写入脚本的，不看）：(1, 1, 1) 已经有了 —— 5.2 给 Tom 下的那张，
 --           所以下面事务里第三条 INSERT 的订单 (1, 1, 1) 会和它重复
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt
   FROM orders WHERE o_d_id <> 9 ORDER BY o_w_id, o_d_id, o_id;
 BEGIN;
 UPDATE customer SET c_balance = c_balance - 200 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 2;   -- Amy −200
 UPDATE customer SET c_balance = c_balance + 200 WHERE c_w_id = 3 AND c_d_id = 1 AND c_id = 2;   -- Ann +200
 INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 1, 1, 2, 3);   -- Amy 的订单：订单号 (1, 1, 1) 已被 Tom 那张占用 → 报错
 COMMIT;
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 2 AND c_w_id IN (1, 3) ORDER BY c_w_id;
 SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 -- 5.5 隔离：A 改了还没提交，B 看不见；B 开着的事务只看开始那一刻的快照 ——
@@ -202,7 +206,7 @@ SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 BEGIN;
 UPDATE customer SET c_balance = c_balance - 100 WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1;   -- Tom −100
 UPDATE customer SET c_balance = c_balance + 100 WHERE c_w_id = 4 AND c_d_id = 1 AND c_id = 1;   -- Ivy +100
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY c_w_id;
 -- 【窗口 B】A 还没提交：看到的是旧值；然后开一个事务，记下此刻的客户数和订单数
 SELECT c_w_id, c_first, c_balance FROM customer WHERE c_d_id = 1 AND c_id = 1 AND c_w_id IN (1, 4) ORDER BY 1;
@@ -231,7 +235,7 @@ UPDATE customer SET c_balance = c_balance - 7 WHERE c_w_id = 2 AND c_d_id = 1 AN
 COMMIT;
 -- 【窗口 B】卡住的 UPDATE 返回报错 could not serialize access due to concurrent update，回滚后看结果
 ROLLBACK;
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_first, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_first, c_balance
   FROM customer WHERE c_w_id = 2 AND c_d_id = 1 AND c_id = 2;
 SELECT sum(c_balance) AS total FROM customer WHERE c_d_id IN (1, 2);
 
@@ -244,15 +248,15 @@ SELECT clock_timestamp()::time(0) AS t, c.n AS customers, o.n AS orders
 INSERT INTO customer (c_w_id, c_d_id, c_id, c_first, c_last, c_balance) VALUES (1, 3, 1, 'Nina', 'He', 500);   -- 新客户 Nina
 INSERT INTO orders (o_w_id, o_d_id, o_id, o_c_id, o_ol_cnt) VALUES (1, 3, 1, 1, 4), (1, 3, 2, 1, 6);   -- Nina 的订单 1、2
 -- 增到了哪：客户进了 customer 的分片、订单进了 orders 的分片，两个分片在同一台 worker
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_d_id, c_id, c_first
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_ol_cnt
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, o_w_id, o_d_id, o_id, o_ol_cnt
   FROM orders WHERE o_w_id = 1 AND o_d_id = 3 ORDER BY o_id;
 -- 6.2 查：按主键查一个客户（Nina）；EXPLAIN 看它只发给一个节点（Task Count: 1，Node 就是上面那台 worker）
 SELECT * FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 EXPLAIN (COSTS OFF) SELECT * FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 -- 查仓库 1 的演示客户：都在同一个分片、同一台 worker（区域号 9 是写入脚本插的，不列）
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_d_id, c_id, c_first, c_last, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_d_id, c_id, c_first, c_last, c_balance
   FROM customer WHERE c_w_id = 1 AND c_d_id <> 9 ORDER BY c_d_id, c_id;
 -- 跨仓库统计：4 个分片并行算，master 汇总（Task Count: 4）
 SELECT c_w_id, count(*) AS customers, sum(c_balance) AS balance FROM customer WHERE c_d_id <> 9 GROUP BY 1 ORDER BY 1;
@@ -265,16 +269,16 @@ SELECT c.c_w_id, c.c_d_id, c.c_id, c.c_first, count(o.o_id) AS orders
  GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3;
 -- 6.3 改：改一个客户 Nina：余额 +50、姓改成 Huang（单分片，直接改），改完看改的是哪个分片
 UPDATE customer SET c_balance = c_balance + 50, c_last = 'Huang' WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;   -- Nina
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first, c_last, c_balance
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_d_id, c_id, c_first, c_last, c_balance
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 -- 一次改多个仓库：区域 2 的 Bob、Mary、Leo、Eva 姓改成大写，一条语句改到 3 个分片、3 台 worker
 UPDATE customer SET c_last = upper(c_last) WHERE c_d_id = 2;   -- Bob、Mary、Leo、Eva
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first, c_last
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_d_id, c_id, c_first, c_last
   FROM customer WHERE c_d_id = 2 ORDER BY c_w_id;
 -- 6.4 删：先看要删的在哪（都在仓库 1 的分片里），再删 Nina 的订单 2、Nina 的其余订单和 Nina 本人
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, o_w_id, o_d_id, o_id, o_c_id
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, o_w_id, o_d_id, o_id, o_c_id
   FROM orders WHERE o_w_id = 1 AND o_d_id = 3 ORDER BY o_id;
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, c_w_id, c_d_id, c_id, c_first
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, c_w_id, c_d_id, c_id, c_first
   FROM customer WHERE c_w_id = 1 AND c_d_id = 3 AND c_id = 1;
 DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_id = 2;     -- Nina 的订单 2
 DELETE FROM orders WHERE o_w_id = 1 AND o_d_id = 3 AND o_c_id = 1;   -- Nina 的其余订单（订单 1）
@@ -290,7 +294,7 @@ SELECT c.c_w_id AS warehouse, count(DISTINCT c.c_id) AS customers, count(o.o_id)
  WHERE c.c_d_id = 9
  GROUP BY 1 ORDER BY 1;
 -- 同一批数据按分片看：写入脚本的数据落在哪些分片、哪台 worker
-SELECT tableoid::regclass::text AS shard, ':' || current_setting('port') AS worker, count(*) AS customers
+SELECT tableoid::regclass::text AS shard, shardpg.node_name() AS worker, count(*) AS customers
   FROM customer WHERE c_d_id = 9 GROUP BY 1, 2 ORDER BY 1;
 -- 合计：和终端 W 最后打印的一致；订单都挂在已有客户名下（上面按客户连出来的订单数加起来等于这里）
 SELECT c.n AS customers, o.n AS orders

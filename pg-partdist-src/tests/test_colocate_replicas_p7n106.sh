@@ -19,7 +19,7 @@ C="${CONTAINER:-pg-test-container}"
 BIN=/work/pg-install/bin
 PASS=0; FAIL=0
 q()   { docker exec -u postgres -e PGCLIENTENCODING=UTF8 "$C" $BIN/psql -h /tmp -p "${2:-5432}" -U postgres -X -At -c "$1" </dev/null 2>&1; }
-run() { docker exec -u postgres -e PGCLIENTENCODING=UTF8 "$C" $BIN/psql -h /tmp -p 5432 -U postgres -X -q -c "$1" </dev/null 2>&1; }
+run() { docker exec -u postgres -e PGCLIENTENCODING=UTF8 "$C" $BIN/psql -h /tmp -p 5432 -U postgres -X -q -v ON_ERROR_STOP=1 -c "$1" </dev/null 2>&1; }
 ok()  { echo "  ✓ $1"; PASS=$((PASS + 1)); }
 no()  { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1（$2）"; else no "$1：实际 [$2]，期望 [$3]"; fi; }
@@ -30,6 +30,8 @@ cleanup() { run "DROP TABLE IF EXISTS t106o2, t106o, t106c, t106bad" >/dev/null;
 trap cleanup EXIT
 
 echo "================ [0] 前提 ================"
+ts=$(q "SELECT partdist.partdist_tso_client_start_ts()")
+[[ "$ts" =~ ^[0-9]+$ ]] || { echo "TSO 不可用，停止测试"; exit 1; }
 cleanup
 check "Citus worker 数" "$(q "SELECT count(*) FROM pg_dist_node WHERE groupid <> 0")" "4"
 
@@ -67,8 +69,8 @@ else
 fi
 
 echo "================ [6] 写数据、共置连接、删表 ================"
-run "INSERT INTO t106c SELECT w, i, 'c' || w || '_' || i FROM generate_series(1, 4) w, generate_series(1, 3) i" >/dev/null
-run "INSERT INTO t106o SELECT w, i, 1 + i % 3 FROM generate_series(1, 4) w, generate_series(1, 5) i" >/dev/null
+run "INSERT INTO t106c SELECT w, i, 'c' || w || '_' || i FROM generate_series(1, 4) w, generate_series(1, 3) i" >/dev/null || exit 1
+run "INSERT INTO t106o SELECT w, i, 1 + i % 3 FROM generate_series(1, 4) w, generate_series(1, 5) i" >/dev/null || exit 1
 check "共置连接：12 个客户、20 张订单" "$(q "SELECT count(DISTINCT (c.w, c.id)) || '/' || count(*) FROM t106c c JOIN t106o o ON o.w = c.w AND o.cid = c.id")" "12/20"
 ids=$(q "SELECT string_agg(shardid::text, ',') FROM pg_dist_shard WHERE logicalrelid IN ('t106c'::regclass, 't106o'::regclass, 't106o2'::regclass)")
 out=$(run "DROP TABLE t106o2, t106o, t106c")

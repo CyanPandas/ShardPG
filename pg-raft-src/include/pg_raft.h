@@ -44,6 +44,10 @@ pg_raft_spi_end(bool must_finish)
 #define PG_RAFT_OP_NOOP              "OP_NOOP"
 /* ★ P7-N102：只改某分区登记的从副本集（副本迁移用）；payload = {"partition_id":P,"primary_term":T,"secondary_nodes":[...]} */
 #define PG_RAFT_OP_PARTITION_SECONDARIES "OP_PARTITION_SECONDARIES"
+/* ★ P7-N112：删分区登记（删表清理用）；payload = {"partition_ids":[P, ...]}。
+ * 登记是经控制面日志写进各节点 partition_map 的，删也必须走日志：原来各节点直接 DELETE，
+ * 之后有节点装快照、重放日志时这些行会被写回来。 */
+#define PG_RAFT_OP_PARTITION_DROP "OP_PARTITION_DROP"
 
 #define PG_RAFT_MAX_HOSTNAME 256
 
@@ -91,6 +95,7 @@ extern int  pg_raft_catchup_interval_ms;
 /* 控制面日志压缩阈值（条），0=关；压缩点之前只能靠 InstallSnapshot 追平 */
 extern int  pg_raft_compact_threshold;
 extern bool pg_raft_any_group_leader_local(void);
+extern bool pg_raft_catchup_wanted_local(void);   /* P7-N115：leader 组，或有待看结局的 prepared 事务 */
 extern bool pg_raft_data_group_role(int64 group_id, bool *is_leader, int64 *term,
                                     TimestampTz *leader_seen_at);
 

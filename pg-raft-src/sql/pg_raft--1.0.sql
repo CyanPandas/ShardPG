@@ -362,6 +362,14 @@ BEGIN
 END;
 $fn$;
 
+-- ★ P7-N110（2026-10-20）：按组号删 hardstate 文件，不要求组在内存里（组还在内存里的、组 0 跳过）。
+-- 删表清理 / 迁移副本清理源节点拆完组后调用：拆组和核对只看内存，看不到被写回来的文件。返回删掉的文件数
+CREATE OR REPLACE FUNCTION pg_raft_hardstate_purge(p_group_ids bigint[])
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_hardstate_purge';
+COMMENT ON FUNCTION pg_raft_hardstate_purge(bigint[]) IS
+    'P7-N110：删这些已拆组的 pg_raft_hardstate.<组号> 文件（组还在内存里的、组 0 跳过），返回删掉的个数。只用于确定已删掉的分片。';
+
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
 -- ★ P7-N35：本节点 raft 日志里已提交的最大数据位点（OP_PARWAL 的 partition_lsn）。
@@ -537,6 +545,13 @@ BEGIN
     -- 副本壳表，多半压根没有回放槽位 —— 若先判 armed 就会直接 RETURN 1 放行，
     -- 分叉检查形同虚设。
     ndiv := partdist.pg_raft_check_fastpath_divergence(loid);
+    -- ★ P7-N111：NULL = 段流里有本机写的提交标记、那笔事务还在本机提交途中（标记先于本地提交，正常时序）。
+    --   不是分叉，但也还不能判"无分叉"：返回 0，下一轮再查；兜底（p_force）也不放行，等它提交完。
+    IF ndiv IS NULL THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 段流里有本机提交途中的事务（标记已写、本地提交未落），升主前置稍后再查（P7-N111）',
+                  loid, p_group_id;
+        RETURN 0;
+    END IF;
     IF ndiv > 0 THEN
         RAISE WARNING 'pg_raft: 分片 % (组 %) 检测到快路径分叉：段流里有 % 条本节点写的 '
                       'COMMIT 标记，其事务在本地 CLOG 却不是 committed。'
@@ -879,7 +894,7 @@ CREATE OR REPLACE FUNCTION pg_raft_check_fastpath_divergence(
     p_loid OID,
     p_max_scan INTEGER DEFAULT 200)
     RETURNS BIGINT
-    LANGUAGE plpgsql STABLE
+    LANGUAGE plpgsql VOLATILE    -- P7-N111：要等 prepared 事务、读的是实时事务状态
 AS $div$
 DECLARE
     tip      BIGINT;
@@ -893,6 +908,9 @@ DECLARE
     st       TEXT;
     cur_full BIGINT;
     full_xid BIGINT;
+    is_prep  BOOLEAN;
+    undecided BOOLEAN := false;  -- P7-N111：有标记的事务还在本机提交途中
+    k        INTEGER;
 BEGIN
     SELECT groupid INTO self_gid FROM pg_dist_local_group;
     IF self_gid IS NULL THEN RETURN 0; END IF;
@@ -950,10 +968,30 @@ BEGIN
                 EXCEPTION WHEN OTHERS THEN
                     st := NULL;         -- xid 已过 CLOG 截断点：无从判定，跳过
                 END;
+                -- ★ P7-N111（2026-10-19）：'in progress' 要分两种。
+                --   · 预备提交的事务（pg_prepared_xacts 里有）：COMMIT PREPARED 的钩子先写标记、
+                --     随后才真正提交，给它一小会儿（≤ 0.3 s）；还停在 prepared 就照旧算分叉（TX4 的构造）。
+                --   · 本机活着的普通事务：标记已写、本地提交还没落 —— 这是 [A] → [B] 的正常时序，不是分叉；
+                --     它要么马上提交，要么本机崩溃、重启后变 aborted 再被这里查出来。记为"尚未判定"。
+                --   原来两种都算分叉：刚当选的放置节点正好在供副本事务提交途中跑升主前置 ⇒ 误判分叉、
+                --   主动让位退避 75 s，主落到没有数据的成员上（实验室建 orders 实测）。
+                is_prep := false;
+                IF st = 'in progress' THEN
+                    is_prep := EXISTS (SELECT 1 FROM pg_prepared_xacts px WHERE px.transaction::text = lo::text);
+                    IF is_prep THEN
+                        FOR k IN 1..15 LOOP
+                            PERFORM pg_sleep(0.02);
+                            st := pg_xact_status(full_xid::text::xid8);
+                            EXIT WHEN st <> 'in progress';
+                        END LOOP;
+                    END IF;
+                END IF;
                 IF st IS NULL THEN
                     NULL;
                 ELSIF st = 'committed' THEN
                     EXIT;               -- [B] 已完成，更早的不可能分叉
+                ELSIF st = 'in progress' AND NOT is_prep THEN
+                    undecided := true;  -- 本机事务提交途中：不计分叉，继续往前查更早的标记
                 ELSE
                     ndiv := ndiv + 1;   -- 流说提交、本地说没有 ⇒ 分叉
                 END IF;
@@ -962,9 +1000,13 @@ BEGIN
         i := i - 1;
     END LOOP;
 
+    -- ★ P7-N111：没有确凿的分叉、但有标记的事务还在本机提交途中 ⇒ NULL（尚未判定，调用方稍后再查）
+    IF ndiv = 0 AND undecided THEN
+        RETURN NULL;
+    END IF;
     RETURN ndiv;
 END
 $div$;
 
 COMMENT ON FUNCTION pg_raft_check_fastpath_divergence(OID, INTEGER) IS
-    '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed。返回分叉条数，0 表示无分叉。';
+    '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed（停在 prepared 也算）。返回分叉条数，0 表示无分叉；NULL 表示尚未判定 —— 有标记的普通事务还在本机提交途中（P7-N111），稍后再查。';

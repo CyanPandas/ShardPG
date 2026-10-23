@@ -68,7 +68,7 @@ expect_eq "建表" "$(q "SELECT to_regclass('public.t_n92') IS NOT NULL")" "t"
 q "INSERT INTO t_n92 SELECT g, g FROM generate_series(1, 10) g" >/dev/null
 expect_eq "基线行数" "$(q 'SELECT count(*) FROM t_n92')" "10"
 SHARD=$(q "SELECT shard_name FROM shardpg.shards WHERE table_name = 't_n92'::regclass")
-PRIM=$(q "SELECT ltrim(\"primary\", ':') FROM shardpg.shards WHERE table_name = 't_n92'::regclass")
+PRIM=$(q "SELECT n.port FROM shardpg.shards s JOIN shardpg.nodes n ON n.name = s.\"primary\" WHERE s.table_name = 't_n92'::regclass")
 [[ "$SHARD" =~ ^t_n92_[0-9]+$ && "$PRIM" =~ ^[0-9]+$ ]] && ok "分片 $SHARD 主在 :$PRIM" || bad "取分片与主节点" "$SHARD / $PRIM"
 
 # ---------------------------------------------------------------------------

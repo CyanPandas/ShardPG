@@ -237,39 +237,57 @@ expect_eq "被拒的写没有留下 prepared 事务" "$np" "0"
 step 4 "shardpg.shards 视图"
 expect_eq "8 行" "$(q "SELECT count(*) FROM shardpg.shards WHERE table_name IN ('customer'::regclass, 'orders'::regclass)")" "8"
 expect_eq "主都有值、从都是 2 个" "$(q "SELECT count(*) FROM shardpg.shards WHERE table_name IN ('customer'::regclass, 'orders'::regclass) AND \"primary\" IS NOT NULL AND cardinality(string_to_array(replicas, ',')) = 2")" "8"
-expect_eq "主与控制面登记一致" "$(q "SELECT count(*) FROM shardpg.shards v JOIN pg_dist_shard s ON shard_name(s.logicalrelid, s.shardid) = v.shard_name JOIN partdist.partition_map m ON m.partition_id::bigint = s.shardid JOIN partdist.node_map nm ON nm.node_id = m.primary_node WHERE v.\"primary\" = ':' || nm.port AND s.logicalrelid IN ('customer'::regclass, 'orders'::regclass)")" "8"
+expect_eq "主与控制面登记一致" "$(q "SELECT count(*) FROM shardpg.shards v JOIN pg_dist_shard s ON shard_name(s.logicalrelid, s.shardid) = v.shard_name JOIN partdist.partition_map m ON m.partition_id::bigint = s.shardid JOIN partdist.node_map nm ON nm.node_id = m.primary_node WHERE v.\"primary\" = shardpg.node_name(nm.node_id) AND s.logicalrelid IN ('customer'::regclass, 'orders'::regclass)")" "8"
 expect_eq "分片键列" "$(q "SELECT string_agg(DISTINCT shard_key, ',') FROM shardpg.shards WHERE table_name = 'customer'::regclass")" "c_w_id"
 run "SELECT * FROM shardpg.shards WHERE table_name IN ('customer'::regclass, 'orders'::regclass)" | sed 's/^/        > /'
 
 # ---------------------------------------------------------------------------
-step 5 "psql \\dt 显示子表"
+step 5 "psql \\dt 分两张表（表 / 分片），分布信息在 \\d 尾行"
+# 2026-10-19 起：List of relations 与原版同列、分布式表 Type 为 distributed_table；
+# 分片单独一张 List of shards；分片键/分片数/每片副本数/共置在 \d 尾行，\d+ 逐个列分片
 out=$(run "\\dt customer")
 printf '%s\n' "$out" | sed 's/^/        > /'
-expect_has "表头有 Hash range" "$out" "Hash range"
-expect_has "父表汇总" "$out" "shard key: c_w_id, 4 shards, 2 replicas, colocated with orders"
-expect_eq "4 个子表行" "$(grep -cE '(\+--|`--) customer_[0-9]+ ' <<<"$out")" "4"
-expect_eq '最后一个子表以 `-- 开头' "$(grep -c -- '`-- customer_' <<<"$out")" "1"
+expect_has "第一张表 List of relations" "$out" "List of relations"
+expect_has "customer 的 Type 是 distributed_table" "$(grep -E '^ public \| customer +\|' <<<"$out")" "distributed_table"
+expect_hasnt "第一张表没有分布汇总" "$out" "shard key:"
+expect_has "第二张表 List of shards" "$out" "List of shards"
+expect_eq "4 个分片行（所属表列是 customer）" "$(grep -cE '^ public \| customer_[0-9]+ +\| customer +\|' <<<"$out")" "4"
 for sid in ${IDS//,/ }; do
     nm=$(q "SELECT shard_name(logicalrelid, shardid) FROM pg_dist_shard WHERE shardid = $sid")
     [[ "$nm" == customer_* ]] || continue
-    pp=$(q "SELECT ':' || nm.port FROM partdist.partition_map m JOIN partdist.node_map nm ON nm.node_id = m.primary_node WHERE m.partition_id::bigint = $sid")
+    pp=$(q "SELECT shardpg.node_name(nm.node_id) FROM partdist.partition_map m JOIN partdist.node_map nm ON nm.node_id = m.primary_node WHERE m.partition_id::bigint = $sid")
     grep -E "$nm +\|" <<<"$out" | grep -qF "| $pp " && ok "$nm 的主 $pp 与登记一致" || bad "$nm 的主应为 $pp" "$(grep "$nm" <<<"$out")"
 done
 out=$(run "\\dt")
-expect_has "不带模式：有汇总" "$out" "shard key: o_w_id, 4 shards, 2 replicas, colocated with customer"
-expect_has "不带模式：也展开子表" "$out" "+-- customer_"
+expect_has "不带模式：orders 也是 distributed_table" "$(grep -E '^ public \| orders +\|' <<<"$out")" "distributed_table"
+expect_eq "不带模式：分片表里有 customer 的 4 个分片" "$(grep -cE '^ public \| customer_[0-9]+ +\| customer +\|' <<<"$out")" "4"
+out=$(run "\\d")
+expect_has "\\d 列表：customer 的 Type 也是 distributed_table" "$(grep -E '^ public \| customer +\|' <<<"$out")" "distributed_table"
+expect_hasnt "\\d 列表：不出分片表（只有纯 \\dt 才出）" "$out" "List of shards"
 out=$(run "\\dt customer*")
-expect_eq "\\dt customer* 展开 4 个子表" "$(grep -cE '(\+--|`--) customer_[0-9]+ ' <<<"$out")" "4"
+expect_eq "\\dt customer* 列出 4 个分片" "$(grep -cE '^ public \| customer_[0-9]+ +\| customer +\|' <<<"$out")" "4"
 # 安静模式（-q）下原版 psql 找不到时只印空表、不报错，提示也随之不出现；这一项不加 -q
 out=$(docker exec -u postgres "$C" bash -c "exec $BIN/psql -h /tmp -p 5432 -U postgres -d postgres -X -c \"\\\\dt customer_1*\" 2>&1" </dev/null)
 expect_has "按子表名查：提示属于哪张表" "$out" "是分布式表 customer 的分片（子表），用 \\dt customer 查看。"
 out=$(run "\\dt+ customer")
 printf '%s\n' "$out" | sed 's/^/        > /'
-expect_has "\\dt+ 有 Rows 列" "$out" "Rows"
-expect_eq "\\dt+ 父表 Rows = 24" "$(grep -E '^ public \| customer ' <<<"$out" | awk -F'|' '{gsub(/ /,"",$8); print $8}')" "24"
+expect_eq "\\dt+ 第一张表与原版同列（没有 Rows）" "$(sed -n '/List of relations/,/^(/p' <<<"$out" | sed -n 2p | grep -c Rows)" "0"
+expect_has "\\dt+ 分片表有 Rows 列" "$(sed -n '/List of shards/,/^(/p' <<<"$out" | sed -n 2p)" "Rows"
+expect_eq "\\dt+ 各分片 Rows 之和 = 24" "$(grep -E '^ public \| customer_[0-9]+ ' <<<"$out" | awk -F'|' '{gsub(/ /,"",$7); s+=$7} END {print s}')" "24"
+out=$(run "\\d customer")
+printf '%s\n' "$out" | tail -6 | sed 's/^/        > /'
+expect_has "\\d 尾行：分片键" "$out" "Shard key: HASH (c_w_id)"
+expect_has "\\d 尾行：分片数" "$out" "Number of shards: 4 (Use \\d+ to list them.)"
+expect_has "\\d 尾行：每片副本数" "$out" "Replicas per shard: 2"
+expect_has "\\d 尾行：共置" "$out" "Colocated with: orders"
+out=$(run "\\d+ customer")
+expect_eq "\\d+ 逐个列出 4 个分片" "$(grep -cE '^(Shards: |        )customer_[0-9]+ +\[' <<<"$out")" "4"
+expect_hasnt "\\d+ 列了分片就不再写分片数" "$out" "Number of shards"
 run "CREATE TABLE t_local (id int PRIMARY KEY)" >/dev/null
 out=$(run "\\dt t_local")
-expect_hasnt "本地表：输出与原版一致（无 Hash range）" "$out" "Hash range"
+expect_hasnt "本地表 \\dt：与原版一致（没有分片表）" "$out" "List of shards"
+expect_hasnt "本地表 \\dt：Type 不是 distributed_table" "$out" "distributed_table"
+expect_hasnt "本地表 \\d：没有分布尾行" "$(run "\\d t_local")" "Shard key"
 run "DROP TABLE t_local" >/dev/null
 
 # ---------------------------------------------------------------------------

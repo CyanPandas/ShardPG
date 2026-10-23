@@ -89,7 +89,7 @@ echo "================ [5] N102：加节点 ================"
 out=$(docker exec -u postgres "$C" bash /work/pg-partdist-src/scripts/new_worker_node.sh 6 5437 2>&1)
 grep -q "新节点 6 就绪" <<<"$out" && ok "新节点准备好（initdb / 配置 / 建扩展）" || no "new_worker_node.sh 失败：$(tail -3 <<<"$out")"
 out=$(q "SELECT string_agg(step, '/') FROM shardpg.add_node('127.0.0.1', 5437)")
-check "shardpg.add_node" "$out" "新节点就绪/各节点追加 pg_raft.peers/加入控制面/Citus 加入 worker/完成"
+check "shardpg.add_node" "$out" "new node ready/append pg_raft.peers/join control plane/shardpg add worker/done"
 bad=0
 for p in 5432 5433 5434 5435 5436 5437; do
   v=$(q "SELECT array_length(string_to_array(current_setting('pg_raft.peers'), ','), 1) || '/' || cluster_size FROM partdist.pg_raft_group_status() WHERE group_id = 0" "$p")
@@ -102,7 +102,7 @@ echo "================ [6] N102：迁移副本（共置段一起搬） =========
 CN=$(q "SELECT shard_name('t102c', $SC)")
 FROM=$(q "SELECT nm.port FROM partdist.partition_map m JOIN partdist.node_map nm ON nm.node_id = m.secondary_nodes[1] WHERE m.partition_id = $SC")
 out=$(q "SELECT string_agg(step, '/') FROM shardpg.move_replica('$CN', $FROM, 5437)")
-[[ "$out" == *"源节点出组/清理源节点/完成" ]] && ok "shardpg.move_replica :$FROM → :5437（$out）" || no "move_replica：$out"
+[[ "$out" == *"remove member/clean up source/done" ]] && ok "shardpg.move_replica :$FROM → :5437（$out）" || no "move_replica：$out"
 for g in $SC $SO; do
   check "组 $g 登记里有节点 6、没有源节点" \
     "$(q "SELECT (6 = ANY (ARRAY[primary_node] || secondary_nodes))::text || '/' || ((SELECT node_id FROM partdist.node_map WHERE port = $FROM) = ANY (ARRAY[primary_node] || secondary_nodes))::text FROM partdist.partition_map WHERE partition_id = $g")" "true/false"
@@ -115,7 +115,7 @@ check "迁移期间的暂停重供登记已撤销" "$(q "SELECT count(*) FROM pa
 
 echo "================ [7] 领导权转交到新节点、在新节点上读写 ================"
 out=$(q "SELECT shardpg.move_primary('$CN', 5437)")
-[[ "$out" == *"都在节点 6"* ]] && ok "shardpg.move_primary → :5437（$out）" || no "move_primary：$out"
+[[ "$out" == *"now on worker5"* ]] && ok "shardpg.move_primary → :5437（$out）" || no "move_primary：$out"
 check "t102c 仓库 1 在 :5437 上读" "$(q "SELECT count(*) || ':' || min(current_setting('port')) FROM t102c WHERE w = 1")" "5:5437"
 q "UPDATE t102c SET v = v + 1 WHERE w = 1 AND id = 1" >/dev/null
 check "在新主上写" "$(q "SELECT v FROM t102c WHERE w = 1 AND id = 1")" "11"

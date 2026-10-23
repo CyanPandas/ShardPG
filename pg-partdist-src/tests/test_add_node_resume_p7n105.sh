@@ -79,8 +79,8 @@ check "半程：Citus 还没有 :5437" "$(q "SELECT count(*) FROM pg_dist_node W
 
 echo "================ [3] 直接重跑 add_node：续做 ================"
 out=$(q "SELECT step || ' | ' || detail FROM shardpg.add_node('127.0.0.1', 5437)")
-check "四步都走到" "$(cut -d'|' -f1 <<<"$out" | sed 's/ *$//' | paste -sd/)" "新节点就绪/各节点追加 pg_raft.peers/加入控制面/Citus 加入 worker/完成"
-grep -q "其中 5 个上次已经追加过" <<<"$out" && ok "② 认出 5 个节点上次已经追加过、跳过" || no "② 没认出做过：$(grep "pg_raft.peers" <<<"$out")"
+check "四步都走到" "$(cut -d'|' -f1 <<<"$out" | sed 's/ *$//' | paste -sd/)" "new node ready/append pg_raft.peers/join control plane/shardpg add worker/done"
+grep -q "5 of them already appended by an earlier run" <<<"$out" && ok "② 认出 5 个节点上次已经追加过、跳过" || no "② 没认出做过：$(grep "pg_raft.peers" <<<"$out")"
 bad=0
 for p in 5432 5433 5434 5435 5436 5437; do
   v=$(q "SELECT array_length(string_to_array(current_setting('pg_raft.peers'), ','), 1) || '/' || cluster_size FROM partdist.pg_raft_group_status() WHERE group_id = 0" "$p")
@@ -91,7 +91,7 @@ check "Citus worker 数" "$(q "SELECT count(*) FROM pg_dist_node WHERE groupid <
 check "各节点 node_map 都是 6 行" "$(for p in 5432 5433 5434 5435 5436 5437; do q "SELECT count(*) FROM partdist.node_map" "$p"; done | sort -u | paste -sd,)" "6"
 
 echo "================ [4] 再跑一次 ================"
-check "已入簇时只返回完成" "$(q "SELECT step || ' | ' || detail FROM shardpg.add_node('127.0.0.1', 5437)")" "完成 | 节点 6（127.0.0.1:5437）已经在集群里，不用再加"
+check "已入簇时只返回完成" "$(q "SELECT step || ' | ' || detail FROM shardpg.add_node('127.0.0.1', 5437)")" "done | worker5 (127.0.0.1:5437) is already in the cluster, nothing to do"
 
 echo "================ [5] 同一会话跨过新节点的一次重启，再做两阶段提交 ================"
 r0=$(reconnects)

@@ -1,231 +1,351 @@
 diff --git a/src/bin/psql/describe.c b/src/bin/psql/describe.c
-index 45f6a86..0c3ef81 100644
+index 45f6a86..e605058 100644
 --- a/src/bin/psql/describe.c
 +++ b/src/bin/psql/describe.c
-@@ -3893,6 +3893,272 @@ describeRoleGrants(const char *pattern, bool showSystem)
+@@ -30,6 +30,7 @@
+ #include "variables.h"
+ 
+ static const char *map_typename_pattern(const char *pattern);
++static void shardpgAddTableFooters(printTableContent *cont, const char *oid, bool verbose);
+ static bool describeOneTableDetails(const char *schemaname,
+ 									const char *relationname,
+ 									const char *oid,
+@@ -3464,6 +3465,10 @@ describeOneTableDetails(const char *schemaname,
+ 		}
+ 		PQclear(result);
+ 
++		/* ShardPG：分布式表的分片键、分片数、每片副本数、共置（\d+ 逐个列出分片） */
++		if (tableinfo.relkind == RELKIND_RELATION)
++			shardpgAddTableFooters(&cont, oid, verbose);
++
+ 		/* Table type */
+ 		if (tableinfo.reloftype)
+ 		{
+@@ -3893,6 +3898,373 @@ describeRoleGrants(const char *pattern, bool showSystem)
  }
  
  
 +/*
-+ * ShardPG：\dt 列出分布式表时，附上它的分片（子表）及每个分片的主从。
++ * ShardPG：\dt 分两张表输出（2026-10-19 起）。
 + *
-+ * 只在纯 \dt（只列表）且服务器装了 Citus 时生效；匹配结果里一张分布式表都没有时
-+ * 返回 NULL，由调用方照原样输出 —— 连普通 PostgreSQL 或只看本地表时与原版一致。
++ *   List of relations —— 与原版同样的列；Citus 分布式表的 Type 显示为 distributed_table，
++ *                         参考表为 reference_table，\dt+ 的 Size 是各分片大小之和
++ *   List of shards    —— 匹配到的哈希分布表的全部分片：所属表、哈希范围、主、从（\dt+ 加每片行数、大小）
 + *
-+ * from / where 是 listTables 已经拼好的 FROM 与 WHERE 子句（含模式匹配），各分支
-+ * 共用，保证父表行与分片行的筛选条件完全相同。父表下面逐行列出它的全部分片；
-+ * 带不带模式都展开（表多时用模式缩小范围，如 \dt customer*）。树形符号与宕机标记一律用 ASCII：
-+ * 客户端编码不是 UTF8 时 psql 按字节算宽度，框线字符会把列挤歪。
++ * 分片键、分片数、每片副本数、共置不在 \dt 里，放在 \d 的尾行（shardpgAddTableFooters）。
++ *
++ * 只在纯 \dt（只列表）且服务器装了 Citus 时生效；匹配结果里一张 Citus 表都没有时返回 false，
++ * 由调用方照原样输出 —— 连普通 PostgreSQL 或只看本地表时与原版一致。
++ *
++ * from / where 是 listTables 已经拼好的 FROM 与 WHERE 子句（含模式匹配），两张表共用，
++ * 保证表与分片的筛选条件完全相同。
 + *
 + * 主从来自 pg_partdist 的控制面登记（partdist.partition_map / node_map），切主后
 + * 再执行一次即反映新主；没装 pg_partdist 或分片没登记时，主退回 Citus 的放置节点。
 + */
-+#define SHARDPG_MAX_COLS 16
 +
-+static PGresult *
-+shardpgListTables(const char *from, const char *where, const char *pattern,
-+				  bool verbose, bool showAm, bool *translate, int ntranslate)
++/*
++ * 节点名（P7-N107）：节点号 1 是 master，其余 worker<节点号-1>，与数据目录名一致；
++ * 与 pg_partdist 的 shardpg.node_name() 同一规则（这里内联，不依赖扩展版本）
++ */
++#define SHARDPG_NM_NAME "CASE WHEN nm.node_id = 1 THEN 'master' ELSE 'worker' || (nm.node_id - 1) END"
++#define SHARDPG_ND_ADDR "CASE WHEN nd.nodename IN ('localhost', '127.0.0.1') THEN '' ELSE nd.nodename END" \
++		" || ':' || nd.nodeport"
++#define SHARDPG_NM_LABEL SHARDPG_NM_NAME " || CASE WHEN nm.status <> 'active' THEN ' (down)' ELSE '' END"
++/* 没有主从登记的分片：Citus 放置节点按地址到 node_map 里找名字，找不到才显示地址 */
++#define SHARDPG_ND_LABEL \
++		"COALESCE((SELECT " SHARDPG_NM_NAME " FROM partdist.node_map nm" \
++		" WHERE nm.port = nd.nodeport AND (nm.hostname = nd.nodename" \
++		" OR (nm.hostname IN ('localhost', '127.0.0.1') AND nd.nodename IN ('localhost', '127.0.0.1'))) LIMIT 1)," \
++		" " SHARDPG_ND_ADDR ")"
++
++/*
++ * 服务器上有没有 Citus、有没有 pg_partdist 的控制面登记表。没有 Citus 返回 false。
++ */
++static bool
++shardpgDetect(bool *have_partdist)
 +{
 +	PGresult   *res;
-+	PQExpBufferData q;
-+	bool		have_partdist;
-+	bool		expand = true;
-+	bool		with_rows = verbose;
-+	int			col;
-+	int			i;
-+	int			hashcol;
-+	bool		any_dist = false;
-+	const char *nm_label =
-+		"CASE WHEN nm.hostname IN ('localhost', '127.0.0.1') THEN '' ELSE nm.hostname END"
-+		" || ':' || nm.port"
-+		" || CASE WHEN nm.status <> 'active' THEN ' (down)' ELSE '' END";
-+	const char *nd_label =
-+		"CASE WHEN nd.nodename IN ('localhost', '127.0.0.1') THEN '' ELSE nd.nodename END"
-+		" || ':' || nd.nodeport";
-+
-+	if (ntranslate < SHARDPG_MAX_COLS)
-+		return NULL;
++	bool		have_citus;
 +
 +	res = PSQLexec("SELECT pg_catalog.to_regclass('pg_catalog.pg_dist_shard') IS NOT NULL,\n"
 +				   "       pg_catalog.to_regclass('partdist.partition_map') IS NOT NULL AND\n"
 +				   "       pg_catalog.to_regclass('partdist.node_map') IS NOT NULL");
 +	if (!res)
-+		return NULL;
-+	if (PQntuples(res) != 1 || strcmp(PQgetvalue(res, 0, 0), "t") != 0)
-+	{
-+		PQclear(res);
-+		return NULL;
-+	}
-+	have_partdist = (strcmp(PQgetvalue(res, 0, 1), "t") == 0);
++		return false;
++	have_citus = (PQntuples(res) == 1 && strcmp(PQgetvalue(res, 0, 0), "t") == 0);
++	*have_partdist = have_citus && strcmp(PQgetvalue(res, 0, 1), "t") == 0;
 +	PQclear(res);
++	return have_citus;
++}
 +
++/*
++ * 拼分片 sid（SQL 表达式）的主、从两列：\dt 的 List of shards 与 \d+ 的 Shards 尾行共用。
++ */
++static void
++shardpgAppendPrimaryReplicas(PQExpBuffer q, bool have_partdist, const char *sid)
++{
++	if (have_partdist)
++		appendPQExpBuffer(q,
++						  "  COALESCE((SELECT " SHARDPG_NM_LABEL " FROM partdist.partition_map m JOIN partdist.node_map nm"
++						  " ON nm.node_id = m.primary_node WHERE m.partition_id = %s),\n"
++						  "           (SELECT " SHARDPG_ND_LABEL " FROM pg_catalog.pg_dist_placement pl JOIN pg_catalog.pg_dist_node nd"
++						  " ON nd.groupid = pl.groupid AND nd.noderole = 'primary' WHERE pl.shardid = %s"
++						  " ORDER BY nd.nodeport LIMIT 1)) AS \"Primary\",\n"
++						  "  (SELECT pg_catalog.string_agg(" SHARDPG_NM_LABEL ", ',' ORDER BY nm.node_id) FROM partdist.partition_map m"
++						  " JOIN partdist.node_map nm ON nm.node_id = ANY (m.secondary_nodes) WHERE m.partition_id = %s) AS \"Replicas\"",
++						  sid, sid, sid);
++	else
++		appendPQExpBuffer(q,
++						  "  (SELECT " SHARDPG_ND_ADDR " FROM pg_catalog.pg_dist_placement pl JOIN pg_catalog.pg_dist_node nd"
++						  " ON nd.groupid = pl.groupid AND nd.noderole = 'primary' WHERE pl.shardid = %s"
++						  " ORDER BY nd.nodeport LIMIT 1) AS \"Primary\",\n"
++						  "  NULL::pg_catalog.text AS \"Replicas\"",
++						  sid);
++}
++
++/*
++ * 返回 true 表示由本函数接管：*rel_res 是 List of relations，*shard_res 是 List of shards
++ * （没有哈希分布表时为 NULL）。返回 false 时调用方走原版。
++ */
++static bool
++shardpgListTables(const char *from, const char *where, bool verbose, bool showAm,
++				  PGresult **rel_res, PGresult **shard_res)
++{
++	PGresult   *res;
++	PQExpBufferData q;
++	bool		have_partdist;
++	bool		any_citus = false;
++	bool		any_hash = false;
++	int			i;
++
++	*rel_res = NULL;
++	*shard_res = NULL;
++	if (!shardpgDetect(&have_partdist))
++		return false;
++
++	/* ---- List of relations：原版的列，只改 Type、\dt+ 的 Size ---- */
 +	initPQExpBuffer(&q);
-+
-+	/* 只算一次的取数：分片大小（\dt+）、逐分片行数（\dt+ 且带模式） */
-+	appendPQExpBufferStr(&q, "WITH ");
 +	if (verbose)
 +		appendPQExpBufferStr(&q,
-+							 "sz AS MATERIALIZED (SELECT shard_id, size FROM pg_catalog.citus_shard_sizes()),\n");
-+	if (with_rows)
-+		appendPQExpBuffer(&q,
-+						  "rc AS MATERIALIZED (SELECT r.shardid, r.success, r.result%s"
-+						  "\n     JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid AND dp.partmethod = 'h'"
-+						  "\n     CROSS JOIN LATERAL pg_catalog.run_command_on_shards(c.oid, 'SELECT count(*) FROM %%s') r"
-+						  "%s),\n",
-+						  from, where);
-+	appendPQExpBufferStr(&q, "dummy AS (SELECT 1)\n");
-+
-+	/* 外层只取可见列 */
-+	appendPQExpBufferStr(&q, "SELECT \"Schema\", \"Name\", \"Type\", \"Owner\", \"Hash range\", \"Primary\", \"Replicas\"");
-+	if (with_rows)
-+		appendPQExpBufferStr(&q, ", \"Rows\"");
-+	if (verbose)
-+	{
-+		appendPQExpBufferStr(&q, ", \"Persistence\"");
-+		if (showAm)
-+			appendPQExpBufferStr(&q, ", \"Access method\"");
-+		appendPQExpBufferStr(&q, ", \"Size\", \"Description\"");
-+	}
-+	appendPQExpBufferStr(&q, "\nFROM (\n");
-+
-+	/* ---- 分支一：表本身（分布式表附一行汇总） ---- */
++							 "WITH sz AS MATERIALIZED (SELECT shard_id, size FROM pg_catalog.citus_shard_sizes())\n");
 +	appendPQExpBuffer(&q,
-+					  "SELECT n.nspname AS \"Schema\", c.relname AS \"Name\",\n"
-+					  "  CASE c.relkind"
++					  "SELECT n.nspname AS \"%s\", c.relname AS \"%s\",\n"
++					  "  CASE WHEN dp.partmethod IN ('h', 'r', 'a') THEN 'distributed_table'"
++					  " WHEN dp.partmethod = 'n' AND dp.repmodel = 't' THEN 'reference_table'"
++					  " ELSE CASE c.relkind"
 +					  " WHEN " CppAsString2(RELKIND_RELATION) " THEN '%s'"
 +					  " WHEN " CppAsString2(RELKIND_TOASTVALUE) " THEN '%s'"
 +					  " WHEN " CppAsString2(RELKIND_PARTITIONED_TABLE) " THEN '%s'"
 +					  " WHEN 's' THEN 'special'"
-+					  " END AS \"Type\",\n"
-+					  "  pg_catalog.pg_get_userbyid(c.relowner) AS \"Owner\",\n",
++					  " END END AS \"%s\",\n"
++					  "  pg_catalog.pg_get_userbyid(c.relowner) AS \"%s\"",
++					  gettext_noop("Schema"),
++					  gettext_noop("Name"),
 +					  gettext_noop("table"),
 +					  gettext_noop("TOAST table"),
-+					  gettext_noop("partitioned table"));
-+	appendPQExpBufferStr(&q,
-+						 "  CASE WHEN dp.partmethod = 'h' THEN 'shard key: '"
-+						 " || pg_catalog.column_to_column_name(dp.logicalrelid, dp.partkey)"
-+						 " || ', ' || (SELECT pg_catalog.count(*) FROM pg_catalog.pg_dist_shard s WHERE s.logicalrelid = c.oid) || ' shards'");
-+	if (have_partdist)
-+		appendPQExpBufferStr(&q,
-+							 " || COALESCE(', ' || (SELECT pg_catalog.max(pg_catalog.cardinality(m.secondary_nodes))"
-+							 " FROM pg_catalog.pg_dist_shard s JOIN partdist.partition_map m ON m.partition_id = s.shardid"
-+							 " WHERE s.logicalrelid = c.oid) || ' replicas', '')");
-+	appendPQExpBufferStr(&q,
-+						 " || COALESCE(', colocated with ' || (SELECT pg_catalog.string_agg(t.n, ', ' ORDER BY t.n)"
-+						 " || CASE WHEN pg_catalog.max(t.total) > 3 THEN ' and ' || (pg_catalog.max(t.total) - 3) || ' more' ELSE '' END"
-+						 " FROM (SELECT o.logicalrelid::pg_catalog.regclass::pg_catalog.text AS n, pg_catalog.count(*) OVER () AS total"
-+						 " FROM pg_catalog.pg_dist_partition o WHERE o.colocationid = dp.colocationid AND dp.colocationid <> 0"
-+						 " AND o.logicalrelid <> c.oid ORDER BY 1 LIMIT 3) t), '')"
-+						 "\n       WHEN dp.partmethod = 'n' AND dp.repmodel = 't' THEN 'reference table'"
-+						 "\n       WHEN dp.partmethod IS NOT NULL THEN 'citus table' END AS \"Hash range\",\n"
-+						 "  NULL::pg_catalog.text AS \"Primary\", NULL::pg_catalog.text AS \"Replicas\"");
-+	if (with_rows)
-+		appendPQExpBufferStr(&q,
-+							 ",\n  CASE WHEN dp.partmethod = 'h' THEN (SELECT pg_catalog.sum(CASE WHEN rc.success THEN rc.result::pg_catalog.int8 END)::pg_catalog.text"
-+							 " FROM rc JOIN pg_catalog.pg_dist_shard s ON s.shardid = rc.shardid WHERE s.logicalrelid = c.oid) END AS \"Rows\"");
++					  gettext_noop("partitioned table"),
++					  gettext_noop("Type"),
++					  gettext_noop("Owner"));
 +	if (verbose)
 +	{
 +		appendPQExpBuffer(&q,
-+						  ",\n  CASE c.relpersistence WHEN 'p' THEN '%s' WHEN 't' THEN '%s' WHEN 'u' THEN '%s' END AS \"Persistence\"",
++						  ",\n  CASE c.relpersistence WHEN 'p' THEN '%s' WHEN 't' THEN '%s' WHEN 'u' THEN '%s' END AS \"%s\"",
 +						  gettext_noop("permanent"),
 +						  gettext_noop("temporary"),
-+						  gettext_noop("unlogged"));
++						  gettext_noop("unlogged"),
++						  gettext_noop("Persistence"));
 +		if (showAm)
-+			appendPQExpBufferStr(&q, ",\n  am.amname AS \"Access method\"");
-+		appendPQExpBufferStr(&q,
-+							 ",\n  pg_catalog.pg_size_pretty(CASE WHEN dp.partmethod = 'h'"
-+							 " THEN (SELECT pg_catalog.sum(sz.size) FROM sz JOIN pg_catalog.pg_dist_shard s ON s.shardid = sz.shard_id"
-+							 " WHERE s.logicalrelid = c.oid)::pg_catalog.int8"
-+							 " ELSE pg_catalog.pg_table_size(c.oid) END) AS \"Size\""
-+							 ",\n  pg_catalog.obj_description(c.oid, 'pg_class') AS \"Description\"");
++			appendPQExpBuffer(&q, ",\n  am.amname AS \"%s\"", gettext_noop("Access method"));
++		appendPQExpBuffer(&q,
++						  ",\n  pg_catalog.pg_size_pretty(CASE WHEN dp.partmethod = 'h'"
++						  " THEN (SELECT pg_catalog.sum(sz.size) FROM sz JOIN pg_catalog.pg_dist_shard s ON s.shardid = sz.shard_id"
++						  " WHERE s.logicalrelid = c.oid)::pg_catalog.int8"
++						  " ELSE pg_catalog.pg_table_size(c.oid) END) AS \"%s\""
++						  ",\n  pg_catalog.obj_description(c.oid, 'pg_class') AS \"%s\"",
++						  gettext_noop("Size"),
++						  gettext_noop("Description"));
 +	}
 +	appendPQExpBuffer(&q,
-+					  ",\n  n.nspname AS \"__s\", c.relname AS \"__r\", 0 AS \"__o\", 0::pg_catalog.int8 AS \"__k\"%s"
-+					  "\n     LEFT JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid%s",
++					  "%s\n     LEFT JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid%s"
++					  "ORDER BY 1, 2;",
 +					  from, where);
-+
-+	/* ---- 分支二：分片（子表），仅在带模式时展开 ---- */
-+	if (expand)
-+	{
-+		appendPQExpBufferStr(&q,
-+							 "UNION ALL\n"
-+							 "SELECT n.nspname, CASE WHEN sh.rn = sh.cnt THEN '`-- ' ELSE '+-- ' END"
-+							 " || pg_catalog.shard_name(c.oid, sh.shardid),\n"
-+							 "  'shard', pg_catalog.pg_get_userbyid(c.relowner),\n"
-+							 "  '[' || sh.shardminvalue || ', ' || sh.shardmaxvalue || ']',\n");
-+		if (have_partdist)
-+			appendPQExpBuffer(&q,
-+							  "  COALESCE((SELECT %s FROM partdist.partition_map m JOIN partdist.node_map nm"
-+							  " ON nm.node_id = m.primary_node WHERE m.partition_id = sh.shardid),\n"
-+							  "           (SELECT %s FROM pg_catalog.pg_dist_placement pl JOIN pg_catalog.pg_dist_node nd"
-+							  " ON nd.groupid = pl.groupid AND nd.noderole = 'primary' WHERE pl.shardid = sh.shardid"
-+							  " ORDER BY nd.nodeport LIMIT 1)),\n"
-+							  "  (SELECT pg_catalog.string_agg(%s, ',' ORDER BY nm.port) FROM partdist.partition_map m"
-+							  " JOIN partdist.node_map nm ON nm.node_id = ANY (m.secondary_nodes) WHERE m.partition_id = sh.shardid)",
-+							  nm_label, nd_label, nm_label);
-+		else
-+			appendPQExpBuffer(&q,
-+							  "  (SELECT %s FROM pg_catalog.pg_dist_placement pl JOIN pg_catalog.pg_dist_node nd"
-+							  " ON nd.groupid = pl.groupid AND nd.noderole = 'primary' WHERE pl.shardid = sh.shardid"
-+							  " ORDER BY nd.nodeport LIMIT 1),\n"
-+							  "  NULL::pg_catalog.text",
-+							  nd_label);
-+		if (with_rows)
-+			appendPQExpBufferStr(&q,
-+								 ",\n  (SELECT CASE WHEN rc.success THEN rc.result ELSE '?' END FROM rc WHERE rc.shardid = sh.shardid)");
-+		if (verbose)
-+		{
-+			appendPQExpBuffer(&q,
-+							  ",\n  CASE c.relpersistence WHEN 'p' THEN '%s' WHEN 't' THEN '%s' WHEN 'u' THEN '%s' END",
-+							  gettext_noop("permanent"),
-+							  gettext_noop("temporary"),
-+							  gettext_noop("unlogged"));
-+			if (showAm)
-+				appendPQExpBufferStr(&q, ",\n  am.amname");
-+			appendPQExpBufferStr(&q,
-+								 ",\n  pg_catalog.pg_size_pretty((SELECT sz.size FROM sz WHERE sz.shard_id = sh.shardid))"
-+								 ",\n  NULL::pg_catalog.text");
-+		}
-+		appendPQExpBuffer(&q,
-+						  ",\n  n.nspname, c.relname, 1, sh.rn%s"
-+						  "\n     JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid AND dp.partmethod = 'h'"
-+						  "\n     CROSS JOIN LATERAL (SELECT s.shardid, s.shardminvalue, s.shardmaxvalue,"
-+						  " pg_catalog.row_number() OVER (ORDER BY s.shardminvalue::pg_catalog.int4) AS rn,"
-+						  " pg_catalog.count(*) OVER () AS cnt"
-+						  " FROM pg_catalog.pg_dist_shard s WHERE s.logicalrelid = c.oid) sh%s",
-+						  from, where);
-+	}
-+	appendPQExpBufferStr(&q, ") x\nORDER BY \"__s\", \"__r\", \"__o\", \"__k\";");
-+
 +	res = PSQLexec(q.data);
 +	termPQExpBuffer(&q);
 +	if (!res)
-+		return NULL;
++		return false;
 +
-+	/* 一张分布式表都没匹配上：交回原版输出（PQfnumber 按标识符处理，带空格/大写的列名要加双引号） */
-+	hashcol = PQfnumber(res, "\"Hash range\"");
-+	for (i = 0; hashcol >= 0 && i < PQntuples(res); i++)
++	/* 一张 Citus 表都没匹配上：交回原版输出 */
++	for (i = 0; i < PQntuples(res); i++)
 +	{
-+		if (!PQgetisnull(res, i, hashcol))
-+		{
-+			any_dist = true;
-+			break;
-+		}
++		const char *t = PQgetvalue(res, i, 2);
++
++		if (strcmp(t, "distributed_table") == 0)
++			any_citus = any_hash = true;
++		else if (strcmp(t, "reference_table") == 0)
++			any_citus = true;
 +	}
-+	if (!any_dist)
++	if (!any_citus)
 +	{
 +		PQclear(res);
-+		return NULL;
++		return false;
++	}
++	*rel_res = res;
++	if (!any_hash)
++		return true;
++
++	/* ---- List of shards：哈希分布表的全部分片 ---- */
++	initPQExpBuffer(&q);
++	if (verbose)
++		appendPQExpBuffer(&q,
++						  "WITH sz AS MATERIALIZED (SELECT shard_id, size FROM pg_catalog.citus_shard_sizes()),\n"
++						  "rc AS MATERIALIZED (SELECT r.shardid, r.success, r.result%s"
++						  "\n     JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid AND dp.partmethod = 'h'"
++						  "\n     CROSS JOIN LATERAL pg_catalog.run_command_on_shards(c.oid, 'SELECT count(*) FROM %%s') r"
++						  "%s)\n",
++						  from, where);
++	appendPQExpBuffer(&q,
++					  "SELECT n.nspname AS \"%s\", pg_catalog.shard_name(c.oid, s.shardid) AS \"%s\", c.relname AS \"%s\",\n"
++					  "  '[' || s.shardminvalue || ', ' || s.shardmaxvalue || ']' AS \"%s\",\n",
++					  gettext_noop("Schema"),
++					  gettext_noop("Name"),
++					  gettext_noop("Table"),
++					  gettext_noop("Hash range"));
++	shardpgAppendPrimaryReplicas(&q, have_partdist, "s.shardid");
++	if (verbose)
++		appendPQExpBuffer(&q,
++						  ",\n  (SELECT CASE WHEN rc.success THEN rc.result ELSE '?' END FROM rc WHERE rc.shardid = s.shardid) AS \"%s\""
++						  ",\n  pg_catalog.pg_size_pretty((SELECT sz.size FROM sz WHERE sz.shard_id = s.shardid)) AS \"%s\"",
++						  gettext_noop("Rows"),
++						  gettext_noop("Size"));
++	appendPQExpBuffer(&q,
++					  "%s"
++					  "\n     JOIN pg_catalog.pg_dist_partition dp ON dp.logicalrelid = c.oid AND dp.partmethod = 'h'"
++					  "\n     JOIN pg_catalog.pg_dist_shard s ON s.logicalrelid = c.oid%s"
++					  "ORDER BY n.nspname, c.relname, s.shardminvalue::pg_catalog.int4;",
++					  from, where);
++	*shard_res = PSQLexec(q.data);
++	termPQExpBuffer(&q);
++	return true;
++}
++
++/*
++ * ShardPG：\d / \d+ 的尾行附上分布信息 —— 照分区表 "Partition key" / "Number of partitions" 的写法：
++ *
++ *   Shard key: HASH (c_w_id)
++ *   Number of shards: 4 (Use \d+ to list them.)      ← \d；\d+ 换成逐个列出的 Shards:
++ *   Replicas per shard: 2                            ← 有 pg_partdist 主从登记时
++ *   Colocated with: orders                           ← 同一共置组的其他表
++ *
++ * 只对 Citus 哈希分布表生效；普通表、没装 Citus 时什么都不加。
++ */
++static void
++shardpgAddTableFooters(printTableContent *cont, const char *oid, bool verbose)
++{
++	PGresult   *res;
++	PQExpBufferData q;
++	PQExpBufferData line;
++	bool		have_partdist;
++	int			i;
++
++	if (!shardpgDetect(&have_partdist))
++		return;
++
++	initPQExpBuffer(&q);
++	appendPQExpBufferStr(&q,
++						 "SELECT pg_catalog.column_to_column_name(dp.logicalrelid, dp.partkey),\n"
++						 "  (SELECT pg_catalog.count(*) FROM pg_catalog.pg_dist_shard s WHERE s.logicalrelid = dp.logicalrelid),\n");
++	if (have_partdist)
++		appendPQExpBufferStr(&q,
++							 "  (SELECT pg_catalog.max(pg_catalog.cardinality(m.secondary_nodes)) FROM pg_catalog.pg_dist_shard s"
++							 " JOIN partdist.partition_map m ON m.partition_id = s.shardid WHERE s.logicalrelid = dp.logicalrelid),\n");
++	else
++		appendPQExpBufferStr(&q, "  NULL::pg_catalog.int4,\n");
++	appendPQExpBuffer(&q,
++					  "  (SELECT pg_catalog.string_agg(t.n, ', ' ORDER BY t.n)"
++					  " || CASE WHEN pg_catalog.max(t.total) > 10 THEN ' and ' || (pg_catalog.max(t.total) - 10) || ' more' ELSE '' END"
++					  " FROM (SELECT o.logicalrelid::pg_catalog.regclass::pg_catalog.text AS n, pg_catalog.count(*) OVER () AS total"
++					  " FROM pg_catalog.pg_dist_partition o WHERE o.colocationid = dp.colocationid AND dp.colocationid <> 0"
++					  " AND o.logicalrelid <> dp.logicalrelid ORDER BY 1 LIMIT 10) t)\n"
++					  "FROM pg_catalog.pg_dist_partition dp WHERE dp.logicalrelid = '%s' AND dp.partmethod = 'h';",
++					  oid);
++	res = PSQLexec(q.data);
++	if (!res || PQntuples(res) != 1)
++	{
++		PQclear(res);
++		termPQExpBuffer(&q);
++		return;
 +	}
 +
-+	/* 需要翻译的列：Type，以及 \dt+ 的 Persistence */
-+	for (i = 0; i < ntranslate; i++)
-+		translate[i] = false;
-+	translate[2] = true;
-+	col = PQfnumber(res, "\"Persistence\"");
-+	if (col >= 0 && col < ntranslate)
-+		translate[col] = true;
-+	return res;
++	initPQExpBuffer(&line);
++	printfPQExpBuffer(&line, _("Shard key: HASH (%s)"), PQgetvalue(res, 0, 0));
++	printTableAddFooter(cont, line.data);
++	if (!verbose)
++	{
++		printfPQExpBuffer(&line, _("Number of shards: %s (Use \\d+ to list them.)"), PQgetvalue(res, 0, 1));
++		printTableAddFooter(cont, line.data);
++	}
++	if (!PQgetisnull(res, 0, 2))
++	{
++		printfPQExpBuffer(&line, _("Replicas per shard: %s"), PQgetvalue(res, 0, 2));
++		printTableAddFooter(cont, line.data);
++	}
++	if (!PQgetisnull(res, 0, 3))
++	{
++		printfPQExpBuffer(&line, _("Colocated with: %s"), PQgetvalue(res, 0, 3));
++		printTableAddFooter(cont, line.data);
++	}
++	PQclear(res);
++
++	if (verbose)
++	{
++		/* 逐个列出分片，照 \d+ 列分区的格式：续行缩进到第一项下面，项与项之间逗号 */
++		const char *ct = _("Shards");
++		int			ctw = pg_wcswidth(ct, strlen(ct), pset.encoding);
++		int			w0 = 0;
++		int			w1 = 0;
++
++		printfPQExpBuffer(&q,
++						  "SELECT pg_catalog.shard_name(s.logicalrelid, s.shardid),"
++						  " '[' || s.shardminvalue || ', ' || s.shardmaxvalue || ']',\n");
++		shardpgAppendPrimaryReplicas(&q, have_partdist, "s.shardid");
++		appendPQExpBuffer(&q,
++						  "\nFROM pg_catalog.pg_dist_shard s WHERE s.logicalrelid = '%s'"
++						  " ORDER BY s.shardminvalue::pg_catalog.int4;",
++						  oid);
++		res = PSQLexec(q.data);
++		if (res)
++		{
++			for (i = 0; i < PQntuples(res); i++)
++			{
++				w0 = Max(w0, (int) strlen(PQgetvalue(res, i, 0)));
++				w1 = Max(w1, (int) strlen(PQgetvalue(res, i, 1)));
++			}
++			if (PQntuples(res) == 0)
++			{
++				printfPQExpBuffer(&line, _("Number of shards: %d"), 0);
++				printTableAddFooter(cont, line.data);
++			}
++			for (i = 0; i < PQntuples(res); i++)
++			{
++				if (i == 0)
++					printfPQExpBuffer(&line, "%s: ", ct);
++				else
++					printfPQExpBuffer(&line, "%*s  ", ctw, "");
++				appendPQExpBuffer(&line, "%-*s %-*s  primary %s",
++								  w0, PQgetvalue(res, i, 0), w1, PQgetvalue(res, i, 1),
++								  PQgetisnull(res, i, 2) ? "?" : PQgetvalue(res, i, 2));
++				if (!PQgetisnull(res, i, 3))
++					appendPQExpBuffer(&line, ", replicas %s", PQgetvalue(res, i, 3));
++				if (i < PQntuples(res) - 1)
++					appendPQExpBufferChar(&line, ',');
++				printTableAddFooter(cont, line.data);
++			}
++			PQclear(res);
++		}
++	}
++	termPQExpBuffer(&line);
++	termPQExpBuffer(&q);
 +}
 +
 +/*
@@ -275,7 +395,7 @@ index 45f6a86..0c3ef81 100644
  /*
   * listTables()
   *
-@@ -3918,10 +4184,14 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -3918,10 +4290,15 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  	bool		showForeign = strchr(tabtypes, 'E') != NULL;
  
  	PQExpBufferData buf;
@@ -284,14 +404,57 @@ index 45f6a86..0c3ef81 100644
  	printQueryOpt myopt = pset.popt;
  	int			cols_so_far;
  	bool		translate_columns[] = {false, false, true, false, false, false, false, false, false};
-+	bool		shard_translate[SHARDPG_MAX_COLS];
-+	bool	   *cur_translate = translate_columns;
++	PGresult   *shard_res = NULL;
 +	size_t		from_off = 0;
 +	size_t		where_off = 0;
++	bool		shardpg_citus = false;
++	bool		shardpg_partdist;
  
  	/* If tabtypes is empty, we default to \dtvmsE (but see also command.c) */
  	if (!(showTables || showIndexes || showViews || showMatViews || showSeq || showForeign))
-@@ -4002,6 +4272,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -3929,10 +4306,17 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+ 
+ 	initPQExpBuffer(&buf);
+ 
++	/*
++	 * ShardPG：列到表时（\d、\dt、\dtv …），Citus 分布式表的 Type 显示为 distributed_table、
++	 * 参考表为 reference_table —— 与纯 \dt 的 List of relations 一致。没装 Citus 时原样。
++	 */
++	if (showTables)
++		shardpg_citus = shardpgDetect(&shardpg_partdist);
++
+ 	printfPQExpBuffer(&buf,
+ 					  "SELECT n.nspname as \"%s\",\n"
+ 					  "  c.relname as \"%s\",\n"
+-					  "  CASE c.relkind"
++					  "  %sCASE c.relkind"
+ 					  " WHEN " CppAsString2(RELKIND_RELATION) " THEN '%s'"
+ 					  " WHEN " CppAsString2(RELKIND_VIEW) " THEN '%s'"
+ 					  " WHEN " CppAsString2(RELKIND_MATVIEW) " THEN '%s'"
+@@ -3942,10 +4326,13 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+ 					  " WHEN " CppAsString2(RELKIND_FOREIGN_TABLE) " THEN '%s'"
+ 					  " WHEN " CppAsString2(RELKIND_PARTITIONED_TABLE) " THEN '%s'"
+ 					  " WHEN " CppAsString2(RELKIND_PARTITIONED_INDEX) " THEN '%s'"
+-					  " END as \"%s\",\n"
++					  " END%s as \"%s\",\n"
+ 					  "  pg_catalog.pg_get_userbyid(c.relowner) as \"%s\"",
+ 					  gettext_noop("Schema"),
+ 					  gettext_noop("Name"),
++					  shardpg_citus ?
++					  "CASE WHEN sdp.partmethod IN ('h', 'r', 'a') THEN 'distributed_table'"
++					  " WHEN sdp.partmethod = 'n' AND sdp.repmodel = 't' THEN 'reference_table' ELSE " : "",
+ 					  gettext_noop("table"),
+ 					  gettext_noop("view"),
+ 					  gettext_noop("materialized view"),
+@@ -3955,6 +4342,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+ 					  gettext_noop("foreign table"),
+ 					  gettext_noop("partitioned table"),
+ 					  gettext_noop("partitioned index"),
++					  shardpg_citus ? " END" : "",
+ 					  gettext_noop("Type"),
+ 					  gettext_noop("Owner"));
+ 	cols_so_far = 4;
+@@ -4002,9 +4390,13 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  						  gettext_noop("Description"));
  	}
  
@@ -299,7 +462,13 @@ index 45f6a86..0c3ef81 100644
  	appendPQExpBufferStr(&buf,
  						 "\nFROM pg_catalog.pg_class c"
  						 "\n     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace");
-@@ -4016,6 +4287,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
++	if (shardpg_citus)
++		appendPQExpBufferStr(&buf,
++							 "\n     LEFT JOIN pg_catalog.pg_dist_partition sdp ON sdp.logicalrelid = c.oid");
+ 
+ 	if (pset.sversion >= 120000 && !pset.hide_tableam &&
+ 		(showTables || showMatViews || showIndexes))
+@@ -4016,6 +4408,7 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  							 "\n     LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid"
  							 "\n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid");
  
@@ -307,24 +476,22 @@ index 45f6a86..0c3ef81 100644
  	appendPQExpBufferStr(&buf, "\nWHERE c.relkind IN (");
  	if (showTables)
  	{
-@@ -4056,9 +4328,26 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4056,9 +4449,24 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  		return false;
  	}
  
-+	/* ShardPG：纯 \dt 时附上分布式表的分片与主从 */
++	/* ShardPG：纯 \dt 时分两张表 —— 表（分布式表 Type 为 distributed_table）与分片 */
 +	if (showTables && !showIndexes && !showViews && !showMatViews &&
 +		!showSeq && !showForeign)
 +	{
 +		char	   *from = pnstrdup(buf.data + from_off, where_off - from_off);
 +		char	   *where = pg_strdup(buf.data + where_off);
 +
-+		res = shardpgListTables(from, where, pattern, verbose,
-+								pset.sversion >= 120000 && !pset.hide_tableam,
-+								shard_translate, lengthof(shard_translate));
++		(void) shardpgListTables(from, where, verbose,
++								 pset.sversion >= 120000 && !pset.hide_tableam,
++								 &res, &shard_res);
 +		free(from);
 +		free(where);
-+		if (res)
-+			cur_translate = shard_translate;
 +	}
 +
  	appendPQExpBufferStr(&buf, "ORDER BY 1,2;");
@@ -335,7 +502,7 @@ index 45f6a86..0c3ef81 100644
  	termPQExpBuffer(&buf);
  	if (!res)
  		return false;
-@@ -4071,8 +4360,12 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+@@ -4071,8 +4479,12 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
  	if (PQntuples(res) == 0 && !pset.quiet)
  	{
  		if (pattern)
@@ -348,15 +515,27 @@ index 45f6a86..0c3ef81 100644
  		else
  			pg_log_error("Did not find any relations.");
  	}
-@@ -4081,8 +4374,9 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
- 		myopt.nullPrint = NULL;
- 		myopt.title = _("List of relations");
- 		myopt.translate_header = true;
--		myopt.translate_columns = translate_columns;
--		myopt.n_translate_columns = lengthof(translate_columns);
-+		myopt.translate_columns = cur_translate;
-+		myopt.n_translate_columns = (cur_translate == shard_translate) ?
-+			lengthof(shard_translate) : lengthof(translate_columns);
+@@ -4085,9 +4497,23 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
+ 		myopt.n_translate_columns = lengthof(translate_columns);
  
  		printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
++
++		/* ShardPG：分片单独一张表 */
++		if (shard_res && PQntuples(shard_res) > 0)
++		{
++			printQueryOpt sopt = pset.popt;
++
++			sopt.nullPrint = NULL;
++			sopt.title = _("List of shards");
++			sopt.translate_header = true;
++			sopt.translate_columns = NULL;
++			sopt.n_translate_columns = 0;
++			printQuery(shard_res, &sopt, pset.queryFout, false, pset.logfile);
++		}
  	}
+ 
+ 	PQclear(res);
++	PQclear(shard_res);
+ 	return true;
+ }
+ 

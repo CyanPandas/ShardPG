@@ -100,7 +100,7 @@ pg_raft_self_trigger_dtx_recover(void)
  * 落后超过环容量（128）时更是永久卡死。
  *
  * 每个节点都跑，但只对**本节点是 leader 的组**做事；一个 leader 组都没有时
- * 连接都不开（pg_raft_any_group_leader_local 是纯 shmem 读）。
+ * 连接都不开（pg_raft_catchup_wanted_local 是纯 shmem 读）。
  */
 static void
 pg_raft_self_trigger_catchup(void)
@@ -377,9 +377,10 @@ pg_raft_maintenance_main(Datum main_arg)
 
         /*
          * 后台追平通道：按 catchup_interval_ms 节流。只有本节点确实是某个组的
-         * leader 时才开连接 —— 否则每个节点每 5 秒空转一次自连接。
+         * leader（或还有待看结局的 prepared 事务，P7-N115）时才开连接 ——
+         * 否则每个节点每 5 秒空转一次自连接。
          */
-        if (pg_raft_catchup_interval_ms > 0 && pg_raft_any_group_leader_local())
+        if (pg_raft_catchup_interval_ms > 0 && pg_raft_catchup_wanted_local())
         {
             TimestampTz now = GetCurrentTimestamp();
 
