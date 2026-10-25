@@ -298,7 +298,12 @@ partdist_planner(Query *parse, const char *query_string, int cursorOptions,
             list_nth(parse->rtable, parse->resultRelation - 1);
 
         if (rte != NULL && rte->rtekind == RTE_RELATION)
+        {
             ShardGuardCheckReferenceWrite(rte->relid);
+            /* 2026-10-21：分片表不支持 INSERT ... ON CONFLICT（见 ShardGuardCheckOnConflict） */
+            if (parse->commandType == CMD_INSERT && parse->onConflict != NULL)
+                ShardGuardCheckOnConflict(rte->relid);
+        }
     }
 
     if (prev_planner_hook)

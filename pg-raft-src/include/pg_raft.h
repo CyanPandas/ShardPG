@@ -151,6 +151,9 @@ extern int  pg_raft_dtx_recover_interval_ms;
 extern int  pg_raft_dtx_recover_timeout_ms;
 extern int  pg_raft_dtx_test_pause_point;
 extern int  pg_raft_dtx_test_pause_ms;
+extern int  pg_raft_dtx_test_status_hold_ms;
+/* 2026-10-21：不用 ON CONFLICT 的"有则改、无则插"（raft_consensus.c） */
+extern void pg_raft_spi_update_or_insert(const char *update_sql, const char *insert_sql, const char *what);
 extern int  pg_raft_promote_catchup_slice_ms;
 extern int  pg_raft_promote_catchup_deadline_ms;
 extern void pg_raft_dtx_install_hooks(void);

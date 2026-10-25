@@ -1842,25 +1842,38 @@ pg_partdist_follower_set_applied_part_lsn(PG_FUNCTION_ARGS)
 	 * 分片时退化成 OID 文本，保证进度列在任何情况下都能推进（它才是本函数的
 	 * 职责，命名只是附带信息）。
 	 */
+	/*
+	 * 2026-10-21：不用 ON CONFLICT（INSERT 只有成功与失败两种结果）—— 已有这一行就 UPDATE
+	 * （进度只前进），没有才 INSERT，且必须插入 1 行。
+	 */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "INSERT INTO partdist.follower_partition_map "
-					 "(partition_id, local_relname, applied_part_lsn, global_shard_id) "
-					 "SELECT %u, coalesce(si.local_relname, %u::text), %lld, si.global_shard_id "
-					 "FROM (SELECT 1) d "
-					 "LEFT JOIN partdist.shard_identity si ON si.local_oid = %u "
-					 "ON CONFLICT (partition_id) DO UPDATE SET "
-					 "applied_part_lsn = GREATEST(partdist.follower_partition_map.applied_part_lsn, "
-					 "EXCLUDED.applied_part_lsn), "
-					 "global_shard_id = coalesce(EXCLUDED.global_shard_id, "
-					 "partdist.follower_partition_map.global_shard_id)",
-					 partition_id, partition_id, (long long) applied_lsn,
-					 partition_id);
+					 "UPDATE partdist.follower_partition_map f "
+					 "SET applied_part_lsn = GREATEST(f.applied_part_lsn, %lld), "
+					 "    global_shard_id = coalesce((SELECT si.global_shard_id FROM partdist.shard_identity si "
+					 "                                WHERE si.local_oid = %u LIMIT 1), f.global_shard_id) "
+					 "WHERE f.partition_id = %u",
+					 (long long) applied_lsn, partition_id, partition_id);
 	ret = SPI_execute(sql.data, false, 0);
+	if (ret == SPI_OK_UPDATE && SPI_processed == 0)
+	{
+		resetStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "INSERT INTO partdist.follower_partition_map "
+						 "(partition_id, local_relname, applied_part_lsn, global_shard_id) "
+						 "SELECT %u, coalesce(si.local_relname, %u::text), %lld, si.global_shard_id "
+						 "FROM (SELECT 1) d "
+						 "LEFT JOIN partdist.shard_identity si ON si.local_oid = %u",
+						 partition_id, partition_id, (long long) applied_lsn,
+						 partition_id);
+		ret = SPI_execute(sql.data, false, 0);
+		if (ret == SPI_OK_INSERT && SPI_processed != 1)
+			ret = SPI_ERROR_ARGUMENT;	/* 没插进 1 行就按失败报 */
+	}
 	pfree(sql.data);
 
 	SPI_finish();
-	PG_RETURN_BOOL(ret == SPI_OK_INSERT);
+	PG_RETURN_BOOL(ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
 }
 
 /* ------------------------------------------------------------------ */

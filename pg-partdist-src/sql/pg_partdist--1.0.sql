@@ -386,7 +386,31 @@ CREATE OR REPLACE FUNCTION rebuild_shard_identity()
 AS $$
 DECLARE
     n INTEGER := 0;
+    n_ins INTEGER := 0;
 BEGIN
+    -- 2026-10-21：不用 ON CONFLICT（INSERT 只有成功与失败两种结果）——
+    -- 已登记的分片先 UPDATE，没登记的再 INSERT。
+    -- T4.5 加固 v2：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
+    -- shard_name() 直接抛错，整个身份重建报废。过滤必须**先于** JOIN 的
+    -- shard_name 求值——SQL 不保证 WHERE 先于 JOIN ON，故用 OFFSET 0
+    -- 优化栅栏把过滤钉死在子查询里（v1 只加 WHERE，实测 planner 仍先
+    -- 求值 shard_name 而炸，worker 上身份重建整体报废）。两条语句都保留这个栅栏。
+    UPDATE shard_identity si
+       SET local_oid     = cur.oid,
+           relfilenode   = cur.relfilenode,
+           local_relname = cur.relname,
+           logical_relid = cur.logicalrelid,
+           registered_at = now()
+      FROM (SELECT s.shardid, cls.oid, cls.relfilenode, cls.relname, s.logicalrelid
+              FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
+                     WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
+                     OFFSET 0) s
+              JOIN pg_catalog.pg_class cls
+                ON cls.oid = pg_catalog.to_regclass(
+                                 pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid) cur
+     WHERE si.global_shard_id = cur.shardid;
+    GET DIAGNOSTICS n = ROW_COUNT;
+
     INSERT INTO shard_identity
         (global_shard_id, local_oid, relfilenode, local_relname, logical_relid)
     SELECT s.shardid,
@@ -394,24 +418,15 @@ BEGIN
            cls.relfilenode,
            cls.relname,
            s.logicalrelid
-    -- T4.5 加固 v2：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
-    -- shard_name() 直接抛错，整个身份重建报废。过滤必须**先于** JOIN 的
-    -- shard_name 求值——SQL 不保证 WHERE 先于 JOIN ON，故用 OFFSET 0
-    -- 优化栅栏把过滤钉死在子查询里（v1 只加 WHERE，实测 planner 仍先
-    -- 求值 shard_name 而炸，worker 上身份重建整体报废）。
     FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
            WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
            OFFSET 0) s
     JOIN pg_catalog.pg_class cls
       ON cls.oid = pg_catalog.to_regclass(
                        pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
-    ON CONFLICT (global_shard_id) DO UPDATE
-       SET local_oid     = EXCLUDED.local_oid,
-           relfilenode   = EXCLUDED.relfilenode,
-           local_relname = EXCLUDED.local_relname,
-           logical_relid = EXCLUDED.logical_relid,
-           registered_at = now();
-    GET DIAGNOSTICS n = ROW_COUNT;
+    WHERE NOT EXISTS (SELECT 1 FROM shard_identity si WHERE si.global_shard_id = s.shardid);
+    GET DIAGNOSTICS n_ins = ROW_COUNT;
+    n := n + n_ins;
 
     -- 清理已不在本节点的分片(表被删/迁走);to_regclass 不受分片隐藏影响。
     --
@@ -464,19 +479,25 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    INSERT INTO shard_identity
-        (global_shard_id, local_oid, relfilenode, local_relname, logical_relid)
-    SELECT gid, cls.oid, cls.relfilenode, cls.relname,
-           (SELECT s.logicalrelid FROM pg_catalog.pg_dist_shard s
-             WHERE s.shardid = gid LIMIT 1)
-    FROM pg_catalog.pg_class cls
-    WHERE cls.oid = p_local_oid
-    ON CONFLICT (global_shard_id) DO UPDATE
-       SET local_oid     = EXCLUDED.local_oid,
-           relfilenode   = EXCLUDED.relfilenode,
-           local_relname = EXCLUDED.local_relname,
-           logical_relid = EXCLUDED.logical_relid,
-           registered_at = now();
+    -- 2026-10-21：不用 ON CONFLICT —— 先 UPDATE，没登记过才 INSERT
+    UPDATE shard_identity si
+       SET local_oid     = cls.oid,
+           relfilenode   = cls.relfilenode,
+           local_relname = cls.relname,
+           logical_relid = (SELECT s.logicalrelid FROM pg_catalog.pg_dist_shard s
+                             WHERE s.shardid = gid LIMIT 1),
+           registered_at = now()
+      FROM pg_catalog.pg_class cls
+     WHERE si.global_shard_id = gid AND cls.oid = p_local_oid;
+    IF NOT FOUND THEN
+        INSERT INTO shard_identity
+            (global_shard_id, local_oid, relfilenode, local_relname, logical_relid)
+        SELECT gid, cls.oid, cls.relfilenode, cls.relname,
+               (SELECT s.logicalrelid FROM pg_catalog.pg_dist_shard s
+                 WHERE s.shardid = gid LIMIT 1)
+        FROM pg_catalog.pg_class cls
+        WHERE cls.oid = p_local_oid;
+    END IF;
     RETURN gid;
 END;
 $$;
@@ -905,9 +926,9 @@ COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGI
 -- 索引表，因此切主后新 leader 手里天然就有全表 —— 这正是"协调权随 Raft 选举
 -- 自动转移"的落地形态。
 --
--- 决议槽一次性：INSERT ... ON CONFLICT (dtxid) DO NOTHING。第一条进入协调组
--- 日志的决议获胜，后到的同 dtxid 决议被忽略（推定中止与正常提交路径可能并发，
--- 见 §2.2）。
+-- 决议槽一次性：写决议前按 dtxid 取决议锁（事务级 advisory），用新快照查，没有才普通 INSERT；
+-- 已有决议就按已有的答（推定中止与正常提交路径可能并发，见 DTX_2PC_DESIGN.md §2.2、§15）。
+-- 2026-10-21 起不用 ON CONFLICT：INSERT 只有成功与失败两种结果。
 CREATE TABLE IF NOT EXISTS dtx_decision (
     dtxid         BIGINT      PRIMARY KEY,
     coord_gsid    BIGINT      NOT NULL,
@@ -999,13 +1020,19 @@ CREATE OR REPLACE FUNCTION dtx_note_participant(
     p_gsids BIGINT[],
     p_local_xid BIGINT DEFAULT 0
 ) RETURNS BOOLEAN
-    LANGUAGE sql VOLATILE
+    LANGUAGE plpgsql VOLATILE
 AS $$
-    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids, local_xid)
-    VALUES (p_dtxid, p_gid, p_gsids, p_local_xid)
-    ON CONFLICT (dtxid, gid) DO UPDATE
-       SET gsids = EXCLUDED.gsids, noted_at = now(), local_xid = EXCLUDED.local_xid
-    RETURNING true
+BEGIN
+    -- 2026-10-21：不用 ON CONFLICT —— 同一 (dtxid, gid) 重登记就 UPDATE，没有才 INSERT
+    UPDATE partdist.dtx_participant
+       SET gsids = p_gsids, noted_at = now(), local_xid = p_local_xid
+     WHERE dtxid = p_dtxid AND gid = p_gid;
+    IF NOT FOUND THEN
+        INSERT INTO partdist.dtx_participant (dtxid, gid, gsids, local_xid)
+        VALUES (p_dtxid, p_gid, p_gsids, p_local_xid);
+    END IF;
+    RETURN true;
+END;
 $$;
 
 COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[], BIGINT) IS

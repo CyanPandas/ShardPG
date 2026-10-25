@@ -72,19 +72,21 @@ raft_save_metadata_snapshot(void)
 {
     StringInfoData sql;
 
+    /* 2026-10-21：不用 ON CONFLICT —— 先 UPDATE 那一行，没有才 INSERT（见 pg_raft_spi_update_or_insert） */
     initStringInfo(&sql);
     appendStringInfoString(&sql,
+                     "UPDATE partdist.raft_snapshot SET "
+                     "node_map = COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                     "partition_map = COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                     "updated_at = now() WHERE singleton = 1");
+    pg_raft_spi_update_or_insert(sql.data,
                      "INSERT INTO partdist.raft_snapshot "
                      "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
                      "SELECT 1, 0, 0, "
                      "COALESCE((SELECT jsonb_agg(to_jsonb(n) ORDER BY node_id) FROM partdist.node_map n), '[]'::jsonb), "
                      "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
-                     "now() "
-                     "ON CONFLICT (singleton) DO UPDATE SET "
-                     "node_map = EXCLUDED.node_map, "
-                     "partition_map = EXCLUDED.partition_map, "
-                     "updated_at = now()");
-    (void) SPI_execute(sql.data, false, 0);
+                     "now()",
+                     "保存元数据快照");
     pfree(sql.data);
 }
 
@@ -368,24 +370,40 @@ pg_raft_apply_partition_primary(Oid partition_id, int primary_node,
      * 新任期的结果。栅栏放在 apply 里，group 0 各成员按同一日志序执行，
      * 判定结果天然一致。
      */
+    /*
+     * 2026-10-21：不用 ON CONFLICT —— 先按任期栅栏 UPDATE；没改到时，表里没有这个分区才 INSERT
+     * （有这一行但栅栏不放行 = 过期 / 重复登记，不生效）。
+     */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "INSERT INTO partdist.partition_map (partition_id, primary_node, secondary_nodes, primary_term) "
-                     "VALUES (%u, %d, %s::int[], %lld) "
-                     "ON CONFLICT (partition_id) DO UPDATE SET "
-                     "primary_node = EXCLUDED.primary_node, "
-                     "secondary_nodes = EXCLUDED.secondary_nodes, "
-                     "primary_term = EXCLUDED.primary_term, updated_at = now() "
-                     "WHERE partition_map.primary_term <= EXCLUDED.primary_term "
-                     "  AND NOT (partition_map.primary_node = EXCLUDED.primary_node AND "
-                     "           partition_map.primary_term = EXCLUDED.primary_term)",
-                     partition_id, primary_node,
-                     quote_literal_cstr(secondaries_array_literal),
-                     (long long) primary_term);
-
+                     "UPDATE partdist.partition_map SET primary_node = %d, secondary_nodes = %s::int[], "
+                     "primary_term = %lld, updated_at = now() "
+                     "WHERE partition_id = %u AND primary_term <= %lld "
+                     "  AND NOT (primary_node = %d AND primary_term = %lld)",
+                     primary_node, quote_literal_cstr(secondaries_array_literal),
+                     (long long) primary_term, partition_id, (long long) primary_term,
+                     primary_node, (long long) primary_term);
     ret = SPI_execute(sql.data, false, 0);
-    ok = (ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
+    ok = (ret == SPI_OK_UPDATE);
     applied = ok && SPI_processed > 0;
+    if (ok && !applied)
+    {
+        resetStringInfo(&sql);
+        appendStringInfo(&sql, "SELECT 1 FROM partdist.partition_map WHERE partition_id = %u", partition_id);
+        if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed == 0)
+        {
+            resetStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "INSERT INTO partdist.partition_map (partition_id, primary_node, secondary_nodes, primary_term) "
+                             "VALUES (%u, %d, %s::int[], %lld)",
+                             partition_id, primary_node,
+                             quote_literal_cstr(secondaries_array_literal),
+                             (long long) primary_term);
+            ret = SPI_execute(sql.data, false, 0);
+            ok = (ret == SPI_OK_INSERT && SPI_processed == 1);
+            applied = ok;
+        }
+    }
     pfree(sql.data);
 
     if (applied)
@@ -482,20 +500,31 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
     if (strcmp(op_type, PG_RAFT_OP_NODE_ADDRESS) == 0)
     {
         /* 2026-10-17（路线 A）：节点地址迁移 —— 落表（重启后由维护进程重灌）+ 立即改本节点共享内存 */
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "WITH j AS (SELECT %s::jsonb AS j), "
-                         "a AS (INSERT INTO partdist.node_address (node_id, host, port, updated_at, tli) "
-                         "      SELECT (j->>'node_id')::int, j->>'host', (j->>'port')::int, now(), "
-                         "             coalesce((j->>'tli')::int, 0) FROM j "
-                         "      ON CONFLICT (node_id) DO UPDATE SET host = EXCLUDED.host, "
-                         "      port = EXCLUDED.port, updated_at = now(), tli = EXCLUDED.tli RETURNING 1) "
-                         "UPDATE partdist.node_map m SET hostname = j->>'host', port = (j->>'port')::int "
-                         "  FROM j WHERE m.node_id = (j->>'node_id')::int",
-                         quote_literal_cstr(payload_json));
-        ret = SPI_execute(sql.data, false, 0);
-        ok = (ret == SPI_OK_UPDATE || ret == SPI_OK_UPDATE_RETURNING || ret >= 0);
-        pfree(sql.data);
+        /* 2026-10-21：不用 ON CONFLICT —— node_address 先 UPDATE、没有才 INSERT，再改 node_map */
+        {
+            StringInfoData ins;
+            const char    *pj = quote_literal_cstr(payload_json);
+
+            initStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "UPDATE partdist.node_address a SET host = j->>'host', port = (j->>'port')::int, "
+                             "updated_at = now(), tli = coalesce((j->>'tli')::int, 0) "
+                             "FROM (SELECT %s::jsonb AS j) s WHERE a.node_id = (j->>'node_id')::int", pj);
+            initStringInfo(&ins);
+            appendStringInfo(&ins,
+                             "INSERT INTO partdist.node_address (node_id, host, port, updated_at, tli) "
+                             "SELECT (j->>'node_id')::int, j->>'host', (j->>'port')::int, now(), "
+                             "       coalesce((j->>'tli')::int, 0) FROM (SELECT %s::jsonb AS j) s", pj);
+            pg_raft_spi_update_or_insert(sql.data, ins.data, "apply 节点地址");
+            resetStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "UPDATE partdist.node_map m SET hostname = j->>'host', port = (j->>'port')::int "
+                             "  FROM (SELECT %s::jsonb AS j) s WHERE m.node_id = (j->>'node_id')::int", pj);
+            ret = SPI_execute(sql.data, false, 0);
+            ok = (ret == SPI_OK_UPDATE);
+            pfree(ins.data);
+            pfree(sql.data);
+        }
         if (ok)
         {
             int  nid = 0, port = 0;
@@ -516,36 +545,69 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
     if (strcmp(op_type, PG_RAFT_OP_NODE_STANDBY) == 0)
     {
         /* 2026-10-17（路线 A）：备库登记 / 注销（切主控制器读这张表） */
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "WITH j AS (SELECT %s::jsonb AS j), "
-                         "d AS (DELETE FROM partdist.node_standby s USING j "
-                         "      WHERE coalesce((j->>'remove')::int, 0) <> 0 "
-                         "        AND s.node_id = (j->>'node_id')::int AND s.name = j->>'name' RETURNING 1) "
-                         "INSERT INTO partdist.node_standby (node_id, name, host, port, updated_at) "
-                         "SELECT (j->>'node_id')::int, j->>'name', j->>'host', (j->>'port')::int, now() FROM j "
-                         " WHERE coalesce((j->>'remove')::int, 0) = 0 "
-                         "ON CONFLICT (node_id, name) DO UPDATE SET host = EXCLUDED.host, "
-                         "port = EXCLUDED.port, updated_at = now()",
-                         quote_literal_cstr(payload_json));
-        ret = SPI_execute(sql.data, false, 0);
-        ok = (ret >= 0);
-        pfree(sql.data);
+        /* 2026-10-21：不用 ON CONFLICT —— 注销就 DELETE；登记先 UPDATE、没有才 INSERT */
+        {
+            const char *pj = quote_literal_cstr(payload_json);
+            bool        do_remove = false;
+
+            initStringInfo(&sql);
+            appendStringInfo(&sql, "SELECT coalesce((%s::jsonb->>'remove')::int, 0) <> 0", pj);
+            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+            {
+                bool    isnull;
+                Datum   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+
+                do_remove = !isnull && DatumGetBool(d);
+            }
+            resetStringInfo(&sql);
+            if (do_remove)
+            {
+                appendStringInfo(&sql,
+                                 "DELETE FROM partdist.node_standby s USING (SELECT %s::jsonb AS j) x "
+                                 "WHERE s.node_id = (j->>'node_id')::int AND s.name = j->>'name'", pj);
+                ret = SPI_execute(sql.data, false, 0);
+                ok = (ret == SPI_OK_DELETE);
+            }
+            else
+            {
+                StringInfoData ins;
+
+                appendStringInfo(&sql,
+                                 "UPDATE partdist.node_standby s SET host = j->>'host', port = (j->>'port')::int, "
+                                 "updated_at = now() FROM (SELECT %s::jsonb AS j) x "
+                                 "WHERE s.node_id = (j->>'node_id')::int AND s.name = j->>'name'", pj);
+                initStringInfo(&ins);
+                appendStringInfo(&ins,
+                                 "INSERT INTO partdist.node_standby (node_id, name, host, port, updated_at) "
+                                 "SELECT (j->>'node_id')::int, j->>'name', j->>'host', (j->>'port')::int, now() "
+                                 "FROM (SELECT %s::jsonb AS j) x", pj);
+                pg_raft_spi_update_or_insert(sql.data, ins.data, "apply 备库登记");
+                ok = true;
+                pfree(ins.data);
+            }
+            pfree(sql.data);
+        }
         raft_spi_end(spi_owned);
         return ok;
     }
     if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
     {
+        /* 2026-10-21：不用 ON CONFLICT —— 先 UPDATE、没有这个节点才 INSERT */
+        StringInfoData ins;
+        const char    *pj = quote_literal_cstr(payload_json);
+
         initStringInfo(&sql);
         appendStringInfo(&sql,
+                         "UPDATE partdist.node_map m SET status = j->>'status', last_heartbeat = now() "
+                         "FROM (SELECT %s::jsonb AS j) s WHERE m.node_id = (j->>'node_id')::int", pj);
+        initStringInfo(&ins);
+        appendStringInfo(&ins,
                          "INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) "
                          "SELECT (j->>'node_id')::int, 'node' || (j->>'node_id'), 5432, j->>'status', now() "
-                         "FROM (SELECT %s::jsonb AS j) s "
-                         "ON CONFLICT (node_id) DO UPDATE SET "
-                         "status = EXCLUDED.status, last_heartbeat = now()",
-                         quote_literal_cstr(payload_json));
-        ret = SPI_execute(sql.data, false, 0);
-        ok = (ret == SPI_OK_INSERT || ret == SPI_OK_UPDATE);
+                         "FROM (SELECT %s::jsonb AS j) s", pj);
+        pg_raft_spi_update_or_insert(sql.data, ins.data, "apply 节点状态");
+        ok = true;
+        pfree(ins.data);
         pfree(sql.data);
     }
     else if (strcmp(op_type, PG_RAFT_OP_PARTITION_PRIMARY_BATCH) == 0)

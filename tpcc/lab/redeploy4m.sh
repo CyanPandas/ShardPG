@@ -5,12 +5,14 @@
 # 用法（145 上）：[KIT=tpcc] [MEM_LIMIT=8g] redeploy4m.sh [镜像=shardpg:tsoraft]
 #   KIT       套件目录（默认 tpcc = 64 迷你仓；tpcc-std = 标准规模，cluster.env 由调用方写好）
 #   MEM_LIMIT 每个数据库容器（协调者、worker、备库）的内存上限，并关 swap —— 模拟内存这么大的服务器
+#   BASE148   148 上 n4 与两个备库的数据目录根（默认 $T，即 /home；大库用 /data3/yyt/shardpg-fix-20261014）
 # 144 是共享机器：只新增 shardpg-fix-n1 容器与 /home/yyt/shardpg-fix-20261014 目录，不碰别的。
 R=/data1/yyt/shardpg-fix-20261014; T=/home/yyt/shardpg-fix-20261014; cd $R
 log() { echo "[$(date +%T)] $*"; }
 IMG=${1:-shardpg:tsoraft}
 KIT=${KIT:-tpcc}
 export MEM_LIMIT=${MEM_LIMIT:-}
+export BASE148=${BASE148:-}
 C4=10.77.110.144
 if [ -f $KIT/cluster.env.4node ]; then     # 迷你套件：由 3 worker 原件改出 4 台机器版本
   sed -e "s/^NODE_HOSTS=.*/NODE_HOSTS=($C4 10.77.110.145 10.77.110.147 10.77.110.148)/" \
@@ -40,7 +42,7 @@ ssh -n 10.77.110.147 "docker rm -f shardpg-fix-n1 > /dev/null 2>&1; true"
 ssh -n 10.77.110.148 "docker rm -f shardpg-fix-n1 > /dev/null 2>&1; true"      # 3 台机器部署时的协调者
 IMG=shardpg:prof ./node.sh 2 31082 $KIT/conf/out &
 ssh -n 10.77.110.147 "cd $T && MEM_LIMIT=$MEM_LIMIT IMG=shardpg:prof ./node.sh 3 31081 conf" &
-ssh -n 10.77.110.148 "cd $T && MEM_LIMIT=$MEM_LIMIT IMG=shardpg:prof ./node.sh 4 31083 conf" &
+ssh -n 10.77.110.148 "cd $T && DATA_DIR=${BASE148:-$T}/data-n4 MEM_LIMIT=$MEM_LIMIT IMG=shardpg:prof ./node.sh 4 31083 conf" &
 ssh -n $C4 "cd $T && MEM_LIMIT=$MEM_LIMIT IMG=shardpg:prof ./node.sh 1 31080 conf" &
 wait
 docker run -d --name shardpg-fix-client --network host -v $PWD/$KIT:/t shardpg:prof sleep infinity > /dev/null

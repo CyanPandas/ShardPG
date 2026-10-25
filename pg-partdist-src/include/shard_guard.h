@@ -11,6 +11,8 @@ extern void ShardGuardCheckPlan(PlannedStmt *pstmt);
 
 /* T7.10：引用表运行期写守卫。由 planner_hook 在 Citus 改写之前调用。 */
 extern void ShardGuardCheckReferenceWrite(Oid relid);
+/* 2026-10-21：分片表不支持 INSERT ... ON CONFLICT（planner_hook 调用） */
+extern void ShardGuardCheckOnConflict(Oid relid);
 
 /* T7.22（R-P6-14）：逻辑复制协议入口的禁令 */
 extern void ShardGuardInstallAuthHook(void);

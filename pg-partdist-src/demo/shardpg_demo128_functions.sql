@@ -156,7 +156,10 @@ BEGIN
     victims := ARRAY(SELECT k::bigint FROM jsonb_each_text(before) e(k, v) WHERE v = p_node);
     n_total := coalesce(array_length(victims, 1), 0);
     d := (SELECT datadir FROM demo.node WHERE name = p_node);
-    INSERT INTO demo.crashed(node) VALUES (p_node) ON CONFLICT (node) DO UPDATE SET at = now();
+    UPDATE demo.crashed SET at = now() WHERE node = p_node;
+    IF NOT FOUND THEN
+        INSERT INTO demo.crashed(node) VALUES (p_node);
+    END IF;
     RAISE NOTICE '宕机前：% 是 % 个分区组的主、另有 % 个分区组的副本', p_node, n_total,
         (SELECT count(*) FROM demo.group_member m JOIN demo.node n ON n.raft_id = m.raft_id WHERE n.name = p_node) - n_total;
     t0 := clock_timestamp();

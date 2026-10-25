@@ -1324,9 +1324,15 @@ _PG_init(void)
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.dtx_test_pause_point",
-                            "（测试用）2PC 发起方的暂停点：1 = 判决已写、本地提交记录未写；2 = 本地已提交、COMMIT PREPARED 未发。",
-                            "配合 pg_raft.dtx_test_pause_ms，在崩溃窗口里杀节点验证跨节点原子性。0 = 关。",
-                            &pg_raft_dtx_test_pause_point, 0, 0, 2,
+                            "（测试用）2PC 发起方的暂停点：1 = 判决已写、本地提交记录未写；2 = 本地已提交、COMMIT PREPARED 未发；3 = 常规路径上协调组已通知、判决未写。",
+                            "配合 pg_raft.dtx_test_pause_ms，在崩溃窗口里杀节点验证跨节点原子性；3 用来让参与方先推定中止。0 = 关。",
+                            &pg_raft_dtx_test_pause_point, 0, 0, 3,
+                            PGC_SUSET, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_raft.dtx_test_status_hold_ms",
+                            "（测试用）dtx_status 写下推定中止的 ABORT、放掉认领位之后，提交之前停多少毫秒。0 = 关。",
+                            "让迟到的判决恰好落在\"ABORT 已写未提交\"的窗口里，验证决议槽以主键仲裁（2026-10-21）。",
+                            &pg_raft_dtx_test_status_hold_ms, 0, 0, 600000,
                             PGC_SUSET, 0, NULL, NULL, NULL);
 
     DefineCustomIntVariable("pg_raft.dtx_test_pause_ms",

@@ -440,8 +440,10 @@ BEGIN
     FOR w IN SELECT demo.workers() LOOP
         PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
     END LOOP;
-    INSERT INTO demo.managed VALUES (p_tbl::text, demo.sids(p_tbl))
-        ON CONFLICT (tbl) DO UPDATE SET shardids = EXCLUDED.shardids;
+    UPDATE demo.managed SET shardids = demo.sids(p_tbl) WHERE tbl = p_tbl::text;
+    IF NOT FOUND THEN
+        INSERT INTO demo.managed VALUES (p_tbl::text, demo.sids(p_tbl));
+    END IF;
     sids := demo.sids(p_tbl);
     holders := (SELECT string_agg(demo.slabel(p_tbl, x) || '→' || demo.route_node(x), '，' ORDER BY x) FROM unnest(sids) x);
     t0 := clock_timestamp();
@@ -1064,8 +1066,10 @@ BEGIN
         PERFORM demo.q(w, 'SELECT partdist.rebuild_shard_identity()::text');
     END LOOP;
     sids := demo.sids(p_tbl);
-    INSERT INTO demo.managed VALUES (p_tbl::text, sids)
-        ON CONFLICT (tbl) DO UPDATE SET shardids = EXCLUDED.shardids;
+    UPDATE demo.managed SET shardids = sids WHERE tbl = p_tbl::text;
+    IF NOT FOUND THEN
+        INSERT INTO demo.managed VALUES (p_tbl::text, sids);
+    END IF;
     v_rf := least(coalesce(p_rf, 3), (SELECT count(*)::int FROM demo.node WHERE kind = 'worker'));
     todo := sids;
     RAISE NOTICE '① 每个分片建一个 Raft 组（副本因子 %：1 主 + % 副本，成员按数据所在节点轮转取），选主、供副本',
@@ -1197,7 +1201,10 @@ BEGIN
     IF sid IS NULL THEN RAISE EXCEPTION '没有这个分片：%', p_shard; END IF;
     victim := demo.leader(sid);
     RAISE NOTICE '停掉 %（它是 % 的主；它同时还是另外几个分片的从）', victim, demo.slabel(p_tbl, sid);
-    INSERT INTO demo.crashed(node) VALUES (victim) ON CONFLICT (node) DO UPDATE SET at = now();
+    UPDATE demo.crashed SET at = now() WHERE node = victim;
+    IF NOT FOUND THEN
+        INSERT INTO demo.crashed(node) VALUES (victim);
+    END IF;
     RETURN QUERY SELECT * FROM demo.crash_node(p_tbl, victim);
 END $$;
 

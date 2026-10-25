@@ -1733,3 +1733,105 @@ new_primary=2`），正是让 `coord_node <= 0` / `slot < 0` 成真的那类窗�
 - 满负载随机杀 worker（`fixb_killrounds.sh`）：18 次，标准一致性与跨节点不变式全部 0 违例。
 - 全新部署后自动切主（`fixb_failover.sh`）：2 次 0 违例（修复前版本 1 次即违例）。另发现与本修复无关的路线 A 缺陷：切主后分片 xid 重复发号（见 `TPCC_CLOUD_REPORT_20261018.md` 9.3）。
 - 性能：256 终端 1 分钟短测，修复前 85,506（6 轮）、修复后 83,726（8 轮），−2.1%，在轮间波动内。
+
+## 15. 2026-10-21 决议槽竞态：推定中止与迟到的判决各写各的
+
+### 15.1 缺陷
+
+lab 4 台机器、300 标准仓、一主两备的 TPC-C 里出现一笔一半提交：69 号仓 6 区第 3212 号订单在发起方 n4 上提交了，它在 n3 上对 134、259 号仓 stock 的更新被回滚（跨节点不变式 X2 两个仓不一致，证据日志在 145 的 `tsoraft_logs/sp300-evidence/`）。时间线（gid `citus_3_13544_218578_0`，两个参与节点，走常规路径）：
+
+| 时刻（本地） | 节点 | 事件 |
+|---|---|---|
+| 12:08:35 | n3 | PREPARE 完成（磁盘打满，单条 PREPARE 10 s） |
+| 12:08:41 | n3 | 发起方取写集（`dtx_local_participant`，6 s），随后通知协调组（协调组在 n3） |
+| 12:10:21.9 | n3 | 恢复守护：这笔 prepared 超过 `pg_raft.dtx_recover_timeout_ms`（30 s）没有判决 ⇒ 推定中止，写 ABORT，回滚 prepared |
+| 12:10:22.4 | n3 | 发起方的 COMMIT PREPARED 到达：prepared 事务已不存在 |
+| 12:10:27 | n4 | 发起方 `failed to commit transaction`，但它本地已提交 |
+
+决议槽"一次性"靠复制认领位互斥 + 进临界区后再查一次，有两处漏洞：
+
+1. **守护的 ABORT 压在大事务里**：本机就是协调组时，恢复守护经 SPI 在 `dtx_recover_prepared` 那一整条语句的事务里调 `dtx_status`。推定中止的 ABORT 行写完就放了认领位，却要等这一轮全部处理完才提交（期间守护已经经自连接回滚了 prepared）。
+2. **临界区里用的是旧快照**：`dtx_lookup_decision` 以 `read_only = true` 执行，沿用调用方语句开始时的快照，看不见"等认领位期间"别人刚提交的判决。
+
+于是发起方在认领位里查不到判决、锚点 prepared 也还在，就写待确认 COMMIT（3）。`dtx_write_decision` 的 `INSERT … ON CONFLICT DO NOTHING` 等守护提交后什么也没插，却照样返回 3。正常负载下发起方从通知协调组到写判决只隔几毫秒，远小于 30 s，所以以前从未触发；300 仓时发起方被磁盘与 TSO 租约中断拖了约 100 s。
+
+### 15.2 修法（`pg-raft-src/src/raft_consensus.c`）
+
+- **决议锁 + 新快照 + 普通 INSERT**（同日第二版，见 §16；第一版用的是 `INSERT … ON CONFLICT DO NOTHING` 占槽，已按"INSERT 只有成功与失败两种结果"的原则改掉）：写 `partdist.dtx_decision` 的四条路径（`dtx_decide`、`dtx_status`、组成员 apply、读者问到后补本地表）都先按 dtxid 取事务级 advisory 锁（`dtx_decision_lock`，持到事务结束，PG 的死锁检测看得见），再用新快照查（`dtx_lookup_decision_ex(dtxid, true)`），没有才普通 INSERT，必须插入 1 行。前一个写入者必已提交或回滚，新快照一定看得见它，所以同一 dtxid 只有一个判决。决议行插入成功后才追加分区流 DECISION 记录、复制、回填 `decided_plsn`。
+- **按已有判决返回**：`dtx_decide` 查到已有判决就原样返回，发起方读到 ABORT 即中止（40001）；`dtx_status` 查到发起方刚写下的 3 按未决答。拿锁时锁被别人占着会打一行"决议锁被并发写入者持有"，验证脚本据此判断是否命中竞态窗口。
+- **推定中止自成一笔事务**：`dtx_ask_coordinator` 在本机是协调组时也经 libpq 连回本机调 `dtx_status`。PQexec 返回时 ABORT 已提交，之后守护才回滚 prepared。否则这一轮若中途出错回滚，ABORT 行消失而 prepared 已回滚，迟到的判决照样能写进 3。
+- **建连失败可重试**：发起方连不上参与节点（`dtx_get_conn`）改报 40001。此时还没有提交记录和判决，整笔中止是安全的；原来报连接失败，pgbench 当成不可重试错误直接退出。
+
+### 15.3 测试钩子
+
+- `pg_raft.dtx_test_pause_point = 3`：常规路径上协调组已通知、判决未写时暂停 `pg_raft.dtx_test_pause_ms`。单参与节点快路径没有这个窗口：通知协调组与写判决在参与方同一笔事务里提交。
+- `pg_raft.dtx_test_status_hold_ms`：`dtx_status` 写下推定中止的 ABORT、放掉认领位之后，提交之前停多久。
+
+二者配合（`tpcc/lab/dtx_race_check.sh`）让迟到的判决恰好落进"ABORT 已写、未提交"的窗口。
+
+### 15.4 验证（lab 4 台机器，30 标准仓，镜像 `shardpg:dtxfix`）
+
+日志在 145 的 `tsoraft_logs/verify_dtxfix.out`，脚本 `tpcc/lab/verify_dtxfix.sh`、`dtx_race_check.sh`。发起方停 25 s（暂停点 3），推定中止超时 8 s，推定中止后停 20 s 不提交。
+
+| 组 | 做法 | 结果 |
+|---|---|---|
+| 默认 | 三个 worker 的推定中止超时都调低 | 3 轮都整笔 ABORT（发起方报"全局决议是 ABORT"，三个仓 w_ytd 不变）。另一个参与节点的守护也来问，拿着认领位卡在主键冲突上，发起方排在它后面，等到 ABORT 提交后用新快照直接看到 —— 验证的是新快照复查与推定中止自成事务 |
+| SOLO | 只调低 n3，n2 / n4 为 10 min | 3 轮都整笔 ABORT，且 3 轮都在协调组日志里出现"写决议时槽已被并发写入占住，按已有决议 2 返回" —— 发起方在"ABORT 已写未提交"期间直接撞上主键冲突、读回 ABORT。协调组在 n4 的两轮里推定中止由 n3 的守护远程触发（dtx_status 总在协调组节点上执行）。（这是第一版 ON CONFLICT 写法的验证；第二版的验证见 §16.4） |
+
+两组之后标准一致性与跨节点不变式都为 0。TPC-C 回归（30 仓，每档一轮，60 s + 3 min）：100 / 200 / 300 / 400 终端 71,817 / 56,396 / 62,286 / 51,568 tpmC，收尾核对全 0；整场没有一次决议槽冲突（正常负载下发起方几毫秒内就写完判决，碰不到推定中止）。这组数字比 §7.3 修复前的 30 仓高，但 148 的数据这次放在 /data3（另一块盘），且单轮波动大，不能算作修复带来的提升。
+
+## 16. 2026-10-21 ShardPG 不用 INSERT … ON CONFLICT
+
+### 16.1 原则
+
+一条 INSERT 只有两种结果：插入成功，或插入失败（报错）。`ON CONFLICT DO NOTHING` 撞上冲突时什么都不写却报告成功 —— §15 的一半提交正是这样来的：决议槽的 INSERT 落空，调用方照样以为判决写成了；`DO UPDATE` 名为插入、实为更新。ShardPG 自己的代码一律不用 `ON CONFLICT`，分片表也不接受应用的 `INSERT … ON CONFLICT`。
+
+### 16.2 替换写法
+
+| 场景 | 写法 |
+|---|---|
+| 单行"有则改、无则插" | `pg_raft_spi_update_or_insert`：先 UPDATE；没改到行再普通 INSERT，必须插入恰好 1 行，否则报错。两步之间若有别的会话插入同一个键，INSERT 撞主键报错（显式失败），不会静默合并 |
+| 批量（raft 日志行；有一处是拼成 SQL 文本发到副本执行的） | 一条语句：`WITH v AS (VALUES …), u AS (UPDATE … FROM v … RETURNING 键) INSERT … SELECT … FROM v WHERE NOT EXISTS (SELECT 1 FROM u …)`。INSERT 只插 u 没改到的行；同样撞主键即报错 |
+| 需要仲裁（2PC 决议表） | 按键取事务级 advisory 锁 → 新快照查 → 没有才普通 INSERT（§15.2） |
+| plpgsql / 安装脚本 | `UPDATE …; IF NOT FOUND THEN INSERT …; END IF;`；安装时的单行初值用 `IF NOT EXISTS (…) THEN INSERT` |
+
+同一个键可能被并发写到的地方（follower 收日志：leader 重发同一批条目时，前一个 AppendEntries 还没提交、后一个就到了），INSERT 放在子事务里执行（`spi_exec_unique_violated`，写法同 plpgsql 的异常块）：撞主键 = 对方刚插入并已提交，INSERT 明确失败、回滚子事务，再显式改做 UPDATE 且必须改到 1 行；批量语句整条重做一次（这次 UPDATE 看得见对方的行）。原来靠 `ON CONFLICT DO UPDATE` 悄悄合并，改写后第一轮健康检查在 n2 上抓到两次撞主键（group 0 下标 4、67，由按环补写恢复）。
+
+中间试过让同组的 AppendEntries 在 follower 上排队（`raft_log_group_lock`，按组号的 advisory 锁）：30 仓健康检查通过，但 300 仓磁盘打满时一个慢请求后面排起几十个（n2 上超过 5 s 的 AppendEntries 91 次、最长 172 s；修复前 0 次），拖慢控制面心跳，加重了一次约 80 s 的发号暂停。已撤掉，改为上面的子事务写法，复制请求恢复并行。
+
+主键 / 唯一索引仍然在，只作兜底：PG 判唯一时会等待未提交的同键插入（这是唯一索引本身的机制），等到对方提交就报重复键 —— 结果是显式失败，而不是悄悄跳过。
+
+### 16.3 改动清单（28 处 + demo / 测试 6 处）
+
+| 文件 | 位置 | 表 |
+|---|---|---|
+| `pg-raft-src/src/raft_consensus.c` | 组成员 apply 判决、写判决、读者问到后补本地表 | `dtx_decision`（决议锁） |
+| 同上 | `raft_config_persist` | `raft_group` |
+| 同上 | `repersist_from_ring`、`persist_log_entry_sql`（单行）；`persist_log_entries_sql_batch`、`rm_pipe_send`（发副本执行）、`rs_local_work`（预备语句）、`pg_raft_partwal_replicate_many`（批量） | `raft_log` |
+| 同上 | `control_maybe_compact`（只前进）、`send_install_snapshot`（带 RETURNING） | `raft_snapshot` |
+| 同上 | `pg_raft_set_node_address` | `node_address` |
+| `pg-raft-src/src/raft_apply.c` | 元数据快照、分区主节点（任期栅栏）、节点地址、备库登记 / 注销、节点状态 | `raft_snapshot`、`partition_map`、`node_address`、`node_standby`、`node_map` |
+| `pg-partdist-src/src/raft_boundary.c` | follower 回放进度（只前进） | `follower_partition_map` |
+| `pg-raft-src/sql/pg_raft--1.0.sql` | 安装初值、`pg_raft_group_create` | `raft_state`、`raft_group` |
+| `pg-partdist-src/sql/pg_partdist--1.0.sql` | `rebuild_shard_identity`、`register_shard_identity`、`dtx_note_participant`（改成 plpgsql） | `shard_identity`、`dtx_participant` |
+| demo / 测试 | `shardpg_demo*_functions.sql`、`mixed_primary_demo.py`、`test/sql/12_cache_invalidate.sql` | 演示表、分片表、`node_map` |
+
+应用侧：`partdist_planner`（planner_hook，Citus 改写之前）遇到 `INSERT … ON CONFLICT` 且目标是分片表（`ShardXidLookupByOid`）即报 `feature not supported`（`ShardGuardCheckOnConflict`）。分片表的写最终都在 worker 上对分片表规划（协调者转发、函数下推、Citus 本地执行都一样），所以按分片表判即可全覆盖；不是分片表的普通表不受影响。
+
+### 16.4 验证（lab 4 台机器、30 标准仓，镜像 `shardpg:noconflict`，`tpcc/lab/health4m_check.sh`）
+
+两轮全面检查（日志 `tsoraft_logs/health4m-1021-1540/`、`health4m-1021-1614/`），第二轮已带 follower 串行锁：
+
+| 项 | 第 1 轮 | 第 2 轮 |
+|---|---|---|
+| 部署 + 登记 6 个备库（控制面 apply 后四个节点 `node_standby` 都是 6 行） | 通过 | 通过 |
+| 4 个节点分别当入口，各 200 笔 TPC-C | 0 失败 | 0 失败 |
+| 经协调者 128 终端 TPC-C + 核对 | 49,733 tpmC，核对全 0 | 46,500 tpmC，核对全 0 |
+| 跨节点读隔离（并发转账 + 读总额） | 0 次不一致 | 0 次不一致 |
+| 决议竞态（默认 3 轮 + SOLO 3 轮） | 6 轮一致，6 轮命中窗口（发起方在决议锁上等推定中止提交后读到 ABORT） | 同左 |
+| 分片表 `INSERT … ON CONFLICT DO NOTHING / DO UPDATE` | 拒绝 | 拒绝；普通表照常 |
+| 负载中 kill worker n4 主库 | 3 s 切主；核对全 0；四个节点 partition_map / node_address 一致；旧主拉起后自行停机 | 6 s 切主；其余同左 |
+| 负载中 kill 协调者 | 0 失败 0 中止，约 8 s 空窗，核对全 0，发起方回到协调者 | 同左 |
+| 全部容器日志里的写入报错（撞主键 / UPDATE、INSERT 失败） | n2 上 2 次（follower 重收同一批日志，见上） | 0 |
+
+杀 worker 那一步的负载记为 0 tpmC：被杀节点上的在途事务以连接中断失败（Citus 报错、不可重试），pgbench（`-l --aggregate-interval` + `--failures-detailed`）遇到这种错误整轮退出，而这一轮先预热 60 s。10-20 的 4 worker 检查同样各有 1 个客户端中止，只是那时没有预热、退出前的 20 s 被计入成绩。属于压测工具的行为，与本改动无关。

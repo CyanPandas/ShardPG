@@ -9,9 +9,11 @@ TAG=${1:?标签}; OUT=$R/tsoraft_logs/ck-$TAG; rm -rf $OUT; mkdir -p $OUT
 log() { echo "[$(date +%T)] $*" | tee -a $OUT/run.log; }
 TERMS=${TERMS:-64}; DUR=${DUR:-150}; KILL_AT=${KILL_AT:-40}
 CH=${COORD_HOST:-10.77.110.148}      # 协调者所在机器（4 台机器部署时是 144）
+# 2026-10-21：NW 仓数、XN 跨节点核对脚本、SYS scale.sh 的系统名（默认 = 64 迷你仓套件）
+NW=${NW:-64}; XN=${XN:-/t/xnode_consistency_mini.sql}; SYS=${SYS:-shardpg}
 CLI="docker exec shardpg-fix-client /work/pg-install/bin/psql -U postgres -XAtq"
 N2="$CLI -h 10.77.110.145 -p 31082"; N1="$CLI -h $CH -p 31080"
-chk() { local P="$1"; echo "标准 [$($P -f /t/sql/90_consistency.sql 2>&1 | grep -E '^ *[0-9]+ *$|ERROR' | tr '\n' ' ')] 跨节点 [$($P -f /t/xnode_consistency_mini.sql 2>&1 | grep -E '^[0-9]+\||ERROR' | tr '\n' ' ')]"; }
+chk() { local P="$1"; echo "标准 [$($P -f /t/sql/90_consistency.sql 2>&1 | grep -E '^ *[0-9]+ *$|ERROR' | tr '\n' ' ')] 跨节点 [$($P -f $XN 2>&1 | grep -E '^[0-9]+\||ERROR' | tr '\n' ' ')]"; }
 # NODES = 全部节点（协调者在第一个），WNODES = 除协调者外的节点；4 个 worker 部署时由调用方覆盖
 NODES=${NODES:-$CH:31080 10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083}
 WNODES=${WNODES:-10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083}
@@ -22,7 +24,7 @@ log "[$TAG] 起点：发号者 $(serving | tr '\n' ';')"
 log "[$TAG] 起点核对（经 n2）：$(chk "$N2")"
 D0=$($N2 -c "select sum(d_next_o_id) from district")
 docker exec shardpg-fix-client bash -c "cd /t && /work/pg-install/bin/pgbench -h 10.77.110.145 -p 31082 -U postgres -n \
-  -c $TERMS -j $TERMS -T $DUR -P 1 --max-tries=20 --failures-detailed -D nw=64 \
+  -c $TERMS -j $TERMS -T $DUR -P 1 --max-tries=20 --failures-detailed -D nw=$NW \
   -f pgbench/new_order.sql@45 -f pgbench/payment.sql@43 -f pgbench/order_status.sql@4 \
   -f pgbench/delivery.sql@4 -f pgbench/stock_level.sql@4 postgres" > $OUT/pgbench.out 2> $OUT/pgbench.err &
 PGB=$!
@@ -44,7 +46,7 @@ log "[$TAG] 协调者宕机期间核对（经 n2）：$(chk "$N2")"
 ssh -n $CH "docker start shardpg-fix-n1" >/dev/null; T1=$(date +%s); log "[$TAG] 拉起 n1"
 for i in $(seq 120); do s=$(serving); case "$s" in $CH:31080*) break;; esac; sleep 1; done
 log "[$TAG] 拉起后 $(( $(date +%s) - T1 )) s 发号者：$(serving | tr '\n' ';')"
-log "[$TAG] 经协调者 TPC-C 16 终端：$(bash scale.sh shardpg 16 2>&1 | tail -1)"
+log "[$TAG] 经协调者 TPC-C 16 终端：$(bash scale.sh $SYS 16 2>&1 | tail -1)"
 log "[$TAG] 收尾核对（经协调者）：$(chk "$N1")"
 for h in 10.77.110.145 10.77.110.147 10.77.110.148; do
   if [ $h = 10.77.110.145 ]; then c="bash -c"; else c="ssh -n $h"; fi

@@ -476,6 +476,7 @@ int   pg_raft_dtx_recover_timeout_ms  = 30000;
 /* 2026-10-18：原子性验证用的暂停点（默认关；见 dtx_test_pause_after_decide） */
 int   pg_raft_dtx_test_pause_point    = 0;
 int   pg_raft_dtx_test_pause_ms       = 0;
+int   pg_raft_dtx_test_status_hold_ms = 0;  /* 2026-10-21：推定中止已写、事务未提交时停多久（测试用） */
 /* 升主前置：每 tick 最多推进多久 / 多久之后按可用性优先放行（见 data_group_promote_prepare） */
 int   pg_raft_promote_catchup_slice_ms    = 2000;
 int   pg_raft_promote_catchup_deadline_ms = 60000;
@@ -487,6 +488,132 @@ int   pg_raft_catchup_interval_ms = 5000;
 int   pg_raft_compact_threshold = 500;
 
 static RaftGroupTable *RaftGroups = NULL;
+
+/* ================================================================== */
+/* 2026-10-21：不用 INSERT ... ON CONFLICT                              */
+/* ================================================================== */
+/*
+ * 原则：一条 INSERT 只有"插入成功"和"插入失败（报错）"两种结果。ON CONFLICT DO NOTHING 撞上冲突时
+ * 什么都不写却报告成功（10-21 一半提交的成因之一：决议槽 INSERT 落空、调用方照样以为写成了），
+ * DO UPDATE 名为插入、实为更新。ShardPG 里"有则改、无则插"一律拆成显式的两步：
+ *   1) UPDATE 已有的行；
+ *   2) 没改到的才普通 INSERT，且必须插入恰好预期的行数，否则报错。
+ * 两步之间若有别的会话插入了同一个键，第 2 步撞主键报错（显式失败），不会静默合并。
+ * 需要仲裁的地方（2PC 决议槽）另加按键的事务级锁，让同一个键的写入者排队，见 dtx_decision_lock。
+ */
+/*
+ * 在子事务里执行一条写语句（写法同 plpgsql 的异常块）。撞了唯一约束 —— 另一个会话刚插入同一个键
+ * 并已提交（唯一检查会先等它结束）—— 就回滚子事务、返回 true，由调用方显式处理（改做 UPDATE，或
+ * 整条重做一次）；其它错误照常抛出。用在 follower 收日志这类同一个键可能被并发写到的地方：
+ * leader 重发同一批条目时，前一个 AppendEntries 还没提交、后一个就到了。
+ * （10-21 晚先试过让同组的 AppendEntries 排队，300 仓磁盘打满时一个慢请求后面排起几十个、最长等
+ *  172 s，拖慢控制面心跳，退回这个写法。）
+ */
+static bool
+spi_exec_unique_violated(const char *sql, int *ret_out)
+{
+    MemoryContext oldcxt = CurrentMemoryContext;
+    ResourceOwner oldowner = CurrentResourceOwner;
+    volatile bool violated = false;
+
+    BeginInternalSubTransaction(NULL);
+    MemoryContextSwitchTo(oldcxt);
+    PG_TRY();
+    {
+        *ret_out = SPI_execute(sql, false, 0);
+        ReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+    }
+    PG_CATCH();
+    {
+        ErrorData  *edata;
+
+        MemoryContextSwitchTo(oldcxt);
+        edata = CopyErrorData();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();
+        MemoryContextSwitchTo(oldcxt);
+        CurrentResourceOwner = oldowner;
+        if (edata->sqlerrcode != ERRCODE_UNIQUE_VIOLATION)
+            ReThrowError(edata);
+        FreeErrorData(edata);
+        violated = true;
+    }
+    PG_END_TRY();
+    return violated;
+}
+
+void
+pg_raft_spi_update_or_insert(const char *update_sql, const char *insert_sql, const char *what)
+{
+    int     ret;
+
+    ret = SPI_execute(update_sql, false, 0);
+    if (ret != SPI_OK_UPDATE && ret != SPI_OK_UPDATE_RETURNING)
+        ereport(ERROR,
+                (errmsg("pg_raft: %s：UPDATE 失败（SPI %d）", what, ret)));
+    if (SPI_processed > 0)
+        return;
+    if (spi_exec_unique_violated(insert_sql, &ret))
+    {
+        /* 插入失败（撞主键）：同一个键刚被别的会话插入并提交 —— 显式改做 UPDATE，必须改到 1 行 */
+        ret = SPI_execute(update_sql, false, 0);
+        if ((ret != SPI_OK_UPDATE && ret != SPI_OK_UPDATE_RETURNING) || SPI_processed != 1)
+            ereport(ERROR,
+                    (errmsg("pg_raft: %s：插入撞主键后改做 UPDATE 也没改到行", what)));
+        return;
+    }
+    if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
+        ereport(ERROR,
+                (errmsg("pg_raft: %s：INSERT 失败（SPI %d）", what, ret)));
+    if (SPI_processed != 1)
+        ereport(ERROR,
+                (errmsg("pg_raft: %s：INSERT 应插入 1 行，实际 " UINT64_FORMAT " 行",
+                        what, SPI_processed)));
+}
+
+/*
+ * raft_log 批量"有则改、无则插"（同 (group_id, log_index)）：调用方先追加 RAFT_LOG_UPSERT_HEAD，
+ * 再追加逗号分隔的 "(g, i, t, op, payload::jsonb, committed)" 行，最后追加 RAFT_LOG_UPSERT_TAIL。
+ * 一条语句、不含 ON CONFLICT：u 改掉已有的行，INSERT 只插 u 没改到的那些；已提交标记只升不降。
+ * 这条语句也会原样发到副本上执行（rm_pipe_send），所以只能是纯 SQL 文本。
+ */
+#define RAFT_LOG_UPSERT_HEAD \
+    "WITH v(g, i, t, o, p, c) AS (VALUES "
+#define RAFT_LOG_UPSERT_TAIL \
+    "), u AS (UPDATE partdist.raft_log r SET term = v.t, op_type = v.o, payload = v.p, " \
+    "committed = r.committed OR v.c FROM v WHERE r.group_id = v.g AND r.log_index = v.i " \
+    "RETURNING r.group_id, r.log_index) " \
+    "INSERT INTO partdist.raft_log (group_id, log_index, term, op_type, payload, committed) " \
+    "SELECT v.g, v.i, v.t, v.o, v.p, v.c FROM v " \
+    "WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.group_id = v.g AND u.log_index = v.i)"
+
+/*
+ * 2PC 决议槽的仲裁锁：按 dtxid 取事务级 advisory 锁（重量级锁，PG 的死锁检测看得见），持到本事务
+ * 提交 / 回滚。所有写 partdist.dtx_decision 的路径都先拿它，再用新快照查、查不到才 INSERT ——
+ * 前一个写入者必已提交或回滚，新快照一定看得见它的结果。拿不到时打一行日志再等（验证脚本据此
+ * 判断是否命中了"别人写了还没提交"的窗口）。field4 用独立的类号，与用户 advisory 锁（1 / 2）、
+ * Citus 自己的类区分开。
+ */
+#define DTX_DECISION_LOCK_CLASS 0x5344
+
+static void
+dtx_decision_lock(int64 dtxid)
+{
+    LOCKTAG     tag;
+
+    SET_LOCKTAG_ADVISORY(tag, MyDatabaseId,
+                         (uint32) (((uint64) dtxid) >> 32), (uint32) dtxid,
+                         DTX_DECISION_LOCK_CLASS);
+    if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+    {
+        elog(LOG, "pg_raft: dtx %lld 的决议锁被并发写入者持有，等它结束再判", (long long) dtxid);
+        (void) LockAcquire(&tag, ExclusiveLock, false, false);
+    }
+}
+
+static int32 dtx_lookup_decision_ex(int64 dtxid, bool fresh);
 
 static RaftPeer peers[RAFT_MAX_PEERS];
 static int      n_peers = 0;
@@ -1731,7 +1858,8 @@ data_entry_store(RaftGroupCtx *ctx, const char *payload, const char *data_hex,
  * 自动转移"的落地点：协调组切主后，新 leader 手里天然就有全表，
  * dtx_status 立刻可答，不需要任何状态搬迁。载荷由 partwal_read_dtx_record
  * 从**本节点刚落盘的字节**解析，因此 follower 上的登记与 leader 逐字段
- * 相同。ON CONFLICT DO NOTHING —— 决议槽一次性，重复 apply 幂等。
+ * 相同。决议槽一次性：按 dtxid 取决议锁、用新快照查，已有就不写（重复 apply 幂等），
+ * 没有才普通 INSERT（2026-10-21 起不用 ON CONFLICT）。
  *
  * ★ FORGET（info==5，§9.7）：presumed abort 的标准收尾。协调组 leader 在
  * acked ⊇ participants 后追加它并复制到多数派；每个成员 apply 它时把该
@@ -1760,64 +1888,62 @@ data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid, int64 plsn, int info)
     }
     else if (info == 2)
     {
+        /*
+         * 2026-10-21：不用 ON CONFLICT。先把 DECISION 记录读出来，再按 dtxid 取决议锁、用新快照查：
+         * 已有 = 重复 apply（幂等，不写）；没有才普通 INSERT，必须插入 1 行。
+         * 读不出这条记录（R-P4-13）照旧单独告警 —— 那才是缺陷。
+         */
+        int64   r_dtxid = 0;
+        char   *r_coord = NULL;
+        char   *r_verdict = NULL;
+        char   *r_cts = NULL;
+        char   *r_parts = NULL;
+
         initStringInfo(&sql);
         appendStringInfo(&sql,
-                         "INSERT INTO partdist.dtx_decision"
-                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
-                         "SELECT d.dtxid, d.coord_gsid, d.verdict, d.commit_ts, "
-                         "       coalesce(d.participants, '{}'::bigint[]), %lld "
+                         "SELECT d.dtxid::text, d.coord_gsid::text, d.verdict::text, d.commit_ts::text, "
+                         "       coalesce(d.participants, '{}'::bigint[])::text "
                          "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d "
-                         "WHERE d.dtxid IS NOT NULL "
-                         "ON CONFLICT (dtxid) DO NOTHING",
-                         (long long) plsn, (unsigned) local_oid,
-                         (long long) plsn);
-        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
-            elog(WARNING,
-                 "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
-                 (long long) ctx->group_id, (long long) plsn);
-        else if (SPI_processed == 0)
+                         "WHERE d.dtxid IS NOT NULL",
+                         (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
         {
-            /*
-             * ★ R-P4-13 诊断：插入 0 行此前**一声不响** —— SPI_OK_INSERT 照样
-             *   返回，于是"apply 游标推进了、决议行却没有"这件事从日志上完全
-             *   看不出来（原登记里"日志里没有任何 DECISION 登记痕迹，既无成功
-             *   记录也无失败告警"说的正是这一格）。
-             *   0 行有两种可能，处置完全相反：① 行已经在（ON CONFLICT 生效，
-             *   正常）；② 本节点字节里**读不出**这条 DTX 记录（WHERE d.dtxid IS
-             *   NOT NULL 把它滤掉）—— 那才是缺陷。分开报。
-             */
-            bool readable = false;
-            bool exists = false;
+            HeapTuple   tup = SPI_tuptable->vals[0];
+            TupleDesc   desc = SPI_tuptable->tupdesc;
+            char       *v = SPI_getvalue(tup, desc, 1);
 
-            pfree(sql.data);
-            initStringInfo(&sql);
-            appendStringInfo(&sql,
-                             "SELECT (d.dtxid IS NOT NULL), "
-                             "       EXISTS (SELECT 1 FROM partdist.dtx_decision dd "
-                             "               WHERE dd.dtxid = d.dtxid) "
-                             "FROM partdist.partwal_read_dtx_record(%u::oid, %lld) d",
-                             (unsigned) local_oid, (long long) plsn);
-            if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-            {
-                bool isnull;
-
-                readable = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                                      SPI_tuptable->tupdesc, 1, &isnull)) && !isnull;
-                exists = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                                    SPI_tuptable->tupdesc, 2, &isnull)) && !isnull;
-            }
-            if (!readable)
-                elog(WARNING,
-                     "pg_raft: R-P4-13 组 %lld 的 DECISION 条目(plsn=%lld)在本节点字节里读不出"
-                     "（local_oid=%u）—— 决议行未登记",
-                     (long long) ctx->group_id, (long long) plsn, (unsigned) local_oid);
-            else if (!exists)
-                elog(WARNING,
-                     "pg_raft: R-P4-13 组 %lld 的 DECISION 条目(plsn=%lld)读得出却插不进"
-                     "（local_oid=%u）",
-                     (long long) ctx->group_id, (long long) plsn, (unsigned) local_oid);
+            r_dtxid = (v != NULL) ? strtoll(v, NULL, 10) : 0;
+            r_coord = SPI_getvalue(tup, desc, 2);
+            r_verdict = SPI_getvalue(tup, desc, 3);
+            r_cts = SPI_getvalue(tup, desc, 4);
+            r_parts = SPI_getvalue(tup, desc, 5);
         }
         pfree(sql.data);
+        if (r_dtxid == 0 || r_coord == NULL || r_verdict == NULL || r_parts == NULL)
+            elog(WARNING,
+                 "pg_raft: R-P4-13 组 %lld 的 DECISION 条目(plsn=%lld)在本节点字节里读不出"
+                 "（local_oid=%u）—— 决议行未登记",
+                 (long long) ctx->group_id, (long long) plsn, (unsigned) local_oid);
+        else
+        {
+            dtx_decision_lock(r_dtxid);
+            if (dtx_lookup_decision_ex(r_dtxid, true) == 0)
+            {
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "INSERT INTO partdist.dtx_decision"
+                                 "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                                 "VALUES (%lld, %s, %s, %s, %s::bigint[], %lld)",
+                                 (long long) r_dtxid, r_coord, r_verdict,
+                                 r_cts != NULL ? r_cts : "0",
+                                 quote_literal_cstr(r_parts), (long long) plsn);
+                if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT || SPI_processed != 1)
+                    elog(WARNING,
+                         "pg_raft: 组 %lld 的 DECISION 记录(plsn=%lld)登记进 dtx_decision 失败",
+                         (long long) ctx->group_id, (long long) plsn);
+                pfree(sql.data);
+            }
+        }
     }
 }
 
@@ -2877,17 +3003,26 @@ raft_config_persist(RaftGroupCtx *ctx, const char *payload)
     if (!raft_persist_spi_begin(&spi_owned))
         return false;           /* 拿不到 SPI：数据组会重试 apply */
 
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "INSERT INTO partdist.raft_group (group_id, members) "
-                     "VALUES (%lld, ARRAY[", (long long) ctx->group_id);
-    for (i = 0; i < n; i++)
-        appendStringInfo(&sql, "%s%d", i ? "," : "", members[i]);
-    appendStringInfoString(&sql,
-                     "]::integer[]) ON CONFLICT (group_id) DO UPDATE "
-                     "SET members = EXCLUDED.members");
-    (void) SPI_execute(sql.data, false, 0);
-    pfree(sql.data);
+    {
+        StringInfoData arr;
+        StringInfoData ins;
+
+        initStringInfo(&arr);
+        appendStringInfoString(&arr, "ARRAY[");
+        for (i = 0; i < n; i++)
+            appendStringInfo(&arr, "%s%d", i ? "," : "", members[i]);
+        appendStringInfoString(&arr, "]::integer[]");
+        initStringInfo(&sql);
+        appendStringInfo(&sql, "UPDATE partdist.raft_group SET members = %s WHERE group_id = %lld",
+                         arr.data, (long long) ctx->group_id);
+        initStringInfo(&ins);
+        appendStringInfo(&ins, "INSERT INTO partdist.raft_group (group_id, members) VALUES (%lld, %s)",
+                         (long long) ctx->group_id, arr.data);
+        pg_raft_spi_update_or_insert(sql.data, ins.data, "持久化组成员");
+        pfree(ins.data);
+        pfree(arr.data);
+        pfree(sql.data);
+    }
 
     raft_persist_spi_end(spi_owned);
     return true;
@@ -3039,18 +3174,27 @@ repersist_from_ring(RaftGroupCtx *ctx)
         SpinLockRelease(&ctx->log->mutex);
         if (!got)
             continue;
-        resetStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "INSERT INTO partdist.raft_log "
-                         "(group_id, log_index, term, op_type, payload, committed) "
-                         "VALUES (%lld, %lld, %lld, %s, %s::jsonb, %s) "
-                         "ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                         "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                         "payload = EXCLUDED.payload, committed = EXCLUDED.committed",
-                         (long long) ctx->group_id, (long long) idx, (long long) e.term,
-                         quote_literal_cstr(e.op_type), quote_literal_cstr(e.payload),
-                         idx <= commit ? "true" : "false");
-        (void) SPI_execute(sql.data, false, 0);
+        {
+            StringInfoData ins;
+
+            resetStringInfo(&sql);
+            appendStringInfo(&sql,
+                             "UPDATE partdist.raft_log SET term = %lld, op_type = %s, payload = %s::jsonb, "
+                             "committed = %s WHERE group_id = %lld AND log_index = %lld",
+                             (long long) e.term, quote_literal_cstr(e.op_type),
+                             quote_literal_cstr(e.payload), idx <= commit ? "true" : "false",
+                             (long long) ctx->group_id, (long long) idx);
+            initStringInfo(&ins);
+            appendStringInfo(&ins,
+                             "INSERT INTO partdist.raft_log "
+                             "(group_id, log_index, term, op_type, payload, committed) "
+                             "VALUES (%lld, %lld, %lld, %s, %s::jsonb, %s)",
+                             (long long) ctx->group_id, (long long) idx, (long long) e.term,
+                             quote_literal_cstr(e.op_type), quote_literal_cstr(e.payload),
+                             idx <= commit ? "true" : "false");
+            pg_raft_spi_update_or_insert(sql.data, ins.data, "按环补写 raft_log");
+            pfree(ins.data);
+        }
         n++;
     }
     pfree(sql.data);
@@ -3098,22 +3242,28 @@ persist_log_entry_sql(RaftGroupCtx *ctx, int64 index, int64 term,
         repersist_from_ring(ctx);
     logtrack_note(ctx->group_id, index);
 
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-                     "INSERT INTO partdist.raft_log "
-                     "(group_id, log_index, term, op_type, payload, committed) "
-                     "VALUES (%lld, %lld, %lld, %s, %s::jsonb, %s) "
-                     "ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                     "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                     "payload = EXCLUDED.payload, committed = partdist.raft_log.committed OR EXCLUDED.committed",
-                     (long long) ctx->group_id,
-                     (long long) index,
-                     (long long) term,
-                     quote_literal_cstr(op_type),
-                     quote_literal_cstr(payload),
-                     committed ? "true" : "false");
-    (void) SPI_execute(sql.data, false, 0);
-    pfree(sql.data);
+    {
+        StringInfoData ins;
+
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "UPDATE partdist.raft_log SET term = %lld, op_type = %s, payload = %s::jsonb, "
+                         "committed = committed OR %s WHERE group_id = %lld AND log_index = %lld",
+                         (long long) term, quote_literal_cstr(op_type), quote_literal_cstr(payload),
+                         committed ? "true" : "false",
+                         (long long) ctx->group_id, (long long) index);
+        initStringInfo(&ins);
+        appendStringInfo(&ins,
+                         "INSERT INTO partdist.raft_log "
+                         "(group_id, log_index, term, op_type, payload, committed) "
+                         "VALUES (%lld, %lld, %lld, %s, %s::jsonb, %s)",
+                         (long long) ctx->group_id, (long long) index, (long long) term,
+                         quote_literal_cstr(op_type), quote_literal_cstr(payload),
+                         committed ? "true" : "false");
+        pg_raft_spi_update_or_insert(sql.data, ins.data, "持久化 raft_log");
+        pfree(ins.data);
+        pfree(sql.data);
+    }
 
     raft_persist_spi_end(spi_owned);
 }
@@ -3152,20 +3302,23 @@ persist_log_entries_sql_batch(RaftGroupCtx *ctx, int n, const int64 *idx, int64 
 
     op_lit = quote_literal_cstr(op_type);
     initStringInfo(&sql);
-    appendStringInfoString(&sql,
-                           "INSERT INTO partdist.raft_log "
-                           "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+    appendStringInfoString(&sql, RAFT_LOG_UPSERT_HEAD);
     for (k = 0; k < n; k++)
         appendStringInfo(&sql, "%s(%lld, %lld, %lld, %s, %s::jsonb, %s)",
                          k == 0 ? "" : ", ",
                          (long long) ctx->group_id, (long long) idx[k], (long long) term,
                          op_lit, quote_literal_cstr(payload[k]),
                          committed ? "true" : "false");
-    appendStringInfoString(&sql,
-                           " ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                           "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                           "payload = EXCLUDED.payload, committed = partdist.raft_log.committed OR EXCLUDED.committed");
-    (void) SPI_execute(sql.data, false, 0);
+    appendStringInfoString(&sql, RAFT_LOG_UPSERT_TAIL);
+    {
+        int     ret;
+
+        /* 撞主键（并发的 AppendEntries 刚写入同一批下标）：整条重做一次，这次 UPDATE 看得见对方已提交的行 */
+        if (spi_exec_unique_violated(sql.data, &ret))
+            ret = SPI_execute(sql.data, false, 0);
+        if (ret != SPI_OK_INSERT)
+            ereport(ERROR, (errmsg("pg_raft: 组 %lld 批量持久化 raft_log 失败", (long long) ctx->group_id)));
+    }
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
 }
@@ -3975,30 +4128,47 @@ control_maybe_compact(RaftGroupCtx *ctx)
 
     /*
      * 快照必须**先于**删行落库：反过来一旦中间崩溃，日志没了、快照也没有，
-     * 落后成员就再也追不上了。raft_snapshot 是 upsert，重复执行无害。
+     * 落后成员就再也追不上了。重复执行无害。
+     * 2026-10-21：不用 ON CONFLICT —— 先按"只前进"的条件 UPDATE 那一行；没改到时，表里没有
+     * 这一行才 INSERT（有更新的快照就不动）。
      */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-                     "INSERT INTO partdist.raft_snapshot "
-                     "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
-                     "SELECT 1, %lld, %lld, "
-                     "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                     "UPDATE partdist.raft_snapshot SET last_included_index = %lld, last_included_term = %lld, "
+                     "node_map = COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
                      "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
-                     "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
-                     "now() "
-                     "ON CONFLICT (singleton) DO UPDATE SET "
-                     "last_included_index = EXCLUDED.last_included_index, "
-                     "last_included_term = EXCLUDED.last_included_term, "
-                     "node_map = EXCLUDED.node_map, "
-                     "partition_map = EXCLUDED.partition_map, updated_at = now() "
-                     "WHERE partdist.raft_snapshot.last_included_index <= EXCLUDED.last_included_index",
+                     "partition_map = COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                     "updated_at = now() "
+                     "WHERE singleton = 1 AND last_included_index <= %lld",
                      (long long) applied, (long long) keep_term,
-                     (long long) pg_raft_tso_snapshot_hwm());
-    if (SPI_execute(sql.data, false, 0) < 0)
+                     (long long) pg_raft_tso_snapshot_hwm(), (long long) applied);
+    if (SPI_execute(sql.data, false, 0) != SPI_OK_UPDATE)
     {
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
         return;
+    }
+    if (SPI_processed == 0 &&
+        SPI_execute("SELECT 1 FROM partdist.raft_snapshot WHERE singleton = 1", false, 1) == SPI_OK_SELECT &&
+        SPI_processed == 0)
+    {
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.raft_snapshot "
+                         "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
+                         "SELECT 1, %lld, %lld, "
+                         "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                         "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                         "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                         "now()",
+                         (long long) applied, (long long) keep_term,
+                         (long long) pg_raft_tso_snapshot_hwm());
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT || SPI_processed != 1)
+        {
+            pfree(sql.data);
+            raft_persist_spi_end(spi_owned);
+            return;
+        }
     }
     resetStringInfo(&sql);
 
@@ -4245,13 +4415,23 @@ pg_raft_set_node_address(PG_FUNCTION_ARGS)
 
     if (raft_persist_spi_begin(&spi_owned))
     {
+        StringInfoData ins;
+
+        /* 2026-10-21：不用 ON CONFLICT —— 先 UPDATE，没有这一行才 INSERT */
         initStringInfo(&sql);
         appendStringInfo(&sql,
+                         "UPDATE partdist.node_address SET host = %s, port = %d, updated_at = now() "
+                         "WHERE node_id = %d",
+                         quote_literal_cstr(host), port, node_id);
+        initStringInfo(&ins);
+        appendStringInfo(&ins,
                          "INSERT INTO partdist.node_address (node_id, host, port, updated_at) "
-                         "VALUES (%d, %s, %d, now()) ON CONFLICT (node_id) DO UPDATE SET "
-                         "host = EXCLUDED.host, port = EXCLUDED.port, updated_at = now(); "
+                         "VALUES (%d, %s, %d, now())",
+                         node_id, quote_literal_cstr(host), port);
+        pg_raft_spi_update_or_insert(sql.data, ins.data, "登记节点地址");
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
                          "UPDATE partdist.node_map SET hostname = %s, port = %d WHERE node_id = %d",
-                         node_id, quote_literal_cstr(host), port,
                          quote_literal_cstr(host), port, node_id);
         (void) SPI_execute(sql.data, false, 0);
         raft_persist_spi_end(spi_owned);
@@ -4709,24 +4889,37 @@ send_install_snapshot(RaftGroupCtx *ctx, RaftPeer *p, int64 term, int64 base_idx
         if (applied >= base_idx && log_term_at(ctx, applied, &aterm) && aterm > 0 &&
             raft_persist_spi_begin(&spi_owned))
         {
+            int     sret;
+
+            /* 2026-10-21：不用 ON CONFLICT —— 先 UPDATE 那一行，没有这一行才 INSERT */
             initStringInfo(&sql);
             appendStringInfo(&sql,
-                             "INSERT INTO partdist.raft_snapshot "
-                             "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
-                             "SELECT 1, %lld, %lld, "
-                             "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                             "UPDATE partdist.raft_snapshot SET last_included_index = %lld, last_included_term = %lld, "
+                             "node_map = COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
                              "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
-                             "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
-                             "now() "
-                             "ON CONFLICT (singleton) DO UPDATE SET "
-                             "last_included_index = EXCLUDED.last_included_index, "
-                             "last_included_term = EXCLUDED.last_included_term, "
-                             "node_map = EXCLUDED.node_map, "
-                             "partition_map = EXCLUDED.partition_map, updated_at = now() "
+                             "partition_map = COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                             "updated_at = now() WHERE singleton = 1 "
                              "RETURNING last_included_index::text, last_included_term::text, node_map::text, partition_map::text",
                              (long long) applied, (long long) aterm,
                              (long long) pg_raft_tso_snapshot_hwm());
-            if (SPI_execute(sql.data, false, 0) == SPI_OK_INSERT_RETURNING && SPI_processed > 0)
+            sret = SPI_execute(sql.data, false, 0);
+            if (sret == SPI_OK_UPDATE_RETURNING && SPI_processed == 0)
+            {
+                resetStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "INSERT INTO partdist.raft_snapshot "
+                                 "(singleton, last_included_index, last_included_term, node_map, partition_map, updated_at) "
+                                 "SELECT 1, %lld, %lld, "
+                                 "COALESCE((SELECT jsonb_agg(to_jsonb(n) || jsonb_build_object('tso_hwm', %lld::bigint) "
+                                 "                           ORDER BY n.node_id) FROM partdist.node_map n), '[]'::jsonb), "
+                                 "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.partition_id) FROM partdist.partition_map p), '[]'::jsonb), "
+                                 "now() "
+                                 "RETURNING last_included_index::text, last_included_term::text, node_map::text, partition_map::text",
+                                 (long long) applied, (long long) aterm,
+                                 (long long) pg_raft_tso_snapshot_hwm());
+                sret = SPI_execute(sql.data, false, 0);
+            }
+            if ((sret == SPI_OK_UPDATE_RETURNING || sret == SPI_OK_INSERT_RETURNING) && SPI_processed == 1)
             {
                 HeapTuple tup = SPI_tuptable->vals[0];
                 TupleDesc desc = SPI_tuptable->tupdesc;
@@ -12415,9 +12608,7 @@ rm_pipe_send(RmGroup *gs, int ng, const bool *claimed, MemoryContext rcxt, Strin
             MemoryContextSwitchTo(rcxt);
         }
         resetStringInfo(sql);
-        appendStringInfoString(sql,
-                               "INSERT INTO partdist.raft_log "
-                               "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+        appendStringInfoString(sql, RAFT_LOG_UPSERT_HEAD);
         for (i = 0; ready && i < ng; i++)
         {
             RmGroup *g = &gs[i];
@@ -12462,11 +12653,7 @@ rm_pipe_send(RmGroup *gs, int ng, const bool *claimed, MemoryContext rcxt, Strin
                 first_row = false;
             }
         }
-        appendStringInfoString(sql,
-                               " ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                               "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                               "payload = EXCLUDED.payload, "
-                               "committed = partdist.raft_log.committed OR EXCLUDED.committed");
+        appendStringInfoString(sql, RAFT_LOG_UPSERT_TAIL);
         self_sent = (!first_row && rm_self_send(sql->data));
         if (!first_row && !self_sent)
             rm_self_mark_hole(gs, ng);
@@ -14260,14 +14447,16 @@ rs_local_work(const bool *advanced)
         {
             Oid         argtypes[5] = {INT8ARRAYOID, INT8ARRAYOID, INT8ARRAYOID,
                                        TEXTARRAYOID, TEXTARRAYOID};
-            SPIPlanPtr  pl = SPI_prepare("INSERT INTO partdist.raft_log "
+            /* 有则改、无则插（不用 ON CONFLICT，见 pg_raft_spi_update_or_insert）；这里的行一律未提交 */
+            SPIPlanPtr  pl = SPI_prepare("WITH v AS (SELECT u.g, u.i, u.t, u.o, u.p::jsonb AS p "
+                                         "           FROM unnest($1, $2, $3, $4, $5) AS u(g, i, t, o, p)), "
+                                         "x AS (UPDATE partdist.raft_log r SET term = v.t, op_type = v.o, payload = v.p "
+                                         "      FROM v WHERE r.group_id = v.g AND r.log_index = v.i "
+                                         "      RETURNING r.group_id, r.log_index) "
+                                         "INSERT INTO partdist.raft_log "
                                          "(group_id, log_index, term, op_type, payload, committed) "
-                                         "SELECT u.g, u.i, u.t, u.o, u.p::jsonb, false "
-                                         "FROM unnest($1, $2, $3, $4, $5) AS u(g, i, t, o, p) "
-                                         "ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                                         "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                                         "payload = EXCLUDED.payload, "
-                                         "committed = partdist.raft_log.committed OR EXCLUDED.committed",
+                                         "SELECT v.g, v.i, v.t, v.o, v.p, false FROM v "
+                                         "WHERE NOT EXISTS (SELECT 1 FROM x WHERE x.group_id = v.g AND x.log_index = v.i)",
                                          5, argtypes);
 
             if (pl == NULL || SPI_keepplan(pl) != 0)
@@ -15204,9 +15393,7 @@ pg_raft_partwal_replicate_many(const Oid *parts, int nparts, bool *failed_out)
                 bool first_row = true;
 
                 resetStringInfo(&sql);
-                appendStringInfoString(&sql,
-                                       "INSERT INTO partdist.raft_log "
-                                       "(group_id, log_index, term, op_type, payload, committed) VALUES ");
+                appendStringInfoString(&sql, RAFT_LOG_UPSERT_HEAD);
                 for (i = 0; i < ng; i++)
                 {
                     RmGroup *g = &gs[i];
@@ -15228,13 +15415,9 @@ pg_raft_partwal_replicate_many(const Oid *parts, int nparts, bool *failed_out)
                         first_row = false;
                     }
                 }
-                appendStringInfoString(&sql,
-                                       " ON CONFLICT (group_id, log_index) DO UPDATE SET "
-                                       "term = EXCLUDED.term, op_type = EXCLUDED.op_type, "
-                                       "payload = EXCLUDED.payload, "
-                                       "committed = partdist.raft_log.committed OR EXCLUDED.committed");
-                if (!first_row)
-                    (void) SPI_execute(sql.data, false, 0);
+                appendStringInfoString(&sql, RAFT_LOG_UPSERT_TAIL);
+                if (!first_row && SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
+                    ereport(ERROR, (errmsg("pg_raft: 多组复制写 leader 日志行失败")));
             }
             raft_persist_spi_end(spi_owned);
             t_persist = GetCurrentTimestamp();
@@ -15582,6 +15765,13 @@ pg_raft_group_reset(PG_FUNCTION_ARGS)
  *
  * 调用方必须已确认本节点是协调组 leader，并已持有复制认领位。
  * 返回该 DECISION 记录的 partition_lsn。
+ *
+ * 2026-10-21：调用方必须已持有该 dtxid 的决议锁（dtx_decision_lock），并已用新快照确认还没有
+ * 决议。先插决议行、后写分区流记录；INSERT 是普通插入，必须插入 1 行，否则报错（不用 ON CONFLICT）。
+ * 决议锁持到事务结束，前一个写入者必已提交或回滚，新快照看得见它 —— 同一 dtxid 只会有一个判决。
+ * lab 300 仓实测的一半提交出在旧写法上：认领位只保证两边不同时进临界区，管不住"对方写了但还没
+ * 提交"与"本语句的快照太旧看不见"；恢复守护在整轮恢复的大事务里写下推定中止的 ABORT 后放掉认领位，
+ * 发起方查不到，写待确认 COMMIT 时 INSERT ... ON CONFLICT DO NOTHING 落空却照样返回 3。
  */
 static struct
 {
@@ -15604,6 +15794,22 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
     if (!raft_persist_spi_begin(&spi_owned))
         ereport(ERROR, (errmsg("pg_raft: dtx 决议需要 SPI")));
 
+    /* 1) 决议行：普通 INSERT，必须插入 1 行（撞主键 = 有写入者绕过了决议锁，报错） */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+                     "INSERT INTO partdist.dtx_decision"
+                     "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn, anchor_xid) "
+                     "VALUES (%lld, %lld, %d, %llu, %s, 0, %lld)",
+                     (long long) dtxid, (long long) ctx->group_id, verdict,
+                     (unsigned long long) commit_ts, participants_sql,
+                     (long long) anchor_xid);
+    if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT || SPI_processed != 1)
+        ereport(ERROR,
+                (errmsg("pg_raft: 组 %lld 写决议行失败（dtxid=%lld）",
+                        (long long) ctx->group_id, (long long) dtxid)));
+    pfree(sql.data);
+
+    /* 2) 分区流 DECISION 记录（多成员组的提交点在下面的 replicate_group_upto） */
     initStringInfo(&sql);
     appendStringInfo(&sql,
                      "SELECT partdist.partwal_append_dtx_record("
@@ -15630,20 +15836,15 @@ dtx_write_decision(RaftGroupCtx *ctx, int64 local_oid, int64 dtxid,
     replicate_group_upto(ctx, plsn, (Oid) local_oid);
 
     /*
-     * 本地索引。其余成员由 data_entry_apply 在 apply 该条目时各自写入，
-     * 因此协调组切主后新 leader 手里天然有全表（§6.2）。
+     * 3) 补上记录位置。本地索引行已在第 1 步占槽时写入；其余成员由 data_entry_apply 在
+     * apply 该条目时各自写入，因此协调组切主后新 leader 手里天然有全表（§6.2）。
      */
     if (raft_persist_spi_begin(&spi_owned))
     {
         initStringInfo(&sql);
         appendStringInfo(&sql,
-                         "INSERT INTO partdist.dtx_decision"
-                         "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn, anchor_xid) "
-                         "VALUES (%lld, %lld, %d, %llu, %s, %lld, %lld) "
-                         "ON CONFLICT (dtxid) DO NOTHING",
-                         (long long) dtxid, (long long) ctx->group_id, verdict,
-                         (unsigned long long) commit_ts, participants_sql,
-                         (long long) plsn, (long long) anchor_xid);
+                         "UPDATE partdist.dtx_decision SET decided_plsn = %lld WHERE dtxid = %lld",
+                         (long long) plsn, (long long) dtxid);
         (void) SPI_execute(sql.data, false, 0);
         pfree(sql.data);
         raft_persist_spi_end(spi_owned);
@@ -15724,8 +15925,13 @@ dtx_flush_pending_broadcast(void)
  * 3 = 待发起方确认的 COMMIT 尚未生效（2026-10-18 方案 B：verdict=3 按锚点
  * prepared 事务的结局折算，见 partdist.dtx_verdict_effective）。
  */
+/*
+ * fresh = true：取新快照再查（SPI 非只读执行，READ COMMITTED 下每条命令一个新快照）。
+ * 决议槽的临界区里必须用它 —— 调用方语句开始时取的快照看不见"等认领位期间"别人刚提交的
+ * 判决（2026-10-21，见 dtx_write_decision）。
+ */
 static int32
-dtx_lookup_decision(int64 dtxid)
+dtx_lookup_decision_ex(int64 dtxid, bool fresh)
 {
     StringInfoData sql;
     bool  spi_owned;
@@ -15739,7 +15945,7 @@ dtx_lookup_decision(int64 dtxid)
                      "SELECT partdist.dtx_verdict_effective(verdict, anchor_xid) "
                      "  FROM partdist.dtx_decision WHERE dtxid = %lld",
                      (long long) dtxid);
-    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
+    if (SPI_execute(sql.data, !fresh, 1) == SPI_OK_SELECT && SPI_processed > 0)
     {
         Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
                                 1, &isnull);
@@ -15749,6 +15955,12 @@ dtx_lookup_decision(int64 dtxid)
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
     return verdict;
+}
+
+static int32
+dtx_lookup_decision(int64 dtxid)
+{
+    return dtx_lookup_decision_ex(dtxid, false);
 }
 
 /*
@@ -15924,8 +16136,12 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     in_txn_replication = true;
     PG_TRY();
     {
-        /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
-        existing = dtx_lookup_decision(dtxid);
+        /*
+         * 进入临界区后先拿决议锁、再用新快照查一次：等待期间可能已被恢复守护写了决议
+         * （它的事务若还没提交，决议锁会让本事务等它结束）。
+         */
+        dtx_decision_lock(dtxid);
+        existing = dtx_lookup_decision_ex(dtxid, true);
         if (existing == 0 && verdict == 3)
         {
             /*
@@ -15946,7 +16162,12 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
             (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
                                       commit_ts, parts_sql, anchor_xid);
         else
+        {
+            /* 已有决议（多半是恢复守护的推定中止）：按已有决议返回，发起方读到 ABORT 即中止 */
+            elog(LOG, "pg_raft: dtx %lld 写决议前发现已有决议 %d，按已有决议返回（协调组 %lld）",
+                 (long long) dtxid, existing, (long long) coord_gsid);
             verdict = existing;
+        }
     }
     PG_FINALLY();
     {
@@ -16066,8 +16287,8 @@ pg_raft_group_peer_decision(PG_FUNCTION_ARGS)
         PG_RETURN_INT32(0);
 
     /*
-     * 顺带把学到的决议补进本地表（幂等、ON CONFLICT DO NOTHING）——
-     * 下次就不必再远程问一趟。失败不影响返回值。
+     * 顺带把学到的决议补进本地表 —— 下次就不必再远程问一趟。
+     * 2026-10-21：不用 ON CONFLICT —— 拿决议锁、用新快照查，本地没有才普通 INSERT（幂等）。
      */
     {
         StringInfoData sql;
@@ -16075,16 +16296,20 @@ pg_raft_group_peer_decision(PG_FUNCTION_ARGS)
 
         if (raft_persist_spi_begin(&spi_owned))
         {
-            initStringInfo(&sql);
-            appendStringInfo(&sql,
-                             "INSERT INTO partdist.dtx_decision"
-                             "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
-                             "VALUES (%lld, %lld, %d, %lld, '{}'::bigint[], 0) "
-                             "ON CONFLICT (dtxid) DO NOTHING",
-                             (long long) dtxid, (long long) group_id,
-                             verdict, (long long) cts);
-            (void) SPI_execute(sql.data, false, 0);
-            pfree(sql.data);
+            dtx_decision_lock(dtxid);
+            if (dtx_lookup_decision_ex(dtxid, true) == 0)
+            {
+                initStringInfo(&sql);
+                appendStringInfo(&sql,
+                                 "INSERT INTO partdist.dtx_decision"
+                                 "(dtxid, coord_gsid, verdict, commit_ts, participants, decided_plsn) "
+                                 "VALUES (%lld, %lld, %d, %lld, '{}'::bigint[], 0)",
+                                 (long long) dtxid, (long long) group_id,
+                                 verdict, (long long) cts);
+                if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT || SPI_processed != 1)
+                    elog(WARNING, "pg_raft: dtx %lld 学到的决议补进本地表失败", (long long) dtxid);
+                pfree(sql.data);
+            }
             raft_persist_spi_end(spi_owned);
         }
     }
@@ -16349,6 +16574,7 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
     int64        local_oid = 0;
     int32        existing;
     char        *parts_sql;
+    bool         wrote_abort = false;
 
     if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
         PG_RETURN_NULL();
@@ -16417,15 +16643,17 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
     in_txn_replication = true;
     PG_TRY();
     {
-        existing = dtx_lookup_decision(dtxid);
+        dtx_decision_lock(dtxid);
+        existing = dtx_lookup_decision_ex(dtxid, true);
         if (existing == 0)
         {
             (void) dtx_write_decision(&ctx, local_oid, dtxid, 2 /* ABORT */,
                                       0, parts_sql, 0);
             existing = 2;
+            wrote_abort = true;
         }
         else if (existing == 3)
-            existing = 0;       /* 等待认领位期间发起方刚写下待确认 COMMIT：本轮按未决答 */
+            existing = 0;       /* 发起方刚写下待确认 COMMIT：本轮按未决答 */       /* 等待认领位期间发起方刚写下待确认 COMMIT：本轮按未决答 */
     }
     PG_FINALLY();
     {
@@ -16436,6 +16664,17 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
     dtx_flush_pending_broadcast();
 
     pfree(parts_sql);
+    /*
+     * 测试钩子（pg_raft.dtx_test_status_hold_ms，超级用户、默认关）：推定中止的 ABORT 已写、
+     * 认领位已放、本事务还没提交 —— 正是 2026-10-21 一半提交的那个窗口。发起方此刻来写判决，
+     * 会在决议锁上等本事务提交，再用新快照读到 ABORT 而中止。
+     */
+    if (wrote_abort && pg_raft_dtx_test_status_hold_ms > 0)
+    {
+        elog(LOG, "pg_raft: [测试] dtx %lld 推定中止已写、事务未提交，停 %d ms",
+             (long long) dtxid, pg_raft_dtx_test_status_hold_ms);
+        pg_usleep((long) pg_raft_dtx_test_status_hold_ms * 1000L);
+    }
     PG_RETURN_INT32(existing);
 }
 
@@ -16512,39 +16751,30 @@ dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
     if (coord_node <= 0)
         return 0;               /* 元数据还没追平：下轮再问 */
 
-    /* 本节点就是协调者：直接本地调，省一次往返 */
+    /*
+     * 2) 走 libpq —— 本节点就是协调者时也连回本机。
+     *
+     * 2026-10-21：原来本机直接 SPI 调 dtx_status 省一次往返，于是推定中止的 ABORT 写在恢复守护
+     * 整轮恢复的大事务里：认领位一放，ABORT 却要等这一轮全部处理完才提交（期间守护已经回滚了
+     * prepared）。并发来写判决的发起方看不见它；这一轮若中途出错回滚，ABORT 行连同"先写后答"
+     * 一起消失，而 prepared 已经回滚了。连回本机让 dtx_status 自成一笔事务：PQexec 返回
+     * （ReadyForQuery）时 ABORT 已提交，之后守护才动 prepared。
+     */
     if (coord_node == pg_raft_node_id)
+        pg_raft_format_conninfo("127.0.0.1", PostPortNumber, conninfo, sizeof(conninfo));
+    else
     {
-        if (!raft_persist_spi_begin(&spi_owned))
+        for (i = 0; i < n_peers; i++)
+            if (peers[i].node_id == coord_node)
+            {
+                slot = i;
+                break;
+            }
+        if (slot < 0)
             return 0;
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "SELECT partdist.dtx_status(%lld, %lld)",
-                         (long long) coord_gsid, (long long) dtxid);
-        if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            Datum d = SPI_getbinval(SPI_tuptable->vals[0],
-                                    SPI_tuptable->tupdesc, 1, &isnull);
-            if (!isnull)
-                verdict = DatumGetInt32(d);
-        }
-        pfree(sql.data);
-        raft_persist_spi_end(spi_owned);
-        return verdict;
+        pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
+                                conninfo, sizeof(conninfo));
     }
-
-    /* 2) 远端：走 libpq */
-    for (i = 0; i < n_peers; i++)
-        if (peers[i].node_id == coord_node)
-        {
-            slot = i;
-            break;
-        }
-    if (slot < 0)
-        return 0;
-
-    pg_raft_format_conninfo(peers[slot].host, peers[slot].port,
-                            conninfo, sizeof(conninfo));
     conn = PQconnectdb(conninfo);
     if (PQstatus(conn) != CONNECTION_OK)
     {
@@ -18191,10 +18421,16 @@ dtx_get_conn(const char *host, int port)
         dtx_conns[slot].conn = NULL;
         if (slot == dtx_nconns - 1)
             dtx_nconns--;
+        /*
+         * 2026-10-21：报可重试的 40001。走到这里时本事务还没有提交记录、也没有判决，整笔中止
+         * 是安全的；对端多半只是忙（lab 300 仓实测：参与节点磁盘打满，3 s 内建不起新连接），
+         * 报连接失败会让客户端（如 pgbench）当成不可重试的错误直接退出。
+         */
         ereport(ERROR,
-                (errcode(ERRCODE_CONNECTION_FAILURE),
+                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                  errmsg("pg_raft: DTX 驱动连不上参与节点 %s:%d", host, port),
-                 errdetail("%s", msg)));
+                 errdetail("%s", msg),
+                 errhint("参与节点暂时不可达或过忙；本事务已整体中止，重试即可。")));
     }
     return dtx_conns[slot].conn;
 }
@@ -18455,7 +18691,10 @@ dtx_maybe_wrote_dist_transaction(void)
  * 2026-10-18：原子性验证用的暂停点（pg_raft.dtx_test_pause_point / _ms，超级用户、默认关）。
  * 让 2PC 发起方停在两个崩溃窗口里，测试趁机杀掉节点，验证判决与本地提交绑定：
  *   1 = 判决（待确认 COMMIT）已写进协调组、本地提交记录还没写 —— 杀掉后应整笔 ABORT；
- *   2 = 本地已提交、Citus 还没发 COMMIT PREPARED —— 杀掉后应整笔 COMMIT。
+ *   2 = 本地已提交、Citus 还没发 COMMIT PREPARED —— 杀掉后应整笔 COMMIT；
+ *   3 = 2026-10-21：常规路径（≥ 2 个参与节点）上协调组已通知、判决还没写 —— 停得比
+ *       pg_raft.dtx_recover_timeout_ms 久，参与方的恢复守护就会推定中止，用来验证推定中止与
+ *       迟到的判决不会各写各的。
  * 第 2 点挂在本模块的事务回调上：回调后注册先调用，排在 Citus 发 COMMIT PREPARED 之前。
  */
 static bool  dtx_test_cb_registered = false;
@@ -18795,6 +19034,18 @@ dtx_master_pre_record_commit(void)
             }
             PG_END_TRY();
         }
+    }
+
+    /*
+     * 测试暂停点 3：协调组已通知到各参与者（参与方的恢复守护从此知道去哪问判决）、判决还没写。
+     * 停得比 pg_raft.dtx_recover_timeout_ms 久，参与方就会推定中止 —— 2026-10-21 一半提交的现场。
+     * 单参与节点快路径没有这个窗口：通知协调组与写判决在参与方的同一笔事务里提交。
+     */
+    if (pg_raft_dtx_test_pause_point == 3 && pg_raft_dtx_test_pause_ms > 0)
+    {
+        elog(LOG, "pg_raft: [测试暂停点 3] dtx %lld 协调组已通知、判决未写，暂停 %d ms",
+             (long long) dtxid, pg_raft_dtx_test_pause_ms);
+        pg_usleep((long) pg_raft_dtx_test_pause_ms * 1000L);
     }
 
     /* ---- 4) 到协调组现任 leader 上做决议 ---- */

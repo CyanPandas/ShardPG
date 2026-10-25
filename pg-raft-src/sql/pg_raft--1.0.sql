@@ -8,9 +8,14 @@ CREATE TABLE IF NOT EXISTS raft_state (
     lease_until      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-INSERT INTO raft_state (singleton, leader_node_id, current_term)
-VALUES (1, 1, 1)
-ON CONFLICT (singleton) DO NOTHING;
+-- 2026-10-21：不用 ON CONFLICT —— 表里没有那一行才插（INSERT 只有成功与失败两种结果）
+DO $init$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM raft_state WHERE singleton = 1) THEN
+        INSERT INTO raft_state (singleton, leader_node_id, current_term) VALUES (1, 1, 1);
+    END IF;
+END
+$init$;
 
 CREATE TABLE IF NOT EXISTS raft_log (
     log_id      BIGSERIAL PRIMARY KEY,
@@ -411,9 +416,13 @@ CREATE OR REPLACE FUNCTION pg_raft_group_create(
     SET search_path = partdist, pg_catalog
 AS $fn$
 BEGIN
-    INSERT INTO partdist.raft_group (group_id, members)
-    VALUES (p_group_id, coalesce(p_members, '{}'::integer[]))
-    ON CONFLICT (group_id) DO UPDATE SET members = EXCLUDED.members;
+    -- 2026-10-21：不用 ON CONFLICT —— 先 UPDATE，没有这个组才 INSERT
+    UPDATE partdist.raft_group SET members = coalesce(p_members, '{}'::integer[])
+     WHERE group_id = p_group_id;
+    IF NOT FOUND THEN
+        INSERT INTO partdist.raft_group (group_id, members)
+        VALUES (p_group_id, coalesce(p_members, '{}'::integer[]));
+    END IF;
     RETURN partdist.pg_raft_group_create_internal(p_group_id, p_members);
 END;
 $fn$;

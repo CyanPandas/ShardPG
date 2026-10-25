@@ -26,7 +26,7 @@ SELECT partdist.pg_partdist_get_primary(600::oid);
 
 -- Change the primary and invalidate again
 UPDATE partdist.node_map SET node_id = 1 WHERE node_id = 1; -- no-op to keep FK valid
-INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (5, 'newcoord', 5432) ON CONFLICT DO NOTHING;
+INSERT INTO partdist.node_map (node_id, hostname, port) VALUES (5, 'newcoord', 5432);
 UPDATE partdist.partition_map SET primary_node = 5 WHERE partition_id = 600::oid;
 SELECT partdist.pg_partdist_cache_invalidate();
  pg_partdist_cache_invalidate 

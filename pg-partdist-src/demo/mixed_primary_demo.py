@@ -1475,7 +1475,9 @@ ALTER TABLE {TABLE} SET (autovacuum_enabled = off);""", "建表（先建好索�
                 s = d.sess("coord")
                 s.run("ROLLBACK;", timeout=10)
                 d.gbegin("coord", d.S(0))
-                s.run(f"INSERT INTO {TABLE} VALUES {vals} ON CONFLICT (sku) DO NOTHING;\nCOMMIT;")
+                # 分片表不支持 ON CONFLICT：先删掉这一段编号再整段插入（行内容是确定的，结果与"补缺"相同）
+                s.run(f"DELETE FROM {TABLE} WHERE sku BETWEEN 101 AND {100 + NROWS};\n"
+                      f"INSERT INTO {TABLE} VALUES {vals};\nCOMMIT;")
 
     def s5_checks(d):
         d.check(f"协调者读到 {NROWS} 行", q(COORD, f"SELECT count(*) FROM {TABLE}"), str(NROWS))

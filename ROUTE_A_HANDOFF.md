@@ -89,6 +89,8 @@ GUC：`pg_raft.auto_failover`（默认 off，`shardpg_rep.sh register` 打开）
 
 ## 6. 已知风险 / 未做
 
+- **【10-21】ShardPG 不用 INSERT … ON CONFLICT**（用户定的原则：INSERT 只有插入成功与插入失败两种结果）：28 处改成"先 UPDATE、没有再普通 INSERT（必须插入 1 行）"或"按键加锁 → 新快照查 → 普通 INSERT"；follower 收日志时在子事务里捕获唯一冲突，再显式 UPDATE 或重试整条批量语句（曾尝试的按组串行锁已撤掉）；分片表拒绝应用的 `INSERT … ON CONFLICT`。`DTX_2PC_DESIGN.md` §16，镜像 `shardpg:noconflict`，`health4m_check.sh` 两轮全面检查通过，最终子事务写法的 10-worker 实验记录另行核对。
+- **【10-21 已修】推定中止与迟到的判决各写各的 ⇒ 一半提交**：300 仓、磁盘打满时发起方从通知协调组到写判决拖了约 100 s，参与方恢复守护推定中止的 ABORT 压在整轮恢复的大事务里未提交，发起方查不到、写待确认 COMMIT 时 INSERT 落空却照样返回 3。修法：决议表主键仲裁 + 临界区新快照复查 + 推定中止自成事务（`DTX_2PC_DESIGN.md` §15，镜像 `shardpg:dtxfix`，`dtx_race_check.sh` 确定性验证 6 轮通过）。
 - **【10-20 已修】worker 切主后各 worker 上的 Citus 路由元数据不更新**：`citus_update_node` 只改协调者，把全部 worker 标成未同步后 Citus 后台逐个补同步互相等、永远补不上 → 从 worker 进来的查询路由到死掉的旧主、2PC 恢复问不到发起节点、prepared 悬挂锁行。修法：切主后立即 `start_metadata_sync_to_all_nodes()` + 控制面 leader 每 10 s 兜底；2PC 恢复按控制面现任地址问发起节点（`TSO_RAFT_REPORT_20261019.md` §5）。
 - **【10-19 已修】切主后分片 xid 被重复发号**（水位推进记 WAL `XLOG_SHARD_XID_WM`，备库回放抬高水位文件；`TSO_RAFT_DESIGN.md` §3，lab 确定性复现与验证见 `TSO_RAFT_REPORT_20261019.md`）。原记录：分片 xid 的持久发号水位是普通文件、不进 WAL，备库上是旧值；物理复制提升后发号起点只从回放的提交 / 判决记录学到，旧主"写了数据没提交"用过的号会被重发，那些元组在新主上随新事务提交而部分"复活"（lab 实测：仓 54 订单 1409 与仓 14 的 Delivery 共用分片 xid 269327）。Raft 模式的 `ShardXidClaimOnPromote` 有跳批保护，路线 A 没走。修法：水位推进记 WAL（每批一次）由备库回放推进，或提升后逐分片跳批 + 判中止。详见 `TPCC_CLOUD_REPORT_20261018.md` 9.3。
 - **【10-18 晚已修】跨节点原子性**：发起方崩溃可致一半提交（云上 12 次 kill 3 次）。已按方案 B 修（判决与发起方本地提交绑定，`DTX_2PC_DESIGN.md` §14），lab 验证通过。
@@ -106,7 +108,8 @@ GUC：`pg_raft.auto_failover`（默认 off，`shardpg_rep.sh register` 打开）
 
 - 只做编译检查：把源码 tar 拷进 `shardpg-fix-client` 容器，`make PG_CONFIG=/work/pg-install/bin/pg_config`。
 - 内核补丁列表在 lab 的 `build/prof/Dockerfile` 与仓库 `tpcc/lab/Dockerfile.prof`（0012–0016）。
-- **lab 现状（10-20 晚）**：
+- **lab 现状（10-21 傍晚）**：4 台机器 ShardPG 30 仓，镜像 `shardpg:noconflict`（148 的数据在 /data3/yyt；健康检查后 n4 已切到 145:31096，旧主 148 上的 n4 已停）；PG 一主两备已停，留着 300 仓数据（148 的备库在 /data3/yyt/pgsync3）。300 仓套件 `$R/tpcc-std300`、`$R/tpcc-pgsync-std300`。大库测试先起 `disk_guard.sh`。
+- **lab 现状（10-20 晚，已过时）**：
   - 部署：4 台机器的 ShardPG 标准规模 30 仓（套件 `$R/tpcc-std`，`redeploy4m.sh` 加 `KIT=tpcc-std`），镜像 `shardpg:tsoraft`，带 TSO 代理；
   - PG 一主两备（`pgsync-*`）已停，数据还在，30 仓；
   - 迷你仓套件 `$R/tpcc` 的 `cluster.env` 是 4 台机器版本，3 worker 原件是 `cluster.env.4node`；

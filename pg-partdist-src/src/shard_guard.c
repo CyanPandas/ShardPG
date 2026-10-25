@@ -256,6 +256,25 @@ ShardGuardIsReferenceTable(Oid relid)
  * Citus 把引用表的写重写成自己的 CustomScan，顶层已经不是普通 ModifyTable。
  */
 void
+ShardGuardCheckOnConflict(Oid relid)
+{
+	/*
+	 * 2026-10-21：ShardPG 的 INSERT 只有"插入成功"与"插入失败（报错）"两种结果。
+	 * ON CONFLICT DO NOTHING 撞上冲突时什么都不写却报告成功，DO UPDATE 名为插入、实为更新 ——
+	 * 分片表一律不接受。由 partdist_planner 在 Citus 改写之前调用；分片表的写最终都在 worker 上
+	 * 对分片表规划（协调者转发、函数下推、Citus 本地执行都一样），按分片表判即可全覆盖。
+	 */
+	if (OidIsValid(relid) && OidIsValid(ShardXidLookupByOid(relid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("分片表 \"%s\" 不支持 INSERT ... ON CONFLICT",
+						get_rel_name(relid) ? get_rel_name(relid) : "?"),
+				 errdetail("ShardPG 的 INSERT 只有插入成功与插入失败两种结果；ON CONFLICT 会在冲突时"
+						   "什么都不写却报告成功（DO NOTHING），或把插入变成更新（DO UPDATE）。"),
+				 errhint("先查询或先 UPDATE，没有再 INSERT；需要仲裁时显式加锁。")));
+}
+
+void
 ShardGuardCheckReferenceWrite(Oid relid)
 {
 	if (!ShardGuardClusterManaged())

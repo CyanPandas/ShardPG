@@ -21,7 +21,8 @@ PSQL="docker exec shardpg-fix-client /work/pg-install/bin/psql -U postgres -XAtq
 # 2026-10-20：MEM_LIMIT（如 8g）给备库容器设内存上限并关 swap（与 node.sh 一致，模拟小内存服务器）
 MEMOPT=""; [ -n "${MEM_LIMIT:-}" ] && MEMOPT="--memory $MEM_LIMIT --memory-swap $MEM_LIMIT"
 onhost() { local h=$1; shift; if [ "$h" = 10.77.110.145 ]; then bash -c "$*"; else ssh -n $h "$*"; fi; }
-base() { [ "$1" = 10.77.110.145 ] && echo $R || echo $T; }
+# 2026-10-21：BASE148 = 148 上数据目录的根（默认 $T；大库放 /data3/yyt/...）
+base() { case "$1" in 10.77.110.145) echo $R ;; 10.77.110.148) echo ${BASE148:-$T} ;; *) echo $T ;; esac; }
 # mk_standby worker名 主库host 主库port 备库host 备库port：在备库 host 上按主库做 pg_basebackup 建备库（同步执行）
 mk_standby() {
   local wn=$1 ph=$2 pp=$3 sh=$4 sp=$5
