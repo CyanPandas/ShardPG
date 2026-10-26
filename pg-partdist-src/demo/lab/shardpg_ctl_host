@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Host launcher for lab 145. Install only as:
+# /data1/yyt/shardpg-ddl-demo/pg-install/bin/shardpg_ctl
+# The implementation and node configuration stay in the current DDL container.
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: ./shardpg_ctl <command> [arguments]
+  status
+  shards [table]
+  files <node>
+  stop <node> [immediate|fast]
+  start <node>
+  add-node worker4 10.77.110.147 32436
+  move-replica <shard> <source-node> <target-node>
+  move-primary <shard> <target-node>
+  remove-node worker4
+
+Run on lab 145. Uses only the shardpg-ddl container control implementation.
+USAGE
+}
+
+case "${1:---help}" in
+    -h|--help|help) usage; exit 0 ;;
+    status|shards|files|stop|start|add-node|move-replica|move-primary|remove-node) ;;
+    *) printf 'Unknown command: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+if ! ddl_control_script=$(docker exec shardpg-ddl-worker1 cat /work/pg-install/bin/shardpg_ctl); then
+    echo 'Cannot read the control script from shardpg-ddl-worker1; check that this DDL container is running.' >&2
+    exit 1
+fi
+# A stopped legacy backup mounts the host installation. Refuse to recurse into
+# this launcher if someone later restores that old container as worker1.
+if ! grep -Fxq 'CONTAINER_CONF=/work/pg-install/etc/lab-nodes.conf' <<<"$ddl_control_script"; then
+    echo 'shardpg-ddl-worker1 does not contain the expected container-mode controller; refusing to run.' >&2
+    exit 1
+fi
+
+export SHARDPG_CONTAINER_MODE=1
+exec bash -c "$ddl_control_script" "$0" "$@"

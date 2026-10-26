@@ -28,18 +28,19 @@
 
 ## 后续展示的控制入口
 
-在 **145 的 bash** 中定义以下函数，不写任何宿主机文件。后续使用 `shardpg_ctl ...`，无需进入旧的宿主机安装目录：
+**2026-10-26 入口更新**：按用户要求，在 145 的 DDL 专属目录安装了启动脚本，现在直接 `cd` 后执行 `./shardpg_ctl`：
 
 ```bash
-shardpg_ctl() {
-  SHARDPG_CONTAINER_MODE=1 bash <(
-    docker exec shardpg-ddl-worker1 cat /work/pg-install/bin/shardpg_ctl
-  ) "$@"
-}
-shardpg_ctl status
+cd /data1/yyt/shardpg-ddl-demo/pg-install/bin
+./shardpg_ctl status
+./shardpg_ctl shards
 ```
 
-对应展示命令仍为 `shardpg_ctl add-node worker4 10.77.110.147 32436`、`shardpg_ctl move-replica <实际分片名> <实际源节点> worker4`、`shardpg_ctl move-primary <实际分片名> worker4`。删表后执行 `shardpg_ctl remove-node worker4`，恢复 master + 3 worker；移除时会按现有 Raft peers 约束重启这套 DDL 数据库。旧宿主机 `./shardpg_ctl` 没有被改写，应使用上述入口。
+对应展示命令为 `./shardpg_ctl add-node worker4 10.77.110.147 32436`、`./shardpg_ctl move-replica <实际分片名> <实际源节点> worker4`、`./shardpg_ctl move-primary <实际分片名> worker4`。删表后执行 `./shardpg_ctl remove-node worker4`，恢复 master + 3 worker；移除时会按现有 Raft peers 约束重启这套 DDL 数据库。
+
+宿主机入口来自 `demo/lab/shardpg_ctl_host`，通过 Docker 读取当前 `shardpg-ddl-worker1` 内的实现并启用容器配置模式，因此加节点仍复制已升级的容器安装。原入口备份为同目录的 `shardpg_ctl.pre-cd-20261026`；此次仅更新 145 的这个 DDL 入口，没有改宿主机数据库二进制、其他项目或服务。直接使用 `docker exec shardpg-ddl-…` 调用 psql、pg_ctl 的方式仍可用。
+
+10 月 26 日只读验证通过：`./shardpg_ctl status` 显示四节点 running/active，`./shardpg_ctl shards` 列出现场已有的 customer/orders 共 8 个分片，原生 `docker exec … pg_ctl status` 正常。本次未停启数据库、未修改表数据。
 
 收尾只读核对：三台主机的其他 424 个容器 ID、名称和状态均未变化；四个 DDL 节点在本次预演时段未出现 PANIC 或 signal 6/11 崩溃记录。
 
