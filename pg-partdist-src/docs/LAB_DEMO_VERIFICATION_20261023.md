@@ -45,3 +45,19 @@ cd /data1/yyt/shardpg-ddl-demo/pg-install/bin
 收尾只读核对：三台主机的其他 424 个容器 ID、名称和状态均未变化；四个 DDL 节点在本次预演时段未出现 PANIC 或 signal 6/11 崩溃记录。
 
 原始 SQL、两个会话记录、写入统计及完整日志保存在本机 `/tmp/shardpg-ddl-demo-20261023/`。初次失败的日志也保留，最终结果以 `transactions.log`、`high_availability-final.log`、`migration-final.log`、`historical-residue-repair-final.log`、`n117-local-final.log` 和 `drop-regression-final.log` 为准。
+
+## 2026-10-26：N118 快照恢复后的旧主回切
+
+现场 `./shardpg_ctl move-primary customer_102365 worker1` 等待 180 秒后失败。worker1 停机期间失去主权，恢复时安装组 0 快照；快照更新了 `partition_map` 和 Citus 路由，却没有执行数据面降级回调。后续同主、同任期的登记被当作重复条目跳过，三个分片留着持久 `promoted` 标记，回切预热因此拒绝回放。这一快照分支不在此前预演覆盖范围内。
+
+`pg-raft-src/src/raft_apply.c` 现在在安装快照时补齐旧主降级：快照主不是本节点、且本节点不是当前数据组 leader 时，通过原有交接回调撤销残留标记；不会仅凭快照升主，也不会降级当前数据 leader。
+
+修复库已在原四个 DDL 容器内安装并逐台重启加载，SHA-256 为 `9f754e127019b36da161a75ca7e5b9ad0e370769cf173912a1d10d1c0fe8d797`。原库备份在各容器 `/work/pg-install/lib/postgresql/pg_raft.so.pre-n118`，未修改 lab 宿主机安装或其他项目。
+
+按用户要求只验证相关展示链路：
+
+- 从当前控制面 leader 取得已提交快照，在 worker1 实际执行安装；102365、102368、102369 从“Raft follower、本地 promoted”恢复为副本，三者预热均返回 `ready`。
+- 通过原宿主机 `cd` / `./shardpg_ctl` 入口执行原命令：customer_102365 和 orders_102369 均切到 worker1，数据库内耗时 4 秒，含远程调用约 8 秒。
+- 在 102365、102366 两个不同 worker 的 customer 行上验证提交可见性、反向提交恢复和回滚；全部八行与原数据一致，余额总额仍为 8000，orders 仍为 0 行。
+
+本次未重跑完整回归或迁移压测。构建、快照恢复、切主、事务及最终四节点核验记录保存在 `/tmp/shardpg-ddl-n118-20261026/`。

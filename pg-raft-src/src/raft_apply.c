@@ -285,7 +285,32 @@ pg_raft_apply_snapshot_state(const char *node_map_json,
     }
 
     for (i = 0; i < nparts; i++)
+    {
+        /*
+         * N118: InstallSnapshot bypasses OP_PARTITION_PRIMARY callbacks.
+         * An old primary can therefore retain its durable promoted marker
+         * after the snapshot has made it a replica.  Replayed tail entries
+         * with the same primary/term are no-ops and cannot repair that marker;
+         * replica_warmup then refuses replay forever.
+         *
+         * Reconcile demotion only.  A snapshot is not permission to promote
+         * a local copy (catch-up and the data-group election still own that).
+         * Nor may an older control snapshot demote a current data leader.
+         * old_primary=0 lets the callback act only on a retained local marker.
+         */
+        if (pg_raft_node_id > 0 && part_primaries[i] > 0 &&
+            part_primaries[i] != pg_raft_node_id)
+        {
+            bool is_leader = false;
+            int64 current_term = 0;
+
+            if (!pg_raft_data_group_role((int64) part_ids[i],
+                                        &is_leader, &current_term, NULL) || !is_leader)
+                raft_notify_primary_switch(part_ids[i], 0,
+                                           part_primaries[i], "0/0");
+        }
         raft_update_citus_placement(part_ids[i], part_primaries[i]);
+    }
 
     raft_invalidate_cache();
     ok = true;
