@@ -38,9 +38,12 @@ check() {
 
 NEG_RUN=0
 neg() {  # neg <名字> <期望片段> <SQL>
-  local hit
-  hit=$(PSQL "$WPORT" -Atc "$3" </dev/null 2>&1 | grep -c "$2")
-  check "负向:$1" "$hit" "1"
+  local output hit rc=0 matched=0
+  output=$(PSQL "$WPORT" -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -Atc "$3" </dev/null 2>&1) || rc=$?
+  hit=$(grep -Ec "$2" <<< "$output") || true
+  if [[ "$rc" -ne 0 && "$hit" == 1 ]]; then matched=1; fi
+  check "负向:$1" "$matched" "1"
+  if [[ "$matched" != 1 ]]; then printf '        psql exit=%s\n%s\n' "$rc" "$output"; fi
   NEG_RUN=$((NEG_RUN+1))
 }
 
@@ -428,8 +431,10 @@ check "夹具表 DROP 之后自动启动器仍正常返回（considered=${d7}）
 # ★ 真负向：自动启动器整条链的地基是不变式 clog_truncate_before <= shard_vacuum_xid
 #   （截断门禁只认 shard_vacuum_xid 这个"趟完"凭据）。违反它必须当场 ERROR，
 #   否则自动启动器就可能拿一个假凭据去截断。
-neg "水位不变式 tb <= vx 违反即拒" "不变式" \
+wm_before_invalid=$(WM "$OA")
+neg "水位不变式 tb <= vx 违反即拒" "XX001: .*reclaim frontier .*exceeds completed sweep" \
     "SELECT partdist.shard_vacuum_set_watermarks($OA::oid, 10::bigint, 5::bigint)"
+check "非法水位被拒后原水位不变" "$(WM "$OA")" "$wm_before_invalid"
 
 echo "========== [12] 负向计数守卫 + 节点健康 =========="
 check "负向用例计数守卫（应跑 4 条）" "$NEG_RUN" "4"

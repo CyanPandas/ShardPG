@@ -1,0 +1,234 @@
+========== [0] 前置：节点就绪 + 符号 + 测试函数 ==========
+  PASS  worker :15433 可用
+  PASS  扩展符号 partdist_shard_sanitize_xmax 存在
+  PASS  测试函数就绪
+========== [1] 构造四种 xmax 形态 ==========
+NOTICE:  table "p5a" does not exist, skipping
+  PASS  p5a 白名单生效
+  PASS  r1 带 ABORTED xmax（非 0）
+  PASS  r2 带 COMMITTED xmax（非 0）
+  PASS  r3 无 xmax
+  PASS  r4 带 ABORTED xmax（非 0）
+  PASS  r1 的 clog = ABORTED(3)
+  PASS  r2 的 clog = COMMITTED(2)
+  PASS  r4 的 clog = ABORTED(3)
+  PASS  发号递增：X4 最大
+  PASS  消毒前可见 3 行（r1/r3/r4）
+========== [2] 消毒：trunc_before = X4（覆盖 X1/X2，不覆盖 X4）==========
+  PASS  返回 1 页扫描/1 页改写/1 条消毒
+  PASS  r1 的 xmax 已清 0
+  PASS  r1 带 HEAP_XMAX_INVALID
+  PASS  r2 的 COMMITTED xmax 不动
+  PASS  r4 的 xmax 在截断点以上不动
+  PASS  消毒后仍可见 3 行
+========== [3] WAL 取证：走的是内核 XLOG_HEAP2_FREEZE_PAGE ==========
+  PASS  区间内有 FREEZE_PAGE 记录
+========== [4] 幂等：再跑一次零动作 ==========
+  PASS  第二趟 0 条
+========== [5] 负向三条 ==========
+  PASS  负向:区间内仍未决即拒
+  PASS  被拒后 r4 的 xmax 未被污染
+  PASS  水位已置 6
+  PASS  负向:trunc_before 后退即拒
+NOTICE:  table "p5plain" does not exist, skipping
+  PASS  负向:非分片表即拒
+  PASS  负向计数守卫（应跑 3 条）
+========== [6] 崩溃持久性：消毒经 WAL 落盘，不是只改了内存 ==========
+  PASS  immediate 崩溃后重启就绪
+  PASS  重启后 r1 的 xmax 仍为 0
+  PASS  重启后 r2 的 xmax 仍在
+  PASS  重启后仍可见 3 行
+========== [7] T5.3a 清场 ==========
+  PASS  T5.3a 清场完成
+========== [8] T5.3b 构造：两活行 + 三种中止形态 ==========
+NOTICE:  table "p5b" does not exist, skipping
+  PASS  p5b 白名单生效
+  PASS  构造后页上 7 个 LP_NORMAL
+  PASS  构造后可见 2 行
+  PASS  截断点取到值
+========== [9] 顺序依赖：不先跑 ③，链上元组只能推迟 ==========
+  PASS  先跑①：删 4 条、推迟 1 条、无跳页
+  PASS  推迟的那条还在页上（3 个 LP_NORMAL）
+  PASS  推迟期间可见行数不变
+========== [10] 先 ③ 后 ①：全部清干净 ==========
+  PASS  ③ 消毒 2 条（活行 k1 的中止 xmax + 链中元组的 xmax）
+  PASS  再跑①：删 1 条、零推迟
+  PASS  页上只剩 2 个 LP_NORMAL
+  PASS  页上无 LP_DEAD 残留
+  PASS  两活行仍可见
+  PASS  活行内容未被误删
+  PASS  幂等：第三趟零动作
+========== [11] WAL 取证：PRUNE + VACUUM 两条内核标准记录（取 [9] 那一趟）==========
+  PASS  区间内有 PRUNE 记录
+  PASS  区间内有 VACUUM 记录
+========== [12] 崩溃持久性 + 负向 ==========
+  PASS  immediate 崩溃后重启就绪
+  PASS  重启后页上仍只 2 个 LP_NORMAL
+  PASS  重启后两活行仍在
+NOTICE:  table "p5idx" does not exist, skipping
+  PASS  p5idx 白名单生效
+  PASS  清理前索引叶页有 4 条索引项
+  PASS  ★ 带索引的关系删掉 2 条死元组
+  PASS  ★ 索引项同步减到 2 条（两阶段的第二阶段真的跑了）
+  PASS  ★ 堆上行指针已回收（只剩 2 个 LP_NORMAL，0 个 LP_DEAD）
+  PASS  ★ 索引扫描仍能取到活行
+  PASS  负向计数守卫（累计应跑 3 条）
+========== [14] T5.3c 构造：三活行 + 四种死法 ==========
+NOTICE:  table "p5c" does not exist, skipping
+  PASS  p5c 白名单生效
+  PASS  构造后页上 7 个 LP_NORMAL
+  PASS  构造后可见 3 行
+  PASS  截断点取到值
+  PASS  中止删除行的 xmax 非 0
+  PASS  已提交条目已补 commit_ts（中止那条仍是 ABORTED）
+========== [15] 跑 ②：只删已提交删除的，活行一条不动 ==========
+  PASS  删 4 条、零推迟、无跳页
+  PASS  页上只剩 3 个 LP_NORMAL
+  PASS  页上无 LP_DEAD 残留
+  PASS  三活行仍可见
+  PASS  活行内容未被误删
+  PASS  ★ 中止删除的行原样保留（xmax 未被碰）
+  PASS  幂等：第二趟零动作
+  PASS  区间内有 PRUNE 记录
+  PASS  区间内有 VACUUM 记录
+  PASS  ③ 接手消毒 1 条（②留下的中止 xmax）
+  PASS  消毒后仍是 3 活行
+========== [16] 负向：commit_ts=0 的已提交条目落在截断点以下 ==========
+NOTICE:  table "p5d" does not exist, skipping
+  PASS  p5d 白名单生效
+  PASS  该 xmax 已被改成 commit_ts=0 的 COMMITTED
+  PASS  负向:commit_ts 为 0 即拒
+  PASS  被拒后元组未被删
+  PASS  p5idx 重新打标
+NOTICE:  table "p5hot" does not exist, skipping
+  PASS  p5hot 打标
+  PASS  负向:★ 带索引 + HOT 链的死根元组即拒（LP_REDIRECT 未实现）
+  PASS  被拒后 p5hot 的行仍可见
+  PASS  负向计数守卫（累计应跑 5 条）
+========== [16b] TOAST 关系的清理（索引两阶段的正主用例）==========
+NOTICE:  table "p5t" does not exist, skipping
+  PASS  p5t 白名单生效
+  PASS  值确实进了 TOAST（chunk 数 > 8）
+  PASS  TOAST 索引项数 = chunk 数
+  PASS  删后可见 4 行
+  PASS  sweep 干净收尾且删了主堆 4 条 + TOAST 一批
+  PASS  ★ 删掉的死元组数 > 4（主堆 4 条之外还有 TOAST 的 chunk）
+  PASS  ★ TOAST chunk 真的被回收了（32 → 16）
+  PASS  ★ TOAST 索引项同步减少
+  PASS  ★ 活行的 TOAST 值仍能完整取出（内容逐字节不变）
+  PASS  清理后仍是 4 行
+  PASS  幂等：再 sweep 一次零动作
+========== [17] 崩溃持久性 ==========
+  PASS  immediate 崩溃后重启就绪
+  PASS  重启后 p5c 页上仍 3 个 LP_NORMAL
+  PASS  重启后 p5c 三活行仍在
+========== [19] T5.4 构造 + 顺序铁律门禁 ==========
+NOTICE:  table "p5e" does not exist, skipping
+  PASS  p5e 白名单生效
+  PASS  构造后可见 2 行
+  PASS  初始水位 0/0
+  PASS  负向:★ 页未清完即拒截断
+  PASS  被拦后水位仍 0/0
+  PASS  半程 sweep 干净收尾
+  PASS  半程 sweep 后标记 = 6
+  PASS  负向:★ 趟标记落后于目标即拒
+  PASS  趟标记落后时拒绝后水位不变
+  PASS  负向:trunc_before 超过下一个待发号即拒
+  PASS  负向计数守卫（累计应跑 8 条）
+========== [20] 完整 sweep → 截断 → 免查区生效 ==========
+  PASS  全程 sweep 干净收尾
+  PASS  两趟总账：消毒1 + 删中止1 + 删死1 = 3 条
+  PASS  趟完标记落到 7
+  PASS  截断返回删段数 0（不足一整段，跨界那段留着）
+  PASS  截断后水位推进到 7/7
+  PASS  跨界段文件仍在
+  PASS  截断后仍可见 2 行
+  PASS  截断后内容正确
+  PASS  页上只剩 2 个 LP_NORMAL
+  PASS  clog 槽已被抹成 RUNNING(0)
+  PASS  ★ 免查区生效：clog 说未决，行照样可见
+  PASS  幂等：再截一次仍 7/7
+========== [21] ★ 两条正确性陷阱：跳过清理直接推水位 ==========
+NOTICE:  table "p5f" does not exist, skipping
+  PASS  p5f 白名单生效
+  PASS  注入前可见 1 行
+  PASS  ★ 陷阱①：不清页直接截断 ⇒ 幽灵行复活（2 行）
+NOTICE:  table "p5g" does not exist, skipping
+  PASS  p5g 白名单生效
+  PASS  注入前可见 1 行
+  PASS  ★ 陷阱③：不消毒直接截断 ⇒ 活行被判死（0 行）
+  （以上两条是**注入**：门禁存在的理由。走正常 sweep→truncate 路径时 [20] 段已证明结果正确）
+========== [22] 截断的崩溃持久性 ==========
+  PASS  immediate 崩溃后重启就绪
+  PASS  重启后 p5e 水位仍 7/7
+  PASS  重启后 p5e 仍可见 2 行
+  PASS  重启后 p5e 内容正确
+========== [24] 状态一：趟不完整（确定性注入 pages_skipped）==========
+NOTICE:  table "p5h" does not exist, skipping
+  PASS  p5h 白名单生效
+  PASS  构造后可见 2 行
+  PASS  ★ 有页被 pin 住时 sweep 不完整（swept=false 且有跳页）
+  PASS  ★ 不完整的趟不落标记（水位仍 0/0）
+  PASS  负向:不完整的趟之后仍拒截断
+  PASS  不完整的趟拒绝截断后水位仍 0/0
+  PASS  负向计数守卫（累计应跑 9 条）
+  PASS  整趟重来：干净收尾
+  PASS  重来后标记落到 6
+  PASS  截断后水位 6/6
+  PASS  可见性正确（2 行）
+========== [25] 状态二：趟完未截断 + 崩溃 ==========
+NOTICE:  table "p5i" does not exist, skipping
+  PASS  p5i 白名单生效
+  PASS  sweep 干净收尾（未截断）
+  PASS  ★ 处于状态二：0/7（vx 跑在 tb 前面）
+  PASS  immediate 崩溃后重启就绪
+  PASS  ★ 状态二跨崩溃保持（仍 0/7）
+  PASS  ★ 恢复只补做截断
+  PASS  恢复后水位 7/7
+  PASS  恢复后可见 2 行
+  PASS  恢复后内容正确
+  PASS  恢复幂等：再做一次是 nothing
+========== [26] 状态一的恢复动作 = 整趟重来（幂等）==========
+  PASS  已清干净的表再跑整趟：零动作
+  PASS  重跑不动水位
+  PASS  重跑后仍可见 2 行
+  PASS  tb == vx 时恢复无事可做
+========== [27] 龄的定义与基点（★ 必须是 clog_truncate_before）==========
+NOTICE:  table "p5j" does not exist, skipping
+  PASS  p5j 白名单生效
+  PASS  默认阈值：阶段1=2e8 阶段2=2^31-1e6
+  PASS  未截断时龄 = next_xid（tb=0）
+  PASS  相位 0（远未到龄）
+  PASS  现处于状态二（0/6）
+  PASS  ★ 状态二下龄未因 sweep 变小（基点是 tb 不是 vx）
+  PASS  截断推进后龄变小
+  PASS  20 个事务后龄回到 20 以上
+========== [28] 阶段 1：到龄 WARNING ==========
+  PASS  阶段1阈值调到 2
+  PASS  相位升为 1
+  PASS  ★ 到龄时发号发 WARNING
+  PASS  到龄不拦写入（阶段1只是提醒）
+========== [29] 阶段 2：拒发新号，该分片进只读 ==========
+  PASS  阶段2停发线调到 10
+  PASS  相位升为 2
+  PASS  负向:★ 停发线以上拒发新号
+  PASS  ★ 只读：读仍然可以
+NOTICE:  table "p5k" does not exist, skipping
+  PASS  p5j+p5k 同时打标
+WARNING:  分片 57349 的 xid 龄 3 已达 shard_vacuum_max_age 2
+DETAIL:  停发线是 10。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  ★ 分片粒度：另一张龄小的分片表照写不误
+  PASS  p5k 未达停发线（相位 1 而非 2）
+  PASS  ★ 停发状态下 vacuum 自身仍可运行（它不领分片 xid）
+  PASS  ★ 推进截断点后相位降回 0
+  PASS  ★ 解锁后写入恢复
+  PASS  负向计数守卫（累计应跑 10 条）
+  PASS  阈值已复位
+========== [30] 清场 ==========
+  PASS  清场完成
+  PASS  本轮无节点崩溃（signal 11/6 或 PANIC）
+================================================================
+  PASS=182  FAIL=0
+================================================================
+  [复原] pg_partdist.shard_vacuum_auto 已 RESET

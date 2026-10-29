@@ -1,0 +1,322 @@
+================ [1] 夹具：1 分片分布表 + raft 组 + 两 follower ================
+  PASS  group0 有 leader
+NOTICE:  table "p5repl" does not exist, skipping
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+  shard=102008 leader=:15433(node2) followers=:15434 :15435
+  PASS  leader fileset 注册（主堆+TOAST堆+TOAST索引=3）
+NOTICE:  table "p5repl_102008" does not exist, skipping
+  PASS  follower :15434 locmap 配对 3 对
+NOTICE:  table "p5repl_102008" does not exist, skipping
+  PASS  follower :15435 locmap 配对 3 对
+  PASS  分区组 102008 leader 就位
+  PASS  follower :15434 replay_enable
+  PASS  follower :15435 replay_enable
+  PASS  控制面主节点登记已同步到 coordinator 及三个副本节点
+  PASS  leader 白名单生效
+  PASS  leader 测试函数就绪
+  PASS  follower 测试函数就绪
+================ [2] 工作负载：制造三类垃圾（全 leader 直写，含 TOAST）================
+  提交写入已带出前面回滚事务的 DATA 与 ABORT 标记
+  PASS  leader 可见 51 行（60 插入 - 8 - 1 已提交删除）
+  PASS  值确实进了 TOAST（chunk 数 > 5）
+  PASS  vacuum 前第 0 页有 LP_NORMAL
+  PASS  leader 认得本地分片（local_partition_for_shard）
+  lead_plsn1=132
+  PASS  leader 已产生 parwal 记录
+  PASS  目标位置已获 Raft 提交确认（committed=132, target=132）
+  PASS  follower1 追平工作负载
+  PASS  follower2 追平工作负载
+================ [2b] U-P5-1：分片 clog 由流重建 ================
+  PASS  leader 分片 clog 有 COMMITTED 判决
+  PASS  leader 分片 clog 有 ABORTED 判决
+  PASS  ★ follower :15434 的分片 clog 由流重建（COMMITTED 逐条到位）
+  PASS    （对照：follower :15434 确实拿到了非空判决，不是全空洞）
+  PASS  ★ follower :15435 的分片 clog 由流重建（COMMITTED 逐条到位）
+  PASS    （对照：follower :15435 确实拿到了非空判决，不是全空洞）
+  PASS  leader 已发过号（next_xid > 3）
+  PASS  ★ follower :15434 的发号水位盖过已回放的最大分片 xid（next=9 > max_seen=8；leader 当前 next=9 仅作参考）
+  PASS  ★ follower :15435 的发号水位盖过已回放的最大分片 xid（next=9 > max_seen=8；leader 当前 next=9 仅作参考）
+  PASS  follower :15434 重启就绪
+  PASS  ★ 重启后发号水位仍在（这才叫持久；next=9 > max_seen=8）
+  PASS  vacuum 前取到 follower1 主堆指纹
+  PASS  vacuum 前取到 follower2 主堆指纹
+  PASS  vacuum 前 follower1 水位 0/0
+  PASS  vacuum 前 follower2 水位 0/0
+================ [3] leader 侧 sweep + 截断 ================
+  PASS  算出截断点
+  PASS  TSO 安全前缀已覆盖 sweep 目标
+  PASS  sweep 干净收尾（零跳页零推迟）
+  PASS  ★ 主堆 + TOAST 一起清：删死元组 > 9
+  PASS  ★ TOAST chunk 被回收（24 → 20）
+  PASS  ★ 活行的 TOAST 值仍能完整取出
+  PASS  截断成功（删段 0，不足一整段）
+  PASS  leader 水位推进到 9/9
+  PASS  vacuum 后 leader 仍可见 51 行
+  PASS  leader 第 0 页 LP_NORMAL 减少了
+  lead_plsn2=147
+  PASS  vacuum 产生了新的 parwal 记录
+================ [4] follower 回放 vacuum 记录 ================
+  PASS  follower1 追平 vacuum
+  PASS  follower2 追平 vacuum
+  PASS  ★ follower1 主堆文件确实变了（vacuum 记录真的到了）
+  PASS  ★ follower2 主堆文件确实变了
+  PASS  ★ follower1 收到并落盘 vacuum 水位 9/9
+  PASS  ★ follower2 收到并落盘 vacuum 水位 9/9
+================ [5] 三方逐字节比对 ================
+  PASS  vacuum回放:f1 0.0.main 两侧都存在
+  PASS  vacuum回放:f1 0.0.main pagecmp(heap) 逐字节
+  PASS  vacuum回放:f1 2.0.main 两侧都存在
+  PASS  vacuum回放:f1 2.0.main pagecmp(heap) 逐字节
+  PASS  vacuum回放:f1 3.0.main 两侧都存在
+  PASS  vacuum回放:f1 3.0.main pagecmp(btree) 逐字节
+  PASS  vacuum回放:f1 比对文件计数守卫（≥3）
+  PASS  vacuum回放:f2 0.0.main 两侧都存在
+  PASS  vacuum回放:f2 0.0.main pagecmp(heap) 逐字节
+  PASS  vacuum回放:f2 2.0.main 两侧都存在
+  PASS  vacuum回放:f2 2.0.main pagecmp(heap) 逐字节
+  PASS  vacuum回放:f2 3.0.main 两侧都存在
+  PASS  vacuum回放:f2 3.0.main pagecmp(btree) 逐字节
+  PASS  vacuum回放:f2 比对文件计数守卫（≥3）
+================ [5b] 32 位算法的短环多次回卷 + 两副本回放 ================
+  PASS  回卷批次 8：安全前缀就绪
+  PASS  回卷批次 8：sweep 完成
+  PASS  回卷批次 8：follower :15434 追平
+  PASS  回卷批次 8：follower :15434 回收凭据持久
+  PASS  回卷批次 8：follower :15435 追平
+  PASS  回卷批次 8：follower :15435 回收凭据持久
+  PASS  回卷批次 8：活行仍为 51
+  PASS  回卷批次 8：保留 TOAST 内容不变
+  PASS  回卷批次 16：安全前缀就绪
+  PASS  回卷批次 16：sweep 完成
+  PASS  回卷批次 16：follower :15434 追平
+  PASS  回卷批次 16：follower :15434 回收凭据持久
+  PASS  回卷批次 16：follower :15435 追平
+  PASS  回卷批次 16：follower :15435 回收凭据持久
+  PASS  回卷批次 16：活行仍为 51
+  PASS  回卷批次 16：保留 TOAST 内容不变
+  PASS  回卷批次 24：安全前缀就绪
+  PASS  回卷批次 24：sweep 完成
+  PASS  回卷批次 24：follower :15434 追平
+  PASS  回卷批次 24：follower :15434 回收凭据持久
+  PASS  回卷批次 24：follower :15435 追平
+  PASS  回卷批次 24：follower :15435 回收凭据持久
+  PASS  回卷批次 24：活行仍为 51
+  PASS  回卷批次 24：保留 TOAST 内容不变
+  PASS  回卷批次 32：安全前缀就绪
+  PASS  回卷批次 32：sweep 完成
+  PASS  回卷批次 32：follower :15434 追平
+  PASS  回卷批次 32：follower :15434 回收凭据持久
+  PASS  回卷批次 32：follower :15435 追平
+  PASS  回卷批次 32：follower :15435 回收凭据持久
+  PASS  回卷批次 32：活行仍为 51
+  PASS  回卷批次 32：保留 TOAST 内容不变
+  PASS  回卷批次 40：安全前缀就绪
+  PASS  回卷批次 40：sweep 完成
+  PASS  回卷批次 40：follower :15434 追平
+  PASS  回卷批次 40：follower :15434 回收凭据持久
+  PASS  回卷批次 40：follower :15435 追平
+  PASS  回卷批次 40：follower :15435 回收凭据持久
+  PASS  回卷批次 40：活行仍为 51
+  PASS  回卷批次 40：保留 TOAST 内容不变
+  PASS  回卷批次 48：安全前缀就绪
+  PASS  回卷批次 48：sweep 完成
+  PASS  回卷批次 48：follower :15434 追平
+  PASS  回卷批次 48：follower :15434 回收凭据持久
+  PASS  回卷批次 48：follower :15435 追平
+  PASS  回卷批次 48：follower :15435 回收凭据持久
+  PASS  回卷批次 48：活行仍为 51
+  PASS  回卷批次 48：保留 TOAST 内容不变
+  PASS  回卷批次 56：安全前缀就绪
+  PASS  回卷批次 56：sweep 完成
+  PASS  回卷批次 56：follower :15434 追平
+  PASS  回卷批次 56：follower :15434 回收凭据持久
+  PASS  回卷批次 56：follower :15435 追平
+  PASS  回卷批次 56：follower :15435 回收凭据持久
+  PASS  回卷批次 56：活行仍为 51
+  PASS  回卷批次 56：保留 TOAST 内容不变
+  PASS  回卷批次 64：安全前缀就绪
+  PASS  回卷批次 64：sweep 完成
+  PASS  回卷批次 64：follower :15434 追平
+  PASS  回卷批次 64：follower :15434 回收凭据持久
+  PASS  回卷批次 64：follower :15435 追平
+  PASS  回卷批次 64：follower :15435 回收凭据持久
+  PASS  回卷批次 64：活行仍为 51
+  PASS  回卷批次 64：保留 TOAST 内容不变
+  PASS  回卷批次 72：安全前缀就绪
+  PASS  回卷批次 72：sweep 完成
+  PASS  回卷批次 72：follower :15434 追平
+  PASS  回卷批次 72：follower :15434 回收凭据持久
+  PASS  回卷批次 72：follower :15435 追平
+  PASS  回卷批次 72：follower :15435 回收凭据持久
+  PASS  回卷批次 72：活行仍为 51
+  PASS  回卷批次 72：保留 TOAST 内容不变
+  PASS  回卷批次 80：安全前缀就绪
+  PASS  回卷批次 80：sweep 完成
+  PASS  回卷批次 80：follower :15434 追平
+  PASS  回卷批次 80：follower :15434 回收凭据持久
+  PASS  回卷批次 80：follower :15435 追平
+  PASS  回卷批次 80：follower :15435 回收凭据持久
+  PASS  回卷批次 80：活行仍为 51
+  PASS  回卷批次 80：保留 TOAST 内容不变
+WARNING:  分片 17623 的 xid 龄 24 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+WARNING:  分片 17623 的 xid 龄 25 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+WARNING:  分片 17623 的 xid 龄 26 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  回卷批次 88：安全前缀就绪
+  PASS  回卷批次 88：sweep 完成
+  PASS  回卷批次 88：follower :15434 追平
+  PASS  回卷批次 88：follower :15434 回收凭据持久
+  PASS  回卷批次 88：follower :15435 追平
+  PASS  回卷批次 88：follower :15435 回收凭据持久
+  PASS  回卷批次 88：活行仍为 51
+  PASS  回卷批次 88：保留 TOAST 内容不变
+  PASS  回卷批次 96：安全前缀就绪
+  PASS  回卷批次 96：sweep 完成
+  PASS  回卷批次 96：follower :15434 追平
+  PASS  回卷批次 96：follower :15434 回收凭据持久
+  PASS  回卷批次 96：follower :15435 追平
+  PASS  回卷批次 96：follower :15435 回收凭据持久
+  PASS  回卷批次 96：活行仍为 51
+  PASS  回卷批次 96：保留 TOAST 内容不变
+  PASS  回卷批次 104：安全前缀就绪
+  PASS  回卷批次 104：sweep 完成
+  PASS  回卷批次 104：follower :15434 追平
+  PASS  回卷批次 104：follower :15434 回收凭据持久
+  PASS  回卷批次 104：follower :15435 追平
+  PASS  回卷批次 104：follower :15435 回收凭据持久
+  PASS  回卷批次 104：活行仍为 51
+  PASS  回卷批次 104：保留 TOAST 内容不变
+  PASS  回卷批次 112：安全前缀就绪
+  PASS  回卷批次 112：sweep 完成
+  PASS  回卷批次 112：follower :15434 追平
+  PASS  回卷批次 112：follower :15434 回收凭据持久
+  PASS  回卷批次 112：follower :15435 追平
+  PASS  回卷批次 112：follower :15435 回收凭据持久
+  PASS  回卷批次 112：活行仍为 51
+  PASS  回卷批次 112：保留 TOAST 内容不变
+  PASS  回卷批次 120：安全前缀就绪
+  PASS  回卷批次 120：sweep 完成
+  PASS  回卷批次 120：follower :15434 追平
+  PASS  回卷批次 120：follower :15434 回收凭据持久
+  PASS  回卷批次 120：follower :15435 追平
+  PASS  回卷批次 120：follower :15435 回收凭据持久
+  PASS  回卷批次 120：活行仍为 51
+  PASS  回卷批次 120：保留 TOAST 内容不变
+  PASS  回卷批次 128：安全前缀就绪
+  PASS  回卷批次 128：sweep 完成
+  PASS  回卷批次 128：follower :15434 追平
+  PASS  回卷批次 128：follower :15434 回收凭据持久
+  PASS  回卷批次 128：follower :15435 追平
+  PASS  回卷批次 128：follower :15435 回收凭据持久
+  PASS  回卷批次 128：活行仍为 51
+  PASS  回卷批次 128：保留 TOAST 内容不变
+  PASS  回卷批次 136：安全前缀就绪
+  PASS  回卷批次 136：sweep 完成
+  PASS  回卷批次 136：follower :15434 追平
+  PASS  回卷批次 136：follower :15434 回收凭据持久
+  PASS  回卷批次 136：follower :15435 追平
+  PASS  回卷批次 136：follower :15435 回收凭据持久
+  PASS  回卷批次 136：活行仍为 51
+  PASS  回卷批次 136：保留 TOAST 内容不变
+  PASS  回卷批次 144：安全前缀就绪
+  PASS  回卷批次 144：sweep 完成
+  PASS  回卷批次 144：follower :15434 追平
+  PASS  回卷批次 144：follower :15434 回收凭据持久
+  PASS  回卷批次 144：follower :15435 追平
+  PASS  回卷批次 144：follower :15435 回收凭据持久
+  PASS  回卷批次 144：活行仍为 51
+  PASS  回卷批次 144：保留 TOAST 内容不变
+  PASS  回卷批次 152：安全前缀就绪
+  PASS  回卷批次 152：sweep 完成
+  PASS  回卷批次 152：follower :15434 追平
+  PASS  回卷批次 152：follower :15434 回收凭据持久
+  PASS  回卷批次 152：follower :15435 追平
+  PASS  回卷批次 152：follower :15435 回收凭据持久
+  PASS  回卷批次 152：活行仍为 51
+  PASS  回卷批次 152：保留 TOAST 内容不变
+  PASS  回卷批次 160：安全前缀就绪
+  PASS  回卷批次 160：sweep 完成
+  PASS  回卷批次 160：follower :15434 追平
+  PASS  回卷批次 160：follower :15434 回收凭据持久
+  PASS  回卷批次 160：follower :15435 追平
+  PASS  回卷批次 160：follower :15435 回收凭据持久
+  PASS  回卷批次 160：活行仍为 51
+  PASS  回卷批次 160：保留 TOAST 内容不变
+WARNING:  分片 17623 的 xid 龄 24 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+WARNING:  分片 17623 的 xid 龄 25 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+WARNING:  分片 17623 的 xid 龄 26 已达 shard_vacuum_max_age 24
+DETAIL:  停发线是 120。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  回卷批次 168：安全前缀就绪
+  PASS  回卷批次 168：sweep 完成
+  PASS  回卷批次 168：follower :15434 追平
+  PASS  回卷批次 168：follower :15434 回收凭据持久
+  PASS  回卷批次 168：follower :15435 追平
+  PASS  回卷批次 168：follower :15435 回收凭据持久
+  PASS  回卷批次 168：活行仍为 51
+  PASS  回卷批次 168：保留 TOAST 内容不变
+  PASS  回卷批次 176：安全前缀就绪
+  PASS  回卷批次 176：sweep 完成
+  PASS  回卷批次 176：follower :15434 追平
+  PASS  回卷批次 176：follower :15434 回收凭据持久
+  PASS  回卷批次 176：follower :15435 追平
+  PASS  回卷批次 176：follower :15435 回收凭据持久
+  PASS  回卷批次 176：活行仍为 51
+  PASS  回卷批次 176：保留 TOAST 内容不变
+  PASS  回卷批次 184：安全前缀就绪
+  PASS  回卷批次 184：sweep 完成
+  PASS  回卷批次 184：follower :15434 追平
+  PASS  回卷批次 184：follower :15434 回收凭据持久
+  PASS  回卷批次 184：follower :15435 追平
+  PASS  回卷批次 184：follower :15435 回收凭据持久
+  PASS  回卷批次 184：活行仍为 51
+  PASS  回卷批次 184：保留 TOAST 内容不变
+  PASS  回卷批次 192：安全前缀就绪
+  PASS  回卷批次 192：sweep 完成
+  PASS  回卷批次 192：follower :15434 追平
+  PASS  回卷批次 192：follower :15434 回收凭据持久
+  PASS  回卷批次 192：follower :15435 追平
+  PASS  回卷批次 192：follower :15435 回收凭据持久
+  PASS  回卷批次 192：活行仍为 51
+  PASS  回卷批次 192：保留 TOAST 内容不变
+  PASS  回卷批次 200：安全前缀就绪
+  PASS  回卷批次 200：sweep 完成
+  PASS  回卷批次 200：follower :15434 追平
+  PASS  回卷批次 200：follower :15434 回收凭据持久
+  PASS  回卷批次 200：follower :15435 追平
+  PASS  回卷批次 200：follower :15435 回收凭据持久
+  PASS  回卷批次 200：活行仍为 51
+  PASS  回卷批次 200：保留 TOAST 内容不变
+  PASS  至少发生两次真实号码复用（短环加速）
+  PASS  重复回卷:f1 0.0.main 两侧都存在
+  PASS  重复回卷:f1 0.0.main pagecmp(heap) 逐字节
+  PASS  重复回卷:f1 2.0.main 两侧都存在
+  PASS  重复回卷:f1 2.0.main pagecmp(heap) 逐字节
+  PASS  重复回卷:f1 3.0.main 两侧都存在
+  PASS  重复回卷:f1 3.0.main pagecmp(btree) 逐字节
+  PASS  重复回卷:f1 比对文件计数守卫（≥3）
+  PASS  重复回卷:f2 0.0.main 两侧都存在
+  PASS  重复回卷:f2 0.0.main pagecmp(heap) 逐字节
+  PASS  重复回卷:f2 2.0.main 两侧都存在
+  PASS  重复回卷:f2 2.0.main pagecmp(heap) 逐字节
+  PASS  重复回卷:f2 3.0.main 两侧都存在
+  PASS  重复回卷:f2 3.0.main pagecmp(btree) 逐字节
+  PASS  重复回卷:f2 比对文件计数守卫（≥3）
+================ [6] 清理 + 节点健康 ================
+  PASS  清场完成
+  PASS  本轮无节点崩溃（signal 11/6 或 PANIC）
+========== 结果：PASS=282 FAIL=0 ==========
+Replay suite exit: PASS=282 FAIL=0 status=0

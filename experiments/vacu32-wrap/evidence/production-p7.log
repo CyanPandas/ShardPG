@@ -1,0 +1,107 @@
+========== [0] 前置：节点与函数面 ==========
+  PASS  worker :15433 可用
+  PASS  自动启动器与观测函数在位（3）
+========== [1] 夹具：TSO 上线 → 打标表 → 三类垃圾 ==========
+  PASS  TSO 已上线、GlobalSafeTs 就绪（157）
+NOTICE:  table "va_auto" does not exist, skipping
+  PASS  夹具表就位（oid=57352）
+  PASS  打标登记成功
+  PASS  负向:分片表拒绝行锁
+  PASS  夹具活行数（20 插入 − 5 删除 = 15）
+  PASS  元组带的是分片 xid（max(xmin) < 1000）
+========== [2] ★ 负向：取不到 GlobalSafeTs 就不清 ==========
+  PASS  max_age 调为 1（实得 1）
+  PASS  分片已到龄（age/phase=6/1，phase 应为 1）
+  PASS  无 GlobalSafeTs 时 detail 记 no-safe-ts（detail=57352:no-safe-ts）
+  PASS  无 GlobalSafeTs 时截断点一动不动（0）
+========== [3] 手工调用：截断点推进、数据完好 ==========
+  PASS  GlobalSafeTs 重新就绪（165）
+  PASS  手工调用后截断点推进（0 → 6；detail=1|57352:0->6）
+  PASS  清完数据仍完好（15 行）
+  PASS  两水位相等（趟完且已截断）
+========== [4] ★ 核心：不手工调，心跳自己干 ==========
+  PASS  心跳取证前暂停自动清理
+WARNING:  分片 57352 的 xid 龄 1 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  心跳取证开始：自动清理已开启
+  PASS  ★ 心跳在 1s 内自动推进了截断点（6 → 9）
+  PASS  ★ 节点日志留痕（≥1，实际 1）
+========== [5] 开关 off：同样条件下一动不动 ==========
+  PASS  开关已关（实得 off）
+WARNING:  分片 57352 的 xid 龄 1 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  关掉之后截断点不动（9）
+  PASS  同一时刻手工调用仍能推进（证明上一条是开关起的作用）
+  PASS  开关已恢复
+========== [6] 两态恢复：趟完未截断，只补截断 ==========
+  PASS  两态场景前：心跳已关（实得 off）
+  PASS  两态恢复的前提：前面已把截断点推到 > 3（tb=11）
+  PASS  已造出两态之二（tb < vx）
+  PASS  detail 记 recover（detail=57352:recover）
+  PASS  截断点补到 vx（两水位重新相等）
+  PASS  两态场景后：心跳已恢复
+========== [7] ★ T7.18（P7-V2）：尾部截断把空间还回去 ==========
+  PASS  截断一节前：心跳已关（实得 off）
+NOTICE:  table "va_trunc" does not exist, skipping
+  PASS  截断夹具：打标登记成功
+WARNING:  分片 57359 的 xid 龄 3 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  截断夹具：关系已有足够多的页（116 块，需 >= 16）
+WARNING:  分片 57359 的 xid 龄 4 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  整趟干净且删掉了尾部那 3000 行（true|3000）
+  PASS  ★ 尾部截断把关系缩小了（116 → 58 块）
+  PASS  截断之后剩下的行一条不少（3000）
+  PASS  截断之后仍能按主键读到边界行（id=3000）
+  PASS  截断开关已关（实得 off）
+WARNING:  分片 57359 的 xid 龄 5 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  关掉截断后元组照样被清掉（true|1500）
+  PASS  关掉之后关系大小不变（58 块）—— 只清元组、不还空间
+  PASS  截断开关已恢复
+========== [8] ★ T7.19（P7-V3）两态之一：页面循环中间崩 → 整趟重来 ==========
+NOTICE:  table "va_fault" does not exist, skipping
+  PASS  故障注入夹具：打标登记成功
+WARNING:  分片 57366 的 xid 龄 3 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  注入点已设为 mid_prune（实得 mid_prune）
+  PASS  负向:页面循环中间被注入中止
+  PASS  ★ 两态之一：标记一个都没落下（水位原样 0/0）
+  PASS  注入点已关
+  PASS  ★ 整趟重来一次就干净（true|3000）
+  PASS  重来之后数据完好（3000 行）
+========== [9] ★ T7.19 两态之二：落完标记崩 → 只补截断 ==========
+WARNING:  分片 57366 的 xid 龄 5 已达 shard_vacuum_max_age 1
+DETAIL:  停发线是 2146483648。
+HINT:  尽快跑 partdist.shard_vacuum_sweep() + partdist.shard_clog_truncate() 推进截断点。
+  PASS  注入点已设为 after_mark（实得 after_mark）
+  PASS  负向:落完标记、截断之前被注入中止
+  PASS  ★ 两态之二成立：标记落了、截断没做（0/6）
+  PASS  注入点已关（二）
+  PASS  恢复动作 = truncated（只补截断）
+  PASS  两水位重新相等（6/6）
+  PASS  ★ 页面确实早已清完（再跑一趟删不动：true|0）
+  PASS  恢复之后数据完好（1500 行）
+========== [10] ★ T7.19：clog 整段删除分支 ==========
+  PASS  截断前该分片有 clog 段文件（1 个）
+  PASS  ★ 整段删除分支：删掉了 ≥1 个整段（实删 1）
+  PASS  段文件确实少了（1 → 0）
+  PASS  截断之后老数据仍可见（免查区语义，1500 行）
+  PASS  sweep 内部诸节结束：心跳已恢复
+========== [11] 表没了但槽位还在：记 gone，不报错 ==========
+  PASS  夹具表 DROP 之后自动启动器仍正常返回（considered=0）
+  PASS  负向:水位不变式 tb <= vx 违反即拒
+  PASS  非法水位被拒后原水位不变
+========== [12] 负向计数守卫 + 节点健康 ==========
+  PASS  负向用例计数守卫（应跑 4 条）
+  PASS  本轮无节点崩溃（signal 11/6 或 PANIC）
+
+========== 结果：PASS=66 FAIL=0 ==========
+T7.17 分片 vacuum 自动启动器：全部通过
+  [复原] GUC 已恢复为套件执行前的值（含 TSO 配置）

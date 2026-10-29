@@ -210,11 +210,13 @@ typedef struct ShardReplayCtx
      * （写水位文件要开事务/取 shmem 锁，worker 不合适）。
      */
     bool               pending_vacuum_wm;
+    uint64             pending_vacuum_plsn;
     TransactionId      pending_trunc_before;
     TransactionId      pending_vacuum_xid;
 
     /* U-P5-1 之二：随 MARKER 捎来的 leader 发号水位（取 max，checkpoint 落盘）*/
     TransactionId      pending_alloc_wm;
+    uint64             pending_alloc_plsn;
 
     /* 建 ctx 时槽位上的 locmap 代次；与槽位不符即须重建（见 ReplayShardSlot）*/
     uint64             locmap_gen;

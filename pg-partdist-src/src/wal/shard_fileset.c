@@ -883,6 +883,15 @@ ShardBaselineEmitEx(Oid shard_oid, int32 target_node)
      * 非打标分片（没有 clog 目录）返回 0 块，行为与从前逐字一致。
      */
     if (ShardClogDirExists(shard_oid))
+    {
+        PartWALCtrlShardXidState xs;
+        memset(&xs, 0, sizeof(xs));
+        xs.alloc_wm = ShardXidAllocWatermark(shard_oid);
+        ShardVacuumGetWatermarks(shard_oid, &xs.trunc_before, &xs.vacuum_xid);
+        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_SHARD_XID_STATE,
+                          (const char *) &xs, sizeof(xs));
+    }
+    if (ShardClogDirExists(shard_oid))
         (void) ShardClogEmitBaseline(shard_oid, ShardXidNextToIssue(shard_oid));
 
     /*

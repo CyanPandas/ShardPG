@@ -86,7 +86,7 @@ shard_vacuum_begin_for(Oid shard, TransactionId trunc_before,
 	TransactionId next_xid;
 
 	/* 一条都不清：InvalidTransactionId / 小于首个可用号，直接返回 */
-	if (!TransactionIdIsValid(trunc_before) || trunc_before <= FIRST_SHARD_XID)
+	if (!TransactionIdIsNormal(trunc_before))
 		return false;
 
 	ShardVacuumGetWatermarks(shard, &cur_tb, &cur_vx);
@@ -95,7 +95,7 @@ shard_vacuum_begin_for(Oid shard, TransactionId trunc_before,
 	 * 截断点不许后退：给一个比现状还小的 trunc_before 是调用者算错了，
 	 * 静默照做会让"判不出来就不动"的分支吞掉本该报错的输入。
 	 */
-	if (TransactionIdIsValid(cur_tb) && trunc_before < cur_tb)
+	if (ShardXidPrecedes(trunc_before, cur_tb))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("分片 %u 的 trunc_before %u 小于当前截断点 %u",
@@ -109,7 +109,7 @@ shard_vacuum_begin_for(Oid shard, TransactionId trunc_before,
 	 * 越界：它只在**已落账**的条目上前进，遇空洞即停。
 	 */
 	next_xid = ShardXidNextToIssue(shard);
-	if (next_xid > 0 && trunc_before > next_xid)
+	if (next_xid > 0 && ShardXidFollows(trunc_before, next_xid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("分片 %u 的 trunc_before %u 超过下一个待发号 %u",
@@ -156,7 +156,7 @@ shard_vacuum_status(Oid shard, TransactionId xid, const char *field,
 {
 	TxnStatus	st = ShardClogReadStatus(shard, xid);
 
-	if (st != TXN_COMMITTED && st != TXN_ABORTED && xid >= cur_tb)
+	if (st != TXN_COMMITTED && st != TXN_ABORTED && !ShardXidPrecedes(xid, cur_tb))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("分片 %u 的 %s %u 在 [%u, %u) 内仍未决（状态 %d）",
@@ -205,7 +205,7 @@ sanitize_plan_for_tuple(Oid shard, HeapTupleHeader tuple,
 						   "出现 multi 说明该路径被绕过。")));
 
 	/* 截断点以上：clog 还查得到，不归本动作管（设计 §6.4 ③） */
-	if (xmax >= trunc_before)
+	if (!ShardXidPrecedes(xmax, trunc_before))
 		return false;
 
 	if (!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
@@ -349,7 +349,7 @@ prune_tuple_is_dead(Oid shard, HeapTupleHeader tuple, ShardVacuumPruneMode mode,
 		if (!TransactionIdIsNormal(xmin))
 			return false;
 		/* 截断点以上：clog 还查得到，本趟不动（设计 §6.4 趟范围） */
-		if (xmin >= trunc_before)
+		if (!ShardXidPrecedes(xmin, trunc_before))
 			return false;
 
 		return shard_vacuum_status(shard, xmin, "xmin",
@@ -374,7 +374,7 @@ prune_tuple_is_dead(Oid shard, HeapTupleHeader tuple, ShardVacuumPruneMode mode,
 		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 			return false;
 
-		if (xmax >= trunc_before)
+		if (!ShardXidPrecedes(xmax, trunc_before))
 			return false;
 
 		if (shard_vacuum_status(shard, xmax, "xmax",
@@ -601,7 +601,7 @@ typedef enum ShardVacuumFaultPoint
 {
 	SV_FAULT_OFF = 0,
 	SV_FAULT_MID_PRUNE,			/* 页面循环跑到第 2 页时中止（两态之一） */
-	SV_FAULT_AFTER_MARK			/* 落完"趟完"标记、截断之前中止（两态之二） */
+	SV_FAULT_AFTER_MARK,			/* 落完"趟完"标记、截断之前中止（两态之二） */
 } ShardVacuumFaultPoint;
 
 int			shard_vacuum_fault_point = SV_FAULT_OFF;
@@ -610,6 +610,8 @@ const struct config_enum_entry shard_vacuum_fault_options[] = {
 	{"off", SV_FAULT_OFF, false},
 	{"mid_prune", SV_FAULT_MID_PRUNE, false},
 	{"after_mark", SV_FAULT_AFTER_MARK, false},
+    {"before_reserve", 3, false},
+    {"after_reclaim_publish", 4, false},
 	{NULL, 0, false}
 };
 
@@ -980,9 +982,9 @@ shard_vacuum_freeze_pass(Relation rel, Oid shard, TransactionId cur_tb,
 				continue;
 			tuple = (HeapTupleHeader) PageGetItem(page, item);
 			xmin = HeapTupleHeaderGetXmin(tuple);
-			if (!TransactionIdIsNormal(xmin) || xmin >= trunc_before)
+			if (!TransactionIdIsNormal(xmin) || !ShardXidPrecedes(xmin, trunc_before))
 				continue;
-			if (xmin >= cur_tb &&
+			if (!ShardXidPrecedes(xmin, cur_tb) &&
 				shard_vacuum_status(shard, xmin, "xmin", trunc_before, cur_tb) != TXN_COMMITTED)
 			{
 				/* Unremoved aborted tuples prohibit advancing the watermark. */
@@ -1203,7 +1205,7 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 		TransactionId target = ShardVacuumComputeTarget(shard, cur_tb,
 												 TsoGetGlobalSafeTs(), trunc_before, &reason);
 
-		if (!TransactionIdIsValid(target) || target != trunc_before - 1)
+		if (!TransactionIdIsValid(target) || ShardXidAdvance(target, 1) != trunc_before)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("分片 %u 的清理目标 %u 未通过全局快照安全检查", shard, trunc_before),
@@ -1297,7 +1299,7 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 	 * trunc_before 不许后退已在 shard_vacuum_begin 里拦过。
 	 */
 	ShardVacuumGetWatermarks(shard, &cur_tb, &cur_vx);
-	if (trunc_before > cur_vx)
+	if (ShardXidFollows(trunc_before, cur_vx))
 		ShardVacuumSetWatermarks(shard, cur_tb, trunc_before);
 
 	/*
@@ -1340,8 +1342,15 @@ ShardVacuumRecover(Oid shard)
 
 	ShardVacuumGetWatermarks(shard, &tb, &vx);
 
-	if (!TransactionIdIsValid(vx) || vx <= tb)
-		return SHARD_VACUUM_RECOVER_NOTHING;
+    if (!TransactionIdIsValid(vx) || !ShardXidFollows(vx, tb))
+    {
+        if (TransactionIdIsNormal(tb) && ShardXidReclaimPending(shard))
+        {
+            (void) ShardXidFinishReclaim(shard, tb, vx);
+            return SHARD_VACUUM_RECOVER_TRUNCATE;
+        }
+        return SHARD_VACUUM_RECOVER_NOTHING;
+    }
 
 	ereport(DEBUG1,
 			(errmsg("pg_partdist: 分片 %u 处于「趟完未截断」态（%u < %u），补做截断",
@@ -1357,7 +1366,7 @@ Datum
 partdist_shard_sanitize_xmax(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId trunc_before = ShardXidFromSql(PG_GETARG_INT64(1));
 	Relation	rel;
 	ShardVacuumPageStats st;
 	Datum		values[3];
@@ -1391,7 +1400,7 @@ Datum
 partdist_shard_remove_aborted(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId trunc_before = ShardXidFromSql(PG_GETARG_INT64(1));
 	Relation	rel;
 	ShardVacuumPageStats st;
 	Datum		values[5];
@@ -1426,7 +1435,7 @@ Datum
 partdist_shard_remove_dead(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId trunc_before = ShardXidFromSql(PG_GETARG_INT64(1));
 	Relation	rel;
 	ShardVacuumPageStats st;
 	Datum		values[5];
@@ -1461,7 +1470,7 @@ Datum
 partdist_shard_vacuum_sweep(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId trunc_before = ShardXidFromSql(PG_GETARG_INT64(1));
 	Relation	rel;
 	ShardVacuumPageStats st;
 	int64		san = 0,
@@ -1617,7 +1626,7 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
 			ShardVacuumGetWatermarks(shard, &tb, &vx);
 
 			/* ① 两态恢复：趟完未截断 —— 只补截断 */
-			if (vx > tb)
+			if (ShardXidFollows(vx, tb))
 			{
 				if (ShardVacuumRecover(shard) == SHARD_VACUUM_RECOVER_TRUNCATE)
 				{
@@ -1631,12 +1640,12 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
 				target = ShardVacuumComputeTarget(shard, tb, safe_ts,
 												  ceiling, &reason);
 
-				if (!TransactionIdIsValid(target) || target < tb)
+				if (!TransactionIdIsValid(target) || ShardXidPrecedes(target, tb))
 					appendStringInfo(&detail, "%s%u:%s", i ? " " : "", shard,
 									 reason ? reason : "no-target");
 				else
 				{
-					TransactionId newtb = target + 1;
+					TransactionId newtb = ShardXidAdvance(target, 1);
 					Relation	rel;
 					ShardVacuumPageStats st;
 					int64		san = 0,

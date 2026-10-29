@@ -1,0 +1,84 @@
+{
+  "base_commit": "f74df49",
+  "date_utc": "2026-10-29",
+  "server": "10.77.110.147",
+  "container": "yyt-vacu-container",
+  "transaction_id_bits": 32,
+  "transaction_epochs": false,
+  "clog_index_bits": 32,
+  "build_input_sha256": "6f3ff70bec10fa2c04ff354248151688fd853954197a04f59ab5f3d05d234350",
+  "build_root": "/home/yyt/vacu32-build-20261029T123154Z",
+  "focused_root": "/home/yyt/vacu32-test-20261029T124337Z",
+  "historical_root": "/home/yyt/vacu32-regress-20261029T130508Z",
+  "replica_root": "/home/yyt/vacu32-regress-20261029T131330Z",
+  "tests": {
+    "production_contracts": {
+      "passed": 9,
+      "skipped": 1
+    },
+    "ring8_contracts": {
+      "passed": 10,
+      "transactions": 600,
+      "reused_raw_xids": 347
+    },
+    "production_p5": {
+      "passed": 182,
+      "failed": 0
+    },
+    "production_p7": {
+      "passed": 66,
+      "failed": 0
+    },
+    "production_replay": {
+      "passed": 67,
+      "failed": 0
+    },
+    "ring8_replay": {
+      "passed": 282,
+      "failed": 0,
+      "rounds": 200,
+      "workload_transactions": 600,
+      "minimum_wraps": 2
+    }
+  },
+  "unexpected_crashes": 0,
+  "replica_topology": "1 coordinator + 3 workers, leader plus two data followers",
+  "original_9_node_lab_replaced": false,
+  "production_deployment_performed": false,
+  "source_files": {
+    "pg-partdist-src/Makefile": "6b490f5f5823ebf95c06c4b5c50dc69605e12d2116e18dd7fa7da6f5b0bae45a",
+    "pg-partdist-src/docs/XID_WRAP32_IMPLEMENTATION.md": "9c652122b986f69e4e0b20427e6afbdf1122e4559aa651dce71dc287472e622f",
+    "pg-partdist-src/include/dtx_pending.h": "5554056b90d677c76d7bb30e27c86d95de63bc7c6f63a66b5dd652e1a83e0ae3",
+    "pg-partdist-src/include/partition_wal_header.h": "61c0842b3fbf75a93f1468c9987ece01fe2e75bd4bdce29be4a1d8bbc7590161",
+    "pg-partdist-src/include/shard_clog.h": "2a13fad87c0eedfe476a019385e6cb2cf13c49712688ba420af87b062d627a68",
+    "pg-partdist-src/include/shard_replay.h": "2a084ad9638e931bf546d1ee5e2eeccb884b72d3bd07de45c22ae37862befc40",
+    "pg-partdist-src/include/shard_visibility.h": "44ff6936f175c11b33699d779e281089ceb284ef39257a3c53735e01899e59bf",
+    "pg-partdist-src/include/shard_xid.h": "c14aedf8a218881ffb6a067c7a0cd96de025edeee7f870c7652c0cef123d37bf",
+    "pg-partdist-src/include/shard_xid_math.h": "ff3e8c33d455e35b582af6d386d3aa6c2789a3ac8c6b7733142757253fcb1947",
+    "pg-partdist-src/src/dtx_pending.c": "73702ae3a97cfc3a19377003956932d4c94576a9f1d60f0ca912a8c66e865201",
+    "pg-partdist-src/src/raft_boundary.c": "7c64da43b970a5ca98bb4dd5ab0db1fd184cafc71a0f8f321e7911a26cbfd1ff",
+    "pg-partdist-src/src/replay/replay_worker.c": "c7ae817a48c0392f2a508688a17dfb30da6a95013811879fe34d64ca07921b96",
+    "pg-partdist-src/src/replay/shard_replay.c": "ecaf8993cb4dffa630aaec7f708abe3dadf73e97a3058189c5211ccf1ffbddc9",
+    "pg-partdist-src/src/shard_clog.c": "afa261a6b3d1e2169465dc7daf15e90cb986218932724f4055f08f80a5f070db",
+    "pg-partdist-src/src/shard_vacuum.c": "91aadc630863b4ba81feb6a16939e481daac03f37e10fba3588fd5b46bb9fef2",
+    "pg-partdist-src/src/shard_visibility.c": "f6344200bc079e4d860ec3c8847a8f30424881cc72518b2e0a9578de5be84e6b",
+    "pg-partdist-src/src/shard_xid.c": "954906a8beee3649646ba0d635efd953165469c5dda7e55784c22ad7decbcd5b",
+    "pg-partdist-src/src/wal/shard_fileset.c": "37b2ba0215653bf90faf104ae65a137b51f88b0c44cb0ba2f1120e2aeb63c745",
+    "pg-partdist-src/tests/local/test_shard_xid_math.c": "a6484054b31d351d8edd6430040c5f748a5ca5dd54b8c533feb2102e2fc956d7",
+    "pg-partdist-src/tests/local/test_xid_wrap_contract.py": "26ce763b8194c39c041c26ace390dd6e98fccccad6a0ed1377b0f355f33fbd66",
+    "pg-partdist-src/tests/test_shard_vacuum_auto_p7.sh": "db3442037df4965f6cd32edc8bee728834c719f1c678fd97900a76ac9e719d8a",
+    "pg-partdist-src/tests/test_shard_vacuum_p5.sh": "bf0c0e770cf2718a1075e90d8bb5bba131f97d0967196d756fcbac09f54da21d",
+    "pg-partdist-src/tests/test_shard_vacuum_replay_p5.sh": "c0eac750d3c07a3006f367adb311dfb4fe9b81efeea9c7496e6511b60ff0c3a2"
+  },
+  "evidence_sha256": {
+    "build-147-20261029T123154Z.log": "4f68454a9e88166d04675c2f42590356900f128bc675bb0e852c38986e01f72a",
+    "production-contracts.log": "49471c7ce51caaed841d4df175b1108497b93c4357b4ba480e23d054f4d60e60",
+    "production-p5.log": "3d83448f8d4511ed772580a1c6a4750491b84c73e05549cea9ec24dc0bf3f5ad",
+    "production-p7.log": "a85c500d5b3e028c45df5c47d5e59f7e8a9c2b6aecda4327387523a3c540864b",
+    "production-replay.log": "967ad2b0101cf8dcb8ae5f35de15468aa8f53e1b6d5e6f554bc3488a6210e48f",
+    "production-wrap.log": "ec648c6f10830bf4341873c32b42f4bc442207f731f7ed2675f3e9f7fc64c220",
+    "ring8-contracts.log": "c50a5fca48f2e0f90e5656007c453a23b5817b8e16255cf70edfb7055ae4b5d9",
+    "ring8-replay.log": "4cd457317279b2a406c698dce17257a99d7145941ffa4c69a49496864d948684",
+    "ring8-wrap.log": "87df384c69c6a7c4f7969cbddd5824c2e503a15f210605a40b40dac7d9728c7f"
+  }
+}

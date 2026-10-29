@@ -1,0 +1,17 @@
+test_10_cross_real_boundary_and_crash (__main__.XidWrapContract) ... ok
+test_20_repeated_reuse_with_toast_and_long_lived_connection (__main__.XidWrapContract) ... wrap progress: 100/600 transactions, 0 repeated raw XIDs
+wrap progress: 200/600 transactions, 0 repeated raw XIDs
+wrap progress: 300/600 transactions, 62 repeated raw XIDs
+wrap progress: 400/600 transactions, 153 repeated raw XIDs
+wrap progress: 500/600 transactions, 247 repeated raw XIDs
+wrap progress: 600/600 transactions, 347 repeated raw XIDs
+ok
+test_30_old_snapshot_blocks_reclaim_and_stop_is_shard_local (__main__.XidWrapContract) ... ok
+test_35_cleared_reuse_batch_crash_before_authorization (__main__.XidWrapContract) ... ok
+test_40_reclaim_publish_crash_completes_clear (__main__.XidWrapContract) ... ok
+test_50_native_prepared_blocks_even_after_terminal_decision (__main__.XidWrapContract) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 164.893s
+
+OK

@@ -55,7 +55,8 @@
 #include "partwal_sync.h"		/* PartWALCtl：truncate 与追加者互斥 */
 #include "dtx_record.h"			/* DTX-2PC 记录载荷（DTX_2PC_DESIGN.md §5） */
 #include "shard_clog.h"			/* P7-N12：升主节点把 in-doubt 决议落进分片 clog */
-#include "shard_xid.h"			/* P7-N18：follower append 时提前接住发号水位 */
+#include "shard_xid.h"
+#include "shard_visibility.h"			/* P7-N18：follower append 时提前接住发号水位 */
 #include "shard_fileset.h"	/* 批次 #10：PartDistRoutePromote */
 #include "shard_replay.h"		/* 批次 #7：角色交接改副本身份/armed */
 #include "global_mvcc.h"		/* MakeGlobalXid / PartDistLocalNodeId */
@@ -384,53 +385,67 @@ Datum
 pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 {
 	Oid				partition_id = PG_GETARG_OID(0);
-	TransactionId	sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId	sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 	GlobalTransactionId hdr_gxid = (GlobalTransactionId) PG_GETARG_INT64(2);
 	bool			committed = PG_GETARG_BOOL(3);
 	int64			cts = PG_GETARG_INT64(4);
 	ShardClogSlot	slot;
 	int64			sts = 0;
-	char		   *payload = NULL;
+	char *volatile	payload = NULL;
 	uint32			payload_len = 0;
-	bool			ok = false;
+	volatile bool	ok = false;
 	int				touched_before;
 	volatile int	prev_no_diverge = -1;
 
 	if (!OidIsValid(partition_id) || !TransactionIdIsNormal(sxid))
 		PG_RETURN_BOOL(false);
 
-	if (ShardClogReadSlot(partition_id, sxid, &slot))
-		sts = (int64) slot.start_ts;
-	ShardClogSetVerdict(partition_id, sxid, committed, committed ? cts : 0);
-	touched_before = PartWALTouchedCount();
-
+	if (!ShardXidDecisionBegin(partition_id, sxid, hdr_gxid))
+		PG_RETURN_BOOL(false);
 	PG_TRY();
 	{
-		payload = PartWALBuildVerdictMarker(sts, committed ? cts : 0, &payload_len);
-		PartWALAppendMarkerForShardXid(partition_id, GxidLocalXid(hdr_gxid),
-									   committed ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT,
-									   payload, payload_len, sxid);
-		PartWALNoteTouchedPartition(partition_id);
-		/* P7-N97：判决标记复制失败不打分叉标记（没有物理改动） */
-		prev_no_diverge = PartWALSetNoDivergeFrom(touched_before);
-		PartWALFlush(InvalidXLogRecPtr, false);
-		PartWALSetNoDivergeFrom(prev_no_diverge);
-		ok = true;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *ed;
+		if (ShardXidDecisionWrite(partition_id, sxid, hdr_gxid,
+								  committed, committed ? cts : 0))
+		{
+			ShardClogReadSlot(partition_id, sxid, &slot);
+			sts = (int64) slot.start_ts;
+			touched_before = PartWALTouchedCount();
 
-		PartWALSetNoDivergeFrom(prev_no_diverge);
-		MemoryContextSwitchTo(TopMemoryContext);
-		ed = CopyErrorData();
-		FlushErrorState();
-		PartWALTouchedTruncate(touched_before);    /* P7-N51：别让调用方的提交点再复制它 */
-		ereport(WARNING,
-				(errmsg("pg_partdist: 升主闭合 in-doubt：分片 %u xid %u 判决已落本地 clog，"
-						"但判决标记未能复制给副本：%s",
-						partition_id, sxid, ed->message)));
-		FreeErrorData(ed);
+			PG_TRY(_verdict);
+			{
+				payload = PartWALBuildVerdictMarker(sts, committed ? cts : 0,
+												  &payload_len);
+				PartWALAppendMarkerForShardXid(partition_id, GxidLocalXid(hdr_gxid),
+								committed ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT,
+								payload, payload_len, sxid);
+				PartWALNoteTouchedPartition(partition_id);
+				/* P7-N97：判决标记复制失败不打分叉标记（没有物理改动） */
+				prev_no_diverge = PartWALSetNoDivergeFrom(touched_before);
+				PartWALFlush(InvalidXLogRecPtr, false);
+				PartWALSetNoDivergeFrom(prev_no_diverge);
+				ok = true;
+			}
+			PG_CATCH(_verdict);
+			{
+				ErrorData  *ed;
+
+				PartWALSetNoDivergeFrom(prev_no_diverge);
+				MemoryContextSwitchTo(TopMemoryContext);
+				ed = CopyErrorData();
+				FlushErrorState();
+				PartWALTouchedTruncate(touched_before); /* P7-N51 */
+				ereport(WARNING,
+						(errmsg("pg_partdist: 升主闭合 in-doubt：分片 %u xid %u 判决已落本地 clog，"
+								"但判决标记未能复制给副本：%s",
+								partition_id, sxid, ed->message)));
+				FreeErrorData(ed);
+			}
+			PG_END_TRY(_verdict);
+		}
+	}
+	PG_FINALLY();
+	{
+		ShardCommitDecisionUnpin(partition_id, sxid);
 	}
 	PG_END_TRY();
 	if (payload != NULL)
@@ -1017,7 +1032,7 @@ pg_partdist_shard_absorb_tail_xids(PG_FUNCTION_ARGS)
 				if ((m->flags & PARTWAL_MARKER_HAS_ALLOC_WM) != 0)
 					cand = (TransactionId) *TxnMarkerAllocWmPtr(m);        /* 已是 next_xid */
 				else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
-					cand = (TransactionId) (*TxnMarkerShardXidPtr(m) + 1);
+					cand = ShardXidAdvance(*TxnMarkerShardXidPtr(m), 1);
 			}
 		}
 		else if (data != NULL &&
@@ -1040,7 +1055,7 @@ pg_partdist_shard_absorb_tail_xids(PG_FUNCTION_ARGS)
 					TransactionId sx = ShardDataRecordShardXid(partition_id, xrec, dec);
 
 					if (TransactionIdIsNormal(sx))
-						cand = sx + 1;         /* 水位 = 已发号 + 1 */
+						cand = ShardXidAdvance(sx, 1);         /* 水位 = 已发号 + 1 */
 				}
 				pfree(dec);
 			}
@@ -1050,7 +1065,7 @@ pg_partdist_shard_absorb_tail_xids(PG_FUNCTION_ARGS)
 			pfree(data);
 
 		if (TransactionIdIsNormal(cand) &&
-			(!TransactionIdIsValid(max_next) || cand > max_next))
+			(!TransactionIdIsValid(max_next) || ShardXidFollows(cand, max_next)))
 		{
 			max_next = cand;
 			n++;
@@ -1293,14 +1308,14 @@ follower_append_impl(FunctionCallInfo fcinfo, bool fresh_append)
 						TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
 
 						if (TransactionIdIsNormal(wm))
-							ShardXidRaiseAllocWatermark(partition_id, wm);
+							ShardXidReplayAlloc(partition_id, wm, (uint64) partition_lsn);
 					}
 					else if ((m->flags & PARTWAL_MARKER_HAS_SHARD_XID) != 0)
 					{
 						TransactionId sx = (TransactionId) *TxnMarkerShardXidPtr(m);
 
 						if (TransactionIdIsNormal(sx))
-							ShardXidRaiseAllocWatermark(partition_id, sx + 1);
+							ShardXidReplayAlloc(partition_id, ShardXidAdvance(sx, 1), (uint64) partition_lsn);
 					}
 				}
 			}

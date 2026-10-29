@@ -9,6 +9,7 @@
 
 #include "dtx_pending.h"
 #include "shard_clog.h"
+#include "shard_xid.h"
 #include "gxid.h"					/* T7.1：从 gxid 还原本地 xid */
 #include "partwal_sync.h"			/* T7.1：判决标记补发 */
 #include "partition_wal_header.h"	/* T7.1：XLOG_XACT_* / MARKER 载荷 */
@@ -399,16 +400,20 @@ DtxPendingFinalized(int64 gxid)
 
 	if (gxid == 0 || PendingCtl == NULL)
 		return;
-	SpinLockAcquire(&PendingCtl->mutex);
-	have = (pending_find_locked(gxid) != NULL);
-	pending_remove_locked(gxid);
-	SpinLockRelease(&PendingCtl->mutex);
-	if (have)
-	{
-		memset(&ent, 0, sizeof(ent));
-		ent.gxid = gxid;
-		dtx_jrnl_append(DTX_JRNL_CLOSE, &ent, false);	/* 丢了只多一次幂等重扫 */
-	}
+    SpinLockAcquire(&PendingCtl->mutex);
+    have = (pending_find_locked(gxid) != NULL);
+    SpinLockRelease(&PendingCtl->mutex);
+    if (have)
+    {
+        memset(&ent, 0, sizeof(ent));
+        ent.gxid = gxid;
+        /* Do not let a closed registration reappear after its 32-bit numbers
+         * have been recycled. Durable CLOSE must precede releasing the pin. */
+        dtx_jrnl_append(DTX_JRNL_CLOSE, &ent, true);
+        SpinLockAcquire(&PendingCtl->mutex);
+        pending_remove_locked(gxid);
+        SpinLockRelease(&PendingCtl->mutex);
+    }
 }
 
 bool
@@ -893,16 +898,40 @@ DtxRecentVerdict(int64 gxid, int64 *cts_out)
 	return verdict;
 }
 
+bool
+DtxPendingReferences(Oid shard, TransactionId sxid)
+{
+    int i, j;
+    bool found = false;
+    if (!PendingCtl) return false;
+    SpinLockAcquire(&PendingCtl->mutex);
+    for (i = 0; i < DTX_PENDING_MAX && !found; i++)
+        if (PendingCtl->e[i].gxid)
+            for (j = 0; j < PendingCtl->e[i].nxids; j++)
+                if (PendingCtl->e[i].pairs[2*j] == shard &&
+                    PendingCtl->e[i].pairs[2*j+1] == sxid)
+                { found = true; break; }
+    SpinLockRelease(&PendingCtl->mutex);
+    return found;
+}
+
 static bool
 dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 {
 	int			i;
 	int			nbad = 0;
 
+    for (i = 0; i < ent->nxids; i++)
+    {
+        ShardClogSlot slot;
+        if (!ShardClogReadSlot(ent->pairs[2*i], ent->pairs[2*i+1], &slot) ||
+            slot.global_xid != (uint64) ent->gxid)
+            return false;
+    }
 	for (i = 0; i < ent->nxids; i++)
-		ShardClogSetVerdict((Oid) ent->pairs[2 * i],
-							(TransactionId) ent->pairs[2 * i + 1],
-							verdict == 1, verdict == 1 ? cts : 0);
+        if (!ShardXidDecisionWrite(ent->pairs[2*i], ent->pairs[2*i+1],
+                                   (uint64) ent->gxid, verdict == 1, verdict == 1 ? cts : 0))
+            return false;
 	dtx_recent_remember(ent->gxid, verdict, cts);	/* P7-N86 */
 
 	/* P7-N86 诊断：落完立刻回读，槽位没变成终局就说出来 */

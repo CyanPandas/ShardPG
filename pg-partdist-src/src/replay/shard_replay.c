@@ -809,12 +809,14 @@ ShardDataRecordShardXid(Oid shard_oid, const XLogRecord *record,
 
 /* redo 侧的薄封装：提取分片 xid，喂进影子发号水位。 */
 static void
-ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const XLogRecord *record,
+ShardReplayNoteDataShardXid(ShardReplayCtx *ctx, const PartWALRecord *hdr,
+                            const XLogRecord *record,
                             const DecodedXLogRecord *decoded)
 {
     TransactionId sxid = ShardDataRecordShardXid(ctx->shard_oid, record, decoded);
 
-    if (TransactionIdIsNormal(sxid))
+    if (TransactionIdIsNormal(sxid) &&
+        ShardXidStreamIsNew(ctx->shard_oid, hdr->partition_lsn, false))
     {
         ShardXidRedoAdvance(ctx->shard_oid, sxid);
         REPLAY_TRACE("TRACE xid: shard %u DATA 记录带分片 xid %u，影子水位推进",
@@ -884,7 +886,7 @@ ApplyDataRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
      * 影子只记"见过的最大分片 xid + 1"，升主时与 MARKER 交接来的值取 Max
      * （ShardXidClaimOnPromote），两者合起来覆盖一切入过流的号。
      */
-    ShardReplayNoteDataShardXid(ctx, record, decoded);
+    ShardReplayNoteDataShardXid(ctx, hdr, record, decoded);
 
     /* 2) 文件号重映射：leader → 本地（唯一改写点） */
     for (id = 0; id <= decoded->max_block_id; id++)
@@ -1409,8 +1411,8 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
     {
         TransactionId wm = (TransactionId) *TxnMarkerAllocWmPtr(m);
 
-        if (wm > ctx->pending_alloc_wm)
-            ctx->pending_alloc_wm = wm;
+        ctx->pending_alloc_wm = wm;
+        ctx->pending_alloc_plsn = hdr->partition_lsn;
     }
 
     origin   = GxidNodeId(gxid);
@@ -1471,7 +1473,8 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
      * **注意这只是本次启动内的内存影子**，跨重启的持久交接仍是缺口
      * （见 DEV PLAN U-P5-1 记要"未做的一半"）。
      */
-    if (TransactionIdIsNormal(sxid))
+    if (TransactionIdIsNormal(sxid) &&
+        ShardXidStreamIsNew(ctx->shard_oid, hdr->partition_lsn, false))
     {
         ShardXidRedoAdvance(ctx->shard_oid, sxid);
 
@@ -1503,6 +1506,8 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
                                      ? (int64) m->start_ts : 0,
                                  (int64) gxid);
 
+        ShardClogSetRedoFenceRange(ctx->shard_oid, sxid, ShardXidAdvance(sxid, 1), GetXLogInsertRecPtr());
+        ShardXidStreamApplied(ctx->shard_oid, hdr->partition_lsn, false);
         REPLAY_TRACE("TRACE marker: shard clog 落账 shard=%u sxid=%u op=0x%02X",
                      ctx->shard_oid, sxid, op);
     }
@@ -1800,13 +1805,14 @@ ApplyFreezeRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
         ctx->pending_freeze_n = (int) upd->nrels;
     }
 
-    if (has_wm)
+    if (has_wm && ShardXidStreamIsNew(ctx->shard_oid, hdr->partition_lsn, true))
     {
         const PartWALFreezeVacuumWm *wm = PartWALCtrlFreezeVacuumWm(upd);
 
         ctx->pending_trunc_before = (TransactionId) wm->clog_truncate_before;
         ctx->pending_vacuum_xid   = (TransactionId) wm->shard_vacuum_xid;
         ctx->pending_vacuum_wm    = true;
+        ctx->pending_vacuum_plsn = hdr->partition_lsn;
 
         REPLAY_TRACE("TRACE freeze: shard %u 收到 vacuum 水位 %u/%u",
                      ctx->shard_oid,
@@ -1924,6 +1930,19 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                         (unsigned long long) hdr->partition_lsn,
                         hdr->version, hdr->rmid)));
 
+    if (hdr->info == PARTWAL_CTRL_SHARD_XID_STATE)
+    {
+        const PartWALCtrlShardXidState *xs = (const PartWALCtrlShardXidState *) body;
+        if (hdr->data_len != sizeof(*xs) || xs->reserved != 0)
+            ereport(ERROR, (errmsg("invalid baseline shard xid state")));
+        /* Flush baseline pages before replacing clog. Checkpoint again after
+         * this record and before applying any following clog chunks. */
+        ShardReplayDoCheckpoint(ctx);
+        ShardXidInstallBaseline(ctx->shard_oid, xs->alloc_wm,
+                                xs->trunc_before, xs->vacuum_xid, hdr->partition_lsn);
+        return true;
+    }
+
     if (hdr->info == PARTWAL_CTRL_FREEZE_UPDATE)
         return ApplyFreezeRecord(ctx, hdr, body);
 
@@ -1944,10 +1963,13 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
                             (unsigned long long) hdr->partition_lsn,
                             hdr->data_len, cc->nslots)));
 
+        if (!ShardXidStreamIsNew(ctx->shard_oid, hdr->partition_lsn, false))
+            return true;
         ShardClogApplyBaselineChunk(ctx->shard_oid,
                                     (TransactionId) cc->first_sxid,
                                     PartWALCtrlShardClogSlots(cc),
                                     cc->nslots);
+        ShardXidStreamApplied(ctx->shard_oid, hdr->partition_lsn, false);
         REPLAY_TRACE("TRACE ctrl: shard clog 落账 first=%u n=%u",
                      cc->first_sxid, cc->nslots);
         return true;            /* 落账完成，游标照常推进 */
@@ -2428,7 +2450,7 @@ ShardReplayPublishPendingFreeze(ShardReplayCtx *ctx)
             s->vacuum_xid          = ctx->pending_vacuum_xid;
             s->vacuum_wm_valid     = true;
         }
-        if (ctx->pending_alloc_wm > s->alloc_wm)
+        if (ctx->pending_alloc_wm != 0)
             s->alloc_wm = ctx->pending_alloc_wm;
         break;
     }
@@ -2522,10 +2544,13 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
      * These functions use files/shmem only; the worker needs no catalog access.
      */
     if (ctx->pending_alloc_wm != 0)
-        ShardXidRaiseAllocWatermark(ctx->shard_oid, ctx->pending_alloc_wm);
+        ShardXidReplayAlloc(ctx->shard_oid, ctx->pending_alloc_wm, ctx->pending_alloc_plsn);
     if (ctx->pending_vacuum_wm)
+    {
         ShardVacuumReplayWatermarks(ctx->shard_oid, ctx->pending_trunc_before,
                                    ctx->pending_vacuum_xid);
+        ShardXidStreamApplied(ctx->shard_oid, ctx->pending_vacuum_plsn, true);
+    }
 
     /* Catalog freeze metadata remains deferred to a database backend. */
     ShardReplayPublishPendingFreeze(ctx);
@@ -2797,7 +2822,9 @@ ShardReplayRun(ShardReplayCtx *ctx, uint64 bound)
         ctx->records_since_ckpt++;
         pos++;
 
-        if (ctx->records_since_ckpt >= (uint64) replay_checkpoint_records)
+        /* Reclaim must complete before any later record reuses a raw XID. */
+        if ((PartWALRecordIsCtrl(&ent->hdr) && ent->hdr.info == PARTWAL_CTRL_SHARD_XID_STATE) ||
+            ctx->pending_vacuum_wm || ctx->records_since_ckpt >= (uint64) replay_checkpoint_records)
             ShardReplayDoCheckpoint(ctx);
     }
 

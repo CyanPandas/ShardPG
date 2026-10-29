@@ -2,6 +2,7 @@
 #define SHARD_XID_H
 
 #include "pg_partdist.h"
+#include "shard_xid_math.h"
 #include "nodes/nodes.h"
 #include "access/xlogdefs.h"
 #include "utils/rel.h"
@@ -21,11 +22,21 @@
  * （access/shard_stamp.h）：assign=false 只判定、assign=true 领号。
  */
 
+/* SQL bigint is a transport for an unsigned 32-bit value, never an extended XID. */
+static inline TransactionId
+ShardXidFromSql(int64 value)
+{
+    if (value < 0 || (uint64) value > SHARD_XID_MASK)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                       errmsg("shard xid is outside the 32-bit ring")));
+    return (TransactionId) value;
+}
+
 /* 分片 xid 起点：0=Invalid、1=Bootstrap、2=Frozen 语义保留（设计 §5.1） */
 #define FIRST_SHARD_XID			((TransactionId) 3)
 
 /* 每次水位推进的批量（一次 fsync 覆盖 4096 个号，崩溃至多跳这么多） */
-#define SHARD_XID_BATCH			4096
+#define SHARD_XID_BATCH ((SHARD_XID_TEST_BITS == 32) ? 4096 : 8)
 
 /* 共享内存固定槽位数（P1 够用；P2 换 DSA/dshash，见 DEV PLAN T1.2） */
 /*
@@ -137,5 +148,19 @@ extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 /* Replay may repeat an older durable prefix after a crash; never regress it. */
 extern void ShardVacuumReplayWatermarks(Oid shard, TransactionId trunc_before,
                                       TransactionId vacuum_xid);
+
+/* Durable log ordering only; these LSNs are never transaction identifiers. */
+extern bool ShardXidDecisionBegin(Oid shard, TransactionId sxid, uint64 gxid);
+extern bool ShardXidDecisionWrite(Oid shard, TransactionId sxid, uint64 gxid,
+                                 bool committed, int64 cts);
+extern bool ShardXidNativeRedoAllowed(Oid shard, TransactionId sxid,
+                                     XLogRecPtr record_lsn);
+extern bool ShardXidStreamIsNew(Oid shard, uint64 plsn, bool reclamation);
+extern void ShardXidStreamApplied(Oid shard, uint64 plsn, bool reclamation);
+extern void ShardXidReplayAlloc(Oid shard, TransactionId wm, uint64 plsn);
+extern void ShardXidInstallBaseline(Oid shard, TransactionId alloc, TransactionId tb,
+                                    TransactionId vx, uint64 plsn);
+extern bool ShardXidReclaimPending(Oid shard);
+extern int ShardXidFinishReclaim(Oid shard, TransactionId tb, TransactionId vx);
 
 #endif							/* SHARD_XID_H */

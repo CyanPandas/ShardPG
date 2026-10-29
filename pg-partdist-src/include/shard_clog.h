@@ -43,6 +43,7 @@
 #define SHARD_CLOG_H
 
 #include "postgres.h"
+#include "access/xlogdefs.h"
 
 #include "enhanced_clog.h"		/* TxnStatus */
 
@@ -93,6 +94,11 @@ extern bool ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
  * 已有终局判决与 PREPARED（P4 in-doubt，不许动）原样保留。每段一次 fsync。
  * 返回改判条数。幂等。
  */
+extern void ShardClogSetRedoFenceRange(Oid shard, TransactionId from,
+                                      TransactionId to, XLogRecPtr lsn);
+extern XLogRecPtr ShardClogGetRedoFence(Oid shard, TransactionId sxid, bool required);
+extern void ShardClogClearAll(Oid shard);
+extern int ShardClogClearRange(Oid shard, TransactionId from, TransactionId to, bool retired);
 extern int ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to);
 
 /*

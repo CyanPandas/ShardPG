@@ -1,0 +1,2 @@
+# Preserve captured command output byte-for-byte, including psql alignment.
+*.log -whitespace

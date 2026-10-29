@@ -856,7 +856,7 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
      */
     if (alloc_wm > 0)
     {
-        ShardXidRaiseAllocWatermark(shard_oid, alloc_wm);
+        /* Allocator state was persisted by the worker before its cursor. */
         ereport(DEBUG1,
                 (errmsg("pg_partdist replay: shard %u 发号水位已落盘（%u）",
                         shard_oid, alloc_wm)));
@@ -864,7 +864,7 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
 
     if (have_wm)
     {
-        ShardVacuumReplayWatermarks(shard_oid, wm_tb, wm_vx);
+        /* Reclamation was completed by the worker in stream order. */
         ereport(DEBUG1,
                 (errmsg("pg_partdist replay: shard %u vacuum 水位已落盘（%u/%u）",
                         shard_oid, wm_tb, wm_vx)));

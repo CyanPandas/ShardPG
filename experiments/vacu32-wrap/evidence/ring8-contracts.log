@@ -1,0 +1,9 @@
+test_frozen_row_ignores_reused_slot_and_still_obeys_delete (__main__.VacuContract) ... ok
+test_manual_cutoff_cannot_override_old_snapshot (__main__.VacuContract) ... ok
+test_sweep_and_recovery_are_idempotent (__main__.VacuContract) ... ok
+test_toast_is_frozen_without_changing_live_value (__main__.VacuContract) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 12.196s
+
+OK

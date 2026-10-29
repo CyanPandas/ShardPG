@@ -125,11 +125,22 @@ for p in $pport $f1 $f2; do
 done
 members="ARRAY[${pnode}, ${f1node}, ${f2node}]"
 PSQL $pport -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" </dev/null >/dev/null
+# Ask the placement node to campaign for this group using ordinary Raft voting.
+# A fixed 20s wait can expire before a private lab's 30s election timer fires.
+PSQL "$pport" -q -c "SELECT partdist.pg_raft_group_campaign(${gid});" </dev/null >/dev/null
+election_ms=$(PSQL "$pport" -Atc 'SHOW pg_raft.election_timeout_ms' </dev/null)
+[[ "$election_ms" =~ ^[0-9]+$ ]] || { echo 'Invalid election timeout' >&2; exit 1; }
+election_wait=$(((2 * election_ms + 999) / 1000 + 30))
 st=""
-for t in $(seq 1 20); do
+for t in $(seq 1 "$election_wait"); do
   st=$(PSQL $pport -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid}" </dev/null 2>/dev/null)
   [[ "$st" == "leader" ]] && break; sleep 1
 done
+if [[ "$st" != leader ]]; then
+  for p in "$pport" "$f1" "$f2"; do
+    PSQL "$p" -c "SELECT * FROM partdist.pg_raft_group_status() WHERE group_id=${gid}" </dev/null || true
+  done
+fi
 check "分区组 ${gid} leader 就位" "$st" "leader"
 for fp in $f1 $f2; do
   PSQL $fp -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" </dev/null >/dev/null
@@ -165,6 +176,7 @@ check "leader 白名单生效" "$guc" "$SOID"
 PDATA=$(PSQL $pport -Atc "SHOW data_directory" </dev/null)
 PSQL $pport -v ON_ERROR_STOP=1 -q <<'SQL'
 SET citus.enable_ddl_propagation TO off;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE OR REPLACE FUNCTION sclog_read(oid, bigint) RETURNS int
   AS '$libdir/pg_partdist','partdist_shard_clog_read' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION sclog_wts(oid, bigint, int, bigint) RETURNS void
@@ -174,6 +186,7 @@ check "leader 测试函数就绪" "$?" "0"
 for fp in $f1 $f2; do
   PSQL $fp -v ON_ERROR_STOP=1 -q <<'SQL'
 SET citus.enable_ddl_propagation TO off;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 CREATE OR REPLACE FUNCTION sclog_read(oid, bigint) RETURNS int
   AS '$libdir/pg_partdist','partdist_shard_clog_read' LANGUAGE C STRICT;
 SQL
@@ -463,6 +476,50 @@ diff_one_follower() {  # <fport> <标签>
 }
 diff_one_follower $f1 "vacuum回放:f1"
 diff_one_follower $f2 "vacuum回放:f2"
+
+if [[ "${VACU_WRAP_REPLAY:-0}" == 1 ]]; then
+  echo '================ [5b] 32 位算法的短环多次回卷 + 两副本回放 ================'
+  [[ "${SHARD_XID_RING_BITS:-32}" == 8 ]] || { echo 'Wrap replay requires the explicitly accelerated build' >&2; exit 1; }
+  previous=$(PSQL "$pport" -Atc "SELECT partdist.shard_xid_next(${SOID}::oid)" </dev/null)
+  wraps=0
+  for round in $(seq 1 200); do
+    raw=$(PSQL "$pport" -Atc "INSERT INTO ${shard_tbl} VALUES($((10000+round)),'wrap') RETURNING xmin::text" </dev/null)
+    [[ "$raw" =~ ^[0-9]+$ && "$raw" -ge 3 && "$raw" -le 255 ]] || exit 1
+    if (( raw < previous )); then wraps=$((wraps+1)); fi
+    previous=$raw
+    PSQL "$pport" -q -c "BEGIN; INSERT INTO ${shard_tbl} VALUES($((20000+round)),'aborted'); ROLLBACK" </dev/null >/dev/null
+    PSQL "$pport" -q -c "DELETE FROM ${shard_tbl} WHERE id=$((10000+round))" </dev/null >/dev/null
+    if (( round % 8 == 0 )); then
+      cutoff=$(PSQL "$pport" -Atc "SELECT partdist.shard_xid_next(${SOID}::oid)" </dev/null)
+      ready=0
+      for poll in $(seq 1 45); do
+        safe=$(PSQL "$COORD" -Atc 'SELECT partdist.partdist_global_safe_ts()' </dev/null)
+        target=$(PSQL "$pport" -Atc "SELECT target_xid FROM partdist.shard_vacuum_target(${SOID}::oid,$safe,$cutoff)" </dev/null)
+        if [[ "$target" =~ ^[0-9]+$ && "$target" -gt 0 ]]; then
+          next_target=$(((target+1)&255))
+          if (( next_target < 3 )); then next_target=3; fi
+          if [[ "$cutoff" == "$next_target" ]]; then ready=1; break; fi
+        fi
+        sleep 1
+      done
+      check "回卷批次 $round：安全前缀就绪" "$ready" 1
+      check "回卷批次 $round：sweep 完成" "$(PSQL "$pport" -Atc "SELECT swept FROM partdist.shard_vacuum_sweep('${shard_tbl}',${cutoff})" </dev/null)" t
+      PSQL "$pport" -q -c "SELECT partdist.shard_clog_truncate(${SOID}::oid,$cutoff)" </dev/null >/dev/null
+      bound=$(PSQL "$pport" -Atc "SELECT partdist.get_partition_flush_lsn(${LEADER_OID})" </dev/null)
+      for fp in "$f1" "$f2"; do
+        caught=$(wait_caught_up "$fp" "$bound" 180)
+        check "回卷批次 $round：follower :$fp 追平" "$([[ "$caught" =~ ^[0-9]+$ && "$caught" -ge "$bound" ]] && echo ok)" ok
+        check "回卷批次 $round：follower :$fp 回收凭据持久" "$(FWM "$fp")" "$cutoff/$cutoff"
+      done
+      check "回卷批次 $round：活行仍为 51" "$(PSQL "$pport" -Atc "SELECT count(*) FROM ${shard_tbl}" </dev/null)" 51
+      check "回卷批次 $round：保留 TOAST 内容不变" "$(PSQL "$pport" -Atc "SELECT md5(string_agg(v,'' ORDER BY id)) FROM ${shard_tbl}" </dev/null)" "$md5_before"
+    fi
+  done
+  check '至少发生两次真实号码复用（短环加速）' "$((wraps >= 2))" 1
+  PSQL "$pport" -q -c CHECKPOINT </dev/null >/dev/null
+  diff_one_follower "$f1" '重复回卷:f1'
+  diff_one_follower "$f2" '重复回卷:f2'
+fi
 
 echo "================ [6] 清理 + 节点健康 ================"
 for fp in $f1 $f2; do

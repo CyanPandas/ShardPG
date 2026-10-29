@@ -1,0 +1,5 @@
+/work/
+/logs/
+__pycache__/
+!/evidence/
+!/evidence/*.log

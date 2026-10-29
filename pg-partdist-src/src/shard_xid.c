@@ -34,6 +34,7 @@
 #include "nodes/parsenodes.h"
 #include "storage/fd.h"
 #include "utils/syscache.h"		/* P7-N40：孤儿登记 GC 判"表还在不在" */
+#include "port/pg_crc32c.h"
 #include "access/xlog.h"			/* T7.22：GetXLogInsertRecPtr */
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -44,19 +45,12 @@
 #include "storage/bufmgr.h"			/* T7.30：RelationGetNumberOfBlocks */
 #include "utils/builtins.h"			/* T7.30：cstring_to_text */
 
-/*
- * 回卷护栏：P1 不处理 32 位分片 xid 回卷（设计 §7 推 P5），逼近上限直接
- * 拒绝发号，绝不静默绕回 0/1/2 保留区。
- */
-#define SHARD_XID_HARD_LIMIT	((TransactionId) 0xFFFF0000)
-
-/* T5.6：回卷护栏两阶段的阈值（设计 §7），GUC 可调 —— 验收要把它们调小 */
-static int	shard_vacuum_max_age = 200000000;
-bool		shard_vacuum_auto_enabled = true;	/* T7.17：自动启动器开关 */
-static int	shard_xid_stop_age = 2146483648;
-
-/* Both cutoffs must fit strictly inside the unambiguous half-circle. */
-#define SHARD_XID_MAX_STOP_AGE 2146483648
+/* The live 32-bit interval must stay strictly inside half the circle. */
+#define SHARD_XID_MAX_STOP_AGE ((int) (SHARD_XID_HALF - ((SHARD_XID_TEST_BITS == 32) ? 1000000 : 8)))
+#define SHARD_XID_DEFAULT_MAX_AGE ((SHARD_XID_TEST_BITS == 32) ? 200000000 : 24)
+static int shard_vacuum_max_age = SHARD_XID_DEFAULT_MAX_AGE;
+bool shard_vacuum_auto_enabled = true;
+static int shard_xid_stop_age = SHARD_XID_MAX_STOP_AGE;
 
 static bool
 check_shard_vacuum_max_age(int *newval, void **extra, GucSource source)
@@ -98,32 +92,6 @@ static char *shard_relids_string = NULL;		/* GUC 原始串 */
 static ShardRelidsCfg *shard_relids_cfg = NULL; /* 当前生效的解析结果 */
 
 /* ---- T1.2：共享内存发号器 ---- */
-
-/*
- * 水位合理性上限。
- *
- * ★【2026-08-21 T5.6 更正，两处】
- *
- * 其一：**原注释里的举证是错的**。它说"实测 '\\x' 序列被读成 858814556，
- * 正落在该区间之上"—— 而 858814556 < 2^30 = 1073741824，这道守卫**拦不住
- * 它自己引用的那个值**。绝对阈值天生分不清"损坏值 8.6 亿"和"真跑了 8.6 亿
- * 笔事务的分片"，这是它的固有局限，不是参数没调好。
- *
- * 其二：**原来的 2^30 会抢在回卷护栏前面触发**。设计 §7 的阶段 2 停发线是
- * 2^31 − 边距；一个正常运转到那个量级的分片，重启读水位时会先撞上 2^30 的
- * "文件损坏"报错 —— 一条完全误导的错误信息。阈值因此上抬到 2^31，让
- * **T5.6 的分片级停发护栏先说话**（它给的信息才是对的：该分片进只读、
- * 去解决前缀阻挡者）。
- *
- * 保留这道检查的意义收窄为：越过停发线还能读到的水位，要么文件损坏、
- * 要么护栏本身失效 —— 两种都必须 fail-closed。
- *
- * 顺带记下一条**不能加**的检查：`vacuum_xid <= alloc_wm` 看着是个真不变式
- * （不可能清理到从未发出过的号），但 T5.4b-2 起 **follower 侧的水位文件正是
- * alloc_wm=0 而 trunc_before/vacuum_xid 非 0**（水位由 CTRL 复制过来、发号
- * 从未在本节点发生），加上去会把每个 follower 判成损坏。
- */
-#define SHARD_XID_SANITY_MAX	((TransactionId) 0x80000000)
 
 typedef struct ShardXidSlot
 {
@@ -473,183 +441,220 @@ ShardXidLookupByOid(Oid reloid)
 
 /* ================= T1.2 发号器 ================= */
 
-/*
- * 水位文件：$PGDATA/pg_shard_xid/<oid>。
- *
- * 格式演进（每次都保持**向后兼容读**，缺失字段一律取"安全方向"的值）：
- *   T1.2  4 字节： {alloc_wm}
- *   T2.4  8 字节： {alloc_wm, claim_wm}
- *   T5.1 16 字节：{alloc_wm, claim_wm, clog_truncate_before, shard_vacuum_xid}
- * 全部 uint32 小端。
- *
- * 崩溃语义：alloc_wm 是"已授权发放的上界"，重启从它续发 —— 最多跳
- * SHARD_XID_BATCH 个号，绝不重发（DEV PLAN T1.2 的"跳号无害"裁定）；
- * claim_wm 之下的历史号已全部认领过（RUNNING 已改判 ABORTED）。
- *
- * T5.1 两个 vacuum 水位（设计 §6.1）：
- *   clog_truncate_before —— 本分片 clog 实际截断到哪；**隐式 freeze 点**，
- *                           也是回卷龄的基点（设计 §7 明确：基点必须是它而
- *                           不是 shard_vacuum_xid，否则"趟完未截断"崩溃窗口
- *                           里龄会被算小，方向不安全）；
- *   shard_vacuum_xid     —— 两态恢复标记（设计 §6.5）：等于
- *                           clog_truncate_before 表示"无未完成的趟"；大于它
- *                           表示"页面趟已完成、截断尚未做"，重启只补截断。
- * 缺失时两者均取 0 —— 含义是"从未截断、从未 vacuum"，**这是安全方向**：
- * 免查隐式冻结区为空，所有 xid 都要正常查 clog，不会把未决当已提交。
- */
-static void
-shard_xid_read_wm_file(Oid shard, TransactionId *alloc_wm,
-					   TransactionId *claim_wm,
-					   TransactionId *trunc_before,
-					   TransactionId *vacuum_xid)
+/* All transaction positions remain uint32. LSN fields order recovery records,
+ * independently of the recycled transaction numbers. */
+#define SHARD_XID_FILE_MAGIC UINT32_C(0x53583332)
+#define SHARD_XID_FILE_VERSION 1
+
+typedef struct ShardXidDiskState
 {
-	char		path[MAXPGPATH];
-	int			fd;
-	uint32		v[4];
-	int			r;
+    uint32 magic, version;
+    TransactionId alloc, claim, tb, vx, cleaned;
+    uint32 ring_bits;
+    uint64 alloc_plsn, reclaim_plsn, clog_plsn;
+    pg_crc32c crc;
+    uint32 padding;
+ } ShardXidDiskState;
+StaticAssertDecl(sizeof(((ShardXidDiskState *) 0)->alloc) == 4, "allocator xid remains 32-bit");
+StaticAssertDecl(sizeof(((ShardXidDiskState *) 0)->tb) == 4, "reclaim xid remains 32-bit");
 
-	*alloc_wm = 0;
-	*claim_wm = 0;
-	if (trunc_before != NULL)
-		*trunc_before = 0;
-	if (vacuum_xid != NULL)
-		*vacuum_xid = 0;
-
-	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
-	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-	{
-		if (errno == ENOENT)
-			return;				/* 该分片从未发过号 */
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法打开分片 xid 水位文件 \"%s\": %m", path)));
-	}
-
-	r = read(fd, v, sizeof(v));
-	if (r == (int) sizeof(v))
-	{
-		/* T5.1 起的 16 字节完整格式 */
-		*alloc_wm = (TransactionId) v[0];
-		*claim_wm = (TransactionId) v[1];
-		if (trunc_before != NULL)
-			*trunc_before = (TransactionId) v[2];
-		if (vacuum_xid != NULL)
-			*vacuum_xid = (TransactionId) v[3];
-	}
-	else if (r == (int) (2 * sizeof(uint32)))
-	{
-		/* T2.4 的 8 字节格式：两个 vacuum 水位缺席 ⇒ 取 0（从未截断） */
-		*alloc_wm = (TransactionId) v[0];
-		*claim_wm = (TransactionId) v[1];
-	}
-	else if (r == (int) sizeof(uint32))
-	{
-		/* 旧 4 字节格式：认领水位按最低值，触发全量补认领 */
-		*alloc_wm = (TransactionId) v[0];
-		*claim_wm = FIRST_SHARD_XID;
-	}
-	else
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("分片 xid 水位文件 \"%s\" 损坏（读到 %d 字节）",
-						path, r)));
-	if (CloseTransientFile(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法关闭分片 xid 水位文件 \"%s\": %m", path)));
-
-	/*
-	 * ★ T5.1 加固：读回的水位做**合理性校验**，而不是照单全收。
-	 *
-	 * 实测暴露：文件字节损坏时（本轮是人为写坏），损坏值会被当作有效水位
-	 * 直接用于发号 —— 新行的 xmin 直接变成那个垃圾数（实测 858814556）。
-	 * 一旦发出去就污染了该分片的 xid 空间，且无声无息。
-	 *
-	 * 校验依据：分片 xid 是**稠密连续分配**的（设计 §5.2），alloc_wm 只可能
-	 * 由本节点一次次 +SHARD_XID_BATCH 推上去。真实值远小于 2^31；一个落在
-	 * 高位区间的值只可能来自损坏。这里不追求精确边界，只拦"显然不可能"的，
-	 * fail-closed：宁可报错要求人工介入，也不静默发出坏号。
-	 */
-	if (*alloc_wm >= SHARD_XID_SANITY_MAX || *claim_wm >= SHARD_XID_SANITY_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("分片 xid 水位文件 \"%s\" 的水位值不合理"
-						"（alloc_wm=%u claim_wm=%u，上限 %u）",
-						path, *alloc_wm, *claim_wm,
-						(uint32) SHARD_XID_SANITY_MAX),
-				 errdetail("分片 xid 稠密连续分配，正常值远小于该上限；"
-						   "此形态只可能来自文件损坏。"),
-				 errhint("继续使用会把损坏值当分片 xid 发出去，污染该分片的 "
-						 "xid 空间（实测新行 xmin 直接变成垃圾数）。")));
+static void
+shard_xid_validate_positions(const ShardXidDiskState *state)
+{
+    const TransactionId positions[] = {state->alloc, state->claim, state->tb, state->vx, state->cleaned};
+    unsigned i;
+    for (i = 0; i < lengthof(positions); i++)
+        if (positions[i] && (positions[i] < FIRST_SHARD_XID || positions[i] > SHARD_XID_MASK))
+            ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid 32-bit shard xid position %u", positions[i])));
 }
 
 static void
-shard_xid_persist_watermark(Oid shard, TransactionId alloc_wm,
-							TransactionId claim_wm,
-							TransactionId trunc_before,
-							TransactionId vacuum_xid)
+shard_xid_read_state(Oid shard, ShardXidDiskState *state)
 {
-	char		tmppath[MAXPGPATH];
-	char		path[MAXPGPATH];
-	int			fd;
-	uint32		v[4];
+    char path[MAXPGPATH];
+    int fd, n;
+    pg_crc32c crc;
 
-	/*
-	 * T5.1 不变式（设计 §6.5）：clog_truncate_before <= shard_vacuum_xid。
-	 * 破坏它意味着"截断点跑到了 vacuum 进度前面" —— 免查区会覆盖尚未清理
-	 * 垃圾的 xid，中止事务的幽灵行会复活。故在**落盘这唯一出口**上守住，
-	 * 而不是散在各调用点（fail-closed：宁可 ERROR 也不写下坏水位）。
-	 */
-	if (TransactionIdIsValid(trunc_before) && TransactionIdIsValid(vacuum_xid) &&
-		trunc_before > vacuum_xid)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("分片 %u 的 vacuum 水位不变式被破坏："
-						"clog_truncate_before=%u > shard_vacuum_xid=%u",
-						shard, trunc_before, vacuum_xid),
-				 errdetail("截断点不得越过 vacuum 进度，否则免查隐式冻结区会"
-						   "覆盖尚未清理垃圾的 xid（设计 §6.4/§6.5）。")));
+    memset(state, 0, sizeof(*state));
+    snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+    {
+        if (errno == ENOENT)
+            return;
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot open shard xid state %s: %m", path)));
+    }
+    n = read(fd, state, sizeof(*state));
+    if (CloseTransientFile(fd) != 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot close shard xid state %s: %m", path)));
+    if (n == 4 || n == 8 || n == 16)
+    {
+        uint32 legacy[4] = {0, FIRST_SHARD_XID, 0, 0};
+        memcpy(legacy, state, n);
+        memset(state, 0, sizeof(*state));
+        state->alloc = legacy[0]; state->claim = legacy[1];
+        state->tb = legacy[2]; state->vx = legacy[3];
+        state->cleaned = state->tb;
+        shard_xid_validate_positions(state);
+        return;
+    }
+    INIT_CRC32C(crc);
+    COMP_CRC32C(crc, state, offsetof(ShardXidDiskState, crc));
+    FIN_CRC32C(crc);
+    if (n != sizeof(*state) || state->magic != SHARD_XID_FILE_MAGIC ||
+        state->version != SHARD_XID_FILE_VERSION ||
+        state->ring_bits != SHARD_XID_TEST_BITS || !EQ_CRC32C(crc, state->crc))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid shard xid state %s (length/version/ring/checksum)", path)));
+    shard_xid_validate_positions(state);
+}
 
-	v[0] = (uint32) alloc_wm;
-	v[1] = (uint32) claim_wm;
-	v[2] = (uint32) trunc_before;
-	v[3] = (uint32) vacuum_xid;
+static void
+shard_xid_write_state(Oid shard, ShardXidDiskState *state)
+{
+    char path[MAXPGPATH], tmp[MAXPGPATH];
+    int fd;
 
-	if (MakePGDirectory(SHARD_XID_DIR) < 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法创建目录 \"%s\": %m", SHARD_XID_DIR)));
+    shard_xid_validate_positions(state);
+    if (ShardXidFollows(state->tb, state->vx))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("shard %u reclaim frontier %u exceeds completed sweep %u", shard, state->tb, state->vx)));
+    state->magic = SHARD_XID_FILE_MAGIC;
+    state->version = SHARD_XID_FILE_VERSION;
+    state->ring_bits = SHARD_XID_TEST_BITS;
+    state->padding = 0;
+    INIT_CRC32C(state->crc);
+    COMP_CRC32C(state->crc, state, offsetof(ShardXidDiskState, crc));
+    FIN_CRC32C(state->crc);
+    if (MakePGDirectory(SHARD_XID_DIR) < 0 && errno != EEXIST)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot create shard xid directory: %m")));
+    snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
+    snprintf(tmp, sizeof(tmp), SHARD_XID_DIR "/%u.tmp", shard);
+    fd = OpenTransientFile(tmp, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+    if (fd < 0 || write(fd, state, sizeof(*state)) != sizeof(*state) || pg_fsync(fd) != 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot persist shard xid state %s: %m", tmp)));
+    if (CloseTransientFile(fd) != 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot close shard xid state %s: %m", tmp)));
+    durable_rename(tmp, path, ERROR);
+}
 
-	snprintf(tmppath, sizeof(tmppath), SHARD_XID_DIR "/%u.tmp", shard);
-	snprintf(path, sizeof(path), SHARD_XID_DIR "/%u", shard);
+static void
+shard_xid_read_wm_file(Oid shard, TransactionId *alloc, TransactionId *claim,
+                       TransactionId *tb, TransactionId *vx)
+{
+    ShardXidDiskState state;
+    shard_xid_read_state(shard, &state);
+    *alloc = state.alloc; *claim = state.claim;
+    if (tb) *tb = state.tb;
+    if (vx) *vx = state.vx;
+}
 
-	fd = OpenTransientFile(tmppath, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法创建分片 xid 水位文件 \"%s\": %m", tmppath)));
+static void
+shard_xid_persist_watermark(Oid shard, TransactionId alloc, TransactionId claim,
+                            TransactionId tb, TransactionId vx)
+{
+    ShardXidDiskState state;
+    shard_xid_read_state(shard, &state);
+    state.alloc = alloc; state.claim = claim;
+    state.tb = tb; state.vx = vx;
+    shard_xid_write_state(shard, &state);
+}
 
-	errno = 0;
-	if (write(fd, &v, sizeof(v)) != sizeof(v))
-	{
-		if (errno == 0)
-			errno = ENOSPC;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法写分片 xid 水位文件 \"%s\": %m", tmppath)));
-	}
-	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法 fsync 分片 xid 水位文件 \"%s\": %m", tmppath)));
-	if (CloseTransientFile(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("无法关闭分片 xid 水位文件 \"%s\": %m", tmppath)));
+/* This is called under the allocator lock, BEFORE authorization of a reused
+ * batch. Never erase a slot still inside the live interval. */
+static void
+shard_xid_reserve(Oid shard, ShardXidSlot *slot, TransactionId wm)
+{
+    ShardXidDiskState state;
+    if (ShardXidDistance(slot->trunc_before, wm) > (uint32) shard_xid_stop_age)
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("shard %u reservation crosses xid stop age", shard)));
+    shard_xid_read_state(shard, &state);
+    if (state.cleaned != state.tb)
+    {
+        ShardClogClearRange(shard, state.cleaned, state.tb, true);
+        state.cleaned = state.tb;
+    }
+    ShardClogClearRange(shard, slot->watermark, wm, false);
+    if (shard_vacuum_fault_point == 3)
+        ereport(ERROR, (errmsg("shard xid fault: before_reserve")));
+    ShardClogSetRedoFenceRange(shard, slot->watermark, wm, GetXLogInsertRecPtr());
+    state.alloc = wm; state.claim = slot->claim_wm;
+    state.tb = slot->trunc_before; state.vx = slot->vacuum_xid;
+    shard_xid_write_state(shard, &state);
+    slot->watermark = wm;
+}
 
-	/* rename + 目录 fsync 一步到位；失败即 ERROR，槽位状态不推进 */
-	durable_rename(tmppath, path, ERROR);
+/* A delayed DTX decision may refer to a number already recycled. Validate and
+ * pin under the same lock used to authorize recycling, then validate again at
+ * the actual write. No network operation runs while this lock is held. */
+bool
+ShardXidDecisionBegin(Oid shard, TransactionId sxid, uint64 gxid)
+{
+    ShardXidDiskState state;
+    ShardClogSlot slot;
+    bool ok;
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    shard_xid_read_state(shard, &state);
+    ok = ShardXidInRange(sxid, state.tb ? state.tb : FIRST_SHARD_XID, state.alloc) &&
+        ShardClogReadSlot(shard, sxid, &slot) && slot.global_xid == gxid;
+    if (ok) ShardCommitDecisionPin(shard, sxid);
+    LWLockRelease(ShardXidCtl->lock);
+    return ok;
+}
+
+bool
+ShardXidDecisionWrite(Oid shard, TransactionId sxid, uint64 gxid,
+                      bool committed, int64 cts)
+{
+    ShardClogSlot slot;
+    bool ok;
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    ok = ShardClogReadSlot(shard, sxid, &slot) && slot.global_xid == gxid &&
+        (slot.status == TXN_PREPARED ||
+         (slot.status == (committed ? TXN_COMMITTED : TXN_ABORTED) &&
+          slot.commit_ts == (uint64) (committed ? cts : 0)));
+    if (ok) ShardClogSetVerdict(shard, sxid, committed, cts);
+    LWLockRelease(ShardXidCtl->lock);
+    return ok;
+}
+
+bool
+ShardXidNativeRedoAllowed(Oid shard, TransactionId sxid, XLogRecPtr record_lsn)
+{
+    ShardXidDiskState state;
+    XLogRecPtr fence;
+    shard_xid_read_state(shard, &state);
+    if (state.alloc == 0)
+        return true; /* legacy recovery without a state file */
+    if (!ShardXidInRange(sxid, state.tb ? state.tb : FIRST_SHARD_XID, state.alloc))
+        return false;
+    /* A received tail may be several circles ahead of physical apply. It is
+     * not a primary's live interval yet. A missing retired fence there must
+     * never turn an old native record into a verdict for the pending tail. */
+    fence = ShardClogGetRedoFence(shard, sxid,
+                                  state.version != 0 && state.alloc_plsn <= state.clog_plsn);
+    if (state.alloc_plsn > state.clog_plsn && XLogRecPtrIsInvalid(fence))
+        return false;
+    return XLogRecPtrIsInvalid(fence) || record_lsn >= fence;
+}
+
+/* Stream LSNs suppress arbitrarily old retransmissions even after many wraps. */
+bool
+ShardXidStreamIsNew(Oid shard, uint64 plsn, bool reclamation)
+{
+    ShardXidDiskState state;
+    shard_xid_read_state(shard, &state);
+    return plsn > (reclamation ? state.reclaim_plsn : state.clog_plsn);
+}
+
+void
+ShardXidStreamApplied(Oid shard, uint64 plsn, bool reclamation)
+{
+    ShardXidDiskState state;
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    shard_xid_read_state(shard, &state);
+    if (reclamation) state.reclaim_plsn = Max(state.reclaim_plsn, plsn);
+    else state.clog_plsn = Max(state.clog_plsn, plsn);
+    shard_xid_write_state(shard, &state);
+    LWLockRelease(ShardXidCtl->lock);
 }
 
 /* ---- T5.1 SQL 包装：验收观测点 ---- */
@@ -679,8 +684,8 @@ Datum
 partdist_shard_vacuum_set_watermarks(PG_FUNCTION_ARGS)
 {
 	ShardVacuumSetWatermarks(PG_GETARG_OID(0),
-							 (TransactionId) PG_GETARG_INT64(1),
-							 (TransactionId) PG_GETARG_INT64(2));
+							 ShardXidFromSql(PG_GETARG_INT64(1)),
+							 ShardXidFromSql(PG_GETARG_INT64(2)));
 	PG_RETURN_VOID();
 }
 
@@ -792,27 +797,46 @@ ShardXidNextToIssue(Oid shard)
  * ★ 不动 claim_wm / 两个 vacuum 水位 —— 落盘是整文件覆写，它们必须原样带回
  *   （T5.1 记要里那条"任何一次落盘不带上它们就会抹成 0"的教训）。
  */
-void
-ShardXidRaiseAllocWatermark(Oid shard, TransactionId alloc_wm)
+/* Metadata reception must not claim RUNNING slots on a follower. Claim only
+ * after the stream has caught up and the node is authorized to serve writes. */
+static void
+shard_xid_receive_alloc(Oid shard, TransactionId wm, uint64 plsn)
 {
-	ShardXidSlot *slot;
+    ShardXidDiskState state;
+    int i;
+    if (!TransactionIdIsNormal(wm) || wm > SHARD_XID_MASK)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid replicated shard xid watermark %u", wm)));
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    shard_xid_read_state(shard, &state);
+    if ((plsn && plsn <= state.alloc_plsn) ||
+        (!plsn && !ShardXidFollows(wm, state.alloc)))
+    {
+        LWLockRelease(ShardXidCtl->lock);
+        return;
+    }
+    state.alloc = wm;
+    if (plsn) state.alloc_plsn = plsn;
+    shard_xid_write_state(shard, &state);
+    for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+        if (ShardXidCtl->slots[i].shard_relid == shard)
+        {
+            ShardXidCtl->slots[i].watermark = wm;
+            ShardXidCtl->slots[i].next_xid = wm;
+            break;
+        }
+    LWLockRelease(ShardXidCtl->lock);
+}
 
-	if (!TransactionIdIsNormal(alloc_wm) || ShardXidCtl == NULL)
-		return;
+void
+ShardXidRaiseAllocWatermark(Oid shard, TransactionId wm)
+{
+    shard_xid_receive_alloc(shard, wm, 0);
+}
 
-	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
-	slot = shard_xid_slot_attach(shard, NULL);
-
-	if (alloc_wm > slot->watermark)
-	{
-		/* 与 ShardVacuumSetWatermarks 同一条纪律：先落盘、成功了才改槽位 */
-		shard_xid_persist_watermark(shard, alloc_wm, slot->claim_wm,
-									slot->trunc_before, slot->vacuum_xid);
-		slot->watermark = alloc_wm;
-		if (slot->next_xid < alloc_wm)
-			slot->next_xid = alloc_wm;
-	}
-	LWLockRelease(ShardXidCtl->lock);
+void
+ShardXidReplayAlloc(Oid shard, TransactionId wm, uint64 plsn)
+{
+    shard_xid_receive_alloc(shard, wm, plsn);
 }
 
 void
@@ -867,7 +891,7 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 
 	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
 	slot = shard_xid_slot_attach(shard, NULL);
-	if (trunc_before < slot->trunc_before || vacuum_xid < slot->vacuum_xid)
+	if (ShardXidPrecedes(trunc_before, slot->trunc_before) || ShardXidPrecedes(vacuum_xid, slot->vacuum_xid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("分片 %u 的 vacuum 水位不许后退", shard)));
@@ -879,8 +903,14 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 	 * 300/200 这个本该被拒的组合）。ERROR 会中止事务但**不会回滚 shmem**，
 	 * 这类"内存先于持久化"的写法在共享内存上一律是错的。
 	 */
-	shard_xid_persist_watermark(shard, slot->watermark, slot->claim_wm,
-								trunc_before, vacuum_xid);
+    {
+        TransactionId claim = slot->claim_wm;
+        if (trunc_before && claim != slot->watermark &&
+            !ShardXidInRange(claim, trunc_before, slot->watermark))
+            claim = trunc_before;
+        shard_xid_persist_watermark(shard, slot->watermark, claim, trunc_before, vacuum_xid);
+        slot->claim_wm = claim;
+    }
 	slot->trunc_before = trunc_before;
 	slot->vacuum_xid = vacuum_xid;
 	LWLockRelease(ShardXidCtl->lock);
@@ -889,19 +919,86 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 /* Called only after the replica pages are durable. Replayed prefixes are
  * idempotent, including a crash between watermark persistence and checkpoint. */
 void
-ShardVacuumReplayWatermarks(Oid shard, TransactionId trunc_before,
-                           TransactionId vacuum_xid)
+ShardXidInstallBaseline(Oid shard, TransactionId alloc, TransactionId tb,
+                        TransactionId vx, uint64 plsn)
 {
-    TransactionId tb, vx;
+    ShardXidDiskState state;
+    int i;
+    if ((alloc && !TransactionIdIsNormal(alloc)) ||
+        (alloc && ShardXidDistance(tb, alloc) >= SHARD_XID_HALF))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid baseline shard xid interval")));
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    memset(&state, 0, sizeof(state));
+    state.alloc = alloc; state.claim = tb ? tb : FIRST_SHARD_XID;
+    state.tb = tb; state.vx = vx; state.cleaned = tb;
+    state.alloc_plsn = state.reclaim_plsn = state.clog_plsn = plsn;
+    if (ShardCommitHasActiveShard(shard))
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("baseline replacement waits for local shard transactions to close")));
+    if (alloc)
+        ShardClogSetRedoFenceRange(shard, tb ? tb : FIRST_SHARD_XID, alloc, GetXLogInsertRecPtr());
+    ShardClogClearAll(shard);
+    shard_xid_write_state(shard, &state);
+    for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+    {
+        if (ShardXidCtl->slots[i].shard_relid == shard)
+            memset(&ShardXidCtl->slots[i], 0, sizeof(ShardXidSlot));
+        if (ShardXidCtl->shadow[i].shard_relid == shard)
+            memset(&ShardXidCtl->shadow[i], 0, sizeof(ShardXidShadow));
+    }
+    LWLockRelease(ShardXidCtl->lock);
+}
 
-    if (trunc_before > vacuum_xid)
-        ereport(ERROR,
-                (errcode(ERRCODE_DATA_CORRUPTED),
-                 errmsg("分片 %u 的回放回收水位超过页面完成水位", shard)));
-    ShardVacuumGetWatermarks(shard, &tb, &vx);
-    if (trunc_before <= tb && vacuum_xid <= vx)
-        return;
-    ShardVacuumSetWatermarks(shard, Max(tb, trunc_before), Max(vx, vacuum_xid));
+bool
+ShardXidReclaimPending(Oid shard)
+{
+    ShardXidDiskState state;
+    shard_xid_read_state(shard, &state);
+    return state.cleaned != state.tb;
+}
+
+int
+ShardXidFinishReclaim(Oid shard, TransactionId tb, TransactionId vx)
+{
+    ShardXidDiskState state;
+    int i, removed;
+    LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+    shard_xid_read_state(shard, &state);
+    if (ShardXidPrecedes(tb, state.tb) || ShardXidPrecedes(vx, state.vx))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("shard %u reclaim frontier regressed", shard)));
+    if (ShardCommitBlocksRange(shard, state.tb, tb))
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("shard %u reclamation is blocked by an active transaction or decision", shard)));
+    state.tb = tb; state.vx = vx;
+    if (tb && state.claim != state.alloc && !ShardXidInRange(state.claim, tb, state.alloc))
+        state.claim = tb;
+    shard_xid_write_state(shard, &state);
+    if (shard_vacuum_fault_point == 4)
+        ereport(ERROR, (errmsg("shard xid fault: after_reclaim_publish")));
+    /* A crash here retries the same arc. Authorization and this clear share
+     * the lock: no reused slot can be written while it is being erased. */
+    removed = ShardClogClearRange(shard, state.cleaned, tb, true);
+    state.cleaned = tb;
+    shard_xid_write_state(shard, &state);
+    for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+        if (ShardXidCtl->slots[i].shard_relid == shard)
+        {
+            ShardXidCtl->slots[i].trunc_before = tb;
+            ShardXidCtl->slots[i].vacuum_xid = vx;
+            ShardXidCtl->slots[i].claim_wm = state.claim;
+            break;
+        }
+    for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
+        if (ShardXidCtl->shadow[i].shard_relid == shard &&
+            ShardXidCtl->shadow[i].next_hint != state.alloc &&
+            !ShardXidInRange(ShardXidCtl->shadow[i].next_hint, tb, state.alloc))
+            memset(&ShardXidCtl->shadow[i], 0, sizeof(ShardXidShadow));
+    LWLockRelease(ShardXidCtl->lock);
+    return removed;
+}
+
+void
+ShardVacuumReplayWatermarks(Oid shard, TransactionId tb, TransactionId vx)
+{
+    (void) ShardXidFinishReclaim(shard, tb, vx);
 }
 
 /*
@@ -939,10 +1036,19 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("分片 xid 槽位用尽（上限 %d）", SHARD_XID_MAX_SLOTS)));
 
-	shard_xid_read_wm_file(shard, &alloc_wm, &claim_wm,
-						   &slot_trunc_before, &slot_vacuum_xid);
-	ceiling = Max(alloc_wm, FIRST_SHARD_XID);
-	claim_wm = Max(claim_wm, FIRST_SHARD_XID);
+    {
+        ShardXidDiskState disk;
+        shard_xid_read_state(shard, &disk);
+        alloc_wm = disk.alloc; claim_wm = disk.claim;
+        slot_trunc_before = disk.tb; slot_vacuum_xid = disk.vx;
+        if (disk.version == 0 && alloc_wm)
+            ShardClogSetRedoFenceRange(shard, disk.tb ? disk.tb : FIRST_SHARD_XID,
+                                      alloc_wm, InvalidXLogRecPtr);
+    }
+	ceiling = alloc_wm ? alloc_wm : FIRST_SHARD_XID;
+	claim_wm = claim_wm ? claim_wm : FIRST_SHARD_XID;
+	if (slot_trunc_before && !ShardXidInRange(claim_wm, slot_trunc_before, ceiling))
+		claim_wm = slot_trunc_before;
 
 	/*
 	 * T2.5：WAL 影子推进兜底——水位文件缺失/落后时，本次恢复窗口内见过的
@@ -952,11 +1058,11 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	for (i = 0; i < SHARD_XID_MAX_SLOTS; i++)
 		if (ShardXidCtl->shadow[i].shard_relid == shard)
 		{
-			ceiling = Max(ceiling, ShardXidCtl->shadow[i].next_hint);
+			ceiling = ShardXidLater(ceiling, ShardXidCtl->shadow[i].next_hint);
 			break;
 		}
 
-	if (claim_wm < ceiling)
+	if (claim_wm != ceiling)
 	{
 		int			n = ShardClogClaimRange(shard, claim_wm, ceiling);
 
@@ -965,7 +1071,7 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 		 * 影子抬了上限时，写回 {0, ceiling} 会让下次重启退化（claim_wm >
 		 * alloc_wm 的畸形档），抬高只多跳号、方向安全。
 		 */
-		shard_xid_persist_watermark(shard, Max(alloc_wm, ceiling), ceiling,
+		shard_xid_persist_watermark(shard, ceiling, ceiling,
 									slot_trunc_before, slot_vacuum_xid);
 		if (nclaimed)
 			*nclaimed = n;
@@ -1000,9 +1106,7 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 static TransactionId
 shard_xid_age_locked(const ShardXidSlot *slot)
 {
-	if (slot->next_xid <= slot->trunc_before)
-		return 0;
-	return slot->next_xid - slot->trunc_before;
+	return ShardXidDistance(slot->trunc_before, slot->next_xid);
 }
 
 /* 阶段 1 的 WARNING 每个后端每分片只发一次（持续状态，逐次发号刷屏无意义） */
@@ -1135,7 +1239,7 @@ ShardXidTwoStateShards(Oid *shards, int max)
 		if (slot->shard_relid == InvalidOid)
 			continue;
 		if (!TransactionIdIsValid(slot->vacuum_xid) ||
-			slot->vacuum_xid <= slot->trunc_before)
+			!ShardXidFollows(slot->vacuum_xid, slot->trunc_before))
 			continue;
 		shards[n++] = slot->shard_relid;
 	}
@@ -1158,7 +1262,7 @@ ShardXidOverdueCount(void)
 }
 
 static TransactionId
-shard_xid_allocate(Oid shard)
+shard_xid_allocate(Oid shard, TransactionId native_xid, int64 start_ts)
 {
 	ShardXidSlot *slot;
 	TransactionId result;
@@ -1172,39 +1276,25 @@ shard_xid_allocate(Oid shard)
 
 	slot = shard_xid_slot_attach(shard, NULL);
 
-	for (;;)
-	{
-		/* Skipped old slots consume distance too; check on every iteration. */
-		shard_xid_wraparound_gate(shard, slot);
-		if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("分片 %u 的 32 位 xid 逼近上限 %u，P1 不支持回卷",
-							shard, SHARD_XID_HARD_LIMIT)));
-
-		if (slot->next_xid >= slot->watermark)
-		{
-			uint64 stop = (uint64) slot->trunc_before + shard_xid_stop_age;
-			TransactionId new_wm = (TransactionId)
-				Min((uint64) slot->next_xid + SHARD_XID_BATCH,
-					Min(stop, (uint64) SHARD_XID_HARD_LIMIT));
-
-			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm,
-										slot->trunc_before, slot->vacuum_xid);
-			slot->watermark = new_wm;
-		}
-
-		result = slot->next_xid++;
-
-		/*
-		 * T2.5 终局槽跳过守卫：clog 里已有判决的号 = 某段历史已经用过它
-		 * （水位文件缺失/落后才会走到），跳过绝不重发——重发会让新事务的
-		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过；
-		 * 每次分配多一次 pread、无 fsync，可接受。
-		 */
-		if (ShardClogReadStatus(shard, result) == TXN_RUNNING)
-			break;
-	}
+    shard_xid_wraparound_gate(shard, slot);
+    if (slot->next_xid == slot->watermark)
+    {
+        uint32 available = (uint32) shard_xid_stop_age - shard_xid_age_locked(slot);
+        uint32 count = Min((uint32) SHARD_XID_BATCH, available);
+        TransactionId wm = ShardXidAdvance(slot->next_xid, count);
+        /* Skipping reserved 0/1/2 may add at most three to the distance. */
+        while (count && ShardXidDistance(slot->trunc_before, wm) > (uint32) shard_xid_stop_age)
+            wm = ShardXidAdvance(slot->next_xid, --count);
+        if (!count)
+            ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("shard %u has no safe xid reservation", shard)));
+        shard_xid_reserve(shard, slot, wm);
+    }
+    result = slot->next_xid;
+    slot->next_xid = ShardXidAdvance(result, 1);
+    xact_map[xact_map_n].shard = shard;
+    xact_map[xact_map_n].sxid = result;
+    xact_map_n++;
+    ShardCommitRegisterRunning(shard, result, native_xid, start_ts);
 
 	LWLockRelease(ShardXidCtl->lock);
 	return result;
@@ -1231,7 +1321,7 @@ ShardXidRedoAdvance(Oid shard, TransactionId sxid)
 		if (ShardXidCtl->shadow[i].shard_relid == shard)
 		{
 			ShardXidCtl->shadow[i].next_hint =
-				Max(ShardXidCtl->shadow[i].next_hint, sxid + 1);
+				ShardXidLater(ShardXidCtl->shadow[i].next_hint, ShardXidAdvance(sxid, 1));
 			LWLockRelease(ShardXidCtl->lock);
 			return;
 		}
@@ -1240,7 +1330,7 @@ ShardXidRedoAdvance(Oid shard, TransactionId sxid)
 	}
 	if (free_i >= 0)
 	{
-		ShardXidCtl->shadow[free_i].next_hint = sxid + 1;
+		ShardXidCtl->shadow[free_i].next_hint = ShardXidAdvance(sxid, 1);
 		ShardXidCtl->shadow[free_i].shard_relid = shard;
 	}
 	LWLockRelease(ShardXidCtl->lock);
@@ -1308,14 +1398,14 @@ ShardXidClaimOnPromote(Oid shard)
 	{
 		if (ShardXidCtl->shadow[i].shard_relid != shard)
 			continue;
-		if (ShardXidCtl->shadow[i].next_hint > slot->watermark)
+		if (ShardXidFollows(ShardXidCtl->shadow[i].next_hint, slot->watermark))
 		{
 			TransactionId hint = ShardXidCtl->shadow[i].next_hint;
 
 			shard_xid_persist_watermark(shard, hint, slot->claim_wm,
 										slot->trunc_before, slot->vacuum_xid);
 			slot->watermark = hint;
-			if (slot->next_xid < hint)
+			if (ShardXidPrecedes(slot->next_xid, hint))
 				slot->next_xid = hint;
 		}
 		break;
@@ -1340,32 +1430,19 @@ ShardXidClaimOnPromote(Oid shard)
 	 * 跳过两批号，32 位号空间足够。下面的认领区间随之扩大，把这段号在本节点 clog 里
 	 * 一并判 ABORTED（本来就没有任何已提交的事务用过它们）。
 	 */
-	/* 幂等：刚跳过、此后一个号都没发（next == 水位且落在批次边界）就不再跳 —— 升主前置会重试 */
-	if (!(slot->next_xid == slot->watermark && slot->watermark % SHARD_XID_BATCH == 0))
-	{
-		TransactionId base = Max(slot->watermark, slot->next_xid);
-		TransactionId safe = ((base + SHARD_XID_BATCH - 1) / SHARD_XID_BATCH + 1) * SHARD_XID_BATCH;
-
-		if (safe < base || (uint64) safe >= (uint64) slot->trunc_before + shard_xid_stop_age)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("分片 %u 的升主跳号会越过 xid 停发线", shard),
-					 errhint("先解除旧快照或未决事务阻挡并完成安全回收。")));
-
-		if (safe > slot->watermark)
-		{
-			shard_xid_persist_watermark(shard, safe, slot->claim_wm,
-										slot->trunc_before, slot->vacuum_xid);
-			slot->watermark = safe;
-		}
-		if (slot->next_xid < safe)
-			slot->next_xid = safe;
-	}
+    if (!(slot->next_xid == slot->watermark && slot->watermark % SHARD_XID_BATCH == 0))
+    {
+        TransactionId base = ShardXidLater(slot->watermark, slot->next_xid);
+        uint32 skip = (SHARD_XID_BATCH - base % SHARD_XID_BATCH) % SHARD_XID_BATCH + SHARD_XID_BATCH;
+        TransactionId safe = ShardXidAdvance(base, skip);
+        shard_xid_reserve(shard, slot, safe);
+        slot->next_xid = safe;
+    }
 
 	from = slot->claim_wm;
 	to = slot->watermark;
 
-	if (from < to)
+	if (from != to)
 	{
 		n += ShardClogClaimRange(shard, from, to);
 
@@ -1486,19 +1563,11 @@ shard_xid_for_current_xact(Oid shard)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("单事务触达的分片数超过上限 %d", SHARD_XID_MAX_PER_XACT)));
 
-	sxid = shard_xid_allocate(shard);
-
-	/*
-	 * T2.3：先落 clog RUNNING 账再进活跃表（都在 RegisterRunning 里，含
-	 * 持有者原生 xid——此刻原生 xid 必已分配，0005 让 heap_* 顶部先
-	 * GetCurrentTransactionId 再换号）。任一步失败则本次领号作废（跳号
-	 * 无害），映射未推进。
-	 */
-	ShardCommitRegisterRunning(shard, sxid, GetCurrentTransactionId());
-
-	xact_map[xact_map_n].shard = shard;
-	xact_map[xact_map_n].sxid = sxid;
-	xact_map_n++;
+    {
+        int64 start_ts = TsoGetStartTs();
+        TransactionId native_xid = GetCurrentTransactionId();
+        sxid = shard_xid_allocate(shard, native_xid, start_ts);
+    }
 
 	return sxid;
 }
@@ -1601,7 +1670,7 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 			 * 正是本缺陷的指纹）。终局判决绝不在此预写。
 			 */
 			for (i = 0; i < xact_map_n; i++)
-				ShardCommitRemove(xact_map[i].shard, xact_map[i].sxid);
+				ShardCommitSetPrepared(xact_map[i].shard, xact_map[i].sxid, InvalidTransactionId);
 			xact_map_n = 0;
 			ShardClogAtAbort();
 			TsoClientClearActive();
@@ -1661,7 +1730,7 @@ ShardXidDefineGUCs(void)
 		"到龄发一条 WARNING，并（在 pg_partdist.shard_vacuum_auto 打开时）"
 		"由心跳工作者触发 partdist.shard_vacuum_auto()（T7.17/P7-V1）。",
 		&shard_vacuum_max_age,
-		200000000,
+		SHARD_XID_DEFAULT_MAX_AGE,
 		1, INT_MAX,
 		PGC_SIGHUP,
 		0, check_shard_vacuum_max_age, NULL, NULL);
@@ -1708,7 +1777,7 @@ ShardXidDefineGUCs(void)
 		"分片版的 xidStopLimit。默认 2^31 − 10^6（设计 §7）。护栏是分片粒度，"
 		"不殃及节点与集群。拒发只是止血 —— 解锁必须解决前缀阻挡者。",
 		&shard_xid_stop_age,
-		2146483648,
+		SHARD_XID_MAX_STOP_AGE,
 		2, SHARD_XID_MAX_STOP_AGE,
 		PGC_SIGHUP,
 		0, check_shard_xid_stop_age, NULL, NULL);
@@ -2196,6 +2265,7 @@ shard_twophase_recover_impl(TransactionId xid, uint16 info,
 	const char *pairs_base;
 	uint32		pairs[2 * DTX_PENDING_MAX_PAIRS];
 	int			i;
+    int nlive = 0;
 
 	/* T7.31：DROP 清单在恢复时无事可做 —— 等 COMMIT/ROLLBACK PREPARED 再结算 */
 	if (info == SHARD_2PC_INFO_DROPS)
@@ -2208,18 +2278,23 @@ shard_twophase_recover_impl(TransactionId xid, uint16 info,
 		uint32		pv[2];
 
 		memcpy(pv, pairs_base + (Size) i * 2 * sizeof(uint32), sizeof(pv));
-		ShardClogSetPrepared((Oid) pv[0], (TransactionId) pv[1],
-							 hdr.start_ts, hdr.gxid);
-		if (i < DTX_PENDING_MAX_PAIRS)
-		{
-			pairs[2 * i] = pv[0];
-			pairs[2 * i + 1] = pv[1];
-		}
+        {
+            ShardClogSlot slot;
+            if (!ShardClogReadSlot(pv[0], pv[1], &slot) || slot.global_xid != (uint64) hdr.gxid)
+                continue;
+            ShardCommitSetPrepared(pv[0], pv[1], xid);
+            if (slot.status == TXN_PREPARED && nlive < DTX_PENDING_MAX_PAIRS)
+            {
+                pairs[2 * nlive] = pv[0];
+                pairs[2 * nlive + 1] = pv[1];
+                nlive++;
+            }
+        }
 	}
 	/* T4.5：登记表兜底重建（日志重放通常已覆盖，缺了才补） */
-	if (hdr.nxids > 0 && hdr.nxids <= DTX_PENDING_MAX_PAIRS)
+	if (nlive > 0)
 		DtxPendingReRegister(hdr.gxid, hdr.coord_gsid, hdr.dtxid,
-							 hdr.start_ts, hdr.nxids, pairs);
+							 hdr.start_ts, nlive, pairs);
 }
 
 /*
@@ -2247,6 +2322,18 @@ shard_twophase_postcommit_impl(TransactionId xid, uint16 info,
 		elog(LOG, "pg_partdist: COMMIT PREPARED 回收 %d 张已删除的分片打标表", n);
 		return;
 	}
+    {
+        ShardTwoPhasePayload hdr;
+        const char *pairs_base;
+        int i;
+        if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base)) return;
+        for (i = 0; i < hdr.nxids; i++)
+        {
+            uint32 pv[2];
+            memcpy(pv, pairs_base + (Size) i * 2 * sizeof(uint32), sizeof(pv));
+            ShardCommitClosePrepared(pv[0], pv[1], xid);
+        }
+    }
 	elog(DEBUG1, "pg_partdist: 分片 2PC 段 postcommit（终局待决议广播，T4.5）");
 }
 
@@ -2270,7 +2357,12 @@ shard_twophase_postabort_impl(TransactionId xid, uint16 info,
 		uint32		pv[2];
 
 		memcpy(pv, pairs_base + (Size) i * 2 * sizeof(uint32), sizeof(pv));
-		ShardClogSetVerdict((Oid) pv[0], (TransactionId) pv[1], false, 0);
+        {
+            ShardClogSlot slot;
+            if (ShardClogReadSlot(pv[0], pv[1], &slot) && slot.global_xid == (uint64) hdr.gxid)
+                ShardClogSetVerdict(pv[0], pv[1], false, 0);
+        }
+		ShardCommitClosePrepared(pv[0], pv[1], xid);
 	}
 	/* T4.5：中止即终局，注销未决登记 */
 	DtxPendingFinalized(hdr.gxid);
@@ -2857,7 +2949,7 @@ partdist_shard_xid_age(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	ShardVacuumGetWatermarks(shard, &tb, NULL);
-	age = (next <= tb) ? 0 : next - tb;
+	age = ShardXidDistance(tb, next);
 	phase = (age >= (TransactionId) shard_xid_stop_age) ? 2
 		: (age >= (TransactionId) shard_vacuum_max_age) ? 1 : 0;
 

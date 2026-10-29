@@ -43,6 +43,7 @@ extern void DtxPendingReRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 								 int64 start_ts, int nxids, const uint32 *pairs);
 extern void DtxPendingFinalized(int64 gxid);
 extern bool DtxPendingLookup(int64 gxid, DtxPendingEntry *out);
+extern bool DtxPendingReferences(Oid shard, TransactionId sxid);
 extern int	DtxPendingCount(void);
 extern bool DtxPendingContainsDtxid(int64 dtxid);	/* R-P4-5 回执门 */
 extern void DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts);

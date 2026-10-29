@@ -38,9 +38,16 @@ extern void ShardVisibilityInstallHooks(void);
 
 /* 领号时调用（T1.2 分配路径）：先落 clog RUNNING 账，再进活跃表；
  * 任一步失败领号作废（fail-closed，跳号无害） */
+extern bool ShardCommitHasActiveShard(Oid shard);
+extern bool ShardCommitIsActive(Oid shard, TransactionId sxid);
+extern bool ShardCommitBlocksRange(Oid shard, TransactionId from, TransactionId to);
+extern void ShardCommitDecisionPin(Oid shard, TransactionId sxid);
+extern void ShardCommitDecisionUnpin(Oid shard, TransactionId sxid);
+extern void ShardCommitSetPrepared(Oid shard, TransactionId sxid, TransactionId native_xid);
+extern void ShardCommitClosePrepared(Oid shard, TransactionId sxid, TransactionId native_xid);
 extern void ShardCommitRemove(Oid shard, TransactionId sxid);
 extern void ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
-									   TransactionId native_xid);
+                                       TransactionId native_xid, int64 start_ts);
 
 /* 事务结束回调里调用：先写 clog 终局判决（fsync），后摘活跃表条目。
  * 判决写失败升 PANIC（借崩溃恢复走 0007 redo 补齐）；摘条目异常仅 WARNING。 */

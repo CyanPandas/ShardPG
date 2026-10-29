@@ -16,6 +16,10 @@
 #include "partwal_sync.h"			/* T7.2：PartWALAppendCtrl */
 #include "shard_fileset.h"	/* T5.4b-2：水位 CTRL 发射 */
 #include "shard_xid.h"
+#include "port/pg_crc32c.h"
+#include "shard_visibility.h"
+#include "dtx_pending.h"
+#include "access/xlogrecovery.h"
 
 #include "access/transam.h"
 #include "funcapi.h"			/* T5.2 SQL 包装：复合返回 */
@@ -260,55 +264,40 @@ ShardClogEmitBaseline(Oid shard, TransactionId upto)
 	hdr = (PartWALCtrlShardClog *) buf;
 	slots = PartWALCtrlShardClogSlots(buf);
 
-	for (x = FirstNormalTransactionId; x < upto; x += SHARD_CLOG_BASELINE_CHUNK)
-	{
-		uint32	n = (uint32) Min((uint64) SHARD_CLOG_BASELINE_CHUNK,
-								 (uint64) (upto - x));
-		uint32	i;
-		bool	any = false;
-		int		probe;
-
-		/*
-		 * ★ 整段跳过：一段是 100 万个 xid，段文件不存在就等于这 100 万个号
-		 * 全是空洞（= RUNNING = 无判决），一个都不用读、一块都不用发。
-		 * 没有这一步的话，扫描代价随**分片 xid 空间**线性增长而不是随
-		 * **实际判决数**增长 —— 本环境实测：反复重启把水位推到 16389 之后，
-		 * 一次基线要扫 1.6 万个号、发 65 块，而真正有判决的只有个位数。
-		 */
-		probe = ShardClogOpenSegFile(shard, x / SHARD_CLOG_XIDS_PER_SEGMENT,
-									 false);
-		if (probe < 0)
-		{
-			uint32 seg_end = ((x / SHARD_CLOG_XIDS_PER_SEGMENT) + 1)
-							 * SHARD_CLOG_XIDS_PER_SEGMENT;
-
-			/* 减去循环自增的一步，跳到下一段的段首 */
-			x = seg_end - SHARD_CLOG_BASELINE_CHUNK;
-			continue;
-		}
-		CloseTransientFile(probe);
-
-		memset(slots, 0, (size_t) SHARD_CLOG_BASELINE_CHUNK * sizeof(ShardClogSlot));
-		for (i = 0; i < n; i++)
-		{
-			ShardClogSlot slot;
-
-			if (ShardClogReadSlot(shard, x + i, &slot) && slot.status != 0)
-			{
-				memcpy(slots + (size_t) i * sizeof(ShardClogSlot),
-					   &slot, sizeof(ShardClogSlot));
-				any = true;
-			}
-		}
-		if (!any)
-			continue;			/* 整块都是空洞：不值得占一条记录 */
-
-		hdr->first_sxid = (uint32) x;
-		hdr->nslots     = n;
-		PartWALAppendCtrl(shard, PARTWAL_CTRL_SHARD_CLOG, buf,
-						  (uint32) PartWALCtrlShardClogSize(n));
-		nblocks++;
-	}
+    {
+        TransactionId tb;
+        ShardVacuumGetWatermarks(shard, &tb, NULL);
+        x = tb ? tb : FIRST_SHARD_XID;
+    }
+    if (ShardXidDistance(x, upto) >= SHARD_XID_HALF)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("baseline xid interval exceeds half-circle")));
+    while (x != upto)
+    {
+        uint32 n = Min((uint32) SHARD_CLOG_BASELINE_CHUNK, ShardXidDistance(x, upto));
+        uint32 i;
+        bool any = false;
+        n = Min(n, SHARD_XID_MASK - x + 1);
+        memset(slots, 0, (size_t) SHARD_CLOG_BASELINE_CHUNK * sizeof(ShardClogSlot));
+        for (i = 0; i < n; i++)
+        {
+            ShardClogSlot slot;
+            if (ShardClogReadSlot(shard, x + i, &slot))
+            {
+                memcpy(slots + (size_t) i * sizeof(slot), &slot, sizeof(slot));
+                any = true;
+            }
+        }
+        if (any)
+        {
+            hdr->first_sxid = x;
+            hdr->nslots = n;
+            PartWALAppendCtrl(shard, PARTWAL_CTRL_SHARD_CLOG, buf,
+                              (uint32) PartWALCtrlShardClogSize(n));
+            nblocks++;
+        }
+        x = ShardXidAdvance(x, n);
+        CHECK_FOR_INTERRUPTS();
+    }
 
 	pfree(buf);
 	if (nblocks > 0)
@@ -322,27 +311,39 @@ ShardClogEmitBaseline(Oid shard, TransactionId upto)
  * ShardClogApplyBaselineChunk —— follower 侧：把一块槽原样写进本地分片 clog。
  * 键是分片 xid，与 oid 无关，所以不需要任何翻译。幂等。
  */
+static void
+ShardClogSyncSegment(Oid shard, uint32 segno)
+{
+    int fd = ShardClogOpenSegFile(shard, segno, false);
+    if (fd < 0 || pg_fsync(fd) != 0 || CloseTransientFile(fd) != 0)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot sync shard %u clog segment %u: %m", shard, segno)));
+}
+
 void
 ShardClogApplyBaselineChunk(Oid shard, TransactionId first_sxid,
-							const char *slots, uint32 nslots)
+                            const char *slots, uint32 nslots)
 {
-	uint32		i;
-
-	for (i = 0; i < nslots; i++)
-	{
-		ShardClogSlot slot;
-
-		memcpy(&slot, slots + (size_t) i * sizeof(ShardClogSlot), sizeof(slot));
-		if (slot.status == 0)
-			continue;			/* 空洞照旧是空洞，不写 */
-		/*
-		 * 最后一个槽 durable=true：段内前面的槽在同一次 fsync 里一起落盘
-		 * （与 ShardClogClaimRange 的"段收尾一次 fsync"同一条纪律）。
-		 * 判决字节必须持久 —— 丢了就是槽回到 RUNNING，认领会把它改判 ABORTED。
-		 */
-		ShardClogWriteSlot(shard, first_sxid + i, &slot,
-						   (i + 1 == nslots));
-	}
+    uint32 i, previous_seg = UINT32_MAX;
+    bool dirty = false;
+    if (!nslots || nslots > SHARD_CLOG_BASELINE_CHUNK ||
+        first_sxid > SHARD_XID_MASK || nslots - 1 > SHARD_XID_MASK - first_sxid)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid shard clog baseline range")));
+    for (i = 0; i < nslots; i++)
+    {
+        ShardClogSlot slot;
+        uint32 segno = (first_sxid + i) / SHARD_CLOG_XIDS_PER_SEGMENT;
+        memcpy(&slot, slots + (size_t) i * sizeof(slot), sizeof(slot));
+        if (slot.status == 0) continue;
+        if (dirty && previous_seg != segno)
+        {
+            ShardClogSyncSegment(shard, previous_seg);
+            dirty = false;
+        }
+        ShardClogWriteSlot(shard, first_sxid + i, &slot, false);
+        dirty = true; previous_seg = segno;
+    }
+    /* The last payload slot may be a hole; sync the last actual write. */
+    if (dirty) ShardClogSyncSegment(shard, previous_seg);
 }
 
 bool
@@ -402,78 +403,269 @@ ShardClogReadStatus(Oid shard, TransactionId sxid)
  * "冻结的启动恢复上限"（调用方 shard_xid.c 保证，R-P2-2），本函数只管
  * 机械改判。PREPARED 保留是 §6.6 第二分支的"不许动"（P4 才有人写它）。
  */
+/* A recovery log fence is indexed by the SAME raw 32-bit slot as clog. It is
+ * a WAL byte address, never a transaction number or an epoch. Unlike a fence
+ * for a whole numeric circle, per-slot fences also handle a transaction that
+ * commits late across zero and reservations that straddle zero. */
+#define SHARD_REDO_FENCE_MAGIC UINT32_C(0x53524631)
+typedef struct ShardRedoFence
+{
+    XLogRecPtr lsn;
+    pg_crc32c crc;
+    uint32 magic;
+} ShardRedoFence;
+StaticAssertDecl(sizeof(ShardRedoFence) == 16, "redo fence disk format");
+
+static void
+shard_redo_fence_path(char *path, Oid shard, uint32 segno)
+{
+    snprintf(path, MAXPGPATH, "%s/pg_shard_xid/%u.redo/%08X", DataDir, shard, segno);
+}
+
+void
+ShardClogSetRedoFenceRange(Oid shard, TransactionId from, TransactionId to, XLogRecPtr lsn)
+{
+    ShardRedoFence fences[512];
+    TransactionId x = from;
+    char dir[MAXPGPATH], path[MAXPGPATH];
+    uint32 i;
+
+    if (from == to) return;
+    if (ShardXidDistance(from, to) >= SHARD_XID_HALF)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("redo fence range exceeds half-circle")));
+    snprintf(dir, sizeof(dir), "%s/pg_shard_xid", DataDir);
+    if (MakePGDirectory(dir) < 0 && errno != EEXIST)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot create redo fence parent: %m")));
+    snprintf(dir, sizeof(dir), "%s/pg_shard_xid/%u.redo", DataDir, shard);
+    if (MakePGDirectory(dir) < 0 && errno != EEXIST)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot create redo fence directory: %m")));
+    fsync_fname("pg_shard_xid", true);
+    memset(fences, 0, sizeof(fences));
+    for (i = 0; i < lengthof(fences); i++)
+    {
+        fences[i].lsn = lsn;
+        fences[i].magic = SHARD_REDO_FENCE_MAGIC;
+        INIT_CRC32C(fences[i].crc);
+        COMP_CRC32C(fences[i].crc, &fences[i].lsn, sizeof(lsn));
+        COMP_CRC32C(fences[i].crc, &fences[i].magic, sizeof(uint32));
+        FIN_CRC32C(fences[i].crc);
+    }
+    while (x != to)
+    {
+        uint32 segno = x / SHARD_CLOG_XIDS_PER_SEGMENT;
+        int fd;
+        shard_redo_fence_path(path, shard, segno);
+        fd = OpenTransientFile(path, O_CREAT | O_RDWR | PG_BINARY);
+        if (fd < 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot open redo fence %s: %m", path)));
+        do
+        {
+            uint32 n = Min((uint32) lengthof(fences), ShardXidDistance(x, to));
+            uint32 local = x % SHARD_CLOG_XIDS_PER_SEGMENT;
+            size_t bytes;
+            n = Min(n, SHARD_CLOG_XIDS_PER_SEGMENT - local);
+            n = Min(n, SHARD_XID_MASK - x + 1);
+            bytes = (size_t) n * sizeof(ShardRedoFence);
+            if (pg_pwrite(fd, fences, bytes, (off_t) local * sizeof(ShardRedoFence)) != bytes)
+                ereport(ERROR, (errcode_for_file_access(), errmsg("cannot write redo fence %s: %m", path)));
+            x = ShardXidAdvance(x, n);
+        } while (x != to && x / SHARD_CLOG_XIDS_PER_SEGMENT == segno);
+        if (pg_fsync(fd) != 0 || CloseTransientFile(fd) != 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot sync redo fence %s: %m", path)));
+    }
+    fsync_fname(dir, true);
+}
+
+XLogRecPtr
+ShardClogGetRedoFence(Oid shard, TransactionId sxid, bool required)
+{
+    char path[MAXPGPATH];
+    ShardRedoFence fence;
+    pg_crc32c crc;
+    ssize_t n = 0;
+    int fd;
+    shard_redo_fence_path(path, shard, sxid / SHARD_CLOG_XIDS_PER_SEGMENT);
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0 && errno != ENOENT)
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot read redo fence %s: %m", path)));
+    memset(&fence, 0, sizeof(fence));
+    if (fd >= 0)
+    {
+        n = pg_pread(fd, &fence, sizeof(fence),
+                     (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT) * sizeof(fence));
+        if (CloseTransientFile(fd) != 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot close redo fence %s: %m", path)));
+    }
+    if (!required && (n == 0 || (n == sizeof(fence) && fence.magic == 0 && fence.lsn == 0 && fence.crc == 0)))
+        return InvalidXLogRecPtr;
+    INIT_CRC32C(crc);
+    COMP_CRC32C(crc, &fence.lsn, sizeof(fence.lsn));
+    COMP_CRC32C(crc, &fence.magic, sizeof(fence.magic));
+    FIN_CRC32C(crc);
+    if (n != sizeof(fence) || fence.magic != SHARD_REDO_FENCE_MAGIC || !EQ_CRC32C(crc, fence.crc))
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid/missing redo fence for shard %u xid %u", shard, sxid)));
+    return fence.lsn;
+}
+
+/* Clear the recycled arc, never extending sparse files. Called only while
+ * holding the allocator lock, before publishing authorization for new numbers. */
+void
+ShardClogClearAll(Oid shard)
+{
+    char dir[MAXPGPATH];
+    DIR *d;
+    struct dirent *de;
+    ShardClogDirPath(dir, sizeof(dir), shard);
+    d = AllocateDir(dir);
+    if (!d)
+    {
+        if (errno == ENOENT) return;
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot scan shard clog %s: %m", dir)));
+    }
+    while ((de = ReadDir(d, dir)) != NULL)
+    {
+        uint32 segno;
+        char extra;
+        char path[MAXPGPATH];
+        if (strlen(de->d_name) != 8 || sscanf(de->d_name, "%8x%c", &segno, &extra) != 1)
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        if (unlink(path) != 0 && errno != ENOENT)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot remove shard clog %s: %m", path)));
+    }
+    FreeDir(d);
+    ShardClogFsyncDir(shard);
+}
+
+int
+ShardClogClearRange(Oid shard, TransactionId from, TransactionId to, bool retired)
+{
+    char dir[MAXPGPATH];
+    DIR *d;
+    struct dirent *de;
+    uint32 distance = ShardXidDistance(from, to);
+    int removed = 0;
+    bool changed = false;
+    char zeros[32768] = {0};
+
+    if (!distance)
+        return 0;
+    if (distance >= SHARD_XID_HALF)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("shard %u clear range is not within half-circle", shard)));
+    ShardClogDirPath(dir, sizeof(dir), shard);
+    d = AllocateDir(dir);
+    if (!d)
+    {
+        if (errno == ENOENT) return 0;
+        ereport(ERROR, (errcode_for_file_access(), errmsg("cannot scan shard clog %s: %m", dir)));
+    }
+    while ((de = ReadDir(d, dir)) != NULL)
+    {
+        uint32 segno, first, last, first_offset;
+        char tail;
+        char path[MAXPGPATH];
+        int fd;
+        struct stat st;
+        uint32 offset;
+        bool dirty = false;
+
+        if (strlen(de->d_name) != 8 || sscanf(de->d_name, "%8x%c", &segno, &tail) != 1 ||
+            segno > SHARD_XID_MASK / SHARD_CLOG_XIDS_PER_SEGMENT)
+            continue;
+        first = segno * SHARD_CLOG_XIDS_PER_SEGMENT;
+        last = first | (SHARD_CLOG_XIDS_PER_SEGMENT - 1);
+        last = Min(last, SHARD_XID_MASK);
+        if (!ShardXidInRange(first, from, to) && !ShardXidInRange(last, from, to) &&
+            !(from >= first && from <= last))
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        /* Both endpoints can be in a wrapping arc while its middle is live.
+         * Require the entire linear file extent to fit before the arc ends.
+         * This also handles a short test ring sharing one physical segment. */
+        first_offset = ShardXidDistance(from, first);
+        if ((first_offset < distance && last - first < distance - first_offset) ||
+            (retired && ShardXidInRange(last, from, to) && (to < first || to > last)))
+        {
+            if (unlink(path) != 0 && errno != ENOENT)
+                ereport(ERROR, (errcode_for_file_access(), errmsg("cannot remove shard clog %s: %m", path)));
+            removed++; changed = true;
+            shard_redo_fence_path(path, shard, segno);
+            if (unlink(path) != 0 && errno != ENOENT)
+                ereport(ERROR, (errcode_for_file_access(), errmsg("cannot remove retired redo fence %s: %m", path)));
+            continue;
+        }
+        fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+        if (fd < 0 || fstat(fd, &st) != 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot open shard clog %s: %m", path)));
+        for (offset = 0; offset <= last - first;)
+        {
+            uint32 xid = first + offset;
+            uint32 n = Min((uint32) (sizeof(zeros) / SHARD_CLOG_SLOT_SIZE), last - xid + 1);
+            off_t pos = (off_t) offset * SHARD_CLOG_SLOT_SIZE;
+            size_t bytes;
+
+            if (pos >= st.st_size) break;
+            /* Split chunks at either end of the arc. */
+            if (ShardXidInRange(xid, from, to))
+            {
+                n = Min(n, ShardXidDistance(xid, to));
+                bytes = Min((off_t) n * SHARD_CLOG_SLOT_SIZE, st.st_size - pos);
+                if (pg_pwrite(fd, zeros, bytes, pos) != bytes)
+                    ereport(ERROR, (errcode_for_file_access(), errmsg("cannot clear shard clog %s: %m", path)));
+                dirty = true;
+            }
+            else if (ShardXidDistance(xid, from) < n)
+                n = ShardXidDistance(xid, from);
+            offset += n;
+        }
+        if (dirty && pg_fsync(fd) != 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot fsync shard clog %s: %m", path)));
+        if (CloseTransientFile(fd) != 0)
+            ereport(ERROR, (errcode_for_file_access(), errmsg("cannot close shard clog %s: %m", path)));
+        changed |= dirty;
+    }
+    FreeDir(d);
+    if (changed)
+    {
+        char redo_dir[MAXPGPATH];
+        struct stat st;
+        ShardClogFsyncDir(shard);
+        snprintf(redo_dir, sizeof(redo_dir), "%s/pg_shard_xid/%u.redo", DataDir, shard);
+        if (stat(redo_dir, &st) == 0) fsync_fname(redo_dir, true);
+    }
+    return removed;
+}
+
 int
 ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to)
 {
-	int			claimed = 0;
-	TransactionId sxid;
-
-	if (from < FirstNormalTransactionId)
-		from = FirstNormalTransactionId;
-
-	sxid = from;
-	while (sxid < to)
-	{
-		uint32		segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
-		TransactionId seg_end = (TransactionId) (segno + 1) *
-			SHARD_CLOG_XIDS_PER_SEGMENT;
-		TransactionId upto = Min(to, seg_end);
-		int			fd = ShardClogOpenSegFile(shard, segno, true);
-		bool		dirtied = false;
-
-		for (; sxid < upto; sxid++)
-		{
-			off_t		off = (off_t) (sxid % SHARD_CLOG_XIDS_PER_SEGMENT)
-				* SHARD_CLOG_SLOT_SIZE;
-			ShardClogSlot slot;
-			ssize_t		nb;
-
-			do
-			{
-				nb = pg_pread(fd, &slot, sizeof(slot), off);
-			} while (nb < 0 && errno == EINTR);
-
-			if (nb != (ssize_t) sizeof(slot) && nb != 0)
-			{
-				CloseTransientFile(fd);
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("pg_partdist: 认领读槽失败 shard=%u xid=%u (%zd)",
-								shard, sxid, nb)));
-			}
-			if (nb == (ssize_t) sizeof(slot) &&
-				(TxnStatus) slot.status != TXN_RUNNING)
-				continue;		/* 终局/PREPARED 保留 */
-
-			memset(&slot, 0, sizeof(slot));
-			slot.status = (uint32) TXN_ABORTED;
-			do
-			{
-				nb = pg_pwrite(fd, &slot, sizeof(slot), off);
-			} while (nb < 0 && errno == EINTR);
-			if (nb != (ssize_t) sizeof(slot))
-			{
-				CloseTransientFile(fd);
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("pg_partdist: 认领改判失败 shard=%u xid=%u: %m",
-								shard, sxid)));
-			}
-			dirtied = true;
-			claimed++;
-		}
-
-		if (dirtied && pg_fsync(fd) != 0)
-		{
-			CloseTransientFile(fd);
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("pg_partdist: 认领段 fsync 失败 shard=%u seg=%08X: %m",
-							shard, segno)));
-		}
-		CloseTransientFile(fd);
-	}
-	return claimed;
+    TransactionId sxid;
+    int claimed = 0;
+    uint32 previous_seg = UINT32_MAX;
+    bool dirty = false;
+    if (from < FIRST_SHARD_XID) from = FIRST_SHARD_XID;
+    if (ShardXidDistance(from, to) >= SHARD_XID_HALF)
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("shard %u claim interval exceeds half-circle", shard)));
+    for (sxid = from; sxid != to; sxid = ShardXidAdvance(sxid, 1))
+    {
+        ShardClogSlot slot;
+        uint32 segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
+        ShardClogReadSlot(shard, sxid, &slot);
+        if (slot.status != TXN_RUNNING) continue;
+        if (dirty && previous_seg != segno)
+        {
+            ShardClogSyncSegment(shard, previous_seg);
+            dirty = false;
+        }
+        memset(&slot, 0, sizeof(slot));
+        slot.status = TXN_ABORTED;
+        ShardClogWriteSlot(shard, sxid, &slot, false);
+        dirty = true; previous_seg = segno;
+        claimed++;
+        CHECK_FOR_INTERRUPTS();
+    }
+    if (dirty) ShardClogSyncSegment(shard, previous_seg);
+    return claimed;
 }
 
 /*
@@ -489,6 +681,9 @@ ShardClogXactRedo(int nxids, const uint32 *pairs, uint64 commit_ts,
 
 	for (i = 0; i < nxids; i++)
 	{
+		if (!ShardXidNativeRedoAllowed((Oid) pairs[2*i], pairs[2*i+1],
+									 GetXLogReplayRecPtr(NULL)))
+			continue;
 		ShardClogSetVerdict((Oid) pairs[2 * i],
 							(TransactionId) pairs[2 * i + 1],
 							committed, (int64) commit_ts);
@@ -620,6 +815,9 @@ ShardClogGcDropped(const Oid *oids, int n)
 		 * 第 65 张。门禁一直靠"移走水位文件 + 重启"绕过去，等于把这条缺陷藏在
 		 * 净场脚本里。判据与上面那句同源：都在 DROP 的提交时点，回滚不执行。
 		 */
+        snprintf(path, MAXPGPATH, "%s/pg_shard_xid/%u.redo", DataDir, dropped[i]);
+        if (stat(path, &st) == 0 && !rmtree(path, true))
+            ereport(WARNING, (errmsg("cannot remove obsolete redo fences %s", path)));
 		ShardXidSlotRelease(dropped[i]);
 	}
 }
@@ -635,71 +833,15 @@ ShardClogAtAbort(void)
 int
 ShardClogTruncate(Oid shard, TransactionId trunc_before)
 {
-	TransactionId cur_tb;
-	TransactionId vacuum_xid;
-	uint32		nfull;
-	uint32		segno;
-	int			removed = 0;
-
-	if (!TransactionIdIsValid(trunc_before) || trunc_before <= FIRST_SHARD_XID)
-		return 0;				/* 没什么可截的 */
-
-	ShardVacuumGetWatermarks(shard, &cur_tb, &vacuum_xid);
-
-	if (trunc_before < cur_tb)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("分片 %u 的截断点不许后退：目标 %u < 当前 %u",
-						shard, trunc_before, cur_tb)));
-
-	/*
-	 * ★ 顺序铁律的落地点（设计 §6.4 末）：页面动作没做完就不许动 clog。
-	 * shard_vacuum_xid 是"整趟页面动作已完成"的唯一凭据，只由
-	 * ShardVacuumSweep 在三类动作全部清完（无跳页、无推迟）后落下。
-	 */
-	if (trunc_before > vacuum_xid)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("分片 %u 的页面尚未清到 %u（趟标记只到 %u），不许截断 clog",
-						shard, trunc_before, vacuum_xid),
-				 errdetail("设计 §6.4 顺序铁律：数据页、索引、堆全部清完，才许动 clog。"
-						   "此时截断会让中止事务的幽灵行复活、让活行被判死。"),
-				 errhint("先跑一趟完整的 partdist.shard_vacuum_sweep()。")));
-
-	/*
-	 * ★ 先推水位、后删文件。反过来一旦在中间崩溃，clog 没了而水位还说"要查
-	 * clog"，那些 xid 读成空洞=RUNNING=不可见，已提交数据当场消失。
-	 */
-	if (trunc_before > cur_tb)
-	{
-		/*
-		 * VACU: publish the durable certificate to the data group FIRST. An
-		 * emission/quorum failure must leave the local reclamation frontier
-		 * unchanged. Retrying the absolute watermark record is idempotent.
-		 */
-		ShardVacuumEmitWatermarkCtrl(shard, trunc_before, vacuum_xid);
-		ShardVacuumSetWatermarks(shard, trunc_before, vacuum_xid);
-	}
-
-	/* 只删完全落在 trunc_before 以下的整段；跨界那一段留着 */
-	nfull = trunc_before / SHARD_CLOG_XIDS_PER_SEGMENT;
-	for (segno = 0; segno < nfull; segno++)
-	{
-		char		path[MAXPGPATH];
-
-		ShardClogSegPath(path, MAXPGPATH, shard, segno);
-		if (unlink(path) == 0)
-			removed++;
-		else if (errno != ENOENT)
-			ereport(WARNING,
-					(errcode_for_file_access(),
-					 errmsg("pg_partdist: 删除分片 clog 段 \"%s\" 失败: %m", path)));
-	}
-
-	if (removed > 0)
-		ShardClogFsyncDir(shard);
-
-	return removed;
+    TransactionId tb, vx;
+    if (!TransactionIdIsNormal(trunc_before))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid shard xid cutoff %u", trunc_before)));
+    ShardVacuumGetWatermarks(shard, &tb, &vx);
+    if (ShardXidPrecedes(trunc_before, tb) || ShardXidFollows(trunc_before, vx))
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("shard %u cutoff %u is outside completed interval %u..%u", shard, trunc_before, tb, vx)));
+    if (tb != trunc_before)
+        ShardVacuumEmitWatermarkCtrl(shard, trunc_before, vx);
+    return ShardXidFinishReclaim(shard, trunc_before, vx);
 }
 
 /* ================= 验收/运维用 SQL 包装 =================
@@ -712,7 +854,7 @@ Datum
 partdist_shard_clog_read_full(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 	ShardClogSlot slot;
 	char		buf[96];
 
@@ -737,7 +879,7 @@ Datum
 partdist_shard_clog_read(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 
 	PG_RETURN_INT32((int32) ShardClogReadStatus(shard, sxid));
 }
@@ -747,7 +889,7 @@ Datum
 partdist_shard_clog_write(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 	int32		status = PG_GETARG_INT32(2);
 
 	switch ((TxnStatus) status)
@@ -813,13 +955,26 @@ ShardVacuumComputeTarget(Oid shard, TransactionId from, int64 safe_ts,
 		return InvalidTransactionId;
 	}
 
+	(void) ShardXidEnsureClaimed(shard);
 	if (!TransactionIdIsValid(from) || from < FIRST_SHARD_XID)
 		from = FIRST_SHARD_XID;
 
-	for (xid = from; xid < ceiling; xid++)
+	if (ShardXidDistance(from, ceiling) >= SHARD_XID_HALF)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("vacuum scan exceeds half-circle")));
+	}
+	for (xid = from; xid != ceiling; xid = ShardXidAdvance(xid, 1))
 	{
 		ShardClogSlot slot;
 
+		if (DtxPendingReferences(shard, xid) || ShardCommitIsActive(shard, xid))
+		{
+			if (stop_reason != NULL)
+				*stop_reason = "prepared-not-closed";
+			break;
+		}
 		if (!ShardClogReadSlot(shard, xid, &slot))
 		{
 			/*
@@ -863,7 +1018,7 @@ partdist_shard_vacuum_target(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
 	int64		safe_ts = PG_GETARG_INT64(1);
-	TransactionId ceiling = (TransactionId) PG_GETARG_INT64(2);
+	TransactionId ceiling = ShardXidFromSql(PG_GETARG_INT64(2));
 	TransactionId tb,
 				vx,
 				target;
@@ -891,7 +1046,7 @@ Datum
 partdist_shard_clog_write_ts(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 	int32		status = PG_GETARG_INT32(2);
 	int64		cts = PG_GETARG_INT64(3);
 
@@ -922,7 +1077,7 @@ Datum
 partdist_shard_clog_truncate(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId trunc_before = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId trunc_before = ShardXidFromSql(PG_GETARG_INT64(1));
 
 	PG_RETURN_INT32(ShardClogTruncate(shard, trunc_before));
 }
@@ -957,7 +1112,7 @@ Datum
 partdist_shard_clog_set_prepared(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId sxid = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 
 	ShardClogSetPrepared(shard, sxid, 1, 1);
 	PG_RETURN_VOID();
@@ -980,7 +1135,7 @@ Datum
 partdist_shard_xid_raise_watermark(PG_FUNCTION_ARGS)
 {
 	Oid			shard = PG_GETARG_OID(0);
-	TransactionId wm = (TransactionId) PG_GETARG_INT64(1);
+	TransactionId wm = ShardXidFromSql(PG_GETARG_INT64(1));
 
 	ShardXidRaiseAllocWatermark(shard, wm);
 	PG_RETURN_VOID();

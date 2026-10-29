@@ -81,40 +81,15 @@ typedef struct ShardCommitEntry
 	 * 的决议号覆盖 PRE_COMMIT 暂存值）。见 ShardCommitSetCommitTs。
 	 */
 	int64		commit_ts;
+	bool prepared;
+    uint32 decision_pins;
 } ShardCommitEntry;
 
 static HTAB *ShardCommitHash = NULL;
 static LWLock *ShardCommitLock = NULL;
 
-/* ---- 后端终局缓存（COMMITTED/ABORTED 不可变，读一次 clog 记住） ---- */
-
-typedef struct ShardVerdictCacheEntry
-{
-	ShardCommitKey key;
-	uint8		status;			/* TXN_COMMITTED / TXN_ABORTED */
-	int64		commit_ts;		/* T3.3：COMMITTED 的 TSO commit_ts（0=遗留） */
-} ShardVerdictCacheEntry;
-
-static HTAB *verdict_cache = NULL;
-
-static ShardVerdictCacheEntry *
-verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
-{
-	if (verdict_cache == NULL)
-	{
-		HASHCTL		ctl;
-
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(ShardCommitKey);
-		ctl.entrysize = sizeof(ShardVerdictCacheEntry);
-		ctl.hcxt = TopMemoryContext;
-		verdict_cache = hash_create("pg_partdist shard verdict cache",
-									256, &ctl,
-									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
-	return (ShardVerdictCacheEntry *) hash_search(verdict_cache, key,
-												  action, NULL);
-}
+/* Verdicts keyed only by a recyclable 32-bit number must never be cached
+ * across transactions. The durable clog is the source of terminal states. */
 
 /* ---- 内部：xid 状态判定 ---- */
 
@@ -147,7 +122,6 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 {
 	ShardCommitKey key;
 	ShardCommitEntry *e;
-	ShardVerdictCacheEntry *ce;
 	ShardClogSlot slot;
 	TimestampTz wait_start = 0;
 
@@ -194,6 +168,11 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 			LWLockRelease(ShardCommitLock);
 			break;				/* 已落账（或不在本次启动内）：往下查终局 */
 		}
+        if (e->prepared || !TransactionIdIsNormal(e->native_xid))
+        {
+            LWLockRelease(ShardCommitLock);
+            break; /* prepared is a reclaim blocker; visibility consults clog */
+        }
 		if (native_xid)
 			*native_xid = e->native_xid;
 		ects = e->commit_ts;
@@ -221,41 +200,15 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 		pg_usleep(1000L);
 	}
 
-	/* 终局缓存 */
-	ce = verdict_cache_search(&key, HASH_FIND);
-	if (ce != NULL)
-	{
-		if (cts_out)
-			*cts_out = ce->commit_ts;
-		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
-	}
 
-	/*
-	 * ★ T5.4 免查隐式冻结区（设计 §6 "免查区"、§7 回卷龄基点）：
-	 * `sxid < clog_truncate_before` 一律解释为"已提交、且早于 GlobalSafeTs
-	 * 因而对一切快照可见"，**不查 clog** —— 它的 clog 已经（或即将）被截掉，
-	 * 再去查只会读到空洞=RUNNING=不可见，已提交数据当场消失。
-	 *
-	 * 这条解释规则与 ShardClogTruncate 是**同一件事的两半**，缺一不可：
-	 * 没有它，截断就是纯粹的破坏动作；没有截断，它永远不生效（水位恒 0）。
-	 *
-	 * commit_ts 给 0 —— 遗留语义正是"对一切快照可见"（§4.1 的
-	 * `my_ts > 0 && cts >= my_ts` 判据在 cts=0 时恒不成立），恰是这里要的。
-	 * 免查区里 ABORTED 与 COMMITTED 已经分不出来了，而这**不是缺陷**：
-	 * 设计 §6.4 的 ① 与 ③ 保证进入免查区之前，中止事务的元组已被删掉、
-	 * 中止的 xmax 已被消毒成 0 —— 没有任何元组还会问到那些号。
-	 *
-	 * 放在这里（活跃表与终局缓存之后、clog 之前）是为了不给热读路径加锁：
-	 * 免查区的 xid 既不可能在活跃表里（§6.3 前缀扫描遇 RUNNING 即停），
-	 * 也早已不在任何人的手里。已知边界：终局缓存是后端本地、不作废，
-	 * 截断前缓存下的 ABORTED 会在本后端内继续报 ABORTED —— 由上一段的
-	 * "没有元组还会问到那些号"覆盖。
-	 */
+    /* Ordinary tuple XIDs are bounded by the live half-circle. Retained old
+     * xmin has the native frozen flag; retired aborted xmin/dead xmax was
+     * removed and aborted xmax invalidated before this frontier advanced. */
 	{
 		TransactionId frozen_before;
 
 		ShardVacuumGetWatermarks(shard, &frozen_before, NULL);
-		if (TransactionIdIsValid(frozen_before) && sxid < frozen_before)
+		if (TransactionIdIsValid(frozen_before) && ShardXidPrecedes(sxid, frozen_before))
 			return SXID_COMMITTED;	/* cts_out 已在函数开头置 0 */
 	}
 
@@ -271,9 +224,8 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	{
 		case TXN_COMMITTED:
 		case TXN_ABORTED:
-			ce = verdict_cache_search(&key, HASH_ENTER);
-			ce->status = (uint8) slot.status;
-			ce->commit_ts = (int64) slot.commit_ts;
+
+
 			if (cts_out)
 				*cts_out = (int64) slot.commit_ts;
 			return ((TxnStatus) slot.status == TXN_COMMITTED)
@@ -301,18 +253,16 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 
 					if (vd == 1)
 					{
-						ce = verdict_cache_search(&key, HASH_ENTER);
-						ce->status = (uint8) TXN_COMMITTED;
-						ce->commit_ts = dcts;
+
+
 						if (cts_out)
 							*cts_out = dcts;
 						return SXID_COMMITTED;
 					}
 					if (vd == 2)
 					{
-						ce = verdict_cache_search(&key, HASH_ENTER);
-						ce->status = (uint8) TXN_ABORTED;
-						ce->commit_ts = 0;
+
+
 						return SXID_ABORTED;
 					}
 
@@ -350,11 +300,10 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 							elog(LOG, "pg_partdist: 分片 %u xid %u（gxid %lld）登记已注销而槽位仍是 PREPARED，"
 								 "按本机学到的判决补落 %s（P7-N86）", shard, sxid,
 								 (long long) slot.global_xid, rv == 1 ? "COMMIT" : "ABORT");
-							ce = verdict_cache_search(&key, HASH_ENTER);
-							ce->status = (uint8) (rv == 1 ? TXN_COMMITTED : TXN_ABORTED);
-							ce->commit_ts = (rv == 1) ? rcts : 0;
+
+
 							if (cts_out)
-								*cts_out = ce->commit_ts;
+								*cts_out = (rv == 1) ? rcts : 0;
 							return (rv == 1) ? SXID_COMMITTED : SXID_ABORTED;
 						}
 					}
@@ -372,9 +321,8 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 							if ((TxnStatus) slot2.status == TXN_COMMITTED ||
 								(TxnStatus) slot2.status == TXN_ABORTED)
 							{
-								ce = verdict_cache_search(&key, HASH_ENTER);
-								ce->status = (uint8) slot2.status;
-								ce->commit_ts = (int64) slot2.commit_ts;
+
+
 								if (cts_out)
 									*cts_out = (int64) slot2.commit_ts;
 								return ((TxnStatus) slot2.status == TXN_COMMITTED)
@@ -1017,7 +965,7 @@ static const ShardVisibilityHooks sv_hooks = {
 
 void
 ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
-						   TransactionId native_xid)
+                           TransactionId native_xid, int64 start_ts)
 {
 	ShardCommitKey key;
 	ShardCommitEntry *e;
@@ -1032,7 +980,7 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	 * 领号作废（跳号无害），fail-closed。此刻 sxid 尚未写进任何元组，读者
 	 * 不可能查到它 —— 两步之间无竞态窗。
 	 */
-	ShardClogSetRunning(shard, sxid, TsoGetStartTs());
+	ShardClogSetRunning(shard, sxid, start_ts);
 
 	key.shard = shard;
 	key.sxid = sxid;
@@ -1050,6 +998,8 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	}
 	e->native_xid = native_xid;
 	e->commit_ts = 0;
+	e->prepared = false;
+    e->decision_pins = 0;
 	LWLockRelease(ShardCommitLock);
 }
 
@@ -1111,10 +1061,13 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 	key.shard = shard;
 	key.sxid = sxid;
 	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	if (hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL) == NULL)
-		elog(WARNING,
-			 "pg_partdist: 事务结束时活跃表缺条目（分片 %u，xid %u）",
-			 shard, sxid);
+    {
+        ShardCommitEntry *entry = hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+        if (entry && entry->decision_pins)
+        { entry->native_xid = InvalidTransactionId; entry->prepared = false; }
+        else
+            hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
+    }
 	LWLockRelease(ShardCommitLock);
 }
 
@@ -1137,6 +1090,120 @@ ShardCommitRemove(Oid shard, TransactionId sxid)
 	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
 	(void) hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
 	LWLockRelease(ShardCommitLock);
+}
+
+/* Keep native PREPARED transactions as reclaim blockers even after the global
+ * decision has reached clog and the pending-decision registry is closed. */
+void
+ShardCommitSetPrepared(Oid shard, TransactionId sxid, TransactionId native_xid)
+{
+    ShardCommitKey key = {shard, sxid};
+    ShardCommitEntry *e;
+    bool found;
+    LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+    e = hash_search(ShardCommitHash, &key, HASH_ENTER_NULL, &found);
+    if (!e)
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("prepared shard transaction table is full")));
+    if (!found) e->decision_pins = 0;
+    if (TransactionIdIsNormal(native_xid) || !found)
+        e->native_xid = native_xid;
+    e->commit_ts = 0;
+    e->prepared = true;
+    LWLockRelease(ShardCommitLock);
+}
+
+void
+ShardCommitClosePrepared(Oid shard, TransactionId sxid, TransactionId native_xid)
+{
+    ShardCommitKey key = {shard, sxid};
+    ShardCommitEntry *e;
+    LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+    e = hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+    if (e && e->prepared && e->native_xid == native_xid)
+    {
+        if (e->decision_pins == 0)
+            hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
+        else
+        { e->native_xid = InvalidTransactionId; e->prepared = false; }
+    }
+    LWLockRelease(ShardCommitLock);
+}
+
+bool
+ShardCommitHasActiveShard(Oid shard)
+{
+    HASH_SEQ_STATUS seq;
+    ShardCommitEntry *e;
+    bool active = false;
+    LWLockAcquire(ShardCommitLock, LW_SHARED);
+    hash_seq_init(&seq, ShardCommitHash);
+    while ((e = hash_seq_search(&seq)) != NULL)
+        if (e->key.shard == shard)
+        { active = true; hash_seq_term(&seq); break; }
+    LWLockRelease(ShardCommitLock);
+    return active;
+}
+
+bool
+ShardCommitIsActive(Oid shard, TransactionId sxid)
+{
+    ShardCommitKey key = {shard, sxid};
+    bool found;
+    if (!ShardCommitHash) return false;
+    LWLockAcquire(ShardCommitLock, LW_SHARED);
+    found = hash_search(ShardCommitHash, &key, HASH_FIND, NULL) != NULL;
+    LWLockRelease(ShardCommitLock);
+    return found;
+}
+
+bool
+ShardCommitBlocksRange(Oid shard, TransactionId from, TransactionId to)
+{
+    HASH_SEQ_STATUS seq;
+    ShardCommitEntry *e;
+    bool blocked = false;
+    LWLockAcquire(ShardCommitLock, LW_SHARED);
+    hash_seq_init(&seq, ShardCommitHash);
+    while ((e = hash_seq_search(&seq)) != NULL)
+        if (e->key.shard == shard && ShardXidInRange(e->key.sxid, from, to))
+        { blocked = true; hash_seq_term(&seq); break; }
+    LWLockRelease(ShardCommitLock);
+    return blocked;
+}
+
+void
+ShardCommitDecisionPin(Oid shard, TransactionId sxid)
+{
+    ShardCommitKey key = {shard, sxid};
+    ShardCommitEntry *e;
+    bool found;
+    LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+    e = hash_search(ShardCommitHash, &key, HASH_ENTER_NULL, &found);
+    if (!e)
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("shard decision pin table is full")));
+    if (!found)
+    {
+        e->native_xid = InvalidTransactionId;
+        e->commit_ts = 0; e->prepared = false; e->decision_pins = 0;
+    }
+    e->decision_pins++;
+    LWLockRelease(ShardCommitLock);
+}
+
+void
+ShardCommitDecisionUnpin(Oid shard, TransactionId sxid)
+{
+    ShardCommitKey key = {shard, sxid};
+    ShardCommitEntry *e;
+    LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
+    e = hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+    if (e && e->decision_pins)
+    {
+        e->decision_pins--;
+        if (!e->decision_pins && !TransactionIdIsNormal(e->native_xid))
+            hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
+    }
+    LWLockRelease(ShardCommitLock);
 }
 
 /* ---- 接线 ---- */

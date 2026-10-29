@@ -52,9 +52,12 @@ check() {
 
 NEG_RUN=0
 neg() {  # neg <名字> <期望片段> <SQL>
-  local hit
-  hit=$(PSQL "$WPORT" -Atc "$3" </dev/null 2>&1 | grep -c "$2")
-  check "负向:$1" "$hit" "1"
+  local output hit rc=0 matched=0
+  output=$(PSQL "$WPORT" -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -Atc "$3" </dev/null 2>&1) || rc=$?
+  hit=$(grep -Ec "$2" <<< "$output") || true
+  if [[ "$rc" -ne 0 && "$hit" == 1 ]]; then matched=1; fi
+  check "负向:$1" "$matched" "1"
+  if [[ "$matched" != 1 ]]; then printf '        psql exit=%s\n%s\n' "$rc" "$output"; fi
   NEG_RUN=$((NEG_RUN+1))
 }
 
@@ -467,7 +470,7 @@ PSQL "$WPORT" -Atc "SELECT sclog_wts($OE::oid, g::bigint, 2, $CTS_COMMITTED::big
 check "构造后可见 2 行" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5e" </dev/null)" "2"
 check "初始水位 0/0"    "$(WM "$OE")" "0/0"
 # ★★ 核心验收：页未清完就截断，必须被拦
-neg "★ 页未清完即拒截断" "不许截断 clog" \
+neg "★ 页未清完即拒截断" "55000: .*outside completed interval" \
     "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
 check "被拦后水位仍 0/0" "$(WM "$OE")" "0/0"
 # 注入"趟标记落后于目标"：先只清到一半的号，再想截到全量
@@ -476,8 +479,9 @@ SW0=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||(sanitized+removed_aborted+removed_
 N0=$(echo "$SW0" | cut -d/ -f2)
 check "半程 sweep 干净收尾" "$(echo "$SW0" | cut -d/ -f1,3,4)" "true/0/0"
 check "半程 sweep 后标记 = $HALF" "$(WM "$OE")" "0/$HALF"
-neg "★ 趟标记落后于目标即拒" "不许截断 clog" \
+neg "★ 趟标记落后于目标即拒" "55000: .*outside completed interval" \
     "SELECT partdist.shard_clog_truncate($OE::oid, $TE::bigint)"
+check "趟标记落后时拒绝后水位不变" "$(WM "$OE")" "0/$HALF"
 neg "trunc_before 超过下一个待发号即拒" "超过下一个待发号" \
     "SELECT swept FROM partdist.shard_vacuum_sweep('p5e'::regclass, 999999::bigint)"
 check "负向计数守卫（累计应跑 8 条）" "$NEG_RUN" "8"
@@ -579,8 +583,9 @@ SQL
 check "★ 有页被 pin 住时 sweep 不完整（swept=false 且有跳页）" \
       "$(echo "$SK" | grep -c '^false/[1-9]')" "1"
 check "★ 不完整的趟不落标记（水位仍 0/0）" "$(WM "$OH")" "0/0"
-neg "不完整的趟之后仍拒截断" "不许截断 clog" \
+neg "不完整的趟之后仍拒截断" "55000: .*outside completed interval" \
     "SELECT partdist.shard_clog_truncate($OH::oid, $TH::bigint)"
+check "不完整的趟拒绝截断后水位仍 0/0" "$(WM "$OH")" "0/0"
 check "负向计数守卫（累计应跑 9 条）" "$NEG_RUN" "9"
 # 游标随事务结束释放 ⇒ 整趟重来即可（这正是状态一的恢复动作）
 SW2=$(PSQL "$WPORT" -Atc "SELECT swept||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('p5h'::regclass, $TH::bigint)" </dev/null)

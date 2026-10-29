@@ -412,6 +412,15 @@ typedef struct TxnMarkerPayload
  * 载荷 = PartWALCtrlBaselineEnd{base_plsn}。
  */
 #define PARTWAL_CTRL_BASELINE_END    UINT8_C(0x07)
+/* A physical baseline includes its 32-bit allocator and reclamation frontiers. */
+#define PARTWAL_CTRL_SHARD_XID_STATE UINT8_C(0x08)
+typedef struct PartWALCtrlShardXidState
+{
+    uint32 alloc_wm;
+    uint32 trunc_before;
+    uint32 vacuum_xid;
+    uint32 reserved;
+} PartWALCtrlShardXidState;
 
 typedef struct PartWALCtrlBaselineEnd
 {
