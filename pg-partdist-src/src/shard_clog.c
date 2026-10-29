@@ -672,14 +672,13 @@ ShardClogTruncate(Oid shard, TransactionId trunc_before)
 	 */
 	if (trunc_before > cur_tb)
 	{
-		ShardVacuumSetWatermarks(shard, trunc_before, vacuum_xid);
-
 		/*
-		 * §6.7：两个水位作为 CTRL 记录写进本分片流，follower 据此建立同一个
-		 * 免查区。放在推水位之后、删文件之前 —— 与"先推水位后删文件"同一个
-		 * 理由：先让语义到位，再回收空间。尽力而为，失败不影响本次截断。
+		 * VACU: publish the durable certificate to the data group FIRST. An
+		 * emission/quorum failure must leave the local reclamation frontier
+		 * unchanged. Retrying the absolute watermark record is idempotent.
 		 */
 		ShardVacuumEmitWatermarkCtrl(shard, trunc_before, vacuum_xid);
+		ShardVacuumSetWatermarks(shard, trunc_before, vacuum_xid);
 	}
 
 	/* 只删完全落在 trunc_before 以下的整段；跨界那一段留着 */

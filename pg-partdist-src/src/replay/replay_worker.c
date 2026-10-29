@@ -864,7 +864,7 @@ ReplayDrainAndApplyFreeze(Oid shard_oid)
 
     if (have_wm)
     {
-        ShardVacuumSetWatermarks(shard_oid, wm_tb, wm_vx);
+        ShardVacuumReplayWatermarks(shard_oid, wm_tb, wm_vx);
         ereport(DEBUG1,
                 (errmsg("pg_partdist replay: shard %u vacuum 水位已落盘（%u/%u）",
                         shard_oid, wm_tb, wm_vx)));

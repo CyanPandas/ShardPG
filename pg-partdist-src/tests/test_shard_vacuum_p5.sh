@@ -725,8 +725,8 @@ check "★ 推进截断点后相位降回 0" "$(PHASE "$OJ")" "0"
 PSQL "$WPORT" -q -c "INSERT INTO p5j VALUES (999,'unlocked');" </dev/null >/dev/null
 check "★ 解锁后写入恢复" "$(PSQL "$WPORT" -Atc "SELECT count(*) FROM p5j WHERE id=999" </dev/null)" "1"
 check "负向计数守卫（累计应跑 10 条）" "$NEG_RUN" "10"
-set_guc pg_partdist.shard_vacuum_max_age 200000000 >/dev/null
 set_guc pg_partdist.shard_xid_stop_age 2146483648 >/dev/null
+set_guc pg_partdist.shard_vacuum_max_age 200000000 >/dev/null
 check "阈值已复位" "$(PSQL "$WPORT" -Atc "SELECT max_age||'/'||stop_age FROM partdist.shard_xid_age($OJ::oid)" </dev/null)" "200000000/2146483648"
 
 echo "========== [30] 清场 =========="

@@ -134,5 +134,8 @@ extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 									 TransactionId *vacuum_xid);
 extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 									 TransactionId vacuum_xid);
+/* Replay may repeat an older durable prefix after a crash; never regress it. */
+extern void ShardVacuumReplayWatermarks(Oid shard, TransactionId trunc_before,
+                                      TransactionId vacuum_xid);
 
 #endif							/* SHARD_XID_H */

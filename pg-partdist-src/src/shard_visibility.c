@@ -21,7 +21,8 @@
  *   - 自见性按元组原始 cid 近似：同事务内"插入后又更新/删除同一行"会把
  *     cmin 覆盖成 cmax（内核 AdjustCmax 对分片 xid 不生成 combo cid），
  *     记录为已知限制，验收用例避开。
- *   - 一律不读不写 hint 位（§4.5）。
+ *   - 普通 hint 位不作为判决依据；VACU 唯一例外是 vacuum 持久化的
+ *     HEAP_XMIN_FROZEN。xmin 使用 GetXmin，冻结先于自见性/缓存/clog 判定。
  */
 #include "pg_partdist.h"
 #include "shard_xid.h"
@@ -630,7 +631,7 @@ sv_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	 */
 	my_ts = TsoGetStartTs();
 
-	switch (shard_xid_state_ex(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts, true))
+	switch (shard_xid_state_ex(shard, HeapTupleHeaderGetXmin(tuple), NULL, &cts, true))
 	{
 		case SXID_MY_OWN:
 			/* 本命令开始之后才插入的行不可见（cid 近似，见文件头） */
@@ -691,7 +692,7 @@ sv_satisfies_self(HeapTuple htup, Buffer buffer, bool *visible)
 
 	ShardAccessGate(shard, "Self 读");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetXmin(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 			break;				/* 自己的插入立即可见（不看 cid） */
@@ -741,7 +742,7 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 
 	/* 调用方约定：入口已把 snapshot->xmin/xmax 置 Invalid（内核分叉点保证） */
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), &native, NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetXmin(tuple), &native, NULL))
 	{
 		case SXID_MY_OWN:
 			break;
@@ -800,7 +801,7 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 	/* T3.4：写侧到达这里前必经过扫描（快照已取），通常是缓存命中 */
 	my_ts = TsoGetStartTs();
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetXmin(tuple), NULL, &cts))
 	{
 		case SXID_MY_OWN:
 			if (HeapTupleHeaderGetRawCommandId(tuple) >= curcid)
@@ -967,7 +968,7 @@ sv_satisfies_vacuum(HeapTuple htup, Buffer buffer, int *res)
 
 	ShardAccessGate(shard, "vacuum 类读判定");
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, NULL))
+	switch (shard_xid_state(shard, HeapTupleHeaderGetXmin(tuple), NULL, NULL))
 	{
 		case SXID_MY_OWN:
 		case SXID_RUNNING:

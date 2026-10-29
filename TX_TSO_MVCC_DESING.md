@@ -387,14 +387,19 @@ GUC 白名单 `pg_partdist.shard_relids` 仍保留为测试通道；`partdist_se
 
 | 变量 | 持久化 | 语义 |
 |---|---|---|
-| `clog_truncate_before` | 是（CTRL 记录+checkpoint） | 本分片 clog 实际截断到哪；**隐式 freeze 点**、回卷龄的基点 |
+| `clog_truncate_before` | 是（CTRL 记录+checkpoint） | 本分片已安全回收边界；显式冻结完成后推进，亦为回卷龄基点 |
 | `ShardVacuumXid` | 是（CTRL 记录+checkpoint） | **整趟完成水印**（不是逐 xid 游标）：本次 vacuum 在页面侧实际完成到哪 |
 | `VacuumTargetXid` | 否，每次实时计算 | 本次按 GlobalSafeTs 扫 clog 得到的理论可达位置 |
 
-**隐式 freeze**：截断之后，凡 `xid < clog_truncate_before` 一律解释为"已提交且对
-一切现在与未来快照可见"。成立依据：前缀规则保证截断点以下全是 committed 且
-commit_ts < GlobalSafeTs，而未来一切快照 start_ts ≥ GlobalSafeTs。**不需要改写
-xmin**——页面不动，对逐字节回放验收（pagecmp）是重大利好。
+**显式 freeze（VACU，2026-10-29）**：完整清理趟在主堆与 TOAST 上给安全的已提交
+插入设置 PG 原生 `HEAP_XMIN_FROZEN`。保留原始 xmin 数值供诊断，但可见性通过
+`HeapTupleHeaderGetXmin()` 先识别冻结，绝不再拿原值查新一轮事务或判断自见性。
+冻结只证明插入已全局可见，删除/更新仍按 xmax 裁决。页面修改使用原生
+`heap_freeze_execute_prepared()` 发 FREEZE_PAGE WAL，不能由读路径直接写提示位。
+
+原 `xid < clog_truncate_before` 隐式规则仅用于兼容未转换的旧页面；下一次完整清理
+趟也须把这些页面显式冻结。此兼容规则不构成开启循环复用的依据。
+详细协议、验证与尚未启用的循环分配见 [VACU_DESIGN](pg-partdist-src/docs/VACU_DESIGN.md)。
 
 ### 6.2 GlobalSafeTs
 
@@ -431,13 +436,19 @@ PG visibility map 类似物）：
 1. **删中止 xmin 的元组**——否则截断后该 xmin 落入免查区被解释为"已提交全可见"，
    中止事务的幽灵行复活；
 2. **删 xmax 已提交且 commit_ts(xmax) < GlobalSafeTs 的死元组**（可回收与否看
-   xmax 不看 xmin：没被删过的老行是活的，零页面动作）；含索引项清理，两阶段
+   xmax 不看 xmin：没被删过的老行必须保留，随后对其安全 xmin 显式冻结）；含索引项清理，两阶段
    （收集死 TID → 清索引 → 回收行指针）；
 3. **xmax 消毒**：把截断点以下的 ABORTED xmax 与 lock-only xmax 清成 Invalid(0)
    ——否则截断后"中止了的删除"读成"早已提交的删除"，活行被判死。
    （即 `heap_prepare_freeze_tuple` 的 xmax 处置换形态重现。）
 
-**顺序铁律：数据页、索引、堆等全部清完，才许动 clog。**
+4. **冻结保留的老行 xmin**：已冻结直接跳过；新回收前缀内的已提交 xmin 才能冻结；
+   旧隐式冻结前缀内的行也转换。仍未移除的中止元组计作推迟，禁止推进边界。
+
+**顺序铁律：数据页、索引、主堆/TOAST 清理与冻结全部完成 → 本机 WAL 持久化 →
+复制分区的页面修改达持久多数派 → 页面趟完成标记 → 水位 CTRL 达持久多数派 →
+本机回收边界持久化 → 删除旧 clog 文件。** 任一复制错误不得降为 WARNING 后继续。
+手工 sweep 也必须重新通过 GlobalSafeTs 前缀检查，不能凭调用者传入 cutoff 绕过。
 
 ### 6.5 中断恢复（两态）
 
@@ -499,21 +510,27 @@ clog 行以 RUNNING 落账后、事务未到提交/中止时崩溃 ⇒ 该行永
   follower 逐字节回放——follower 不跑自己的 vacuum。
 - 两个水位作为 **CTRL 记录**写进本分片流（现成 FREEZE_UPDATE 通道换语义）。
   "页在前、截断在后"由**流序自动保证**——leader 崩溃恢复按 WAL 序、follower 按
-  流序，顺序铁律在所有副本上同时成立，无需额外协议。checkpoint 收口，与现有
-  apply_checkpoint 一致。
+  流序。副本 checkpoint 必须先刷盘并 fsync 页面，再持久化分片发号/回收水位，
+  最后推进持久回放游标；只把水位发布到共享内存不算完成。旧水位重放幂等且不后退。
 
 ---
 
 ## 7 回卷防护（分片级）
 
-`xid_age = (next_xid − clog_truncate_before) mod 2^32`。
+目标环形协议：`xid_age = (next_xid − 安全回收边界) mod 2^32`。
+本分支仍保留线性分配及绝对上限停发；**不把本轮三项安全改动宣称为已启用回卷**。
+开启环形分配还须完成轮次/缓存/账本槽复用与恢复格式的迁移及跨回卷验收。
+
+启动线默认 200,000,000；停止线默认且最大 2³¹−1,000,000。
+必须满足 `1 <= 启动线 < 停止线 <= 2³¹−1,000,000`，配置检查拒绝相等或倒置。
+调低两条线先降低启动线，调高先提高停止线；检查在配置生效时执行。
+分配前逐号检查，跳过已有终局槽也计入年龄；批量预留和升主跳号不得越过停止线。
 
 - **基点必须是 clog_truncate_before 而非 ShardVacuumXid**：歧义边界挂在解释规则
   （免查隐式冻结区）上；"趟完未截断"崩溃窗口里 ShardVacuumXid 跑在前面，用它算龄
   会把紧迫度算小，方向不安全。平时两者相等。
-- **阶段 1**（`autovacuum_freeze_max_age` 分片版）：到龄强制启动分片防回卷 vacuum，
-  **无视常规 vacuum 开关**（§13 约束 5 的教训：防回卷本就不理会
-  autovacuum_enabled=off）。
+- **阶段 1**：达到启动线，由自定义心跳启动分片回收，不走原生表 autovacuum。
+  自定义 `shard_vacuum_auto=off` 仍是紧急停后台开关；关闭不会解除停发保护。
 - **阶段 2**（`xidStopLimit` 分片版）：age 达 2^31 − 安全边距（如 10^6）时拒发新
   xid，**该分片进只读**——护栏是分片粒度，不殃及节点和集群。
 - 实话两条：拒发只是止血，解锁必须解决前缀阻挡者——超龄 RUNNING 事务按策略强杀，

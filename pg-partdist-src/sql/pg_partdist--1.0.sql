@@ -596,7 +596,7 @@ CREATE OR REPLACE FUNCTION shard_remove_dead(
 COMMENT ON FUNCTION shard_remove_dead(REGCLASS, BIGINT) IS
     'T5.3c：删已提交删除的死元组（设计 §6.4 ②）。判据只看 xmax：clog COMMITTED 且 xmax < p_trunc_before 即删；xmax 为空/中止/lock-only 一律不动。与 shard_remove_aborted 共用同一条页面通路（PRUNE + VACUUM 两条内核记录），定义域互不相交。带索引即 ERROR（索引两阶段未实现）。';
 
--- T5.4（设计 §6.4 顺序铁律）：一整趟页面动作 ③→①→②。
+-- VACU：先验证全局安全前缀，再按 ③→①→②→显式冻结 扫主堆及 TOAST。
 -- **只有整趟干净**（pages_skipped=0 且 tuples_deferred=0）才落"趟完"标记
 -- shard_vacuum_xid = p_trunc_before —— 这是 shard_clog_truncate 唯一认的凭据。
 CREATE OR REPLACE FUNCTION shard_vacuum_sweep(
@@ -611,7 +611,7 @@ CREATE OR REPLACE FUNCTION shard_vacuum_sweep(
     AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_sweep';
 
 COMMENT ON FUNCTION shard_vacuum_sweep(REGCLASS, BIGINT) IS
-    'T5.4：一整趟页面动作（③ xmax 消毒 → ① 删中止 xmin → ② 删已提交删除的死元组）。③ 必须最先——① 对"仍挂 HOT 链的 heap-only 元组"的推迟要靠 ③ 清 xmax 才解除。整趟干净才落 shard_vacuum_xid 标记，否则返回 swept=false 且不动水位，截断随之被拦。';
+    'VACU：GlobalSafeTs 校验通过后，主堆/TOAST 依次执行 xmax 消毒、删中止插入、删死元组、PG 显式 xmin 冻结。冻结保留原始 xmin，读取通过冻结标记跳过旧事务状态。页面 WAL 持久化及复制完成、无跳页/推迟后才落完成标记。';
 
 -- T7.17（P7-V1）：分片 vacuum 自动启动器。
 -- 把"到龄了该跑 vacuum"从一条 WARNING 变成真的会跑：逐个到龄分片走
@@ -637,7 +637,7 @@ RETURNS INTEGER LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'partdist_shard_clog_truncate';
 
 COMMENT ON FUNCTION shard_clog_truncate(OID, BIGINT) IS
-    'T5.4：截断分片 clog 到 p_trunc_before（开区间上界；此后 xid < 该值进入免查隐式冻结区）。要求 p_trunc_before <= shard_vacuum_xid（顺序铁律：页没清完不许动 clog），否则 ERROR。先推水位后删文件——反过来一旦中途崩溃，clog 没了而水位还说要查 clog，已提交数据当场消失。按段整删，返回删掉的段文件数。';
+    'VACU：先同步复制水位 CTRL，再持久化本地回收边界，最后截断分片 clog 到 p_trunc_before（开区间上界；此后 xid < 该值进入免查隐式冻结区）。要求 p_trunc_before <= shard_vacuum_xid（顺序铁律：页没清完不许动 clog），否则 ERROR。先推水位后删文件——反过来一旦中途崩溃，clog 没了而水位还说要查 clog，已提交数据当场消失。按段整删，返回删掉的段文件数。';
 
 -- T5.5（设计 §6.5）：两态恢复。
 --   clog_truncate_before == shard_vacuum_xid ⇒ 无未完成的趟，返回 'nothing'

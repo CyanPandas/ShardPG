@@ -1,8 +1,8 @@
 /*
  * shard_vacuum.c
  *
- * 分片级 vacuum 的页面动作（设计 §6.4，P5 T5.3）。当前实现 ③ xmax 消毒
- * （T5.3a）。
+ * 分片级 vacuum：xmax 消毒、垃圾清理、主堆/TOAST 显式 xmin 冻结。
+ * VACU：冻结采用 PG HEAP_XMIN_FROZEN + 原生 FREEZE_PAGE WAL。
  *
  * ★ 为什么不走内核的 heap_prepare_freeze_tuple（动手前的勘察结论）
  *
@@ -63,6 +63,7 @@
 #include "shard_vacuum.h"
 #include "partwal_sync.h"	/* T7.27：分叉自动修复的触发位 */
 #include "shard_xid.h"
+#include "shard_fileset.h"
 
 /*
  * 两个页面动作的共同开场：认分片、拒绝无意义/后退的 trunc_before、取当前
@@ -342,7 +343,7 @@ prune_tuple_is_dead(Oid shard, HeapTupleHeader tuple, ShardVacuumPruneMode mode,
 {
 	if (mode == SVP_ABORTED_XMIN)
 	{
-		TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple);
+		TransactionId xmin = HeapTupleHeaderGetXmin(tuple);
 
 		/* 冻结/无效 xmin：不是分片 xid，不归本动作管 */
 		if (!TransactionIdIsNormal(xmin))
@@ -938,7 +939,74 @@ ShardVacuumRemoveDeadTuples(Relation rel, TransactionId trunc_before,
 /* T5.4：一整趟页面动作 —— 顺序铁律的凭据来源                          */
 /* ================================================================== */
 
-/* 对一张关系（主堆或它的 TOAST）按 ③→①→② 跑一遍，计数累加进 stats */
+/*
+ * VACU: retain raw xmin for diagnostics, but retire its transaction identity.
+ * heap_freeze_execute_prepared writes the native FREEZE_PAGE record; setting a
+ * hint bit directly here would lose the freeze on crash or on a replica.
+ * The complete prefix was checked against GlobalSafeTs before any page work.
+ * Legacy implicitly-frozen rows below cur_tb must also be converted: their
+ * clog segment may already have been removed by the previous implementation.
+ */
+static void
+shard_vacuum_freeze_pass(Relation rel, Oid shard, TransactionId cur_tb,
+						 TransactionId trunc_before, ShardVacuumPageStats *stats)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	BlockNumber blkno;
+
+	for (blkno = 0; blkno < nblocks; blkno++)
+	{
+		Buffer buf;
+		Page page;
+		OffsetNumber off;
+		OffsetNumber maxoff;
+		HeapTupleFreeze frozen[MaxHeapTuplesPerPage];
+		int nfrozen = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		stats->pages_scanned++;
+		maxoff = PageIsNew(page) ? InvalidOffsetNumber : PageGetMaxOffsetNumber(page);
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId item = PageGetItemId(page, off);
+			HeapTupleHeader tuple;
+			TransactionId xmin;
+			HeapTupleFreeze *frz;
+
+			if (!ItemIdIsNormal(item))
+				continue;
+			tuple = (HeapTupleHeader) PageGetItem(page, item);
+			xmin = HeapTupleHeaderGetXmin(tuple);
+			if (!TransactionIdIsNormal(xmin) || xmin >= trunc_before)
+				continue;
+			if (xmin >= cur_tb &&
+				shard_vacuum_status(shard, xmin, "xmin", trunc_before, cur_tb) != TXN_COMMITTED)
+			{
+				/* Unremoved aborted tuples prohibit advancing the watermark. */
+				stats->tuples_deferred++;
+				continue;
+			}
+			frz = &frozen[nfrozen++];
+			memset(frz, 0, sizeof(*frz));
+			frz->offset = off;
+			frz->xmax = HeapTupleHeaderGetRawXmax(tuple);
+			frz->t_infomask = tuple->t_infomask | HEAP_XMIN_FROZEN;
+			frz->t_infomask2 = tuple->t_infomask2;
+		}
+		if (nfrozen > 0)
+		{
+			heap_freeze_execute_prepared(rel, buf, InvalidTransactionId, frozen, nfrozen);
+			stats->pages_dirtied++;
+		}
+		UnlockReleaseBuffer(buf);
+		PartWALBackpressure();
+	}
+}
+
+/* Main heap and TOAST: sanitize, remove aborted/dead tuples, then freeze. */
 static void
 sweep_one_rel(Relation rel, Oid shard, TransactionId cur_tb,
 			  TransactionId trunc_before, ShardVacuumPageStats *stats,
@@ -972,6 +1040,8 @@ sweep_one_rel(Relation rel, Oid shard, TransactionId cur_tb,
 	stats->pages_dirtied += one.pages_dirtied;
 	stats->pages_skipped += one.pages_skipped;
 	stats->tuples_deferred += one.tuples_deferred;
+
+	shard_vacuum_freeze_pass(rel, shard, cur_tb, trunc_before, stats);
 }
 
 /* ================================================================== */
@@ -1126,6 +1196,20 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 	if (!shard_vacuum_begin(rel, trunc_before, &shard, &cur_tb))
 		return false;
 
+	/* A maintenance caller must not bypass snapshot safety with a made-up cutoff. */
+	if (cur_tb != trunc_before)
+	{
+		const char *reason = NULL;
+		TransactionId target = ShardVacuumComputeTarget(shard, cur_tb,
+												 TsoGetGlobalSafeTs(), trunc_before, &reason);
+
+		if (!TransactionIdIsValid(target) || target != trunc_before - 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("分片 %u 的清理目标 %u 未通过全局快照安全检查", shard, trunc_before),
+					 errdetail("停止原因：%s。", reason ? reason : "no-target")));
+	}
+
 	sweep_one_rel(rel, shard, cur_tb, trunc_before, stats,
 				  sanitized, removed_aborted, removed_dead);
 
@@ -1203,6 +1287,9 @@ ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 	 * **任何一个'已经做完'的持久断言，都不能先于它所断言的那件事持久。**
 	 */
 	XLogFlush(GetXLogInsertRecPtr());
+
+	/* Quorum must know the page changes before the local completion certificate. */
+	ShardVacuumSyncPages(shard);
 
 	/*
 	 * 落"趟完"标记（设计 §6.5 两态之二："趟完、截断前"）。

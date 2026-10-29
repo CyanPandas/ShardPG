@@ -2516,16 +2516,18 @@ ShardReplayDoCheckpoint(ShardReplayCtx *ctx)
     }
 
     /*
-     * 冻结账目发布到槽位（§13 约束 5）。放在写游标之前，是为了让"游标之前
-     * 的效果都已就绪"这句话对它也成立 —— 尽管真正落 pg_class 的是
-     * replay_catchup 的调用方。
-     *
-     * 已知的**尽力而为**边界：槽位在共享内存里，节点崩溃即丢，而 leader 侧
-     * 的基线已记为"已发"、不会重发。后果只是这一轮账目滞后 —— leader 下次
-     * vacuum 推进 relfrozenxid 时会再发一条补上。对一个以千万 xid 为尺度
-     * 变化的账目字段，这个语义够用；要精确一次得把它也放进 apply_checkpoint
-     * 快照并动 checkpoint 格式版本，不值当。
+     * VACU: pages have been flushed and fsynced above. Persist allocator and
+     * reclamation certificates BEFORE advancing the durable replay cursor.
+     * Publishing these only in shmem lost them on a crash after checkpoint.
+     * These functions use files/shmem only; the worker needs no catalog access.
      */
+    if (ctx->pending_alloc_wm != 0)
+        ShardXidRaiseAllocWatermark(ctx->shard_oid, ctx->pending_alloc_wm);
+    if (ctx->pending_vacuum_wm)
+        ShardVacuumReplayWatermarks(ctx->shard_oid, ctx->pending_trunc_before,
+                                   ctx->pending_vacuum_xid);
+
+    /* Catalog freeze metadata remains deferred to a database backend. */
     ShardReplayPublishPendingFreeze(ctx);
 
     /* xid_map 快照：与头同在一个 tmp 文件里原子落盘（§8.4） */

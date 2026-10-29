@@ -1138,6 +1138,22 @@ FreezeEntriesEqual(const PartWALFreezeEntry *a, int na,
  * 以及 follower 侧（那里天然没有持久化 fileset）。
  */
 void
+ShardVacuumSyncPages(Oid shard_oid)
+{
+    ShardFileSet probe;
+    char *reason;
+
+    if (!LoadShardFileSet(shard_oid, &probe))
+        return;
+    PartWALFlush(InvalidXLogRecPtr, false);
+    reason = ShardDivergedReason(shard_oid);
+    if (reason != NULL)
+        ereport(ERROR,
+                (errmsg("shard %u cannot certify vacuum on a diverged stream", shard_oid),
+                 errdetail("%s", reason)));
+}
+
+void
 ShardVacuumEmitWatermarkCtrl(Oid shard_oid, TransactionId trunc_before,
                              TransactionId vacuum_xid)
 {
@@ -1145,10 +1161,10 @@ ShardVacuumEmitWatermarkCtrl(Oid shard_oid, TransactionId trunc_before,
     PartWALCtrlFreezeUpdate  *payload;
     PartWALFreezeVacuumWm    *wm;
     uint32                    payload_len;
-    MemoryContext             oldcxt;
 
     if (!IsTransactionState() || !OidIsValid(MyDatabaseId))
-        return;
+        ereport(ERROR,
+                (errmsg("vacuum watermark emission requires a database transaction")));
     if (!LoadShardFileSet(shard_oid, &probe))
         return;                 /* 不是本节点维护的复制分区 */
 
@@ -1160,29 +1176,12 @@ ShardVacuumEmitWatermarkCtrl(Oid shard_oid, TransactionId trunc_before,
     wm->clog_truncate_before = (uint32) trunc_before;
     wm->shard_vacuum_xid     = (uint32) vacuum_xid;
 
-    oldcxt = CurrentMemoryContext;      /* 必须在 PG_TRY 之前存 */
-    PG_TRY();
-    {
-        PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FREEZE_UPDATE,
-                          (const char *) payload, payload_len);
-        ereport(DEBUG1,
-                (errmsg("pg_partdist: shard %u vacuum 水位已发射（%u/%u）",
-                        shard_oid, trunc_before, vacuum_xid)));
-    }
-    PG_CATCH();
-    {
-        ErrorData *ed;
-
-        MemoryContextSwitchTo(oldcxt);
-        ed = CopyErrorData();
-        FlushErrorState();
-        ereport(WARNING,
-                (errmsg("pg_partdist: shard %u vacuum 水位发射失败（%s）——"
-                        "follower 免查区暂时落后，下一轮截断会补上",
-                        shard_oid, ed->message)));
-        FreeErrorData(ed);
-    }
-    PG_END_TRY();
+    /* DATA must reach durable quorum before its completion certificate. */
+    ShardVacuumSyncPages(shard_oid);
+    /* PartWALAppendCtrl fsyncs the record and synchronously replicates it.
+     * Errors must propagate: the caller has not advanced the local frontier. */
+    PartWALAppendCtrl(shard_oid, PARTWAL_CTRL_FREEZE_UPDATE,
+                      (const char *) payload, payload_len);
 
     pfree(payload);
 }

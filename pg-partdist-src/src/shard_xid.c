@@ -55,6 +55,33 @@ static int	shard_vacuum_max_age = 200000000;
 bool		shard_vacuum_auto_enabled = true;	/* T7.17：自动启动器开关 */
 static int	shard_xid_stop_age = 2146483648;
 
+/* Both cutoffs must fit strictly inside the unambiguous half-circle. */
+#define SHARD_XID_MAX_STOP_AGE 2146483648
+
+static bool
+check_shard_vacuum_max_age(int *newval, void **extra, GucSource source)
+{
+	if (*newval >= shard_xid_stop_age)
+	{
+		GUC_check_errdetail("shard_vacuum_max_age must be less than shard_xid_stop_age (%d).",
+						   shard_xid_stop_age);
+		return false;
+	}
+	return true;
+}
+
+static bool
+check_shard_xid_stop_age(int *newval, void **extra, GucSource source)
+{
+	if (*newval <= shard_vacuum_max_age)
+	{
+		GUC_check_errdetail("shard_xid_stop_age must exceed shard_vacuum_max_age (%d).",
+						   shard_vacuum_max_age);
+		return false;
+	}
+	return true;
+}
+
 /* ---- T1.1：GUC 白名单 ---- */
 
 /*
@@ -642,8 +669,8 @@ partdist_shard_vacuum_watermarks(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	ShardVacuumGetWatermarks(shard, &tb, &vx);
-	values[0] = TransactionIdGetDatum(tb);
-	values[1] = TransactionIdGetDatum(vx);
+	values[0] = Int64GetDatum((int64) tb);
+	values[1] = Int64GetDatum((int64) vx);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
@@ -793,6 +820,7 @@ ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 						 TransactionId *vacuum_xid)
 {
 	int			i;
+	bool		found = false;
 
 	if (trunc_before != NULL)
 		*trunc_before = 0;
@@ -807,6 +835,7 @@ ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 	{
 		if (ShardXidCtl->slots[i].shard_relid == shard)
 		{
+			found = true;
 			if (trunc_before != NULL)
 				*trunc_before = ShardXidCtl->slots[i].trunc_before;
 			if (vacuum_xid != NULL)
@@ -821,8 +850,7 @@ ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 	 * **跨重启的持久事实**，不能因为"这次还没建槽"就报 0（那会让回卷龄
 	 * 算出天文数字、误触阶段 2 拒发号）。
 	 */
-	if (trunc_before != NULL && *trunc_before == 0 &&
-		vacuum_xid != NULL && *vacuum_xid == 0)
+	if (!found)
 	{
 		TransactionId a,
 					c;
@@ -839,6 +867,10 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 
 	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
 	slot = shard_xid_slot_attach(shard, NULL);
+	if (trunc_before < slot->trunc_before || vacuum_xid < slot->vacuum_xid)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("分片 %u 的 vacuum 水位不许后退", shard)));
 
 	/*
 	 * ★ 顺序要害（2026-08-18 实测踩到）：**先落盘、成功了才更新槽位**。
@@ -852,6 +884,24 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 	slot->trunc_before = trunc_before;
 	slot->vacuum_xid = vacuum_xid;
 	LWLockRelease(ShardXidCtl->lock);
+}
+
+/* Called only after the replica pages are durable. Replayed prefixes are
+ * idempotent, including a crash between watermark persistence and checkpoint. */
+void
+ShardVacuumReplayWatermarks(Oid shard, TransactionId trunc_before,
+                           TransactionId vacuum_xid)
+{
+    TransactionId tb, vx;
+
+    if (trunc_before > vacuum_xid)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("分片 %u 的回放回收水位超过页面完成水位", shard)));
+    ShardVacuumGetWatermarks(shard, &tb, &vx);
+    if (trunc_before <= tb && vacuum_xid <= vx)
+        return;
+    ShardVacuumSetWatermarks(shard, Max(tb, trunc_before), Max(vx, vacuum_xid));
 }
 
 /*
@@ -1122,10 +1172,10 @@ shard_xid_allocate(Oid shard)
 
 	slot = shard_xid_slot_attach(shard, NULL);
 
-	shard_xid_wraparound_gate(shard, slot);
-
 	for (;;)
 	{
+		/* Skipped old slots consume distance too; check on every iteration. */
+		shard_xid_wraparound_gate(shard, slot);
 		if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -1134,7 +1184,10 @@ shard_xid_allocate(Oid shard)
 
 		if (slot->next_xid >= slot->watermark)
 		{
-			TransactionId new_wm = slot->next_xid + SHARD_XID_BATCH;
+			uint64 stop = (uint64) slot->trunc_before + shard_xid_stop_age;
+			TransactionId new_wm = (TransactionId)
+				Min((uint64) slot->next_xid + SHARD_XID_BATCH,
+					Min(stop, (uint64) SHARD_XID_HARD_LIMIT));
 
 			shard_xid_persist_watermark(shard, new_wm, slot->claim_wm,
 										slot->trunc_before, slot->vacuum_xid);
@@ -1292,6 +1345,12 @@ ShardXidClaimOnPromote(Oid shard)
 	{
 		TransactionId base = Max(slot->watermark, slot->next_xid);
 		TransactionId safe = ((base + SHARD_XID_BATCH - 1) / SHARD_XID_BATCH + 1) * SHARD_XID_BATCH;
+
+		if (safe < base || (uint64) safe >= (uint64) slot->trunc_before + shard_xid_stop_age)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("分片 %u 的升主跳号会越过 xid 停发线", shard),
+					 errhint("先解除旧快照或未决事务阻挡并完成安全回收。")));
 
 		if (safe > slot->watermark)
 		{
@@ -1605,7 +1664,7 @@ ShardXidDefineGUCs(void)
 		200000000,
 		1, INT_MAX,
 		PGC_SIGHUP,
-		0, NULL, NULL, NULL);
+		0, check_shard_vacuum_max_age, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"pg_partdist.shard_vacuum_auto",
@@ -1650,9 +1709,9 @@ ShardXidDefineGUCs(void)
 		"不殃及节点与集群。拒发只是止血 —— 解锁必须解决前缀阻挡者。",
 		&shard_xid_stop_age,
 		2146483648,
-		1, INT_MAX,
+		2, SHARD_XID_MAX_STOP_AGE,
 		PGC_SIGHUP,
-		0, NULL, NULL, NULL);
+		0, check_shard_xid_stop_age, NULL, NULL);
 }
 
 void

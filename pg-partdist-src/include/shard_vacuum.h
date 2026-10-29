@@ -113,14 +113,14 @@ extern void ShardVacuumRemoveDeadTuples(Relation rel,
 /*
  * T5.4：一整趟页面动作 —— 顺序铁律的凭据来源。
  *
- * 按 **③ → ① → ②** 跑完三类动作（③ 必须最先：① 对"仍挂 HOT 链的 heap-only
+ * 按 **③ → ① → ② → 显式 xmin 冻结** 跑完整清理趟（③ 必须最先：① 对"仍挂 HOT 链的 heap-only
  * 元组"的推迟要靠 ③ 清 xmax 才解除，见 ShardVacuumRemoveAbortedXmin 注释）。
  *
  * **只有整趟干净**（`pages_skipped == 0 && tuples_deferred == 0`）才落下
  * "趟完"标记 `shard_vacuum_xid = trunc_before`；这是 `ShardClogTruncate` 唯一
  * 认的凭据。不干净则返回 false 且不动任何水位 —— 截断随之被拦住。
  *
- * 三个计数分别回填 ③/①/② 的处置条数；`pages_scanned` 是三趟之和。
+ * 三个计数分别回填 ③/①/② 的处置条数；冻结另计扫描/脏页，不混入清理条数。
  */
 extern bool ShardVacuumSweep(Relation rel, TransactionId trunc_before,
 							 ShardVacuumPageStats *stats,
