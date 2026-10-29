@@ -79,11 +79,25 @@ health_crash_lines() {
   #   diff 不可信"。守卫越尽职、越会被这条检查冤枉。
   # 扫描集合 = 各节点**当前真正**的日志 ∪ 历史约定路径（时间窗内的旧世代日志
   # 仍然算数）。两者可能指向同一文件，故最后 sort -u 去重，避免一次崩溃被数两遍。
-  local live
-  live=$(health_live_logs | tr '\n' ' ')
-  docker exec -u postgres "$CONTAINER" bash -c \
-    "grep -HE \"terminated by signal (11|6|4|7)|UTC \\[[0-9]+\\] PANIC:\" $live /work/pg-cluster-data/*/restart.log /work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log 2>/dev/null" \
-  2>/dev/null | sort -u \
+  local -a live
+  mapfile -t live < <(health_live_logs)
+  docker exec -u postgres "$CONTAINER" bash -c '
+    shopt -s nullglob
+    files=(/work/pg-cluster-data/*/*.log /work/pg-cluster-data/*.log)
+    for f in "$@"; do
+      [[ ! -f "$f" ]] || files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+      echo "No readable lab node logs found" >&2
+      exit 2
+    fi
+    # grep returns 1 for no matches and 2 for a read failure. Missing glob
+    # matches must not turn a healthy run into status 2 under pipefail; actual
+    # read failures must still fail the health check.
+    rc=0
+    grep -HE "terminated by signal (11|6|4|7)|UTC \\[[0-9]+\\] PANIC:" "${files[@]}" || rc=$?
+    [[ "$rc" -le 1 ]] || exit "$rc"
+  ' _ "${live[@]}" | sort -u \
   | awk -v ts="$_HEALTH_START_TS" '
       {
         i = index($0, ":")            # grep -H 的 "路径:" 分隔（路径本身不含冒号）
@@ -97,7 +111,10 @@ health_crash_lines() {
 
 health_check_no_crash() {
   local lines n
-  lines=$(health_crash_lines)
+  if ! lines=$(health_crash_lines); then
+    check "本轮崩溃日志读取成功" "read-error" "ok"
+    return 1
+  fi
   n=$(printf '%s' "$lines" | grep -c . || true)
   check "本轮无节点崩溃（signal 11/6 或 PANIC）" "$n" "0"
   if [[ "$n" != "0" ]]; then

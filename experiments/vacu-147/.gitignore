@@ -1,0 +1,8 @@
+# This directory archives scripts and results; runtime artifacts stay in yyt.
+/work/
+/tmp/
+/logs/
+/bin/
+/lab.env
+/*.tar.gz
+/*.next

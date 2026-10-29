@@ -30,8 +30,13 @@ class VacuContract(unittest.TestCase):
 
     @classmethod
     def args(cls, master=False):
+        # Fixtures belong to this worker only. Every call opens a new session,
+        # including the long-lived snapshot reader, so disable Citus DDL
+        # propagation before reading that session's SQL from stdin. This also
+        # permits local CREATE EXTENSION / CREATE FUNCTION on a worker.
         return [cls.psql, cls.master if master else cls.worker,
-                "-X", "-qAt", "-v", "ON_ERROR_STOP=1"]
+                "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+                "-c", "SET citus.enable_ddl_propagation=off", "-f", "-"]
 
     @classmethod
     def sql(cls, query, master=False, check=True):

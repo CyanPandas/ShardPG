@@ -1,7 +1,8 @@
 # pg_partdist
 
 > **VACU 分支（2026-10-29）**：PG 显式冻结、回收/停发阈值校验与持久化证书顺序，
-> 见 [VACU 设计及验证说明](pg-partdist-src/docs/VACU_DESIGN.md)。循环分配尚未开放，运行验收待完成。
+> 见 [VACU 设计及验证说明](pg-partdist-src/docs/VACU_DESIGN.md)及 [147 实验报告](experiments/vacu-147/TEST_REPORT_147.md)。
+> 已完成隔离环境的冻结、清理、恢复与复制功能验证；真实 XID 循环分配尚未实现，完整回卷验收未完成。
 
 
 > ## ★ 先读这里（2026-09-09 回填）

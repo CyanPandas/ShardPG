@@ -1,0 +1,105 @@
+{
+  "description": "Original execution transcripts and diagnostic archives retained under /home/zhanhao/yyt/logs; hashes preserve the association with the validation report.",
+  "artifacts": [
+    {
+      "path": "/home/zhanhao/yyt/logs/lab.log",
+      "bytes": 182,
+      "sha256": "5c12a0fbc45c04abeb442497c3d617059b6982c7526e04224af9b9fc4d389b81"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-20261029T071132Z.log",
+      "bytes": 144,
+      "sha256": "8aa6ff335b1e245635736da2012570d96af0e11056fc07ea25ac80bc10684921"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-20261029T071203Z.log",
+      "bytes": 151,
+      "sha256": "7c9648d380d3f906a14743ac78025005d68aae095e393065befcf1c19039c7a9"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-20261029T071325Z.log",
+      "bytes": 151,
+      "sha256": "7c9648d380d3f906a14743ac78025005d68aae095e393065befcf1c19039c7a9"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-20261029T073007Z.log",
+      "bytes": 151,
+      "sha256": "8d6de21b33ea5e002991ca7c1d5e6ada4c5890ea6a2a90e3da93155fe3427de0"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-20261029T074050Z.log",
+      "bytes": 7613,
+      "sha256": "423ff14e3d740d0f79d426d1d1362682cd7dc24fda3b34a590702d090dcd41d4"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-diagnostics-20261029T083905Z.tar.gz",
+      "bytes": 72940,
+      "sha256": "196f28c776196cdea7548103fdaff8ba750f26392baa5b1eeea593977dd6b207"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-diagnostics-20261029T084320Z.tar.gz",
+      "bytes": 84685,
+      "sha256": "697f2108663cc8b728c9c438b60a6c83d901888b6b1f49e8699f499db1349291"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-diagnostics-20261029T084709Z.tar.gz",
+      "bytes": 126438,
+      "sha256": "d7cf3fdf9fd40595d6a75aa12e040ea9c62c2c32852573cfbd17011e262cc848"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-diagnostics-20261029T090342Z.tar.gz",
+      "bytes": 168888,
+      "sha256": "c80ddf1ced0f6b8340ceba3b7a4a2c2ad5bea304f9a28c94cc4668935df08dde"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T080238Z.log",
+      "bytes": 1757,
+      "sha256": "773b4ec2b1ca9d434710443cbbe1114edf06137501dd8f71967f74ffd39bedb1"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T081949Z.log",
+      "bytes": 30003,
+      "sha256": "0e7cfca3fcb866a2ed94ca57b9a5bf43ea939de3b9f0b9a87a1b7f45f738c47a"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T082736Z.log",
+      "bytes": 3096,
+      "sha256": "5c735d1b22dd968341d5df38c42382f7bbae8dbd621e198056997c27dc8e04f9"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T083105Z.log",
+      "bytes": 40187,
+      "sha256": "9b6b70b5440b5381d5ed02821d9193e12f78e2163b5bc602fe3725493954f67f"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T083905Z.log",
+      "bytes": 74866,
+      "sha256": "013e47bff059c6eaa0dd7b3da81c445d41603dd7f2a9a3c368198683e562f138"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T084320Z.log",
+      "bytes": 83164,
+      "sha256": "7cb95a3a5f8d5283ad30cfda8e2660cada1a615feff629d5a8fa3bc16876c68f"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T084709Z.log",
+      "bytes": 208446,
+      "sha256": "6a6af95c2b23a84259c8fe5a14b98d287f3ec4a42a05f80d7029f1cb849c8be6"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T090342Z.log",
+      "bytes": 9333,
+      "sha256": "5b63ea97df60ff77a03af0f8bfb816f5d5ed1c1fe610c1226fdbdc10f9618e83"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-resume-20261029T091208Z.log",
+      "bytes": 705,
+      "sha256": "92c6164b4d4d9e5d3d19daa3bd7913549a9aedfff31e619a17d4f7af2b5db233"
+    },
+    {
+      "path": "/home/zhanhao/yyt/logs/remote-147-state-20261029T090342Z.log",
+      "bytes": 94914,
+      "sha256": "d6f8ea69d581069b6a32a35991dc26fa3c72ca3004879d6231719ce86009dd41"
+    }
+  ]
+}

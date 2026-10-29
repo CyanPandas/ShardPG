@@ -8,7 +8,7 @@
 # 本套件验的是"到龄了真的会自己跑"，以及它在各种不该跑的情形下**真的不跑**。
 #
 # 覆盖：
-#   [1] 夹具：登记打标表 + 制造三类垃圾（中止 xmin / 已提交删除 / lock-only xmax）
+#   [1] 夹具：中止 xmin / 已提交删除；另验分片表拒绝行锁
 #   [2] ★ 负向：取不到 GlobalSafeTs 一律停在 no-safe-ts —— 少清一轮无害，
 #       拿不可信的安全线截断 clog 不可逆
 #   [3] 手工调用：截断点推进、数据完好
@@ -18,7 +18,7 @@
 #   [7] 表没了但槽位还在 ⇒ 记 gone，不报错、不拖累同批其它分片
 # 工程纪律：容器调用一律 </dev/null；断言空值即 FAIL；负向配计数守卫；
 #       GUC 改动挂 EXIT 复原；结尾节点健康检查。
-set -u
+set -uo pipefail
 
 CONTAINER="${CONTAINER:-pg-test-container}"
 WPORT="${WPORT:-5433}"
@@ -26,7 +26,7 @@ COORD=5432
 PASS=0; FAIL=0
 
 DEX()  { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$CONTAINER" "$@"; }
-PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
+PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 check() {
   if [[ -z "$2" ]]; then
@@ -54,19 +54,27 @@ health_mark_start
 # ★ 本套件把 shard_vacuum_max_age 调到 1，也就是让**本节点所有分片**都算到龄。
 #   不复原的话，之后每一套都会被心跳顺手 vacuum，红起来的样子与被测内容毫无
 #   关系 —— 与 lib_topology.sh 头注释里"停节点必复原"是同一条纪律。
+declare -A saved_gucs=()
+for guc_name in pg_partdist.shard_vacuum_max_age pg_partdist.shard_vacuum_auto \
+    pg_partdist.shard_vacuum_truncate pg_partdist.shard_vacuum_fault pg_partdist.tso_conninfo; do
+  saved_gucs[$guc_name]=$(PSQL "$WPORT" -Atc "SHOW $guc_name" </dev/null) || exit 1
+done
+saved_tso_master=$(PSQL "$COORD" -Atc 'SHOW pg_partdist.tso_master' </dev/null) || exit 1
 restore_gucs() {
-  # ★ ALTER SYSTEM 必须**各自一条** -c：多条语句挤进一个 -c 会被 psql 当作
-  #   隐式事务块发出去，而 ALTER SYSTEM 在事务块里直接 ERROR。
-  PSQL "$WPORT" -q \
-    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_max_age" \
-    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_auto" \
-    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_truncate" \
-    -c "ALTER SYSTEM RESET pg_partdist.shard_vacuum_fault" \
-    -c "ALTER SYSTEM RESET pg_partdist.tso_conninfo" \
-    -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 || true
-  PSQL "$COORD" -q -c "ALTER SYSTEM RESET pg_partdist.tso_master" \
-                -c "SELECT pg_reload_conf()" </dev/null >/dev/null 2>&1 || true
-  echo "  [复原] GUC 已 RESET（max_age / auto / tso_conninfo）"
+  local rc=$? name value
+  trap - EXIT
+  # RESET would erase this lab's pre-existing TSO configuration. Restore the
+  # effective values captured before the suite instead, one ALTER per command.
+  for name in "${!saved_gucs[@]}"; do
+    value=${saved_gucs[$name]//\'/\'\'}
+    PSQL "$WPORT" -c "ALTER SYSTEM SET $name = '$value'" </dev/null >/dev/null || rc=1
+  done
+  PSQL "$WPORT" -c 'SELECT pg_reload_conf()' </dev/null >/dev/null || rc=1
+  value=${saved_tso_master//\'/\'\'}
+  PSQL "$COORD" -c "ALTER SYSTEM SET pg_partdist.tso_master = '$value'" \
+    -c 'SELECT pg_reload_conf()' </dev/null >/dev/null || rc=1
+  echo "  [复原] GUC 已恢复为套件执行前的值（含 TSO 配置）"
+  exit "$rc"
 }
 trap restore_gucs EXIT
 
@@ -75,7 +83,7 @@ set_guc() {  # set_guc <名> <值>；等 SHOW 真的变了才返回
   PSQL "$WPORT" -q -c "ALTER SYSTEM SET $n = $v" -c "SELECT pg_reload_conf()" </dev/null >/dev/null
   for t in $(seq 1 15); do
     got=$(PSQL "$WPORT" -Atc "SHOW $n" </dev/null | tail -1)
-    [[ -n "$got" ]] && break
+    [[ "$got" == "$v" ]] && break
     sleep 1
   done
   echo "$got"
@@ -84,6 +92,22 @@ set_guc() {  # set_guc <名> <值>；等 SHOW 真的变了才返回
 WM()  { PSQL "$WPORT" -Atc "SELECT clog_truncate_before||'/'||shard_vacuum_xid FROM partdist.shard_vacuum_watermarks($1::oid)" </dev/null | tail -1; }
 TB()  { PSQL "$WPORT" -Atc "SELECT clog_truncate_before FROM partdist.shard_vacuum_watermarks($1::oid)" </dev/null | tail -1; }
 AGE() { PSQL "$WPORT" -Atc "SELECT age||'/'||phase FROM partdist.shard_xid_age($1::oid)" </dev/null | tail -1; }
+
+wait_safe_prefix() {  # <local oid>; do not modify commit timestamps or bypass safety
+  local oid=$1 cutoff safe target reason t
+  cutoff=$(PSQL "$WPORT" -Atc "SELECT partdist.shard_xid_next($oid::oid)" </dev/null) || return 1
+  [[ "$cutoff" =~ ^[0-9]+$ && "$cutoff" -gt 3 ]] || return 1
+  for t in $(seq 1 45); do
+    safe=$(PSQL "$COORD" -Atc 'SELECT partdist.partdist_global_safe_ts()' </dev/null) || return 1
+    [[ "$safe" =~ ^[0-9]+$ ]] || return 1
+    target=$(PSQL "$WPORT" -Atc "SELECT target_xid FROM partdist.shard_vacuum_target($oid::oid,$safe,$cutoff)" </dev/null) || return 1
+    [[ "$target" == "$((cutoff - 1))" ]] && return 0
+    sleep 1
+  done
+  reason=$(PSQL "$WPORT" -Atc "SELECT stop_reason FROM partdist.shard_vacuum_target($oid::oid,$safe,$cutoff)" </dev/null)
+  echo "FAIL: shard $oid cutoff $cutoff is unsafe after 45s ($reason)" >&2
+  return 1
+}
 
 echo "========== [0] 前置：节点与函数面 =========="
 up=$(PSQL "$WPORT" -Atc "SELECT 1" </dev/null)
@@ -121,17 +145,18 @@ PSQL "$WPORT" -q -c "INSERT INTO partdist.partition_map (partition_id, primary_n
 reg=$(PSQL "$WPORT" -Atc "SELECT partdist.partdist_set_shard_mvcc('va_auto'::regclass); SELECT 'ok'" </dev/null 2>&1 | tail -1)
 check "打标登记成功" "$reg" "ok"
 
-# 三类垃圾各造一点：
+# 两类垃圾各造一点：
 #   ① 中止 xmin：整事务回滚的插入
 #   ② 已提交删除的死元组：插入并提交，再删除并提交
-#   ③ lock-only xmax：SELECT FOR UPDATE 后提交（xmax 有值但不是删除）
+# 行锁已由项目禁止，以下作为独立负向用例检查，不把失败当作成功的夹具。
 PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
 SET citus.enable_ddl_propagation TO off;
 INSERT INTO va_auto SELECT g, 'keep'||g FROM generate_series(1,20) g;
 BEGIN; INSERT INTO va_auto SELECT g, 'abort'||g FROM generate_series(101,110) g; ROLLBACK;
 DELETE FROM va_auto WHERE id BETWEEN 1 AND 5;
-BEGIN; SELECT * FROM va_auto WHERE id = 10 FOR UPDATE; COMMIT;
 SQL
+neg "分片表拒绝行锁" 'row-level locking is not supported' \
+    'SELECT * FROM va_auto WHERE id = 10 FOR UPDATE'
 alive=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT count(*) FROM va_auto" </dev/null | tail -1)
 check "夹具活行数（20 插入 − 5 删除 = 15）" "$alive" "15"
 nx=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT max(xmin::text::bigint) FROM va_auto" </dev/null | tail -1)
@@ -173,6 +198,10 @@ check "清完数据仍完好（15 行）" \
 check "两水位相等（趟完且已截断）" "$(WM "$OA")" "$tb1/$tb1"
 
 echo "========== [4] ★ 核心：不手工调，心跳自己干 =========="
+# Establish the workload, watermark and log baseline before allowing the
+# heartbeat to start, so it cannot finish before this test starts observing.
+got=$(set_guc pg_partdist.shard_vacuum_auto off)
+check "心跳取证前暂停自动清理" "$got" "off"
 # 再制造一批可清的账目，让截断点还能往前走
 PSQL "$WPORT" -v ON_ERROR_STOP=1 -q >/dev/null <<'SQL'
 SET citus.enable_ddl_propagation TO off;
@@ -185,10 +214,13 @@ SQL
 #   而**出口门禁净场用 `-l <datadir>/pg.log` 拉起节点**。写死任何一种，
 #   单跑绿、进批就红（实测 `worker1.log: No such file or directory`）。
 #   按"数据目录下任何 .log + 同名 .log"一网打尽。
-NODELOGS="/work/pg-cluster-data/worker$((WPORT-5432))/*.log /work/pg-cluster-data/worker$((WPORT-5432)).log"
-logmark=$(DEX bash -c "cat $NODELOGS 2>/dev/null | wc -l" </dev/null | tr -d '[:space:]')
+NODELOG=$(health_node_log "worker$((WPORT-5432))")
+[[ "$NODELOG" == /work/pg-cluster-data/* ]] || { echo 'Cannot locate live worker log' >&2; exit 1; }
+logmark=$(DEX bash -c 'wc -l < "$1"' _ "$NODELOG" </dev/null | tr -d '[:space:]')
 logmark=${logmark:-0}
 tb2=$(TB "$OA")
+got=$(set_guc pg_partdist.shard_vacuum_auto on)
+check "心跳取证开始：自动清理已开启" "$got" "on"
 auto_ok=""; waited=0
 for t in $(seq 1 40); do
   cur=$(TB "$OA")
@@ -196,7 +228,13 @@ for t in $(seq 1 40); do
   sleep 1
 done
 check "★ 心跳在 ${waited}s 内自动推进了截断点（$tb2 → $(TB "$OA")）" "$auto_ok" "ok"
-hit=$(DEX bash -c "cat $NODELOGS 2>/dev/null | tail -n +$((logmark + 1)) | grep -c '分片 vacuum 自动启动器' || true" </dev/null | tail -1 | tr -d '[:space:]')
+# The watermark becomes visible just before the heartbeat logs its result.
+for t in $(seq 1 10); do
+  hit=$(DEX bash -c 'tail -n +"$2" "$1" | grep -c "分片 vacuum 自动启动器" || true' \
+    _ "$NODELOG" "$((logmark + 1))" </dev/null | tr -d '[:space:]')
+  [[ "$hit" =~ ^[0-9]+$ && "$hit" -ge 1 ]] && break
+  sleep 1
+done
 check "★ 节点日志留痕（≥1，实际 $hit）" "$([[ -n "$hit" && "$hit" -ge 1 ]] && echo ok)" "ok"
 
 echo "========== [5] 开关 off：同样条件下一动不动 =========="
@@ -269,6 +307,7 @@ PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_trunc 
 # ★ 这一节直接驱动 sweep，不走心跳：截断是 sweep 的收尾动作，与"什么时候被
 #   触发"是两件事；混在一起验，时序一抖就分不清是截断没做还是压根没触发。
 #   （触发那一半已由 [4] 单独验过。）
+wait_safe_prefix "$OT" || exit 1
 swp=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
         SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_trunc'::regclass,
           partdist.shard_xid_next('va_trunc'::regclass::oid)::bigint)" </dev/null | tail -1)
@@ -285,6 +324,7 @@ got=$(set_guc pg_partdist.shard_vacuum_truncate off)
 check "截断开关已关（实得 $got）" "$got" "off"
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_trunc WHERE id > 1500" </dev/null >/dev/null
 sz2=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off; SELECT pg_relation_size('va_trunc')/8192" </dev/null | tail -1)
+wait_safe_prefix "$OT" || exit 1
 swp2=$(PSQL "$WPORT" -Atc "SET citus.enable_ddl_propagation=off;
         SELECT swept||'|'||removed_dead FROM partdist.shard_vacuum_sweep('va_trunc'::regclass,
           partdist.shard_xid_next('va_trunc'::regclass::oid)::bigint)" </dev/null | tail -1)
@@ -318,6 +358,7 @@ INSERT INTO va_fault SELECT g, repeat('y',120) FROM generate_series(1,6000) g;
 DELETE FROM va_fault WHERE id > 3000;
 SQL
 wm_before=$(WM "$OF")
+wait_safe_prefix "$OF" || exit 1
 got=$(set_guc pg_partdist.shard_vacuum_fault mid_prune)
 check "注入点已设为 mid_prune（实得 $got）" "$got" "mid_prune"
 neg "页面循环中间被注入中止" "注入的 vacuum 故障点" \
@@ -334,6 +375,7 @@ check "重来之后数据完好（3000 行）" \
 
 echo "========== [9] ★ T7.19 两态之二：落完标记崩 → 只补截断 =========="
 PSQL "$WPORT" -q -c "SET citus.enable_ddl_propagation=off; DELETE FROM va_fault WHERE id > 1500" </dev/null >/dev/null
+wait_safe_prefix "$OF" || exit 1
 got=$(set_guc pg_partdist.shard_vacuum_fault after_mark)
 check "注入点已设为 after_mark（实得 $got）" "$got" "after_mark"
 neg "落完标记、截断之前被注入中止" "注入的 vacuum 故障点" \
@@ -390,9 +432,10 @@ neg "水位不变式 tb <= vx 违反即拒" "不变式" \
     "SELECT partdist.shard_vacuum_set_watermarks($OA::oid, 10::bigint, 5::bigint)"
 
 echo "========== [12] 负向计数守卫 + 节点健康 =========="
-check "负向用例计数守卫（应跑 3 条）" "$NEG_RUN" "3"
+check "负向用例计数守卫（应跑 4 条）" "$NEG_RUN" "4"
 health_check_no_crash
 
 echo ""
 echo "========== 结果：PASS=${PASS} FAIL=${FAIL} =========="
 if [[ "$FAIL" -eq 0 ]]; then echo "T7.17 分片 vacuum 自动启动器：全部通过"; else echo "T7.17 分片 vacuum 自动启动器：存在 FAIL"; fi
+[[ "$FAIL" -eq 0 ]]

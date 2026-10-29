@@ -26,30 +26,58 @@
 #
 # ★ follower 壳表绝不能被 SELECT（无白名单 ⇒ on-access 剪枝会按原生 clog
 #   清掉分片元组，就地损毁副本）。本脚本只用文件级比对触碰 follower。
-set -u
+set -euo pipefail
 
 CONTAINER="${CONTAINER:-pg-citus-tx2-container}"
 COORD=5432
 PASS=0; FAIL=0
 
 DEX()  { docker exec -i -u postgres -e HOME=/var/lib/postgresql "$CONTAINER" "$@"; }
-PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X "$@"; }
+PSQL() {
+  local port=$1; shift
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || {
+    echo "Invalid test PostgreSQL port: '$port'" >&2; return 2;
+  }
+  DEX /work/pg-install/bin/psql -h /tmp -p "$port" -U postgres -d postgres -X -q -v ON_ERROR_STOP=1 "$@"
+}
 
 check() {
   if [[ -z "$2" ]]; then
-    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return
+    echo "  FAIL  $1（实际取不到值：命令替换返回空串）"; FAIL=$((FAIL+1)); return 1
   fi
   if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; PASS=$((PASS+1));
-  else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); fi
+  else echo "  FAIL  $1（实际='$2' 期望='$3'）"; FAIL=$((FAIL+1)); return 1; fi
 }
 
 source "$(dirname "$0")/lib_node_health.sh"
 health_mark_start
 
+declare -A saved_replay_trust=()
+saved_shard_relids=""
+saved_shard_relids_set=0
+restore_replay_gucs() {
+  local rc=$? p value
+  trap - EXIT
+  for p in "${!saved_replay_trust[@]}"; do
+    value=${saved_replay_trust[$p]//\'/\'\'}
+    PSQL "$p" -c "ALTER SYSTEM SET pg_partdist.replay_trust_local_segments = '$value'" \
+      -c 'SELECT pg_reload_conf()' </dev/null >/dev/null || rc=1
+  done
+  if [[ -n "${pport:-}" && "$saved_shard_relids_set" == 1 ]]; then
+    value=${saved_shard_relids//\'/\'\'}
+    PSQL "$pport" -c "ALTER SYSTEM SET pg_partdist.shard_relids = '$value'" \
+      -c 'SELECT pg_reload_conf()' </dev/null >/dev/null || rc=1
+  fi
+  echo "Replay suite exit: PASS=$PASS FAIL=$FAIL status=$rc"
+  exit "$rc"
+}
+trap restore_replay_gucs EXIT
+
 echo "================ [1] 夹具：1 分片分布表 + raft 组 + 两 follower ================"
 leader0=$(PSQL $COORD -Atc "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()" </dev/null)
 check "group0 有 leader" "$([[ -n "$leader0" && "$leader0" != "0" ]] && echo ok)" "ok"
 for p in 5433 5434 5435 5436 5437 5438 5439 5440; do
+  saved_replay_trust[$p]=$(PSQL "$p" -Atc 'SHOW pg_partdist.replay_trust_local_segments' </dev/null)
   PSQL $p -q -c "ALTER SYSTEM SET pg_partdist.replay_trust_local_segments = on;" </dev/null >/dev/null
   PSQL $p -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 done
@@ -63,7 +91,9 @@ SELECT create_distributed_table('p5repl', 'id');
 ALTER TABLE p5repl SET (autovacuum_enabled = off, toast.autovacuum_enabled = off);
 SQL
 gid=$(PSQL $COORD -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='p5repl'::regclass" </dev/null)
+[[ "$gid" =~ ^[0-9]+$ && "$gid" -gt 0 ]] || { echo 'Cannot resolve p5repl shard id; stopping fixture setup' >&2; exit 1; }
 pport=$(PSQL $COORD -Atc "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=${gid}" </dev/null)
+[[ "$pport" =~ ^[0-9]+$ && "$pport" -ge 5433 && "$pport" -le 5440 ]] || { echo 'Cannot resolve p5repl placement port; stopping fixture setup' >&2; exit 1; }
 pnode=$((pport - 5431))
 f1=""; f2=""
 for p in 5433 5434 5435 5436 5437 5438 5439 5440; do
@@ -107,7 +137,24 @@ for fp in $f1 $f2; do
   check "follower :$fp replay_enable" "$en" "t"
 done
 
+# Election and primary registration are separate steps. In particular, do not
+# run the workload while control-plane apply is still registering this group.
+registered=0
+for t in $(seq 1 45); do
+  registered=1
+  for p in "$COORD" "$pport" "$f1" "$f2"; do
+    mapped=$(PSQL "$p" -Atc "SELECT count(*) FROM partdist.partition_map WHERE partition_id=$gid AND primary_node=$pnode AND primary_term>=1" </dev/null)
+    [[ "$mapped" == 1 ]] || registered=0
+  done
+  [[ "$registered" == 1 ]] && break
+  sleep 2
+done
+check '控制面主节点登记已同步到 coordinator 及三个副本节点' "$registered" 1
+
 SOID=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT '${shard_tbl}'::regclass::oid" </dev/null | tail -1)
+[[ "$SOID" =~ ^[0-9]+$ && "$SOID" -gt 0 ]] || { echo 'Invalid leader relation OID' >&2; exit 1; }
+saved_shard_relids=$(PSQL "$pport" -Atc 'SHOW pg_partdist.shard_relids' </dev/null)
+saved_shard_relids_set=1
 PSQL $pport -q -c "ALTER SYSTEM SET pg_partdist.shard_relids = '${SOID}';" </dev/null >/dev/null
 PSQL $pport -q -c "SELECT pg_reload_conf();" </dev/null >/dev/null
 guc=""
@@ -155,6 +202,18 @@ PSQL $pport -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
 SET citus.override_table_visibility=false;
 BEGIN; DELETE FROM ${shard_tbl} WHERE id = 1; ROLLBACK;
 SQL
+# PartWALAbort deliberately drains DATA + ABORT to the local stream without
+# synchronous replication. Its documented delivery path is the next committed
+# write on this same shard. Supply that write before measuring the replay goal.
+# The insert/delete pair preserves the 51 visible rows and adds real vacuum work.
+PSQL "$pport" -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
+SET citus.override_table_visibility=false;
+BEGIN;
+INSERT INTO ${shard_tbl} VALUES (999,'replication-barrier');
+DELETE FROM ${shard_tbl} WHERE id=999;
+COMMIT;
+SQL
+echo '  提交写入已带出前面回滚事务的 DATA 与 ABORT 标记'
 vis=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT count(*) FROM ${shard_tbl}" </dev/null | tail -1)
 check "leader 可见 51 行（60 插入 - 8 - 1 已提交删除）" "$vis" "51"
 TREL=$(PSQL $pport -Atc "SET citus.override_table_visibility=false; SELECT reltoastrelid::regclass::text FROM pg_class WHERE oid=${SOID}" </dev/null | tail -1)
@@ -174,15 +233,23 @@ echo "  lead_plsn1=${lead_plsn1}"
 # partition_lsn 是**分区流内的逻辑位置**（记录序），不是字节 LSN —— 本夹具
 # 这点写入量下实测只有 70 上下，照抄 pagecmp 的 ">100" 会误报。
 check "leader 已产生 parwal 记录" "$([[ -n "$lead_plsn1" && "$lead_plsn1" -gt 0 ]] && echo ok)" "ok"
+committed_ready=0
+for t in $(seq 1 30); do
+  committed=$(PSQL "$pport" -Atc "SELECT partdist.pg_raft_group_committed_plsn($gid)" </dev/null)
+  if [[ "$committed" =~ ^[0-9]+$ && "$committed" -ge "$lead_plsn1" ]]; then committed_ready=1; break; fi
+  sleep 1
+done
+check "目标位置已获 Raft 提交确认（committed=$committed, target=$lead_plsn1）" "$committed_ready" 1
 
 wait_caught_up() {  # <fport> <期望plsn> <超时s>
   local fp=$1 target=$2 timeout=$3 app foid
   # 空 target 会让下面的 -ge 比较变成语法错误，进而把断言变成假通过
   [[ -n "$target" && "$target" -gt 0 ]] || { echo ""; return 1; }
   foid=$(PSQL "$fp" -Atc "SELECT partdist.local_partition_for_shard(${gid})" </dev/null)
-  app=$(PSQL "$fp" -Atc "SELECT partdist.replay_catchup(${foid}::regclass, ${target}, $((timeout * 1000)))" </dev/null 2>/dev/null || echo 0)
+  app=$(PSQL "$fp" -Atc "SELECT partdist.replay_catchup(${foid}::regclass, ${target}, $((timeout * 1000)))" </dev/null || echo 0)
   [[ -n "$app" && "$app" -ge "$target" ]] && { echo "$app"; return 0; }
   app=$(PSQL "$fp" -Atc "SELECT applied FROM partdist.replay_status() WHERE shard=${foid}" </dev/null 2>/dev/null || echo 0)
+  echo "Replay failed: port=$fp shard=$foid applied=${app:-unknown} target=$target" >&2
   echo "$app"; return 1
 }
 FWM() {  # <fport> —— 该 follower 上本分片的 vacuum 两水位（不碰壳表，只读水位）
@@ -289,13 +356,16 @@ TB=$(PSQL $pport -Atc "SET citus.override_table_visibility=false;
   SELECT max(GREATEST(t_xmin::text::bigint, t_xmax::text::bigint))+1
     FROM heap_page_items(get_raw_page('${shard_tbl}',0)) WHERE lp_flags=1" </dev/null | tail -1)
 check "算出截断点" "$([[ -n "$TB" && "$TB" -gt 3 ]] && echo ok)" "ok"
-# 本环境 TSO 未配置 ⇒ 提交写下的 commit_ts 恒 0，② 的守卫会（正确地）拦下；
-# 照 T5.2/T5.3c 的办法补真时间戳。
-# ★★ 2026-09-11：commit_ts 不写死（同 test_shard_vacuum_p5）。
-#   SI 判据是 commit_ts < 读者 start_ts，start_ts 来自 TSO 计数器；写死 1000
-#   等于隐含假设"TSO 已涨过 1000"。刚重置的集群 TSO 只有一两百（实测 160），
-#   判据翻转 ⇒ 活行读不回来。与 R-P6-20 同类："此前能跑只因现场有垫片"。
-PSQL $pport -Atc "SELECT sclog_wts(${SOID}::oid, g::bigint, 2, 1::bigint) FROM generate_series(3, $((TB-1))) g WHERE sclog_read(${SOID}::oid, g::bigint)=2" </dev/null >/dev/null
+# This lab configures TSO before any writes. Wait for the real safe prefix;
+# never rewrite commit timestamps merely to make a maintenance call succeed.
+safe_ready=0
+for t in $(seq 1 45); do
+  safe=$(PSQL "$COORD" -Atc 'SELECT partdist.partdist_global_safe_ts()' </dev/null)
+  target=$(PSQL "$pport" -Atc "SELECT target_xid FROM partdist.shard_vacuum_target(${SOID}::oid,$safe,$TB)" </dev/null)
+  if [[ "$target" == "$((TB - 1))" ]]; then safe_ready=1; break; fi
+  sleep 1
+done
+check 'TSO 安全前缀已覆盖 sweep 目标' "$safe_ready" '1'
 SW=$(PSQL $pport -Atc "SELECT swept||'/'||sanitized||'/'||removed_aborted||'/'||removed_dead||'/'||pages_skipped||'/'||tuples_deferred FROM partdist.shard_vacuum_sweep('${shard_tbl}'::regclass, ${TB}::bigint)" </dev/null | tail -1)
 check "sweep 干净收尾（零跳页零推迟）" "$(echo "$SW" | cut -d/ -f1,5,6)" "true/0/0"
 check "★ 主堆 + TOAST 一起清：删死元组 > 9" \
@@ -365,7 +435,15 @@ diff_one_follower() {  # <fport> <标签>
       check "${tag} ${key}${fork:-.main} 两侧都存在" "$lex/$fex" "y/y"
       [[ "$lex" == "y" && "$fex" == "y" ]] || continue
       kind=$(pagecmp_kind "$key" "$fork")
-      same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "$lpath" "$fpath" </dev/null 2>/dev/null)
+      if [[ -n "${VACU_LAB_ROOT:-}" ]]; then
+        # The image need not contain Python: read the same bind-mounted bytes
+        # using the host's Python, scoped strictly to this isolated /work mount.
+        [[ "$lpath" == /work/* && "$fpath" == /work/* ]] || { echo "Unexpected page path" >&2; return 1; }
+        same=$(python3 "$(dirname "${BASH_SOURCE[0]}")/pagecmp.py" --kind="$kind" \
+          "$VACU_LAB_ROOT/work/${lpath#/work/}" "$VACU_LAB_ROOT/work/${fpath#/work/}" </dev/null 2>/dev/null)
+      else
+        same=$(DEX python3 /tmp/pagecmp.py --kind="$kind" "$lpath" "$fpath" </dev/null 2>/dev/null)
+      fi
       if [[ -z "$fork" ]]; then
         # ★ T5.8 起三个 fileset 成员（主堆 / TOAST 堆 / TOAST 索引）都参与了
         #   本轮 vacuum —— 主堆走 PRUNE+VACUUM，TOAST 堆同样，TOAST 索引走
@@ -400,7 +478,7 @@ PSQL $COORD -q -c "DROP TABLE IF EXISTS p5repl;" </dev/null >/dev/null 2>&1
 for p in $COORD $pport $f1 $f2; do
   PSQL $p -q -c "DELETE FROM partdist.partition_map WHERE partition_id=${gid};" </dev/null >/dev/null 2>&1
 done
-PSQL $pport -q -c "DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null 2>&1
+PSQL $pport -q -c "SET citus.enable_ddl_propagation=off; DROP FUNCTION IF EXISTS sclog_read(oid,bigint); DROP FUNCTION IF EXISTS sclog_wts(oid,bigint,int,bigint);" </dev/null >/dev/null 2>&1
 for fp in $f1 $f2; do
   PSQL $fp -q -c "SET citus.enable_ddl_propagation=off; DROP FUNCTION IF EXISTS sclog_read(oid,bigint);" </dev/null >/dev/null 2>&1
   fdata2=$(PSQL "$fp" -Atc "SHOW data_directory" </dev/null)

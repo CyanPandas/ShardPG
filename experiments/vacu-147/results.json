@@ -1,0 +1,78 @@
+{
+  "source": "user-provided terminal output",
+  "server_ip": "10.77.110.147",
+  "hostname": "gpmaster",
+  "user": "yyt",
+  "directory": "/home/yyt",
+  "docker_version": "28.0.4",
+  "available_memory": "47Gi",
+  "available_home_disk": "7.2T",
+  "deployment_started": true,
+  "host_python": "3.9.21",
+  "build_image": "46cc50ca1017",
+  "image_gcc": true,
+  "image_make": true,
+  "image_stdio_h": true,
+  "image_python3": false,
+  "remote_lab": "/home/yyt/vacu-bb62a57-20261029T074050Z",
+  "source_transferred": true,
+  "initial_image_build": "failed: Docker build DNS resolution",
+  "compilation_started": true,
+  "lab_container_created": true,
+  "last_blocker": null,
+  "identity_fix": "reuse existing numeric group; allow private postgres alias for existing UID; rerun preparation before build",
+  "compilation_result": "pg_partdist and pg_raft compiled and installed successfully",
+  "nodes_started": 9,
+  "verify_passed": [
+    "V1",
+    "V2",
+    "V3",
+    "V4",
+    "V5",
+    "V6"
+  ],
+  "vacuum_tests_started": true,
+  "pending_harness_fix": null,
+  "vacuum_contract_tests_run": 4,
+  "vacuum_contract_result": "4 passed",
+  "page_and_crash_suite": {
+    "pass": 180,
+    "fail": 0
+  },
+  "auto_suite": {
+    "pass": 65,
+    "fail": 0
+  },
+  "replay_suite": {
+    "functional_assertions_passed": 66,
+    "functional_assertions_failed": 0,
+    "original_exit_status": 2,
+    "original_exit_reason": "health log grep received nonexistent glob paths under pipefail; fixed in yyt snapshot",
+    "valid_replay_evidence": true,
+    "leader_and_follower_reclaim_watermarks": "9/9",
+    "page_comparisons": "all six main/TOAST heap/index comparisons passed"
+  },
+  "diagnostics_archive": "logs/remote-147-diagnostics-20261029T083905Z.tar.gz",
+  "acceptance_passed": false,
+  "ddl_crash_reproduction": {
+    "log": "logs/remote-147-resume-20261029T084320Z.log",
+    "result": "normal undefined-table error; original SIGSEGV not reproduced and remains unresolved",
+    "debug_setting_restored": true
+  },
+  "latest_transcript": "logs/remote-147-resume-20261029T091208Z.log",
+  "replay_health_audit": {
+    "pass": 10,
+    "fail": 0,
+    "nodes_available": 9,
+    "new_crashes": 0,
+    "since_utc": "2026-10-29 09:03:42",
+    "log": "logs/remote-147-resume-20261029T091208Z.log"
+  },
+  "covered_functional_validation_passed": true,
+  "open_items": [
+    "Earlier 08:33:12 missing-LIKE-source DDL SIGSEGV remains unresolved; not reproduced in later attempt",
+    "Actual 32-bit circular XID reuse is not enabled",
+    "Full replication-failure/promotion/crash fault matrix has not been completed"
+  ],
+  "report": "TEST_REPORT_147.md"
+}

@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# [宿主机] 一键完整复现 shardpg-TX 测试环境：1 coordinator + N workers（默认 8）。
+#
+# 本分支（shardpg-TX）由 shardpg-replay（物理回放线，R1/L1/R2/D1/D2 + #40）与
+# shardpg-4.0（Raft/2PC 线：切主重构、prepare 接线、DTX-2PC、控制面压缩）双向合并
+# 而成。默认值已绑定到本分支的标准开发环境 pg-citus-tx（9 节点），因此在
+# 本分支上直接 `./reproduce-env.sh all` 即可原样重建该环境；改分支/规模请用环境变量
+# 覆盖。克隆目录默认在 /home/zhanhao 下（/tmp 已两次被宿主机重启清空，不再放那里）。
+#
+# 复现内容与 raft4 环境同构：同一镜像、容器内 /work 布局、同一套 postgresql.conf
+# 模板（pg_raft 参数与 setup-raft.sh 一致）、Citus 接线（coordinator 注册 + N 个
+# citus_add_node）、partdist.node_map 种子、pg_partdist/pg_raft 现场编译安装。
+# 不同点仅两处，均为参数：节点数 N_WORKERS、内存参数 SHARED_BUFFERS（小内存宿主
+# 机上 17 实例跑不动 128MB x 17，默认降为 32MB）。
+#
+# 用法:
+#   ./reproduce-env.sh up        # 克隆 + 起容器 + 编扩展 + initdb + 接线 + 等收敛
+#   ./reproduce-env.sh verify    # 六项一致性/功能校验（V1..V6，冒烟）
+#   ./reproduce-env.sh test      # 全量验收十套件，对齐分支记录的回归数字
+#   ./reproduce-env.sh reset     # 只重建数据目录（容器/扩展保留，不重新克隆）
+#   ./reproduce-env.sh destroy   # 删容器 + 删克隆目录
+#   ./reproduce-env.sh all       # up + verify
+#   ./reproduce-env.sh full      # up + verify + test（要几小时，但这才是"复现到已验证状态"）
+#
+# ⚠ 宿主机同时只放得下**一套** 9 节点环境。默认 ENV_NAME=pg-citus-tx 与现有开发
+#   环境同名，[0/6] 会因容器/目录已存在而直接 die（不覆盖）。要在旁边另起一套做
+#   对照，必须同时换名并把现有那套停掉：
+#       docker stop pg-citus-tx-container
+#       ENV_NAME=pg-citus-tx2 ./reproduce-env.sh full
+#
+# 可覆盖的环境变量:
+#   ENV_NAME=pg-citus-tx              环境名（容器名/目录名前缀）
+#   N_WORKERS=8                       worker 数（group0 成员 = N+1，须 <= RAFT_MAX_PEERS）
+#   SRC_REPO=<url|path>               克隆源，默认 GitHub CyanPandas/ShardPG
+#   BRANCH=shardpg-TX
+#   CLONE_ROOT=/home/zhanhao/<ENV_NAME>   克隆/工作区根目录
+#   IMAGE=pg-partdist-raft4-env       容器镜像；不存在则用克隆里的 Dockerfile 构建
+#   SHARED_BUFFERS=32MB               每实例 shared_buffers
+#   HEARTBEAT_MS=1000                 pg_raft 心跳（小核宿主机上勿调小）
+#   ELECTION_TIMEOUT_MS=6000          pg_raft 选举超时
+set -euo pipefail
+
+ENV_NAME="${ENV_NAME:-pg-citus-tx}"
+N_WORKERS="${N_WORKERS:-8}"
+SRC_REPO="${SRC_REPO:-https://github.com/CyanPandas/ShardPG.git}"
+BRANCH="${BRANCH:-shardpg-TX}"
+IMAGE="${IMAGE:-pg-partdist-raft4-env}"
+SHARED_BUFFERS="${SHARED_BUFFERS:-32MB}"
+# Raft 超时：原 400/1500 是给 4 节点环境调的。9 节点跑在 2 核宿主机上时，
+# 负载升高会让心跳赶不上 → 连环改选 → 数据组丢主 → leader 写入被拒，
+# 症状一路误导成"回放缺陷"（L1 验收实测踩过两次）。默认放宽。
+HEARTBEAT_MS="${HEARTBEAT_MS:-1000}"
+ELECTION_TIMEOUT_MS="${ELECTION_TIMEOUT_MS:-6000}"
+
+CLONE_ROOT="${CLONE_ROOT:-/home/zhanhao/${ENV_NAME}}"
+CLONE_DIR="${CLONE_ROOT}/ShardPG"
+CONTAINER="${ENV_NAME//_/-}-container"
+COORD_PORT=5432                       # coordinator=node1; worker i => 端口 5432+i, node_id i+1
+N_NODES=$((N_WORKERS + 1))
+
+DEX() { docker exec -i -u postgres "$CONTAINER" "$@"; }
+DEX0() { docker exec -i -u 0 "$CONTAINER" "$@"; }
+PSQL() { local port=$1; shift; DEX /work/pg-install/bin/psql -p "$port" -U postgres -d postgres "$@"; }
+
+node_dir()  { local i=$1; [[ $i -eq 1 ]] && echo coordinator || echo "worker$((i-1))"; }
+node_port() { local i=$1; echo $((5431 + i)); }
+
+build_peers() {
+  local s="" i
+  for i in $(seq 1 "$N_NODES"); do
+    s+="${s:+,}${i}@127.0.0.1:$(node_port "$i")"
+  done
+  echo "$s"
+}
+
+die() { echo "FATAL: $*" >&2; exit 1; }
+
+# ============================== up ==============================
+do_up() {
+  echo "========== [0/6] 前置检查 =========="
+  [[ -e "$CLONE_ROOT" ]] && die "目录 $CLONE_ROOT 已存在，先 destroy 或换 ENV_NAME"
+  docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER" && die "容器 $CONTAINER 已存在"
+
+  echo "========== [1/6] 克隆 ${BRANCH} =========="
+  mkdir -p "$CLONE_ROOT"
+  git clone --branch "$BRANCH" --single-branch "$SRC_REPO" "$CLONE_DIR"
+  local head max_peers
+  head=$(git -C "$CLONE_DIR" rev-parse --short HEAD)
+  echo "HEAD = $head"
+  max_peers=$(grep -oP '#define RAFT_MAX_PEERS\s+\K[0-9]+' "$CLONE_DIR/pg-raft-src/src/raft_consensus.c")
+  [[ "$N_NODES" -le "$max_peers" ]] || die "节点数 ${N_NODES} 超过 RAFT_MAX_PEERS=${max_peers}"
+
+  # ★ 本脚本**不打内核补丁、也不重编 PostgreSQL**：下面直接把克隆里的
+  # pg-install/ 整棵树拷进容器。所以"能不能复原"完全取决于仓库里那份构建是不是
+  # 打过补丁的。2026-08-04 实测：仓库里那份只含 0001，缺 0001v2/0002，
+  # destroy 之后 up 出来的环境编不过 pg_partdist —— 而那时旧容器已经删了。
+  # 在这里先验，让它**在建容器之前**就失败，别等到编译报符号未定义。
+  bash "$CLONE_DIR/pg-partdist-src/scripts/check_pg_install_patched.sh" \
+       "$CLONE_DIR/pg-install" \
+    || die "克隆里的 pg-install 不是打过补丁的构建，见 pg-partdist-src/patches/README.md"
+
+  echo "========== [2/6] 起容器（镜像 ${IMAGE}）=========="
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "镜像不存在，从克隆构建..."
+    docker build -t "$IMAGE" "$CLONE_DIR"
+  fi
+  # ★ --init（2026-09-14）：PID 1 必须能回收孤儿。没有它 PID 1 就是 `sleep infinity`，
+  #   pg_ctl 起的 postmaster（以及 kill -9 后留下的 backend）退出后全挂在它名下成僵尸、
+  #   永不回收。僵尸照样占容器 pids cgroup 的名额（systemd 默认 TasksMax = 内核
+  #   threads-max 的 15%，4 GB 机器上是 4621）。pg-test 4 天攒到 2486 个、每天 +400~700，
+  #   名额一满容器里一切 fork 都失败：postgres 起不了 backend / bgworker，看起来像产品缺陷。
+  docker run -d --init --name "$CONTAINER" "$IMAGE" sleep infinity >/dev/null
+  DEX0 mkdir -p /work
+  for d in pg-install pg-partdist-src pg-raft-src; do
+    docker cp "$CLONE_DIR/$d" "$CONTAINER:/work/$d"
+  done
+  DEX0 chown -R postgres:postgres /work
+  DEX0 bash -c "echo '$head' > /work/REPRODUCED_FROM_COMMIT"
+
+  echo "========== [3/6] 编译安装 pg_partdist + pg_raft =========="
+  DEX bash -c 'cd /work/pg-partdist-src && make clean >/dev/null 2>&1; make -s PG_CONFIG=/work/pg-install/bin/pg_config && make -s install PG_CONFIG=/work/pg-install/bin/pg_config' >/dev/null
+  DEX bash -c 'cd /work/pg-raft-src && make clean >/dev/null 2>&1; make -s PG_CONFIG=/work/pg-install/bin/pg_config && make -s install PG_CONFIG=/work/pg-install/bin/pg_config' >/dev/null
+  echo "两个扩展编译安装完成"
+
+  wire_cluster
+}
+
+# ------------------------------------------------------------------
+# wire_cluster —— initdb + 配置 + 装扩展 + Citus 接线 + 等 group0 收敛。
+# do_up 与 do_reset 共用同一份模板：复制一份出来迟早会和 do_up 走散。
+# ------------------------------------------------------------------
+wire_cluster() {
+  echo "========== [4/6] initdb + 配置 ${N_NODES} 个节点 =========="
+  local PEERS; PEERS=$(build_peers)
+  local i dir port
+  for i in $(seq 1 "$N_NODES"); do
+    dir=$(node_dir "$i"); port=$(node_port "$i")
+    DEX /work/pg-install/bin/initdb -D "/work/pg-cluster-data/$dir" -U postgres --no-locale >/dev/null
+    DEX bash -c "cat >> /work/pg-cluster-data/$dir/postgresql.conf" <<EOF
+
+# reproduce-env.sh（与 raft4 环境 setup-raft.sh 同一模板，仅节点数/内存参数化）
+port = ${port}
+shared_preload_libraries = 'citus,pg_partdist,pg_raft'
+max_prepared_transactions = 200
+shared_buffers = ${SHARED_BUFFERS}
+max_wal_size = 512MB
+logging_collector = off
+pg_raft.node_id = ${i}
+pg_raft.raft_enabled = on
+pg_raft.peers = '${PEERS}'
+pg_raft.heartbeat_ms = ${HEARTBEAT_MS}
+pg_raft.election_timeout_ms = ${ELECTION_TIMEOUT_MS}
+pg_raft.probe_interval_ms = 3000
+pg_raft.probe_fail_threshold = 1
+# 协调节点(coordinator)：group 0 leader 优先落于此，且不得作为数据组成员
+pg_raft.coordinator_node_id = 1
+# ★ DTX-2PC（DTX_2PC_DESIGN.md §9.4）：必须关掉 Citus 自带的 2PC 恢复。
+# 它把 pg_dist_transaction 当决议真相源，会把我们决议为 ABORT 的事务无条件
+# COMMIT PREPARED，造成部分参与者提交、部分回滚的**分叉提交**。
+# 关掉之后由 partdist.dtx_recover_prepared() 统一收尾：协调组有决议的按决议，
+# 没走 2PC 的（快路径）再退回 Citus 原生规则。
+citus.recover_2pc_interval = -1
+EOF
+    DEX /work/pg-install/bin/pg_ctl start -D "/work/pg-cluster-data/$dir" \
+        -l "/work/pg-cluster-data/$dir.log" -w -t 60 >/dev/null
+    echo "  node$i ($dir:$port) 已启动"
+  done
+
+  echo "========== [5/6] 装扩展 + Citus 接线 + node_map 种子 =========="
+  for i in $(seq 1 "$N_NODES"); do
+    port=$(node_port "$i")
+    PSQL "$port" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE EXTENSION IF NOT EXISTS citus;
+SET citus.enable_ddl_propagation = off;
+CREATE EXTENSION IF NOT EXISTS pg_partdist;
+CREATE EXTENSION IF NOT EXISTS pg_raft;
+SQL
+    # 与 setup-raft.sh 相同的幂等补齐（全新库应为 no-op，留作保险）
+    PSQL "$port" -v ON_ERROR_STOP=0 -q <<'SQL' >/dev/null 2>&1 || true
+SET citus.enable_ddl_propagation = off;
+ALTER TABLE partdist.raft_log ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_raft_log_group_index ON partdist.raft_log(group_id, log_index);
+ALTER TABLE partdist.partition_map ADD COLUMN IF NOT EXISTS primary_term BIGINT NOT NULL DEFAULT 0;
+SQL
+    # node_map 种子（每个节点一份全量拓扑，与 raft4 环境一致：127.0.0.1 + 端口）
+    local j vals=""
+    for j in $(seq 1 "$N_NODES"); do
+      vals+="${vals:+,}(${j}, '127.0.0.1', $(node_port "$j"), 'active', now())"
+    done
+    PSQL "$port" -v ON_ERROR_STOP=1 -q -c \
+      "INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat)
+       VALUES ${vals}
+       ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname,
+         port=EXCLUDED.port, status=EXCLUDED.status, last_heartbeat=now();"
+  done
+  PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "SELECT citus_set_coordinator_host('localhost', ${COORD_PORT});" >/dev/null
+  for i in $(seq 2 "$N_NODES"); do
+    PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+      "SELECT citus_add_node('localhost', $(node_port "$i"));" >/dev/null
+    echo "  citus_add_node(localhost:$(node_port "$i")) done"
+  done
+
+  echo "========== [6/6] 等待 group0 收敛 =========="
+  local t leader=""
+  for t in $(seq 1 60); do
+    leader=$(PSQL "$COORD_PORT" -Atc \
+      "SELECT leader_node_id FROM partdist.pg_raft_get_cluster_status()" 2>/dev/null || echo "")
+    [[ -n "$leader" && "$leader" != "0" ]] && break
+    sleep 1
+  done
+  [[ -n "$leader" && "$leader" != "0" ]] || die "group0 在 60s 内未选出 leader"
+  echo "group0 leader = node ${leader}（${t}s 收敛）"
+  echo "环境 ${ENV_NAME} 就绪：容器 ${CONTAINER}，${N_NODES} 节点（coordinator:5432 + worker1..${N_WORKERS}:5433..$(node_port "$N_NODES")）"
+}
+
+# ------------------------------------------------------------------
+# do_reset —— 只重建 N 个数据目录，容器与已装好的扩展原样保留。
+#
+# 为什么需要它：`up` 会从 GitHub 重新克隆，**工作区里尚未提交的改动会被丢掉**。
+# 而验收又必须在干净集群上跑（跑过几轮的集群会积任期、残留 fileset、
+# 陈旧 partition_map 行，结果不作数）。改代码期间要干净现场，用这一支。
+# 注意：它不重编扩展 —— 自己先 make install 好，再 reset，最后节点是新起的，
+# 装载的就是新 .so。
+# ------------------------------------------------------------------
+do_reset() {
+  docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" || die "容器 $CONTAINER 不在运行，reset 需要一个已建好的环境"
+  echo "========== [reset] 停节点 + 清数据目录 =========="
+  local i
+  for i in $(seq 1 "$N_NODES"); do
+    DEX /work/pg-install/bin/pg_ctl -D "/work/pg-cluster-data/$(node_dir $i)" -m immediate stop >/dev/null 2>&1 || true
+  done
+  DEX0 rm -rf /work/pg-cluster-data
+  DEX0 mkdir -p /work/pg-cluster-data
+  DEX0 chown -R postgres:postgres /work/pg-cluster-data
+  wire_cluster
+}
+
+# ============================ verify ============================
+V_FAIL=0
+check() {  # check <名字> <实际> <期望>
+  if [[ "$2" == "$3" ]]; then echo "  PASS  $1"; else echo "  FAIL  $1（实际='$2' 期望='$3'）"; V_FAIL=1; fi
+}
+
+do_verify() {
+  local i port
+  echo "========== V1 全节点可连 + 三扩展就位 =========="
+  for i in $(seq 1 "$N_NODES"); do
+    port=$(node_port "$i")
+    check "node$i 扩展 citus,pg_partdist,pg_raft" \
+      "$(PSQL "$port" -Atc "SELECT count(*) FROM pg_extension WHERE extname IN ('citus','pg_partdist','pg_raft')" 2>/dev/null || echo ERR)" "3"
+  done
+
+  echo "========== V2 Citus 拓扑（coordinator + ${N_WORKERS} workers，元数据同步到 worker）=========="
+  check "pg_dist_node 行数(coordinator)" \
+    "$(PSQL "$COORD_PORT" -Atc 'SELECT count(*) FROM pg_dist_node')" "$N_NODES"
+  check "pg_dist_node 行数(worker1 元数据同步)" \
+    "$(PSQL 5433 -Atc 'SELECT count(*) FROM pg_dist_node')" "$N_NODES"
+
+  echo "========== V3 group0：${N_NODES} 成员、全员同 leader 同任期 =========="
+  check "cluster_size(coordinator 视角)" \
+    "$(PSQL "$COORD_PORT" -Atc 'SELECT cluster_size FROM partdist.pg_raft_group_status() WHERE group_id=0')" "$N_NODES"
+  local pairs
+  pairs=$(for i in $(seq 1 "$N_NODES"); do
+    PSQL "$(node_port "$i")" -Atc \
+      "SELECT leader_node_id || '/' || current_term FROM partdist.pg_raft_get_cluster_status()" 2>/dev/null
+  done | sort -u)
+  check "全 ${N_NODES} 节点 leader/term 一致" "$(echo "$pairs" | wc -l)" "1"
+  echo "        （leader/term = ${pairs}）"
+
+  echo "========== V4 node_map 全量种子 =========="
+  for port in "$COORD_PORT" 5433 "$(node_port "$N_NODES")"; do
+    check "node_map@${port} active 行数" \
+      "$(PSQL "$port" -Atc "SELECT count(*) FROM partdist.node_map WHERE status='active'")" "$N_NODES"
+  done
+
+  echo "========== V5 Citus 分布表冒烟（${N_WORKERS} 分片撒满 ${N_WORKERS} worker）=========="
+  PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "DROP TABLE IF EXISTS reply_v5; SET citus.shard_count=${N_WORKERS}; SET citus.shard_replication_factor=1;
+     CREATE TABLE reply_v5(id int primary key, v text); SELECT create_distributed_table('reply_v5','id');" >/dev/null
+  check "分片分布的 worker 数" \
+    "$(PSQL "$COORD_PORT" -Atc "SELECT count(DISTINCT p.groupid) FROM pg_dist_placement p JOIN pg_dist_shard s ON s.shardid=p.shardid WHERE s.logicalrelid='reply_v5'::regclass")" "$N_WORKERS"
+  PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "INSERT INTO reply_v5 SELECT g, 'v'||g FROM generate_series(1,160) g;" >/dev/null
+  check "插入 160 行回读" "$(PSQL "$COORD_PORT" -Atc 'SELECT count(*) FROM reply_v5')" "160"
+
+  echo "========== V6 数据面复制冒烟（单分片组：leader→全部 follower 备份逐字节一致）=========="
+  PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "DROP TABLE IF EXISTS reply_v6; SET citus.shard_count=1; SET citus.shard_replication_factor=1;
+     CREATE TABLE reply_v6(id int primary key, v text); SELECT create_distributed_table('reply_v6','id');" >/dev/null
+  local gid pport pid f1
+  gid=$(PSQL "$COORD_PORT" -Atc "SELECT shardid FROM pg_dist_shard WHERE logicalrelid='reply_v6'::regclass")
+  pport=$(PSQL "$COORD_PORT" -Atc \
+    "SELECT n.nodeport FROM pg_dist_placement p JOIN pg_dist_node n ON n.groupid=p.groupid AND n.noderole='primary' WHERE p.shardid=${gid}")
+  pid=$((pport - 5431))
+  # ★ follower 数量按拓扑取，**不能写死两个**。N_WORKERS=2 时除 leader 外只有
+  # 一个 follower，旧写法让 f2 为空，于是 `$((f2 - 5431))` 算出 -5431，
+  # **建组时塞进一个不存在的成员**——组照样建起来、leader 照样选出来，只在
+  # 最后一条指纹断言上报一个端口为空的 FAIL（`follower2(:)`），看上去像复现失败。
+  # 改成收集实际存在的 follower（最多 2 个），断言只对它们做。
+  local -a fols=()
+  for i in $(seq 2 "$N_NODES"); do
+    port=$(node_port "$i")
+    [[ "$port" == "$pport" ]] && continue
+    fols+=("$port")
+    [[ "${#fols[@]}" -ge 2 ]] && break
+  done
+  check "V6 至少有 1 个 follower（当前拓扑 N_NODES=${N_NODES}）" \
+    "$([[ "${#fols[@]}" -ge 1 ]] && echo ok || echo none)" "ok"
+  if [[ "${#fols[@]}" -lt 1 ]]; then
+    echo "        N_WORKERS=${N_WORKERS} 太小，数据面复制无从验起；至少要 2。"
+    return
+  fi
+  f1="${fols[0]}"
+  for port in "${fols[@]}"; do
+    PSQL "$port" -v ON_ERROR_STOP=1 -q -c \
+      "SET citus.enable_ddl_propagation=off; CREATE TABLE IF NOT EXISTS reply_v6_${gid} (LIKE reply_v6 INCLUDING ALL);" >/dev/null
+  done
+  for port in "$pport" "${fols[@]}"; do
+    PSQL "$port" -q -c "SELECT partdist.rebuild_shard_identity();" >/dev/null
+  done
+  local members="ARRAY[${pid}"
+  for port in "${fols[@]}"; do members+=", $((port - 5431))"; done
+  members+="]"
+  PSQL "$pport" -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null
+  local t st=""
+  for t in $(seq 1 20); do
+    st=$(PSQL "$pport" -Atc "SELECT state FROM partdist.pg_raft_group_status() WHERE group_id=${gid}" 2>/dev/null || echo "")
+    [[ "$st" == "leader" ]] && break; sleep 1
+  done
+  check "分区组 ${gid} leader 落在 placement 节点(:${pport})" "$st" "leader"
+  for port in "${fols[@]}"; do
+    PSQL "$port" -q -c "SELECT partdist.pg_raft_group_create(${gid}, ${members});" >/dev/null
+  done
+  # Leader election precedes asynchronous control-plane registration. DTX
+  # resolves the decision leader through partition_map on the coordinator;
+  # starting a write before that map converges aborts a healthy new group.
+  # Check the published state, without inserting or overriding any metadata.
+  local ready deadline=$((SECONDS + 90)) pending=""
+  while :; do
+    ready=1
+    pending=""
+    for i in $(seq 1 "$N_NODES"); do
+      port=$(node_port "$i")
+      st=$(PSQL "$port" -v ON_ERROR_STOP=1 -Atc \
+        "SELECT count(*) FROM partdist.partition_map WHERE partition_id=${gid} AND primary_node=${pid} AND primary_term>=1" 2>/dev/null) || st="unavailable"
+      if [[ "$st" != "1" ]]; then
+        ready=0
+        pending+=" :${port}=${st}"
+      fi
+    done
+    [[ "$ready" == 1 ]] && break
+    if (( SECONDS >= deadline )); then
+      echo "  FAIL  分区组 ${gid} 主节点登记未在 90 秒内收敛:${pending}" >&2
+      return 1
+    fi
+    echo "  WAIT  分区组 ${gid} 等待控制面登记:${pending}"
+    sleep 2
+  done
+  check "分区组 ${gid} 主节点登记已同步到全部 ${N_NODES} 节点" "$ready" "1"
+  PSQL "$COORD_PORT" -v ON_ERROR_STOP=1 -q -c \
+    "INSERT INTO reply_v6 SELECT g, 'r'||g FROM generate_series(1,3) g;" >/dev/null
+  sleep 2
+  # ★ 指纹必须在**三方共同的 plsn 区间**上算，不能各自按自己的 flush_lsn 取上界。
+  #   原写法先采 leader、再采 follower，两次采样之间后台发射器（D2 冻结账目同步
+  #   每 60s 一条 FREEZE_UPDATE、分叉自愈的基线、收尾 DROP 的 SHARD_DROP）随时会
+  #   多落一条并复制出去 —— follower 就比 leader 多一条，报成"指纹不等"。
+  #   实测：leader 9 条 / follower 10 条，而 1..9 与 1..10 两侧都逐条相同，纯属采样竞态。
+  local cnt_sql="SELECT partdist.get_partition_flush_lsn(partdist.local_partition_for_shard(${gid}))"
+  local nmin lead_n
+  nmin=$(PSQL "$pport" -Atc "$cnt_sql")
+  for port in "${fols[@]}"; do
+    local n; n=$(PSQL "$port" -Atc "$cnt_sql")
+    [[ -n "$n" && "$n" -lt "$nmin" ]] && nmin=$n
+  done
+  local fp_sql="SELECT COALESCE(md5(string_agg(md5(r.data), ',' ORDER BY g)),'') FROM generate_series(1, ${nmin:-0}) g, LATERAL partdist.partwal_read_record(partdist.local_partition_for_shard(${gid}), g) r"
+  local lead_fp fp k=0
+  check "leader 侧有 parwal 记录(防两侧皆空的假阳性)" \
+    "$([[ -n "$nmin" && "$nmin" -ge 1 ]] && echo ok || echo empty)" "ok"
+  lead_fp=$(PSQL "$pport" -Atc "$fp_sql")
+  for port in "${fols[@]}"; do
+    k=$((k + 1))
+    fp=$(PSQL "$port" -Atc "$fp_sql")
+    check "follower${k}(:${port}) parwal 指纹 == leader(共同区间 1..${nmin})" "$fp" "$lead_fp"
+  done
+  check "follower 壳表 0 行(只备份不回放)" \
+    "$(PSQL "$f1" -Atc "SELECT count(*) FROM reply_v6_${gid}")" "0"
+  check "coordinator 收到自治登记(primary=${pid}, term>=1)" \
+    "$(PSQL "$COORD_PORT" -Atc "SELECT count(*) FROM partdist.partition_map WHERE partition_id=${gid} AND primary_node=${pid} AND primary_term>=1")" "1"
+
+  # 冒烟夹具清理
+  for port in "$pport" "${fols[@]}"; do
+    PSQL "$port" -q -c "SELECT partdist.pg_raft_group_reset();" >/dev/null 2>&1 || true
+  done
+  for port in "${fols[@]}"; do
+    PSQL "$port" -q -c "SET citus.enable_ddl_propagation=off; DROP TABLE IF EXISTS reply_v6_${gid};" >/dev/null 2>&1 || true
+  done
+  PSQL "$COORD_PORT" -q -c "DROP TABLE IF EXISTS reply_v6; DROP TABLE IF EXISTS reply_v5;" >/dev/null 2>&1 || true
+  for i in $(seq 1 "$N_NODES"); do
+    PSQL "$(node_port "$i")" -q -c "DELETE FROM partdist.partition_map WHERE partition_id=${gid};" >/dev/null 2>&1 || true
+  done
+
+  echo
+  if [[ "$V_FAIL" -eq 0 ]]; then
+    echo "VERIFY: 全部通过（${N_NODES} 节点环境与 ${BRANCH} 预期一致）"
+  else
+    echo "VERIFY: 存在 FAIL 项"; exit 1
+  fi
+}
+
+# =========================== destroy ============================
+# 跑全量验收套件。
+#
+# ★ 为什么 verify 之外还要这个：V1..V6 只证明"环境起得来、拓扑对、单分片组能复制"，
+# 不证明复现出来的环境与被验证过的那个**行为一致**。分支上每个提交都附了全量回归
+# 数字（当前 438/0），只有把这十个套件跑一遍才对得上。
+#
+# 脚本跑在**宿主机**，靠 CONTAINER 环境变量指到容器，所以直接复用克隆里的那份，
+# 不需要往容器里拷。
+do_test() {
+  local t rc o line total_p=0 total_f=0 bad=0
+  local suites
+  # SUITES 可覆盖，用于只跑某几个（空格分隔的套件名，不带 .sh）
+  read -r -a suites <<< "${SUITES:-test_local_wal_conflict test_txn_layer_r2 \
+test_lazy_replay_l1 test_ddl_fileset_d1 test_freeze_sync_d2 test_follower_replay_r1 \
+test_dtx_replay_tx1 test_dtx_commit_marker_tx2 test_promote_catchup_tx3 \
+test_fastpath_divergence_tx4}"
+  docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" \
+    || die "容器 $CONTAINER 没在跑，先 $0 up"
+  [[ -d "$CLONE_DIR/pg-partdist-src/tests" ]] \
+    || die "找不到 $CLONE_DIR/pg-partdist-src/tests，先 $0 up"
+
+  echo "========== 全量验收（${#suites[@]} 个套件，容器 ${CONTAINER}）=========="
+  for t in "${suites[@]}"; do
+    printf '  %-34s ' "$t"
+    # ★ 必须写成 `... || rc=$?`：脚本顶部是 set -e，而验收套件的退出码就是 FAIL 数，
+    # 写成 `o=$(...); rc=$?` 的话第一个失败的套件会**直接终止整个 test**，
+    # 后面的套件根本不跑，还会漏掉下面那条"无结果行"的守卫。
+    rc=0
+    o=$(CONTAINER="$CONTAINER" bash "$CLONE_DIR/pg-partdist-src/tests/${t}.sh" 2>&1) || rc=$?
+    # `|| true` 不能省：顶部是 set -o pipefail，grep 没匹配到就返回 1，
+    # 整条管道失败 ⇒ 赋值触发 errexit ⇒ 整个 test 在这里断掉，
+    # 下面那条"无结果行 = 异常退出"的守卫永远等不到执行。
+    line=$(grep -oE '结果：PASS=[0-9]+ FAIL=[0-9]+' <<< "$o" | tail -1 || true)
+    if [[ -z "$line" ]]; then
+      # 没打出结果行 = 脚本中途挂了，绝不能当成通过
+      echo "异常退出(rc=$rc，无结果行)"; bad=$((bad+1))
+      tail -15 <<< "$o" | sed 's/^/        /'
+      continue
+    fi
+    echo "$line"
+    total_p=$((total_p + $(sed -E 's/.*PASS=([0-9]+).*/\1/' <<< "$line")))
+    total_f=$((total_f + $(sed -E 's/.*FAIL=([0-9]+).*/\1/' <<< "$line")))
+    if [[ "$rc" -ne 0 ]]; then
+      bad=$((bad+1))
+      grep -E '^  FAIL' <<< "$o" | sed 's/^/        /' || true
+    fi
+  done
+  echo "========== 合计 PASS=${total_p} FAIL=${total_f}（异常套件 ${bad} 个）=========="
+  [[ "$total_f" -eq 0 && "$bad" -eq 0 ]] \
+    && echo "复现环境与分支记录的验收状态一致。" \
+    || { echo "与分支记录不一致，别把它当作可用环境。"; return 1; }
+}
+
+do_destroy() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 && echo "容器 ${CONTAINER} 已删" || echo "容器 ${CONTAINER} 不存在"
+  rm -rf "$CLONE_ROOT" && echo "目录 ${CLONE_ROOT} 已删"
+}
