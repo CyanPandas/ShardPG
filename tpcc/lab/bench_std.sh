@@ -14,7 +14,15 @@
 #       tpcc-pgsync-std = tpcc-std 经 scripts/make_native.sh 生成，cluster.env 指向 145:31300。两个目录都要 chmod 777。
 # 先测 PG（ShardPG 容器停掉），再全新部署 ShardPG 测；跑完 lab 留在 ShardPG 标准规模部署上。
 # 用法（145 上，nohup 后台）：bench_std.sh   可选 SKIP_PG=1 / SKIP_SP=1
+#   2026-10-21：SPKIT（ShardPG 套件，默认 tpcc-std）、SPTAG（日志标签，默认 sp）、SPIMG（镜像，默认 shardpg:tsoraft）、BASE148（见 redeploy4m.sh）
+#   例：300 仓 SKIP_PG=1 SPKIT=tpcc-std300 SPTAG=sp300 BASE148=/data3/yyt/shardpg-fix-20261014 bash bench_std.sh
+#       PG 300 仓 SKIP_SP=1 PGKIT=tpcc-pgsync-std300 PGTAG=pg300 PG_BASE148=/data3/yyt/pgsync3 PG_ASYNC_LOAD=1 bash bench_std.sh
 R=/data1/yyt/shardpg-fix-20261014; cd $R; L=$R/tsoraft_logs; mkdir -p $L
+SPKIT=${SPKIT:-tpcc-std}; SPTAG=${SPTAG:-sp}; export BASE148=${BASE148:-}
+SPIMG=${SPIMG:-shardpg:tsoraft}    # 2026-10-21：ShardPG 镜像（修复版 shardpg:noconflict）
+# PG 侧：PGKIT（默认 tpcc-pgsync-std）、PGTAG（默认 pg）、PG_BASE148（见 pgsync3.sh）、PG_ASYNC_LOAD=1（装载期间临时关同步复制，装完恢复并等备库追平）
+PGKIT=${PGKIT:-tpcc-pgsync-std}; PGTAG=${PGTAG:-pg}; export PG_BASE148=${PG_BASE148:-}
+PQ="docker exec pgsync-client /work/pg-install/bin/psql -h 10.77.110.145 -p 31300 -U postgres -XAtq"
 log() { echo "[$(date +%T)] $*"; }
 step() { log "== $*"; }
 limits() { for h in 10.77.110.144 10.77.110.145 10.77.110.147 10.77.110.148; do
@@ -30,24 +38,35 @@ ssh -n 10.77.110.148 "docker stop shardpg-fix-n4 > /dev/null 2>&1; true"
 ssh -n 10.77.110.144 "docker stop shardpg-fix-n1 > /dev/null 2>&1; true"
 
 step "PG 一主两备：全新部署（shared_buffers 8GB，不限资源）"
-bash pgsync3.sh destroy > $L/std-pg-deploy.log 2>&1
-SB=8GB EFFC=32GB bash pgsync3.sh deploy >> $L/std-pg-deploy.log 2>&1
-grep -E "^\[" $L/std-pg-deploy.log | tail -3
+bash pgsync3.sh destroy > $L/std-$PGTAG-deploy.log 2>&1
+SB=8GB EFFC=32GB bash pgsync3.sh deploy >> $L/std-$PGTAG-deploy.log 2>&1
+grep -E "^\[" $L/std-$PGTAG-deploy.log | tail -3
 bash pgsync3.sh status 2>&1 | sed 's/password=[^ ]*/password=***/g'
 limits '^pgsync-(primary|standby)'
 . /data1/yyt/pgsync3/.secrets
 docker rm -f pgsync-client > /dev/null 2>&1
-docker run -d --name pgsync-client --network host -e PGPASSWORD="$SUPW" -v $R/tpcc-pgsync-std:/t shardpg:prof sleep infinity > /dev/null
+docker run -d --name pgsync-client --network host -e PGPASSWORD="$SUPW" -v $R/$PGKIT:/t shardpg:prof sleep infinity > /dev/null
 unset SUPW REPL_PASS
-step "PG 装载 $(grep '^WAREHOUSES=' tpcc-pgsync-std/cluster.env | cut -d= -f2) 仓（同步复制开着）"
-rm -f tpcc-pgsync-std/build_db.log
+if [ "${PG_ASYNC_LOAD:-0}" = 1 ]; then
+  $PQ -c "alter system set synchronous_standby_names = ''" -c "select pg_reload_conf()" > /dev/null
+  step "PG 装载 $(grep '^WAREHOUSES=' $PGKIT/cluster.env | cut -d= -f2) 仓（装载期间临时关同步复制，备库照常流复制；装完恢复 ANY 1 并等追平）"
+else
+  step "PG 装载 $(grep '^WAREHOUSES=' $PGKIT/cluster.env | cut -d= -f2) 仓（同步复制开着）"
+fi
+rm -f $PGKIT/build_db.log
 docker exec pgsync-client bash -c 'cd /t && bash scripts/build_db.sh > /t/build_db.log 2>&1; echo EXIT=$? >> /t/build_db.log'
-log "PG 装载 $(grep -E '^\[|FAIL' tpcc-pgsync-std/build_db.log | grep -E '④|⑤|FAIL' | tr '\n' ' ') $(tail -1 tpcc-pgsync-std/build_db.log)"
-grep -q "EXIT=0" tpcc-pgsync-std/build_db.log || { log "PG 装载失败"; tail -20 tpcc-pgsync-std/build_db.log; exit 1; }
+log "PG 装载 $(grep -E '^\[|FAIL' $PGKIT/build_db.log | grep -E '④|⑤|FAIL' | tr '\n' ' ') $(tail -1 $PGKIT/build_db.log)"
+grep -q "EXIT=0" $PGKIT/build_db.log || { log "PG 装载失败"; tail -20 $PGKIT/build_db.log; exit 1; }
 docker exec pgsync-client /work/pg-install/bin/psql -h 10.77.110.145 -p 31300 -U postgres -XAtq -c "checkpoint" > /dev/null
+if [ "${PG_ASYNC_LOAD:-0}" = 1 ]; then
+  $PQ -c "alter system reset synchronous_standby_names" -c "select pg_reload_conf()" > /dev/null
+  lsn=$($PQ -c "select pg_current_wal_lsn()")
+  for i in $(seq 720); do [ "$($PQ -c "select count(*) from pg_stat_replication where replay_lsn >= '$lsn'::pg_lsn")" = 2 ] && break; sleep 5; done
+  log "同步复制已恢复（$($PQ -c "show synchronous_standby_names")），两个备库回放到 $lsn：$($PQ -c "select count(*) from pg_stat_replication where replay_lsn >= '$lsn'::pg_lsn") / 2"
+fi
 log "PG 库大小 $(docker exec pgsync-client /work/pg-install/bin/psql -h 10.77.110.145 -p 31300 -U postgres -XAtq -c "select pg_size_pretty(pg_database_size('postgres'))")"
 bash pgsync3.sh status 2>&1 | sed 's/password=[^ ]*/password=***/g'
-step "PG 一主两备性能"; rm -f $L/perf5-pg.txt; bash perf5_run.sh pgsync-std pg
+step "PG 一主两备性能"; rm -f $L/perf5-$PGTAG.txt; bash perf5_run.sh ${PGKIT#tpcc-} $PGTAG
 bash pgsync3.sh status 2>&1 | sed 's/password=[^ ]*/password=***/g'
 step "停 PG"
 docker rm -f pgsync-client > /dev/null 2>&1
@@ -55,11 +74,11 @@ bash pgsync3.sh stop > /dev/null 2>&1
 fi
 
 if [ "${SKIP_SP:-0}" != 1 ]; then
-step "ShardPG 4 台机器（协调者 144 + 3 worker，一主两备）：全新部署 + 装载 $(grep '^WAREHOUSES=' tpcc-std/cluster.env | cut -d= -f2) 仓（shared_buffers 8GB，不限资源）"
-KIT=tpcc-std bash redeploy4m.sh shardpg:tsoraft > $L/std-sp-deploy.log 2>&1
-grep -E "^\[|EXIT|FAIL" $L/std-sp-deploy.log | tail -6
-grep -q "部署完成" $L/std-sp-deploy.log || { log "ShardPG 部署失败"; tail -30 $L/std-sp-deploy.log; exit 1; }
-log "ShardPG 装载 $(grep -E '④|⑤' tpcc-std/build_db.log | tr '\n' ' ')"
+step "ShardPG 4 台机器（协调者 144 + 3 worker，一主两备）：全新部署 + 装载 $(grep '^WAREHOUSES=' $SPKIT/cluster.env | cut -d= -f2) 仓（shared_buffers 8GB，不限资源）"
+KIT=$SPKIT bash redeploy4m.sh $SPIMG > $L/std-$SPTAG-deploy.log 2>&1
+grep -E "^\[|EXIT|FAIL" $L/std-$SPTAG-deploy.log | tail -6
+grep -q "部署完成" $L/std-$SPTAG-deploy.log || { log "ShardPG 部署失败"; tail -30 $L/std-$SPTAG-deploy.log; exit 1; }
+log "ShardPG 装载 $(grep -E '④|⑤' $SPKIT/build_db.log | tr '\n' ' ')"
 limits '^shardpg-fix-n[0-9]'
 CLI="docker exec shardpg-fix-client /work/pg-install/bin/psql -U postgres -XAtq"
 for i in $(seq 120); do $CLI -h 10.77.110.144 -p 31080 -c "select partdist.partdist_tso_status()" 2>/dev/null | grep -qE 'raft_term=[1-9]' && break; sleep 1; done
@@ -67,7 +86,7 @@ log "发号者：$($CLI -h 10.77.110.144 -p 31080 -c "select partdist.partdist_t
 for hp in 10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083; do
   log "  $hp 库大小 $($CLI -h ${hp%:*} -p ${hp#*:} -c "select pg_size_pretty(pg_database_size('postgres'))")"
 done
-step "ShardPG 性能"; rm -f $L/perf5-sp.txt; bash perf5_run.sh shardpg-std sp
+step "ShardPG 性能"; rm -f $L/perf5-$SPTAG.txt; bash perf5_run.sh shardpg-${SPKIT#tpcc-} $SPTAG
 bash shardpg_rep.sh status
 fi
 step "STD_DONE"

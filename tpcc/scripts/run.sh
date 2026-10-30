@@ -42,9 +42,11 @@ log "起 pgbench：$TERMINALS 终端、$WAREHOUSES 仓、总时长 ${TOTAL}s（�
   -D nw="$WAREHOUSES" \
   -f "$PB/new_order.sql@45" -f "$PB/payment.sql@43" -f "$PB/order_status.sql@4" \
   -f "$PB/delivery.sql@4" -f "$PB/stock_level.sql@4" \
-  -l --aggregate-interval=60 --log-prefix="$OUT/pgbench_agg" \
   "$DB" > "$OUT/pgbench.out" 2> "$OUT/pgbench.err" &
 PGB=$!
+# 2026-10-21：不再开 -l --aggregate-interval 聚合日志 —— pgbench 16 开着它时，第一笔不可重试的错误就会
+# "unexpected error status: 4" 整个进程退出（实测），一轮成绩变成 0；关掉后只中止出错的那个终端、其余跑满。
+# 每分钟吞吐看 pgbench.err 里 -P 60 的进度行。
 
 # 取数失败（如可重试的串行化错误）时重试，不能拿空值去算 tpmC
 snap() { local v i; for i in 1 2 3 4 5 6 7 8 9 10; do

@@ -50,6 +50,6 @@ log "[$TAG] 经协调者 TPC-C 16 终端：$(bash scale.sh $SYS 16 2>&1 | tail -
 log "[$TAG] 收尾核对（经协调者）：$(chk "$N1")"
 for h in 10.77.110.145 10.77.110.147 10.77.110.148; do
   if [ $h = 10.77.110.145 ]; then c="bash -c"; else c="ssh -n $h"; fi
-  for ct in $($c "docker ps -a --format '{{.Names}}' | grep -E '^shardpg-fix-n[1-4]\$'"); do $c "docker cp $ct:/d/pgdata/log - 2>/dev/null" > $OUT/log-$ct.tar 2>/dev/null; done
+  for ct in $($c "docker ps -a --format '{{.Names}}' | grep -E '^shardpg-fix-n[0-9]+\$'"); do $c "docker cp $ct:/d/pgdata/log - 2>/dev/null" > $OUT/log-$ct.tar 2>/dev/null; done
 done
 echo CK_DONE

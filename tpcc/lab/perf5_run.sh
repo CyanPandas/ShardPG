@@ -3,10 +3,10 @@
 # 各一轮（预热 RAMPUP_S + 测量 DURATION_S，见套件 cluster.env；30 仓那组是 60 s + 3 min），跑两遍；每轮前后不做一致性检查（CONSISTENCY_EACH=0），全部跑完后统一核对：
 # 标准 90_consistency.sql + 跨节点不变式 xnode_consistency.sql（标准规模版）。
 # 另记：数据节点缓冲池命中（blks_hit / blks_read）、第 1 遍 400 终端第 4 分钟各容器内存、有没有后端被 OOM 杀掉。
-# 用法（145 上，集群已部署、已装载、备库已追平）：perf5_run.sh <pgsync-std|shardpg-std> <标签>
+# 用法（145 上，集群已部署、已装载、备库已追平）：perf5_run.sh <pgsync-std[N]|shardpg-std[N]> <标签>
 R=/data1/yyt/shardpg-fix-20261014; cd $R
 SYS=${1:?系统}; TAG=${2:?标签}; OUT=$R/tsoraft_logs/perf5-$TAG.txt
-if [ $SYS = pgsync-std ]; then C=pgsync-client; COORD=10.77.110.145:31300; NODES=$COORD; PAT='^pgsync-(primary|standby)'
+if [[ $SYS == pgsync-std* ]]; then C=pgsync-client; COORD=10.77.110.145:31300; NODES=$COORD; PAT='^pgsync-(primary|standby)'
 else C=shardpg-fix-client; COORD=10.77.110.144:31080; NODES="10.77.110.145:31082 10.77.110.147:31081 10.77.110.148:31083"; PAT='^shardpg-fix-n[0-9]'; fi
 PSQL="docker exec $C /work/pg-install/bin/psql -U postgres -XAtq"
 log() { echo "[$(date +%T)] $*" | tee -a $OUT; }

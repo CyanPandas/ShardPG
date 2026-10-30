@@ -27,7 +27,9 @@ SB=${SB:-8GB}; EFFC=${EFFC:-32GB}
 MEMOPT=""; [ -n "${MEM_LIMIT:-}" ] && MEMOPT="--memory $MEM_LIMIT --memory-swap $MEM_LIMIT"
 log() { echo "[$(date +%T)] $*"; }
 onhost() { local h=$1; shift; if [ "$h" = $PRIMARY ]; then bash -c "$*"; else ssh -n $h "$*"; fi; }
-base() { [ "$1" = $PRIMARY ] && echo $BASE145 || echo $BASEREMOTE; }
+base() { [ "$1" = $PRIMARY ] && echo $BASE145 || rbase $1; }
+# 2026-10-21：PG_BASE148 = 148 上备库数据目录的根（默认 $BASEREMOTE；148 的 /home 只剩几十 GB，大库放 /data3/yyt/pgsync3）
+rbase() { [ "$1" = 10.77.110.148 ] && echo ${PG_BASE148:-$BASEREMOTE} || echo $BASEREMOTE; }
 P() { docker exec -i pgsync-primary psql -U postgres -p $PORT -XAtq "$@"; }
 S() { local h=$1 n=$2; shift 2; onhost $h "docker exec -i pgsync-$n psql -U postgres -p $PORT -XAtq $*"; }
 
@@ -50,7 +52,8 @@ deploy() {
   secrets
   log "清理旧的 pgsync 容器与数据目录"
   for sb in $STANDBYS; do h=${sb#*:}; n=${sb%%:*}
-    onhost $h "docker rm -f pgsync-$n >/dev/null 2>&1; mkdir -p $BASEREMOTE/data; chmod 777 $BASEREMOTE/data; docker run --rm -v $BASEREMOTE/data:$PGD $IMG bash -c 'rm -rf $PGD/pgdata'"
+    rb=$(rbase $h)
+    onhost $h "docker rm -f pgsync-$n >/dev/null 2>&1; mkdir -p $rb/data; chmod 777 $rb/data; docker run --rm -v $rb/data:$PGD $IMG bash -c 'rm -rf $PGD/pgdata'"
   done
   # lab 的 Docker 里容器 root 在宿主机上没有特权（与 node.sh / shardpg_rep.sh 一样，数据目录给 777）
   docker rm -f pgsync-primary >/dev/null 2>&1; mkdir -p $BASE145/data; chmod 777 $BASE145/data
@@ -91,12 +94,13 @@ HBA
   for sb in $STANDBYS; do h=${sb#*:}; n=${sb%%:*}
     log "备库 $n（$h:$PORT）：pg_basebackup -R -X stream -C -S ${n}_slot，application_name=$n"
     P -c "SELECT pg_drop_replication_slot('${n}_slot') FROM pg_replication_slots WHERE slot_name = '${n}_slot'" >/dev/null
+    rb=$(rbase $h)
     onhost $h "set -e
-      docker run --rm -v $BASEREMOTE/data:$PGD $IMG bash -c 'mkdir -p $PGD/pgdata && chown -R postgres:postgres $PGD && chmod 700 $PGD/pgdata'
-      docker run --rm --network host -v $BASEREMOTE/data:$PGD $IMG gosu postgres pg_basebackup \
+      docker run --rm -v $rb/data:$PGD $IMG bash -c 'mkdir -p $PGD/pgdata && chown -R postgres:postgres $PGD && chmod 700 $PGD/pgdata'
+      docker run --rm --network host -v $rb/data:$PGD $IMG gosu postgres pg_basebackup \
         -d 'host=$PRIMARY port=$PORT user=repl_user password=$REPL_PASS application_name=$n' \
         -D $PGD/pgdata -R -X stream -C -S ${n}_slot -c fast
-      docker run -d --name pgsync-$n --network host --shm-size 1g $MEMOPT -e PGDATA=$PGD/pgdata -v $BASEREMOTE/data:$PGD $IMG -c port=$PORT >/dev/null" \
+      docker run -d --name pgsync-$n --network host --shm-size 1g $MEMOPT -e PGDATA=$PGD/pgdata -v $rb/data:$PGD $IMG -c port=$PORT >/dev/null" \
       || { log "$n 建库失败"; exit 1; }
     wait_ready $h pgsync-$n
   done
@@ -157,7 +161,7 @@ case "${1:-}" in
   test) test_sync ;;
   stop) for sb in $STANDBYS; do onhost ${sb#*:} "docker stop pgsync-${sb%%:*}" >/dev/null; done; docker stop pgsync-primary >/dev/null; log "已停" ;;
   start) docker start pgsync-primary >/dev/null; for sb in $STANDBYS; do onhost ${sb#*:} "docker start pgsync-${sb%%:*}" >/dev/null; done; log "已起" ;;
-  destroy) for sb in $STANDBYS; do onhost ${sb#*:} "docker rm -f pgsync-${sb%%:*} >/dev/null 2>&1; docker run --rm -v $BASEREMOTE/data:$PGD $IMG bash -c 'rm -rf $PGD/pgdata'"; done
+  destroy) for sb in $STANDBYS; do onhost ${sb#*:} "docker rm -f pgsync-${sb%%:*} >/dev/null 2>&1; docker run --rm -v $(rbase ${sb#*:})/data:$PGD $IMG bash -c 'rm -rf $PGD/pgdata'"; done
            docker rm -f pgsync-primary >/dev/null 2>&1; docker run --rm -v $BASE145/data:$PGD $IMG bash -c "rm -rf $PGD/pgdata"; log "已删除" ;;
   *) sed -n 2,19p "$0"; exit 1 ;;
 esac

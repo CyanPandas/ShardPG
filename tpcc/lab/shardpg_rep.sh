@@ -21,12 +21,14 @@ PSQL="docker exec shardpg-fix-client /work/pg-install/bin/psql -U postgres -XAtq
 # 2026-10-20：MEM_LIMIT（如 8g）给备库容器设内存上限并关 swap（与 node.sh 一致，模拟小内存服务器）
 MEMOPT=""; [ -n "${MEM_LIMIT:-}" ] && MEMOPT="--memory $MEM_LIMIT --memory-swap $MEM_LIMIT"
 onhost() { local h=$1; shift; if [ "$h" = 10.77.110.145 ]; then bash -c "$*"; else ssh -n $h "$*"; fi; }
-# 2026-10-21：BASE148 = 148 上数据目录的根（默认 $T；大库放 /data3/yyt/...）
+# 2026-10-21：BASE148 = 148 上数据目录的根（默认 $T；148 的 /home 只剩几十 GB，大库放 /data3/yyt/...）
 base() { case "$1" in 10.77.110.145) echo $R ;; 10.77.110.148) echo ${BASE148:-$T} ;; *) echo $T ;; esac; }
+# 2026-10-21：REP_DIR = 备库数据目录在根下的子目录名（默认 shardpg-rep；10 个 worker 部署用 shardpg-rep-w10，不覆盖 4 台机器那套）
+RD=${REP_DIR:-shardpg-rep}
 # mk_standby worker名 主库host 主库port 备库host 备库port：在备库 host 上按主库做 pg_basebackup 建备库（同步执行）
 mk_standby() {
   local wn=$1 ph=$2 pp=$3 sh=$4 sp=$5
-  local sn=${wn}s${sh##*.} name=shardpg-fix-$wn-s${sh##*.} dir=$(base $sh)/shardpg-rep/data-$wn-s${sh##*.}
+  local sn=${wn}s${sh##*.} name=shardpg-fix-$wn-s${sh##*.} dir=$(base $sh)/$RD/data-$wn-s${sh##*.}
   $PSQL -h $ph -p $pp -c "select pg_drop_replication_slot('$sn') from pg_replication_slots where slot_name='$sn'" >/dev/null
   $PSQL -h $ph -p $pp -c "select pg_create_physical_replication_slot('$sn', true)" >/dev/null
   onhost $sh "set -e; docker rm -f $name >/dev/null 2>&1 || true; mkdir -p $dir; chmod 777 $dir
@@ -51,7 +53,7 @@ standbys)
     $PSQL -h $ph -p $pp -c "alter system set synchronous_standby_names = ''" -c "select pg_reload_conf()" >/dev/null
     for sh in $HOSTS; do
       [ "$sh" = "$ph" ] && continue
-      sn=${wn}s${sh##*.}; name=shardpg-fix-$wn-s${sh##*.}; dir=$(base $sh)/shardpg-rep/data-$wn-s${sh##*.}
+      sn=${wn}s${sh##*.}; name=shardpg-fix-$wn-s${sh##*.}; dir=$(base $sh)/$RD/data-$wn-s${sh##*.}
       $PSQL -h $ph -p $pp -c "select pg_drop_replication_slot('$sn') from pg_replication_slots where slot_name='$sn'" >/dev/null
       $PSQL -h $ph -p $pp -c "select pg_create_physical_replication_slot('$sn', true)" >/dev/null
       onhost $sh "set -e; docker rm -f $name >/dev/null 2>&1 || true; mkdir -p $dir; chmod 777 $dir
@@ -124,7 +126,7 @@ stop)
     IFS=: read wn ph pp pc sp <<< "$w"
     $PSQL -h $ph -p $pp -c "alter system set synchronous_standby_names = ''" -c "select pg_reload_conf()" >/dev/null 2>&1
   done
-  for sh in $HOSTS; do onhost $sh "docker ps -a --format '{{.Names}}' | grep -E '^shardpg-fix-n[0-9]-s[0-9]+$' | xargs -r docker rm -f"; done
+  for sh in $HOSTS; do onhost $sh "docker ps -a --format '{{.Names}}' | grep -E '^shardpg-fix-n[0-9]+-s[0-9]+$' | xargs -r docker rm -f"; done
   ;;
 rejoin)
   wn=${2:?worker 名，如 n3}; nid=${wn#n}
