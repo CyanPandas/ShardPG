@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "shard_clog.h"
+#include "shard_twophase.h"
 #include "partition_wal_header.h"	/* T7.2：基线 clog CTRL 载荷 */
 #include "partwal_sync.h"			/* T7.2：PartWALAppendCtrl */
 #include "shard_fileset.h"	/* T5.4b-2：水位 CTRL 发射 */
@@ -160,6 +161,10 @@ ShardClogWriteSlot(Oid shard, TransactionId sxid,
 	int			fd;
 	ssize_t		nb;
 
+	if (slot->status != TXN_RUNNING && slot->status != TXN_COMMITTED &&
+        slot->status != TXN_ABORTED)
+        elog(ERROR, "shard clog only stores IN_PROGRESS, COMMITTED or ABORTED");
+
 	if (sxid < FirstNormalTransactionId)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -200,6 +205,7 @@ ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts)
 
 	memset(&slot, 0, sizeof(slot));	/* 全零 = RUNNING；start_ts 是附注列 */
 	slot.start_ts = (uint64) start_ts;
+    ShardTwoPhaseForget(shard, sxid);
 	ShardClogWriteSlot(shard, sxid, &slot, false);
 }
 
@@ -215,20 +221,27 @@ ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 	slot.status = (uint32) (committed ? TXN_COMMITTED : TXN_ABORTED);
 	slot.commit_ts = committed ? (uint64) commit_ts : 0;
 	ShardClogWriteSlot(shard, sxid, &slot, true);
+    ShardTwoPhaseForget(shard, sxid);
 }
 
 void
-ShardClogSetPrepared(Oid shard, TransactionId sxid, int64 start_ts, int64 gxid)
+ShardTwoPhasePrepare(Oid shard, TransactionId sxid, int64 start_ts, int64 gxid)
 {
 	ShardClogSlot slot;
 
 	/* 读改写：RUNNING 落账里的 start_ts 若已在，以入参为准（同源同值） */
 	if (!ShardClogReadSlot(shard, sxid, &slot))
 		memset(&slot, 0, sizeof(slot));
-	slot.status = (uint32) TXN_PREPARED;
+	/* Prepare is recorded separately; clog remains IN_PROGRESS (RUNNING). */
+    if ((slot.status == TXN_COMMITTED || slot.status == TXN_ABORTED) &&
+        slot.global_xid == (uint64) gxid)
+        return;
+    slot.status = (uint32) TXN_RUNNING;
+	slot.commit_ts = 0;
 	slot.start_ts = (uint64) start_ts;
 	slot.global_xid = (uint64) gxid;
 	ShardClogWriteSlot(shard, sxid, &slot, true);
+    ShardTwoPhaseRemember(shard, sxid, (uint64) gxid);
 }
 
 /*
@@ -285,6 +298,16 @@ ShardClogEmitBaseline(Oid shard, TransactionId upto)
             {
                 memcpy(slots + (size_t) i * sizeof(slot), &slot, sizeof(slot));
                 any = true;
+                if (ShardTwoPhaseIsPrepared(shard, x + i))
+                {
+                    PartWALCtrlShardPrepared prepared;
+                    memset(&prepared, 0, sizeof(prepared));
+                    prepared.sxid = x + i;
+                    prepared.gxid = slot.global_xid;
+                    prepared.start_ts = slot.start_ts;
+                    PartWALAppendCtrl(shard, PARTWAL_CTRL_SHARD_PREPARED,
+                                      (char *) &prepared, sizeof(prepared));
+                }
             }
         }
         if (any)
@@ -333,7 +356,12 @@ ShardClogApplyBaselineChunk(Oid shard, TransactionId first_sxid,
         ShardClogSlot slot;
         uint32 segno = (first_sxid + i) / SHARD_CLOG_XIDS_PER_SEGMENT;
         memcpy(&slot, slots + (size_t) i * sizeof(slot), sizeof(slot));
-        if (slot.status == 0) continue;
+        if (slot.status == 1) /* older baseline: convert into separate 2PC membership */
+        {
+            ShardTwoPhasePrepare(shard, first_sxid + i, slot.start_ts, slot.global_xid);
+            continue;
+        }
+        if (slot.status == TXN_RUNNING && slot.global_xid == 0 && slot.start_ts == 0) continue;
         if (dirty && previous_seg != segno)
         {
             ShardClogSyncSegment(shard, previous_seg);
@@ -385,6 +413,11 @@ ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 		memset(out, 0, sizeof(*out));	/* 文件尾之外 = 洞 */
 		return false;
 	}
+    if (out->status == 1) /* legacy PREPARED, read compatibility only */
+    {
+        ShardTwoPhaseRemember(shard, sxid, out->global_xid);
+        out->status = TXN_RUNNING;
+    }
 	return true;
 }
 
@@ -515,6 +548,7 @@ ShardClogClearAll(Oid shard)
     char dir[MAXPGPATH];
     DIR *d;
     struct dirent *de;
+    ShardTwoPhaseClearRange(shard, 0, 0, true);
     ShardClogDirPath(dir, sizeof(dir), shard);
     d = AllocateDir(dir);
     if (!d)
@@ -552,6 +586,7 @@ ShardClogClearRange(Oid shard, TransactionId from, TransactionId to, bool retire
         return 0;
     if (distance >= SHARD_XID_HALF)
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("shard %u clear range is not within half-circle", shard)));
+    ShardTwoPhaseClearRange(shard, from, to, false);
     ShardClogDirPath(dir, sizeof(dir), shard);
     d = AllocateDir(dir);
     if (!d)
@@ -651,7 +686,7 @@ ShardClogClaimRange(Oid shard, TransactionId from, TransactionId to)
         ShardClogSlot slot;
         uint32 segno = sxid / SHARD_CLOG_XIDS_PER_SEGMENT;
         ShardClogReadSlot(shard, sxid, &slot);
-        if (slot.status != TXN_RUNNING) continue;
+        if (slot.status != TXN_RUNNING || ShardTwoPhaseIsPrepared(shard, sxid)) continue;
         if (dirty && previous_seg != segno)
         {
             ShardClogSyncSegment(shard, previous_seg);
@@ -791,6 +826,9 @@ ShardClogGcDropped(const Oid *oids, int n)
 					(errmsg("pg_partdist: 分片 clog 目录 \"%s\" 删除不完整，"
 							"残留为无害孤儿", path)));
 
+        snprintf(path, MAXPGPATH, "%s/pg_shard_twophase/%u", DataDir, dropped[i]);
+        if (stat(path, &st) == 0 && !rmtree(path, true))
+            ereport(WARNING, (errmsg("cannot remove shard 2PC directory %s", path)));
 		snprintf(path, MAXPGPATH, "%s/pg_shard_xid/%u",
 				 DataDir, dropped[i]);
 		if (unlink(path) != 0 && errno != ENOENT)
@@ -907,7 +945,7 @@ partdist_shard_clog_write(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("status 只接受 0(RUNNING)/2(COMMITTED)/3(ABORTED)，"
-							"PREPARED 是 P4 的事")));
+							"prepare 状态保存在独立的 2PC 记录中")));
 	}
 	PG_RETURN_VOID();
 }
@@ -1004,7 +1042,7 @@ ShardVacuumComputeTarget(Oid shard, TransactionId from, int64 safe_ts,
 		}
 		/* RUNNING / PREPARED */
 		if (stop_reason != NULL)
-			*stop_reason = (slot.status == TXN_PREPARED) ? "prepared" : "running";
+			*stop_reason = ShardTwoPhaseIsPrepared(shard, xid) ? "prepared" : "running";
 		break;
 	}
 
@@ -1055,9 +1093,6 @@ partdist_shard_clog_write_ts(PG_FUNCTION_ARGS)
 		case TXN_RUNNING:
 			ShardClogSetRunning(shard, sxid, cts);
 			break;
-		case TXN_PREPARED:
-			ShardClogSetPrepared(shard, sxid, cts, 0);
-			break;
 		case TXN_COMMITTED:
 			ShardClogSetVerdict(shard, sxid, true, cts);
 			break;
@@ -1067,7 +1102,7 @@ partdist_shard_clog_write_ts(PG_FUNCTION_ARGS)
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("status 只接受 0/1/2/3，收到 %d", status)));
+					 errmsg("status 只接受 0(IN_PROGRESS)/2(COMMITTED)/3(ABORTED)，收到 %d", status)));
 	}
 	PG_RETURN_VOID();
 }
@@ -1101,7 +1136,7 @@ partdist_shard_claim_on_promote(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(partdist_shard_clog_set_prepared);
 
 /*
- * 验收探针：直接把某分片 xid 写成 TXN_PREPARED。
+ * 验收探针：登记独立 2PC 状态，分片 clog 保持 IN_PROGRESS。
  *
  * 不去放宽 partdist_shard_clog_write() 的 status 白名单 —— 那道"PREPARED 是
  * P4 的事"的守卫是故意的，为了一条测试把它松掉，等于用验收去磨产品的棱角。
@@ -1114,7 +1149,7 @@ partdist_shard_clog_set_prepared(PG_FUNCTION_ARGS)
 	Oid			shard = PG_GETARG_OID(0);
 	TransactionId sxid = ShardXidFromSql(PG_GETARG_INT64(1));
 
-	ShardClogSetPrepared(shard, sxid, 1, 1);
+	ShardTwoPhasePrepare(shard, sxid, 1, 1);
 	PG_RETURN_VOID();
 }
 

@@ -25,6 +25,10 @@
 
 #include "postgres.h"
 
+struct Query;
+extern void TsoEnsureRouterSnapshot(struct Query *query);
+extern void TsoSetCoordinator(int64 coord_gsid);
+
 #define TSO_MAX_NODES		64
 #define TSO_BOOT_MARKER		"pg_tso_boot"
 #define TSO_HWM_FILE		"pg_tso_hwm"	/* P7-N101：发号上限（高水位）+ GlobalSafeTs 下界 */

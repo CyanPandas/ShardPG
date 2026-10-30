@@ -8,7 +8,7 @@ OBJS = \
 	src/topology_monitor.o
 
 EXTENSION = pg_raft
-DATA = sql/pg_raft--1.0.sql
+DATA = sql/pg_raft--1.0.sql sql/first_shard_decision.sql
 
 PG_CONFIG ?= $(if $(wildcard $(CURDIR)/../pg-install/bin/pg_config),$(CURDIR)/../pg-install/bin/pg_config,pg_config)
 

@@ -7,6 +7,7 @@
 #include "postgres.h"
 
 #include "dtx_participant.h"
+#include "dtx_coordinator.h"
 #include "dtx_record.h"
 #include "partition_wal.h"
 #include "partition_wal_writer.h"
@@ -88,6 +89,12 @@ DtxidFromGid(const char *gid, int64 *dtxid)
     if (gid == NULL)
         return false;
 
+    if (sscanf(gid, "shardpg_fc_%lld_%lld_%lld", &d, &c, &conn) == 3 && d > 0)
+    {
+        *dtxid = d;
+        return true;
+    }
+
     if (sscanf(gid, "citus_%lld_%lld_%lld_%lld",
                &group, &pid, &txn, &conn) == 4)
     {
@@ -159,12 +166,15 @@ void
 PartDistDtxPrePrepareCapture(void)
 {
     int n;
+    const Oid *branch_parts;
+    int nb, i, j;
 
     if (dtx_pending_gid == NULL)
         return;
 
     n = PartWALTouchedCount();
-    if (n <= 0)
+    nb = DtxBranchPartitions(&branch_parts);
+    if (n <= 0 && nb <= 0)
         return;                 /* 只读参与者（§8.3）：不登记、不写标记 */
 
     /*
@@ -173,8 +183,18 @@ PartDistDtxPrePrepareCapture(void)
      * TopTransactionContext。
      */
     dtx_touched_snapshot = (Oid *) MemoryContextAlloc(TopMemoryContext,
-                                                      sizeof(Oid) * n);
+                                                      sizeof(Oid) * (n + nb));
     dtx_touched_count = PartWALCopyTouched(dtx_touched_snapshot, n);
+    /* Read-only branches still participate in the coordinator's vote and
+     * acknowledgement set. They replicate PREPARE markers, without creating
+     * any shard xid/clog slot for data they did not write. */
+    for (i = 0; i < nb; i++)
+    {
+        for (j = 0; j < dtx_touched_count; j++)
+            if (dtx_touched_snapshot[j] == branch_parts[i]) break;
+        if (j == dtx_touched_count)
+            dtx_touched_snapshot[dtx_touched_count++] = branch_parts[i];
+    }
 }
 
 /*
@@ -293,7 +313,7 @@ PartDistDtxPrePrepareFinish(void)
 
             (void) AppendDtxRecord(touched[i], DTX_PREPARE,
                                    dtx_pending_dtxid,
-                                   0 /* coord_gsid：prepare 时 master 还没算出来 */,
+                                   TsoCurrentCoordGsid(),
                                    0 /* commit_ts */, 0 /* verdict */,
                                    NULL, 0, xid);
 
@@ -392,6 +412,15 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
         return;
     if (!DtxidFromGid(gid, &dtxid))
         return;
+
+    /* Coordinator-driven branches receive the authoritative timestamp through
+     * dtx_apply_decision, which replicates each shard's own verdict first. Do
+     * not append the legacy finish marker with a new/local commit timestamp. */
+    if (strncmp(gid, "shardpg_fc_", 11) == 0)
+    {
+        DtxFinishPrepared(gid, committed);
+        return;
+    }
 
     if (SPI_connect() != SPI_OK_CONNECT)
         return;
@@ -568,22 +597,22 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
             pfree(vq.data);
 
             /*
-             * ★ 只在该分片 xid **仍是 PREPARED（st=1）** 时才落 ABORT。
+             * ★ 只在该分片 xid **仍在独立 2PC 未决记录中** 时才落 ABORT。
              *
              * shard_verdict_apply 是无条件覆写：槽位若已是 COMMITTED，覆成 ABORT
              * 会把一笔已提交事务翻掉 —— 它插入的行消失、它 UPDATE 掉的旧版本复活，
              * 实测总额 +1001、分片上冒出重复行（同一 id 两个可见版本）。
-             * N12 之二的 in-doubt 闭合本来就用 `shard_clog_status(...)=1` 过滤过，
+             * N12 之二的 in-doubt 闭合本来就用 `shard_is_prepared(...)` 过滤过，
              * 这条补判决的路径漏了同一道闸。按 dtxid 回查 sxid 理论上唯一，但
              * 只要有一次错配就是不可逆的数据损坏，闸门必须在。
              */
             if (TransactionIdIsNormal(sxid))
             {
-                int st = -1;
+                bool prepared = false;
 
                 initStringInfo(&vq);
                 appendStringInfo(&vq,
-                                 "SELECT partdist.shard_clog_status(%u::oid, %lld::bigint)",
+                                 "SELECT partdist.shard_is_prepared(%u::oid, %lld::bigint)",
                                  (unsigned) local_oid, (long long) sxid);
                 if (SPI_execute(vq.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
                 {
@@ -592,11 +621,11 @@ PartDistDtxOnFinishPrepared(const char *gid, bool committed)
                                             SPI_tuptable->tupdesc, 1, &isnull);
 
                     if (!isnull)
-                        st = DatumGetInt32(d);
+                        prepared = DatumGetBool(d);
                 }
                 pfree(vq.data);
 
-                if (st == 1)            /* TXN_PREPARED */
+                if (prepared)
                 {
                     initStringInfo(&vq);
                     appendStringInfo(&vq,

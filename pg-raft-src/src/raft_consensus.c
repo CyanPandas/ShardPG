@@ -1513,6 +1513,30 @@ data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid, int64 plsn, int info)
                  "pg_raft: 组 %lld apply FORGET 记录（plsn=%lld）删除决议行失败",
                  (long long) ctx->group_id, (long long) plsn);
         pfree(sql.data);
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.dtx_commit_decided dd "
+                         "USING partdist.partwal_read_dtx_record(%u::oid,%lld) d "
+                         "WHERE dd.dtxid=d.dtxid",
+                         (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_DELETE)
+            elog(ERROR, "could not forget COMMIT decision");
+        pfree(sql.data);
+    }
+    else if (info == 6)
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "INSERT INTO partdist.dtx_commit_decided"
+                         "(dtxid,coord_gsid,participants,decided_plsn) "
+                         "SELECT d.dtxid,d.coord_gsid,d.participants,%lld "
+                         "FROM partdist.partwal_read_dtx_record(%u::oid,%lld) d "
+                         "WHERE d.kind=6 AND d.verdict=1 AND d.commit_ts=0 "
+                         "ON CONFLICT(dtxid) DO NOTHING",
+                         (long long) plsn, (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_INSERT)
+            elog(ERROR, "could not index durable COMMIT decision");
+        pfree(sql.data);
     }
     else if (info == 2)
     {
@@ -1669,7 +1693,7 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
     int          info = entry_record_info(e->payload);
 
     if ((entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
-        (info == 2 || info == 5))
+        (info == 2 || info == 5 || info == 6))
     {
         it.plsn = plsn;
         it.info = info;
@@ -3578,7 +3602,7 @@ group_apply_pending(RaftGroupCtx *ctx)
                 {
                     int inf = entry_record_info(e.payload);
 
-                    if (inf == 2 || inf == 5)
+                    if (inf == 2 || inf == 5 || inf == 6)
                     {
                         dtx_items[ndtx].plsn = batch_plsn;
                         dtx_items[ndtx].info = inf;
@@ -3599,7 +3623,7 @@ group_apply_pending(RaftGroupCtx *ctx)
                     {
                         int inf = entry_record_info(be.payload);
 
-                        if ((inf == 2 || inf == 5) && ndtx < RAFT_LOG_CAPACITY)
+                        if ((inf == 2 || inf == 5 || inf == 6) && ndtx < RAFT_LOG_CAPACITY)
                         {
                             dtx_items[ndtx].plsn = pl;
                             dtx_items[ndtx].info = inf;
@@ -10845,6 +10869,7 @@ dtx_lookup_decision(int64 dtxid)
     appendStringInfo(&sql,
                      "SELECT verdict FROM partdist.dtx_decision WHERE dtxid = %lld",
                      (long long) dtxid);
+    PushActiveSnapshot(GetLatestSnapshot());
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
     {
         Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
@@ -10852,9 +10877,81 @@ dtx_lookup_decision(int64 dtxid)
         if (!isnull)
             verdict = DatumGetInt16(d);
     }
+    PopActiveSnapshot();
     pfree(sql.data);
     raft_persist_spi_end(spi_owned);
     return verdict;
+}
+
+/* Keep decision writers serialized until their SQL indexes commit, not merely
+ * until the shorter Raft replication claim is released. */
+static void
+dtx_lock_transaction(int64 dtxid)
+{
+    bool owned;
+    char q[128];
+    if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DTX requires SPI");
+    snprintf(q, sizeof(q), "SELECT pg_catalog.pg_advisory_xact_lock(%lld)", (long long) dtxid);
+    if (SPI_execute(q, false, 0) != SPI_OK_SELECT) elog(ERROR, "DTX lock failed");
+    raft_persist_spi_end(owned);
+}
+
+static bool
+dtx_has_commit_decision(int64 dtxid)
+{
+    bool owned;
+    bool found;
+    char q[160];
+    if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DTX requires SPI");
+    snprintf(q, sizeof(q), "SELECT 1 FROM partdist.dtx_commit_decided WHERE dtxid=%lld",
+             (long long) dtxid);
+    PushActiveSnapshot(GetLatestSnapshot());
+    found = SPI_execute(q, true, 1) == SPI_OK_SELECT && SPI_processed == 1;
+    PopActiveSnapshot();
+    raft_persist_spi_end(owned);
+    return found;
+}
+
+/* A new leader must commit its current term and apply the inherited prefix
+ * before interpreting an absent decision as ABORT. Called under replicate_claim.
+ */
+static void
+dtx_decision_barrier(RaftGroupCtx *ctx)
+{
+    int64 term, commit;
+    bool current;
+    bool owned;
+    StringInfoData sql;
+    RaftLogEntry entry;
+    SpinLockAcquire(&ctx->cons->mutex);
+    term = ctx->cons->current_term;
+    SpinLockRelease(&ctx->cons->mutex);
+    SpinLockAcquire(&ctx->log->mutex);
+    commit = ctx->log->commit_index;
+    current = commit > 0 && log_get_entry_locked(ctx, commit, &entry) && entry.term == term;
+    SpinLockRelease(&ctx->log->mutex);
+    if (!current && group_propose(ctx, "OP_NOOP", "{}") <= 0)
+        elog(ERROR, "DTX coordinator could not establish a current-term quorum");
+    group_apply_pending(ctx);
+    SpinLockAcquire(&ctx->log->mutex);
+    current = ctx->log->last_applied >= ctx->log->commit_index;
+    SpinLockRelease(&ctx->log->mutex);
+    if (!current) elog(ERROR, "DTX coordinator decision index is not caught up");
+    /* A quorum record can outlive the SQL transaction that indexed it. Replay
+     * from a transactional cursor before interpreting absence as ABORT or
+     * selecting a second timestamp. Only the committed prefix is authoritative.
+     */
+    if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DTX requires SPI");
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT partdist.dtx_reindex_committed(%lld,%u::oid,"
+        "partdist.pg_raft_group_committed_plsn(%lld))",
+        (long long) ctx->group_id, (unsigned) group_local_partition(ctx),
+        (long long) ctx->group_id);
+    if (SPI_execute(sql.data, false, 0) != SPI_OK_SELECT)
+        elog(ERROR, "could not refresh coordinator decision index");
+    pfree(sql.data);
+    raft_persist_spi_end(owned);
 }
 
 /*
@@ -10963,9 +11060,7 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
         PG_RETURN_NULL();
 
-    existing = dtx_lookup_decision(dtxid);
-    if (existing != 0)
-        PG_RETURN_INT32(existing);
+    dtx_lock_transaction(dtxid);
 
     /*
      * T4.4 换源：驱动节点在"全部票齐"点从 TSO 取的 commit_ts 经参数传入
@@ -10982,11 +11077,22 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
     in_txn_replication = true;
     PG_TRY();
     {
+        dtx_decision_barrier(&ctx);
         /* 进入临界区后再查一次：等待期间可能已被恢复守护写了决议 */
         existing = dtx_lookup_decision(dtxid);
         if (existing == 0)
-            (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
-                                      commit_ts, parts_sql);
+        {
+            bool committed = dtx_has_commit_decision(dtxid);
+            if (committed && verdict == 2)
+                verdict = 0;    /* irrevocably committed, timestamp still pending */
+            else
+            {
+                if (committed && p_commit_ts <= 0)
+                    elog(ERROR, "a durable COMMIT decision requires its TSO timestamp");
+                (void) dtx_write_decision(&ctx, local_oid, dtxid, verdict,
+                                          commit_ts, parts_sql);
+            }
+        }
         else
             verdict = existing;
     }
@@ -10999,6 +11105,89 @@ pg_raft_dtx_decide(PG_FUNCTION_ARGS)
 
     pfree(parts_sql);
     PG_RETURN_INT32(verdict);
+}
+
+/* Irrevocable commit point for the first-shard protocol. Deliberately has no
+ * TSO call: commit_ts is allocated only AFTER this request commits successfully.
+ */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_choose_commit);
+Datum
+pg_raft_dtx_choose_commit(PG_FUNCTION_ARGS)
+{
+    int64 coord = PG_GETARG_INT64(0);
+    int64 id = PG_GETARG_INT64(1);
+    ArrayType *parts = PG_GETARG_ARRAYTYPE_P(2);
+    RaftGroupCtx ctx;
+    int64 oid = 0;
+    char *parts_sql;
+    int verdict = 0;
+    bool owned;
+    StringInfoData q;
+    bool isnull;
+    int64 plsn;
+
+    if (coord <= 0 || id <= 0 || ARR_NDIM(parts) != 1 ||
+        ArrayGetNItems(ARR_NDIM(parts), ARR_DIMS(parts)) <= 0 || ARR_HASNULL(parts))
+        elog(ERROR, "COMMIT decision requires a coordinator, transaction and participants");
+    if (!dtx_coord_ctx(coord, &ctx, &oid)) PG_RETURN_NULL();
+    dtx_lock_transaction(id);
+    parts_sql = dtx_participants_sql(parts);
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
+    {
+        dtx_decision_barrier(&ctx);
+        verdict = dtx_lookup_decision(id);
+        if (verdict == 0 && !dtx_has_commit_decision(id))
+        {
+            if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DTX requires SPI");
+            initStringInfo(&q);
+            appendStringInfo(&q,
+                "SELECT partdist.partwal_append_dtx_record(%u::oid,6,%lld,%lld,0,1,%s)",
+                (unsigned) oid, (long long) id, (long long) coord, parts_sql);
+            if (SPI_execute(q.data, false, 1) != SPI_OK_SELECT || SPI_processed != 1)
+                elog(ERROR, "could not append COMMIT decision");
+            plsn = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            if (isnull || plsn <= 0) elog(ERROR, "invalid COMMIT decision position");
+            pfree(q.data);
+            raft_persist_spi_end(owned);
+            replicate_group_upto(&ctx, plsn, (Oid) oid);
+            if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DTX requires SPI");
+            data_apply_dtx_one(&ctx, oid, plsn, 6);
+            raft_persist_spi_end(owned);
+        }
+        if (verdict == 0) verdict = 1;
+    }
+    PG_FINALLY();
+    {
+        in_txn_replication = false;
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+    pfree(parts_sql);
+    PG_RETURN_INT32(verdict);
+}
+
+PG_FUNCTION_INFO_V1(pg_raft_dtx_refresh);
+Datum
+pg_raft_dtx_refresh(PG_FUNCTION_ARGS)
+{
+    RaftGroupCtx ctx;
+    int64 oid;
+    if (!dtx_coord_ctx(PG_GETARG_INT64(0), &ctx, &oid)) PG_RETURN_BOOL(false);
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
+    {
+        dtx_decision_barrier(&ctx);
+    }
+    PG_FINALLY();
+    {
+        in_txn_replication = false;
+        replicate_release(&ctx);
+    }
+    PG_END_TRY();
+    PG_RETURN_BOOL(true);
 }
 
 /*
@@ -11180,17 +11369,16 @@ pg_raft_dtx_status(PG_FUNCTION_ARGS)
     if (!dtx_coord_ctx(coord_gsid, &ctx, &local_oid))
         PG_RETURN_NULL();
 
-    existing = dtx_lookup_decision(dtxid);
-    if (existing != 0)
-        PG_RETURN_INT32(existing);
+    dtx_lock_transaction(dtxid);
 
     parts_sql = dtx_participants_sql(NULL);
     replicate_claim(&ctx);
     in_txn_replication = true;
     PG_TRY();
     {
+        dtx_decision_barrier(&ctx);
         existing = dtx_lookup_decision(dtxid);
-        if (existing == 0)
+        if (existing == 0 && !dtx_has_commit_decision(dtxid))
         {
             (void) dtx_write_decision(&ctx, local_oid, dtxid, 2 /* ABORT */,
                                       0, parts_sql);
@@ -11223,9 +11411,16 @@ static bool
 dtx_parse_gid(const char *gid, int64 *dtxid, int64 *coord_gsid)
 {
     long long d = 0, c = 0;
+    unsigned long long branch = 0;
 
     if (gid == NULL)
         return false;
+    if (sscanf(gid, "shardpg_fc_%lld_%lld_%llu", &d, &c, &branch) == 3 && d > 0 && c > 0)
+    {
+        *dtxid = d;
+        *coord_gsid = c;
+        return true;
+    }
     if (sscanf(gid, "shardpg_dtx_%lld_%lld", &d, &c) != 2)
         return false;
     if (d <= 0 || c <= 0)
@@ -11281,28 +11476,8 @@ dtx_ask_coordinator(int64 coord_gsid, int64 dtxid)
     if (coord_node <= 0)
         return 0;               /* 元数据还没追平：下轮再问 */
 
-    /* 本节点就是协调者：直接本地调，省一次往返 */
-    if (coord_node == pg_raft_node_id)
-    {
-        if (!raft_persist_spi_begin(&spi_owned))
-            return 0;
-        initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "SELECT partdist.dtx_status(%lld, %lld)",
-                         (long long) coord_gsid, (long long) dtxid);
-        if (SPI_execute(sql.data, false, 1) == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            Datum d = SPI_getbinval(SPI_tuptable->vals[0],
-                                    SPI_tuptable->tupdesc, 1, &isnull);
-            if (!isnull)
-                verdict = DatumGetInt32(d);
-        }
-        pfree(sql.data);
-        raft_persist_spi_end(spi_owned);
-        return verdict;
-    }
-
-    /* 2) 远端：走 libpq */
+    /* Even self-queries use an autonomous connection: a newly chosen ABORT
+     * must commit its SQL index before COMMIT/ROLLBACK PREPARED consults it. */
     for (i = 0; i < n_peers; i++)
         if (peers[i].node_id == coord_node)
         {
@@ -11547,7 +11722,8 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
      */
     appendStringInfo(&sql,
                      "SELECT gid FROM pg_prepared_xacts "
-                     " WHERE (strpos(gid, 'shardpg_dtx_') = 1 OR strpos(gid, 'citus_') = 1) "
+                     " WHERE (strpos(gid, 'shardpg_dtx_') = 1 OR strpos(gid, 'citus_') = 1 "
+                     "        OR strpos(gid, 'shardpg_fc_') = 1) "
                      "   AND prepared < now() - interval '%d milliseconds' "
                      " ORDER BY prepared LIMIT 64",
                      timeout_ms);
@@ -12027,6 +12203,7 @@ pg_raft_dtx_ack(PG_FUNCTION_ARGS)
         PG_RETURN_NULL();
 
     gsids_sql = dtx_participants_sql(arr);
+    dtx_lock_transaction(dtxid);
 
     if (!raft_persist_spi_begin(&spi_owned))
         ereport(ERROR, (errmsg("pg_raft: dtx_ack 需要 SPI")));
@@ -12098,6 +12275,9 @@ dtx_ack_sweep(void)
         " WHERE p.coord_gsid IS NOT NULL "
         "   AND p.noted_at < now() - interval '5 seconds' "
         "   AND NOT EXISTS (SELECT 1 FROM pg_prepared_xacts x WHERE x.gid = p.gid) "
+        "   AND NOT EXISTS (SELECT 1 FROM partdist.dtx_participant p2 "
+        "                   JOIN pg_prepared_xacts x2 ON x2.gid=p2.gid "
+        "                  WHERE p2.dtxid=p.dtxid) "
         " LIMIT 16");
     if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
     {
@@ -12285,6 +12465,7 @@ dtx_forget_sweep(void)
         if (!dtx_coord_ctx_soft(coords[i], &ctx, &local_oid))
             continue;           /* 不是这组的 leader：由现任 leader 负责 */
 
+        dtx_lock_transaction(dtxids[i]);
         replicate_claim(&ctx);
         in_txn_replication = true;
         PG_TRY();
@@ -12779,7 +12960,7 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
         "  FROM prep p LEFT JOIN cl ON cl.dtxid = p.dtxid "
         "  LEFT JOIN LATERAL partdist.partwal_prepare_sxid(%u::oid, p.dtxid, "
         "                       partdist.get_partition_flush_lsn(%u::oid)) m ON true "
-        " WHERE (m.sxid IS NOT NULL AND partdist.shard_clog_status(%u::oid, m.sxid) = 1) "
+        " WHERE (m.sxid IS NOT NULL AND partdist.shard_is_prepared(%u::oid, m.sxid)) "
         "    OR (m.sxid IS NULL AND cl.v IS NULL) "
         " LIMIT 64",
         (unsigned) partition_id, (unsigned) partition_id,
@@ -12964,6 +13145,12 @@ dtx_dtxid_from_gid(const char *gid, int64 *dtxid)
 
     if (gid == NULL)
         return false;
+
+    if (sscanf(gid, "shardpg_fc_%lld_%lld_%lld", &d, &c, &conn) == 3 && d > 0)
+    {
+        *dtxid = d;
+        return true;
+    }
 
     if (sscanf(gid, "citus_%lld_%lld_%lld_%lld", &group, &pid, &txn, &conn) == 4)
     {
@@ -13675,6 +13862,16 @@ pg_raft_dtx_note_participant(int64 dtxid, const char *gid,
     }
 
     initStringInfo(&sql);
+    /* Registration must survive whenever the subsequent native PREPARE does,
+     * regardless of a cluster-wide asynchronous-commit setting. */
+    res = PQexec(conn, "SET synchronous_commit = on");
+    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        PQclear(res);
+        PQfinish(conn);
+        return false;
+    }
+    PQclear(res);
     appendStringInfoString(&sql, "SELECT partdist.dtx_note_participant(");
     appendStringInfo(&sql, "%lld, ", (long long) dtxid);
     {

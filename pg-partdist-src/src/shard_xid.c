@@ -11,6 +11,7 @@
 #include "shard_xid.h"
 #include "shard_replay.h"	/* T6.3c：副本壳表闸门 */
 #include "shard_clog.h"
+#include "shard_twophase.h"
 #include "shard_vacuum.h"
 #include "shard_guard.h"
 #include "partwal_sync.h"		/* T7.27：写路径背压 */
@@ -608,7 +609,7 @@ ShardXidDecisionWrite(Oid shard, TransactionId sxid, uint64 gxid,
     bool ok;
     LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
     ok = ShardClogReadSlot(shard, sxid, &slot) && slot.global_xid == gxid &&
-        (slot.status == TXN_PREPARED ||
+        (ShardTwoPhaseIsPrepared(shard, sxid) ||
          (slot.status == (committed ? TXN_COMMITTED : TXN_ABORTED) &&
           slot.commit_ts == (uint64) (committed ? cts : 0)));
     if (ok) ShardClogSetVerdict(shard, sxid, committed, cts);
@@ -1363,7 +1364,7 @@ ShardXidRedoAdvance(Oid shard, TransactionId sxid)
  *
  * **PREPARED 一根汗毛都不动**：ShardClogClaimRange 只改 RUNNING（含空洞槽），
  * 这是 §6.6 第二支。未决的 2PC 分片 xid 在 follower 上由回放
- * （shard_replay.c 的 XLOG_XACT_PREPARE 分支）写成 TXN_PREPARED，因此不会被
+ * （shard_replay.c 的 XLOG_XACT_PREPARE 分支）登记到独立的分片 2PC 状态，因此不会被
  * 本函数误判成中止 —— 否则一笔后来被判 COMMIT 的分布式事务会在这一分片上丢掉。
  * 调用方仍应把 dtx_close_indoubt() 排在本函数**之前**，让有决议的先落终局。
  *
@@ -1663,7 +1664,7 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PREPARE:
 			/*
 			 * T4.5：joined 分片写的 PREPARE（T4.3 起合法）在此把活跃表条目
-			 * **只摘不判**——此后"未决"由 clog PREPARED + 未决登记表承载，
+			 * **只摘不判**——此后"未决"由 IN_PROGRESS clog + 独立 2PC 记录承载，
 			 * 读者走 §4.2 三态。不摘的话：持有条目的是 Citus 池化任务连接
 			 * （可存活极久），读者先命中活跃表即返 RUNNING，决议收敛写进
 			 * clog 的 COMMITTED 被永久遮蔽（实测：池连接一退出行立即可见，
@@ -2229,7 +2230,7 @@ shard_at_prepare_impl(void)
 	sts = TsoGetStartTs();
 
 	for (i = 0; i < xact_map_n; i++)
-		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
+		ShardTwoPhasePrepare(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
 
 	sz = offsetof(ShardTwoPhasePayload, pairs) +
 		(Size) xact_map_n * 2 * sizeof(uint32);
@@ -2282,8 +2283,10 @@ shard_twophase_recover_impl(TransactionId xid, uint16 info,
             ShardClogSlot slot;
             if (!ShardClogReadSlot(pv[0], pv[1], &slot) || slot.global_xid != (uint64) hdr.gxid)
                 continue;
+            if (slot.status == TXN_RUNNING)
+                ShardTwoPhaseRemember(pv[0], pv[1], (uint64) hdr.gxid);
             ShardCommitSetPrepared(pv[0], pv[1], xid);
-            if (slot.status == TXN_PREPARED && nlive < DTX_PENDING_MAX_PAIRS)
+            if (ShardTwoPhaseIsPrepared(pv[0], pv[1]) && nlive < DTX_PENDING_MAX_PAIRS)
             {
                 pairs[2 * nlive] = pv[0];
                 pairs[2 * nlive + 1] = pv[1];

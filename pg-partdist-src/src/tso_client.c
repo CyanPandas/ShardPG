@@ -25,6 +25,7 @@
 #include "shard_xid.h"
 #include "shard_vacuum.h"
 #include "dtx_pending.h"
+#include "dtx_coordinator.h"
 
 #include "gxid.h"				/* P7-N91：GxidAllocate */
 
@@ -34,6 +35,7 @@
 #include "fmgr.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
@@ -593,7 +595,8 @@ TsoMarkerCommitTsEx(bool *is_tso)
 
 /*
  * T4.4：决议点取号（pg_raft 经 rendezvous "partdist_tso_dtx_decision_ts_fn"
- * 调用）。"全部 PREPARE 持久确认之后、决议持久化之前"的新号（§2-4 两时机，
+ * 调用）。旧协议在全部 PREPARE 后取号；首分片协议在 COMMIT decision
+ * 持久化之后、广播之前取号。每次向 TSO 请求新号（
  * 不预取不缓存）；未配置 TSO 返回 0（决议侧回退本地时钟，遗留宇宙不混）。
  *
  * ★ 取到的决议 ts **覆盖**本事务的 PRE_COMMIT 暂存：驱动事务自己的
@@ -867,6 +870,64 @@ partdist_join_global_txn(PG_FUNCTION_ARGS)
  */
 bool		shardpg_auto_global_txn = true;
 
+/* Allocate once before Citus plans/routes the first distributed statement.
+ * The remote-BEGIN hook propagates it and also covers cached-plan execution.
+ */
+void
+TsoEnsureRouterSnapshot(Query *query)
+{
+	typedef bool (*IsCitusTableFn)(Oid);
+	static IsCitusTableFn is_citus_table = NULL;
+	static bool entering = false;
+	ListCell *lc;
+	bool distributed = false;
+
+	if (entering || query == NULL || !shardpg_auto_global_txn ||
+		MyBackendType != B_BACKEND || !IsTransactionState() ||
+		!tso_configured() || cur_gxid != 0)
+		return;
+	if (is_citus_table == NULL)
+		is_citus_table = (IsCitusTableFn) dlsym(RTLD_DEFAULT, "IsCitusTable");
+	if (is_citus_table == NULL)
+		return;
+	entering = true;
+	PG_TRY();
+	{
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+			if (rte->rtekind == RTE_RELATION && is_citus_table(rte->relid))
+			{
+				distributed = true;
+				break;
+			}
+		}
+		if (distributed)
+		{
+			if (pending_join_ts > 0)
+				(void) TsoGetStartTs();
+			else
+			{
+				cur_gxid = GxidAllocate();
+				(void) TsoGetStartTs();
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		entering = false;
+	}
+	PG_END_TRY();
+}
+
+void
+TsoSetCoordinator(int64 coord_gsid)
+{
+	if (coord_gsid <= 0 || (cur_coord_gsid != 0 && cur_coord_gsid != coord_gsid))
+		ereport(ERROR, (errmsg("transaction coordinator cannot change")));
+	cur_coord_gsid = coord_gsid;
+}
+
 typedef void (*CitusRemoteTxnBeginHook) (StringInfo command);
 static CitusRemoteTxnBeginHook prev_remote_begin_hook = NULL;
 
@@ -881,6 +942,8 @@ partdist_remote_txn_begin(StringInfo command)
 	if (!shardpg_auto_global_txn || MyBackendType != B_BACKEND ||
 		!IsTransactionState() || !tso_configured())
 		return;
+
+	DtxRequireRouterHooks();
 
 	if (cur_gxid == 0)
 	{

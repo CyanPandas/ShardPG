@@ -203,3 +203,11 @@ nm -D /work/pg-install/bin/postgres | grep -E \
 一键复现直接断在编译（`468a518` 的教训）。回归里的守卫是 `raft_22` A 段：
 它断言当前二进制导出 `pre_record_commit_hook`，没有就直接判失败并指出
 "内核补丁 0004 未落地，跨分区事务不会走 2PC"。
+# citus-0004：首分片协调与异步提交（待构建、集群验收）
+
+`citus-0004-first-shard-coordinator.patch` 在 0002/0003 之后应用。新增远程
+分支上下文钩子及提交委托钩子，使 router 交接连接并转发客户端 COMMIT，
+由首个登记分片驱动 prepare。已交接连接不会再被 router 的 abort 回调回滚。
+该补丁尚未同步为仓库内的 `citus.so` 二进制；需与新 pg_partdist/pg_raft、SQL
+迁移一起构建、部署和重启。协议及验收范围见
+[FIRST_SHARD_COORDINATOR.md](../docs/FIRST_SHARD_COORDINATOR.md)。

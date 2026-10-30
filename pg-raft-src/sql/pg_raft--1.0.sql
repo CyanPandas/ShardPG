@@ -130,9 +130,10 @@ CREATE OR REPLACE FUNCTION pg_raft_report_data_leader_batch(p_items text)
 -- ------------------------------------------------------------------
 -- DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）
 -- ------------------------------------------------------------------
--- 决议记录写在**协调组**（写集内按 hash(dtxid) 选出的那个分区组）的日志里；
--- **该记录在协调组达到多数派持久化即为全局提交点**，dtx_decide 只有在那之后
--- 才返回成功。索引表 partdist.dtx_decision 由各成员的 apply 路径维护，
+-- 决议记录写在协调组日志里。新协议采用首个登记到达的分片；关闭新协议时
+-- 兼容路径仍在 master 收票后按 dtxid 取模选组。
+-- 新协议先由 dtx_choose_commit 持久化不可撤销的决议，再取 TSO 时间戳，
+-- dtx_decide 为其附加时间戳；兼容旧路径仍可一次写完整决议。索引表 partdist.dtx_decision 由各成员的 apply 路径维护，
 -- 因此协调组切主后新 leader 立刻可答（协调权随 Raft 选举自动转移）。
 CREATE OR REPLACE FUNCTION dtx_decide(
     p_coord_gsid bigint,
@@ -1010,3 +1011,18 @@ $div$;
 
 COMMENT ON FUNCTION pg_raft_check_fastpath_divergence(OID, INTEGER) IS
     '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed（停在 prepared 也算）。返回分叉条数，0 表示无分叉；NULL 表示尚未判定 —— 有标记的普通事务还在本机提交途中（P7-N111），稍后再查。';
+
+-- BEGIN first_shard_decision.sql (keep in sync with standalone upgrade)
+-- Run on every node after deploying the new pg_raft library, before enabling
+-- first-shard coordination. The replicated index is installed by pg_partdist.
+CREATE OR REPLACE FUNCTION partdist.dtx_choose_commit(
+    p_coord_gsid bigint, p_dtxid bigint, p_participants bigint[]
+) RETURNS integer LANGUAGE c STRICT VOLATILE
+AS '$libdir/pg_raft', 'pg_raft_dtx_choose_commit';
+CREATE OR REPLACE FUNCTION partdist.dtx_refresh(bigint)
+RETURNS boolean LANGUAGE c STRICT VOLATILE
+AS '$libdir/pg_raft', 'pg_raft_dtx_refresh';
+REVOKE ALL ON FUNCTION partdist.dtx_refresh(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION partdist.dtx_choose_commit(bigint,bigint,bigint[]) FROM PUBLIC;
+COMMENT ON FUNCTION partdist.dtx_choose_commit(bigint,bigint,bigint[]) IS
+    'Replicate irrevocable COMMIT before requesting commit_ts. Returns 1 for COMMIT, 2 for an existing ABORT, NULL on a non-leader. No visibility is published until the timestamped decision is replicated.';

@@ -188,7 +188,7 @@ for sid in "${SIDS[@]}"; do lp=$(cur_leader $sid)
   nx=$(Q $lp "SELECT partdist.shard_xid_next($lo)")
   [[ "$lo" =~ ^[0-9]+$ && "$nx" =~ ^[0-9]+$ ]] || { check "组 $sid 检查参数有效" "missing" "valid"; continue; }
   prep=$(PSQL $lp -At -v ON_ERROR_STOP=1 <<SQL
-SELECT string_agg(x::text, ',') FROM generate_series(3, ${nx}-1) x WHERE public.sclog_full(${lo}::oid, x) LIKE 'st=1 %';
+SELECT string_agg(x::text, ',') FROM generate_series(3, ${nx}-1) x WHERE partdist.shard_is_prepared(${lo}::oid, x);
 SQL
 )
   [[ $? -eq 0 ]] || { check "组 $sid 分片事务状态查询成功" "error" "ok"; continue; }

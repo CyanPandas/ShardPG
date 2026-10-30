@@ -9,6 +9,7 @@
 
 #include "dtx_pending.h"
 #include "shard_clog.h"
+#include "shard_twophase.h"
 #include "shard_xid.h"
 #include "gxid.h"					/* T7.1：从 gxid 还原本地 xid */
 #include "partwal_sync.h"			/* T7.1：判决标记补发 */
@@ -677,8 +678,8 @@ dtx_inquire_core_ex(int64 coord_gsid, int64 dtxid, int64 *cts_out, bool *answere
  * 由构造保证一致。三条调用路径（广播接收 `dtx_apply_decision`、清扫工作者、
  * 恢复守护）都是普通 backend，可以安全地开 writer、取 PartWALCtl 锁、发提案。
  *
- * ★ 失败一律不上抛。本地分片 clog 已经落账（调用方在本函数之前做的），那是
- * 正确性的底线；复制是尽力而为，与 §3.3 阶段 3 "随下一次 flush 复制" 同一口径。
+ * 失败返回 false：调用方保留未决登记，不发布本地终局，不发送完成回执。
+ * 异步 commit 分发可以重试，但成功回执必须覆盖各分片自己的多数派。
  * 最典型的失败是**本节点已不是该分片的主**（切主后由恢复守护补判决，R-P4-9 的
  * 场景）——写栅栏会拒，这正是它该拒的：陈旧主不得再往流里写。
  */
@@ -785,7 +786,7 @@ dtx_replicate_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		ereport((replicate_fail_streak == 1 || replicate_fail_streak % 50 == 0) ? WARNING : LOG,
 				(errmsg("pg_partdist: 判决标记未能复制给副本（gxid=%lld，连续第 %d 次）：%s",
 						(long long) ent->gxid, replicate_fail_streak, ed->message),
-				 errdetail("本地分片 clog 判决已落账；未决登记**保留**（挡住回执与决议 FORGET），"
+				 errdetail("本地终局等待多数派复制；未决登记保留（挡住回执与决议 FORGET），"
 						   "清扫时重试复制；本节点若已不是该分片的主，待主权登记转到新主后自动注销。"),
 				 errhint("本节点若已不是该分片的主，这是写栅栏的正常拒绝。")));
 		FreeErrorData(ed);
@@ -928,6 +929,11 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
             slot.global_xid != (uint64) ent->gxid)
             return false;
     }
+    /* A terminal clog slot is published only after the verdict reaches each
+     * affected shard's own quorum. Failed delivery keeps the pending entry. */
+    if (!dtx_replicate_verdict(ent, verdict, cts))
+        return false;
+
 	for (i = 0; i < ent->nxids; i++)
         if (!ShardXidDecisionWrite(ent->pairs[2*i], ent->pairs[2*i+1],
                                    (uint64) ent->gxid, verdict == 1, verdict == 1 ? cts : 0))
@@ -943,10 +949,6 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 	if (nbad > 0)
 		elog(WARNING, "pg_partdist: gxid=%lld 判决落分片 clog 后回读，%d/%d 个槽位不是终局（P7-N86）",
 			 (long long) ent->gxid, nbad, ent->nxids);
-
-	/* ★ T7.1（R-P6-15）：本节点刚落的这本账，要复制给副本 */
-	if (!dtx_replicate_verdict(ent, verdict, cts))
-		return false;
 
 	DtxPendingFinalized(ent->gxid);
 	return true;
@@ -1011,9 +1013,8 @@ DtxPendingSweep(void)
 
 			for (j = 0; j < snap[i].nxids; j++)
 			{
-				if (ShardClogReadStatus((Oid) snap[i].pairs[2 * j],
-										(TransactionId) snap[i].pairs[2 * j + 1])
-					== TXN_PREPARED)
+				if (ShardTwoPhaseIsPrepared((Oid) snap[i].pairs[2 * j],
+                                            (TransactionId) snap[i].pairs[2 * j + 1]))
 				{
 					any_prepared = true;
 					break;

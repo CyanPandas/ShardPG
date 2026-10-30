@@ -4,7 +4,12 @@
  * DTX-2PC 参与者侧接线（worker 侧）。设计依据
  * pg-partdist-src/docs/DTX_2PC_DESIGN.md §3.3 / §5 / §9.3。
  *
- * 形态：Citus 在 master 的 XACT_EVENT_PRE_COMMIT 里对每个参与节点发
+ * 新协议：首个分片的协调者封闭参与者集合并发布 PREPARE，Worker 在原任务
+ * backend 的 dtx_handoff 中读取命令，调用 PrepareTransactionBlock。native
+ * prepare 完成后直接向分片协调者投票。详见 dtx_coordinator.h。
+ *
+ * 兼容路径（关闭 shardpg.first_shard_coordinator 时）：Citus 在 master 的
+ * XACT_EVENT_PRE_COMMIT 里对每个参与节点发
  * `PREPARE TRANSACTION 'citus_<group>_<pid>_<txnnum>_<conn>'`。
  * 本模块在 worker 的 ProcessUtility 里截下这条语句（此时触达集合还在），
  * 记住 gid；随后在 XACT_EVENT_PRE_PREPARE 里：
@@ -18,8 +23,8 @@
  *
  * 之后 PG 才写 prepare 记录并 fsync（[B]），时序不变式 [A] < [B] 保持。
  *
- * 触达集合为空 ⇒ 本节点在这笔事务里**没有写任何纳管分区**（只读参与者），
- * 不登记、不写标记，master 侧的写集里自然不会有它（§8.3 只读参与者剔除）。
+ * 新协议还将已登记的只读分片纳入标记与完成回执集合。只有实际写过数据的
+ * 分片拥有 shard xid/clog 槽；只读分片不创建虚假的分片 clog 状态。
  */
 #ifndef DTX_PARTICIPANT_H
 #define DTX_PARTICIPANT_H

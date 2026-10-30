@@ -27,6 +27,7 @@
 #include "pg_partdist.h"
 #include "shard_xid.h"
 #include "shard_clog.h"
+#include "shard_twophase.h"
 #include "dtx_pending.h"
 #include "tso.h"
 #include "shard_visibility.h"
@@ -114,7 +115,7 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 
 /*
  * strict = true：快照读（sv_satisfies_mvcc）。判决定不下来的 PREPARED 不许
- * 静默当"未提交"——见下面 TXN_PREPARED 分支里 P7-N52 的说明。
+ * 静默当"未提交"——见下面 独立 2PC 查询分支里 P7-N52 的说明。
  */
 static SxidState
 shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
@@ -231,7 +232,8 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 			return ((TxnStatus) slot.status == TXN_COMMITTED)
 				? SXID_COMMITTED : SXID_ABORTED;
 
-		case TXN_PREPARED:
+        case TXN_RUNNING:
+            if (!ShardTwoPhaseIsPrepared(shard, sxid)) return SXID_RUNNING;
 			/*
 			 * §4.2 三态（T4.5 落地）：①槽 start_ts > 读者快照 ⇒ 未来提交
 			 * 必不可见——零开销跳过；②未决登记缺失 ⇒ NULL 不变式（登记
@@ -297,7 +299,7 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 						if (rv == 1 || rv == 2)
 						{
 							ShardClogSetVerdict(shard, sxid, rv == 1, rv == 1 ? rcts : 0);
-							elog(LOG, "pg_partdist: 分片 %u xid %u（gxid %lld）登记已注销而槽位仍是 PREPARED，"
+							elog(LOG, "pg_partdist: 分片 %u xid %u（gxid %lld）登记已注销而槽位仍是 IN_PROGRESS 且有 2PC 记录，"
 								 "按本机学到的判决补落 %s（P7-N86）", shard, sxid,
 								 (long long) slot.global_xid, rv == 1 ? "COMMIT" : "ABORT");
 
@@ -359,7 +361,6 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				}
 				return SXID_RUNNING;
 			}
-		case TXN_RUNNING:
 		default:
 			/*
 			 * clog RUNNING 且不在活跃表：要么是崩溃遗留的无主事务（T2.4
@@ -1074,7 +1075,7 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 /*
  * ShardCommitRemove — 只摘活跃表条目，不写任何判决（T4.5）。
  *
- * 用于 PREPARE：此后"未决"由 clog PREPARED + 未决登记表承载（读者走
+ * 用于 PREPARE：此后"未决"由 IN_PROGRESS clog + 独立 2PC 记录承载（读者走
  * §4.2 三态），活跃表只管本地 RUNNING。终局判决交给决议收敛/postabort，
  * 绝不在这里预写。条目缺失静默——PREPARE 前崩溃恢复等路径可能已清。
  */

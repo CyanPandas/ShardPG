@@ -38,14 +38,19 @@ typedef enum DtxRecordKind
      * partdist.dtx_decision 删除。此后不会再有人来问这笔决议——每个写过的
      * 参与者都已闭合并留下标记。载荷只有 dtxid/coord_gsid，participants 空。
      */
-    DTX_FORGET   = 5
+    DTX_FORGET   = 5,
+
+    /* First-shard protocol: irrevocable COMMIT decision BEFORE asking TSO.
+     * Carries participants, verdict=COMMIT, commit_ts=0. It is not a visibility
+     * marker. A later DTX_DECISION record durably attaches commit_ts. */
+    DTX_COMMIT_DECISION = 6
 } DtxRecordKind;
 
 #define DTX_VERDICT_COMMIT  UINT32_C(1)
 #define DTX_VERDICT_ABORT   UINT32_C(2)
 
 /*
- * 定长部分 32 字节；participants[] 紧随其后，仅 DECISION 记录携带。
+ * 定长部分 32 字节；participants[] 紧随其后，由 DECISION / COMMIT_DECISION 记录携带。
  * PREPARE 记录**不带**参与者清单——那正是 §2.2 用推定中止换掉"协调者续跑"
  * 所省掉的东西。
  */
@@ -54,8 +59,8 @@ typedef struct DtxRecordPayload
     uint64  dtxid;            /* 全局事务号                                    */
     int64   coord_gsid;       /* 协调组 global_shard_id；DECISION 中 = 自身    */
     uint64  commit_ts;        /* 提交时间戳；PREPARE/ABORT 为 0                */
-    uint32  verdict;          /* 仅 DECISION 有效：DTX_VERDICT_*               */
-    uint32  nparticipants;    /* 仅 DECISION 有效；其余为 0                    */
+    uint32  verdict;          /* 仅两种决议记录有效：DTX_VERDICT_*               */
+    uint32  nparticipants;    /* 仅两种决议记录有效；其余为 0                    */
     /* int64 participants[nparticipants] 紧随其后：参与组 global_shard_id 升序 */
 } DtxRecordPayload;
 
@@ -68,14 +73,14 @@ typedef struct DtxRecordPayload
 static inline bool
 DtxRecordKindIsValid(int kind)
 {
-    return kind >= DTX_PREPARE && kind <= DTX_FORGET;
+    return kind >= DTX_PREPARE && kind <= DTX_COMMIT_DECISION;
 }
 
 /*
  * 往某分区的 parwal 流里追加一条 DTX 记录并 fsync，返回分配到的
  * partition_lsn。SQL 入口 partdist.partwal_append_dtx_record() 是它的薄包装。
  *
- * participants[] 只有 DECISION 记录会写进去（其余 kind 一律忽略，§5.2）；
+ * participants[] 由 DECISION / COMMIT_DECISION 记录写入（其余 kind 一律忽略，§5.2）；
  * xid 只有事务内写的 PREPARE 标记会带（见 §5.1 的头字段约定）。
  */
 extern uint64 AppendDtxRecord(Oid partition_id, int kind,

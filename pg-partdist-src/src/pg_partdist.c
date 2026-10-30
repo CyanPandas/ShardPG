@@ -18,6 +18,7 @@
 #include "shard_vacuum.h"
 #include "global_mvcc.h"
 #include "dtx_participant.h"
+#include "dtx_coordinator.h"
 #include "shard_xid.h"
 #include "shard_visibility.h"
 #include "tso.h"
@@ -280,6 +281,7 @@ static PlannedStmt *
 partdist_planner(Query *parse, const char *query_string, int cursorOptions,
                  ParamListInfo boundParams)
 {
+    TsoEnsureRouterSnapshot(parse);
     if (parse != NULL &&
         (parse->commandType == CMD_INSERT ||
          parse->commandType == CMD_UPDATE ||
@@ -304,6 +306,7 @@ static void
 partdist_executor_start(QueryDesc *queryDesc, int eflags)
 {
     ShardFreezeNoteUserActivity();
+    DtxEnlistPlan(queryDesc->plannedstmt);
 
     if (queryDesc->operation == CMD_INSERT ||
         queryDesc->operation == CMD_UPDATE ||
@@ -474,6 +477,9 @@ partdist_process_utility(PlannedStmt *pstmt,
 {
     ShardFreezeNoteUserActivity();
     PartDistMaybeInstallUsr2Backtrace();     /* P7-N21 取证，GUC 默认 off */
+
+    if (DtxHandoffUtility(pstmt->utilityStmt, context, qc))
+        return;
 
     /* Register COPY FROM target BEFORE the chain writes WAL */
     pg_partdist_process_utility(pstmt, queryString, readOnlyTree,
@@ -913,6 +919,7 @@ _PG_init(void)
     ShardpgDdlDefineGucs();
     /* P7-N91：跨分片事务自动加入全局事务（Citus 已先于本扩展加载） */
     TsoClientInstallRemoteBeginHook();
+    DtxCoordinatorInit();
 
     /* Chain ProcessUtility hook */
     prev_ProcessUtility_hook = ProcessUtility_hook;
@@ -989,7 +996,7 @@ _PG_init(void)
     {
         void **rv = find_rendezvous_variable("partdist_dtx_broadcast_fn");
 
-        *rv = (void *) DtxBroadcastDecision;
+        *rv = (void *) DtxScheduleDecision;
     }
 
     /* R-P4-9：恢复守护闭合 prepared 前，先经此把判决落进本节点分片 clog */

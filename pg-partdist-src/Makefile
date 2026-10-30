@@ -15,6 +15,8 @@ OBJS = \
 	src/replay/shard_route.o \
 	src/replay/replay_worker.o \
 	src/dtx/dtx_participant.o \
+	src/dtx/dtx_coordinator.o \
+	src/dtx/shard_twophase.o \
 	src/dtx_pending.o \
 	src/shard_guard.o \
 	src/raft_boundary.o \
@@ -29,6 +31,7 @@ OBJS = \
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql
+DATA += sql/first_shard_coordinator.sql
 
 PG_CPPFLAGS = -I$(CURDIR)/include -I$(shell $(PG_CONFIG) --includedir)
 ifdef SHARD_XID_RING_BITS

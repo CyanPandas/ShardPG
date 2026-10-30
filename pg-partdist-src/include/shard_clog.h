@@ -8,7 +8,7 @@
  * 那套的键是 64 位 gxid（uint16 node_id 编码进目录名），服务既有回放/DTX
  * 基线；这套的键是 (Oid shard, 分片xid)——32 位 Oid 塞不进 node_id 的编码，
  * 参数化复用等于动基线磁盘格式（P2_PRECHECK 结论一），所以是独立新实例，
- * 只克隆它的 I/O 纪律。状态枚举 TxnStatus 两家共用同一套值。
+ * 只克隆它的 I/O 纪律。保留既有数值编码；分片 clog 只写 RUNNING/COMMITTED/ABORTED。
  *
  * 布局：pg_shard_clog/<shard_oid>/<8 位十六进制段号>，段内扁平定长 32 字节
  * 槽数组，槽号 = 分片 xid 段内偏移（稠密发号 ⇒ xid 即行号，直接寻址）。
@@ -78,10 +78,8 @@ extern void ShardClogSetRunning(Oid shard, TransactionId sxid, int64 start_ts);
 extern void ShardClogSetVerdict(Oid shard, TransactionId sxid, bool committed,
 								int64 commit_ts);
 
-/* T4.3：PREPARE 落账（durable fsync——投票持久前 PREPARED 必须已持久）。
- * 带 start_ts 与 gxid（§5.3 五列；parent 链 P4 子事务再起用）。幂等。 */
-extern void ShardClogSetPrepared(Oid shard, TransactionId sxid,
-								 int64 start_ts, int64 gxid);
+/* Prepare membership is maintained by shard_twophase.h. The clog status
+ * remains TXN_RUNNING (IN_PROGRESS) until a terminal verdict is installed. */
 
 /* 读状态。空洞/段不存在 = TXN_RUNNING。 */
 extern TxnStatus ShardClogReadStatus(Oid shard, TransactionId sxid);
@@ -91,7 +89,7 @@ extern bool ShardClogReadSlot(Oid shard, TransactionId sxid, ShardClogSlot *out)
 
 /*
  * T2.4 认领原语：把 [from, to) 里所有 RUNNING（含全零洞）改判 ABORTED，
- * 已有终局判决与 PREPARED（P4 in-doubt，不许动）原样保留。每段一次 fsync。
+ * 已有终局判决与独立 2PC 记录保护的 IN_PROGRESS 原样保留。每段一次 fsync。
  * 返回改判条数。幂等。
  */
 extern void ShardClogSetRedoFenceRange(Oid shard, TransactionId from,

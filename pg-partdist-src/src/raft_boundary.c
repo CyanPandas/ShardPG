@@ -1440,8 +1440,8 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 	Size				paylen;
 	uint64				assigned;
 
-	/* 参与者清单只有 DECISION 记录携带（§5.2） */
-	if (kind != DTX_DECISION)
+	/* 两种协调者决议记录携带参与者清单 */
+	if (kind != DTX_DECISION && kind != DTX_COMMIT_DECISION)
 		nparts = 0;
 
 	paylen = DtxPayloadSize(nparts);
@@ -1449,7 +1449,8 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 	payload->dtxid = (uint64) dtxid;
 	payload->coord_gsid = coord_gsid;
 	payload->commit_ts = (uint64) commit_ts;
-	payload->verdict = (kind == DTX_DECISION) ? (uint32) verdict : 0;
+	payload->verdict = (kind == DTX_DECISION || kind == DTX_COMMIT_DECISION)
+		? (uint32) verdict : 0;
 	payload->nparticipants = (uint32) nparts;
 	if (nparts > 0)
 		memcpy(DtxPayloadParticipants(payload), partvals,
@@ -1542,7 +1543,11 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("partwal_append_dtx_record: 非法的记录子类型 %d", kind),
-				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET。")));
+				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET 6=COMMIT_DECISION。")));
+
+	if (kind == DTX_COMMIT_DECISION &&
+		(verdict != DTX_VERDICT_COMMIT || commit_ts != 0 || parts == NULL))
+		ereport(ERROR, (errmsg("COMMIT_DECISION requires COMMIT, no timestamp, and participants")));
 
 	if (kind == DTX_DECISION &&
 		verdict != (int32) DTX_VERDICT_COMMIT && verdict != (int32) DTX_VERDICT_ABORT)

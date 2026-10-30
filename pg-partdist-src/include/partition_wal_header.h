@@ -414,6 +414,16 @@ typedef struct TxnMarkerPayload
 #define PARTWAL_CTRL_BASELINE_END    UINT8_C(0x07)
 /* A physical baseline includes its 32-bit allocator and reclamation frontiers. */
 #define PARTWAL_CTRL_SHARD_XID_STATE UINT8_C(0x08)
+#define PARTWAL_CTRL_SHARD_PREPARED  UINT8_C(0x09)
+
+/* Independent 2PC membership in a physical baseline; no clog status change. */
+typedef struct PartWALCtrlShardPrepared
+{
+    uint32 sxid;
+    uint32 reserved;
+    uint64 gxid;
+    uint64 start_ts;
+} PartWALCtrlShardPrepared;
 typedef struct PartWALCtrlShardXidState
 {
     uint32 alloc_wm;

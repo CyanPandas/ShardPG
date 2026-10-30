@@ -29,7 +29,8 @@
 #include "partition_wal_header.h"
 #include "partition_wal_writer.h"
 #include "enhanced_clog.h"
-#include "shard_clog.h"	/* U-P5-1：分片 clog 由流重建 */
+#include "shard_clog.h"
+#include "shard_twophase.h"	/* U-P5-1：分片 clog 由流重建 */
 #include "shard_xid.h"
 
 #include "utils/guc.h"            /* P7-N69：GetConfigOption */
@@ -1498,10 +1499,10 @@ ApplyMarkerRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr, char *body)
              *   废掉**：那一支拿槽里的 start_ts 与读者 TSO 快照比大小，墙钟值
              *   （~8.4e14）恒大于任何 TSO 号 ⇒ 恒假 ⇒ 第三支"问协调者"永远
              *   不执行 ⇒ 已提交的 in-doubt 行一直读不到。而 leader 自己那条
-             *   `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 遗留模式存的
+             *   `ShardTwoPhasePrepare(..., TsoGetStartTs(), ...)` 遗留模式存的
              *   就是 0 —— 落 0 才是和 leader 一致，不是将就。
              */
-            ShardClogSetPrepared(ctx->shard_oid, sxid,
+            ShardTwoPhasePrepare(ctx->shard_oid, sxid,
                                  (m->flags & PARTWAL_MARKER_STS_IS_TSO)
                                      ? (int64) m->start_ts : 0,
                                  (int64) gxid);
@@ -1945,6 +1946,19 @@ ApplyCtrlRecord(ShardReplayCtx *ctx, const PartWALRecord *hdr,
 
     if (hdr->info == PARTWAL_CTRL_FREEZE_UPDATE)
         return ApplyFreezeRecord(ctx, hdr, body);
+
+    if (hdr->info == PARTWAL_CTRL_SHARD_PREPARED)
+    {
+        const PartWALCtrlShardPrepared *p = (const PartWALCtrlShardPrepared *) body;
+        if (hdr->data_len != sizeof(*p) || p->reserved != 0 ||
+            !TransactionIdIsNormal(p->sxid))
+            ereport(ERROR, (errmsg("invalid baseline shard 2PC membership")));
+        if (!ShardXidStreamIsNew(ctx->shard_oid, hdr->partition_lsn, false))
+            return true;
+        ShardTwoPhasePrepare(ctx->shard_oid, p->sxid, p->start_ts, p->gxid);
+        ShardXidStreamApplied(ctx->shard_oid, hdr->partition_lsn, false);
+        return true;
+    }
 
     /*
      * ★ T7.2（R-P6-17）：分片 clog 块。键是分片 xid，与 oid 无关，原样落进

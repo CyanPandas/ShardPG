@@ -1,0 +1,81 @@
+--- a/src/backend/distributed/transaction/remote_transaction.c
++++ b/src/backend/distributed/transaction/remote_transaction.c
+@@ -94,6 +94,10 @@
+  */
+ PGDLLEXPORT bool remote_transaction_multi_shard_read_blocks = false;
+ 
++/* ShardPG: delegate distributed commit to a participant shard. */
++PGDLLEXPORT remote_transaction_branch_hook_type remote_transaction_branch_hook = NULL;
++PGDLLEXPORT remote_transaction_delegate_hook_type remote_transaction_delegate_hook = NULL;
++
+ /*
+  * IsMainDBCommand is true if this is a query in the Citus main database that is started
+  * by a query from a different database.
+@@ -305,6 +309,11 @@
+ 						   assignDistributedTransactionIdCommand);
+ 
+ 	pfree(assignDistributedTransactionIdCommand);
++
++	if (remote_transaction_branch_hook != NULL)
++	{
++		remote_transaction_branch_hook(connection, beginAndSetDistributedTransactionId);
++	}
+ 
+ 	bool success = SendRemoteCommand(connection,
+ 									 beginAndSetDistributedTransactionId->data);
+@@ -1224,6 +1233,7 @@
+ 		RemoteTransaction *transaction = &connection->remoteTransaction;
+ 
+ 		if (transaction->transactionState == REMOTE_TRANS_NOT_STARTED ||
++			transaction->transactionState == REMOTE_TRANS_COMMITTED ||
+ 			transaction->transactionState == REMOTE_TRANS_1PC_ABORTING ||
+ 			transaction->transactionState == REMOTE_TRANS_2PC_ABORTING ||
+ 			transaction->transactionState == REMOTE_TRANS_ABORTED)
+--- a/src/backend/distributed/transaction/transaction_management.c
++++ b/src/backend/distributed/transaction/transaction_management.c
+@@ -546,6 +546,15 @@
+ 			 * fails, which can lead to divergence when not using 2PC.
+ 			 */
+ 
++			/* The router parks task connections and forwards client COMMIT.
++			 * The participant coordinator owns all PREPARE votes and phase two. */
++			if (remote_transaction_delegate_hook != NULL &&
++				remote_transaction_delegate_hook())
++			{
++				CurrentCoordinatedTransactionState = COORD_TRANS_COMMITTED;
++				break;
++			}
++
+ 			if (ShouldCoordinatedTransactionUse2PC)
+ 			{
+ 				CoordinatedRemoteTransactionsPrepare();
+--- a/src/backend/distributed/executor/adaptive_executor.c
++++ b/src/backend/distributed/executor/adaptive_executor.c
+@@ -1308,6 +1308,14 @@
+ 		return xactProperties;
+ 	}
+ 
++	/* The delegated protocol needs a branch even for a one-shard task.
++	 * Explicitly nontransactional tasks retain the early returns above. */
++	if (remote_transaction_delegate_hook != NULL)
++	{
++		xactProperties.useRemoteTransactionBlocks = TRANSACTION_BLOCKS_REQUIRED;
++		xactProperties.errorOnAnyFailure = true;
++	}
++
+ 	if (TaskListRequiresRollback(taskList))
+ 	{
+ 		/* transaction blocks are required if the task list needs to roll back */
+--- a/src/include/distributed/remote_transaction.h
++++ b/src/include/distributed/remote_transaction.h
+@@ -168,4 +168,10 @@
+  */
+ extern PGDLLEXPORT bool remote_transaction_multi_shard_read_blocks;
+ 
++/* ShardPG citus-0004: BEGIN context and complete commit delegation. */
++typedef void (*remote_transaction_branch_hook_type)(struct MultiConnection *, StringInfo);
++typedef bool (*remote_transaction_delegate_hook_type)(void);
++extern PGDLLEXPORT remote_transaction_branch_hook_type remote_transaction_branch_hook;
++extern PGDLLEXPORT remote_transaction_delegate_hook_type remote_transaction_delegate_hook;
++
+ #endif /* REMOTE_TRANSACTION_H */

@@ -255,7 +255,8 @@ s_com=$(PSQL $f1 -Atc "SELECT sclog_read(${foid}::oid, ${X_COMMIT}::bigint)" </d
 echo "  造好的三态：RUNNING=$s_run PREPARED=$s_prep COMMITTED=$s_com（xid ${X_RUN}/${X_PREP}/${X_COMMIT}）"
 check "夹具：无主 RUNNING 就位" "$s_run" "0"
 check "夹具：COMMITTED 就位" "$s_com" "2"
-check "夹具：PREPARED 就位（阴性对照的前提）" "$s_prep" "1"
+check "夹具：prepared 的 clog 仍为 IN_PROGRESS" "$s_prep" "0"
+check "夹具：独立 2PC 登记存在" "$(PSQL $f1 -Atc "SELECT partdist.shard_is_prepared(${foid}::oid, ${X_PREP}::bigint)" </dev/null|tail -1)" "t"
 
 echo "--- ★★ 先证明 T2.4 那条老路径管不了这件事（T6.4 存在的理由） ---"
 old_n=$(PSQL $f1 -Atc "SELECT sclog_claim_t24(${foid}::oid)" </dev/null|tail -1)
@@ -271,7 +272,8 @@ a_com=$(PSQL $f1 -Atc "SELECT sclog_read(${foid}::oid, ${X_COMMIT}::bigint)" </d
 echo "  认领 $n_claim 条；三态变为 RUNNING→$a_run PREPARED→$a_prep COMMITTED→$a_com"
 check "★★ 无主 RUNNING 已改判 ABORTED" "$a_run" "3"
 check "★★ 认领条数 >= 1（不是空转）" "$([[ -n "$n_claim" && "$n_claim" -ge 1 ]] && echo ok)" "ok"
-check "★★ 阴性对照：PREPARED 一根汗毛没动（§6.6 第二支）" "$a_prep" "$s_prep"
+check "★★ 阴性对照：prepared 的 clog 保持 IN_PROGRESS" "$a_prep" "$s_prep"
+check "★★ 独立 2PC 登记未被认领删除" "$(PSQL $f1 -Atc "SELECT partdist.shard_is_prepared(${foid}::oid, ${X_PREP}::bigint)" </dev/null|tail -1)" "t"
 check "★★ 阴性对照：COMMITTED 仍是 COMMITTED" "$a_com" "2"
 
 echo "--- 水位推进后再认领应为空转（认领水位真的落了盘） ---"

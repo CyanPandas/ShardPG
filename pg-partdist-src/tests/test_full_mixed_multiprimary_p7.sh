@@ -332,7 +332,7 @@ tota=$(converge $COORD "SELECT coalesce(sum(n),0) FROM fm_mvcc WHERE v IN ('m','
 check "[6] ★ 切主后总额守恒" "$tota" "$totb"
 # 无 PREPARED 残留（当前主）
 lo=$(Q $NEWL "SELECT partdist.local_partition_for_shard($FS)"); xmax=$(( $(Q $NEWL "SELECT partdist.shard_xid_next($lo::oid)") + 1 )); res=0
-for x in $(seq 1 $xmax); do st2=$(Q $NEWL "SELECT partdist.shard_clog_status_full($lo::oid,$x)" | grep -oE 'st=[0-9]+'); [[ "$st2" == "st=1" ]] && res=$((res+1)); done
+for x in $(seq 1 $xmax); do st2=$(Q $NEWL "SELECT partdist.shard_is_prepared($lo::oid,$x)"); [[ "$st2" == "t" ]] && res=$((res+1)); done
 check "[6] ★ 新主无 PREPARED 残留" "$res" "0"
 # 无 reissue 撞号：跨节点对读同一分片 xid 的 sts
 coll=0; declare -A seen
@@ -364,7 +364,7 @@ residue_on() {  # <组> → 当前主上 PREPARED 残留笔数
   local sid=$1 lp lo xmax n=0 x
   lp=$(cur_leader $sid); [[ -z "$lp" ]] && { echo -1; return; }
   lo=$(Q $lp "SELECT partdist.local_partition_for_shard($sid)"); xmax=$(( $(Q $lp "SELECT partdist.shard_xid_next($lo::oid)") + 1 ))
-  for x in $(seq 1 $xmax); do [[ "$(Q $lp "SELECT partdist.shard_clog_status($lo::oid,$x)")" == 1 ]] && n=$((n+1)); done
+  for x in $(seq 1 $xmax); do [[ "$(Q $lp "SELECT partdist.shard_is_prepared($lo::oid,$x)")" == t ]] && n=$((n+1)); done
   echo $n
 }
 collide_on() {  # <组> → 跨节点同分片 xid 不同 start_ts 的笔数（重号）

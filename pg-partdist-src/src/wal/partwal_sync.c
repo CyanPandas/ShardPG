@@ -831,7 +831,7 @@ PartWALBuildMarkerPayload(bool with_children, bool with_commit_ts,
      *   并且**用一位标出这个值属于哪个宇宙**（见 PARTWAL_MARKER_STS_IS_TSO）。
      *
      * 缺陷：这里一直无条件用 `GetCurrentTransactionStartTimestamp()`，回放侧原样
-     * 写进分片 clog 的 PREPARED 槽（`ShardClogSetPrepared(..., m->start_ts)`），
+     * 写进分片 clog 的 IN_PROGRESS 槽及独立 2PC 记录（`ShardTwoPhasePrepare(..., m->start_ts)`），
      * 于是副本上 `sts = 842001420732582`（微秒墙钟）而 leader 的 TSO 是个小整数
      * —— R-P3-2「双 ts 宇宙串线」成真：升主后 §4.2 三态处置的第一支拿它与 TSO
      * 快照比，**恒为"跳过"**，那一支等于没有。
@@ -899,7 +899,7 @@ PartWALBuildVerdictMarker(int64 start_ts, int64 commit_ts, uint32 *out_len)
     TxnMarkerPayload *m;
     /*
      * 这里的 start_ts 来自未决登记，与 leader 自己那条
-     * `ShardClogSetPrepared(..., TsoGetStartTs(), ...)` 同源 —— 要么是 TSO 号，
+     * `ShardTwoPhasePrepare(..., TsoGetStartTs(), ...)` 同源 —— 要么是 TSO 号，
      * 要么是 0（遗留模式），不会是墙钟。>0 即置位。
      */
     uint32            flags = (start_ts > 0 ? PARTWAL_MARKER_STS_IS_TSO : 0) |
