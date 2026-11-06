@@ -24,8 +24,12 @@
 /* 分片 xid 起点：0=Invalid、1=Bootstrap、2=Frozen 语义保留（设计 §5.1） */
 #define FIRST_SHARD_XID			((TransactionId) 3)
 
-/* 每次水位推进的批量（一次 fsync 覆盖 4096 个号，崩溃至多跳这么多） */
-#define SHARD_XID_BATCH			4096
+/*
+ * 每次水位推进的批量（一次 fsync 覆盖这么多号，崩溃至多跳这么多）。
+ * TPC-C 分支：4096 → 65536。落盘在全局 ShardXidCtl 排他锁里做，128 终端下每节点
+ * 约每秒一次 fsync，期间全部分片的发号与读侧水位查询一起停；放大 16 倍后罕见。
+ */
+#define SHARD_XID_BATCH			65536
 
 /* 共享内存固定槽位数（P1 够用；P2 换 DSA/dshash，见 DEV PLAN T1.2） */
 /*
@@ -125,9 +129,10 @@ extern bool shard_vacuum_auto_enabled;
 /* T7.17（P7-V1）：到龄分片枚举，供 vacuum 自动启动器用。只读 shmem */
 extern int	ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max);
 extern int	ShardXidTwoStateShards(Oid *shards, int max);
-extern void ShardXidNoteAutoVacuum(Oid shard);	/* TPC-C 分支：回收触发限流 */
+extern void ShardXidNoteAutoVacuum(Oid shard, BlockNumber pages);	/* TPC-C 分支：回收触发限流（pages=Invalid 不更新） */
 extern int	ShardXidOverdueCount(void);
 
+extern TransactionId ShardXidClaimedTruncBefore(Oid shard);	/* TPC-C 分支：认领 + 截断水位（后端缓存） */
 extern void ShardVacuumGetWatermarks(Oid shard, TransactionId *trunc_before,
 									 TransactionId *vacuum_xid);
 extern void ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,

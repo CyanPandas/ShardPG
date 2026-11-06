@@ -1,0 +1,34 @@
+{
+  "description": "Exact source and installed runtime snapshot from the lab image used for2026-11-05 experiments; no code optimization or rebuild.",
+  "image_id": "sha256:876db7e5468bfb2e9253f3c959e94986bbaf913408d772c83201b683336caaa2",
+  "local_loaded_image_id": "sha256:b0de7584cc973402d26658fda8ae8b98c74790dc1d20cd78924b280696b2d269",
+  "image_equivalence_proof": "artifacts/lab-tsoraft-20261106/image-equivalence.json",
+  "local_image_tag": "shardpg:lab-tsoraft-20261106",
+  "archive_relative": "artifacts/lab-tsoraft-20261106/shardpg-tsoraft-876db7e5468b.docker.tar.gz",
+  "archive_sha256": "446854cf68aac6f4cdde8e8054ff5bc185d9c2666af717b0fb92565291618bad",
+  "source_archive_hash_verified": true,
+  "original_mmp_commit": "01e5635a2ca6010c929130ed26281d34838b8686",
+  "backup_branch": "backup/mmp-before-lab-sync-20261106",
+  "components": [
+    "pg-partdist-src",
+    "pg-raft-src",
+    "tpcc",
+    "pg-install",
+    "postgres-src",
+    "citus-src"
+  ],
+  "full_workspace_manifest_sha256": "e4b5fea7787fd3e2e5db8095e71cbe32c38ecd620e84f175e6326ceabed71284",
+  "mirrored_file_count": 14321,
+  "selected_git_file_count": 12527,
+  "generated_files_kept_locally_not_newly_versioned": 1794,
+  "binary_sha256": {
+    "pg-install/bin/postgres": "1100cd33c590ad06df4c39a5b5d40d231ecaef61959e819d950cc22dbfa1f364",
+    "pg-install/lib/postgresql/pg_partdist.so": "5467f5423fd9e0711f37e5299612cba04e29950641d25b0db96d710dee217934",
+    "pg-install/lib/postgresql/pg_raft.so": "4accefb31cfc644b020a95df16fe880ca3bf1728ae043f4c7d868127bca14a6b",
+    "pg-install/lib/postgresql/citus.so": "0a8c781981e4efad8daab6724fe170d815717181fe6442b97c5239169a6b8f88"
+  },
+  "four_core_binaries_match_yesterday": true,
+  "postgres_citus_source_vendored_from_image": true,
+  "database_started": false,
+  "rebuild_performed": false
+}

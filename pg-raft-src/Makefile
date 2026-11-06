@@ -5,7 +5,7 @@ OBJS = \
 	src/raft_consensus.o \
 	src/raft_apply.o \
 	src/raft_remote.o \
-	src/topology_monitor.o
+	src/topology_monitor.o src/raft_failover.o
 
 EXTENSION = pg_raft
 DATA = sql/pg_raft--1.0.sql

@@ -34,6 +34,8 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/shard_stamp.h"
+#include "replication/syncrep.h"	/* 2026-10-17：SyncRepStandbyNames */
+#include "shard_wal.h"
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
@@ -74,13 +76,51 @@ typedef struct ShardCommitEntry
 	 */
 	bool		committing;
 	int64		commit_ts;
+	/*
+	 * 补丁 0014 提前放锁：提交记录已插入、锁已放，WAL 尚未刷盘，分片判决等刷完
+	 * 再写（判决先于 WAL 落盘，崩溃后就会有"判决已提交、提交记录却丢了"的行）。
+	 * 写者路径（更新判定、Dirty、唯一性检查、等锁）把它当已提交 —— 它们自己的
+	 * 提交记录排在后面，刷盘必然连带；快照读仍按"提交中"等判决落地，绝不看到
+	 * 可能丢失的数据。
+	 */
+	bool		elr_done;
+	XLogRecPtr	elr_lsn;		/* 该事务提交记录的末尾（读者据此在自己结束前补刷） */
 } ShardCommitEntry;
+
+/*
+ * 本事务读到过的"已放锁待刷盘"版本里，最大的提交记录 LSN。事务结束、回复客户端
+ * 之前须 XLogFlush 到这里（ShardElrTakeObservedLsn，见 shard_xid_xact_callback）——
+ * 这样快照读不必轮询等判决落地，又绝不会把可能因崩溃丢失的数据交给客户端。
+ */
+static XLogRecPtr elr_observed_lsn = InvalidXLogRecPtr;
+
+XLogRecPtr
+ShardElrTakeObservedLsn(void)
+{
+	XLogRecPtr	l = elr_observed_lsn;
+
+	elr_observed_lsn = InvalidXLogRecPtr;
+	return l;
+}
 
 /* 读者等"提交中"事务落定的上限：超时报 40001（可重试），绝不给出未定的判决 */
 #define SHARD_COMMITTING_WAIT_MAX_MS	10000
 
 static HTAB *ShardCommitHash = NULL;
-static LWLock *ShardCommitLock = NULL;
+/*
+ * TPC-C 分支：活跃表分 16 个分区锁（dynahash HASH_PARTITION，按键哈希取锁）。
+ * 原来一把锁，可见性判定每次缓存未命中都抢它的共享模式（perf：LWLock 开销的
+ * 四分之一），提交 / 放锁 / 刷盘后各一次排他。表上没有全表遍历，分区无代价。
+ */
+#define SHARD_COMMIT_PARTITIONS 16
+static LWLock *ShardCommitLocks[SHARD_COMMIT_PARTITIONS];
+#define SC_LOCK(h)	(ShardCommitLocks[(h) % SHARD_COMMIT_PARTITIONS])
+
+static inline uint32
+sc_hash(const ShardCommitKey *k)
+{
+	return get_hash_value(ShardCommitHash, k);
+}
 
 /* ---- 后端终局缓存（COMMITTED/ABORTED 不可变，读一次 clog 记住） ---- */
 
@@ -92,10 +132,27 @@ typedef struct ShardVerdictCacheEntry
 } ShardVerdictCacheEntry;
 
 static HTAB *verdict_cache = NULL;
+static uint32 verdict_cache_gen = 0;
 
 static ShardVerdictCacheEntry *
 verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
 {
+	/*
+	 * 分片 DROP 回收过 clog ⇒ 该 OID 可能被新表复用、sxid 从头再发：整表作废。
+	 * 终局缓存现在排在活跃表之前（见 shard_xid_state_ex），陈旧条目会直接
+	 * 盖过新表的活跃事务，必须随 drop 代数一起失效。
+	 */
+	/*
+	 * 另设容量上限：池化连接常驻数小时，见过的 (shard, sxid) 只增不减，不设上限
+	 * 每后端可涨到几十 MB。满了整表重建（纯缓存，丢了只多读几次 clog）。
+	 */
+	if (verdict_cache != NULL &&
+		(ShardClogDropGen() != verdict_cache_gen ||
+		 (action == HASH_ENTER && hash_get_num_entries(verdict_cache) >= 262144)))
+	{
+		hash_destroy(verdict_cache);
+		verdict_cache = NULL;
+	}
 	if (verdict_cache == NULL)
 	{
 		HASHCTL		ctl;
@@ -107,6 +164,7 @@ verdict_cache_search(const ShardCommitKey *key, HASHACTION action)
 		verdict_cache = hash_create("pg_partdist shard verdict cache",
 									256, &ctl,
 									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		verdict_cache_gen = ShardClogDropGen();
 	}
 	return (ShardVerdictCacheEntry *) hash_search(verdict_cache, key,
 												  action, NULL);
@@ -126,6 +184,56 @@ static SxidState
 shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				   int64 *cts_out, bool strict);
 
+/* ---- 2026-10-17 诊断（pg_partdist.diag_visibility）：任务 #13 高并发下行被跳过 / TM_Invisible ---- */
+extern bool shard_diag_visibility;
+
+static const char *
+sx_name(int s)
+{
+	switch (s)
+	{
+		case SXID_MY_OWN:
+			return "MY_OWN";
+		case SXID_RUNNING:
+			return "RUNNING";
+		case SXID_COMMITTED:
+			return "COMMITTED";
+		case SXID_ABORTED:
+			return "ABORTED";
+	}
+	return "-";
+}
+
+/* cat：0..7 各类各自限流，免得一类刷屏把别的挤掉 */
+static void
+sv_diag(int cat, const char *what, HeapTuple htup, Oid shard, int xmin_s, int xmax_s,
+		int64 xmin_cts, int64 xmax_cts)
+{
+	static int	n[8];
+	HeapTupleHeader t = htup->t_data;
+
+	if (!shard_diag_visibility || cat < 0 || cat >= 8 || n[cat] >= 30)
+		return;
+	n[cat]++;
+	elog(LOG, "pg_partdist[diag] %s rel=%u shard=%u tid=(%u,%u) xmin=%u(%s cts=" INT64_FORMAT ") "
+		 "xmax=%u(%s cts=" INT64_FORMAT ") infomask=%04x infomask2=%04x cid=%u ctid=(%u,%u) my_ts=" INT64_FORMAT
+		 " iso=%d",
+		 what, htup->t_tableOid, shard,
+		 ItemPointerGetBlockNumber(&htup->t_self), ItemPointerGetOffsetNumber(&htup->t_self),
+		 HeapTupleHeaderGetRawXmin(t), sx_name(xmin_s), xmin_cts,
+		 HeapTupleHeaderGetRawXmax(t), sx_name(xmax_s), xmax_cts,
+		 t->t_infomask, t->t_infomask2, HeapTupleHeaderGetRawCommandId(t),
+		 ItemPointerGetBlockNumber(&t->t_ctid), ItemPointerGetOffsetNumber(&t->t_ctid),
+		 TsoPeekStartTs(), XactIsoLevel);
+}
+
+/*
+ * pg_partdist.rc_update_recheck：本事务在 EPQ 路径上越过了"快照之后提交"的版本时，
+ * 记下当时的 start_ts；下一条语句开始前若仍是这个快照就换新（ShardSnapshotEagerStart）。
+ * 按 ts 而不是布尔记：事务结束后 start_ts 必然变化，残留标记自然失效，不必挂回调。
+ */
+static int64 rc_stale_ts = 0;
+
 static SxidState
 shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				int64 *cts_out)
@@ -137,11 +245,20 @@ shard_xid_state(Oid shard, TransactionId sxid, TransactionId *native_xid,
  * strict = true：快照读（sv_satisfies_mvcc）。判决定不下来的 PREPARED 不许
  * 静默当"未提交"——见下面 TXN_PREPARED 分支里 P7-N52 的说明。
  */
+/* 本节点的提交是否要等同步备库（synchronous_standby_names 非空且 synchronous_commit 不低于 on） */
+static bool
+shard_sync_rep_active(void)
+{
+	return SyncRepStandbyNames != NULL && SyncRepStandbyNames[0] != '\0' &&
+		synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH;
+}
+
 static SxidState
 shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 				   int64 *cts_out, bool strict)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 	ShardVerdictCacheEntry *ce;
 	ShardClogSlot slot;
@@ -160,6 +277,22 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 
 	key.shard = shard;
 	key.sxid = sxid;
+	kh = sc_hash(&key);
+
+	/*
+	 * ★ TPC-C 分支：终局缓存提到活跃表之前。缓存里只有从 clog 读到或问询学到的
+	 * 终局判决（COMMITTED/ABORTED，对一个 xid 不可变），命中即不可能还在活跃表里。
+	 * 原顺序每判一个元组都先拿共享的 ShardCommitLock 查活跃表 —— perf 实测
+	 * LWLockAttemptLock 占 worker CPU 16%，其中六成来自这里（全部后端抢同一条
+	 * 缓存行）。后端本地哈希命中不拿任何锁。
+	 */
+	ce = verdict_cache_search(&key, HASH_FIND);
+	if (ce != NULL)
+	{
+		if (cts_out)
+			*cts_out = ce->commit_ts;
+		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
+	}
 
 	/*
 	 * 活跃表：本次启动内 RUNNING 的都在这，命中即免文件 I/O。
@@ -185,21 +318,49 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 		for (;;)
 		{
 			bool		committing;
+			bool		elr;
+			XLogRecPtr	elr_lsn;
 			int64		cts;
 
-			LWLockAcquire(ShardCommitLock, LW_SHARED);
-			e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+			LWLockAcquire(SC_LOCK(kh), LW_SHARED);
+			e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh,
 												 HASH_FIND, NULL);
 			if (e == NULL)
 			{
-				LWLockRelease(ShardCommitLock);
+				LWLockRelease(SC_LOCK(kh));
 				break;			/* 已落定（或从未在活跃表）：往下查终局 */
 			}
 			if (native_xid)
 				*native_xid = e->native_xid;
 			committing = e->committing;
 			cts = e->commit_ts;
-			LWLockRelease(ShardCommitLock);
+			elr = e->elr_done;
+			elr_lsn = e->elr_lsn;
+			LWLockRelease(SC_LOCK(kh));
+
+			/*
+			 * 补丁 0014："已放锁、待刷盘"一律按已提交判（可见与否照常比 commit_ts）。
+			 * 写者路径：自己的提交记录排在后面，刷盘连带。快照读：记下它的提交记录
+			 * LSN，本事务结束、回复之前补刷到那里 —— 不再 1 ms 一轮地轮询活跃表。
+			 */
+			/*
+			 * 2026-10-17：同步复制在用时，快照读不读"已放锁、待刷盘"的版本 —— 它的提交可能
+			 * 还没到备库（补丁 0016 把同步复制等待放到了放锁之后），切主后会丢；读者补刷
+			 * 本地 WAL 兜不住这一点。此时按"提交中"等判决落地（判决在等备库返回之后才写）。
+			 * 写者照旧按已提交处理：它自己的提交记录排在后面，本地刷盘与备库落盘按 LSN 连带。
+			 */
+			if (elr && strict && shard_sync_rep_active())
+				elr = false;
+			if (elr)
+			{
+				if (strict && elr_lsn > elr_observed_lsn)
+					elr_observed_lsn = elr_lsn;
+				if (native_xid)
+					*native_xid = InvalidTransactionId;
+				if (cts_out)
+					*cts_out = cts;
+				return SXID_COMMITTED;
+			}
 
 			if (!committing)
 				return SXID_RUNNING;
@@ -219,15 +380,6 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 			pg_usleep(1000L);
 			waited_ms++;
 		}
-	}
-
-	/* 终局缓存 */
-	ce = verdict_cache_search(&key, HASH_FIND);
-	if (ce != NULL)
-	{
-		if (cts_out)
-			*cts_out = ce->commit_ts;
-		return (ce->status == TXN_COMMITTED) ? SXID_COMMITTED : SXID_ABORTED;
 	}
 
 	/*
@@ -251,19 +403,18 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 	 * 截断前缓存下的 ABORTED 会在本后端内继续报 ABORTED —— 由上一段的
 	 * "没有元组还会问到那些号"覆盖。
 	 */
+	/*
+	 * TPC-C 分支：认领与截断水位一起走后端缓存（ShardXidClaimedTruncBefore，代数
+	 * 校验）。原先每次缓存未命中都拿两次全局 ShardXidCtl 共享锁线性扫槽位，perf
+	 * 里占 LWLock 开销的四分之一。语义同下面两段注释：先认领再读 clog；免查区
+	 * 以下一律已提交。
+	 */
 	{
-		TransactionId frozen_before;
+		TransactionId frozen_before = ShardXidClaimedTruncBefore(shard);
 
-		ShardVacuumGetWatermarks(shard, &frozen_before, NULL);
 		if (TransactionIdIsValid(frozen_before) && sxid < frozen_before)
 			return SXID_COMMITTED;	/* cts_out 已在函数开头置 0 */
 	}
-
-	/*
-	 * T2.4：咨询 clog 前确保认领已跑（读路径入口；发号路径在分配时已触发）。
-	 * 崩溃遗留的无主 RUNNING 在此改判 ABORTED，之后才读真相源。
-	 */
-	(void) ShardXidEnsureClaimed(shard);
 
 	/* 分片 clog（真相源）。全零/空洞 = RUNNING = 未决不可见（§5.3）。 */
 	(void) ShardClogReadSlot(shard, sxid, &slot);
@@ -298,6 +449,66 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 					int64		dcts = 0;
 					int			vd = DtxReaderResolve((int64) slot.global_xid,
 													  &dcts);
+
+					/*
+					 * 2026-10-17（任务 #13）：协调组答"未决"时，快照读**不能**当未提交。
+					 *
+					 * 协调者先在"票齐"点向 TSO 取 commit_ts c、**再**把决议写进协调组。
+					 * 读者若在这段窗口里取到 s > c，问到的是"未决"，可这笔事务马上就会以
+					 * c < s 提交 —— 按 §4.1 它对本快照可见。原来照"未提交"处理：同一快照里
+					 * 先把新版本判不可见，片刻后本地 clog 落了判决（memo 只管协调组答复，
+					 * 管不住 clog），再看旧版本时 xmax 已是"快照前提交" —— 新旧两个版本
+					 * 都不可见，UPDATE 影响 0 行（TPC-C 高并发下 ol_dist_info 为 NULL），
+					 * 跨分片读还会读到一半提交。
+					 *
+					 * 槽的 start_ts > s 的（未来提交必晚于本快照）在上面已经直接跳过，
+					 * 到这里的都可能以 c < s 提交，只能等决议：每 1 ms 重读本地槽位（判决
+					 * 常由广播 / 收尾进程先落到 clog），每 10 ms 绕过 memo 再问一次协调组。
+					 * 决议通常是毫秒级（协调者正在提交途中）；5 s 仍定不下来（协调者中途宕机、
+					 * 等恢复守护推定中止）报可重试的 40001。持有缓冲区共享锁等待与上面
+					 * "提交中"的等待同理：判决的产生不碰堆页面。
+					 */
+					if (strict && vd == 0)
+					{
+						int			waited_ms = 0;
+
+						for (;;)
+						{
+							ShardClogSlot s2;
+
+							pg_usleep(1000L);
+							waited_ms++;
+							(void) ShardClogReadSlot(shard, sxid, &s2);
+							if ((TxnStatus) s2.status == TXN_COMMITTED)
+							{
+								vd = 1;
+								dcts = (int64) s2.commit_ts;
+								break;
+							}
+							if ((TxnStatus) s2.status == TXN_ABORTED)
+							{
+								vd = 2;
+								break;
+							}
+							if (waited_ms % 10 == 0)
+							{
+								vd = DtxReaderResolveEx((int64) slot.global_xid, &dcts, true);
+								if (vd != 0)
+									break;
+							}
+							if (waited_ms >= 5000)
+								ereport(ERROR,
+										(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+										 errmsg("分片 %u 上的分布式事务（gxid %lld）决议 %d ms 未出，"
+												"本次读取给不出一致的结果", shard,
+												(long long) slot.global_xid, waited_ms),
+										 errhint("重试本事务。")));
+						}
+						if (vd == 1 && dcts > 0 && dcts < my_ts && shard_diag_visibility)
+							elog(LOG, "pg_partdist[diag] 快照读等到 PREPARED 决议：分片 %u xid %u gxid %lld "
+								 "COMMIT cts=" INT64_FORMAT " < my_ts=" INT64_FORMAT "（等了 %d ms；旧逻辑会判不可见）",
+								 shard, sxid, (long long) slot.global_xid, dcts, my_ts, waited_ms);
+					}
 
 					if (vd == 1)
 					{
@@ -346,6 +557,11 @@ shard_xid_state_ex(Oid shard, TransactionId sxid, TransactionId *native_xid,
 						 */
 						if (rv == 1 || rv == 2)
 						{
+							uint32		pv[2];
+
+							pv[0] = (uint32) shard;
+							pv[1] = (uint32) sxid;
+							(void) ShardWalLogVerdict(0, rv == 1, rv == 1 ? rcts : 0, 1, pv);	/* 2026-10-17 */
 							ShardClogSetVerdict(shard, sxid, rv == 1, rv == 1 ? rcts : 0);
 							elog(LOG, "pg_partdist: 分片 %u xid %u（gxid %lld）登记已注销而槽位仍是 PREPARED，"
 								 "按本机学到的判决补落 %s（P7-N86）", shard, sxid,
@@ -740,6 +956,10 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 	HeapTupleHeader tuple = htup->t_data;
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
 	TransactionId native;
+	int			dx_min = -1,
+				dx_max = -1;
+	int64		dx_min_cts = 0,
+				dx_max_cts = 0;
 
 	if (!OidIsValid(shard))
 		return false;
@@ -748,7 +968,7 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 
 	/* 调用方约定：入口已把 snapshot->xmin/xmax 置 Invalid（内核分叉点保证） */
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), &native, NULL))
+	switch ((dx_min = shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), &native, &dx_min_cts)))
 	{
 		case SXID_MY_OWN:
 			break;
@@ -756,9 +976,12 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 			/* 镜像原生语义：报告"插入进行中"，xmin 给原生持有者供调用方等待 */
 			snapshot->xmin = native;
 			*visible = true;
+			if (!TransactionIdIsValid(native))
+				sv_diag(0, "dirty: xmin 未决但无原生持有者（调用方不会等）", htup, shard, dx_min, -1, dx_min_cts, 0);
 			return true;
 		case SXID_ABORTED:
 			*visible = false;
+			sv_diag(1, "dirty: xmin ABORTED → 不可见", htup, shard, dx_min, -1, dx_min_cts, 0);
 			return true;
 		case SXID_COMMITTED:
 			break;
@@ -773,20 +996,25 @@ sv_satisfies_dirty(HeapTuple htup, Snapshot snapshot, Buffer buffer,
 		return true;
 	}
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), &native, NULL))
+	switch ((dx_max = shard_xid_state(shard, HeapTupleHeaderGetRawXmax(tuple), &native, &dx_max_cts)))
 	{
 		case SXID_MY_OWN:
 			*visible = false;
+			sv_diag(2, "dirty: xmax 是自己（非锁）→ 不可见", htup, shard, dx_min, dx_max, dx_min_cts, dx_max_cts);
 			break;
 		case SXID_RUNNING:
 			snapshot->xmax = native;
 			*visible = true;
+			if (!TransactionIdIsValid(native))
+				sv_diag(3, "dirty: xmax 未决但无原生持有者（调用方不会等）", htup, shard, dx_min, dx_max, dx_min_cts, dx_max_cts);
 			break;
 		case SXID_ABORTED:
 			*visible = true;
 			break;
 		case SXID_COMMITTED:
 			*visible = false;
+			if (ItemPointerEquals(&htup->t_self, &tuple->t_ctid))
+				sv_diag(4, "dirty: xmax COMMITTED 且链尾（当作已删除）", htup, shard, dx_min, dx_max, dx_min_cts, dx_max_cts);
 			break;
 	}
 	return true;
@@ -800,6 +1028,9 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 	Oid			shard = ShardXidLookupByOid(htup->t_tableOid);
 	int64		my_ts;
 	int64		cts = 0;
+	bool		rc_recheck;
+	int			ux_min = -1;
+	int64		ux_min_cts = 0;
 
 	if (!OidIsValid(shard))
 		return false;
@@ -809,28 +1040,63 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 	/* T3.4：写侧到达这里前必经过扫描（快照已取），通常是缓存命中 */
 	my_ts = TsoGetStartTs();
 
-	switch (shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts))
+	/*
+	 * pg_partdist.rc_update_recheck：READ COMMITTED 事务遇到快照之后提交的
+	 * 删改不报 40001，而是如实报 TM_Updated/Deleted，由执行器走原生 EPQ
+	 * （补丁 0012 放开了 heapam_tuple_lock 的更新链追随）。版本链与 commit_ts
+	 * 序一致：本事务的 commit_ts 在 PRE_COMMIT 向 TSO 取号，必晚于它覆盖的
+	 * 那个版本已落定的 commit_ts。
+	 */
+	rc_recheck = shard_rc_follow_updates && !IsolationUsesXactSnapshot();
+
+	switch ((ux_min = shard_xid_state(shard, HeapTupleHeaderGetRawXmin(tuple), NULL, &cts)))
 	{
 		case SXID_MY_OWN:
 			if (HeapTupleHeaderGetRawCommandId(tuple) >= curcid)
 			{
 				*result = TM_Invisible; /* 本命令内才插入 */
+				sv_diag(5, "update: xmin 自己本命令插入 → TM_Invisible", htup, shard, ux_min, -1, cts, 0);
 				return true;
 			}
 			break;
 		case SXID_RUNNING:
+			/*
+			 * 2026-10-17：RC 重评顺更新链走到的最新版本，其创建者在 PG 里已结束（旧版本的
+			 * xmax 已判提交），但在分片可见性里仍"提交中"（2PC 的 COMMIT PREPARED 收尾、
+			 * 同步复制拉长提交窗口时都会出现）。原来返回 TM_Invisible，执行器不认这个结果，
+			 * 报 "unexpected table_tuple_lock status: 1" 且不可重试（pgbench 整轮中止）。
+			 * 这里按快照隔离冲突报 40001，交给客户端重试 —— 与 rc_update_recheck 关闭时
+			 * first-committer-wins 的处置一致。正常扫描不会选中 xmin 未决的版本，只有顺链才到这里。
+			 */
+			if (rc_recheck)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update"),
+						 errdetail("分片 %u 更新链上的最新版本（xmin=%u）仍在提交中。",
+								   shard, HeapTupleHeaderGetRawXmin(tuple)),
+						 errhint("重试事务。")));
+			*result = TM_Invisible;
+			sv_diag(5, "update: xmin RUNNING → TM_Invisible", htup, shard, ux_min, -1, cts, 0);
+			return true;
 		case SXID_ABORTED:
 			*result = TM_Invisible;
+			sv_diag(5, "update: xmin ABORTED → TM_Invisible", htup, shard, ux_min, -1, cts, 0);
 			return true;
 		case SXID_COMMITTED:
-			/* 快照之后才诞生的行：对本事务不可见（防御，正常扫描不会选中） */
-			if (my_ts > 0 && cts >= my_ts)
+			/*
+			 * 快照之后才诞生的行：对本事务不可见（防御，正常扫描不会选中）。
+			 * 例外：RC 重评模式下，EPQ 顺更新链锁/改的正是这种最新版本
+			 * （补丁 0012）—— 与原生 HeapTupleSatisfiesUpdate 一样只看提交与否。
+			 */
+			if (my_ts > 0 && cts >= my_ts && !rc_recheck)
 			{
 				*result = TM_Invisible;
+				sv_diag(5, "update: xmin 快照后提交 → TM_Invisible", htup, shard, ux_min, -1, cts, 0);
 				return true;
 			}
 			break;
 	}
+	ux_min_cts = cts;
 
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) ||
 		!TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
@@ -861,6 +1127,8 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			/* 本命令删的 = SelfModified；更早命令删的 = 不可见 */
 			*result = (HeapTupleHeaderGetRawCommandId(tuple) >= curcid) ?
 				TM_SelfModified : TM_Invisible;
+			if (*result == TM_Invisible)
+				sv_diag(6, "update: xmax 自己更早命令删改 → TM_Invisible", htup, shard, ux_min, SXID_MY_OWN, ux_min_cts, 0);
 			break;
 		case SXID_RUNNING:
 			*result = TM_BeingModified;
@@ -879,7 +1147,9 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 			 * cts < my_ts 的历史提交到不了这里（那样的行对本快照不可见，
 			 * 扫描不会选中；xmin 分支的防御同理）。
 			 */
-			if (my_ts > 0 && cts >= my_ts)
+			if (my_ts > 0 && cts >= my_ts && rc_recheck)
+				rc_stale_ts = my_ts;
+			if (my_ts > 0 && cts >= my_ts && !rc_recheck)
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 						 errmsg("could not serialize access due to concurrent update"),
@@ -890,6 +1160,8 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
 						 errhint("重试事务。")));
 			*result = !ItemPointerEquals(&htup->t_self, &tuple->t_ctid) ?
 				TM_Updated : TM_Deleted;
+			if (*result == TM_Deleted)
+				sv_diag(7, "update: xmax COMMITTED 且链尾 → TM_Deleted", htup, shard, ux_min, SXID_COMMITTED, ux_min_cts, cts);
 			break;
 	}
 	return true;
@@ -901,6 +1173,51 @@ sv_satisfies_update(HeapTuple htup, CommandId curcid, Buffer buffer,
  * 表无持有者）直接 ERROR —— 静默返回会让调用方 BeingModified→等待→重评
  * 无限自旋；T2.4 认领落地后此路径改为触发认领。
  */
+/*
+ * 等锁路径遇到 2PC 参与者的 PREPARED 槽（活跃表已摘、原生事务已结束或已交给
+ * prepared 的虚拟 PGPROC）：判决要等协调组决议（广播 / 问询 / 清扫）落到本分片，
+ * 是正常窗口而不是"持有者消亡"；已知还有"登记已注销、槽位仍 PREPARED"的残留
+ * （P7-N86，根因待查）。快照读路径对这两种都有处理，等锁路径原先直接 XX000，
+ * 函数下推后 worker 发起的跨仓库 2PC 一跑就撞上。
+ *
+ * 做法：按快照读的严格三态规则解析一次（含 N86 本机近期判决补落、问协调组，学到即
+ * 幂等回写本分片 clog）；未果则短暂轮询等落地；仍定不下来报可重试的 40001。
+ * 返回 true = 已有终局（调用方返回、由内核重评）；槽不是 PREPARED 返回 false。
+ */
+static bool
+sv_wait_resolve_prepared(Oid shard, TransactionId sxid)
+{
+	ShardClogSlot slot;
+	int			i;
+
+	(void) ShardClogReadSlot(shard, sxid, &slot);
+	/*
+	 * 调用方刚看到 PREPARED，判决可能就在这之间落地（单参与节点快路径让这个窗口
+	 * 常见了）：已是终局就算"已决"，让调用方重评，而不是当成无主 RUNNING 报错。
+	 */
+	if ((TxnStatus) slot.status == TXN_COMMITTED ||
+		(TxnStatus) slot.status == TXN_ABORTED)
+		return true;
+	if ((TxnStatus) slot.status != TXN_PREPARED)
+		return false;
+
+	if (shard_xid_state_ex(shard, sxid, NULL, NULL, true) != SXID_RUNNING)
+		return true;
+	for (i = 0; i < 200; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(10000L);
+		if (shard_xid_state(shard, sxid, NULL, NULL) != SXID_RUNNING)
+			return true;
+	}
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("could not serialize access due to pending distributed commit"),
+			 errdetail("分片 %u 的 xid %u（2PC 参与者）判决尚未落到本分片。", shard, sxid),
+			 errhint("重试事务。")));
+	return false;				/* 不可达 */
+}
+
 static void
 sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 			 ItemPointer ctid, XLTW_Oper oper)
@@ -914,6 +1231,8 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 	if (shard_xid_state(shard, sxid, &native, NULL) != SXID_RUNNING)
 		return;					/* 已结束，重评即可 */
 
+	if (!TransactionIdIsValid(native) && sv_wait_resolve_prepared(shard, sxid))
+		return;
 	if (!TransactionIdIsValid(native))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -941,11 +1260,15 @@ sv_xmax_wait(struct RelationData *relation, TransactionId sxid,
 
 	if (shard_xid_state(shard, sxid, NULL, NULL) == SXID_RUNNING &&
 		!TransactionIdIsInProgress(native))
+	{
+		if (sv_wait_resolve_prepared(shard, sxid))
+			return;
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("分片 %u 的 xid %u 是无主 RUNNING 条目（持有者原生 xid %u 已不在）",
 						shard, sxid, native),
 				 errdetail("持有者后端异常消亡；等 T2.4 认领或重启集群。")));
+	}
 }
 
 /*
@@ -1055,6 +1378,7 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 						   TransactionId native_xid)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 
 	if (ShardCommitHash == NULL)
@@ -1071,12 +1395,13 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key,
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh,
 										 HASH_ENTER_NULL, NULL);
 	if (e == NULL)
 	{
-		LWLockRelease(ShardCommitLock);
+		LWLockRelease(SC_LOCK(kh));
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("分片活跃表已满（上限 %d 条）",
@@ -1086,7 +1411,9 @@ ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 	e->native_xid = native_xid;
 	e->committing = false;
 	e->commit_ts = 0;
-	LWLockRelease(ShardCommitLock);
+	e->elr_done = false;
+	e->elr_lsn = InvalidXLogRecPtr;
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1099,20 +1426,22 @@ void
 ShardCommitMarkCommitting(Oid shard, TransactionId sxid, int64 commit_ts)
 {
 	ShardCommitKey key;
+	uint32		kh;
 	ShardCommitEntry *e;
 
 	if (ShardCommitHash == NULL)
 		return;
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	e = (ShardCommitEntry *) hash_search(ShardCommitHash, &key, HASH_FIND, NULL);
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_FIND, NULL);
 	if (e != NULL)
 	{
 		e->committing = true;
 		e->commit_ts = commit_ts;
 	}
-	LWLockRelease(ShardCommitLock);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1140,7 +1469,14 @@ ShardSnapshotEagerStart(PlannedStmt *pstmt)
 		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid) &&
 			sv_is_shard_rel(rte->relid))
 		{
-			(void) TsoGetStartTs();
+			int64		ts = TsoGetStartTs();
+
+			if (rc_stale_ts != 0)
+			{
+				if (rc_stale_ts == ts && !IsolationUsesXactSnapshot())
+					TsoRefreshStartTs();
+				rc_stale_ts = 0;
+			}
 			return;
 		}
 	}
@@ -1159,15 +1495,45 @@ ShardSnapshotEagerStart(PlannedStmt *pstmt)
 void
 ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 {
+	ShardCommitMarkEndedTs(shard, sxid, committed,
+						   committed ? TsoStashedCommitTs() : 0);
+}
+
+/* 提前放锁：提交记录已插入、尚未刷盘（见 ShardCommitEntry.elr_done） */
+void
+ShardCommitMarkElrDone(Oid shard, TransactionId sxid, XLogRecPtr lsn)
+{
 	ShardCommitKey key;
+	uint32		kh;
+	ShardCommitEntry *e;
+
+	if (ShardCommitHash == NULL)
+		return;
+	key.shard = shard;
+	key.sxid = sxid;
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	e = (ShardCommitEntry *) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_FIND, NULL);
+	if (e != NULL)
+	{
+		e->elr_lsn = lsn;
+		e->elr_done = true;
+	}
+	LWLockRelease(SC_LOCK(kh));
+}
+
+void
+ShardCommitMarkEndedTs(Oid shard, TransactionId sxid, bool committed, int64 cts)
+{
+	ShardCommitKey key;
+	uint32		kh;
 
 	if (ShardCommitHash == NULL)
 		return;
 
 	PG_TRY();
 	{
-		ShardClogSetVerdict(shard, sxid, committed,
-							committed ? TsoStashedCommitTs() : 0);
+		ShardClogSetVerdict(shard, sxid, committed, committed ? cts : 0);
 	}
 	PG_CATCH();
 	{
@@ -1180,12 +1546,13 @@ ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed)
 
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	if (hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL) == NULL)
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	if (hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_REMOVE, NULL) == NULL)
 		elog(WARNING,
 			 "pg_partdist: 事务结束时活跃表缺条目（分片 %u，xid %u）",
 			 shard, sxid);
-	LWLockRelease(ShardCommitLock);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /*
@@ -1199,14 +1566,16 @@ void
 ShardCommitRemove(Oid shard, TransactionId sxid)
 {
 	ShardCommitKey key;
+	uint32		kh;
 
 	if (ShardCommitHash == NULL)
 		return;
 	key.shard = shard;
 	key.sxid = sxid;
-	LWLockAcquire(ShardCommitLock, LW_EXCLUSIVE);
-	(void) hash_search(ShardCommitHash, &key, HASH_REMOVE, NULL);
-	LWLockRelease(ShardCommitLock);
+	kh = sc_hash(&key);
+	LWLockAcquire(SC_LOCK(kh), LW_EXCLUSIVE);
+	(void) hash_search_with_hash_value(ShardCommitHash, &key, kh, HASH_REMOVE, NULL);
+	LWLockRelease(SC_LOCK(kh));
 }
 
 /* ---- 接线 ---- */
@@ -1232,7 +1601,7 @@ RequestShardCommitShmem(void)
 {
 	RequestAddinShmemSpace(hash_estimate_size(SHARD_COMMIT_MAX_ENTRIES,
 											  sizeof(ShardCommitEntry)));
-	RequestNamedLWLockTranche("pg_partdist_shard_commit", 1);
+	RequestNamedLWLockTranche("pg_partdist_shard_commit", SHARD_COMMIT_PARTITIONS);
 }
 
 void
@@ -1240,18 +1609,22 @@ ShardCommitShmemInit(void)
 {
 	HASHCTL		ctl;
 
+	int			i;
+
 	ShardCommitHash = NULL;
-	ShardCommitLock = NULL;
 
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(ShardCommitKey);
 	ctl.entrysize = sizeof(ShardCommitEntry);
+	ctl.num_partitions = SHARD_COMMIT_PARTITIONS;
 	ShardCommitHash = ShmemInitHash("pg_partdist_shard_commit",
 									SHARD_COMMIT_MAX_ENTRIES,
 									SHARD_COMMIT_MAX_ENTRIES,
 									&ctl,
-									HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
-	ShardCommitLock = &GetNamedLWLockTranche("pg_partdist_shard_commit")[0].lock;
+									HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE |
+									HASH_PARTITION);
+	for (i = 0; i < SHARD_COMMIT_PARTITIONS; i++)
+		ShardCommitLocks[i] = &GetNamedLWLockTranche("pg_partdist_shard_commit")[i].lock;
 }
 
 void

@@ -49,6 +49,7 @@ extern PGDLLIMPORT shard_relation_xid_hook_type shard_relation_xid_hook;
  * runs first within heap_delete).
  */
 #include "access/htup.h"
+#include "access/xlogdefs.h"
 #include "access/tableam.h"
 #include "storage/buf.h"
 #include "storage/itemptr.h"
@@ -127,5 +128,41 @@ extern PGDLLIMPORT shard_twophase_cb_type shard_twophase_postabort_hook;
  */
 typedef void (*shard_at_prepare_hook_type) (void);
 extern PGDLLIMPORT shard_at_prepare_hook_type shard_at_prepare_hook;
+
+/* ---- 0012：READ COMMITTED 下的更新链追随（EPQ 重评） ---- */
+
+/*
+ * 默认 false：分片表只提供快照隔离，目标行在快照之后被并发改过 ⇒ 40001
+ * （first-committer-wins，设计 §4.4）。扩展可把它打开（GUC
+ * pg_partdist.rc_update_recheck）：此时 READ COMMITTED 事务的 UPDATE/DELETE/
+ * SELECT FOR UPDATE 与原生 PG 一样顺更新链锁住最新版本、经 EvalPlanQual
+ * 重评条件后再改；读仍用事务快照。可见性分叉点（HeapTupleSatisfiesUpdate 钩子）
+ * 与本标志同进同退。
+ */
+extern PGDLLIMPORT bool shard_rc_follow_updates;
+
+/* ---- 0014：提前释放锁（early lock release） ---- */
+
+/*
+ * 打开后（扩展 GUC pg_partdist.early_lock_release），同步提交的事务在
+ * RecordTransactionCommit 里只插入提交记录、不等刷盘（clog 按异步提交标记，
+ * 提示位等 WAL 落盘才设），照常放锁、清 procarray；到 CommitTransaction 末尾、
+ * 回复客户端之前才 XLogFlush 到提交记录 —— 客户端收到的提交仍然持久。
+ * 热行上的后继写者不必等前者的 fsync：它自己的提交记录排在后面，刷盘必然连带。
+ *
+ * shard_elr_pending_lsn：本次提交走了提前放锁时为提交记录末尾（扩展的
+ *   XACT_EVENT_COMMIT 回调据此推迟写分片判决），否则 Invalid。
+ * shard_elr_post_flush_hook：刷盘完成后调用（事务已结束，不得访问目录）。
+ */
+extern PGDLLIMPORT bool shard_early_lock_release;
+/*
+ * 本次提交不得提前放锁（pre_record_commit 钩子置位，RecordTransactionCommit 用后清零）。
+ * 2PC 驱动者必须先刷本地提交再让 Citus 发 COMMIT PREPARED：否则崩溃后远端已提交、
+ * 本地那半却丢了。
+ */
+extern PGDLLIMPORT bool shard_elr_inhibit;
+extern PGDLLIMPORT XLogRecPtr shard_elr_pending_lsn;
+typedef void (*shard_elr_post_flush_hook_type) (void);
+extern PGDLLIMPORT shard_elr_post_flush_hook_type shard_elr_post_flush_hook;
 
 #endif							/* SHARD_STAMP_H */

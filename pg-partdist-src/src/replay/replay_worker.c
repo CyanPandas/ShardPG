@@ -67,6 +67,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/resowner.h"
 #include "utils/wait_event.h"
+#include "partwal_recent.h"
 
 /* ================================================================== */
 /* GUC                                                                 */
@@ -2012,6 +2013,7 @@ ReplayReclaimStale(int grace_secs, int *slots_freed, int *dirs_removed)
             if (grace_secs > 0 && (now - st.st_mtime) < grace_secs)
                 continue;               /* 还在宽限期内 */
 
+            PartWALRecentInvalidateAll();   /* 关系 OID 日后可能被复用 */
             if (!rmtree(sub, true))
             {
                 ereport(WARNING,

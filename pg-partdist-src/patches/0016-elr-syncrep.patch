@@ -1,0 +1,25 @@
+--- a/src/backend/access/transam/xact.c	2026-10-17 07:58:24.071560971 +0000
++++ b/src/backend/access/transam/xact.c	2026-10-17 07:58:24.075561384 +0000
+@@ -1553,7 +1553,13 @@
+ 	 * Note that at this stage we have marked clog, but still show as running
+ 	 * in the procarray and continue to hold locks.
+ 	 */
+-	if (wrote_xlog && markXidCommitted)
++	/*
++	 * patch 0016：提前放锁的提交把同步复制等待也挪到放锁之后（CommitTransaction
++	 * 末尾补刷之后）。依赖它的后继写者的提交记录 LSN 更大，本地刷盘与备库落盘都按
++	 * LSN 顺序推进，后继者的等待必然覆盖本条；快照读等分片判决，判决在等待返回之后
++	 * 才写，读者看不到尚未到达备库的数据。回复客户端仍在等待之后。
++	 */
++	if (wrote_xlog && markXidCommitted && shard_elr_pending_lsn == InvalidXLogRecPtr)
+ 		SyncRepWaitForLSN(XactLastRecEnd, true);
+ 
+ 	/* remember end of last commit record */
+@@ -2460,6 +2466,7 @@
+ 		XLogRecPtr	lsn = shard_elr_pending_lsn;
+ 
+ 		XLogFlush(lsn);
++		SyncRepWaitForLSN(lsn, true);	/* patch 0016：同步复制等待放到放锁之后 */
+ 		shard_elr_pending_lsn = InvalidXLogRecPtr;
+ 		if (shard_elr_post_flush_hook)
+ 			shard_elr_post_flush_hook();

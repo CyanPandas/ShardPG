@@ -2,6 +2,7 @@
 #define SHARD_VISIBILITY_H
 
 #include "pg_partdist.h"
+#include "access/xlogdefs.h"
 
 /*
  * TX-TSO-MVCC 可见性裁决（配内核补丁 0006；分叉结构 T1.6–T1.8 交付，
@@ -44,6 +45,9 @@ extern void ShardCommitRegisterRunning(Oid shard, TransactionId sxid,
 /* 事务结束回调里调用：先写 clog 终局判决（fsync），后摘活跃表条目。
  * 判决写失败升 PANIC（借崩溃恢复走 0007 redo 补齐）；摘条目异常仅 WARNING。 */
 extern void ShardCommitMarkEnded(Oid shard, TransactionId sxid, bool committed);
+extern void ShardCommitMarkEndedTs(Oid shard, TransactionId sxid, bool committed, int64 cts);
+extern void ShardCommitMarkElrDone(Oid shard, TransactionId sxid, XLogRecPtr lsn);	/* 补丁 0014 */
+extern XLogRecPtr ShardElrTakeObservedLsn(void);
 
 /* TPC-C 分支：PRE_COMMIT 置"提交中"（cts=0 = 号未到）/ 填 commit_ts */
 extern void ShardCommitMarkCommitting(Oid shard, TransactionId sxid, int64 commit_ts);

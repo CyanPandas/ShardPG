@@ -21,6 +21,7 @@
 #include "shard_xid.h"
 #include "shard_visibility.h"
 #include "tso.h"
+#include "shard_wal.h"
 
 #include "storage/bufmgr.h"
 
@@ -32,6 +33,7 @@
 #include "funcapi.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "shard_clog.h"			/* 补丁 0015：检查点钩子 ShardClogSyncDirty */
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
@@ -40,6 +42,8 @@
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "tcop/utility.h"
+#include "partwal_recent.h"
+extern void PartWALRegisterReadHook(void);   /* raft_boundary.c */
 
 PG_MODULE_MAGIC;
 
@@ -148,7 +152,10 @@ PartWALXactCallback(XactEvent event, void *arg)
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT ||
         event == XACT_EVENT_PARALLEL_ABORT || event == XACT_EVENT_PARALLEL_COMMIT ||
         event == XACT_EVENT_PREPARE)
+    {
         PartWALDeferSyncReset();
+        PartWALXactNonShardWrite = false;
+    }
 
     switch (event)
     {
@@ -634,8 +641,10 @@ PartDistMaybeInstallUsr2Backtrace(void)
 void
 _PG_init(void)
 {
+    PartWALRegisterReadHook();   /* 2026-10-17：pg_raft 复制流按 plsn 读记录（C 层） */
     if (!process_shared_preload_libraries_in_progress)
         return;
+    ShardWalRegisterRmgr();      /* 2026-10-17：分片账本 WAL（PREPARED / 判决），路线 A 备库重建用；只能在预加载时注册 */
 
     /*
      * T6.3c：副本壳表的本地访问闸门的逃生口。
@@ -688,6 +697,18 @@ _PG_init(void)
         0,
         NULL, NULL, NULL
     );
+    DefineCustomIntVariable(
+        "pg_partdist.partwal_recent_cache_mb",
+        "最近写下的分区流记录的节点级内存缓存大小（MB，0 = 关，默认 256）。",
+        "复制按 plsn 取刚落盘的记录、DTX 收尾按 dtxid 找刚写的 DTX_PREPARE 都先查它，"
+        "查不中才回读段文件。只缓存已写进段文件的记录；任何分区截断时整体作废。",
+        &partwal_recent_cache_mb,
+        256, 0, 8192,
+        PGC_POSTMASTER,
+        GUC_UNIT_MB,
+        NULL, NULL, NULL
+    );
+
     /* P7-N4/N7：分区流按 plsn 查记录的稀疏索引开关（逃生口 + 正确性对照用） */
     DefineCustomBoolVariable(
         "pg_partdist.partwal_record_index",
@@ -721,6 +742,28 @@ _PG_init(void)
         &partdist_auto_reprovision_demoted,
         true,
         PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
+        "pg_partdist.single_replica_fast_commit",
+        "单副本快速提交：分区 WAL 不 fsync、数据与提交标记一轮复制（默认 off）。",
+        "只能在全部数据组单成员（REPLICAS=0）时开启：持久化以 pg_wal 为准，崩溃可能丢分区流尾部；"
+        "多副本下 follower 依赖落盘才 ack，开启会破坏多数派持久化语义。",
+        &partwal_fast_commit,
+        false,
+        PGC_SIGHUP,
+        0,
+        NULL, NULL, NULL
+    );
+    DefineCustomBoolVariable(
+        "pg_partdist.partwal_group_fsync",
+        "多副本：分区段文件出全局锁后组提交 fsync，checkpoint 以节点级缓存为准（默认 on）。",
+        "关掉退回原路径：每个写入器关闭时在 PartWALCtl->lock 之下 fsync 段文件并写 checkpoint 文件"
+        "再 fsync。打开时复制只送已 fsync 的前缀，多数派语义不变。单副本快速模式下不起作用。",
+        &partwal_group_fsync,
+        true,
+        PGC_POSTMASTER,
         0,
         NULL, NULL, NULL
     );
@@ -941,6 +984,13 @@ _PG_init(void)
 
         *rv = (void *) DtxPendingContainsDtxid;
     }
+
+    /*
+     * 内核补丁 0015：检查点时把分片 clog 的脏段落盘（与原生 clog 同一时机）。
+     * 判决丢失只可能发生在"早于检查点 redo 点且未落盘"的那部分；redo 点之后的
+     * 由 0007 的提交记录重放补回。有了它，心跳就不必每轮 fsync。
+     */
+    shard_checkpoint_hook = ShardClogSyncDirty;
 
     /* T4.5②：决议主动广播（pg_raft 在决议达多数派后触发；推送是纯优化） */
     {

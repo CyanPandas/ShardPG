@@ -21,6 +21,9 @@ CREATE TABLE partition_map (
     -- 数据组自治选举出的主副本任期（任期栅栏：apply 只接受不回退的更新）。
     -- 0 = 尚无数据组管理（历史/合成分区，仍走旧"控制面指定"通道）。
     primary_term    BIGINT      NOT NULL DEFAULT 0,
+    -- TX-TSO-MVCC（T2.7）：本分区是否启用分片级 xid 打标（P2 起）。
+    -- 由 partdist_set_shard_mvcc() 翻转；既有行默认 false 保 438 基线。
+    shard_mvcc      BOOLEAN     NOT NULL DEFAULT false,
     CONSTRAINT pk_partition_map PRIMARY KEY (partition_id)
 );
 
@@ -391,7 +394,14 @@ BEGIN
            cls.relfilenode,
            cls.relname,
            s.logicalrelid
-    FROM pg_catalog.pg_dist_shard s
+    -- T4.5 加固 v2：悬空的 pg_dist_shard 行（logicalrelid 已被删）会让
+    -- shard_name() 直接抛错，整个身份重建报废。过滤必须**先于** JOIN 的
+    -- shard_name 求值——SQL 不保证 WHERE 先于 JOIN ON，故用 OFFSET 0
+    -- 优化栅栏把过滤钉死在子查询里（v1 只加 WHERE，实测 planner 仍先
+    -- 求值 shard_name 而炸，worker 上身份重建整体报废）。
+    FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
+           WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
+           OFFSET 0) s
     JOIN pg_catalog.pg_class cls
       ON cls.oid = pg_catalog.to_regclass(
                        pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid
@@ -404,9 +414,23 @@ BEGIN
     GET DIAGNOSTICS n = ROW_COUNT;
 
     -- 清理已不在本节点的分片(表被删/迁走);to_regclass 不受分片隐藏影响。
+    --
+    -- ★ 2026-08-18：本条**漏了 INSERT 分支同款的悬空过滤**，实测因此报废。
+    -- 悬空的 pg_dist_shard 行（logicalrelid 指向的逻辑表已被删）会让
+    -- shard_name() 抛 "object_name does not reference a valid relation"，
+    -- 而它在 NOT EXISTS 子查询里对**每一行** pg_dist_shard 求值 ⇒ 整个
+    -- rebuild_shard_identity() 报废 ⇒ shard_identity 建不出来 ⇒
+    -- local_partition_for_shard() 返回空 ⇒ 下游连锁（实测 pagecmp_p1 7 条、
+    -- dtx_convergence_p4 11 条同源失败）。
+    -- 修法与 INSERT 分支一致：先用 OFFSET 0 优化栅栏把悬空行滤掉，再让
+    -- shard_name 求值。**只加 WHERE 不够** —— planner 仍可能先求值 shard_name
+    -- （INSERT 分支的 v1 就栽在这里，注释已记）。
     DELETE FROM shard_identity si
      WHERE NOT EXISTS (
-         SELECT 1 FROM pg_catalog.pg_dist_shard s
+         SELECT 1
+           FROM (SELECT * FROM pg_catalog.pg_dist_shard ds
+                  WHERE ds.logicalrelid::oid IN (SELECT oid FROM pg_catalog.pg_class)
+                  OFFSET 0) s
           WHERE pg_catalog.to_regclass(
                     pg_catalog.shard_name(s.logicalrelid, s.shardid))::oid = si.local_oid);
 
@@ -485,6 +509,173 @@ COMMENT ON FUNCTION global_id_for_partition(OID) IS
 -- ----------------------------------------------------------------
 -- Raft control-plane boundary functions (consumed by pg_raft)
 -- ----------------------------------------------------------------
+
+-- T5.1（设计 §6.1）：分片级 vacuum 两水位的读写。观测/维护用。
+CREATE OR REPLACE FUNCTION shard_vacuum_watermarks(
+    p_shard OID,
+    OUT clog_truncate_before BIGINT,
+    OUT shard_vacuum_xid BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_watermarks';
+
+COMMENT ON FUNCTION shard_vacuum_watermarks(OID) IS
+    'T5.1：读本分片的 vacuum 两水位。clog_truncate_before = clog 实际截断点（隐式 freeze 点、回卷龄基点）；shard_vacuum_xid = 两态恢复标记（== 前者表示无未完成的趟，> 前者表示页面趟已完成、截断待补）。';
+
+CREATE OR REPLACE FUNCTION shard_vacuum_set_watermarks(
+    p_shard OID, p_trunc_before BIGINT, p_vacuum_xid BIGINT)
+RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_set_watermarks';
+
+COMMENT ON FUNCTION shard_vacuum_set_watermarks(OID, BIGINT, BIGINT) IS
+    'T5.1：写本分片的 vacuum 两水位并落盘。不变式 clog_truncate_before <= shard_vacuum_xid 在落盘出口强制，违反即 ERROR。';
+
+-- T5.2（设计 §6.3）：前缀扫描算 VacuumTargetXid。从本分片当前的
+-- clog_truncate_before 起顺扫至 p_ceiling（不含），返回可安全截断到的**前一条**；
+-- 0 = 一条都不能清。stop_reason 回填停因供排障。
+CREATE OR REPLACE FUNCTION shard_vacuum_target(
+    p_shard OID, p_safe_ts BIGINT, p_ceiling BIGINT,
+    OUT target_xid BIGINT,
+    OUT stop_reason TEXT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_target';
+
+COMMENT ON FUNCTION shard_vacuum_target(OID, BIGINT, BIGINT) IS
+    'T5.2：前缀扫描算 VacuumTargetXid（设计 §6.3）。COMMITTED 且 commit_ts < p_safe_ts 放行，**ABORTED 也放行**（挡住它会让一个中止事务永久钉死截断）；遇 RUNNING / PREPARED / 空洞 / commit_ts 太新即停。停因：scanned-to-ceiling / no-safe-ts / hole-running / commit-ts-too-new / prepared / running。';
+
+-- T5.3a（设计 §6.4 ③）：xmax 消毒。把 xmax < p_trunc_before 且 ABORTED 或
+-- lock-only 的 xmax 清成 0，其余原样。**只清不推进水位** —— 顺序铁律要求
+-- 页面全部清完才许动 clog，推进由 T5.4 的截断路径统一落。
+CREATE OR REPLACE FUNCTION shard_sanitize_xmax(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT tuples_sanitized BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_sanitize_xmax';
+
+COMMENT ON FUNCTION shard_sanitize_xmax(REGCLASS, BIGINT) IS
+    'T5.3a：分片表 xmax 消毒（设计 §6.4 ③）。p_trunc_before = 本轮打算推进到的截断点（开区间上界，= ShardVacuumComputeTarget 结果 + 1）。截断点以下的 ABORTED / lock-only xmax 清成 0，COMMITTED 不动（留给动作②）；区间内仍未决即 ERROR。页面修改经内核 heap_freeze_execute_prepared 发 XLOG_HEAP2_FREEZE_PAGE，follower 逐字节回放。';
+
+-- T5.3b（设计 §6.4 ①）：删中止 xmin 的元组。不做则截断后该 xmin 落进免查
+-- 隐式冻结区、被解释成"已提交全可见"，**中止事务的幽灵行复活**。
+-- ★ 必须先跑 shard_sanitize_xmax（③）：中止事务"插入后又更新"留下的 HOT 链，
+--   其 HEAP_HOT_UPDATED 位要靠 ③ 清 xmax 才失效；③ 没跑过的那些元组会计进
+--   tuples_deferred 留到下一趟。
+-- ★ 只对无索引的分片表可用（索引两阶段是 T5.3c）；带索引即 ERROR。
+-- pages_skipped > 0 或 tuples_deferred > 0 ⇒ 本趟不完整，不得据此截断。
+CREATE OR REPLACE FUNCTION shard_remove_aborted(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_removed BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_remove_aborted';
+
+COMMENT ON FUNCTION shard_remove_aborted(REGCLASS, BIGINT) IS
+    'T5.3b：删中止 xmin 的元组（设计 §6.4 ①）。判据只看 xmin：clog ABORTED 且 xmin < p_trunc_before 即删。走原生无索引表通路——XLOG_HEAP2_PRUNE 置 LP_DEAD/LP_UNUSED，紧接 XLOG_HEAP2_VACUUM 置 LP_UNUSED 并截行指针数组，页面变换全交内核 heap_page_prune_execute。需先跑 shard_sanitize_xmax；带索引即 ERROR。';
+
+-- T5.3c（设计 §6.4 ②）：删已提交删除的死元组。**判据看 xmax 不看 xmin** ——
+-- 没被删过的老行是活的，零页面动作。commit_ts < GlobalSafeTs 由 p_trunc_before
+-- 的构造保证（§6.3 只让满足该条件的 COMMITTED 过关）；反命题做成守卫：
+-- commit_ts=0 的已提交条目落在截断点以下即 ERROR。
+-- ★ 与 ① 不对称：本动作**不推迟**仍挂 HOT 链的 heap-only 元组——已提交的 xmax
+--   没有后续动作会清它的 HEAP_HOT_UPDATED，推迟就是永远推迟，会把截断钉死。
+-- ★ 索引两阶段尚未实现（带索引即 ERROR），见 DEV PLAN T5.3c 实施记要。
+CREATE OR REPLACE FUNCTION shard_remove_dead(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT pages_scanned BIGINT,
+    OUT pages_dirtied BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_removed BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_remove_dead';
+
+COMMENT ON FUNCTION shard_remove_dead(REGCLASS, BIGINT) IS
+    'T5.3c：删已提交删除的死元组（设计 §6.4 ②）。判据只看 xmax：clog COMMITTED 且 xmax < p_trunc_before 即删；xmax 为空/中止/lock-only 一律不动。与 shard_remove_aborted 共用同一条页面通路（PRUNE + VACUUM 两条内核记录），定义域互不相交。带索引即 ERROR（索引两阶段未实现）。';
+
+-- T5.4（设计 §6.4 顺序铁律）：一整趟页面动作 ③→①→②。
+-- **只有整趟干净**（pages_skipped=0 且 tuples_deferred=0）才落"趟完"标记
+-- shard_vacuum_xid = p_trunc_before —— 这是 shard_clog_truncate 唯一认的凭据。
+CREATE OR REPLACE FUNCTION shard_vacuum_sweep(
+    p_rel REGCLASS, p_trunc_before BIGINT,
+    OUT swept BOOLEAN,
+    OUT sanitized BIGINT,
+    OUT removed_aborted BIGINT,
+    OUT removed_dead BIGINT,
+    OUT pages_skipped BIGINT,
+    OUT tuples_deferred BIGINT
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_sweep';
+
+COMMENT ON FUNCTION shard_vacuum_sweep(REGCLASS, BIGINT) IS
+    'T5.4：一整趟页面动作（③ xmax 消毒 → ① 删中止 xmin → ② 删已提交删除的死元组）。③ 必须最先——① 对"仍挂 HOT 链的 heap-only 元组"的推迟要靠 ③ 清 xmax 才解除。整趟干净才落 shard_vacuum_xid 标记，否则返回 swept=false 且不动水位，截断随之被拦。';
+
+-- T7.17（P7-V1）：分片 vacuum 自动启动器。
+-- 把"到龄了该跑 vacuum"从一条 WARNING 变成真的会跑：逐个到龄分片走
+-- 「两态恢复 → 算目标 → 趟页面 → 截断」，单个分片失败只让那一个跳过。
+-- 判据与阶段 1 护栏同源（age >= shard_vacuum_max_age），所以不会出现
+-- "警告了却不动手"或"没警告却在动手"的错位。
+-- p_max_shards <= 0 表示不限（上限仍是 64 个槽位）。
+CREATE OR REPLACE FUNCTION shard_vacuum_auto(
+    p_max_shards INTEGER DEFAULT 0,
+    OUT shards_considered INTEGER,
+    OUT shards_swept INTEGER,
+    OUT shards_truncated INTEGER,
+    OUT detail TEXT
+) RETURNS record LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_auto';
+
+COMMENT ON FUNCTION shard_vacuum_auto(INTEGER) IS
+    'T7.17：分片 vacuum 自动启动器。心跳工作者按 pg_partdist.shard_vacuum_auto 自连触发，也可手工调用。detail 逐分片回填结果：<oid>:<旧截断点>-><新截断点> / recover / gone / not-swept(...) / <停因> / error。取不到 GlobalSafeTs 时一律停在 no-safe-ts —— 少清一轮无害，拿不可信的安全线截断 clog 不可逆。';
+
+-- T5.4：截断本分片 clog。门禁 = 顺序铁律；内部次序 = 先推水位后删文件。
+CREATE OR REPLACE FUNCTION shard_clog_truncate(p_shard OID, p_trunc_before BIGINT)
+RETURNS INTEGER LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_truncate';
+
+COMMENT ON FUNCTION shard_clog_truncate(OID, BIGINT) IS
+    'T5.4：截断分片 clog 到 p_trunc_before（开区间上界；此后 xid < 该值进入免查隐式冻结区）。要求 p_trunc_before <= shard_vacuum_xid（顺序铁律：页没清完不许动 clog），否则 ERROR。先推水位后删文件——反过来一旦中途崩溃，clog 没了而水位还说要查 clog，已提交数据当场消失。按段整删，返回删掉的段文件数。';
+
+-- T5.5（设计 §6.5）：两态恢复。
+--   clog_truncate_before == shard_vacuum_xid ⇒ 无未完成的趟，返回 'nothing'
+--       （趟中崩溃落在这一格：整趟重来即可，三类动作各自幂等）；
+--   clog_truncate_before <  shard_vacuum_xid ⇒ 趟完未截断，**只补做截断**，
+--       返回 'truncated'，绝不重跑页面趟。
+CREATE OR REPLACE FUNCTION shard_vacuum_recover(p_shard OID)
+RETURNS TEXT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_vacuum_recover';
+
+COMMENT ON FUNCTION shard_vacuum_recover(OID) IS
+    'T5.5：分片 vacuum 的两态恢复（设计 §6.5）。两个水位相等=无未完成的趟（什么都不做）；shard_vacuum_xid 跑在前面=趟完未截断（只补做截断）。幂等：连做两次第二次必回 nothing。';
+
+-- T5.6（设计 §7）：分片级回卷护栏的观测点。
+-- 龄 = next_xid - clog_truncate_before。★ 基点是 clog_truncate_before 而**不是**
+-- shard_vacuum_xid：歧义边界挂在免查区的解释规则上，而"趟完未截断"窗口里
+-- shard_vacuum_xid 跑在前面，拿它算龄会把紧迫度算小，方向不安全。
+-- phase 0=正常 / 1=到龄（须尽快 vacuum）/ 2=已停发（该分片进只读）。
+CREATE OR REPLACE FUNCTION shard_xid_age(
+    p_shard OID,
+    OUT age BIGINT,
+    OUT phase INTEGER,
+    OUT max_age BIGINT,
+    OUT stop_age BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_age';
+
+COMMENT ON FUNCTION shard_xid_age(OID) IS
+    'T5.6：分片 xid 龄与回卷护栏相位（设计 §7）。阈值由 pg_partdist.shard_vacuum_max_age（阶段1，默认 2e8）与 pg_partdist.shard_xid_stop_age（阶段2，默认 2^31-1e6）控制；阶段 2 触发后该分片拒发新号、进只读，护栏是分片粒度不殃及节点与集群。';
+
+-- U-P5-1：本分片下一个待发号。follower 上它由 MARKER 捎来的 leader 发号水位
+-- 落盘而来（升主后发号器取 Max(文件 alloc_wm, 影子) 起步，不会重号）。
+CREATE OR REPLACE FUNCTION shard_xid_next(p_shard OID)
+RETURNS BIGINT LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_next';
+
+COMMENT ON FUNCTION shard_xid_next(OID) IS
+    'U-P5-1：本分片下一个待发号（0 = 取不到）。所有已发号都小于它。';
 
 CREATE OR REPLACE FUNCTION get_partition_flush_lsn(partition_id OID)
     RETURNS BIGINT
@@ -567,6 +758,28 @@ CREATE OR REPLACE FUNCTION partwal_follower_append(
 ) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append';
 
+-- T7.24（R-P4-13 根因）：同参数的"新追加"入口。编号已被本地孤儿记录占住时，
+-- 只有新追加（条目落在本节点 raft 日志末尾之后）才许截断重写；重传时不一致
+-- 则标记分叉、不截断。pg_raft 在新追加时调它，重传时调原入口。
+CREATE OR REPLACE FUNCTION partwal_follower_append_fresh(
+    p_partition_id OID,
+    p_partition_lsn BIGINT,
+    p_orig_lsn PG_LSN,
+    p_rmid INTEGER,
+    p_info INTEGER,
+    p_flags INTEGER,
+    p_gxid BIGINT,
+    p_data BYTEA
+) RETURNS BIGINT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_follower_append_fresh';
+
+-- P7-N41（2026-10-03）：group commit —— follower 收一批 AppendEntries 时批内只写不 fsync，
+-- 批尾 end 一次 fsync 碰过的段并持久化 checkpoint（失败报错 ⇒ 不 ack）。
+CREATE OR REPLACE FUNCTION partwal_defer_sync_begin() RETURNS boolean
+    LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'pg_partdist_partwal_defer_sync_begin';
+CREATE OR REPLACE FUNCTION partwal_defer_sync_end() RETURNS integer
+    LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'pg_partdist_partwal_defer_sync_end';
+
 -- Raft 日志截断时同步截断 parwal：被截断条目的字节若滞留，切主后新 leader
 -- 会把不同记录写到同一个 partition_lsn 上，幂等去重反而会保留错误内容。
 CREATE OR REPLACE FUNCTION partwal_truncate_to(
@@ -596,6 +809,91 @@ CREATE OR REPLACE FUNCTION partwal_append_dtx_record(
 ) RETURNS BIGINT LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_partwal_append_dtx_record';
 
+-- P7-N12：分片 clog 状态的正式 SQL 入口（此前只有测试临时建的包装）。0=RUNNING 1=PREPARED 2=COMMITTED 3=ABORTED
+-- P7-N16：该分片是否处在全量物理基线半程（收到 FULL_BASELINE 截空、未收到 BASELINE_END）。
+-- 升主前置据此拒绝放行"空壳主"（索引 0 字节、整片不可读）。
+-- P7-N18（之二）：升主前把 (from_plsn, upto_plsn] 这截已复制、可能未 apply 的流里出现过的
+-- 分片 xid 全部吸收进发号水位（DATA 记录的 xmin/xmax + MARKER 尾块），挡住新主重发旧号。
+CREATE OR REPLACE FUNCTION shard_absorb_tail_xids(p_shard OID, p_from BIGINT, p_upto BIGINT)
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_absorb_tail_xids';
+
+COMMENT ON FUNCTION shard_absorb_tail_xids(OID, BIGINT, BIGINT) IS
+    '扫 (p_from, p_upto] 的分区流，把 DATA/MARKER 里出现过的分片 xid 抬进发号水位；升主前置调用以防重号。';
+
+CREATE OR REPLACE FUNCTION shard_baseline_pending(p_shard OID)
+    RETURNS boolean LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_pending';
+
+-- ★ P7-N64（2026-10-05）：本地这份分片副本是否残缺（不可升主、需要重供）。
+-- "基线半程"标记只在共享内存里，节点重启就丢 —— 实测供副本中途被断电的成员重启后
+-- 标记没了，升主前置放行，堆和主键都是 0 字节的空壳当上了主。这里补一条**磁盘事实**：
+-- 分片任何一个索引文件是 0 字节（btree / hash / gin 都至少有一个元页）⇒ 基线没灌完。
+CREATE OR REPLACE FUNCTION shard_local_copy_broken(p_shard OID)
+    RETURNS boolean LANGUAGE sql STABLE
+AS $fn$
+    SELECT partdist.shard_baseline_pending(p_shard)
+        OR EXISTS (SELECT 1 FROM pg_catalog.pg_index i
+                    WHERE i.indrelid = p_shard
+                      AND pg_catalog.pg_relation_size(i.indexrelid) = 0)
+$fn$;
+
+COMMENT ON FUNCTION shard_baseline_pending(OID) IS
+    '收到 FULL_BASELINE（截空本地文件、等 FPI 重建）到收到匹配 BASELINE_END 之间返回真；升主前置见真即不放行。';
+
+CREATE OR REPLACE FUNCTION shard_mark_promotion_pending(p_shard OID)
+    RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_mark_promotion_pending';
+
+COMMENT ON FUNCTION shard_mark_promotion_pending(OID) IS
+    'P7-N31：升主前置返回 1 时调，标记该分片"即将登记为主"15 s；读闸门见此标记会等本地登记 apply 跟上而不是立即拒读。';
+
+CREATE OR REPLACE FUNCTION shard_promoted_selfheld(p_shard OID)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_promoted_selfheld';
+
+COMMENT ON FUNCTION shard_promoted_selfheld(OID) IS
+    'P7-N23：本节点对该分片仍持「已升主」身份，且（本进程生命期内）升主以来没收到过他人写的 DATA/MARKER；为真时本地流未回放的尾巴全是自己当主时写的，再次升主可跳过追平。';
+
+CREATE OR REPLACE FUNCTION shard_clog_status(p_shard OID, p_xid BIGINT)
+    RETURNS integer LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_read';
+
+COMMENT ON FUNCTION shard_clog_status(OID, BIGINT) IS
+    '读本节点分片 clog 里一个分片 xid 的状态：0=RUNNING（含空洞）1=PREPARED 2=COMMITTED 3=ABORTED。';
+
+CREATE OR REPLACE FUNCTION shard_clog_status_full(p_shard OID, p_xid BIGINT)
+    RETURNS text LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clog_read_full';
+
+COMMENT ON FUNCTION shard_clog_status_full(OID, BIGINT) IS
+    '读本节点分片 clog 槽的全文："st=<状态> sts=<start_ts> cts=<commit_ts>"。';
+
+-- P7-N12（之二）：升主节点把 in-doubt 决议映射回分片 xid 并落账（见 raft_boundary.c）
+CREATE OR REPLACE FUNCTION partwal_prepare_sxid(
+    p_partition_id OID,
+    p_dtxid BIGINT,
+    p_upto BIGINT,
+    OUT sxid BIGINT,
+    OUT hdr_gxid BIGINT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'pg_partdist_partwal_prepare_sxid';
+
+COMMENT ON FUNCTION partwal_prepare_sxid(OID, BIGINT, BIGINT) IS
+    '按 dtxid 在本分区流（1..p_upto）里找 DTX_PREPARE 记录的头部 gxid，再取紧随其后同 gxid 的 PREPARE MARKER 尾块里的分片 xid。找不到返回 NULL。';
+
+CREATE OR REPLACE FUNCTION shard_verdict_apply(
+    p_partition_id OID,
+    p_sxid BIGINT,
+    p_hdr_gxid BIGINT,
+    p_committed BOOLEAN,
+    p_commit_ts BIGINT
+) RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_verdict_apply';
+
+COMMENT ON FUNCTION shard_verdict_apply(OID, BIGINT, BIGINT, BOOLEAN, BIGINT) IS
+    '把一笔 in-doubt 判决落进本地分片 clog（start_ts 取 PREPARED 槽），并追加带分片 xid 的判决 MARKER 复制给副本（与 leader 侧 dtx_replicate_verdict 同构）。本地已落账即返回，复制失败返回 false。';
+
 COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGINT, INTEGER, BIGINT[]) IS
     '在本节点该分区的 parwal 流追加一条 DTX 记录并 fsync，返回分配到的 partition_lsn。participants 仅 DECISION(kind=2) 记录携带。';
 
@@ -613,16 +911,51 @@ COMMENT ON FUNCTION partwal_append_dtx_record(OID, INTEGER, BIGINT, BIGINT, BIGI
 CREATE TABLE IF NOT EXISTS dtx_decision (
     dtxid         BIGINT      PRIMARY KEY,
     coord_gsid    BIGINT      NOT NULL,
-    verdict       SMALLINT    NOT NULL,   -- 1=COMMIT, 2=ABORT
+    verdict       SMALLINT    NOT NULL,   -- 1=COMMIT, 2=ABORT, 3=COMMIT 待发起方确认（见下）
     commit_ts     BIGINT      NOT NULL DEFAULT 0,
     participants  BIGINT[]    NOT NULL DEFAULT '{}',
     decided_plsn  BIGINT      NOT NULL,   -- 该 DECISION 记录的 partition_lsn
     acked         BIGINT[]    NOT NULL DEFAULT '{}',  -- 已回执的参与组（GC 用）
-    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    decided_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    anchor_xid    BIGINT      NOT NULL DEFAULT 0      -- verdict=3 的锚点：本节点该事务 prepared 事务的 full xid
 );
+ALTER TABLE dtx_decision ADD COLUMN IF NOT EXISTS anchor_xid BIGINT NOT NULL DEFAULT 0;
 
 COMMENT ON TABLE dtx_decision IS
     'DTX-2PC 决议索引：由协调组的 apply 路径在每个成员上维护，供 dtx_status 快速应答。权威仍是协调组日志里的 DECISION 记录。';
+
+-- ------------------------------------------------------------------
+-- 2026-10-18 原子性修复（方案 B）：判决跟发起方的本地提交绑在一起
+-- ------------------------------------------------------------------
+-- 缺陷：发起方（2PC 驱动者）在写本地提交记录**之前**就把 COMMIT 判决写进了协调组。
+-- 它恰好在两步之间崩溃时，参与方照判决提交，发起方本地那一半却因没有提交记录被回滚
+-- —— 跨节点事务一半提交（云上满负载杀 worker 12 次复现 3 次）。
+--
+-- 修法：发起方在提交前只写 verdict=3（"COMMIT，待发起方确认"）+ commit_ts，判决在
+-- 发起方本地提交持久之后才生效。生效的凭据有两个，都不需要额外写盘或往返：
+--   ① 锚点：协调组 leader 记下**本节点**这笔事务的 prepared 事务 xid（anchor_xid）。
+--      只有发起方本地提交持久后 Citus 才会发 COMMIT PREPARED；发起方中止则发
+--      ROLLBACK PREPARED。所以锚点事务的结局就是判决：已提交 ⇒ COMMIT，已回滚 ⇒ ABORT，
+--      仍 prepared ⇒ 未决。锚点结局在 pg_xact 里，随 WAL 持久、随流复制到备库。
+--   ② 发起方崩溃、COMMIT PREPARED 永远不来时，由恢复守护（dtx_status）去问发起方：
+--      发起方事务还在跑 ⇒ 未决；否则看它本地 pg_dist_transaction 里这笔事务的行
+--      （与本地提交同生共死）在不在 ⇒ COMMIT / ABORT。结论不写回本表（会与回执清扫自死锁），
+--      恢复守护按它提交 / 回滚锚点，判决随锚点生效。
+-- verdict=3 未生效期间，读者 / 清扫问到的一律是"未决"（与提交中窗口同口径）。
+CREATE OR REPLACE FUNCTION dtx_verdict_effective(p_verdict integer, p_anchor_xid bigint)
+RETURNS integer LANGUAGE sql STABLE AS $$
+    SELECT CASE
+             WHEN p_verdict IS DISTINCT FROM 3 THEN coalesce(p_verdict, 0)
+             WHEN coalesce(p_anchor_xid, 0) <= 0 THEN 3
+             ELSE CASE pg_catalog.pg_xact_status(p_anchor_xid::text::xid8)
+                    WHEN 'committed' THEN 1
+                    WHEN 'aborted'   THEN 2
+                    ELSE 3 END
+           END
+$$;
+
+COMMENT ON FUNCTION dtx_verdict_effective(integer, bigint) IS
+    '决议的有效值：verdict 1/2 原样返回；3（待发起方确认）按锚点 prepared 事务的结局折算（提交=1、回滚=2、仍 prepared 或锚点未知=3）。';
 
 -- ------------------------------------------------------------------
 -- dtx_participant：本节点在某笔分布式事务里的参与登记（§9.3 的落地形态）
@@ -648,8 +981,10 @@ CREATE TABLE IF NOT EXISTS dtx_participant (
     gsids       BIGINT[]    NOT NULL,   -- 本节点在该事务里真正写过的分区组
     coord_gsid  BIGINT,                 -- master 下发；NULL = 决议尚未可能发生
     noted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    local_xid   BIGINT      NOT NULL DEFAULT 0,  -- 2026-10-18：本节点这个 gid 的 prepared 事务 full xid（待确认决议的锚点）
     CONSTRAINT pk_dtx_participant PRIMARY KEY (dtxid, gid)
 );
+ALTER TABLE dtx_participant ADD COLUMN IF NOT EXISTS local_xid BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_dtx_participant_dtxid ON dtx_participant(dtxid);
 CREATE INDEX IF NOT EXISTS idx_dtx_participant_noted ON dtx_participant(noted_at);
 
@@ -661,19 +996,20 @@ COMMENT ON TABLE dtx_participant IS
 CREATE OR REPLACE FUNCTION dtx_note_participant(
     p_dtxid BIGINT,
     p_gid TEXT,
-    p_gsids BIGINT[]
+    p_gsids BIGINT[],
+    p_local_xid BIGINT DEFAULT 0
 ) RETURNS BOOLEAN
     LANGUAGE sql VOLATILE
 AS $$
-    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids)
-    VALUES (p_dtxid, p_gid, p_gsids)
+    INSERT INTO partdist.dtx_participant (dtxid, gid, gsids, local_xid)
+    VALUES (p_dtxid, p_gid, p_gsids, p_local_xid)
     ON CONFLICT (dtxid, gid) DO UPDATE
-       SET gsids = EXCLUDED.gsids, noted_at = now()
+       SET gsids = EXCLUDED.gsids, noted_at = now(), local_xid = EXCLUDED.local_xid
     RETURNING true
 $$;
 
-COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[]) IS
-    '登记本节点在某笔分布式事务里写过的分区组。必须在独立事务里调用。';
+COMMENT ON FUNCTION dtx_note_participant(BIGINT, TEXT, BIGINT[], BIGINT) IS
+    '登记本节点在某笔分布式事务里写过的分区组，以及这个 gid 即将 prepare 的本地事务（full xid，待确认决议的锚点）。必须在独立事务里调用。';
 
 -- master 侧第一轮：本节点在该事务里写过的全部分区组（多个 gid 取并集）。
 CREATE OR REPLACE FUNCTION dtx_local_participant(p_dtxid BIGINT)
@@ -792,6 +1128,35 @@ CREATE OR REPLACE FUNCTION register_shard_fileset(
 COMMENT ON FUNCTION register_shard_fileset(REGCLASS) IS
     'Leader 侧：把 shard 的全部物理文件（主堆/索引/TOAST 堆及其索引）注册进捕获反向映射并持久化，索引与 TOAST 的 WAL 记录随主堆进入同一 parwal 流。';
 
+-- ------------------------------------------------------------------
+-- T6.1（P6）：全量物理基线
+-- ------------------------------------------------------------------
+--
+-- 把该 shard 的**全部字节**重新灌进它自己的分区流（整页 FPI，走的是 §12
+-- DDL 变更那条成熟通路），返回这次基线的起点 partition_lsn。
+--
+-- 用法：在 **leader** 上对分片表调用，把返回值交给 follower 当
+-- base_part_lsn —— 从这一条开始重放，之前的记录一律不看。
+--
+-- 实装的是设计 §13 约束 2 后半句（"拷贝时记下 partition_lsn 静止点"）。
+-- 此前只有前半句：locmap 只配对"哪个文件对哪个文件"，从不配对"从哪个游标
+-- 开始"，缺省游标 0 等于沉默地断言"本地文件 == leader 在流起点时的文件"。
+DROP FUNCTION IF EXISTS shard_baseline_emit(REGCLASS);
+
+CREATE OR REPLACE FUNCTION shard_baseline_emit(p_shard REGCLASS)
+    RETURNS BIGINT
+    LANGUAGE c STRICT
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_emit';
+
+-- ★ P7-N69：定向基线 —— 只有 p_target_node 截断重建，其余 follower 照常回放 FPI、不截断
+CREATE OR REPLACE FUNCTION shard_baseline_emit(p_shard REGCLASS, p_target_node INTEGER)
+    RETURNS BIGINT
+    LANGUAGE c STRICT
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_baseline_emit';
+
+COMMENT ON FUNCTION shard_baseline_emit(REGCLASS) IS
+    '发射该 shard 的全量物理基线（整页 FPI 进本分区流），返回基线起点 partition_lsn。三个消费者：副本初始配对、快路径分叉修复、永久分叉修复。只在 leader 上调用；块数超过 pg_partdist.fileset_inline_max_blocks 时显式报错而不静默降级。';
+
 -- fileset 导出：follower 侧 replay_set_locmap 的输入。
 CREATE OR REPLACE FUNCTION shard_fileset(
     p_shard REGCLASS,
@@ -808,18 +1173,31 @@ COMMENT ON FUNCTION shard_fileset(REGCLASS) IS
 
 -- follower 侧：按 (role, ord) 把 leader fileset 与本地 shell 表配对成 loc_map，
 -- 持久化到 pg_parwal/<oid>/locmap，并登记补丁 0002 的刷脏豁免。
+--
+-- ★ T6.2 新增第 7 参 p_base_part_lsn —— **本配对的起效游标**，实装设计
+--   §13 约束 2 的后半句（"拷贝时记下 partition_lsn 静止点"）。
+--     >0 = 由 partdist.shard_baseline_emit() 给出，自那条全量基线起重放；
+--      0 = 显式声明"这条流从关系的出生点开始"。这是**断言**不是缺省值，
+--          函数会核对本地关系确为空，不为空即报错。
+--
+-- ★ 必须先 DROP 旧的 6 参签名再建 7 参版本：只 CREATE OR REPLACE 会留下一个
+--   **重载**，而那个 6 参声明仍指向同一个 C 符号 —— 它会去读并不存在的第 7 个
+--   参数。带 DEFAULT 的 7 参版本对既有 6 参调用点完全兼容。
+DROP FUNCTION IF EXISTS replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]);
+
 CREATE OR REPLACE FUNCTION replay_set_locmap(
     p_local_shard REGCLASS,
     p_roles INTEGER[],
     p_ords INTEGER[],
     p_spcs OID[],
     p_dbs OID[],
-    p_relnums OID[]
+    p_relnums OID[],
+    p_base_part_lsn BIGINT DEFAULT 0
 ) RETURNS INTEGER LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_replay_set_locmap';
 
-COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[]) IS
-    'Follower 侧：建立 leader→本地 文件号映射（loc_map）。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。';
+COMMENT ON FUNCTION replay_set_locmap(REGCLASS, INTEGER[], INTEGER[], OID[], OID[], OID[], BIGINT) IS
+    'Follower 侧：建立 leader→本地 文件号映射（loc_map）+ 本配对的起效游标。两侧索引/TOAST 结构必须一致（同源物理基线，FRD §13.2）。p_base_part_lsn>0 取自 shard_baseline_emit()；=0 是"从流起点开始"的断言，函数会核对本地关系为空。';
 
 -- follower 侧当前生效的 loc_map。leader 一次 VACUUM FULL/REINDEX/TRUNCATE
 -- 就会经 CTRL:FILESET_UPDATE 把 leader_relnum 整体换掉（FRD §12），
@@ -891,6 +1269,138 @@ CREATE OR REPLACE FUNCTION replay_catchup(
 COMMENT ON FUNCTION replay_catchup(REGCLASS, BIGINT, INTEGER) IS
     '惰性回放触发入口：把该副本追平到 p_upto（NULL=本地全部字节；升主时传 Raft commit_index），同步等待完成，返回追平后的 applied_part_lsn。';
 
+-- ------------------------------------------------------------------
+-- T6.3b：升主推进本地 WAL 插入位点（FRD §11 步骤 4，内核补丁 0010）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION advance_wal_past_shard(
+    p_local_shard REGCLASS
+) RETURNS PG_LSN LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_advance_wal_past_shard';
+
+CREATE OR REPLACE FUNCTION advance_wal_to(
+    p_target PG_LSN
+) RETURNS PG_LSN LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_advance_wal_to';
+
+COMMENT ON FUNCTION advance_wal_to(PG_LSN) IS
+    'FRD §11 步骤 4 的原语（内核补丁 0010）：把本地 WAL 插入位点在线推进到 p_target 之后的段边界。跳跃发生在一次强制检查点持有全部插入锁的临界区内，因此不存在"跳了却没有检查点"的丢数据窗口。跳过的 WAL 段号成为永久空洞：本地崩溃恢复不受影响，原生归档/PITR 在此断链。限超级用户。';
+
+CREATE OR REPLACE FUNCTION shard_xid_raise_watermark(
+    p_shard OID,
+    p_watermark BIGINT
+) RETURNS void LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_xid_raise_watermark';
+
+COMMENT ON FUNCTION shard_xid_raise_watermark(OID, BIGINT) IS
+    '把本分片的发号水位抬到 p_watermark（只升不降）。供给副本时由 leader 把自己的水位带过去：纯靠物理基线建出来的副本，元组里带的是分片 xid，却没有任何 MARKER 教它水位——水位为 0 会让 T6.3c 的读闸门把它误当成遗留副本放行，也会让 T6.4 的切主认领区间为空。';
+
+CREATE OR REPLACE FUNCTION shard_divergence(p_shard OID)
+    RETURNS TEXT LANGUAGE c STABLE
+    AS 'MODULE_PATHNAME', 'partdist_shard_divergence';
+
+COMMENT ON FUNCTION shard_divergence(OID) IS
+    '§13 约束 13 的检测面：该分片有没有被标记为「副本可能已分叉」，返回标记时刻与原因，无标记返回 NULL。标记由复制挂钩失败时就地写下（非事务性——出事的事务马上要中止，写表会一起回滚）。修复是重做物理基线：shard_baseline_emit / provision_shard_replica 成功后会自己清。';
+
+-- R3 读路径取证（FOLLOWER_REPLAY_DESIGN.md §9.4）：把"两跳"摊开。
+--   role       本关系在本节点的角色：native_leader / replica / promoted
+--   watermark  升主水位 W（promoted 才有意义）
+--   nxidmap    本后端缓存的 xid_map 条目数
+--   gxid       该 xid 翻出来的全局事务号；NULL = 不属于回放宇宙
+--   status     gclog 里的判决：running/prepared/committed/aborted，
+--              或 not_replayed（gxid 解不出来）
+CREATE OR REPLACE FUNCTION route_resolve(
+    p_rel OID,
+    p_xid BIGINT,
+    OUT role TEXT,
+    OUT watermark BIGINT,
+    OUT nxidmap INTEGER,
+    OUT gxid BIGINT,
+    OUT status TEXT
+) RETURNS record LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_route_resolve';
+
+COMMENT ON FUNCTION route_resolve(OID, BIGINT) IS
+    'R3 读路径取证：本关系的路由角色/升主水位/xid_map 规模，以及给定 xid 翻成的 gxid 与 gclog 判决。';
+
+CREATE OR REPLACE FUNCTION route_status(p_shard OID)
+    RETURNS TEXT LANGUAGE c STABLE
+    AS 'MODULE_PATHNAME', 'partdist_route_status';
+
+COMMENT ON FUNCTION route_status(OID) IS
+    'FRD §11 步骤 5 的观测面：该分片在**本节点**上的角色（promoted / replica_or_plain）、写入会不会被 wal_insert_hook 捕获、fileset 成员数、分配器水位。此前这三件事分散在 replay_status() / 文件系统 / shard_xid_next()，交接出问题时最需要的恰恰是这一句。';
+
+-- T7.27（P7-W2）：捕获环观测面
+CREATE OR REPLACE FUNCTION partwal_ring_stats(
+    OUT capacity INTEGER,
+    OUT unconsumed INTEGER,
+    OUT overwrites BIGINT,
+    OUT backpressure_flushes BIGINT,
+    OUT diverged_pending BOOLEAN
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_partwal_ring_stats';
+
+COMMENT ON FUNCTION partwal_ring_stats() IS
+    'T7.27/P7-W2：全节点共享捕获环的容量、未消费槽位数、累计覆盖次数（>0 即有记录没进分区流、副本缺记录）、写路径背压排空次数、是否有待自动修复的分叉标记。';
+
+CREATE OR REPLACE FUNCTION repair_diverged_shards()
+    RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';
+
+-- ★ P7-N66：只修指定分片（升主前置用，避免一个组的升主替别的组发基线、串成跨组等待链）
+CREATE OR REPLACE FUNCTION repair_diverged_shards(p_only OID)
+    RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_repair_diverged_shards';
+
+COMMENT ON FUNCTION repair_diverged_shards() IS
+    '把「见到分叉标记就重做基线」从逐个分片手工变成一次调用：扫 pg_parwal 下所有带标记的分片，对本节点能发基线的那些重发（基线成功自动清标），发不出去的（多半不是组 leader / 多数派没恢复）保留标记并计入 skipped。限超级用户。升主路径也会顺带跑一次。';
+
+CREATE OR REPLACE FUNCTION shard_clear_divergence(p_shard OID)
+    RETURNS void LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_clear_divergence';
+
+COMMENT ON FUNCTION shard_clear_divergence(OID) IS
+    '手工清除分叉标记（限超级用户）。清标不等于修好了——真正的修复是重做物理基线，那两个入口成功后会自己清。本函数只给"取证后确认无事"的场景留。';
+
+-- ------------------------------------------------------------------
+-- 批次 #7：副本供给（在 leader 上调用，向目标节点推）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION provision_shard_replica(
+    p_global_shard_id BIGINT,
+    p_target_node     INTEGER
+) RETURNS TEXT LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_provision_shard_replica';
+
+-- P7-N25：新主登记后由一次性工作者调用；也可人工调。在本节点（须是该组 leader）上判定前任主 p_target
+-- 有无 armed 回放槽位，没有就 provision_shard_replica(p_gsid, p_target)。返回 not_leader / not_needed / done: … / retry: …
+CREATE OR REPLACE FUNCTION reprovision_demoted(p_gsid BIGINT, p_target INTEGER)
+    RETURNS TEXT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_reprovision_demoted';
+
+-- 2026-10-12：自动归队的兜底扫尾。pg_raft maintenance 进程每 60 s 经常驻连接调一次。
+CREATE OR REPLACE FUNCTION reprovision_sweep()
+    RETURNS INTEGER LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_reprovision_sweep';
+
+COMMENT ON FUNCTION reprovision_sweep() IS
+    '对本节点此刻是 leader 且持已升主记号的数据组，逐对端批量核对成员副本是否健康（armed、未 failed、不残缺、无分叉），连续两轮不健康的排自动重供。补的是归队请求撞 not_leader 被丢、此后再没人替它重供的洞。返回本轮排上的重供数。';
+
+COMMENT ON FUNCTION provision_shard_replica(BIGINT, INTEGER) IS
+    '把「给分片 X 在节点 N 上建一个副本」做成一个入口：本地登记 fileset → 发物理基线（§13 约束 2 的静止点）→ 到目标节点建壳表、按该基线的 partition_lsn 配 locmap、arm 回放。此前 register_shard_fileset/replay_set_locmap/replay_enable 在产品代码里没有任何调用方，副本只能靠人手建。须在该分片的 leader 上、由超级用户调用。';
+
+-- ------------------------------------------------------------------
+-- T6.4：§6.6 第三支，切主认领
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION shard_claim_on_promote(
+    p_shard OID
+) RETURNS INTEGER LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_claim_on_promote';
+
+COMMENT ON FUNCTION shard_claim_on_promote(OID) IS
+    '升主收尾：把该分片 [claim_wm, watermark) 区间内仍是 RUNNING（含空洞）的分片 xid 一律改判 ABORTED——新主追平后流里没有提交标记即从未提交过。PREPARED 不动（§6.6 第二支），调用方须先 dtx_close_indoubt。与 T2.4 的挂槽认领不同：升主的 follower 上槽位一定已存在（回放推水位时就挂了），那条路径一条都不认领，所以切主必须有自己的入口。返回改判条数。';
+
+COMMENT ON FUNCTION advance_wal_past_shard(REGCLASS) IS
+    '升主前置：把本地 WAL 插入位点推进到该分片 max_orig_lsn（已应用的最大 leader 坐标 LSN）之后。不做的后果是升主后写入的数据在一次本地崩溃后消失——新记录 LSN 小于页面携带的 leader LSN，恢复时被 lsn <= PageGetLSN 当作"已更新过"跳过。返回推进后的插入位点；本节点没有该分片回放游标时返回 NULL。';
+
 -- ==================================================================
 -- 增强型 CLOG（pg_gclog）核账入口（R2-d）
 -- ==================================================================
@@ -956,3 +1466,966 @@ $$;
 
 COMMENT ON FUNCTION replay_freeze_status() IS
     '副本壳表的冻结账目暴露面（FRD §13 约束 5）：pct_to_force 达到 100% 时内核会忽略 autovacuum_enabled=off 强制回卷 vacuum，而副本元组带的是外来 xid，本地无法解释。';
+
+-- ------------------------------------------------------------------
+-- 陈旧回放槽位与 pg_parwal 目录的回收
+-- ------------------------------------------------------------------
+--
+-- 槽位上限 REPLAY_MAX_SHARDS(64)，而壳表 DROP 之后槽位不会自动释放、
+-- pg_parwal/<oid>/ 也不会删 —— launcher 重启还会从这些目录把槽位重建出来。
+-- 反复建/删副本的环境会先攒满目录（实测一天密集测试后每节点 143–148 个），
+-- 再撞上"回放槽位已满"，此后新副本一个都建不了。
+--
+-- 判据只有一条：**目录名那个 OID 在 pg_class 里已经不存在**。目录名就是本地
+-- shard（或副本壳表）的 OID，关系还在就说明这份流仍有主，一律不碰；关系没了，
+-- 流就是垃圾 —— 无论本节点对该分片是 primary 还是 secondary，判据都一样。
+--
+-- 被活着的 worker 认领的槽位一律不动（它可能正在其上回放）。
+-- replay_set_locmap() 会在建槽之前自动调一次，所以正常路径无需手工执行；
+-- 本函数供运维在"目录攒太多但暂时不建新副本"时主动清理。
+CREATE OR REPLACE FUNCTION replay_reclaim_stale(
+    p_grace_seconds INTEGER DEFAULT 300,
+    OUT slots_freed INTEGER,
+    OUT dirs_removed INTEGER)
+    RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_replay_reclaim_stale';
+
+COMMENT ON FUNCTION replay_reclaim_stale(INTEGER) IS
+    '回收关系已不存在的回放槽位与 pg_parwal 目录。判据=OID 不在 pg_class；被活着的 worker 认领的槽位不动。replay_set_locmap 建槽前会自动调用。';
+
+-- TX-TSO-MVCC（T2.7）：把既有 partition_map 分区登记为分片打标表。
+-- P2 只支持登记不支持撤销（DROP TABLE 即全清）；需超级用户、建议自动提交。
+CREATE OR REPLACE FUNCTION partdist_set_shard_mvcc(rel regclass,
+                                                   enable boolean DEFAULT true)
+RETURNS void
+AS 'MODULE_PATHNAME', 'partdist_set_shard_mvcc'
+LANGUAGE C STRICT;
+
+-- T7.30（P7-V4）：按全局分片号在**本节点**登记打标（placement 上调用；副本壳表、非空表拒绝）。
+-- 分布表请用协调者上的 set_table_shard_mvcc(regclass)，它逐 placement 下发本函数。
+-- ★ P7-N40：清掉本节点的孤儿打标登记（pg_shard_xid/<oid> 还在、OID 已无对应表）。
+-- 返回清掉几个。孤儿的来路见 shard_xid.c 里的注释；DROP 判据已修，这个函数是给存量用的。
+CREATE OR REPLACE FUNCTION shard_mvcc_gc_orphans()
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_gc_orphans';
+
+COMMENT ON FUNCTION shard_mvcc_gc_orphans() IS
+    'P7-N40：清掉本节点 pg_shard_xid/ 里 OID 已无对应表的孤儿登记（连同 pg_shard_clog 目录、共享内存登记、分配器槽位）。';
+
+CREATE OR REPLACE FUNCTION shard_mvcc_register(p_shardid bigint)
+RETURNS text
+AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_register'
+LANGUAGE C STRICT VOLATILE;
+
+-- T7.30 观测点："registered=yes|no evidence=yes|no replica=yes|no"
+CREATE OR REPLACE FUNCTION shard_mvcc_status(p_rel oid)
+RETURNS text
+AS 'MODULE_PATHNAME', 'partdist_shard_mvcc_status'
+LANGUAGE C STRICT STABLE;
+
+-- T7.30（P7-V4）：**协调者上一次调用**，把一张分布表的全部分片登记为打标表。
+-- 取代"组内每个成员各自 ALTER SYSTEM SET pg_partdist.shard_relids = '<本节点 OID 列表>'"
+-- 的手工做法。时机：建表（含索引 —— 打标后禁 CREATE INDEX）之后、写入数据之前。
+-- 副本不登记：身份随 CTRL SHARD_MVCC / 物理基线落成证据目录，升主时继承（T7.4）。
+-- 每行一个 placement；status 以 registered/already 开头为成功，其余为失败原因。幂等，可重跑。
+CREATE OR REPLACE FUNCTION set_table_shard_mvcc(p_table regclass)
+RETURNS TABLE(shardid bigint, node_port integer, status text)
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    v       record;
+    v_ok    boolean;
+    v_res   text;
+    v_n     integer := 0;
+    v_bad   integer := 0;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_partition d
+                    WHERE d.logicalrelid = p_table AND d.partmethod <> 'n') THEN
+        RAISE EXCEPTION 'set_table_shard_mvcc: % 不是（非引用表的）分布表', p_table;
+    END IF;
+
+    -- ⓪ 分片身份（shard_identity）：建表之后没人自动填，登记靠它把 shardid 翻成本地 OID。
+    --   每个涉及的节点跑一次，幂等（与 raft_replicate_table_shards 同款前置）。
+    FOR v IN
+        SELECT DISTINCT n.nodename, n.nodeport
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+          JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+         WHERE s.logicalrelid = p_table
+    LOOP
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v.nodename], ARRAY[v.nodeport],
+               ARRAY['SELECT partdist.rebuild_shard_identity()'], false) r;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'set_table_shard_mvcc: %:% 上重建分片身份失败（%）',
+                v.nodename, v.nodeport, v_res;
+        END IF;
+    END LOOP;
+
+    FOR v IN
+        SELECT s.shardid AS sid, n.nodename, n.nodeport
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+          JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+         WHERE s.logicalrelid = p_table
+         ORDER BY s.shardid, n.nodeport
+    LOOP
+        v_n := v_n + 1;
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v.nodename], ARRAY[v.nodeport],
+               ARRAY[format('SELECT partdist.shard_mvcc_register(%s)', v.sid)], false) r;
+        shardid   := v.sid;
+        node_port := v.nodeport;
+        status    := CASE WHEN v_ok THEN v_res ELSE 'FAILED: ' || v_res END;
+        IF status !~ '^(registered|already) ' THEN
+            v_bad := v_bad + 1;
+        END IF;
+        RETURN NEXT;
+    END LOOP;
+
+    IF v_n = 0 THEN
+        RAISE EXCEPTION 'set_table_shard_mvcc: % 没有任何 placement', p_table;
+    END IF;
+    IF v_bad > 0 THEN
+        RAISE WARNING 'set_table_shard_mvcc: % 个 placement 中 % 个登记失败，见 status 列；修正后可重跑（幂等）',
+            v_n, v_bad;
+    END IF;
+END
+$fn$;
+
+-- TX-TSO-MVCC（T3.1）：TSO 服务入口（v1 = master 内存计数器，设计 §2.4）。
+-- 只有 pg_partdist.tso_master=on 的节点服务；worker 经 libpq 调用（T3.2）。
+CREATE OR REPLACE FUNCTION partdist_tso_start_ts(node int, oldest bigint)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_start_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_commit_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_status()
+RETURNS text AS 'MODULE_PATHNAME', 'partdist_tso_status' LANGUAGE C STRICT;
+-- 2026-10-20：节点内 TSO 代理一个往返要一段连续的号（n = 0 返回 0、不发号）。返回这一段的第一个号。
+CREATE OR REPLACE FUNCTION partdist_tso_start_ts_n(node int, oldest bigint, n int)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_start_ts_n' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_commit_ts_n(n int)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_commit_ts_n' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T3.2）：worker 取号通路的调试/验收入口（内部 C API 为正道）。
+CREATE OR REPLACE FUNCTION partdist_tso_client_start_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_start_ts' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_tso_client_commit_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_client_commit_ts' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T3.5）：GlobalSafeTs——心跳续租（worker bgworker 调用）与读出。
+CREATE OR REPLACE FUNCTION partdist_tso_heartbeat(node int, oldest bigint)
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_tso_heartbeat' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_global_safe_ts()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_global_safe_ts' LANGUAGE C STRICT;
+
+-- TX-TSO-MVCC（T4.1）：连接加入协议与 globalXID 分配器。
+CREATE OR REPLACE FUNCTION partdist_join_global_txn(gxid bigint, start_ts bigint,
+                                                    coord_gsid bigint DEFAULT 0)
+RETURNS void AS 'MODULE_PATHNAME', 'partdist_join_global_txn' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION partdist_gxid_next()
+RETURNS bigint AS 'MODULE_PATHNAME', 'partdist_gxid_next' LANGUAGE C STRICT;
+
+-- ------------------------------------------------------------------
+-- T4.5：未决 2PC 决议收敛（TX_TSO_MVCC_DESING.md §3.3/§4.2）
+-- ------------------------------------------------------------------
+
+-- 只读决议窥视：在协调组 leader 上答该 dtxid 的判决；非 leader 或无决议
+-- 返回 0 行。与 dtx_status 的本质区别：**绝不写推定中止**——这是读者与
+-- 清扫的问询口，"首决胜出"的 ABORT 安装只属于恢复守护（dtx_status）。
+CREATE OR REPLACE FUNCTION dtx_peek(
+    p_coord_gsid bigint,
+    p_dtxid bigint
+) RETURNS TABLE(verdict integer, commit_ts bigint)
+LANGUAGE plpgsql VOLATILE AS $fn$
+-- 改 plpgsql 的**唯一理由**见下面 R-P4-16：补读必须另起一条语句。
+DECLARE
+    v_is_leader boolean;
+    v_verdict   integer;
+    v_cts       bigint;
+    v_anchor    bigint;
+BEGIN
+    -- R-P4-12：应答前先把**自己**的 apply 积压排空。新当选的 leader 可能
+    -- 正是尚未 apply 该决议的成员（决议在多数派上、选举合法），不追平就
+    -- 读本地表 ⇒ 谁都问不到判决（实测 90s 不收敛）。drain 幂等、非 leader
+    -- 或无该组时返回 -1，不影响下面的门控语义。
+    PERFORM partdist.pg_raft_group_drain_apply(p_coord_gsid);
+
+    SELECT EXISTS (SELECT 1 FROM partdist.pg_raft_group_status() s
+                    WHERE s.group_id = p_coord_gsid AND s.state = 'leader')
+      INTO v_is_leader;
+
+    -- ① 本地答案：仍受 leader 门控（follower 有 apply 滞后会答错）。
+    IF v_is_leader THEN
+        SELECT d.verdict::integer, d.commit_ts::bigint, d.anchor_xid
+          INTO v_verdict, v_cts, v_anchor
+          FROM partdist.dtx_decision d WHERE d.dtxid = p_dtxid;
+        IF FOUND THEN
+            -- 2026-10-18（方案 B）：待发起方确认的 COMMIT 按锚点折算；仍未生效就是
+            -- 权威的"未决"（verdict=0，读者据此等决议），不转问组员（它们手里至多也是
+            -- 同一条待确认记录）。不需要 leader_settled 前提：那道闸防的是"查无此行"
+            -- 可能落在未 apply 的日志尾巴里，这里行就在手上。
+            IF v_verdict = 3 THEN
+                v_verdict := partdist.dtx_verdict_effective(3, v_anchor);
+                IF v_verdict = 3 THEN
+                    verdict := 0; commit_ts := 0;
+                    RETURN NEXT; RETURN;
+                END IF;
+                IF v_verdict = 2 THEN
+                    v_cts := 0;
+                END IF;
+            END IF;
+            verdict := v_verdict; commit_ts := v_cts;
+            RETURN NEXT; RETURN;
+        END IF;
+    END IF;
+
+    -- ② 本地无答案 ⇒ 转问组内成员（R-P4-13 绕行 + R-P4-14 去门控）。
+    -- 决议是一次性的正向事实（写下不再改），从谁那里读到都等价；本步只读，
+    -- 不写推定中止。拉到即幂等补进本地表，下次无需再远程问。
+    v_verdict := partdist.pg_raft_group_peer_decision(p_coord_gsid, p_dtxid);
+    IF v_verdict IS NULL OR v_verdict NOT IN (1, 2) THEN
+        -- ★ P7-N52（之三）：leader 排空 apply 后本地与组内都查无决议 ⇒ 这是**权威的"未决"**，
+        --   返回一行 verdict=0；非 leader 仍返回 0 行（"不知道"）。问询方据此区分
+        --   "确实还没决议"（读者按未提交）与"没问到"（读者报可重试错误）。
+        -- ★ P7-N65（2026-10-05）：leader 还没提交过本任期的条目时，前任期留下的决议
+        --   可能还在它日志的未提交尾巴里、谁都没 apply —— 这时说"没有"不算数，答"不知道"。
+        IF v_is_leader AND partdist.pg_raft_group_leader_settled(p_coord_gsid) THEN
+            verdict := 0; commit_ts := 0;
+            RETURN NEXT;
+        END IF;
+        RETURN;
+    END IF;
+
+    -- ★ R-P4-16（2026-08-17，修的是 R-P4-13 绕行自身的缺陷）：
+    -- 上一步已把决议幂等补进本地表，但**必须另起一条语句**再读才拿得到
+    -- commit_ts —— 首版把补读写成同一条 SQL 里的 LEFT JOIN，那个 JOIN 用的
+    -- 是语句开始时的快照，看不到函数刚插进去的行，于是答出
+    -- "verdict=1 而 commit_ts=0"。实测取证：5433 答 `1@0`，而组内两个成员
+    -- 都是 `1@22`。
+    SELECT d.commit_ts::bigint INTO v_cts
+      FROM partdist.dtx_decision d WHERE d.dtxid = p_dtxid;
+
+    -- ★ 守卫：COMMIT 判决必须带有效 commit_ts，否则宁可答"无从判定"让调用方
+    -- 重试，**绝不能把 cts=0 发出去**。参与方拿到 `1@0` 只有两种下场，实测
+    -- 两种都出现过：拒收 ⇒ 落 ABORTED 并注销登记（清扫再无东西可扫，Q3 必然
+    -- 60s 超时，取证见 st=3 sts=20 cts=0）；或收下 ⇒ 落一个时间戳错误的
+    -- COMMITTED，破坏 SI（M1 取证见 st=2 sts=4 cts=0）。
+    -- ABORT 判决与 commit_ts 无关，0 是正常值。
+    IF v_verdict = 1 AND coalesce(v_cts, 0) <= 0 THEN
+        RETURN;                 -- 答不全就不答
+    END IF;
+
+    verdict := v_verdict; commit_ts := coalesce(v_cts, 0);
+    RETURN NEXT;
+END
+$fn$;
+
+COMMENT ON FUNCTION dtx_peek(bigint, bigint) IS
+    '只读决议窥视（T4.5）：leader 查无决议时返回一行 verdict=0（权威未决，P7-N52），非 leader 问不到返回 0 行；本地答案受 leader 门控（follower 有 apply 滞后会答错）；本地无答案时转问组内成员（R-P4-13/14）并另起语句补读 commit_ts（R-P4-16）；COMMIT 判决缺有效 commit_ts 时宁可返回 0 行，绝不写推定中止、绝不答半个判决。';
+
+-- 问询核心：SPI 解析协调组 leader 地址（partition_map→node_map）+ 远程
+-- dtx_peek。verdict 0=无从判定 1=COMMIT 2=ABORT。
+-- 注意：单行复合返回（OUT + RETURNS record，proretset=false）。写成
+-- RETURNS TABLE 会被标记为集合返回函数，与 C 侧的单行返回协议不符，
+-- SQL 调用即报 "set-valued function called in context ..."（读者③首轮
+-- 静默失败的根因——清扫通道直调 C 核心不经 SQL，故只有读者路径中招）。
+CREATE OR REPLACE FUNCTION dtx_inquire(
+    p_coord_gsid bigint,
+    p_dtxid bigint,
+    OUT verdict integer,
+    OUT commit_ts bigint
+) RETURNS record
+LANGUAGE c VOLATILE AS 'MODULE_PATHNAME', 'partdist_dtx_inquire';
+
+-- 清扫一轮本节点未决 2PC 登记（心跳工作者自连周期触发；测试可手动调），
+-- 返回收敛笔数。
+CREATE OR REPLACE FUNCTION dtx_pending_sweep()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_pending_sweep';
+
+CREATE OR REPLACE FUNCTION dtx_pending_count()
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_pending_count';
+
+-- T4.5②：决议广播的接收端。按 dtxid 找本节点未决登记并幂等落分片 clog，
+-- 返回落账笔数（0 = 本节点没参与 / 已收敛）。推送是优化，拉取（dtx_inquire
+-- / dtx_pending_sweep）仍是兜底真相源。
+CREATE OR REPLACE FUNCTION dtx_apply_decision(
+    p_dtxid bigint,
+    p_verdict integer,
+    p_commit_ts bigint
+) RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_dtx_apply_decision';
+
+-- ------------------------------------------------------------------
+-- T7.23（P7-R2）：给一张分布表的**全部分片**建组 + 供副本（在协调者上调用）
+-- ------------------------------------------------------------------
+-- 在此之前，每个分片都要人手走一遍：在 placement 节点建组 → 等它当选 →
+-- 在各副本节点建组 → 回 leader 上 provision_shard_replica。一张 32 分片的表
+-- 就是上百条命令，而这几步的**顺序**是踩出来的（见 test_clog_hole_c4 的
+-- P7-T1：先铺副本再建组、或者建完发现主不对就推倒重来，都会让选举把 Citus
+-- placement 迁到一个没有数据的节点上）。本函数把那条已验证的顺序固化下来：
+--
+--   ① placement 节点先建组、领先几秒（有数据的节点先当主）；
+--   ② 再让副本节点入组，等 placement 当选 —— 落到副本上就只拆这个组重来；
+--   ③ 再确认组主仍在 placement，由它逐个 provision_shard_replica（它自己会
+--      发物理基线、建壳表、配 locmap、arm 回放）。
+--
+-- 单个分片失败不拖累其余：逐分片返回一行状态，调用方据此重试失败的那几个。
+-- 副本节点按 pg_dist_node 里 worker 的顺序、从 placement 之后轮转挑选，
+-- 让副本在 worker 之间摊开，而不是全挤到头几个节点上。
+CREATE OR REPLACE FUNCTION raft_replicate_table_shards(
+    p_table    regclass,
+    p_replicas integer DEFAULT 1,
+    p_leader_timeout_s integer DEFAULT 60
+) RETURNS TABLE(shardid bigint, leader_port integer, replica_ports integer[], status text)
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    v_workers   record;
+    v_hosts     text[]    := '{}';
+    v_ports     integer[] := '{}';
+    v_nodeids   integer[] := '{}';
+    v_n         integer;
+    v_shard     record;
+    v_pidx      integer;
+    v_members   integer[];
+    v_rports    integer[];
+    v_rhosts    text[];
+    v_i         integer;
+    v_k         integer;
+    v_ok        boolean;
+    v_res       text;
+    v_state     text;
+    v_t0        timestamptz;
+    v_fail      text;
+    v_round     integer;
+BEGIN
+    -- TPC-C 分支：p_replicas = 0 = 单副本（每个分片一个只有 placement 的单成员 Raft 组）。
+    -- 组仍然要建：跨分片 2PC 的判决与 commit_ts 靠协调者分片组的决议广播落到参与方
+    -- （0009 postcommit 不写终局），完全不建组的打标分片做不了跨分片事务。
+    IF p_replicas < 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards: p_replicas 必须 >= 0（0 = 单成员组，不供副本）';
+    END IF;
+
+    -- 全部 primary worker，以及它们各自的 raft 节点号（逐个问，不猜映射）
+    FOR v_workers IN
+        SELECT n.nodename, n.nodeport
+          FROM pg_catalog.pg_dist_node n
+         WHERE n.noderole = 'primary' AND n.groupid <> 0 AND n.isactive
+         ORDER BY n.groupid
+    LOOP
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v_workers.nodename],
+                                               ARRAY[v_workers.nodeport],
+                                               ARRAY['SHOW pg_raft.node_id'], false) r;
+        IF NOT v_ok OR v_res !~ '^[0-9]+$' THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards: 取不到 %:% 的 pg_raft.node_id（%）',
+                v_workers.nodename, v_workers.nodeport, v_res;
+        END IF;
+        v_hosts   := v_hosts   || v_workers.nodename;
+        v_ports   := v_ports   || v_workers.nodeport;
+        v_nodeids := v_nodeids || v_res::integer;
+
+        -- ⓪ 分片身份登记（shard_identity）：provision_shard_replica 第一步就按它
+        --   认"本节点是不是这个分片的主"，建表之后没人自动填（P7-V4 同源的手工缺口）。
+        --   首版漏了这步，4 个分片全报「本节点没有分片」。幂等，每个 worker 跑一次。
+        SELECT r.success, r.result INTO v_ok, v_res
+          FROM pg_catalog.master_run_on_worker(ARRAY[v_workers.nodename],
+                                               ARRAY[v_workers.nodeport],
+                                               ARRAY['SELECT partdist.rebuild_shard_identity()'], false) r;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards: %:% 上重建分片身份失败（%）',
+                v_workers.nodename, v_workers.nodeport, v_res;
+        END IF;
+    END LOOP;
+    v_n := coalesce(array_length(v_ports, 1), 0);
+
+    IF p_replicas > v_n - 1 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards: 要 % 个副本，但除 placement 外只有 % 个 worker',
+            p_replicas, v_n - 1;
+    END IF;
+
+    FOR v_shard IN
+        SELECT s.shardid AS sid, n.nodename AS phost, n.nodeport AS pport
+          FROM pg_catalog.pg_dist_shard s
+          JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+          JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+         WHERE s.logicalrelid = p_table
+         ORDER BY s.shardid
+    LOOP
+        shardid := v_shard.sid;
+        leader_port := v_shard.pport;
+        v_fail := NULL;
+
+        v_pidx := array_position(v_ports, v_shard.pport);
+        IF v_pidx IS NULL THEN
+            replica_ports := NULL; status := 'placement 节点不在 worker 列表里';
+            RETURN NEXT; CONTINUE;
+        END IF;
+
+        -- 副本：从 placement 之后轮转挑 p_replicas 个
+        v_rports := '{}'; v_rhosts := '{}'; v_members := ARRAY[v_nodeids[v_pidx]];
+        FOR v_k IN 1..p_replicas LOOP
+            v_i := ((v_pidx - 1 + v_k) % v_n) + 1;
+            v_rports  := v_rports  || v_ports[v_i];
+            v_rhosts  := v_rhosts  || v_hosts[v_i];
+            v_members := v_members || v_nodeids[v_i];
+        END LOOP;
+        replica_ports := v_rports;
+
+        -- ①② placement 先建组、领先几秒，再让副本入组，然后等 placement 当选。
+        --   不能"等 placement 当选之后再让副本入组"：配置里已经有副本，单独一个
+        --   placement 凑不够多数派，永远选不上（首版就这么写的，逐分片超时）。
+        --   选举落到副本上（副本还没有数据）⇒ 只拆**这个组**重来，不能用
+        --   pg_raft_group_reset（它清的是节点上的全部数据组，会把前面已经
+        --   供好的分片一起拆掉）。
+        v_state := 'none';
+        FOR v_round IN 1..3 LOOP
+            SELECT r.success, r.result INTO v_ok, v_res
+              FROM pg_catalog.master_run_on_worker(ARRAY[v_shard.phost], ARRAY[v_shard.pport],
+                   ARRAY[format('SELECT partdist.pg_raft_group_create(%s, %L::integer[])',
+                                v_shard.sid, v_members)], false) r;
+            IF NOT v_ok OR v_res <> 't' THEN
+                v_fail := '在 placement 上建组失败：' || v_res; EXIT;
+            END IF;
+            PERFORM pg_catalog.pg_sleep(3);
+
+            FOR v_k IN 1..p_replicas LOOP
+                SELECT r.success, r.result INTO v_ok, v_res
+                  FROM pg_catalog.master_run_on_worker(ARRAY[v_rhosts[v_k]], ARRAY[v_rports[v_k]],
+                       ARRAY[format('SELECT partdist.pg_raft_group_create(%s, %L::integer[])',
+                                    v_shard.sid, v_members)], false) r;
+                IF NOT v_ok OR v_res <> 't' THEN
+                    v_fail := format('副本 :%s 入组失败：%s', v_rports[v_k], v_res); EXIT;
+                END IF;
+            END LOOP;
+            EXIT WHEN v_fail IS NOT NULL;
+
+            v_t0 := clock_timestamp();
+            LOOP
+                SELECT r.result INTO v_state
+                  FROM pg_catalog.master_run_on_worker(ARRAY[v_shard.phost], ARRAY[v_shard.pport],
+                       ARRAY[format('SELECT coalesce((SELECT state FROM partdist.pg_raft_group_status() '
+                                    'WHERE group_id = %s), %L)', v_shard.sid, 'none')], false) r;
+                EXIT WHEN v_state = 'leader'
+                       OR clock_timestamp() - v_t0 > make_interval(secs => greatest(p_leader_timeout_s / 3, 10));
+                PERFORM pg_catalog.pg_sleep(1);
+            END LOOP;
+            EXIT WHEN v_state = 'leader';
+
+            RAISE NOTICE 'raft_replicate_table_shards: 分片 % 第 % 轮组主没落在 placement（state=%），拆组重来',
+                v_shard.sid, v_round, v_state;
+            PERFORM pg_catalog.master_run_on_worker(v_rhosts || v_shard.phost, v_rports || v_shard.pport,
+                    array_fill(format('SELECT partdist.pg_raft_group_drop(%s)', v_shard.sid),
+                               ARRAY[p_replicas + 1]), true);
+            PERFORM pg_catalog.pg_sleep(2);
+        END LOOP;
+        IF v_fail IS NULL AND v_state <> 'leader' THEN
+            v_fail := format('三轮都没让 placement 当选（最后 state=%s）', v_state);
+        END IF;
+        IF v_fail IS NOT NULL THEN
+            status := v_fail; RETURN NEXT; CONTINUE;
+        END IF;
+
+        -- ③ 由 leader 逐个供给。每次供给前**再确认一次**组主仍在 placement：
+        --   基线发射走 raft 写路径，写栅栏看的是"此刻是不是 leader"。
+        FOR v_k IN 1..p_replicas LOOP
+            v_t0 := clock_timestamp();
+            LOOP
+                SELECT r.result INTO v_state
+                  FROM pg_catalog.master_run_on_worker(ARRAY[v_shard.phost], ARRAY[v_shard.pport],
+                       ARRAY[format('SELECT coalesce((SELECT state FROM partdist.pg_raft_group_status() '
+                                    'WHERE group_id = %s), %L)', v_shard.sid, 'none')], false) r;
+                EXIT WHEN v_state = 'leader'
+                       OR clock_timestamp() - v_t0 > make_interval(secs => p_leader_timeout_s);
+                PERFORM pg_catalog.pg_sleep(1);
+            END LOOP;
+            IF v_state <> 'leader' THEN
+                v_fail := format('供给 :%s 前组主已离开 placement（state=%s）', v_rports[v_k], v_state); EXIT;
+            END IF;
+            SELECT r.success, r.result INTO v_ok, v_res
+              FROM pg_catalog.master_run_on_worker(ARRAY[v_shard.phost], ARRAY[v_shard.pport],
+                   ARRAY[format('SELECT partdist.provision_shard_replica(%s, %s)',
+                                v_shard.sid, v_nodeids[array_position(v_ports, v_rports[v_k])])], false) r;
+            IF NOT v_ok OR v_res NOT LIKE 'shard=%' THEN
+                v_fail := format('向 :%s 供给失败：%s', v_rports[v_k], v_res); EXIT;
+            END IF;
+        END LOOP;
+
+        status := coalesce(v_fail, 'ok');
+        RETURN NEXT;
+    END LOOP;
+END;
+$fn$;
+-- ------------------------------------------------------------------
+-- ★ 2026-10-03：raft_replicate_table_shards 的并行版（上百个分片组用）
+-- ------------------------------------------------------------------
+-- raft_replicate_table_shards 逐分片串行：每片"建组 → 领先 3 s → 副本入组 → 等当选 →
+-- 逐个供副本"，实测约 28 s/片，128 个分片就是一个小时。本函数沿用同一套已验证的顺序与
+-- 同一条成员轮转规则（placement 之后按 groupid 轮转挑 p_replicas 个），但**所有分片一起推进**：
+--
+--   ⓪ 各 worker 重建分片身份（并行）；
+--   ① 每台 worker 一条命令，把它当 placement 的那些组一次建完（4 台并行）；
+--   ② 等 3 s（placement 领先），再每台一条命令让它当副本的那些组入组（并行）；
+--   ③ 轮询各 worker 的组状态，等每个分片的 placement 当选；超时没落到 placement 的
+--      分片拆组重来（最多 p_rounds 轮）—— 与原函数同一处置；
+--   ④ 供副本：每台 leader 一轮发一个 provision_shard_replica，4 台并行（同一台上仍串行，
+--      避免同一 leader 上多个基线互相抢复制认领位）；失败的最后再补供一遍。
+--
+-- 每个 provision 仍是独立事务（与原函数一致）。返回每个分片一行状态。
+DROP FUNCTION IF EXISTS raft_replicate_table_shards_bulk(regclass, integer, integer, integer);
+-- p_shards：只处理这些分片（NULL = 全部）。2026-10-04：上百个分片一次全上会把控制面打满
+-- （登记风暴，P7-N58），调用方可以按批（如每批 32 个）分几次调。
+CREATE OR REPLACE FUNCTION raft_replicate_table_shards_bulk(
+    p_table    regclass,
+    p_replicas integer DEFAULT 2,
+    p_elect_timeout_s integer DEFAULT 180,
+    p_rounds   integer DEFAULT 3,
+    p_shards   bigint[] DEFAULT NULL
+) RETURNS TABLE(shardid bigint, leader_port integer, replica_ports integer[], status text)
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    w           record;
+    v_hosts     text[]    := '{}';
+    v_ports     integer[] := '{}';
+    v_nids      integer[] := '{}';
+    v_n         integer;
+    v_cmds      text[];
+    v_h         text[];
+    v_p         integer[];
+    v_i         integer;
+    v_k         integer;
+    v_round     integer;
+    v_t0        timestamptz;
+    v_last_note timestamptz;
+    v_total     integer;
+    v_done      integer;
+    v_pending   integer;
+    v_res_cmd   text;
+    v_armed     integer;
+    r           record;
+BEGIN
+    -- TPC-C 分支：p_replicas = 0 = 单副本（每个分片一个只有 placement 的单成员 Raft 组）。
+    -- 组仍然要建：跨分片 2PC 的判决与 commit_ts 靠协调者分片组的决议广播落到参与方
+    -- （0009 postcommit 不写终局），完全不建组的打标分片做不了跨分片事务。
+    IF p_replicas < 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: p_replicas 必须 >= 0（0 = 单成员组，不供副本）';
+    END IF;
+
+    -- ⓪ worker 清单与 raft 节点号
+    FOR w IN SELECT n.nodename, n.nodeport FROM pg_catalog.pg_dist_node n
+              WHERE n.noderole = 'primary' AND n.groupid <> 0 AND n.isactive ORDER BY n.groupid
+    LOOP
+        v_hosts := v_hosts || w.nodename::text;
+        v_ports := v_ports || w.nodeport;
+    END LOOP;
+    v_n := coalesce(array_length(v_ports, 1), 0);
+    IF p_replicas > v_n - 1 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: 要 % 个副本，但除 placement 外只有 % 个 worker',
+            p_replicas, v_n - 1;
+    END IF;
+    v_cmds := array_fill('SHOW pg_raft.node_id'::text, ARRAY[v_n]);
+    FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+        IF NOT r.success OR r.result !~ '^[0-9]+$' THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards_bulk: 取不到 %:% 的 pg_raft.node_id（%）',
+                r.node_name, r.node_port, r.result;
+        END IF;
+        v_nids[array_position(v_ports, r.node_port)] := r.result::integer;
+    END LOOP;
+    v_cmds := array_fill('SELECT partdist.rebuild_shard_identity()::text'::text, ARRAY[v_n]);
+    FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+        IF NOT r.success THEN
+            RAISE EXCEPTION 'raft_replicate_table_shards_bulk: %:% 上重建分片身份失败（%）',
+                r.node_name, r.node_port, r.result;
+        END IF;
+    END LOOP;
+
+    -- 每个分片：placement 下标、成员（raft 节点号）、副本下标
+    DROP TABLE IF EXISTS pg_temp._rtsb;
+    CREATE TEMP TABLE _rtsb (sid bigint PRIMARY KEY, pidx int, members int[], ridx int[],
+                             elected bool DEFAULT false, prov_ok int DEFAULT 0, st text);
+    INSERT INTO _rtsb (sid, pidx, members, ridx)
+    SELECT s.shardid, x.pidx,
+           ARRAY[v_nids[x.pidx]] || ARRAY(SELECT v_nids[((x.pidx - 1 + k) % v_n) + 1] FROM generate_series(1, p_replicas) k ORDER BY k),
+           ARRAY(SELECT ((x.pidx - 1 + k) % v_n) + 1 FROM generate_series(1, p_replicas) k ORDER BY k)
+      FROM pg_catalog.pg_dist_shard s
+      JOIN pg_catalog.pg_dist_placement p ON p.shardid = s.shardid
+      JOIN pg_catalog.pg_dist_node n ON n.groupid = p.groupid AND n.noderole = 'primary'
+      CROSS JOIN LATERAL (SELECT array_position(v_ports, n.nodeport) AS pidx) x
+     WHERE s.logicalrelid = p_table
+       AND (p_shards IS NULL OR s.shardid = ANY (p_shards));
+    SELECT count(*) INTO v_total FROM _rtsb;
+    IF v_total = 0 THEN
+        RAISE EXCEPTION 'raft_replicate_table_shards_bulk: % 没有任何分片', p_table;
+    END IF;
+    UPDATE _rtsb SET st = 'placement 节点不在 worker 列表里' WHERE pidx IS NULL;
+
+    FOR v_round IN 1..p_rounds LOOP
+        -- ① placement 建组（每台一条批量命令，并行）
+        v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+        FOR v_i IN 1..v_n LOOP
+            SELECT 'SELECT count(*) FILTER (WHERE partdist.pg_raft_group_create(g, m))::text FROM (VALUES '
+                   || string_agg(format('(%s::bigint, %L::integer[])', sid, members), ',') || ') v(g, m)'
+              INTO v_res_cmd FROM _rtsb WHERE pidx = v_i AND NOT elected AND st IS NULL;
+            IF v_res_cmd IS NOT NULL THEN
+                v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+            END IF;
+        END LOOP;
+        EXIT WHEN coalesce(array_length(v_cmds, 1), 0) = 0;
+        PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+        PERFORM pg_catalog.pg_sleep(1);
+
+        -- ③ 等 placement 当选（轮询各 worker 的 leader 组清单）
+        v_t0 := clock_timestamp(); v_last_note := v_t0;
+        LOOP
+            v_cmds := array_fill('SELECT coalesce(string_agg(group_id::text, '',''), '''') FROM partdist.pg_raft_group_status() WHERE state = ''leader'' AND group_id <> 0'::text, ARRAY[v_n]);
+            FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+                IF r.success AND r.result <> '' THEN
+                    UPDATE _rtsb SET elected = true
+                     WHERE NOT elected AND pidx = array_position(v_ports, r.node_port)
+                       AND sid = ANY (string_to_array(r.result, ',')::bigint[]);
+                END IF;
+            END LOOP;
+            SELECT count(*) FILTER (WHERE elected) INTO v_done FROM _rtsb;
+            EXIT WHEN v_done + (SELECT count(*) FROM _rtsb WHERE st IS NOT NULL AND NOT elected) >= v_total;
+            EXIT WHEN clock_timestamp() - v_t0 > make_interval(secs => p_elect_timeout_s);
+            IF clock_timestamp() - v_last_note > interval '10 seconds' THEN
+                RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 轮，已有 %/% 个分片由 placement 当选', v_round, v_done, v_total;
+                v_last_note := clock_timestamp();
+            END IF;
+            PERFORM pg_catalog.pg_sleep(2);
+        END LOOP;
+        SELECT count(*) INTO v_pending FROM _rtsb WHERE NOT elected AND st IS NULL;
+        EXIT WHEN v_pending = 0;
+        RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 轮结束仍有 % 个分片的主没落在 placement，拆组重来', v_round, v_pending;
+        -- 拆这些组（在全部成员上），下一轮重建
+        v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+        FOR v_i IN 1..v_n LOOP
+            SELECT 'SELECT count(partdist.pg_raft_group_drop(g))::text FROM unnest(ARRAY['
+                   || string_agg(sid::text, ',') || ']::bigint[]) g'
+              INTO v_res_cmd FROM _rtsb WHERE NOT elected AND st IS NULL AND (pidx = v_i OR v_i = ANY (ridx));
+            IF v_res_cmd IS NOT NULL THEN
+                v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+            END IF;
+        END LOOP;
+        IF coalesce(array_length(v_cmds, 1), 0) > 0 THEN
+            PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+        END IF;
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+    UPDATE _rtsb SET st = format('%s 轮后组主仍未落在 placement', p_rounds) WHERE NOT elected AND st IS NULL;
+
+    -- ② 副本入组（每台一条批量命令，并行）—— **在 placement 当选之后**才做。
+    --    2026-10-03：原来建完 placement 组 sleep 3 s 就入组；选举超时 15 s 时 placement 还没来得及竞选，
+    --    已知成员集的副本可能先超时、先当选（它没有数据），之后要靠升主前置 -1 让位 —— 每节点的升主前置
+    --    是串行的，几十个组排队一百多秒，供副本那一步正撞上"主在没数据的成员上"（实测 32 个分片失败）。
+    --    入组之前副本那边只有 hearsay 建出的组：照常投票、但成员集未知不会主动竞选。
+    v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+    FOR v_i IN 1..v_n LOOP
+        SELECT 'SELECT count(*) FILTER (WHERE partdist.pg_raft_group_create(g, m))::text FROM (VALUES '
+               || string_agg(format('(%s::bigint, %L::integer[])', sid, members), ',') || ') v(g, m)'
+          INTO v_res_cmd FROM _rtsb WHERE v_i = ANY (ridx) AND elected AND st IS NULL;
+        IF v_res_cmd IS NOT NULL THEN
+            v_cmds := v_cmds || v_res_cmd; v_h := v_h || v_hosts[v_i]; v_p := v_p || v_ports[v_i];
+        END IF;
+    END LOOP;
+    IF coalesce(array_length(v_cmds, 1), 0) > 0 THEN
+        PERFORM * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true);
+    END IF;
+
+
+    -- ④ 供副本。每一遍先**重新读**每个组当前的主、以及哪些成员已经有 armed 的回放槽位，
+    --    只给"不是当前主、又还没 armed"的成员供，从**当前主**发起：
+    --    CPU 饱和时组主可能在建组之后漂到别的成员（2026-10-03 实测 128 组时 44 个分片因此失败，
+    --    "provision_shard_replica: 本节点不是分片的主"）。当选的成员一定持有数据（没有数据的成员
+    --    当选会被升主前置拒绝并让位），所以从它供是对的；被替下来的原主同样要重新供成副本。
+    --    第 k 轮每台 leader 发它的第 k 个（各台并行，同台串行），最多 p_rounds 遍。
+    DROP TABLE IF EXISTS pg_temp._rtsb_prov;
+    CREATE TEMP TABLE _rtsb_prov (sid bigint, lidx int, target int, seq int, result text, ok bool DEFAULT false);
+    ALTER TABLE _rtsb ADD COLUMN lidx int;
+    ALTER TABLE _rtsb ADD COLUMN armed int[] DEFAULT '{}';
+    ALTER TABLE _rtsb ADD COLUMN prov_err text;
+    -- 时间预算按"有没有进展"算：p_elect_timeout_s * 5 秒内没有任何一个副本新 armed 才放弃
+    -- （组主刚换时要等它向控制面登记完才能供；128 组的登记风暴里登记本身可能排十几分钟，见 P7-N58）
+    -- （128 组在 2 vCPU 上供 256 个副本要十来分钟，按总时长算会在进行中途收手）。
+    v_t0 := clock_timestamp();
+    v_armed := -1;
+    FOR v_round IN 1..1000 LOOP
+        EXIT WHEN clock_timestamp() - v_t0 > make_interval(secs => p_elect_timeout_s * 5);
+        -- 当前主（下标）
+        UPDATE _rtsb SET lidx = NULL;
+        v_cmds := array_fill('SELECT coalesce(string_agg(group_id::text, '',''), '''') FROM partdist.pg_raft_group_status() WHERE state = ''leader'' AND group_id <> 0'::text, ARRAY[v_n]);
+        FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+            IF r.success AND r.result <> '' THEN
+                UPDATE _rtsb SET lidx = array_position(v_ports, r.node_port)
+                 WHERE sid = ANY (string_to_array(r.result, ',')::bigint[]);
+            END IF;
+        END LOOP;
+        -- 已 armed 的副本（raft 节点号）；有新增就重置进展计时
+        UPDATE _rtsb SET armed = '{}';
+        v_cmds := array_fill('SELECT coalesce(string_agg(partdist.global_id_for_partition(shard)::text, '',''), '''') FROM partdist.replay_status() WHERE armed'::text, ARRAY[v_n]);
+        FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_hosts, v_ports, v_cmds, true) LOOP
+            IF r.success AND r.result <> '' THEN
+                UPDATE _rtsb SET armed = armed || v_nids[array_position(v_ports, r.node_port)]
+                 WHERE sid = ANY (string_to_array(r.result, ',')::bigint[]);
+            END IF;
+        END LOOP;
+
+        IF (SELECT coalesce(sum(cardinality(armed)), 0) FROM _rtsb) > v_armed THEN
+            v_armed := (SELECT coalesce(sum(cardinality(armed)), 0) FROM _rtsb);
+            v_t0 := clock_timestamp();
+        END IF;
+        TRUNCATE _rtsb_prov;
+        -- 只从**有数据**的主发起：placement 本身，或回放槽位已 armed 的成员。没数据的成员当选（入组那一刻
+        -- 它的"最近一次收到 leader 心跳"被清零，预选拦不住）会在升主前置里让位，这一遍先跳过、等它让位。
+        INSERT INTO _rtsb_prov (sid, lidx, target)
+        SELECT b.sid, b.lidx, m
+          FROM _rtsb b CROSS JOIN LATERAL unnest(b.members) m
+         WHERE b.elected AND b.st IS NULL AND b.lidx IS NOT NULL
+           AND (b.lidx = b.pidx OR v_nids[b.lidx] = ANY (b.armed)
+                OR EXISTS (SELECT 1 FROM partdist.partition_map pm      -- 已登记 = 升主前置验过有数据
+                            WHERE pm.partition_id = b.sid AND pm.primary_node = v_nids[b.lidx]))
+           AND m <> v_nids[b.lidx] AND NOT (m = ANY (b.armed));
+        IF NOT EXISTS (SELECT 1 FROM _rtsb_prov) THEN
+            -- 没有可发的：要么全部供完，要么剩下的都在等"没数据的主"让位
+            EXIT WHEN NOT EXISTS (
+                SELECT 1 FROM _rtsb b CROSS JOIN LATERAL unnest(b.members) m
+                 WHERE b.elected AND b.st IS NULL
+                   AND (b.lidx IS NULL OR m <> v_nids[b.lidx]) AND NOT (m = ANY (b.armed)));
+            PERFORM pg_catalog.pg_sleep(5);
+            CONTINUE;
+        END IF;
+        IF v_round > 1 THEN
+            RAISE NOTICE 'raft_replicate_table_shards_bulk: 第 % 遍补供 % 个副本（含组主漂移后从新主重供）',
+                v_round, (SELECT count(*) FROM _rtsb_prov);
+        END IF;
+        UPDATE _rtsb_prov q SET seq = x.rn
+          FROM (SELECT sid, target, row_number() OVER (PARTITION BY lidx ORDER BY sid, target) rn FROM _rtsb_prov) x
+         WHERE q.sid = x.sid AND q.target = x.target;
+
+        FOR v_k IN 1..coalesce((SELECT max(seq) FROM _rtsb_prov), 0) LOOP
+            v_cmds := '{}'; v_h := '{}'; v_p := '{}';
+            FOR r IN SELECT sid, lidx, target FROM _rtsb_prov WHERE seq = v_k LOOP
+                v_cmds := v_cmds || format('SELECT partdist.provision_shard_replica(%s::bigint, %s)', r.sid, r.target);
+                v_h := v_h || v_hosts[r.lidx]; v_p := v_p || v_ports[r.lidx];
+            END LOOP;
+            CONTINUE WHEN coalesce(array_length(v_cmds, 1), 0) = 0;
+            FOR r IN SELECT * FROM pg_catalog.master_run_on_worker(v_h, v_p, v_cmds, true) LOOP
+                -- 同一台一轮只有一条，用端口对回去
+                UPDATE _rtsb_prov SET result = r.result, ok = (r.success AND r.result LIKE 'shard=%')
+                 WHERE seq = v_k AND lidx = array_position(v_ports, r.node_port);
+            END LOOP;
+        END LOOP;
+        UPDATE _rtsb b SET prov_err = (SELECT string_agg(format(':%s→节点%s %s', v_ports[q.lidx], q.target, left(q.result, 120)), '；')
+                                         FROM _rtsb_prov q WHERE q.sid = b.sid AND NOT q.ok);
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM _rtsb_prov WHERE NOT ok);
+        PERFORM pg_catalog.pg_sleep(2);
+    END LOOP;
+
+    FOR r IN SELECT b.* FROM _rtsb b ORDER BY b.sid LOOP
+        shardid := r.sid;
+        leader_port := v_ports[coalesce(r.lidx, r.pidx)];
+        replica_ports := ARRAY(SELECT v_ports[array_position(v_nids, m)] FROM unnest(r.members) m
+                                WHERE m <> v_nids[coalesce(r.lidx, r.pidx)]);
+        status := coalesce(r.st,
+                           CASE WHEN r.lidx IS NULL THEN '组当前无主'
+                                WHEN EXISTS (SELECT 1 FROM unnest(r.members) m
+                                              WHERE m <> v_nids[r.lidx] AND NOT (m = ANY (r.armed)))
+                                     AND NOT (r.lidx = r.pidx OR v_nids[r.lidx] = ANY (r.armed)
+                                              OR EXISTS (SELECT 1 FROM partdist.partition_map pm
+                                                          WHERE pm.partition_id = r.sid AND pm.primary_node = v_nids[r.lidx]))
+                                     THEN '组主落在没有数据的成员上，等它让位超时'
+                                WHEN EXISTS (SELECT 1 FROM _rtsb_prov q WHERE q.sid = r.sid AND NOT q.ok)
+                                     THEN '供副本失败：' || coalesce(r.prov_err, '?')
+                                ELSE 'ok' END);
+        RETURN NEXT;
+    END LOOP;
+END
+$fn$;
+
+-- 2026-10-03（P7-N53）：路由对账。把 Citus 路由（pg_dist_placement）拨到控制面登记（partition_map）的主上。
+-- 正常情况下每条主权登记 apply 时就拨了；但控制面快照安装那一刻偶有漏拨（实测 128 组建组时 2 个分片
+-- 漏拨、之后再无人纠正：打标打到了已经是副本壳表的旧节点上）。由 topology monitor 每轮追平时顺带调用。
+CREATE OR REPLACE FUNCTION reconcile_routing() RETURNS integer
+LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE n integer := 0;
+BEGIN
+    IF to_regclass('pg_catalog.pg_dist_placement') IS NULL THEN
+        RETURN 0;
+    END IF;
+    WITH fix AS (
+        UPDATE pg_catalog.pg_dist_placement p SET groupid = dn.groupid
+          FROM partdist.partition_map pm, partdist.node_map m, pg_catalog.pg_dist_node dn
+         WHERE pm.partition_id = p.shardid AND m.node_id = pm.primary_node
+           AND dn.nodeport = m.port AND dn.noderole = 'primary'
+           AND p.groupid <> dn.groupid
+           AND (SELECT count(*) FROM pg_catalog.pg_dist_placement q WHERE q.shardid = p.shardid) = 1
+        RETURNING p.shardid, dn.nodeport)
+    SELECT count(*) INTO n FROM fix;
+    IF n > 0 THEN
+        RAISE LOG 'pg_partdist: 路由对账把 % 个分片的 pg_dist_placement 拨到了控制面登记的主上', n;
+    END IF;
+    RETURN n;
+END
+$fn$;
+
+COMMENT ON FUNCTION raft_replicate_table_shards_bulk(regclass, integer, integer, integer, bigint[]) IS
+    '2026-10-03：raft_replicate_table_shards 的并行版 —— 同样的顺序与成员轮转（副本因子 = 1 + p_replicas），'
+    '所有分片一起推进：建组/入组每台一条批量命令、4 台并行；供副本每台 leader 一轮一个、4 台并行。'
+    '上百个分片组时用它（串行版约 28 s/片）。';
+
+
+COMMENT ON FUNCTION raft_replicate_table_shards(regclass, integer, integer) IS
+    'T7.23/P7-R2：在协调者上一条命令给分布表的全部分片建 Raft 组并供副本。顺序固化为「placement 先建组并当选 → 副本入组 → leader 逐个 provision_shard_replica」；逐分片返回状态，单个失败不拖累其余。';
+
+-- ------------------------------------------------------------------
+-- T7.25（P7-R4）：DDL 自动跟随（副本侧）
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION replay_pending_follow(
+    p_shard OID,
+    OUT ddl_hint TEXT,
+    OUT roles INTEGER[], OUT ords INTEGER[],
+    OUT spcs OID[], OUT dbs OID[], OUT relnums OID[]
+) RETURNS record LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_replay_pending_follow';
+
+CREATE OR REPLACE FUNCTION replay_pending_follow_clear(p_shard OID)
+    RETURNS INTEGER LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_replay_pending_follow_clear';
+
+CREATE OR REPLACE FUNCTION replay_pending_base(p_shard OID)
+    RETURNS BIGINT LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'partdist_replay_pending_base';
+
+COMMENT ON FUNCTION replay_pending_base(OID) IS
+    'T7.25：副本撞结构栅栏时记下的重配起效游标 = max(配对起效游标, 已落 checkpoint 游标)。补齐结构后重跑 replay_set_locmap() 须把它作第 7 参传入 —— 缺省的 0 是"从流起点开始"的断言，本地非空即被拒。无待办时为 NULL。';
+
+CREATE OR REPLACE FUNCTION indexdef_string(p_index OID)
+    RETURNS TEXT LANGUAGE c STRICT STABLE
+    AS 'MODULE_PATHNAME', 'partdist_indexdef_string';
+
+-- 对账：让本地壳表的索引集合与 leader 的定义清单一致（按去掉索引名之后的
+-- 定义文本比较，多重集语义），再按 leader 的新 fileset 重配 locmap。
+--
+-- ★ 顺序必须是"先删后建、按清单顺序建"：fileset 的 ord 是 RelationGetIndexList
+--   的 OID 升序，新建的索引拿到的 OID 天然大于所有幸存者，于是按清单顺序建出来的
+--   索引与 leader 一侧落在同样的 ord 上 —— 这是配对能按 (role, ord) 对上的前提。
+-- ★ 删掉的若是约束背后的索引（主键/唯一约束），必须 DROP CONSTRAINT，直接
+--   DROP INDEX 会被拒。
+CREATE OR REPLACE FUNCTION replay_auto_follow(p_shard OID)
+RETURNS TEXT LANGUAGE plpgsql VOLATILE
+SET search_path = partdist, pg_catalog
+AS $fn$
+DECLARE
+    v        record;
+    v_tbl    regclass;
+    v_want   text[];
+    v_norm   text[];
+    v_used   boolean[];
+    v_have   record;
+    v_n      text;
+    v_pos    integer;
+    v_i      integer;
+    v_drop   integer := 0;
+    v_make   integer := 0;
+    v_pairs  integer;
+    v_have_norm text[];
+    v_base   bigint;
+BEGIN
+    SELECT * INTO v FROM partdist.replay_pending_follow(p_shard);
+    IF v.roles IS NULL THEN
+        RETURN 'nothing';
+    END IF;
+    IF v.ddl_hint IS NULL THEN
+        RETURN 'no-hint：栅栏不是由带结构提示的 DDL 引起的，需人工补结构';
+    END IF;
+
+    v_tbl  := p_shard::regclass;
+    v_want := CASE WHEN v.ddl_hint = '' THEN '{}'::text[]
+                   ELSE string_to_array(v.ddl_hint, E'\n') END;
+    v_norm := '{}'; v_used := '{}';
+    FOR v_i IN 1..coalesce(array_length(v_want, 1), 0) LOOP
+        v_norm := v_norm || regexp_replace(v_want[v_i], '^(CREATE (UNIQUE )?INDEX )\S+ ON ', '\1ON ');
+        v_used := v_used || false;
+    END LOOP;
+
+    PERFORM set_config('citus.enable_ddl_propagation', 'off', true);
+
+    -- ① 删：本地有、清单里没有（多重集：每条清单只抵消一个本地索引）
+    FOR v_have IN
+        SELECT i.indexrelid,
+               partdist.indexdef_string(i.indexrelid) AS def,
+               c.conname
+          FROM pg_catalog.pg_index i
+          LEFT JOIN pg_catalog.pg_constraint c
+                 ON c.conindid = i.indexrelid AND c.conrelid = i.indrelid
+         WHERE i.indrelid = p_shard
+         ORDER BY i.indexrelid
+    LOOP
+        v_n := regexp_replace(v_have.def, '^(CREATE (UNIQUE )?INDEX )\S+ ON ', '\1ON ');
+        v_pos := NULL;
+        FOR v_i IN 1..coalesce(array_length(v_norm, 1), 0) LOOP
+            IF NOT v_used[v_i] AND v_norm[v_i] = v_n THEN
+                v_pos := v_i; EXIT;
+            END IF;
+        END LOOP;
+        IF v_pos IS NULL THEN
+            IF v_have.conname IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', v_tbl, v_have.conname);
+            ELSE
+                EXECUTE format('DROP INDEX %s', v_have.indexrelid::regclass);
+            END IF;
+            v_drop := v_drop + 1;
+        ELSE
+            v_used[v_pos] := true;
+        END IF;
+    END LOOP;
+
+    -- ② 建：清单里有、本地没有，按清单顺序
+    FOR v_i IN 1..coalesce(array_length(v_want, 1), 0) LOOP
+        IF NOT v_used[v_i] THEN
+            EXECUTE v_want[v_i];
+            v_make := v_make + 1;
+        END IF;
+    END LOOP;
+
+    -- ③ 核对：locmap 按 (role, ord) 配对，ord 是 RelationGetIndexList 的 OID 顺序。
+    --   对账只保证"集合相等"，**顺序**相等靠的是"新建的 OID 一定比留下的大、
+    --   且 leader 那边同样如此"。OID 回卷、或者 leader 与本地的历史不对称时，
+    --   这个前提会破 —— 那时按 ord 配对就是把 A 索引的页回放进 B 索引的文件，
+    --   **静默物理损坏**。所以配对之前按本地真实顺序再比一次，不一致宁可
+    --   整个回滚、留在栅栏里等人工，也不去猜。
+    SELECT coalesce(array_agg(regexp_replace(partdist.indexdef_string(i.indexrelid),
+                                             '^(CREATE (UNIQUE )?INDEX )\S+ ON ', '\1ON ')
+                              ORDER BY i.indexrelid), '{}')
+      INTO v_have_norm
+      FROM pg_catalog.pg_index i
+     WHERE i.indrelid = p_shard;
+    IF v_have_norm IS DISTINCT FROM v_norm THEN
+        RAISE EXCEPTION 'replay_auto_follow: 对账后本地索引顺序与 leader 不一致，拒绝按 ord 配对（本地 %，leader %）',
+            v_have_norm, v_norm;
+    END IF;
+
+    -- ④ 按 leader 的新 fileset 重配。起效游标必须带上（见 replay_pending_base 的注释）：
+    --   缺省 0 是"从流起点开始"的断言，副本上一有数据就被拒 —— 首版就栽在这。
+    v_base := partdist.replay_pending_base(p_shard);
+    IF v_base IS NULL THEN
+        RAISE EXCEPTION 'replay_auto_follow: shard % 缺重配起效游标（pending_base），不猜，留在栅栏', p_shard;
+    END IF;
+    v_pairs := partdist.replay_set_locmap(v_tbl, v.roles, v.ords, v.spcs, v.dbs, v.relnums, v_base);
+
+    PERFORM partdist.replay_pending_follow_clear(p_shard);
+    RETURN format('followed：删 %s 个索引、建 %s 个，locmap 重配 %s 对', v_drop, v_make, v_pairs);
+END;
+$fn$;
+
+COMMENT ON FUNCTION replay_auto_follow(OID) IS
+    'T7.25/P7-R4：副本撞上 DDL 结构栅栏后的自动跟随 —— 按 leader 随流发来的索引定义清单对账本地壳表（缺的建、多的删），再按 leader 新 fileset 重配 locmap。回放启动器会自动调它；也可手工调用。';

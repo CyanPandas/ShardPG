@@ -1,0 +1,1 @@
+/work/postgres-src/src/backend/catalog/pg_foreign_table_d.h

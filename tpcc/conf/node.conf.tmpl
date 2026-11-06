@@ -48,11 +48,23 @@ pg_partdist.tso_conninfo = 'host=@COORD_HOST@ port=@COORD_PORT@ dbname=postgres 
 pg_partdist.tso_lease_ms = 60000
 
 # ---- 分片 vacuum（TPC-C 分支） ----
-# 回卷护栏阈值保持默认（2 亿）；回收触发单独设：龄满 2 万就清一次，
-# 同一分片两次之间至少隔 5 分钟（热点页拿不到 cleanup lock 时不至于每 5 s 重扫）。
+# 回卷护栏阈值保持默认（2 亿）；回收触发单独设：龄满 1000 就清，同一分片最少隔 5 s。
+# 压测下死版本堆积比扫描代价高得多（热表膨胀、索引链变长），所以清得勤；
+# 物理截尾暂关（与并发扩展的交互尚未完全验证），只回收槽位不缩文件。
 pg_partdist.shard_vacuum_auto = on
-pg_partdist.shard_vacuum_trigger_age = 20000
-pg_partdist.shard_vacuum_trigger_interval_s = 300
+pg_partdist.shard_vacuum_trigger_age = 1000
+pg_partdist.shard_vacuum_trigger_interval_s = 5
+pg_partdist.shard_vacuum_truncate = off
+
+# ---- 写冲突：READ COMMITTED 按原生 EPQ 重评（需内核补丁 0012） ----
+# 关掉 = 快照隔离 first-committer-wins：district / warehouse 热行上并发更新者
+# 全部 40001 整笔重试（128 终端实测约每秒 870 次）。打开后 RC 事务的
+# UPDATE 与原生 PG 一样等前者提交、在最新版本上重算再改；读仍用 TSO 快照。
+pg_partdist.rc_update_recheck = on
+
+# ---- 提前放锁（需内核补丁 0014）：提交记录插入后先放行锁，回复客户端前再刷 WAL ----
+# 客户端收到的提交仍然持久；热行（warehouse/district）上的后继写者不必排在前者的 fsync 后面。
+pg_partdist.early_lock_release = on
 
 # ---- 日志（长跑取证） ----
 logging_collector = on
@@ -63,3 +75,14 @@ log_line_prefix = '%m [%p] %q%u@%d '
 log_min_duration_statement = 5000
 log_lock_waits = on
 deadlock_timeout = 1s
+
+# ---- 事务函数下推（sql/06_delegate.sql） ----
+# 下推到 worker 的事务函数碰到远程仓库时，由 worker 发起嵌套分布式访问
+citus.allow_nested_distributed_execution = on
+# 下推后事务函数跑在 worker 的 Citus 内部后端里；原版 Citus 在这类后端里不缓存
+# 任何连接 —— 每次跨 worker 访问都新建连接、对端 fork 新后端（还会连带新建 TSO 连接）。
+# 补丁 pg-partdist-src/patches/citus-0001 提供此开关。
+citus.cache_connections_in_internal_backends = on
+# 串行化冲突等远程报错中止事务后，远端只是停在（失败的）事务里的连接回滚后继续缓存，
+# 不关掉重连（每次重连 worker 都要 fork 新后端、再建 TSO 连接）。补丁 citus-0001。
+citus.keep_connections_after_abort = on

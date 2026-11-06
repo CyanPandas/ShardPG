@@ -1,0 +1,101 @@
+diff -ruN a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+--- a/src/backend/access/transam/xact.c	2026-10-15 01:48:46.382028484 +0000
++++ b/src/backend/access/transam/xact.c	2026-10-15 03:08:06.382397055 +0000
+@@ -77,6 +77,12 @@
+ shard_xact_wal_list_hook_type shard_xact_wal_list_hook = NULL;
+ shard_xact_redo_hook_type shard_xact_redo_hook = NULL;
+ 
++/* patch 0014：见 access/shard_stamp.h */
++bool		shard_early_lock_release = false;
++bool		shard_elr_inhibit = false;
++XLogRecPtr	shard_elr_pending_lsn = InvalidXLogRecPtr;
++shard_elr_post_flush_hook_type shard_elr_post_flush_hook = NULL;
++
+ /*
+  *	User-tweakable parameters
+  */
+@@ -1475,7 +1481,21 @@
+ 	 * if all to-be-deleted tables are temporary though, since they are lost
+ 	 * anyway if we crash.)
+ 	 */
+-	if ((wrote_xlog && markXidCommitted &&
++	/*
++	 * patch 0014：提前放锁。只换"何时刷"，不换"刷不刷"：下面走异步分支插入
++	 * 提交记录，CommitTransaction 末尾回复客户端前补 XLogFlush。删文件
++	 * （nrels）与 forceSyncCommit 照旧当场刷；并行 worker 不走。
++	 */
++	shard_elr_pending_lsn = InvalidXLogRecPtr;
++	if (shard_early_lock_release && !shard_elr_inhibit && wrote_xlog && markXidCommitted &&
++		synchronous_commit > SYNCHRONOUS_COMMIT_OFF &&
++		!forceSyncCommit && nrels == 0 && !IsParallelWorker())
++	{
++		XLogSetAsyncXactLSN(XactLastRecEnd);
++		TransactionIdAsyncCommitTree(xid, nchildren, children, XactLastRecEnd);
++		shard_elr_pending_lsn = XactLastRecEnd;
++	}
++	else if ((wrote_xlog && markXidCommitted &&
+ 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
+ 		forceSyncCommit || nrels > 0)
+ 	{
+@@ -2430,6 +2450,21 @@
+ 	 */
+ 	s->state = TRANS_DEFAULT;
+ 
++	/*
++	 * patch 0014：提前放锁的提交在这里补刷 —— 锁、procarray 早已放掉，
++	 * 但回复客户端（CommandComplete / ReadyForQuery）在本函数返回之后。
++	 */
++	shard_elr_inhibit = false;
++	if (shard_elr_pending_lsn != InvalidXLogRecPtr)
++	{
++		XLogRecPtr	lsn = shard_elr_pending_lsn;
++
++		XLogFlush(lsn);
++		shard_elr_pending_lsn = InvalidXLogRecPtr;
++		if (shard_elr_post_flush_hook)
++			shard_elr_post_flush_hook();
++	}
++
+ 	RESUME_INTERRUPTS();
+ }
+ 
+diff -ruN a/src/include/access/shard_stamp.h b/src/include/access/shard_stamp.h
+--- a/src/include/access/shard_stamp.h	2026-10-15 01:48:46.390029310 +0000
++++ b/src/include/access/shard_stamp.h	2026-10-15 02:05:01.830724228 +0000
+@@ -49,6 +49,7 @@
+  * runs first within heap_delete).
+  */
+ #include "access/htup.h"
++#include "access/xlogdefs.h"
+ #include "access/tableam.h"
+ #include "storage/buf.h"
+ #include "storage/itemptr.h"
+@@ -140,4 +141,28 @@
+  */
+ extern PGDLLIMPORT bool shard_rc_follow_updates;
+ 
++/* ---- 0014：提前释放锁（early lock release） ---- */
++
++/*
++ * 打开后（扩展 GUC pg_partdist.early_lock_release），同步提交的事务在
++ * RecordTransactionCommit 里只插入提交记录、不等刷盘（clog 按异步提交标记，
++ * 提示位等 WAL 落盘才设），照常放锁、清 procarray；到 CommitTransaction 末尾、
++ * 回复客户端之前才 XLogFlush 到提交记录 —— 客户端收到的提交仍然持久。
++ * 热行上的后继写者不必等前者的 fsync：它自己的提交记录排在后面，刷盘必然连带。
++ *
++ * shard_elr_pending_lsn：本次提交走了提前放锁时为提交记录末尾（扩展的
++ *   XACT_EVENT_COMMIT 回调据此推迟写分片判决），否则 Invalid。
++ * shard_elr_post_flush_hook：刷盘完成后调用（事务已结束，不得访问目录）。
++ */
++extern PGDLLIMPORT bool shard_early_lock_release;
++/*
++ * 本次提交不得提前放锁（pre_record_commit 钩子置位，RecordTransactionCommit 用后清零）。
++ * 2PC 驱动者必须先刷本地提交再让 Citus 发 COMMIT PREPARED：否则崩溃后远端已提交、
++ * 本地那半却丢了。
++ */
++extern PGDLLIMPORT bool shard_elr_inhibit;
++extern PGDLLIMPORT XLogRecPtr shard_elr_pending_lsn;
++typedef void (*shard_elr_post_flush_hook_type) (void);
++extern PGDLLIMPORT shard_elr_post_flush_hook_type shard_elr_post_flush_hook;
++
+ #endif							/* SHARD_STAMP_H */

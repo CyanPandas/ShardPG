@@ -199,6 +199,15 @@ extern XLogRecPtr XLogInsertRecord(struct XLogRecData *rdata,
 								   int num_fpi,
 								   bool topxid_included);
 extern void XLogFlush(XLogRecPtr record);
+extern void XLogWriteUpTo(XLogRecPtr record);	/* patch 0013 */
+
+/*
+ * patch 0015：检查点钩子，在 CheckPointGuts 里紧跟 CheckPointCLOG 调用。
+ * 扩展自管的提交状态文件（分片 clog）只需在检查点把 redo 点推过它们之前落盘 ——
+ * 与原生 clog 同一条规则；之前的判决丢了由 WAL 重放补回。
+ */
+typedef void (*shard_checkpoint_hook_type) (void);
+extern PGDLLIMPORT shard_checkpoint_hook_type shard_checkpoint_hook;
 /* pg_partdist 补丁 0010：在线推进本地 WAL 插入位点（升主，FRD §11 步骤 4） */
 extern void XLogRequestInsertPositionAdvance(XLogRecPtr target);
 extern bool XLogBackgroundFlush(void);

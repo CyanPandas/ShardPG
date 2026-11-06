@@ -25,6 +25,8 @@
 #include "shard_xid.h"
 #include "shard_vacuum.h"
 #include "dtx_pending.h"
+#include "shard_clog.h"
+#include "partition_wal_writer.h"
 
 #include "fmgr.h"
 #include "libpq-fe.h"
@@ -289,10 +291,15 @@ tso_fence_check(void)
 
 	if (TsoClientCtl == NULL || !tso_configured())
 		return;
-	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
-	beat = TsoClientCtl->last_beat_ok;
-	lease = TsoClientCtl->lease_ms;
-	LWLockRelease(TsoClientCtl->lock);
+
+	/*
+	 * ★ TPC-C 分支：无锁读。每次可见性判定都经 TsoGetStartTs 走到这里，原先
+	 * 每个元组拿一次共享 LWLock（perf：LWLockAcquire 调用方第二名）。两个字段
+	 * 都是对齐的 64/32 位整数，x86-64 上读写原子；写者仍持排他锁。两字段之间
+	 * 读到新旧混合无害：lease_ms 启动后基本不变，beat 只会前进。
+	 */
+	beat = *((volatile TimestampTz *) &TsoClientCtl->last_beat_ok);
+	lease = *((volatile int32 *) &TsoClientCtl->lease_ms);
 	if (lease <= 0 || beat == 0)
 		return;					/* 尚无租约信息（本快照刚经 RPC 取得） */
 
@@ -461,6 +468,39 @@ TsoGetStartTs(void)
 	tso_note_lease_renewal(0);	/* start_ts 在 master 侧即续租 */
 	tso_active_register(cur_start_ts);
 	return cur_start_ts;
+}
+
+/*
+ * pg_partdist.rc_update_recheck：READ COMMITTED 事务在 EPQ 改过"快照之后提交的
+ * 新版本"以后，下一条语句开始前换一个新 start_ts —— 等同原生 RC 的"每语句新快照"，
+ * 只在真的发生过重评时才付这一次 RPC。不换的话旧快照仍看得见被覆盖的那个旧版本
+ * （它的删除者在快照之后提交），同一行就同时读到旧版本和本事务写的新版本。
+ * 只在语句边界调用；活跃集合登记随之上移（偏大只因旧快照已不再使用，安全）。
+ */
+void
+TsoRefreshStartTs(void)
+{
+	char		sql[128];
+	int64		oldest;
+	int64		ts;
+
+	if (cur_start_ts == 0 || !tso_configured() || TsoClientCtl == NULL)
+		return;
+
+	LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+	oldest = tso_active_min_locked();
+	LWLockRelease(TsoClientCtl->lock);
+
+	snprintf(sql, sizeof(sql),
+			 "SELECT partdist.partdist_tso_start_ts(%d, CAST(" INT64_FORMAT " AS bigint))",
+			 (int) PartDistLocalNodeId(), oldest);
+	ts = tso_rpc(sql, "start_ts");
+	tso_note_lease_renewal(0);
+	if (ts > cur_start_ts)
+	{
+		cur_start_ts = ts;
+		tso_active_register(ts);
+	}
 }
 
 /*
@@ -656,6 +696,11 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 	for (;;)
 	{
 		int			wait_ms = 5000;
+		TimestampTz iter_start;
+		TimestampTz t_beat;
+		TimestampTz t_side;
+		long		ms_beat;
+		long		ms_side;
 
 		CHECK_FOR_INTERRUPTS();
 		if (ShutdownRequestPending)
@@ -666,11 +711,38 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
+		iter_start = GetCurrentTimestamp();
 		if (tso_configured())
 		{
-			(void) TsoHeartbeatOnce();
+			if (!TsoHeartbeatOnce())
+				ereport(LOG,
+						(errmsg("pg_partdist: TSO 心跳续租失败：%s", tso_last_err)));
+			/*
+			 * TPC-C 分支：续租间隔封顶 3 s。原先 lease/3（lease=60 s 时 20 s 一次），
+			 * 偶发连丢两次就越过 lease−lease/4 的栅栏；心跳本身只是一次 LW 锁 +
+			 * 一行更新，勤一点几乎没有代价。
+			 */
 			if (TsoClientCtl != NULL && TsoClientCtl->lease_ms > 0)
-				wait_ms = Max(1000, TsoClientCtl->lease_ms / 3);
+				wait_ms = Max(1000, Min(3000, TsoClientCtl->lease_ms / 3));
+		}
+		t_beat = GetCurrentTimestamp();
+
+		/*
+		 * 单副本快速提交：分片 clog 判决的延迟 fsync。持久性由检查点钩子（内核补丁
+		 * 0015）保证；这里只做 60 s 一次的兜底，免得登记表长期积压。原先每轮都刷，
+		 * 128 终端下每节点每秒几十次 fsync，与 WAL 刷盘抢同一块盘。
+		 */
+		if (partwal_fast_commit)
+		{
+			static TimestampTz last_clog_sync = 0;
+			TimestampTz now_c = GetCurrentTimestamp();
+
+			if (last_clog_sync == 0 ||
+				TimestampDifferenceExceeds(last_clog_sync, now_c, 60000))
+			{
+				ShardClogSyncDirty();
+				last_clog_sync = now_c;
+			}
 		}
 
 		/*
@@ -679,7 +751,7 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * 里做 SPI 寻址 + 远程 peek。登记表空则零开销。
 		 */
 		if (DtxPendingCount() > 0)
-			DtxPendingSelfTriggerSweep();
+			ShardDtxSweepSelfTrigger();	/* TPC-C 分支：异步，不拖住续租 */
 
 		/*
 		 * T7.17（P7-V1）：分片 vacuum 自动启动器。
@@ -714,6 +786,15 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			if (PartWALReprovQueuePop(&qg, &qt))
 				PartDistLaunchReprovision(qg, qt);
 		}
+
+		/* 一轮（不含等待）超过 2 s 就记下各段耗时：心跳被拖住时据此定位 */
+		t_side = GetCurrentTimestamp();
+		ms_beat = (long) ((t_beat - iter_start) / 1000);
+		ms_side = (long) ((t_side - t_beat) / 1000);
+		if (ms_beat + ms_side > 2000)
+			ereport(LOG,
+					(errmsg("pg_partdist: TSO 心跳循环一轮耗时 %ld ms（续租 %ld ms，附带任务 %ld ms）",
+							ms_beat + ms_side, ms_beat, ms_side)));
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

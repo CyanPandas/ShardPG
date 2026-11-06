@@ -28,6 +28,7 @@
  * segments and writes data_len>0 records for any records missed at runtime.
  */
 #include "postgres.h"
+#include "access/shard_stamp.h"   /* 2026-10-17：写非分片块即禁用提前放锁 */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -75,6 +76,12 @@
  */
 typedef void (*PartWALReplicateHook) (Oid partition_id);
 static void **partwal_replicate_hook_rv = NULL;
+/*
+ * 2026-10-16：一次复制本事务触达的全部分区（pg_raft 合成一轮、多数派即返回）。
+ * failed_out[i] 由挂钩在 ERROR 前置位，标出没达多数派的那几个分区。
+ */
+typedef void (*PartWALReplicateManyHook) (const Oid *parts, int nparts, bool *failed_out);
+static void **partwal_replicate_many_rv = NULL;
 
 /* ================================================================== */
 /* Shmem names / tranche                                               */
@@ -106,6 +113,12 @@ static HTAB    *PartWALRelHash = NULL;
  * Passed implicitly to PartWALFlush() when upto_lsn == InvalidXLogRecPtr.
  */
 static XLogRecPtr partwal_my_max_lsn = InvalidXLogRecPtr;
+/*
+ * 2026-10-17：本事务是否写过不属于任何被跟踪分片（含其索引 / TOAST）的数据块。
+ * 提前放锁（补丁 0014/0016）只许用在全部写入都落在分片表上的事务：分片表的读者等判决，
+ * 判决在刷盘与同步复制之后才写；普通表的读者没有这道闸，放锁即可见。事务结束清零。
+ */
+bool PartWALXactNonShardWrite = false;
 
 /*
  * 本事务已由 PartWALFlush 落盘的最大 LSN。partwal_my_max_lsn 在 flush 结束时
@@ -264,6 +277,8 @@ RequestPartWALSyncShmem(void)
     RequestAddinShmemSpace(hash_estimate_size(PARTWAL_RELFHASH_SIZE,
                                                sizeof(PartWALRelEntry)));
     RequestNamedLWLockTranche(PARTWAL_SYNC_LOCK_TRANCHE, 1);
+    /* 2026-10-16：分区段文件组提交 fsync 的串行锁（见 PartWALSyncPartitionUpTo） */
+    RequestNamedLWLockTranche("pg_partdist_partsync", PARTWAL_PARTSYNC_LOCKS);
 }
 
 Size
@@ -299,6 +314,12 @@ PartWALSyncShmemInit(void)
         PartWALCtl->diverged_pending  = true;   /* 重启前留下的分叉标记也要修 */
         PartWALCtl->repair_last_try   = 0;
         memset(PartWALCtl->slots, 0, sizeof(PartWALCtl->slots));
+        SpinLockInit(&PartWALCtl->ckpt_mutex);
+        SpinLockInit(&PartWALCtl->clog_dirty_mutex);
+        pg_atomic_init_u32(&PartWALCtl->clog_drop_gen, 0);
+        pg_atomic_init_u64(&PartWALCtl->relmap_gen, 1);
+        PartWALCtl->clog_ndirty       = 0;
+        PartWALCtl->ckpt_n            = 0;
     }
 
     memset(&ctl, 0, sizeof(ctl));
@@ -330,8 +351,63 @@ PartWALSyncRegister(Oid partition_id, RelFileNumber relfilenode)
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
     entry = (PartWALRelEntry *)
         hash_search(PartWALRelHash, &relfilenode, HASH_ENTER, &found);
+    if (!found || entry->partition_id != partition_id)
+        pg_atomic_fetch_add_u64(&PartWALCtl->relmap_gen, 1);
     entry->partition_id = partition_id;
     LWLockRelease(PartWALCtl->lock);
+}
+
+/*
+ * 2026-10-17：relfilenode→分区映射的后端本地缓存（直接映射，1024 槽）。
+ *
+ * 快速提交模式下每一条 WAL 记录都要查一次映射。原来每次都拿 PartWALCtl->lock 的共享模式，
+ * 而这把全局锁同时被 2PC 标记写入等路径以排它模式持有、并在锁内做分区 WAL 文件 I/O ——
+ * 于是全节点的写入都排在别人的文件 I/O 后面（256 终端实测：一台 worker 约 1/5 的活跃会话
+ * 等在这把锁上）。映射只增不删（只有登记会改它），登记时代次 +1；后端看到代次变了就整表作废。
+ * 命中时完全不碰全局锁。
+ *
+ * 不分配内存（静态数组）：WAL 插入钩子常在临界区里被调。读到代次之后、查共享表之前有新登记
+ * 进来，等价于这条记录早于登记写下（与下面共享锁预筛同一个论证），下一次调用就会作废重查。
+ */
+#define PARTWAL_RELMAP_CACHE 1024
+
+typedef struct PartWALRelMapCacheEnt
+{
+    RelFileNumber rfn;              /* 0 = 空槽 */
+    Oid           part;             /* InvalidOid = 不属于任何被跟踪分区 */
+} PartWALRelMapCacheEnt;
+
+static PartWALRelMapCacheEnt partwal_relmap_cache[PARTWAL_RELMAP_CACHE];
+static uint64 partwal_relmap_cache_gen = 0;
+
+static bool
+partwal_relmap_lookup(RelFileNumber rfn, Oid *part_out)
+{
+    uint64      gen = pg_atomic_read_u64(&PartWALCtl->relmap_gen);
+    PartWALRelMapCacheEnt *e;
+
+    if (gen != partwal_relmap_cache_gen)
+    {
+        memset(partwal_relmap_cache, 0, sizeof(partwal_relmap_cache));
+        partwal_relmap_cache_gen = gen;
+    }
+    e = &partwal_relmap_cache[((uint32) rfn * 2654435761U) >> 22];
+    if (e->rfn != rfn || !RelFileNumberIsValid(e->rfn))
+    {
+        PartWALRelEntry *se;
+        bool        found = false;
+        Oid         part = InvalidOid;
+
+        LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+        se = (PartWALRelEntry *) hash_search(PartWALRelHash, &rfn, HASH_FIND, &found);
+        if (found)
+            part = se->partition_id;
+        LWLockRelease(PartWALCtl->lock);
+        e->rfn = rfn;
+        e->part = part;
+    }
+    *part_out = e->part;
+    return OidIsValid(e->part);
 }
 
 bool
@@ -389,10 +465,76 @@ PartWALInsert(XLogRecPtr end_lsn,
      * buffer，locator 在 main data 里。补丁 0001-v2 让钩子对这类记录以
      * nblocks == 0 触发；这里在加锁前先把 locator 解析出来。
      */
+    /*
+     * ★ 单副本快速提交：数据记录不进分区流，只记"触达"。
+     *
+     * 分区流里的数据记录只服务于 follower 回放 / 物理基线 / Raft 复制 —— 快速模式下
+     * 三者都不存在（单成员组不提议，持久化以 pg_wal 为准）。原路径每条 WAL 记录都以
+     * 排他模式拿一次 PartWALCtl->lock 占环槽，提交时再排空、写段文件，并为回读 peer
+     * 槽位多刷一次 pg_wal —— 128 终端实测这把全局锁是两台 worker 上最大的等待点。
+     *
+     * 仍然必须记"触达"：2PC 的 PRE_PREPARE 据此写 DTX_PREPARE 标记、向协调组登记
+     * 参与者（广播收件人与 in-doubt 闭合都靠它）。DTX / CTRL / 判决标记走各自的
+     * 直写路径，不经过这里，照旧进流。查映射只要共享锁。
+     */
+    if (partwal_fast_commit)
+    {
+        Oid         part = InvalidOid;
+
+        if (nblocks == 0)
+            return;             /* SMGR（截断等）：只有副本在乎 */
+        for (i = 0; i < nblocks; i++)
+        {
+            Oid         p;
+
+            if (partwal_relmap_lookup(blocks[i].rlocator.relNumber, &p))
+            {
+                if (!OidIsValid(part))
+                    part = p;
+            }
+            else
+                { PartWALXactNonShardWrite = true; shard_elr_inhibit = true; }
+        }
+        if (OidIsValid(part))
+            PartWALNoteTouched(part);
+        return;
+    }
+
     if (nblocks == 0)
     {
         if (rmid != RM_SMGR_ID ||
             !SmgrRecordGetLocator(record_data, record_len, info, &smgr_loc))
+            return;
+    }
+
+    /*
+     * 2026-10-17：先在共享锁下查一遍 —— 不属于任何被跟踪分区的记录（raft_log 行、目录表、
+     * follower_partition_map …）直接返回，不再为它们抢全节点排他锁。这把锁同时罩着分区流的
+     * 写入与 flush，原来每一条 WAL 记录都要排它一次，复制流的副本会话写日志行时实测大量排队。
+     * 两次加锁之间有分区新登记进来，等价于这条记录早于登记写下（登记之前的记录本来就不跟踪）。
+     */
+    {
+        bool    any = false;
+
+        LWLockAcquire(PartWALCtl->lock, LW_SHARED);
+        if (nblocks == 0)
+            (void) hash_search(PartWALRelHash, &smgr_loc.relNumber, HASH_FIND, &any);
+        else
+        {
+            for (i = 0; i < nblocks; i++)
+            {
+                bool f = false;
+
+                (void) hash_search(PartWALRelHash, &blocks[i].rlocator.relNumber,
+                                   HASH_FIND, &f);
+                if (f)
+                    any = true;
+                else
+                    { PartWALXactNonShardWrite = true; shard_elr_inhibit = true; }
+            }
+        }
+        LWLockRelease(PartWALCtl->lock);
+        if (!any)
             return;
     }
 
@@ -1044,7 +1186,8 @@ PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid, uint8 op,
                             payload, payload_len,
                             MakeGlobalXid(PartDistLocalNodeId(), xid),
                             PARTWAL_FLAG_MARKER);
-        DestroyPartitionWALWriter(w);   /* flush + fsync */
+        /* 组提交模式：锁内只 write()，出锁后再落盘；否则 flush + fsync */
+        (void) PartWALWriterFinishLazy(w);
     }
     PG_FINALLY();
     {
@@ -1052,6 +1195,9 @@ PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid, uint8 op,
             LWLockRelease(PartWALCtl->lock);
     }
     PG_END_TRY();
+
+    /* 返回即已落盘（与原语义相同）：调用方随后复制，或把它当 2PC 的持久化点 */
+    PartWALSyncPartitionUpTo(partition_id, 0);
 }
 
 static void PartWALReplicateTouched(void);
@@ -1222,9 +1368,51 @@ PartWALReplicateTouched(void)
     if (fn == NULL)
         return;
 
+    if (partwal_replicate_many_rv == NULL)
+        partwal_replicate_many_rv =
+            find_rendezvous_variable("partdist_partwal_replicate_many_hook");
+    if (*partwal_replicate_many_rv != NULL)
+    {
+        PartWALReplicateManyHook many = (PartWALReplicateManyHook) *partwal_replicate_many_rv;
+        bool   *failed;
+        int     n = partwal_my_ntouched;
+
+        /* 多副本组提交：挂钩只送已 fsync 的前缀，先把各分区已写下的字节落盘 */
+        if (PartWALLazySync())
+            for (i = 0; i < n; i++)
+                PartWALSyncPartitionUpTo(partwal_my_touched[i], 0);
+
+        failed = (bool *) palloc0(sizeof(bool) * n);
+        PG_TRY();
+        {
+            many(partwal_my_touched, n, failed);
+        }
+        PG_CATCH();
+        {
+            /* 与逐分区路径相同的检测（§13 约束 13），只标没达多数派的那几个 */
+            if (!partwal_ctrl_best_effort)
+                for (i = 0; i < n; i++)
+                    if (failed[i])
+                        ShardMarkDiverged(partwal_my_touched[i],
+                                          "复制挂钩失败：本事务已中止，但 leader 侧的"
+                                          "物理截断不随回滚撤销，副本可能已分叉（§13 约束 13）");
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        pfree(failed);
+        return;
+    }
+
     for (i = 0; i < partwal_my_ntouched; i++)
     {
         Oid part = partwal_my_touched[i];
+
+        /*
+         * 多副本组提交：挂钩只送"已 fsync"的前缀（get_partition_flush_lsn 返回 synced），
+         * 先把本分区已写下的字节落盘，保证本事务的记录在其中。已落过的是空操作。
+         */
+        if (PartWALLazySync())
+            PartWALSyncPartitionUpTo(part, 0);
 
         /*
          * ★★ §13 约束 13 的"检测"（批次 #8）。
@@ -1533,6 +1721,8 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     char               *marker_payload = NULL;
     uint32              marker_len = 0;
     bool                drain_needed = true;
+    bool                lazy = PartWALLazySync();   /* 多副本组提交：锁内只 write()，出锁后组提交 fsync */
+    bool                markers_written = false;
 
     /* Default: flush up to the per-backend tracked max LSN */
     if (upto_lsn == InvalidXLogRecPtr)
@@ -1572,6 +1762,23 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     if (write_marker && partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
         marker_payload = PartWALBuildTxnMarker(true, &marker_len);
 
+
+    /*
+     * 先把 pg_wal 刷到 upto_lsn（group-commit 回读 peer 槽位的前提，见下），放在全局锁
+     * **外面**：XLogFlush 自带组提交与并发安全，原先夹在 PartWALCtl->lock 里，等于把
+     * 本节点所有分片的提交串在一次 WAL fsync 后面。
+     */
+    /*
+     * 单副本快速提交：分区 WAL 本就不 fsync，[A] 先于 [B] 的持久序无从谈起；
+     * 回读 peer 槽位只要求字节已 write() 进 pg_wal 文件。只写不刷（内核补丁
+     * 0013），否则每笔写事务要串行等两次 WAL fsync（数据记录一次、提交记录
+     * 一次），128 终端实测 fsync/提交 0.26，原生 PG 0.04。
+     */
+    if (partwal_fast_commit)
+        XLogWriteUpTo(upto_lsn);
+    else
+        XLogFlush(upto_lsn);
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
     /*
@@ -1592,8 +1799,7 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
      * 这里刷的只是数据记录（[B] 是本事务提交记录的 XLogFlush，尚未发生），
      * [A] parwal fsync 仍然先于 [B]。
      */
-    if (drain_needed)
-        XLogFlush(upto_lsn);
+    /* XLogFlush(upto_lsn) 已在加锁前完成 */
 
     PG_TRY();
     {
@@ -1753,13 +1959,82 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
             PartWALCtl->nvalid--;
 
             if (!cache_it)
-                DestroyPartitionWALWriter(writer);
+            {
+                if (lazy)
+                    (void) PartWALWriterFinishLazy(writer);
+                else
+                    DestroyPartitionWALWriter(writer);
+            }
         }
 
-        /* Flush and close all cached writers (includes fsync) */
-        for (i = 0; i < ncached; i++)
-            DestroyPartitionWALWriter(cache_writer[i]);
-        ncached = 0;
+        /*
+         * ★ 多副本组提交（2026-10-16）：**只触达一个分区（一个组）**的事务，COMMIT 标记与
+         * 数据在同一次持锁里写下、随后一轮复制一起送走。
+         *
+         * 单组时这不削弱不变式：标记排在本事务全部 DATA 之后（本事务 orig_lsn ≤ upto_lsn 的
+         * 槽位上面已全部排空，同一分区的编号在这把锁下单调分配），同一组的 Raft 日志有序，
+         * 标记被提交 ⇒ 它前面的 DATA 已提交。复制失败 ⇒ 事务中止，未提交的尾巴（含标记）
+         * 被丢弃，PartWALAbort 补 ABORT 标记 —— 与原实现"标记那一轮失败"同一情形。
+         *
+         * **多组事务不这么做**（2026-10-16 修正）：一轮里某组拿到多数派、另一组失败时，前者
+         * 的副本上已有 COMMIT 标记而事务在本地中止 ⇒ 跨分区部分提交；且标记在本地流里一直
+         * 躺到整轮复制结束，[B] 之前被杀 ⇒ 流说提交、pg_wal 说没有（实测升主时报快路径分叉）。
+         * 多组事务回到原顺序：DATA 先在全部组多数派持久化，之后才写标记、再送一轮
+         * （见本函数末尾的组提交分支）。
+         */
+        if (lazy && marker_payload != NULL && partwal_my_ntouched == 1)
+        {
+            int t;
+
+            for (t = 0; t < partwal_my_ntouched; t++)
+            {
+                Oid                 part = partwal_my_touched[t];
+                PartitionWALWriter *w = NULL;
+                int                 j;
+                bool                cached_w = false;
+
+                for (j = 0; j < ncached; j++)
+                    if (cache_partition[j] == part)
+                    {
+                        w = cache_writer[j];
+                        cached_w = true;
+                        break;
+                    }
+                if (w == NULL)
+                {
+                    InitPartitionWALDirectory(part);
+                    w = CreatePartitionWALWriter(part, InvalidRelFileNumber);
+                    if (w == NULL)
+                        ereport(ERROR,
+                                (errmsg("pg_partdist: 无法为分区 %u 打开 writer "
+                                        "写提交标记", part)));
+                    if (ncached < PARTWAL_WRITER_CACHE_MAX)
+                    {
+                        cache_partition[ncached] = part;
+                        cache_writer[ncached] = w;
+                        ncached++;
+                        cached_w = true;
+                    }
+                }
+                PartWALMarkerSetShardXid(marker_payload, part, InvalidTransactionId);
+                PartWALAppendTxnMarker(w, marker_lsn, my_xid, true,
+                                       marker_payload, marker_len);
+                if (!cached_w)
+                    (void) PartWALWriterFinishLazy(w);
+            }
+            markers_written = true;
+        }
+
+        /* Flush and close all cached writers（非组提交模式含 fsync） */
+        while (ncached > 0)
+        {
+            PartitionWALWriter *w = cache_writer[--ncached];
+
+            if (lazy)
+                (void) PartWALWriterFinishLazy(w);
+            else
+                DestroyPartitionWALWriter(w);
+        }
     }
     PG_CATCH();
     {
@@ -1835,12 +2110,75 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     partwal_my_flushed_lsn = upto_lsn;
     partwal_my_max_lsn = InvalidXLogRecPtr;
 
+    if (lazy)
+    {
+        int t;
+
+        /*
+         * 组提交模式：先把本事务碰过的分区组提交落盘（[A]），再复制。
+         *   · 单组事务：标记已随数据写下，一轮送走（数据 + 标记）；
+         *   · 多组事务：这一轮只有数据；全部组都拿到多数派（挂钩失败即 ERROR、事务中止，
+         *     此时流里没有本事务的 COMMIT 标记）之后，才写 COMMIT 标记、落盘、再送一轮 ——
+         *     与非组提交路径相同的强不变式：流里出现 COMMIT 标记 ⇒ 全部组的 DATA 已在多数派持久化。
+         * 中止路径（replicate=false）不在这里落盘，ABORT 标记由 PartWALAbort 自己落盘。
+         */
+        if (replicate)
+        {
+            for (t = 0; t < partwal_my_ntouched; t++)
+                PartWALSyncPartitionUpTo(partwal_my_touched[t], 0);
+            PartWALReplicateTouched();
+        }
+        if (marker_payload != NULL && !markers_written)
+        {
+            LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
+            PG_TRY();
+            {
+                for (t = 0; t < partwal_my_ntouched; t++)
+                {
+                    PartitionWALWriter *w;
+
+                    InitPartitionWALDirectory(partwal_my_touched[t]);
+                    w = CreatePartitionWALWriter(partwal_my_touched[t],
+                                                 InvalidRelFileNumber);
+                    if (w == NULL)
+                        ereport(ERROR,
+                                (errmsg("pg_partdist: 无法为分区 %u 打开 writer "
+                                        "写提交标记", partwal_my_touched[t])));
+                    PartWALMarkerSetShardXid(marker_payload, partwal_my_touched[t],
+                                             InvalidTransactionId);
+                    PartWALAppendTxnMarker(w, marker_lsn, my_xid, true,
+                                           marker_payload, marker_len);
+                    (void) PartWALWriterFinishLazy(w);
+                }
+            }
+            PG_CATCH();
+            {
+                LWLockRelease(PartWALCtl->lock);
+                PG_RE_THROW();
+            }
+            PG_END_TRY();
+            LWLockRelease(PartWALCtl->lock);
+
+            /* 标记落盘后再送（挂钩只送已落盘的前缀）；送不到多数派 ⇒ ERROR、事务中止 */
+            for (t = 0; t < partwal_my_ntouched; t++)
+                PartWALSyncPartitionUpTo(partwal_my_touched[t], 0);
+            PartWALReplicateTouched();
+        }
+        if (marker_payload != NULL)
+            pfree(marker_payload);
+        return;
+    }
+
     /*
      * [A] 已完成（本地 parwal 已 fsync）。在 [B]（提交/prepare 记录的
      * XLogFlush）之前，把本事务涉及分区的新记录复制到各自的 raft 组。
      * 锁已全部释放，网络往返不占 PartWALCtl；挂钩 ERROR 即事务中止。
      */
-    if (replicate)
+    /*
+     * 单副本快速提交：数据与提交标记合成一轮复制（标记写完后下面那次挂钩一并送出）。
+     * "标记晚于数据在多数派持久化"的不变式在单成员组上平凡成立 —— 两者都只在本地。
+     */
+    if (replicate && !(partwal_fast_commit && marker_payload != NULL))
         PartWALReplicateTouched();
 
     /*
@@ -2073,7 +2411,8 @@ PartWALAbort(void)
                                          InvalidTransactionId);
                 PartWALAppendTxnMarker(w, my_max, my_xid, false,
                                        payload, payload_len);
-                DestroyPartitionWALWriter(w);   /* flush + fsync */
+                /* 组提交模式下只 write()：中止标记不必等落盘（见 PartWALFlushImpl 的说明） */
+                (void) PartWALWriterFinishLazy(w);
             }
         }
         PG_CATCH();
@@ -2093,6 +2432,35 @@ PartWALAbort(void)
     }
 
     LWLockRelease(PartWALCtl->lock);
+
+    /*
+     * 组提交模式：ABORT 标记补一次落盘（2026-10-16）。它要抵消流里可能已有（单组事务的标记
+     * 随数据写下；多组事务的标记轮失败）、甚至已复制出去的同一 gxid 的 COMMIT 标记 ——
+     * 只 write() 的话一次崩溃就把它丢了，流和副本上只剩 COMMIT。落盘失败只降级为 WARNING
+     * （中止路径里不能抛 ERROR；fsync 失败本身按 data_sync_elevel 升 PANIC）。
+     */
+    if (already_on_disk && payload != NULL && PartWALLazySync())
+    {
+        PG_TRY();
+        {
+            int     t;
+
+            for (t = 0; t < partwal_my_ntouched; t++)
+                PartWALSyncPartitionUpTo(partwal_my_touched[t], 0);
+        }
+        PG_CATCH();
+        {
+            ErrorData *ed;
+
+            MemoryContextSwitchTo(TopMemoryContext);
+            ed = CopyErrorData();
+            FlushErrorState();
+            ereport(WARNING,
+                    (errmsg("pg_partdist: 中止标记落盘失败：%s", ed->message)));
+            FreeErrorData(ed);
+        }
+        PG_END_TRY();
+    }
 
     if (drain_failed)
     {

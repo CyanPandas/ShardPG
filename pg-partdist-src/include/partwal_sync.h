@@ -30,6 +30,8 @@
 #include "access/xloginsert.h"
 #include "common/relpath.h"
 #include "storage/lwlock.h"
+#include "storage/spin.h"
+#include "port/atomics.h"
 #include "partition_wal_writer.h"
 
 /* ------------------------------------------------------------------ */
@@ -75,6 +77,50 @@ typedef struct PartWALSlot
 #define PARTWAL_LOST_MAX 16
 #define PARTWAL_REPROV_QUEUE_MAX 256
 
+/*
+ * 单副本快速提交：分区 checkpoint（最后分配的 partition_lsn 等）的节点级缓存。
+ * 快速模式下 checkpoint 只写这里、不写文件；读先查这里。自带自旋锁，不依赖调用方
+ * 持有哪把锁。重启后第一次取用某分区时以"checkpoint 文件"与"扫段得到的实际最大
+ * plsn"二者取大填入，保证不重发编号。
+ */
+#define PARTWAL_CKPT_CACHE_MAX 4096
+typedef struct PartWALCkptCacheEnt
+{
+    Oid            partition_id;
+    RelFileNumber  relfilenode;
+    XLogRecPtr     last_wal_lsn;
+    uint64         last_part_lsn;
+    /*
+     * 2026-10-16 多副本组提交（pg_partdist.partwal_group_fsync）：
+     *   synced_part_lsn —— 已 fsync 的最大编号（≤ last_part_lsn）。复制挂钩只送到这里，
+     *                     leader 计自己那一票的前提是字节已落盘。
+     *   lo/hi_segno     —— 尚未 fsync 的写入落在哪几个段（lo = 0 表示没有欠账）。
+     */
+    uint64         synced_part_lsn;
+    XLogSegNo      lo_unsynced_segno;
+    XLogSegNo      hi_segno;
+    TimestampTz    file_ts;         /* 上次把缓存值写回 checkpoint 文件（不 fsync，仅作重启提示）的时刻 */
+    int            sync_inflight;   /* 已接手欠账、fsync 还没做完的组提交者个数（期间 synced 不许被"无欠账"推进） */
+    uint32         trunc_gen;       /* 编号每回退（截断）一次 +1：组提交者 fsync 期间若变过，不推进 synced、不写提示 */
+} PartWALCkptCacheEnt;
+
+/*
+ * 分区段文件组提交 fsync 的串行锁（按分区号散列）。拿着它的 backend 一次 fsync 把
+ * 别人写下、尚未落盘的字节一并带走；排在后面的醒来发现 synced 已越过自己就直接返回。
+ */
+#define PARTWAL_PARTSYNC_LOCKS 64
+
+/*
+ * 单副本快速提交：分片 clog 判决写入不再逐笔 fsync，只登记"脏段"，由心跳工作者每轮
+ * （≤3 s）统一 fsync。表满时写入方退回同步 fsync，不会漏。
+ */
+#define PARTWAL_CLOG_DIRTY_MAX 1024
+typedef struct ShardClogDirtyEnt
+{
+    Oid            shard;
+    uint32         segno;
+} ShardClogDirtyEnt;
+
 typedef struct PartWALCtlData
 {
     LWLock        *lock;            /* protects all fields below */
@@ -114,6 +160,16 @@ typedef struct PartWALCtlData
     int            reprov_active;   /* 正在跑的归队工作者数（并发上限见 PartDistLaunchReprovision） */
     int64          reprov_gsid[PARTWAL_REPROV_QUEUE_MAX];
     int32          reprov_target[PARTWAL_REPROV_QUEUE_MAX];
+
+    pg_atomic_uint32 clog_drop_gen;  /* 分片 clog 被 DROP 回收的代次：后端据此作废段描述符缓存 */
+    pg_atomic_uint64 relmap_gen;     /* 2026-10-17：relfilenode→分区映射的代次（登记一次 +1），后端据此作废本地缓存 */
+    slock_t        clog_dirty_mutex;
+    int            clog_ndirty;
+    ShardClogDirtyEnt clog_dirty[PARTWAL_CLOG_DIRTY_MAX];
+
+    slock_t        ckpt_mutex;
+    int            ckpt_n;
+    PartWALCkptCacheEnt ckpt[PARTWAL_CKPT_CACHE_MAX];
 
     PartWALSlot    slots[PARTWAL_BUFFER_SLOTS];
 } PartWALCtlData;
@@ -352,5 +408,7 @@ extern void  PartWALAppendMarkerForShardXid(Oid partition_id, TransactionId xid,
 extern XLogRecPtr ScanWALRangeForPartition(PartitionWALWriter *writer,
                                             XLogRecPtr start_lsn,
                                             XLogRecPtr end_lsn);
+
+extern bool PartWALXactNonShardWrite;   /* 2026-10-17：本事务写过非分片数据块（提前放锁据此禁用） */
 
 #endif /* PARTWAL_SYNC_H */

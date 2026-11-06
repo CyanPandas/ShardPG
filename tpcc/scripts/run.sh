@@ -41,7 +41,11 @@ log "起 pgbench：$TERMINALS 终端、$WAREHOUSES 仓、总时长 ${TOTAL}s（�
   "$DB" > "$OUT/pgbench.out" 2> "$OUT/pgbench.err" &
 PGB=$!
 
-snap() { QV "$COORD_HOST" "$COORD_PORT" "SELECT sum(d_next_o_id) FROM district"; }
+# 取数失败（如可重试的串行化错误）时重试，不能拿空值去算 tpmC
+snap() { local v i; for i in 1 2 3 4 5 6 7 8 9 10; do
+  v=$(QV "$COORD_HOST" "$COORD_PORT" "SELECT sum(d_next_o_id) FROM district" 2>/dev/null)
+  [[ "$v" =~ ^[0-9]+$ ]] && { echo "$v"; return 0; }; sleep 1; done
+  echo "FATAL: sum(d_next_o_id) 连续 10 次取不到" >&2; echo 0; }
 sleep "$RAMPUP_S"
 S1=$(snap); T1=$(date +%s)
 log "预热结束：sum(d_next_o_id)=$S1，开始计成绩"

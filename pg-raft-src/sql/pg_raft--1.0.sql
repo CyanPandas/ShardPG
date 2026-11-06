@@ -146,6 +146,33 @@ CREATE OR REPLACE FUNCTION dtx_decide(
 COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
     '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
 
+-- TPC-C 分支：只有一个参与节点时，master 一次往返在该节点上做完
+-- "取写集 → 选协调组 → 下发协调组 → 决议"（同一事务、一次提交）。
+-- 原来是三次往返、两次提交（note_coord 与决议各一次 fsync），夹在
+-- master 持有热行锁的提交路径里。
+-- 返回：1/2 = 决议；0 = 本节点在该事务里没写纳管分片（无需决议）；
+--       -1 = 本节点不是协调组 leader（调用方回落到常规路径）。
+CREATE OR REPLACE FUNCTION dtx_local_note_decide(p_dtxid bigint, p_commit_ts bigint)
+RETURNS integer LANGUAGE plpgsql VOLATILE AS $fn$
+DECLARE
+    parts bigint[];
+    coord bigint;
+    v     integer;
+BEGIN
+    parts := partdist.dtx_local_participant(p_dtxid);   -- 升序去重
+    IF parts IS NULL OR cardinality(parts) = 0 THEN
+        RETURN 0;
+    END IF;
+    -- 与 master 侧 parts[dtxid % nparts]（qsort 升序）同一选法
+    coord := parts[(p_dtxid % cardinality(parts)) + 1];
+    PERFORM partdist.dtx_note_coord(p_dtxid, coord);
+    v := partdist.dtx_decide(coord, p_dtxid, 1, parts, p_commit_ts);
+    IF v IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'dtx_local_note_decide: not coord leader';
+    END IF;
+    RETURN v;
+END $fn$;
+
 -- R-P4-12：把本节点该组的 apply 积压排空（leader 自追平），返回 last_applied。
 -- dtx_peek 在读表前调它——新 leader 可能尚未 apply 决议，先追平再应答。
 -- R-P4-13 绕行：本地决议行缺失时，向组内其他成员只读拉取该决议。
@@ -269,6 +296,51 @@ CREATE OR REPLACE FUNCTION pg_raft_append_entries_batch(
 
 COMMENT ON FUNCTION pg_raft_append_entries_batch(bigint, integer, bigint, bigint, bigint, bigint, bigint[], bigint, text[], text[]) IS
     'P7-N41 批量 AppendEntries：数据组一批 parwal 记录一条 RPC、对端一次 fsync。';
+
+-- 2026-10-17（路线 A）：节点地址覆盖。节点号不变、物理地址随切主迁移（备库提升接替原节点号）。
+-- 只由控制面 OP_NODE_ADDRESS 的 apply 写入；pg_raft 把它套到 pg_raft.peers 上（共享内存，维护进程定期重灌）。
+CREATE TABLE IF NOT EXISTS node_address (
+    node_id    integer PRIMARY KEY,
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    tli        integer NOT NULL DEFAULT 0   -- 接替者（被提升备库）的 WAL 时间线；旧主据此自我隔离
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_set_node_address(p_node_id integer, p_host text, p_port integer)
+    RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_set_node_address';
+
+CREATE OR REPLACE FUNCTION pg_raft_sync_node_addresses()
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_sync_node_addresses';
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_address(p_node_id integer, p_host text, p_port integer,
+                                                        p_tli integer DEFAULT 0)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_address';
+
+-- 2026-10-17（路线 A）：各节点的物理备库登记。只由控制面 OP_NODE_STANDBY 的 apply 写入；
+-- 控制面 leader 的切主控制器（pg_raft.auto_failover）据此探测主库、挑备库提升。
+CREATE TABLE IF NOT EXISTS node_standby (
+    node_id    integer NOT NULL,
+    name       text    NOT NULL,     -- 复制槽名 = application_name
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, name)
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_standby(p_node_id integer, p_name text, p_host text,
+                                                        p_port integer, p_remove boolean)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_standby';
+
+-- 2026-10-17：节点级有序复制流的接收端 —— 一条二进制消息装着 leader 发给本节点的多个组的条目，
+-- 全部组一次 fsync、随本语句事务一次提交后回 "gid term ok last;..."。
+CREATE OR REPLACE FUNCTION pg_raft_stream_apply(p_msg bytea)
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_stream_apply';
 
 CREATE OR REPLACE FUNCTION pg_raft_apply_committed()
     RETURNS boolean LANGUAGE c STRICT VOLATILE

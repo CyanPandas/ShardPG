@@ -20,6 +20,7 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "access/xact.h"
+#include "partwal_recent.h"
 
 /* ---- module-level shared-memory pointers ---- */
 PartdistSharedState *PartdistState    = NULL;
@@ -69,6 +70,9 @@ pg_partdist_shmem_request_hook(void)
 
     /* TX-TSO-MVCC P4：未决 2PC 登记表（T4.5，含持久日志重放） */
     RequestDtxPendingShmem();
+
+    /* 2026-10-16：最近写下的分区流记录缓存（按 plsn 回读的快路径） */
+    RequestPartWALRecentShmem();
 }
 
 void
@@ -143,6 +147,7 @@ pg_partdist_shmem_startup_hook(void)
     TsoClientShmemInit();
     DtxPendingShmemInit();
     GxidShmemInit();
+    PartWALRecentShmemInit();
 }
 
 /* ---- SPI helpers ---- */

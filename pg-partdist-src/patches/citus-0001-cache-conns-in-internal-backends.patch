@@ -1,0 +1,156 @@
+diff -ru a/src/backend/distributed/connection/connection_management.c b/src/backend/distributed/connection/connection_management.c
+--- a/src/backend/distributed/connection/connection_management.c	2026-10-14 19:41:51.953505953 +0000
++++ b/src/backend/distributed/connection/connection_management.c	2026-10-14 19:57:12.094492574 +0000
+@@ -10,6 +10,8 @@
+ 
+ #include "postgres.h"
+ 
++#include <poll.h>
++
+ #include "libpq-fe.h"
+ #include "miscadmin.h"
+ #include "pg_config.h"
+@@ -47,6 +49,76 @@
+ 
+ int NodeConnectionTimeout = 30000;
+ int MaxCachedConnectionsPerWorker = 1;
++
++/*
++ * ShardPG TPC-C: also cache connections opened from backends that serve an
++ * internal Citus connection. With function call delegation the transaction
++ * function runs inside such a backend on the worker; without caching, every
++ * cross-worker access opens (and the remote side forks) a new connection.
++ */
++bool CacheConnectionsInInternalBackends = false;
++
++/*
++ * ShardPG TPC-C: after a remote error aborts the transaction, a connection whose
++ * remote side is merely left in (failed) transaction state is still healthy --
++ * roll it back synchronously and keep it, instead of closing it and making the
++ * next transaction reconnect (and the worker fork a new backend). Snapshot-
++ * isolation conflicts make this the common case under contention.
++ */
++bool KeepConnectionsAfterAbort = false;
++
++static void
++TryRecoverConnectionForCaching(MultiConnection *connection)
++{
++	PGTransactionStatusType st;
++	PGresult   *res;
++
++	if (!KeepConnectionsAfterAbort || connection->pgConn == NULL ||
++		PQstatus(connection->pgConn) != CONNECTION_OK ||
++		connection->forceCloseAtTransactionEnd)
++		return;
++
++	st = PQtransactionStatus(connection->pgConn);
++	if (st == PQTRANS_ACTIVE)
++	{
++		/*
++		 * The error result was consumed but ReadyForQuery may still be in flight.
++		 * Wait briefly (bounded, ~50 ms total) for the remaining protocol messages;
++		 * give up -- and let the connection be closed as before -- if the remote
++		 * is actually still running something.
++		 */
++		int			sock = PQsocket(connection->pgConn);
++		int			waits = 0;
++
++		for (;;)
++		{
++			if (!PQconsumeInput(connection->pgConn))
++				break;
++			if (PQisBusy(connection->pgConn))
++			{
++				struct pollfd pfd;
++
++				if (sock < 0 || ++waits > 10)
++					break;
++				pfd.fd = sock;
++				pfd.events = POLLIN;
++				pfd.revents = 0;
++				(void) poll(&pfd, 1, 5);
++				continue;
++			}
++			res = PQgetResult(connection->pgConn);
++			if (res == NULL)
++				break;
++			PQclear(res);
++		}
++		st = PQtransactionStatus(connection->pgConn);
++	}
++	if (st == PQTRANS_INERROR || st == PQTRANS_INTRANS)
++	{
++		res = PQexec(connection->pgConn, "ROLLBACK");
++		PQclear(res);
++	}
++}
+ int MaxCachedConnectionLifetime = 10 * MS_PER_MINUTE;
+ 
+ HTAB *ConnectionHash = NULL;
+@@ -1491,6 +1563,9 @@
+ 		}
+ 
+ 
++		if (!isCommit)
++			TryRecoverConnectionForCaching(connection);
++
+ 		if (ShouldShutdownConnection(connection, cachedConnectionCount))
+ 		{
+ 			ShutdownConnection(connection);
+@@ -1538,7 +1613,8 @@
+ 	 * escalating the number of cached connections. We can recognize such backends
+ 	 * from their application name.
+ 	 */
+-	return (IsCitusInternalBackend() || IsRebalancerInternalBackend()) ||
++	return ((IsCitusInternalBackend() && !CacheConnectionsInInternalBackends) ||
++			IsRebalancerInternalBackend()) ||
+ 		   connection->initializationState != POOL_STATE_INITIALIZED ||
+ 		   cachedConnectionCount >= MaxCachedConnectionsPerWorker ||
+ 		   connection->forceCloseAtTransactionEnd ||
+diff -ru a/src/backend/distributed/shared_library_init.c b/src/backend/distributed/shared_library_init.c
+--- a/src/backend/distributed/shared_library_init.c	2026-10-14 19:41:51.980508740 +0000
++++ b/src/backend/distributed/shared_library_init.c	2026-10-14 19:50:51.428196142 +0000
+@@ -1940,6 +1940,31 @@
+ 		GUC_UNIT_MS | GUC_STANDARD,
+ 		NULL, NULL, NULL);
+ 
++	DefineCustomBoolVariable(
++		"citus.keep_connections_after_abort",
++		gettext_noop("Keeps healthy connections cached after a transaction abort."),
++		gettext_noop("When a remote error aborts the transaction, connections whose "
++					 "remote side is only left in a (failed) transaction are rolled "
++					 "back synchronously and kept, instead of being closed."),
++		&KeepConnectionsAfterAbort,
++		false,
++		PGC_SIGHUP,
++		GUC_STANDARD,
++		NULL, NULL, NULL);
++
++	DefineCustomBoolVariable(
++		"citus.cache_connections_in_internal_backends",
++		gettext_noop("Caches connections opened from internal Citus backends."),
++		gettext_noop("By default backends that serve an internal connection (e.g. a "
++					 "delegated function call) close every connection they open at "
++					 "transaction end. Enabling this applies the normal "
++					 "citus.max_cached_conns_per_worker rule instead."),
++		&CacheConnectionsInInternalBackends,
++		false,
++		PGC_SIGHUP,
++		GUC_STANDARD,
++		NULL, NULL, NULL);
++
+ 	DefineCustomIntVariable(
+ 		"citus.max_cached_conns_per_worker",
+ 		gettext_noop("Sets the maximum number of connections to cache per worker."),
+diff -ru a/src/include/distributed/connection_management.h b/src/include/distributed/connection_management.h
+--- a/src/include/distributed/connection_management.h	2026-10-14 19:41:51.967507398 +0000
++++ b/src/include/distributed/connection_management.h	2026-10-14 19:50:51.427196039 +0000
+@@ -272,6 +272,8 @@
+ 
+ /* maximum number of connections to cache per worker per session */
+ extern int MaxCachedConnectionsPerWorker;
++extern bool CacheConnectionsInInternalBackends;
++extern bool KeepConnectionsAfterAbort;
+ 
+ /* maximum lifetime of connections in miliseconds */
+ extern int MaxCachedConnectionLifetime;

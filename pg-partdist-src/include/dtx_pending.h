@@ -21,7 +21,7 @@
 
 #include "postgres.h"
 
-#define DTX_PENDING_MAX			128
+#define DTX_PENDING_MAX			1024	/* TPC-C 分支：128 → 1024。128 终端下待决 2PC 常态就超过 128，满了新登记被丢，读者全走全流扫描闭合 */
 #define DTX_PENDING_MAX_PAIRS	256	/* = SHARD_XID_MAX_PER_XACT（2026-10-03：16 → 256） */
 
 typedef struct DtxPendingEntry
@@ -56,6 +56,8 @@ extern int	DtxPendingSweep(void);
  * 返回 0=无从判定（不可见处置） 1=COMMIT（*cts_out 有效） 2=ABORT。
  */
 extern int	DtxReaderResolve(int64 gxid, int64 *cts_out);
+/* retry_undecided：本事务问过且协调组答"未决"的，照样再问（快照读等决议用，见 shard_visibility.c） */
+extern int	DtxReaderResolveEx(int64 gxid, int64 *cts_out, bool retry_undecided);
 extern bool DtxReaderCloseOrphan(Oid shard, bool *search_complete);
 
 /*

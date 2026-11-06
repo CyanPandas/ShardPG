@@ -12,6 +12,10 @@ for f in 02_gen_funcs.sql 04_load_funcs.sql 05_txn_funcs.sql; do
 done
 log "③ 分布 + 建 Raft 组 + 供副本 + 打标（shard_count=$SHARD_COUNT replicas=$REPLICAS）"
 QC -v shard_count="$SHARD_COUNT" -v replicas="$REPLICAS" -f "$S/03_distribute.sql" || die "接入失败"
+if [[ "${DELEGATE:-1}" == 1 && -f "$S/06_delegate.sql" ]]; then
+  log "③b 事务函数下推到 worker（create_distributed_function，按仓库号共置）"
+  QC -q -f "$S/06_delegate.sql" || die "函数下推失败"
+fi
 
 log "④ 装载 $WAREHOUSES 个仓库（并行 $LOAD_PARALLEL）"
 bash "$TPCC_DIR/scripts/load.sh" || die "装载失败"
@@ -34,7 +38,7 @@ check oorder     "SELECT count(*) FROM oorder"     "$((W*30000))"    || bad=1
 check new_order  "SELECT count(*) FROM new_order"  "$((W*9000))"     || bad=1
 check stock      "SELECT count(*) FROM stock"      "$((W*100000))"   || bad=1
 check item       "SELECT count(*) FROM item"       "100000"          || bad=1
-check order_line "SELECT count(*) = (SELECT sum(o_ol_cnt) FROM oorder) FROM order_line" "t" || bad=1
+check order_line "SELECT (SELECT count(*) FROM order_line) = (SELECT sum(o_ol_cnt) FROM oorder)" "t" || bad=1
 [[ $bad -eq 0 ]] || die "装载后行数不对"
 log "一致性基线（装载后必须全 0）"
 QC -f "$S/90_consistency.sql"

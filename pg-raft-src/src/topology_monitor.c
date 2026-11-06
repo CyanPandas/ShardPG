@@ -4,6 +4,7 @@
 
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "access/xact.h"           /* 2026-10-17：节点地址同步的短事务 */
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
@@ -310,6 +311,63 @@ pg_raft_maintenance_main(Datum main_arg)
 
         if (!pg_raft_raft_enabled)
             continue;
+
+        /*
+         * 2026-10-17（路线 A）：每 5 s 按 partdist.node_address 重灌节点地址覆盖（重启 / 切主后
+         * 第一时间生效；控制面 apply 也会直接改，这里是兜底）。本进程连着库，直接起一个短事务。
+         */
+        {
+            static TimestampTz last_addr_sync = 0;
+            TimestampTz now = GetCurrentTimestamp();
+            volatile int n_addr = 0;
+
+            if (last_addr_sync == 0 || now - last_addr_sync >= 5000 * 1000L)
+            {
+                last_addr_sync = now;
+                PG_TRY();
+                {
+                    StartTransactionCommand();
+                    n_addr = pg_raft_sync_node_addresses_internal();
+                    CommitTransactionCommand();
+                }
+                PG_CATCH();
+                {
+                    EmitErrorReport();
+                    FlushErrorState();
+                    AbortCurrentTransaction();
+                }
+                PG_END_TRY();
+                /* 有地址覆盖（切过主）才需要对齐 TSO 连接串；平时零开销 */
+                if (n_addr > 0)
+                    pg_raft_routea_reconcile_tso();
+            }
+        }
+
+        /* 2026-10-17（路线 A）：每 10 s 核对本实例是否已被新主接替（被取代的旧主自行停机） */
+        if (pg_raft_auto_failover)
+        {
+            static TimestampTz last_fence = 0;
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_fence == 0 || now - last_fence >= 10 * 1000000L)
+            {
+                pg_raft_routea_fence_check();
+                last_fence = GetCurrentTimestamp();
+            }
+        }
+
+        /* 2026-10-17（路线 A）：控制面 leader 上的自动切主（全程 libpq，不在本进程开事务） */
+        if (pg_raft_auto_failover && pg_raft_is_leader_local())
+        {
+            static TimestampTz last_fo = 0;
+            TimestampTz now = GetCurrentTimestamp();
+
+            if (last_fo == 0 || now - last_fo >= pg_raft_failover_probe_ms * 1000L)
+            {
+                pg_raft_routea_failover_tick();
+                last_fo = GetCurrentTimestamp();
+            }
+        }
 
         /*
          * 仅当本节点是 Leader 才触发控制面探测。探测较重（查 node_map + 连各

@@ -122,6 +122,11 @@ CREATE OR REPLACE FUNCTION pg_raft_report_data_leader(
 ) RETURNS bigint LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader';
 
+-- ★ P7-N58：批量登记。p_items = '[[组, 新主节点, 任期, [从副本...]], ...]'
+CREATE OR REPLACE FUNCTION pg_raft_report_data_leader_batch(p_items text)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_report_data_leader_batch';
+
 -- ------------------------------------------------------------------
 -- DTX-2PC 决议层（DTX_2PC_DESIGN.md §6）
 -- ------------------------------------------------------------------
@@ -133,12 +138,53 @@ CREATE OR REPLACE FUNCTION dtx_decide(
     p_coord_gsid bigint,
     p_dtxid bigint,
     p_verdict integer,
-    p_participants bigint[] DEFAULT NULL
+    p_participants bigint[] DEFAULT NULL,
+    p_commit_ts bigint DEFAULT 0
 ) RETURNS integer LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_decide';
 
-COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[]) IS
-    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。';
+COMMENT ON FUNCTION dtx_decide(bigint, bigint, integer, bigint[], bigint) IS
+    '在协调组 leader 上写入全局决议并等多数派持久化（=提交点）。返回最终生效的 verdict（1=COMMIT 2=ABORT 3=COMMIT 待发起方确认）；本节点不是协调组 leader 时返回 NULL，调用方按 partition_map 重新寻址。决议槽一次性：已有决议则原样返回，不覆盖。发起方在本地提交之前只能写 3（2026-10-18 方案 B）：本节点记下这笔事务的 prepared 事务作锚点，锚点提交 / 回滚即判决生效；本节点已无它的 prepared 事务则改判 ABORT。';
+
+-- TPC-C 分支：只有一个参与节点时，master 一次往返在该节点上做完
+-- "取写集 → 选协调组 → 下发协调组 → 决议"（同一事务、一次提交）。
+-- 原来是三次往返、两次提交（note_coord 与决议各一次 fsync），夹在
+-- master 持有热行锁的提交路径里。
+-- 2026-10-18（方案 B）：决议只写 verdict=3（COMMIT 待发起方确认），发起方本地提交
+-- 持久之后才生效（锚点 = 本节点这笔事务的 prepared 事务，见 partdist.dtx_verdict_effective）。
+-- 返回：3 = 待确认 COMMIT 已记下；2 = 已有 ABORT 决议；0 = 本节点在该事务里没写纳管分片
+--       （无需决议）；本节点不是协调组 leader 时报错（调用方回落到常规路径）。
+CREATE OR REPLACE FUNCTION dtx_local_note_decide(p_dtxid bigint, p_commit_ts bigint)
+RETURNS integer LANGUAGE plpgsql VOLATILE AS $fn$
+DECLARE
+    parts bigint[];
+    coord bigint;
+    v     integer;
+BEGIN
+    parts := partdist.dtx_local_participant(p_dtxid);   -- 升序去重
+    IF parts IS NULL OR cardinality(parts) = 0 THEN
+        RETURN 0;
+    END IF;
+    -- 与 master 侧 parts[dtxid % nparts]（qsort 升序）同一选法
+    coord := parts[(p_dtxid % cardinality(parts)) + 1];
+    PERFORM partdist.dtx_note_coord(p_dtxid, coord);
+    v := partdist.dtx_decide(coord, p_dtxid, 3, parts, p_commit_ts);
+    IF v IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'dtx_local_note_decide: not coord leader';
+    END IF;
+    RETURN v;
+END $fn$;
+
+-- R-P4-12：把本节点该组的 apply 积压排空（leader 自追平），返回 last_applied。
+-- dtx_peek 在读表前调它——新 leader 可能尚未 apply 决议，先追平再应答。
+-- R-P4-13 绕行：本地决议行缺失时，向组内其他成员只读拉取该决议。
+CREATE OR REPLACE FUNCTION pg_raft_group_peer_decision(p_group_id bigint, p_dtxid bigint)
+    RETURNS integer LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_peer_decision';
+
+CREATE OR REPLACE FUNCTION pg_raft_group_drain_apply(p_group_id bigint)
+    RETURNS bigint LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_drain_apply';
 
 CREATE OR REPLACE FUNCTION dtx_status(
     p_coord_gsid bigint,
@@ -182,11 +228,21 @@ CREATE OR REPLACE FUNCTION dtx_close_indoubt(
 ) RETURNS integer LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_dtx_close_indoubt';
 
+-- ★ P7-N65：本节点是该组 leader 且已提交过本任期条目、apply 追到提交点（dtx_peek 权威未决的前提）
+CREATE OR REPLACE FUNCTION pg_raft_group_leader_settled(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_leader_settled';
+
+-- ★ P7-N52（之四）：全部数据节点此刻是否都可达（读者判"找不到判决 ⇒ 未决"的前提）
+CREATE OR REPLACE FUNCTION pg_raft_all_data_peers_reachable()
+    RETURNS boolean LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_all_data_peers_reachable';
+
 COMMENT ON FUNCTION dtx_close_indoubt(oid) IS
     '对本节点该分区的 parwal 流做 in-doubt 闭合：找出有 DTX_PREPARE 而无闭合记录的 dtxid，按 登记协调组 → 本地决议索引 → 广播 peers → citus 前缀规则 的顺序全网求决议，找到即补写 DTX_COMMIT/ABORT 标记。找不到的保持 in-doubt（NOTICE 报数）。返回闭合数。升主序列在追平之后、对外服务之前调用。';
 
 COMMENT ON FUNCTION dtx_status(bigint, bigint) IS
-    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。本节点不是协调组 leader 时返回 NULL。';
+    '参与者恢复时查询决议（推定中止）：查无决议时**先写一条 ABORT 决议并达多数派**再返回 2，防止"问的时候没有、答完又被写成 COMMIT"。决议是待发起方确认的 COMMIT 且锚点仍 prepared 时，问发起方本地事务的结局（pg_dist_transaction 的行），问到返回 1/2 并推送给参与方（不写回决议行，判决随锚点生效），问不到返回 0（保持未决）。本节点不是协调组 leader 时返回 NULL。';
 
 COMMENT ON FUNCTION pg_raft_report_data_leader(bigint, integer, bigint, integer[]) IS
     '数据组新任 leader 的登记入口（须在 group 0 leader 上执行）：过任期栅栏后把 '
@@ -223,6 +279,71 @@ CREATE OR REPLACE FUNCTION pg_raft_append_entries(
 COMMENT ON FUNCTION pg_raft_append_entries IS
     'Raft AppendEntries RPC：向 follower 复制日志条目或发送心跳。';
 
+-- P7-N41（2026-10-03）：心跳按对端合并。req = "gid term prev_idx prev_term commit;..."，
+-- 回执每组一行 "gid term ok"。BGW tick 每个对端只发这一条，替代逐组逐对端的 AppendEntries 心跳。
+CREATE OR REPLACE FUNCTION pg_raft_heartbeat_multi(p_leader_id integer, p_req text)
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_heartbeat_multi';
+
+COMMENT ON FUNCTION pg_raft_heartbeat_multi(integer, text) IS
+    'P7-N41 合并心跳：一条 RPC 携带本节点作为 leader 的全部组对该 follower 的心跳。';
+
+-- P7-N41（2026-10-03）：数据组 group commit 的接收端 —— 一批连续 OP_PARWAL 条目，全批落盘后一次 fsync 再 ack。
+CREATE OR REPLACE FUNCTION pg_raft_append_entries_batch(
+    p_term bigint, p_leader_id integer, p_prev_log_index bigint, p_prev_log_term bigint,
+    p_leader_commit bigint, p_group_id bigint, p_entry_index bigint[], p_entry_term bigint,
+    p_entry_payload text[], p_entry_data_hex text[])
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_append_entries_batch';
+
+COMMENT ON FUNCTION pg_raft_append_entries_batch(bigint, integer, bigint, bigint, bigint, bigint, bigint[], bigint, text[], text[]) IS
+    'P7-N41 批量 AppendEntries：数据组一批 parwal 记录一条 RPC、对端一次 fsync。';
+
+-- 2026-10-17（路线 A）：节点地址覆盖。节点号不变、物理地址随切主迁移（备库提升接替原节点号）。
+-- 只由控制面 OP_NODE_ADDRESS 的 apply 写入；pg_raft 把它套到 pg_raft.peers 上（共享内存，维护进程定期重灌）。
+CREATE TABLE IF NOT EXISTS node_address (
+    node_id    integer PRIMARY KEY,
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    tli        integer NOT NULL DEFAULT 0   -- 接替者（被提升备库）的 WAL 时间线；旧主据此自我隔离
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_set_node_address(p_node_id integer, p_host text, p_port integer)
+    RETURNS void LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_set_node_address';
+
+CREATE OR REPLACE FUNCTION pg_raft_sync_node_addresses()
+    RETURNS integer LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_sync_node_addresses';
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_address(p_node_id integer, p_host text, p_port integer,
+                                                        p_tli integer DEFAULT 0)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_address';
+
+-- 2026-10-17（路线 A）：各节点的物理备库登记。只由控制面 OP_NODE_STANDBY 的 apply 写入；
+-- 控制面 leader 的切主控制器（pg_raft.auto_failover）据此探测主库、挑备库提升。
+CREATE TABLE IF NOT EXISTS node_standby (
+    node_id    integer NOT NULL,
+    name       text    NOT NULL,     -- 复制槽名 = application_name
+    host       text    NOT NULL,
+    port       integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, name)
+);
+
+CREATE OR REPLACE FUNCTION pg_raft_propose_node_standby(p_node_id integer, p_name text, p_host text,
+                                                        p_port integer, p_remove boolean)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_propose_node_standby';
+
+-- 2026-10-17：节点级有序复制流的接收端 —— 一条二进制消息装着 leader 发给本节点的多个组的条目，
+-- 全部组一次 fsync、随本语句事务一次提交后回 "gid term ok last;..."。
+CREATE OR REPLACE FUNCTION pg_raft_stream_apply(p_msg bytea)
+    RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_stream_apply';
+
 CREATE OR REPLACE FUNCTION pg_raft_apply_committed()
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_apply_committed';
@@ -241,6 +362,27 @@ CREATE OR REPLACE FUNCTION pg_raft_group_create_internal(
 CREATE OR REPLACE FUNCTION pg_raft_group_drop_internal(p_group_id bigint)
     RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_raft_group_drop';
+
+-- 受控切主（2026-09-18）：本节点在下一个 tick 对**这一个组**发起选举，别的组不受影响。
+-- 取代"旧主 heartbeat_ms 调大 + 目标 election_timeout 调小"这种作用于全节点所有组的做法。
+CREATE OR REPLACE FUNCTION pg_raft_group_campaign(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_campaign';
+
+-- T7.20（P7-R1）：成员变更的**安全路径**。
+-- 在此之前唯一的办法是在每个节点上各自重调 pg_raft_group_create(gid, 新成员集) ——
+-- 那是没有协调的：变更期间不同节点持有不同成员集，同一个组因此有两套不相交的
+-- 多数派定义。现在走日志：一条 CONFIG 条目复制到多数派，各节点在 append 那一刻
+-- 同步切到新成员集（Raft 论文 §4.1 的单节点变更；不做 joint consensus）。
+-- 四道门禁：必须是 leader / 成员集必须已知 / 同时只允许一个未提交的变更 /
+-- 一次只加或减一个。要"三换三"就调三次。
+CREATE OR REPLACE FUNCTION pg_raft_group_change_member(
+    p_group_id bigint, p_node_id integer, p_add boolean DEFAULT true
+) RETURNS text LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_change_member';
+
+COMMENT ON FUNCTION pg_raft_group_change_member(bigint, integer, boolean) IS
+    'T7.20/P7-R1：经 Raft 日志做成员变更（一次一个节点）。只能在该组 leader 上发起；成员集未知、已有未提交变更、一次动多个、把成员减到空，四种情形一律 ERROR。';
 
 CREATE OR REPLACE FUNCTION pg_raft_group_propose(
     p_group_id bigint, p_op_type text, p_payload text
@@ -289,6 +431,50 @@ $fn$;
 
 COMMENT ON FUNCTION pg_raft_group_create(bigint, integer[]) IS
     '创建一个数据面 Raft 组（group_id 建议取 Citus shardid）；members 为空表示全体 peers。';
+-- ★ P7-N35：本节点 raft 日志里已提交的最大数据位点（OP_PARWAL 的 partition_lsn）。
+-- 升主追平的上界要取它与 applied_part_lsn 的大者：applied 是"本地 apply 到哪"，会落后，
+-- 落后的那截里若有提交标记，升主不回放它 ⇒ 认领把那笔已确认的提交判成 ABORTED。
+CREATE OR REPLACE FUNCTION pg_raft_group_committed_plsn(p_group_id bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_committed_plsn';
+
+COMMENT ON FUNCTION pg_raft_group_committed_plsn(bigint) IS
+    'P7-N35：本节点已提交的最大数据位点（OP_PARWAL partition_lsn）；升主追平上界用它兜住 applied_part_lsn 的滞后。';
+
+CREATE OR REPLACE FUNCTION pg_raft_group_flow_stats()
+    RETURNS TABLE(
+        group_id        bigint,
+        ring_depth      bigint,   -- last_log_index - last_applied
+        ring_capacity   integer,
+        ring_full_waits bigint,   -- 因环满而背压等待的次数（>0 正常）
+        ring_full_drops bigint,   -- 背压超时后被丢弃的提案数（>0 = 可能已分叉）
+        quorum_drops    bigint,   -- 多数派不足被丢弃的条目数（>0 = 可能已分叉）
+        last_drop_plsn  bigint    -- 最近一次被丢弃的数据条目 partition_lsn
+    ) LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_flow_stats';
+
+COMMENT ON FUNCTION pg_raft_group_flow_stats() IS
+'每个 Raft 组的背压/丢弃计数（FRD §13 约束 13）。ring_full_drops 或 quorum_drops '
+'非零意味着有提案被丢弃 —— 数据组上这等于副本可能与 leader 永久分叉（leader 的'
+'物理变更如 VACUUM 尾部截断不随事务回滚），需要重做物理基线。';
+
+-- P7-W6（2026-09-15）：多数派存活探测，给分叉标记自动修复当前置判据
+CREATE OR REPLACE FUNCTION pg_raft_group_quorum_alive(p_group_id bigint)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_quorum_alive';
+
+COMMENT ON FUNCTION pg_raft_group_quorum_alive(bigint) IS
+'本节点是该组 leader，且"自己 + 最近 2 个选举超时内应答过 AppendEntries 的成员"够多数派'
+'时为 true。partdist.repair_diverged_shards() 据此决定此刻发不发物理基线（多数派缺失时'
+'发必败，且每次被拒两次提案）。';
+
+CREATE OR REPLACE FUNCTION pg_raft_group_quorum_alive_excl(p_group_id bigint, p_exclude_node integer)
+    RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_group_quorum_alive_excl';
+
+COMMENT ON FUNCTION pg_raft_group_quorum_alive_excl(bigint, integer) IS
+    '2026-10-12：同 pg_raft_group_quorum_alive，但不把 p_exclude_node 算作存活。自动归队给某成员重供基线前用：除它以外凑不齐多数派就先不发（否则基线提案拿不到票、独占复制认领位挡住写入）。';
+
 COMMENT ON FUNCTION pg_raft_group_status() IS
     '列出本节点全部活跃 Raft 组的角色/term/日志游标；group_id=0 为控制面组。'
     'base_index/base_term 是日志压缩基点（快照 last_included_*），0 表示从未压缩过；'
@@ -347,3 +533,524 @@ $fn$;
 
 COMMENT ON FUNCTION pg_raft_group_reset() IS
     '清空本节点全部数据面 Raft 组(shmem 状态 + HardState 文件 + 注册表 + 日志);控制面 group 0 不受影响。';
+
+-- ------------------------------------------------------------------
+-- 升主前置：与惰性回放 promotion 路径合流（DTX_2PC_DESIGN.md §0.0 第 6 步 a）
+-- ------------------------------------------------------------------
+--
+-- 数据组自治选举胜出之后、**向控制面上报之前**调用（调用点在
+-- raft_consensus.c 的 data_group_try_report）。返回 false 表示"还不能上报"，
+-- 调用方保留 report_pending、下个 tick 重试。
+--
+-- 为什么放在上报之前而不是 group 0 的 apply 里：
+--   a) apply 里做追平会**阻塞整个控制面** —— 惰性回放平时一条 redo 都不做，
+--      升主时的积压可能很大，group 0 是串行 apply 的，一卡全卡；
+--   b) 放在上报前，"追不平就不上报"天然等价于"追不平就不翻 pg_dist_placement"，
+--      而路由正是在 apply 里紧跟着登记翻的（raft_apply.c）。顺序天生正确。
+--
+-- 每次调用只推进最多 p_timeout_ms 毫秒（BGW tick 还要发心跳，不能久占），
+-- 没追平就返回 false 等下一 tick 继续 —— 分片切成小片，心跳不受影响。
+CREATE OR REPLACE FUNCTION pg_raft_promote_prepare_ex(
+    p_group_id BIGINT,
+    p_timeout_ms INTEGER,
+    p_force BOOLEAN)
+    RETURNS INTEGER
+    LANGUAGE plpgsql VOLATILE
+AS $promox$
+DECLARE
+    loid    OID;
+    is_armed BOOLEAN;
+    app     BIGINT;
+    bound   BIGINT;
+    got     BIGINT;
+    cur_app BIGINT;              -- P7-N70：这一片追完之后的实际回放进度
+    ndiv    BIGINT;
+    caught_up BOOLEAN := true;   -- P7-N30：本次升主是否真的追平（兜底放行时为假）
+    has_tail  BOOLEAN;           -- P7-N35：日志里还有上一任期继承来、尚未提交的尾巴
+    noop_idx  BIGINT;
+    cplsn     BIGINT;            -- P7-N35：raft 里已提交的最大数据位点
+BEGIN
+    -- 返回值三态：1 = 可以上报；0 = 还没好，稍后重试；**-1 = 分叉，永不上报**。
+    -- 三态而不是布尔，是因为"还没追平"可以被 deadline 兜底放行（可用性优先），
+    -- 而"检测到分叉"绝不能放行 —— 放行等于让一个已知与组分叉的副本当上主库。
+    loid := partdist.local_partition_for_shard(p_group_id);
+    IF loid IS NULL OR loid = 0 THEN
+        -- ★★ R-P7-1（批次 #9）：这里原本无条件 RETURN 1，注释写"本节点没有该
+        -- 分片，无事可做"。**那个假设是错的**：本函数的入参就是**这个组自己的**
+        -- 分片，拿不到本地 OID 只有一个含义 —— **本节点根本没有这个分片的副本**。
+        -- 放行等于把一个**没有任何数据**的节点选成主。
+        --
+        -- 它比 R-P4-15 拦的那一格更糟：R-P4-15 是"读到旧数据"，这是"读到空表"。
+        -- 而 R-P4-15 的判据（get_follower_applied_part_lsn > 0）恰恰挡不住它 ——
+        -- 从没被供给过的成员连字节都收不到（没有壳表 ⇒ shard_identity 里没有
+        -- 本地 OID ⇒ 字节归不了档），那个值恒为 0，守卫判否直接放行。
+        -- 实测：三成员组只供给了一个 follower，杀掉 leader 后选中的正是那个
+        -- 从未被供给的陪跑节点，新主上连表都不存在。
+        --
+        -- 返回 -1（永不放行）而不是 0（重试）：没有副本不会自己长出来，重试只是
+        -- 空转到 deadline 再被兜底放行 —— 缺陷原样回来，只是晚了一分钟。
+        -- 正解是先供给（partdist.provision_shard_replica）再让它参选。
+        -- 可用性：只排除这一个节点，同组其余**有副本**的成员照常可当选。
+        RAISE WARNING 'pg_raft: 分片 (组 %) 拒绝升主：本节点没有该分片的本地副本 '
+                      '（shard_identity 里查不到本地 OID）。从未被供给的成员当选 '
+                      '= 新主上连表都没有。请先 partdist.provision_shard_replica() '
+                      '把副本建起来再参选。', p_group_id;
+        RETURN -1;
+    END IF;
+--
+    -- ★ 第 6 步 b（§9.5）：快路径分叉的归队规则。
+    --
+    -- 必须排在 armed 判断**之前**：分叉的旧 leader 上，该分片是真表而不是
+    -- 副本壳表，多半压根没有回放槽位 —— 若先判 armed 就会直接 RETURN 1 放行，
+    -- 分叉检查形同虚设。
+    ndiv := partdist.pg_raft_check_fastpath_divergence(loid);
+    IF ndiv > 0 THEN
+        RAISE WARNING 'pg_raft: 分片 % (组 %) 检测到快路径分叉：段流里有 % 条本节点写的 '
+                      'COMMIT 标记，其事务在本地 CLOG 却不是 committed。'
+                      '本节点拒绝升主，该分片须重做物理基线后才能重新参选。',
+                      loid, p_group_id, ndiv;
+        -- 顺手把回放槽位下电（若有），避免它以"看似正常"的姿态继续参与。
+        BEGIN
+            PERFORM partdist.replay_disable(loid::regclass);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;               -- 没有槽位/已下电：无所谓
+        END;
+        RETURN -1;
+    END IF;
+--
+    SELECT s.armed, s.applied INTO is_armed, app
+      FROM partdist.replay_status() s WHERE s.shard = loid;
+    IF NOT FOUND OR is_armed IS NOT TRUE THEN
+        -- ★★ R-P4-15（2026-08-17，解冻批次 #5）★★
+        --
+        -- 原逻辑在此无条件 RETURN 1，理由是"没槽位 ⇒ 没什么要追的"。它漏掉
+        -- 了第三种情形：**曾是主、崩溃、带着陈旧数据回来的节点**。这种节点
+        -- 持有的是真表而不是副本壳表，从没被 replay_enable 过，因此天然没有
+        -- 槽位 —— 恰好走这条捷径被放行，其陈旧副本随即成为 Citus 路由目标，
+        -- 已提交的行从读取结果里消失（M5 腿实测 count 4 → 3，两次复现指纹
+        -- 逐项吻合）。
+        --
+        -- 判据取 follower_partition_map.applied_part_lsn（本节点作为 follower
+        -- **已收到并落盘**的分区 WAL 位点）。它 > 0 就意味着有记录躺在
+        -- pg_parwal 里；而"无槽位"意味着这些记录一条都没 redo 进堆 ——
+        -- 收到了却没回放，堆必然落后。实测快照（M4 每轮必现的场景）：
+        --   :5433 raft=follower 12/12/12 收=12 放=无槽位 物理行数=1
+        --   :5435 raft=leader   12/12/12 收=12 放=true/12 物理行数=2
+        -- 收的位点一样，物理行数差一行，差别全在"放"。
+        --
+        -- 为什么是 -1（永不放行）而不是 0（重试）：这种节点**没有 locmap**
+        -- （实测 pg_parwal/<oid>/ 下只有 checkpoint/fileset/freeze，正常
+        -- follower 才有 locmap），装不了槽位、追不上去。返回 0 只会空转到
+        -- pg_raft.promote_catchup_deadline_ms 的"可用性优先"兜底，然后照样
+        -- 被放行 —— 缺陷原样回来，只是晚了一分钟。它与快路径分叉同类：
+        -- 须重做物理基线才能重新参选。
+        --
+        -- 可用性：只排除这一个节点，同组其余带 locmap 的正常副本照常可当选。
+        bound := partdist.get_follower_applied_part_lsn(loid);
+        -- ★ 2026-10-12：例外 —— 本节点**从没交出主权**（仍持"已升主"记号，切主 apply 会删它），
+        --   且升主以来没落过他人写的 DATA/MARKER（foreign 记号）。那它收到的分区 WAL 全是
+        --   自己当主时写的、早就在堆里，堆不落后，可以再当主。
+        --   实测（演示二 P059）：原始 placement 主 w3 在给两个副本发全量基线的半程被改选
+        --   拉下台，两个副本都成了索引 0 字节的残缺副本、拒绝升主；w3 自己又按这条一刀切被拒 ——
+        --   三个成员全拒，整组永久无主、数据不可读写。
+        IF coalesce(bound, 0) > 0 AND partdist.shard_promoted_selfheld(loid) THEN
+            RAISE LOG 'pg_raft: 分片 % (组 %) 无回放槽位但本节点从未交出主权、收到的分区 WAL '
+                      '（到位点 %）全是自己当主时写的，放行再次升主', loid, p_group_id, bound;
+            RETURN 1;
+        END IF;
+        IF coalesce(bound, 0) > 0 THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 拒绝升主：本节点已收到分区 WAL 到位点 %，'
+                          '却没有回放槽位（这些记录一条都没 redo 进堆），堆数据必然落后。'
+                          '典型成因：本节点曾是该分片的主，崩溃后带着陈旧数据回归。'
+                          '该分片须重做物理基线（建立 locmap 并追平）后才能重新参选。',
+                          loid, p_group_id, bound;
+            RETURN -1;
+        END IF;
+        -- 确实没收到过分区 WAL：本节点一直是该组 leader，或压根没有该分片的
+        -- 副本。分叉检查已在上面做过，这里放行是安全的。
+        RETURN 1;
+    END IF;
+--
+    -- ★★ P7-N35（2026-09-20，P0：会丢已确认的提交）：先把上一任期继承来的尾巴**提交掉**，
+    --   再算追平上界。
+    --
+    --   缺陷链：旧主提交最后一笔时，数据与提交标记都已达多数派、客户端已收到成功；但从节点
+    --   要等旧主的**下一次心跳**才知道"这条已提交"。恰在这一拍里旧主宕机 ⇒ 新主日志里有这条
+    --   （Raft 领导人完备性保证），可它的"已知已提交位点"还停在前一条，于是下面的追平只追到
+    --   那里，提交标记不被回放；紧接着 ShardXidClaimOnPromote 按"流里没有提交标记 ⇒ 从未提交"
+    --   把这个分片 xid 改判 ABORTED —— **已确认的提交就此丢失**（实测：切主后那行先可见，
+    --   新主上第一次写触发认领后消失；新主流里 plsn 64 的提交标记带的正是那个 xid）。
+    --
+    --   修法用 Raft 的标准动作：新 leader 上任先提交一条**本任期**的空条目。它一提交，
+    --   上一任期的尾巴全部随之提交、被 apply，已知已提交位点自然推到尾巴末端，上界不再短。
+    --   "绝不回放未提交条目"这条不变式**没有放松** —— 是把它们变成已提交，而不是去读未提交的。
+    --   凑不齐多数派就 RETURN 0（下个 tick 重试），绝不带着短上界往下走去认领。
+    SELECT last_log_index > commit_index INTO has_tail
+      FROM partdist.pg_raft_group_status()
+     WHERE group_id = p_group_id
+     ORDER BY (state = 'leader') DESC LIMIT 1;
+    IF coalesce(has_tail, false) THEN
+        BEGIN
+            noop_idx := partdist.pg_raft_group_propose(p_group_id, 'OP_NOOP', '{}');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 提交本任期空条目失败: %', loid, p_group_id, SQLERRM;
+            noop_idx := 0;
+        END;
+        IF coalesce(noop_idx, 0) <= 0 THEN
+            -- ★ P7-N70（2026-10-05）：兜底也不放行。原来 p_force 时这里"兜底放行"，注释自己就写着
+            --   "继承来的尾巴若含提交标记，可能被认领改判" —— 那就是丢已确认的提交（N35 的同一机制）。
+            RAISE LOG 'pg_raft: 分片 % (组 %) 本任期空条目还没提交（上一任期的尾巴尚未确认提交），'
+                      '本轮不升主，下个 tick 重试（P7-N35/N70：兜底也不放行）', loid, p_group_id;
+            RETURN 0;
+        END IF;
+    END IF;
+
+    -- 追平上界取 Raft 已提交位点，绝不碰未提交条目（惰性回放的核心不变式）。
+    bound := partdist.get_follower_applied_part_lsn(loid);
+    IF bound IS NULL THEN bound := 0; END IF;
+    -- ★ P7-N35 之二：applied_part_lsn 是"本地 apply 到哪"，会落后于"已提交到哪"
+    --   （CPU 忙、事务内复制跳过推进、apply 卡锁）。落后的那截里若有提交标记，
+    --   升主不回放它 ⇒ 认领把那笔**已确认的提交**判成 ABORTED。取两者的大者：
+    --   已提交的条目按定义已被多数派持久化，回放它们不违反"不碰未提交条目"。
+    cplsn := partdist.pg_raft_group_committed_plsn(p_group_id);
+    IF coalesce(cplsn, 0) > bound THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 追平上界按已提交位点抬高：applied=% → committed=%（P7-N35）',
+                  loid, p_group_id, bound, cplsn;
+        bound := cplsn;
+    END IF;
+--
+    -- ★ P7-N4/N6（2026-09-17）：p_force = BGW 判定已过 pg_raft.promote_catchup_deadline_ms。
+    --   兜底**仍尽力追一片**，但不再以追平为前提，并且**照做下面的全部升主步骤**。
+    --   原实现的兜底是：tick 拿到 0 就直接放行上报 —— 推进 WAL 位点、闭合 in-doubt、修分叉、
+    --   认领一步都没做（放行那一轮这里 RETURN 0 了）。可分叉/无副本的 -1 检查在上面，兜底绕不过去。
+    -- ★ P7-N23（2026-09-18）：本节点仍是该分片"已升主"的前任主（主权没交出去——
+    --   中间当选的节点还没登记就丢了领导权），且升主以来没收到过他人写的 DATA/MARKER
+    --   ⇒ (app, bound] 全是本节点自己当主时写的、早已在堆里。已升主的槽位
+    --   replay_catchup 一律拒（"已升主，不再回放别人的流"），原逻辑在这里每轮 RETURN 0、
+    --   空转满 promote_catchup_deadline_ms（60 s）才走兜底 force——等待毫无收益，
+    --   却让该组 60 s 无主（扩展验收 [9] 第 2 轮实测）。收到过他人记录则照旧走追平/兜底。
+    IF bound > app AND partdist.shard_promoted_selfheld(loid) THEN
+        RAISE LOG 'pg_raft: 分片 % (组 %) 本节点仍持已升主身份且未收到他人写的记录，'
+                  '(%, %] 均为本节点当主时自写、已在堆中，跳过追平',
+                  loid, p_group_id, app, bound;
+        app := bound;
+    END IF;
+
+    IF bound > app THEN
+        BEGIN
+            got := partdist.replay_catchup(loid::regclass, bound, p_timeout_ms);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主追平 shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+            -- ★ P7-N32（2026-09-18，P0 丢数据）：流内空洞是**永久**性的——等多久都补不上，
+            --   兜底放行就是拿明知残缺的本地数据登记成主。实测（N25 回归）：原始主 A 重供后
+            --   空洞追不上，被切回、60 s 后 force 登记，协调者从此只读到 120 行（应为 180），
+            --   随后在册主 A 的心跳修复把这份残缺基线推给了健康的 B/C，丢失落地。
+            --   返回 -1 ⇒ BGW 主动让位（P7-N14），由追平了的成员当选；新主的自动归队
+            --   （P7-N25）会把回放 failed 的本节点重供基线。
+            IF SQLERRM LIKE '%流内空洞%' THEN
+                RAISE WARNING 'pg_raft: 分片 % (组 %) 回放流有空洞、永久追不上，拒绝升主'
+                              '（兜底也不放行：否则登记的是残缺数据，P7-N32）', loid, p_group_id;
+                RETURN -1;
+            END IF;
+            got := NULL;
+        END;
+        IF got IS NULL OR got < bound THEN
+            -- ★ P7-N70（2026-10-05，P0 丢数据）：**追不平就不放行**，兜底轮也一样。
+            --
+            --   原兜底（N4/N6）过了截止期就以"可用性优先"放行：追平没完成也照常认领、上报、对外服务。
+            --   确定性复现（截止期 1 ms + 冻结候选者回放进程）：①没回放的尾巴里那笔**已确认提交**
+            --   读不到（读不一致）；②认领把它的分片 xid 当无主 RUNNING 改判；③升主后回放仍在跑，
+            --   把旧主的整页镜像盖到新主正在用的页上 —— 旧主尾巴里的提交（51 号 = 515151）和升主后
+            --   新写入的提交（17 号 = 171717，分片 xid 32768 在 clog 里是已提交、元组却已不存在）
+            --   都永久丢失。惰性回放让副本积压整个任期的流，生产规模下追平超过 60 s 是常态。
+            --
+            --   现在：没追平一律返回 0，下个 tick 接着追（BGW 保持 leader，后台回放也在继续）；
+            --   兜底轮里这一片**毫无进展**（回放卡死：结构栅栏、回放进程异常等）才返回 -1 让位，
+            --   让别的成员去试 —— 不让一个永远追不上的节点死占 leader。
+            --   另一种取舍（保留放行但跳过认领、拒绝写入直到追平）记在 P7 文档 N70，留待后续。
+            -- 进度按回放槽位的实际 applied 量（超时是以异常抛出的，got 那时为 NULL，不能拿它判）
+            SELECT s.applied INTO cur_app FROM partdist.replay_status() s WHERE s.shard = loid;
+            IF p_force AND coalesce(cur_app, 0) <= coalesce(app, 0) THEN
+                RAISE WARNING 'pg_raft: 分片 % (组 %) 过了追平截止期、这一片毫无进展（applied=% → %，目标=%），'
+                              '本节点让位（P7-N70：追不平不放行）', loid, p_group_id, app, cur_app, bound;
+                RETURN -1;
+            END IF;
+            RETURN 0;           -- 这一片没追完，下个 tick 接着追（兜底轮也不放行）
+        END IF;
+    END IF;
+
+    -- ★ P7-N16（2026-09-18）：追平之后若该分片仍处在"全量物理基线半程"（收到
+    --   FULL_BASELINE 截空了本地文件、还没收到 BASELINE_END 把 FPI 灌完），本地就是
+    --   索引 0 字节的空壳，绝不能升主（升主即整片不可读、丢数据）。RETURN 0（不放行、
+    --   继续等/追）而不是 -1：FPI 已提交则追平会把它连同 BASELINE_END 一起 apply、
+    --   下一轮 pending 转假即放行；FPI 未提交则本就没有节点持有该数据，等待即正确。
+    --   force 兜底也不许绕过——空壳主比暂时无主坏得多。
+    --
+    -- ★ P7-N63（2026-10-04）：过了追平截止期（p_force）仍未收尾 ⇒ 返回 -1 让位。
+    --   上面"FPI 未提交则本就没有节点持有该数据"不成立的情形：供副本**中途**本节点被断电，
+    --   基线流断了，而前任主手里有完整数据 —— 本节点等多久都等不来 FPI，却赢了选举、
+    --   占着 leader 不让（实测组 106976 占了 10 分钟，路由停在前任主上，读写全被拒）。
+    --   让位后由有完整数据的成员当选；截止期内仍返回 0 等待（保留 N16 的原意）。
+    -- ★ P7-N64：先看磁盘事实。索引文件 0 字节 = 基线没灌完（重启会丢掉内存里的半程标记），
+    --   等多久都不会好 —— 不等截止期，直接 -1 让位，由完整的成员当选、新主重供本节点。
+    IF NOT partdist.shard_baseline_pending(loid) AND partdist.shard_local_copy_broken(loid) THEN
+        RAISE WARNING 'pg_raft: 分片 % (组 %) 本地副本残缺（索引文件 0 字节，基线未灌完），'
+                      '拒绝升主并让位（P7-N64）', loid, p_group_id;
+        RETURN -1;
+    END IF;
+    IF partdist.shard_baseline_pending(loid) THEN
+        IF p_force THEN
+            RAISE WARNING 'pg_raft: 分片 % (组 %) 全量物理基线过了追平截止期仍未收尾，'
+                          '本节点让位（P7-N63）', loid, p_group_id;
+            RETURN -1;
+        END IF;
+        RAISE LOG 'pg_raft: 分片 % (组 %) 全量物理基线未收尾（FPI 未到齐），暂不升主',
+                  loid, p_group_id;
+        RETURN 0;
+    END IF;
+--
+    -- ★★ T6.3b（解冻批次 #6）：推进本地 WAL 插入位点，越过 max_orig_lsn。
+    --
+    -- 必须排在追平**之后**（max_orig_lsn 这时才是终值），也必须排在下面任何
+    -- 本地写**之前**。不做的后果不是性能问题而是丢数据：物理回放出来的页
+    -- 带的是 leader 坐标的 LSN，升主后这些页改由本地 XLogInsert 保护；本地
+    -- 插入位点若还低于页面现有 LSN，新记录的 LSN 就小于页 LSN，本地崩溃恢复
+    -- 时 `lsn <= PageGetLSN(page)` 会把新记录当成"页面已经更新过"直接跳过。
+    --
+    -- 尽力而为：位点没推成不该把一个已追平的副本挡在升主之外（那等于用一次
+    -- 可用性事故换一个可以重试的动作），但要留下 WARNING —— 这条日志是事后
+    -- 判断"该节点升主时位点到底推没推"的唯一证词。
+    BEGIN
+        PERFORM partdist.advance_wal_past_shard(loid::regclass);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主推进 WAL 插入位点 shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+--
+    -- 追平之后才闭合 in-doubt：判决要按已回放到位的流来求，顺序不能反。
+    -- 尽力而为 —— 闭合失败不该把一个已经追平的副本挡在升主之外，
+    -- 恢复守护（dtx_recover_prepared）随后仍会周期性重试。
+    BEGIN
+        PERFORM partdist.dtx_close_indoubt(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主闭合 in-doubt shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+--
+    -- ★ 批次 #9：升主顺带修一次分叉标记。
+    --
+    -- 分叉标记是复制挂钩失败时就地写下的（§13 约束 13 的检测面，批次 #8），
+    -- 修复动作是重做物理基线。此刻是个安全的自动触发点：追平刚做完、本节点
+    -- 是组 leader（基线要走 raft 写路径）、且还没对外服务。
+    -- 尽力而为：修不动不挡升主（多数派可能还没回来），标记留着下次再修。
+    -- ★ P7-N30（2026-09-18，P0 丢数据）：上面那句"追平刚做完"在兜底放行时**不成立**。
+    --   修复 = 以本地数据为准发全量物理基线、让其余副本截断重建；本地没追平时，那等于拿
+    --   陈旧数据覆盖健康副本。实测（N25 回归）：原始主 A 流内空洞追不上，当选后 60 s 兜底，
+    --   force 这一轮顺带修复发出基线（plsn 221），副本 C 截空后按 A 的 120 行重建；随后 C
+    --   当选登记，B 任期内写的 60 行已提交数据从此不可见。没追平就不修，标记留给当上
+    --   在册主之后的心跳自动修复（repair_diverged_shards 自己也只让在册主发基线）。
+    IF caught_up THEN
+        BEGIN
+            -- ★ P7-N66：只修本分片；别的分片交给心跳自动修复，不让升主互相串等
+            PERFORM partdist.repair_diverged_shards(loid::oid);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主顺带修复分叉标记 shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+        END;
+    ELSE
+        RAISE LOG 'pg_raft: 分片 % (组 %) 兜底放行、本地未追平，跳过升主顺带的分叉修复'
+                  '（从落后数据发基线会覆盖健康副本，P7-N30）', loid, p_group_id;
+    END IF;
+--
+    -- ★★ T6.4（解冻批次 #6）：§6.6 第三支，切主认领。
+    --
+    -- 顺序要害：**必须排在 dtx_close_indoubt 之后**。认领的判据是"流里没有
+    -- 提交标记 ⇒ 从未提交过 ⇒ 改 ABORTED"，而未决的 2PC 分片 xid 在
+    -- follower 上是 TXN_PREPARED（回放的 XLOG_XACT_PREPARE 分支写的），
+    -- 认领本身不动 PREPARED；先闭合是为了让**有决议的**先落成终局，
+    -- 剩下的才交给认领兜底。反过来做，语义上仍不会误伤（PREPARED 受保护），
+    -- 但会把本可立刻定案的事务多晾一轮。
+    --
+    -- 同样尽力而为：认领失败不挡升主，但留 WARNING。未认领的后果是那些
+    -- 无主 RUNNING 继续挂着（未决即不可见，方向安全），下轮仍有机会。
+    BEGIN
+        -- ★ P7-N18（之二）：认领之前先把"已复制、未 apply 的尾巴"里出现过的分片 xid 吸收进水位。
+        -- 双重快切 + 可用性放行时 applied 远落后于 flush，那截 DATA 记录的分片 xid 既不在水位、
+        -- 也不在影子（还没 redo）⇒ 不吸收就会重发旧号、老元组复活成重复行（N18 实测账户被复读）。
+        -- 从本节点回放 applied 游标扫到 flush；下界以下的号 redo 时已进影子。认领紧随其后，把这些
+        -- 号里没有提交标记的一并改判 ABORTED。
+        BEGIN
+            PERFORM partdist.shard_absorb_tail_xids(
+                        loid,
+                        LEAST(partdist.get_follower_applied_part_lsn(loid),
+                              coalesce((SELECT s.applied FROM partdist.replay_status() s
+                                          WHERE s.shard = loid), 0)),
+                        partdist.get_partition_flush_lsn(loid));
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'pg_raft: 升主吸收尾巴分片 xid shard % (组 %) 失败: %',
+                          loid, p_group_id, SQLERRM;
+        END;
+        PERFORM partdist.shard_claim_on_promote(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_raft: 升主认领无主 RUNNING shard % (组 %) 失败: %',
+                      loid, p_group_id, SQLERRM;
+    END;
+--
+    -- ★ P7-N31：即将上报登记。标记"升主在途"，让读闸门在本地登记 apply 之前等一等而不是拒读。
+    BEGIN
+        PERFORM partdist.shard_mark_promotion_pending(loid::oid);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+    RETURN 1;
+END
+$promox$;
+
+COMMENT ON FUNCTION pg_raft_promote_prepare_ex(BIGINT, INTEGER, BOOLEAN) IS
+    '升主前置（P7-N4 起 BGW 调这个）。p_force=false 与 pg_raft_promote_prepare 相同：没追平返回 0。p_force=true 由 BGW 在超过 pg_raft.promote_catchup_deadline_ms 后传入：仍尽力追一片，但不再以追平为前提，推进 WAL 位点/闭合 in-doubt/修分叉/认领照做，然后返回 1（可用性优先放行）；分叉或无副本仍返回 -1，兜底绕不过。';
+
+CREATE OR REPLACE FUNCTION pg_raft_promote_prepare(
+    p_group_id BIGINT,
+    p_timeout_ms INTEGER DEFAULT 2000)
+    RETURNS INTEGER
+    LANGUAGE sql VOLATILE
+AS $promow$
+    -- P7-N4：逻辑搬进 pg_raft_promote_prepare_ex；保留原签名供运维与旧用例调用（不兜底）
+    SELECT partdist.pg_raft_promote_prepare_ex(p_group_id, p_timeout_ms, false);
+$promow$;
+
+COMMENT ON FUNCTION pg_raft_promote_prepare(BIGINT, INTEGER) IS
+    '升主前置：先查快路径分叉，再确认"无槽位"不是"带陈旧数据的旧主回归"（R-P4-15），然后把本节点该分片的物理回放追平到 Raft 已提交位点；追平后依次推进本地 WAL 插入位点越过 max_orig_lsn（T6.3b，不做则升主后写入会在一次本地崩溃后被 lsn<=PageGetLSN 跳过而消失）、闭合 in-doubt 分布式事务、认领无主 RUNNING 改判 ABORTED（T6.4，§6.6 第三支）。后三步均尽力而为、失败只 WARNING 不挡升主。返回 1=可上报，0=尚未就绪（可重试，超时后按可用性优先放行），-1=分叉或收到了却回放不了（永不放行，须重做物理基线）。';
+
+-- ------------------------------------------------------------------
+-- 快路径分叉检测（DTX_2PC_DESIGN.md §9.5，第 6 步 b）
+-- ------------------------------------------------------------------
+--
+-- **要检测的窗口**：单分区（快路径）事务沿用 `[A] → quorum → [B]` 时序 ——
+-- 记录与 COMMIT 标记先达组内多数派，leader 本地的 [B]（pg_wal 提交记录 fsync）
+-- 之后才发生。leader 在这两步之间崩溃 ⇒ **组内认为已提交、leader 本地事务却
+-- 中止** ⇒ 旧 leader 与自己的组分叉。
+--
+-- **怎么检测**：段流里的 COMMIT 标记是"本组认为这笔事务提交了"的凭据，
+-- 而本地 CLOG 是"本节点认为它提交了没有"的凭据。两者对同一个 xid 给出相反
+-- 答案，就是分叉的**直接证据**，不需要比对页面。
+--
+-- 只查**本节点写的**标记（gxid 高 16 位 = 本节点 Citus group id）：别的节点
+-- 写的标记，其 xid 在本地 CLOG 里根本没有意义。
+--
+-- **从流尾往回扫，遇到第一个"本地确实提交了"的标记就停**：那笔事务的 [B]
+-- 已经完成，比它更早的事务不可能停在 [A]-[B] 之间。所以扫描量与分叉深度同阶，
+-- 正常情况下第一条就停。p_max_scan 只是防御性上限。
+CREATE OR REPLACE FUNCTION pg_raft_check_fastpath_divergence(
+    p_loid OID,
+    p_max_scan INTEGER DEFAULT 200)
+    RETURNS BIGINT
+    LANGUAGE plpgsql STABLE
+AS $div$
+DECLARE
+    tip      BIGINT;
+    self_gid INTEGER;
+    i        BIGINT;
+    scanned  INTEGER := 0;
+    ndiv     BIGINT  := 0;
+    rec      RECORD;
+    nid      INTEGER;
+    lo       BIGINT;
+    st       TEXT;
+    cur_full BIGINT;
+    full_xid BIGINT;
+BEGIN
+    SELECT groupid INTO self_gid FROM pg_dist_local_group;
+    IF self_gid IS NULL THEN RETURN 0; END IF;
+
+    -- pg_xact_status 接的是 **xid8**（64 位 full xid），而 gxid 低位存的是
+    -- 32 位 TransactionId。要按当前 epoch 还原，不能硬转：epoch 边界上
+    -- 硬转会查到隔了一整个 epoch 的另一笔事务的判决。
+    cur_full := pg_current_xact_id()::text::bigint;
+
+    tip := partdist.get_partition_flush_lsn(p_loid);
+    IF tip IS NULL OR tip <= 0 THEN RETURN 0; END IF;
+
+    i := tip;
+    WHILE i >= 1 AND scanned < p_max_scan LOOP
+        scanned := scanned + 1;
+        BEGIN
+            SELECT r.flags, r.info, r.gxid, r.data INTO rec
+              FROM partdist.partwal_read_record(p_loid, i) r;
+        EXCEPTION WHEN OTHERS THEN
+            EXIT;                       -- 读不出来（截断/损坏）：不再往前
+        END;
+
+        -- ★★ T7.14（P7-E3）2026-09-11：遇到**物理基线**即停 —— 它之前的记录
+        --   已被基线取代，不可能再造成分叉。
+        --
+        --   为什么非加不可：此前本函数只管从流尾往前扫，**完全不看基线**。
+        --   于是快路径分叉一旦发生就**没有任何归队路径** —— 重做物理基线之后
+        --   判据依然是 1、promote_prepare 依然返回 -1（永不放行），该副本被
+        --   永久判死，等于那个分片从此少一个副本。实测：基线发射成功
+        --   （base_plsn=35）而 d 仍为 1。
+        --   计划里"分叉是既成事实，**只有重做物理基线才行**"这句话，在本次
+        --   实装前是**不成立**的 —— 基线做了也不消除。现在才名副其实。
+        --
+        --   判据是 FILESET_UPDATE(opcode=0x01) 且载荷 flags 含 FULL_BASELINE
+        --   (0x0002)；载荷布局见 PartWALCtrlFilesetUpdate：nrels(4B) + flags(2B)，
+        --   故 flags 在偏移 4 的两字节小端。基线之后 follower 从新游标起放，
+        --   陈旧 COMMIT 标记永远不会被重放，所以"基线之前"确实与分叉无关。
+        IF rec.flags = 4 AND rec.info = 1
+           AND rec.data IS NOT NULL AND length(rec.data) >= 6
+           AND ((get_byte(rec.data, 5) << 8) | get_byte(rec.data, 4)) & 2 <> 0 THEN
+            EXIT;
+        END IF;
+
+        -- flags=2 MARKER, info=0 XLOG_XACT_COMMIT
+        IF rec.flags = 2 AND rec.info = 0 THEN
+            nid := (rec.gxid >> 48)::int;
+            lo  := rec.gxid & ((1::bigint << 48) - 1);
+            IF nid = self_gid AND lo > 0 THEN
+                full_xid := cur_full - (cur_full % 4294967296) + lo;
+                IF full_xid > cur_full THEN
+                    full_xid := full_xid - 4294967296;   -- 属上一个 epoch
+                END IF;
+                BEGIN
+                    st := pg_xact_status(full_xid::text::xid8);
+                EXCEPTION WHEN OTHERS THEN
+                    st := NULL;         -- xid 已过 CLOG 截断点：无从判定，跳过
+                END;
+                IF st IS NULL THEN
+                    NULL;
+                ELSIF st = 'committed' THEN
+                    EXIT;               -- [B] 已完成，更早的不可能分叉
+                ELSE
+                    ndiv := ndiv + 1;   -- 流说提交、本地说没有 ⇒ 分叉
+                END IF;
+            END IF;
+        END IF;
+        i := i - 1;
+    END LOOP;
+
+    RETURN ndiv;
+END
+$div$;
+
+COMMENT ON FUNCTION pg_raft_check_fastpath_divergence(OID, INTEGER) IS
+    '检测快路径分叉：段流里本节点写的 COMMIT 标记，其 xid 在本地 CLOG 却不是 committed。返回分叉条数，0 表示无分叉。';
+
+-- 2026-10-19：TSO 随控制面 leader 发号（pg_partdist.tso_raft = on；见 raft_consensus.c 末尾的设计说明）
+CREATE OR REPLACE FUNCTION pg_raft_tso_lease_check(p_term bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_lease_check';
+COMMENT ON FUNCTION pg_raft_tso_lease_check(bigint) IS
+'返回本节点控制面的当前任期。TSO 发号者（控制面 leader）每 100 ms 问一圈，过半数回答 <= 它的任期就续租。';
+
+CREATE OR REPLACE FUNCTION pg_raft_tso_takeover(p_term bigint, p_batch bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_takeover';
+COMMENT ON FUNCTION pg_raft_tso_takeover(bigint, bigint) IS
+'新 leader 接任发号：屏障条目 → 以已 apply 的最大预留上界为起点 → 预留一批 → 开始发号。由 TSO 管理进程在等满租约期后调用。';
+
+CREATE OR REPLACE FUNCTION pg_raft_tso_extend(p_term bigint, p_batch bigint)
+    RETURNS bigint LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_raft_tso_extend';
+COMMENT ON FUNCTION pg_raft_tso_extend(bigint, bigint) IS
+'发号者续批：经控制面日志预留下一批号，返回新上界。';

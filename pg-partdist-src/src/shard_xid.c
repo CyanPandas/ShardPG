@@ -25,6 +25,7 @@
 
 #include "access/shard_stamp.h"
 #include "access/twophase_rmgr.h"
+#include "shard_wal.h"			/* 2026-10-17：PREPARED / 判决记 WAL */
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "executor/spi.h"
@@ -33,6 +34,7 @@
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "storage/fd.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"		/* P7-N40：孤儿登记 GC 判"表还在不在" */
 #include "access/xlog.h"			/* T7.22：GetXLogInsertRecPtr */
 #include "storage/ipc.h"
@@ -44,6 +46,8 @@
 #include "access/relation.h"		/* T7.30：relation_open */
 #include "storage/bufmgr.h"			/* T7.30：RelationGetNumberOfBlocks */
 #include "utils/builtins.h"			/* T7.30：cstring_to_text */
+
+bool		shard_diag_visibility = false;	/* 2026-10-17 诊断：见 pg_partdist.diag_visibility */
 
 /*
  * 回卷护栏：P1 不处理 32 位分片 xid 回卷（设计 §7 推 P5），逼近上限直接
@@ -125,6 +129,8 @@ typedef struct ShardXidSlot
 	TransactionId vacuum_xid;	/* 两态恢复标记，>= trunc_before */
 	/* TPC-C 分支：自动启动器按 trigger_age 最近一次接手本分片的时刻（限流用） */
 	TimestampTz auto_vacuum_at;
+	/* TPC-C 分支：最近一次接手时的页数（按大小放宽间隔，见 ShardXidOverdueShards） */
+	BlockNumber auto_vacuum_pages;
 } ShardXidSlot;
 
 /*
@@ -167,6 +173,13 @@ typedef struct ShardXidState
 	uint32		vacuum_cursor;
 
 	/*
+	 * TPC-C 分支：槽位"身份/截断水位"代数。建槽、释放槽、改截断水位时加一；
+	 * 发号不动它。读侧（可见性判定的每次缓存未命中）据此在后端本地缓存
+	 * 截断水位与"已认领"，不必每次拿全局 ShardXidCtl 锁线性扫 256 个槽。
+	 */
+	pg_atomic_uint64 wm_gen;
+
+	/*
 	 * T2.7 partition_map 驱动门控：已登记打标的表 OID 集合。真相 =
 	 * partition_map.shard_mvcc 列（注册函数写）；本集合是运行时判定用的
 	 * 影子，重启时由 ShardXidShmemInit 扫 pg_shard_xid/ 目录重建（注册即
@@ -200,6 +213,39 @@ static struct
 	TransactionId sxid;
 }			xact_map[SHARD_XID_MAX_PER_XACT];
 static int	xact_map_n = 0;
+
+/*
+ * 补丁 0014 提前放锁：本次提交待刷盘后才写的分片判决（XACT_EVENT_COMMIT 里
+ * 拷出来 —— 那之后 xact_map 与 TSO 暂存都会被清掉）。
+ */
+static struct
+{
+	Oid			shard;
+	TransactionId sxid;
+}			elr_map[SHARD_XID_MAX_PER_XACT];
+static int	elr_map_n = 0;
+static int64 elr_cts = 0;
+static MemoryContext elr_cxt = NULL;
+
+/* 内核在 CommitTransaction 末尾 XLogFlush 之后调（事务已结束，不访问目录） */
+static void
+shard_elr_post_flush(void)
+{
+	MemoryContext old;
+	int			i;
+
+	if (elr_map_n == 0)
+		return;
+	if (elr_cxt == NULL)
+		elr_cxt = AllocSetContextCreate(TopMemoryContext, "pg_partdist elr",
+										ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(elr_cxt);
+	for (i = 0; i < elr_map_n; i++)
+		ShardCommitMarkEndedTs(elr_map[i].shard, elr_map[i].sxid, true, elr_cts);
+	elr_map_n = 0;
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(elr_cxt);
+}
 
 /*
  * 后端本地 TOAST→属主 映射（会话生存期）。
@@ -272,14 +318,43 @@ shard_mvcc_set_contains(Oid relid)
 	if (n == 0)
 		return false;
 
-	LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
-	for (i = 0; i < ShardXidCtl->mvcc_n; i++)
-		if (ShardXidCtl->mvcc_set[i] == relid)
+	/*
+	 * ★ TPC-C 分支：后端本地结果缓存（含否定结果）。本函数在每个元组的可见性
+	 * 判定里都要调，原先每次都拿 ShardXidCtl->lock —— 128 终端实测是 worker 上
+	 * 一处可见的锁等待。集合只在打标 / 摘标时变，以成员数作版本：变了整表作废。
+	 */
+	{
+#define MVCC_CACHE_MAX 512
+		static Oid	mc_rel[MVCC_CACHE_MAX];
+		static bool mc_val[MVCC_CACHE_MAX];
+		static int	mc_n = 0;
+		static int	mc_ver = -1;
+
+		if (mc_ver != n)
 		{
-			found = true;
-			break;
+			mc_n = 0;
+			mc_ver = n;
 		}
-	LWLockRelease(ShardXidCtl->lock);
+		for (i = 0; i < mc_n; i++)
+			if (mc_rel[i] == relid)
+				return mc_val[i];
+
+		LWLockAcquire(ShardXidCtl->lock, LW_SHARED);
+		for (i = 0; i < ShardXidCtl->mvcc_n; i++)
+			if (ShardXidCtl->mvcc_set[i] == relid)
+			{
+				found = true;
+				break;
+			}
+		LWLockRelease(ShardXidCtl->lock);
+
+		if (mc_n < MVCC_CACHE_MAX)
+		{
+			mc_rel[mc_n] = relid;
+			mc_val[mc_n] = found;
+			mc_n++;
+		}
+	}
 	return found;
 }
 
@@ -864,6 +939,7 @@ ShardVacuumSetWatermarks(Oid shard, TransactionId trunc_before,
 								trunc_before, vacuum_xid);
 	slot->trunc_before = trunc_before;
 	slot->vacuum_xid = vacuum_xid;
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	LWLockRelease(ShardXidCtl->lock);
 }
 
@@ -941,8 +1017,10 @@ shard_xid_slot_attach(Oid shard, int *nclaimed)
 	free_slot->trunc_before = slot_trunc_before;
 	free_slot->vacuum_xid = slot_vacuum_xid;
 	free_slot->auto_vacuum_at = 0;
+	free_slot->auto_vacuum_pages = 0;
 	/* relid 最后置：上面 ERROR 的话槽位仍是空的 */
 	free_slot->shard_relid = shard;
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	return free_slot;
 }
 
@@ -1061,13 +1139,21 @@ ShardXidOverdueShards(Oid *shards, TransactionId *ages, int max)
 			age = shard_xid_age_locked(slot);
 			if (age < (TransactionId) shard_vacuum_max_age)
 			{
-				/* TPC-C 分支：回收触发（见 shard_vacuum_trigger_age 的注释） */
+				/*
+				 * TPC-C 分支：回收触发（见 shard_vacuum_trigger_age 的注释）。
+				 * 间隔按上次的页数放宽：每 2048 页一个基本间隔。页面趟是整表扫，
+				 * 大而少改的表（order_line 一个分片 2 万页）每 5 s 扫一遍纯属浪费，
+				 * 还占着单线程启动器，让小而热的表（district/warehouse 几百页、
+				 * 每秒几百次更新）排到 30 s 一轮，死版本链越拖越长。
+				 */
+				int			mult = 1 + (int) (slot->auto_vacuum_pages / 2048);
+
 				if (shard_vacuum_trigger_age <= 0 ||
 					age < (TransactionId) shard_vacuum_trigger_age ||
 					(slot->auto_vacuum_at != 0 &&
 					 !TimestampDifferenceExceeds(slot->auto_vacuum_at,
 												 GetCurrentTimestamp(),
-												 shard_vacuum_trigger_interval_s * 1000)))
+												 shard_vacuum_trigger_interval_s * 1000 * mult)))
 					continue;
 			}
 			shards[n] = slot->shard_relid;
@@ -1121,7 +1207,7 @@ ShardXidTwoStateShards(Oid *shards, int max)
  * 只在真正处理时调（计数路径不调，否则计数本身就把限流窗口刷新了）。
  */
 void
-ShardXidNoteAutoVacuum(Oid shard)
+ShardXidNoteAutoVacuum(Oid shard, BlockNumber pages)
 {
 	int			i;
 
@@ -1132,6 +1218,8 @@ ShardXidNoteAutoVacuum(Oid shard)
 		if (ShardXidCtl->slots[i].shard_relid == shard)
 		{
 			ShardXidCtl->slots[i].auto_vacuum_at = GetCurrentTimestamp();
+			if (pages != InvalidBlockNumber)
+				ShardXidCtl->slots[i].auto_vacuum_pages = pages;
 			break;
 		}
 	LWLockRelease(ShardXidCtl->lock);
@@ -1162,14 +1250,14 @@ shard_xid_allocate(Oid shard)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_partdist 分片 xid 共享内存未初始化")));
 
-	LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
-
-	slot = shard_xid_slot_attach(shard, NULL);
-
-	shard_xid_wraparound_gate(shard, slot);
-
 	for (;;)
 	{
+		LWLockAcquire(ShardXidCtl->lock, LW_EXCLUSIVE);
+
+		slot = shard_xid_slot_attach(shard, NULL);
+
+		shard_xid_wraparound_gate(shard, slot);
+
 		if (slot->next_xid >= SHARD_XID_HARD_LIMIT)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -1187,17 +1275,22 @@ shard_xid_allocate(Oid shard)
 
 		result = slot->next_xid++;
 
+		LWLockRelease(ShardXidCtl->lock);
+
 		/*
 		 * T2.5 终局槽跳过守卫：clog 里已有判决的号 = 某段历史已经用过它
 		 * （水位文件缺失/落后才会走到），跳过绝不重发——重发会让新事务的
-		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过；
-		 * 每次分配多一次 pread、无 fsync，可接受。
+		 * 结局"复活"同号历史元组。正常路径槽位是洞（RUNNING），一次通过。
+		 *
+		 * ★ TPC-C 分支：pread 挪到锁外。号的唯一性只靠计数器（锁内已 ++），
+		 * 这一步只决定"这个号要不要跳过"；跳过就回头再领一个，被跳的号作废。
+		 * 原先每次分配都在全局排他锁里做一次 pread，所有分片的发号与读侧水位
+		 * 查询都排在它后面。
 		 */
 		if (ShardClogReadStatus(shard, result) == TXN_RUNNING)
 			break;
 	}
 
-	LWLockRelease(ShardXidCtl->lock);
 	return result;
 }
 
@@ -1511,6 +1604,22 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 {
 	int			i;
 
+	/*
+	 * 补丁 0014：本事务读到过"已放锁待刷盘"的版本 ⇒ 结束前刷到它们的提交记录。
+	 * 本事务自己走了提前放锁时不必在这里刷（还持着锁）：自己的提交记录排在
+	 * 那些之后，CommitTransaction 末尾那次刷盘一并覆盖。
+	 */
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+		event == XACT_EVENT_PREPARE || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		XLogRecPtr	obs = ShardElrTakeObservedLsn();
+
+		if (obs != InvalidXLogRecPtr &&
+			!(event == XACT_EVENT_COMMIT && shard_elr_pending_lsn >= obs))
+			XLogFlush(obs);
+	}
+
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
@@ -1564,6 +1673,27 @@ shard_xid_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			if (shard_elr_pending_lsn != InvalidXLogRecPtr && xact_map_n > 0 &&
+				event == XACT_EVENT_COMMIT)
+			{
+				/*
+				 * 补丁 0014：提交记录已插入未刷盘 —— 判决推迟到刷盘后
+				 * （shard_elr_post_flush），活跃表条目先标"已放锁待刷盘"。
+				 */
+				elr_cts = TsoStashedCommitTs();
+				for (i = 0; i < xact_map_n; i++)
+				{
+					ShardCommitMarkElrDone(xact_map[i].shard, xact_map[i].sxid,
+										   shard_elr_pending_lsn);
+					elr_map[i].shard = xact_map[i].shard;
+					elr_map[i].sxid = xact_map[i].sxid;
+				}
+				elr_map_n = xact_map_n;
+				xact_map_n = 0;
+				ShardClogAtCommit();
+				TsoClientClearActive();
+				break;
+			}
 			/* 先翻临时提交表（删除条目=提交点，P1 桩），再清映射 */
 			for (i = 0; i < xact_map_n; i++)
 				ShardCommitMarkEnded(xact_map[i].shard, xact_map[i].sxid, true);
@@ -1690,6 +1820,39 @@ ShardXidDefineGUCs(void)
 		GUC_UNIT_S, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"pg_partdist.early_lock_release",
+		"同步提交的事务先放行锁、回复客户端前再刷 WAL（内核补丁 0014，默认 off）。",
+		"客户端收到的提交仍然持久：刷盘完成才回复。热行上的后继写者不必等前者的 "
+		"fsync（它自己的提交记录排在后面，刷盘必然连带）；快照读等分片判决落地，"
+		"判决在刷盘之后才写，读者看不到可能因崩溃丢失的数据。",
+		&shard_early_lock_release,
+		false,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"pg_partdist.diag_visibility",
+		"诊断：把分片表 Dirty / 更新判定里\"判不可见、TM_Invisible、当作已删除\"的决定打进日志（每后端每类限 30 条）。",
+		NULL,
+		&shard_diag_visibility,
+		false,
+		PGC_SIGHUP,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"pg_partdist.rc_update_recheck",
+		"READ COMMITTED 事务改分片表时，遇并发已提交的新版本按原生 EPQ 重评（默认 off）。",
+		"off = 快照隔离 first-committer-wins：目标行在本事务快照之后被改过即 40001。"
+		"on = 仅对 READ COMMITTED 事务：UPDATE/DELETE/SELECT FOR UPDATE 顺更新链锁住"
+		"最新已提交版本、重评 WHERE 后再改（与原生 PG 的 RC 写语义一致，不丢更新）；"
+		"读仍用事务开始时的 TSO 快照。REPEATABLE READ / SERIALIZABLE 不受影响。"
+		"需要内核补丁 0012。",
+		&shard_rc_follow_updates,
+		false,
+		PGC_USERSET,
+		0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"pg_partdist.shard_vacuum_truncate",
 		"分片 vacuum 的尾部截断（T7.18/P7-V2）。",
 		"三类页面动作干净收尾后，把尾部连续空页还给文件系统。抢不到排他锁就"
@@ -1751,6 +1914,7 @@ ShardXidShmemInit(void)
 		memset(ShardXidCtl->shadow, 0, sizeof(ShardXidCtl->shadow));
 		memset(ShardXidCtl->mvcc_set, 0, sizeof(ShardXidCtl->mvcc_set));
 		ShardXidCtl->mvcc_n = 0;
+		pg_atomic_init_u64(&ShardXidCtl->wm_gen, 1);
 		ShardXidCtl->logical_fence_lsn = ShardLogicalFenceLoad();
 		ShardXidCtl->lock =
 			&GetNamedLWLockTranche("pg_partdist_shard_xid")[0].lock;
@@ -1863,7 +2027,60 @@ ShardXidSlotRelease(Oid relid)
 		if (ShardXidCtl->shadow[i].shard_relid == relid)
 			memset(&ShardXidCtl->shadow[i], 0, sizeof(ShardXidShadow));
 	}
+	pg_atomic_fetch_add_u64(&ShardXidCtl->wm_gen, 1);
 	LWLockRelease(ShardXidCtl->lock);
+}
+
+/*
+ * TPC-C 分支：可见性判定用的"认领 + 截断水位"快路径。等价于先
+ * ShardXidEnsureClaimed(shard) 再 ShardVacuumGetWatermarks(shard, &tb, NULL)，
+ * 但在代数没变时直接用后端本地缓存（一次原子读，不拿锁）。先读代数再取值：
+ * 取值期间若有变化，存下的是旧代数，下一次必然重取 —— 不会用到比真实更旧的水位
+ * 而又以为是新的。
+ */
+#define WM_CACHE_N 64
+static struct
+{
+	Oid			shard;
+	uint64		gen;
+	TransactionId trunc_before;
+}			wm_cache[WM_CACHE_N];
+
+TransactionId
+ShardXidClaimedTruncBefore(Oid shard)
+{
+	uint64		gen;
+	int			i,
+				h;
+	TransactionId tb;
+
+	if (ShardXidCtl == NULL)
+		return InvalidTransactionId;
+	gen = pg_atomic_read_u64(&ShardXidCtl->wm_gen);
+	h = (int) (shard % WM_CACHE_N);
+	for (i = 0; i < WM_CACHE_N; i++)
+	{
+		int			k = (h + i) % WM_CACHE_N;
+
+		if (wm_cache[k].shard == shard)
+		{
+			if (wm_cache[k].gen == gen)
+				return wm_cache[k].trunc_before;
+			h = k;
+			break;
+		}
+		if (wm_cache[k].shard == InvalidOid)
+		{
+			h = k;
+			break;
+		}
+	}
+	(void) ShardXidEnsureClaimed(shard);
+	ShardVacuumGetWatermarks(shard, &tb, NULL);
+	wm_cache[h].shard = shard;
+	wm_cache[h].gen = gen;
+	wm_cache[h].trunc_before = tb;
+	return tb;
 }
 
 /*
@@ -2171,9 +2388,6 @@ shard_at_prepare_impl(void)
 	gxid = TsoCurrentGxid();
 	sts = TsoGetStartTs();
 
-	for (i = 0; i < xact_map_n; i++)
-		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
-
 	sz = offsetof(ShardTwoPhasePayload, pairs) +
 		(Size) xact_map_n * 2 * sizeof(uint32);
 	p = (ShardTwoPhasePayload *) palloc(sz);
@@ -2187,15 +2401,35 @@ shard_at_prepare_impl(void)
 		p->pairs[2 * i] = (uint32) xact_map[i].shard;
 		p->pairs[2 * i + 1] = (uint32) xact_map[i].sxid;
 	}
-	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
 
 	/*
 	 * T4.5：未决登记（OPEN fsync 先于 EndPrepare 的 WAL 刷盘 ⇒
 	 * "prepared 存在 ⇒ 登记必在"）。判决落分片 clog 时才注销——
 	 * COMMIT PREPARED 不注销（终局等决议）。
+	 *
+	 * ★ TPC-C 分支：登记挪到槽位写 PREPARED **之前**。原顺序是先写槽、后登记，
+	 * 读者落在两者之间就看到"槽 PREPARED、本机无登记"（DtxReaderResolve 返回 3），
+	 * 随即远程触发就地 in-doubt 闭合 —— 那要把分区流从头扫一遍找 DTX 记录。
+	 * 128 终端实测 n2 上 PREPARE 近 4000 次、闭合一次都没找到东西，却吃掉 1/3 的
+	 * 采样。先登记后写槽：读者要么看到 RUNNING（不可见、走活跃表），要么看到
+	 * PREPARED 且登记已在（正常问协调组）。PREPARE 若在此之后失败，中止回调把槽
+	 * 写成 ABORTED，清扫按残渣注销登记。
 	 */
 	DtxPendingRegister(gxid, p->coord_gsid, p->dtxid, sts,
 					   xact_map_n, p->pairs);
+
+	for (i = 0; i < xact_map_n; i++)
+	{
+		ShardClogSetPrepared(xact_map[i].shard, xact_map[i].sxid, sts, gxid);
+	}
+
+	/*
+	 * 2026-10-17（路线 A）：PREPARED 落账也记一条 WAL，排在 PREPARE 记录之前，随 EndPrepare
+	 * 的刷盘与同步复制等待一起持久。物理备库据此重建槽位与未决登记，切主后仍能问决议。
+	 */
+	(void) ShardWalLogPrepared(gxid, p->coord_gsid, p->dtxid, sts, xact_map_n, p->pairs);
+
+	RegisterTwoPhaseRecord(TWOPHASE_RM_SHARD_ID, 0, p, (uint32) sz);
 	pfree(p);
 }
 
@@ -2277,6 +2511,14 @@ shard_twophase_postabort_impl(TransactionId xid, uint16 info,
 
 	if (!shard_twophase_parse(recdata, len, &hdr, &pairs_base))
 		return;
+	/* 2026-10-17（路线 A）：中止判决也记 WAL（备库回放 ROLLBACK PREPARED 不会调本回调） */
+	{
+		uint32	   *pairs = (uint32 *) palloc((Size) hdr.nxids * 2 * sizeof(uint32));
+
+		memcpy(pairs, pairs_base, (Size) hdr.nxids * 2 * sizeof(uint32));
+		(void) ShardWalLogVerdict(hdr.gxid, false, 0, hdr.nxids, pairs);
+		pfree(pairs);
+	}
 	for (i = 0; i < hdr.nxids; i++)
 	{
 		uint32		pv[2];
@@ -2299,6 +2541,7 @@ ShardXidInstallHook(void)
 	shard_twophase_postcommit_hook = shard_twophase_postcommit_impl;
 	shard_twophase_postabort_hook = shard_twophase_postabort_impl;
 	RegisterXactCallback(shard_xid_xact_callback, NULL);
+	shard_elr_post_flush_hook = shard_elr_post_flush;
 }
 
 /* ================= P1 数据保护拦截 ================= */

@@ -7,6 +7,7 @@ OBJS = \
 	src/wal/partition_wal.o \
 	src/wal/partition_wal_writer.o \
 	src/wal/partwal_sync.o \
+	src/wal/partwal_recent.o \
 	src/wal/shard_fileset.o \
 	src/worker/demux_worker.o \
 	src/replay/enhanced_clog.o \
@@ -16,6 +17,7 @@ OBJS = \
 	src/replay/replay_worker.o \
 	src/dtx/dtx_participant.o \
 	src/dtx_pending.o \
+	src/shard_wal.o \
 	src/shard_guard.o \
 	src/raft_boundary.o \
 	src/shard_xid.o \
