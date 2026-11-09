@@ -13075,9 +13075,9 @@ pg_raft_dtx_close_indoubt(PG_FUNCTION_ARGS)
         {
             initStringInfo(&sql);
             appendStringInfo(&sql,
-                             "SELECT partdist.shard_verdict_apply(%u::oid, %lld::bigint, %lld::bigint, %s, %lld::bigint)",
+                             "SELECT partdist.shard_verdict_apply(%u::oid, %lld::bigint, %lld::bigint, %s, %lld::bigint, %lld::bigint)",
                              (unsigned) partition_id, sxids[i], hgx[i],
-                             (verdict == 1) ? "true" : "false", (long long) cts);
+                             (verdict == 1) ? "true" : "false", (long long) cts, dtxids[i]);
             (void) SPI_execute(sql.data, false, 1);
             pfree(sql.data);
             raft_persist_spi_end(spi_owned);

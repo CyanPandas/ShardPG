@@ -26,8 +26,9 @@ INSERT INTO partdist.tso_gate VALUES(false);
 CREATE SEQUENCE partdist.timestamps START 100;
 CREATE TABLE partdist.dtx_participant(dtxid bigint,gid text,gsids bigint[],coord_gsid bigint,noted_at timestamptz DEFAULT now(),PRIMARY KEY(dtxid,gid));
 CREATE TABLE partdist.dtx_decision(dtxid bigint PRIMARY KEY,coord_gsid bigint,verdict integer,commit_ts bigint,participants bigint[],decided_plsn bigserial);
-CREATE TABLE partdist.node_map(hostname text,port integer);
-INSERT INTO partdist.node_map VALUES('worker1',5433),('worker2',5434);
+CREATE TABLE partdist.node_map(hostname text,port integer,node_id serial);
+CREATE TABLE partdist.partition_map(partition_id oid,primary_node integer);
+INSERT INTO partdist.node_map(hostname,port) VALUES('worker1',5433),('worker2',5434);
 CREATE TABLE partdist.mock_parwal(oid oid,plsn bigint,kind integer,dtxid bigint,coord_gsid bigint,commit_ts bigint,verdict integer,participants bigint[]);
 CREATE FUNCTION partdist.partwal_read_dtx_record(p_oid oid,p_plsn bigint) RETURNS TABLE(kind integer,dtxid bigint,coord_gsid bigint,commit_ts bigint,verdict integer,participants bigint[]) LANGUAGE sql AS $$ SELECT kind,dtxid,coord_gsid,commit_ts,verdict,participants FROM partdist.mock_parwal WHERE oid=p_oid AND plsn=p_plsn $$;
 CREATE FUNCTION partdist.dtx_refresh(bigint) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;
@@ -218,8 +219,70 @@ SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
 """
 
 
+RECOVERY_CASES = r"""
+INSERT INTO partdist.partition_map VALUES(10,1),(20,2);
+CREATE TABLE partdist.recovery_gate(verdict text,ack boolean);
+INSERT INTO partdist.recovery_gate VALUES('2',true);
+CREATE OR REPLACE FUNCTION partdist.dtx_rpc(h text,p integer,q text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT fail FROM partdist.rpc_gate) THEN RAISE EXCEPTION 'unavailable'; END IF;
+  INSERT INTO partdist.events(event) VALUES(q);
+  IF q LIKE '%dtx_decide(%' THEN RETURN (SELECT verdict FROM partdist.recovery_gate); END IF;
+  RETURN (SELECT CASE WHEN ack THEN 't' ELSE 'f' END FROM partdist.recovery_gate);
+END $$;
+SELECT partdist.dtx_enlist(100,10,'aborted','worker1',5433,ARRAY[10]::bigint[]);
+SELECT partdist.dtx_vote(100,'aborted',false);
+SELECT partdist.dtx_route_claim(100,10);
+UPDATE partdist.rpc_gate SET fail=true;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=100) THEN
+    RAISE EXCEPTION 'unavailable decision service lost registration'; END IF;
+END $$;
+UPDATE partdist.rpc_gate SET fail=false;
+UPDATE partdist.recovery_gate SET verdict='1';
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=100)
+     OR EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_finish_decision(100%') THEN
+    RAISE EXCEPTION 'existing COMMIT was replaced or registration lost'; END IF;
+END $$;
+UPDATE partdist.recovery_gate SET verdict='0';
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=100) THEN
+    RAISE EXCEPTION 'timestamp-pending COMMIT was discarded'; END IF;
+END $$;
+UPDATE partdist.recovery_gate SET verdict='2',ack=false;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=100) THEN
+    RAISE EXCEPTION 'registration lost before participant acknowledgement'; END IF;
+END $$;
+UPDATE partdist.recovery_gate SET ack=true;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=100)
+     OR EXISTS(SELECT FROM partdist.dtx_coord_branch WHERE dtxid=100) THEN
+    RAISE EXCEPTION 'fully acknowledged rollback was not reclaimed'; END IF;
+END $$;
+TRUNCATE partdist.events;
+SELECT partdist.dtx_enlist(101,10,'ended','worker1',5433,ARRAY[10]::bigint[]);
+SELECT partdist.dtx_enlist(101,10,'active','worker2',5434,ARRAY[20]::bigint[]);
+SELECT partdist.dtx_vote(101,'ended',false);
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=101)
+     OR EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_decide(%') THEN
+    RAISE EXCEPTION 'active branch was presumed aborted'; END IF;
+END $$;
+SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
+"""
+
+
 class CoordinatorSQLTests(unittest.TestCase):
-    def test_actual_sql_state_machine(self):
+    def run_sql_case(self, case_sql):
         env = dict(os.environ)
         env["LD_LIBRARY_PATH"] = str(ROOT / "pg-install/lib")
         script = SQL.read_text()
@@ -230,7 +293,7 @@ class CoordinatorSQLTests(unittest.TestCase):
         # Strip SQL line comments before joining: preserve dollar-quoted bodies.
         script = " ".join(re.sub(r"--[^\n]*", "", script).splitlines())
         setup = " ".join(STUBS.splitlines())
-        cases = " ".join(re.sub(r"--[^\n]*", "", CASES).splitlines())
+        cases = " ".join(re.sub(r"--[^\n]*", "", case_sql).splitlines())
         with tempfile.TemporaryDirectory(prefix="shardpg-first-coord-sql-") as td:
             init = subprocess.run([str(ROOT / "pg-install/bin/initdb"), "-D", td,
                                    "--no-locale", "-A", "trust"], env=env,
@@ -242,6 +305,12 @@ class CoordinatorSQLTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             self.assertNotRegex(run.stderr, r"\b(ERROR|FATAL|PANIC):", run.stdout + run.stderr)
             self.assertIn('= "FIRST_SHARD_STATE_MACHINE_OK"', run.stdout)
+
+    def test_actual_sql_state_machine(self):
+        self.run_sql_case(CASES)
+
+    def test_aborted_registration_recovery(self):
+        self.run_sql_case(RECOVERY_CASES)
 
     def test_install_script_matches_upgrade(self):
         install = (ROOT / "pg-partdist-src/sql/pg_partdist--1.0.sql").read_text()

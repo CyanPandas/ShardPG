@@ -23,6 +23,7 @@
 #include "postmaster/postmaster.h"	/* PostPortNumber */
 #include "storage/fd.h"
 #include "storage/shmem.h"
+#include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -62,6 +63,7 @@ typedef struct DtxPendingCtl
 } DtxPendingCtl;
 
 static DtxPendingCtl *PendingCtl = NULL;
+static LWLock *PendingJournalLock = NULL;
 
 /* ---- 持久日志 ---- */
 
@@ -306,6 +308,7 @@ void
 RequestDtxPendingShmem(void)
 {
 	RequestAddinShmemSpace(MAXALIGN(sizeof(DtxPendingCtl)));
+	RequestNamedLWLockTranche("pg_partdist_pending_journal", 1);
 }
 
 void
@@ -313,6 +316,7 @@ DtxPendingShmemInit(void)
 {
 	bool		found;
 
+	PendingJournalLock = &GetNamedLWLockTranche("pg_partdist_pending_journal")[0].lock;
 	PendingCtl = ShmemInitStruct("pg_partdist_dtx_pending",
 								 sizeof(DtxPendingCtl), &found);
 	if (!found)
@@ -347,12 +351,19 @@ DtxPendingRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 	ent.nxids = nxids;
 	memcpy(ent.pairs, pairs, (Size) nxids * 2 * sizeof(uint32));
 
-	/* 持久化点：OPEN fsync 先于 shmem 登记（也先于 PREPARE 的 WAL 刷盘） */
-	dtx_jrnl_append(DTX_JRNL_OPEN, &ent, true);
-
-	SpinLockAcquire(&PendingCtl->mutex);
-	rc = pending_insert_locked(&ent);
-	SpinLockRelease(&PendingCtl->mutex);
+    /* Serialize durable OPEN/merge with CLOSE/removal. No RPC or heap buffer
+     * acquisition is performed while this journal lock is held. */
+    LWLockAcquire(PendingJournalLock, LW_EXCLUSIVE);
+    PG_TRY();
+    {
+        dtx_jrnl_append(DTX_JRNL_OPEN, &ent, true);
+        SpinLockAcquire(&PendingCtl->mutex);
+        rc = pending_insert_locked(&ent);
+        SpinLockRelease(&PendingCtl->mutex);
+    }
+    PG_FINALLY();
+    { LWLockRelease(PendingJournalLock); }
+    PG_END_TRY();
 	pending_insert_warn(rc, gxid);
 }
 
@@ -393,28 +404,51 @@ DtxPendingReRegister(int64 gxid, int64 coord_gsid, int64 dtxid,
 		DtxPendingRegister(gxid, coord_gsid, dtxid, start_ts, nxids, pairs);
 }
 
-void
+bool
 DtxPendingFinalized(int64 gxid)
 {
-	DtxPendingEntry ent;
-	bool		have;
+    DtxPendingEntry ent;
+    DtxPendingEntry *slot;
+    bool have;
+    volatile bool complete = true;
+    int i;
 
-	if (gxid == 0 || PendingCtl == NULL)
-		return;
-    SpinLockAcquire(&PendingCtl->mutex);
-    have = (pending_find_locked(gxid) != NULL);
-    SpinLockRelease(&PendingCtl->mutex);
-    if (have)
+    if (gxid == 0 || PendingCtl == NULL)
+        return true;
+    LWLockAcquire(PendingJournalLock, LW_EXCLUSIVE);
+    PG_TRY();
     {
-        memset(&ent, 0, sizeof(ent));
-        ent.gxid = gxid;
-        /* Do not let a closed registration reappear after its 32-bit numbers
-         * have been recycled. Durable CLOSE must precede releasing the pin. */
-        dtx_jrnl_append(DTX_JRNL_CLOSE, &ent, true);
         SpinLockAcquire(&PendingCtl->mutex);
-        pending_remove_locked(gxid);
+        slot = pending_find_locked(gxid);
+        have = slot != NULL;
+        if (have) ent = *slot;
         SpinLockRelease(&PendingCtl->mutex);
+        /* A sweeper may have copied this gxid before another local branch
+         * merged its PREPARE. Closing that old snapshot must never erase the
+         * new branch. Check the FULL current union under the OPEN/CLOSE lock.
+         * A postabort callback similarly covers only its own native branch. */
+        for (i = 0; have && i < ent.nxids; i++)
+        {
+            ShardClogSlot clog;
+            if (!ShardClogReadSlot(ent.pairs[2*i], ent.pairs[2*i+1], &clog) ||
+                (clog.status != TXN_COMMITTED && clog.status != TXN_ABORTED))
+            {
+                complete = false;
+                break;
+            }
+        }
+        if (have && complete)
+        {
+            dtx_jrnl_append(DTX_JRNL_CLOSE, &ent, true);
+            SpinLockAcquire(&PendingCtl->mutex);
+            pending_remove_locked(gxid);
+            SpinLockRelease(&PendingCtl->mutex);
+        }
     }
+    PG_FINALLY();
+    { LWLockRelease(PendingJournalLock); }
+    PG_END_TRY();
+    return complete;
 }
 
 bool
@@ -950,8 +984,7 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 		elog(WARNING, "pg_partdist: gxid=%lld 判决落分片 clog 后回读，%d/%d 个槽位不是终局（P7-N86）",
 			 (long long) ent->gxid, nbad, ent->nxids);
 
-	DtxPendingFinalized(ent->gxid);
-	return true;
+	return DtxPendingFinalized(ent->gxid);
 }
 
 /* ---- 清扫（backend 语境） ---- */
@@ -1061,7 +1094,8 @@ DtxPendingSweep(void)
 
 				snprintf(q, sizeof(q),
 						 "SELECT 1 FROM pg_prepared_xacts WHERE gid LIKE 'citus\\_%%'"
-						 "    OR gid LIKE 'shardpg\\_dtx\\_%%' LIMIT 1");
+						 "    OR gid LIKE 'shardpg\\_dtx\\_%%'"
+                         "    OR gid LIKE 'shardpg\\_fc\\_%%' LIMIT 1");
 				if (SPI_execute(q, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
 					any_prepared = true;	/* 还有活的 prepared：不敢注销 */
 				SPI_finish();

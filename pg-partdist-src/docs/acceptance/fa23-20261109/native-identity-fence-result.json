@@ -1,0 +1,14 @@
+{
+  "status": "PASS_NATIVE_IDENTITY_FENCE",
+  "node": 2,
+  "shard": 102008,
+  "local_oid": 17710,
+  "shard_xid": 4108,
+  "stream_header_gxid": 281474976722514,
+  "tso_dtxid": 4137,
+  "wrong_identity_rejected": true,
+  "native_header_alone_rejected": true,
+  "correct_tso_identity_idempotently_applied": true,
+  "before": "st=2 sts=100087 cts=100088",
+  "after": "st=2 sts=100087 cts=100088"
+}

@@ -1,0 +1,37 @@
+[
+  {
+    "path": "pg-partdist-src/include/dtx_pending.h",
+    "before_sha256": "5554056b90d677c76d7bb30e27c86d95de63bc7c6f63a66b5dd652e1a83e0ae3",
+    "after_sha256": "dccd8a6fc133e7982c691cfc1c972781726af8ca7eb9ddfff99e8d56d37a27d0"
+  },
+  {
+    "path": "pg-partdist-src/sql/first_shard_coordinator.sql",
+    "before_sha256": "323aae2c7afed25a5a8b8c596e20755999cf1fcac00383a2bb67b22ff45d5e0a",
+    "after_sha256": "b16f01f42d804090117ab65e399ca2e18d8172b689b819cc17c46c95360198e2"
+  },
+  {
+    "path": "pg-partdist-src/sql/pg_partdist--1.0.sql",
+    "before_sha256": "f4cb22c189a8f58caf501bc2de453f8d4cfe69ebdf4a10eb514ade653de6106f",
+    "after_sha256": "9ed2db2e4efb2c2ea4eaa0f434c5933c531fe9aaccd146b42648c66700ad2fba"
+  },
+  {
+    "path": "pg-partdist-src/src/dtx_pending.c",
+    "before_sha256": "3474aefb834d5bc1a38e9c86737a6e8a87cd12bcbd7cff45772320fd4d7db74c",
+    "after_sha256": "187bf8ca62374a1437e2d0ed61c2d50785864c9e1d75a1879f6093fb3a77f617"
+  },
+  {
+    "path": "pg-partdist-src/src/raft_boundary.c",
+    "before_sha256": "b2a576f6c4376b4d12afa9b7116ee79767e7594be6ffcef547d6febcc76a39bd",
+    "after_sha256": "aed32aae4b33e52c457a238f9293f956714d3b3d5b0f95fde8009b7d73198c61"
+  },
+  {
+    "path": "pg-partdist-src/tests/local/test_first_shard_coordinator.py",
+    "before_sha256": "1cf0d0b37d0e073489d3f6c7549f756317c5a1827cabcf1f85145b7fbcbe4f2d",
+    "after_sha256": "77e1de71129e3c34a206d4c97d2e0b55578f3b0480b65380f79daeeb36515581"
+  },
+  {
+    "path": "pg-raft-src/src/raft_consensus.c",
+    "before_sha256": "4c6a4ce7f85c8cff72c1f6058c0530f082fefe8649e40cf4b20d74cc3f2ba01e",
+    "after_sha256": "49e4756147251e62f4eb3ba864d6455bb4b38bb555afb4c8fe8a2cdd44ef1a49"
+  }
+]

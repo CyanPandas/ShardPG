@@ -1,0 +1,262 @@
+{
+  "started": 1794160593.5321484,
+  "status": "PASS_ALL_REQUESTED_FUNCTIONAL_CHECKS",
+  "cases": {
+    "four_customers_in_four_distinct_shards": {
+      "status": "PASS",
+      "proof": {
+        "customers": [
+          {
+            "warehouse": 1,
+            "shard_id": 102008,
+            "primary_node": 2,
+            "id": 101,
+            "order": 1001,
+            "name": "Alice"
+          },
+          {
+            "warehouse": 3,
+            "shard_id": 102009,
+            "primary_node": 3,
+            "id": 102,
+            "order": 1002,
+            "name": "Bob"
+          },
+          {
+            "warehouse": 6,
+            "shard_id": 102010,
+            "primary_node": 4,
+            "id": 103,
+            "order": 1003,
+            "name": "Chen"
+          },
+          {
+            "warehouse": 2,
+            "shard_id": 102011,
+            "primary_node": 2,
+            "id": 104,
+            "order": 1004,
+            "name": "Deng"
+          }
+        ],
+        "balances": {
+          "101": "1000.00",
+          "102": "1000.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        }
+      },
+      "time": 1794160595.5581307
+    },
+    "one_order_each_and_balances_1000": {
+      "status": "PASS",
+      "proof": {
+        "balances": {
+          "101": "1000.00",
+          "102": "1000.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        },
+        "orders": 4
+      },
+      "time": 1794160598.5447927
+    },
+    "cross_worker_cross_table_commit": {
+      "status": "PASS",
+      "proof": {
+        "balances": {
+          "101": "900.00",
+          "102": "1100.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        },
+        "orders_updated": 2
+      },
+      "time": 1794160603.1141016
+    },
+    "cross_shard_rollback_and_read_own_writes": {
+      "status": "PASS",
+      "proof": {
+        "balances": {
+          "101": "1000.00",
+          "102": "1000.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        },
+        "orders": 4
+      },
+      "time": 1794160606.7613513
+    },
+    "snapshot_isolation_dirty_reads_repeatable_reads_and_phantoms": {
+      "status": "PASS",
+      "proof": {
+        "old_snapshot": {
+          "101": 1000,
+          "102": 1000,
+          "103": 1000,
+          "104": 1000
+        },
+        "new_snapshot": {
+          "101": 900,
+          "102": 1100,
+          "103": 1000,
+          "104": 1000
+        },
+        "old_orders": 4,
+        "new_orders": 5
+      },
+      "time": 1794160613.7582564
+    },
+    "write_write_conflict_40001_and_atomic_loser_rollback": {
+      "status": "PASS",
+      "proof": {
+        "sqlstate": "40001",
+        "balances": {
+          "101": "1050.00",
+          "102": "1000.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        }
+      },
+      "time": 1794160617.9394798
+    },
+    "committed_delete_and_reinsert": {
+      "status": "PASS",
+      "proof": {
+        "balances": {
+          "101": "1000.00",
+          "102": "1000.00",
+          "103": "1000.00",
+          "104": "1000.00"
+        },
+        "orders": 4
+      },
+      "time": 1794160624.9231348
+    },
+    "all_four_nodes_quiescent": {
+      "status": "PASS",
+      "proof": {
+        "1": {
+          "prepared": 0,
+          "pending": 0,
+          "coordinator": 0,
+          "branches": 0
+        },
+        "2": {
+          "prepared": 0,
+          "pending": 0,
+          "coordinator": 0,
+          "branches": 0
+        },
+        "3": {
+          "prepared": 0,
+          "pending": 0,
+          "coordinator": 0,
+          "branches": 0
+        },
+        "4": {
+          "prepared": 0,
+          "pending": 0,
+          "coordinator": 0,
+          "branches": 0
+        }
+      },
+      "time": 1794160629.3441827
+    }
+  },
+  "source_commit": "fa23c79f8c197b53d112074b4294305fc0a34035",
+  "customers": [
+    {
+      "warehouse": 1,
+      "shard_id": 102008,
+      "primary_node": 2,
+      "id": 101,
+      "order": 1001,
+      "name": "Alice"
+    },
+    {
+      "warehouse": 3,
+      "shard_id": 102009,
+      "primary_node": 3,
+      "id": 102,
+      "order": 1002,
+      "name": "Bob"
+    },
+    {
+      "warehouse": 6,
+      "shard_id": 102010,
+      "primary_node": 4,
+      "id": 103,
+      "order": 1003,
+      "name": "Chen"
+    },
+    {
+      "warehouse": 2,
+      "shard_id": 102011,
+      "primary_node": 2,
+      "id": 104,
+      "order": 1004,
+      "name": "Deng"
+    }
+  ],
+  "transaction_pair": [
+    {
+      "warehouse": 1,
+      "shard_id": 102008,
+      "primary_node": 2,
+      "id": 101,
+      "order": 1001,
+      "name": "Alice"
+    },
+    {
+      "warehouse": 3,
+      "shard_id": 102009,
+      "primary_node": 3,
+      "id": 102,
+      "order": 1002,
+      "name": "Bob"
+    }
+  ],
+  "resumes_failed_attempt": "business-result.json",
+  "seed_inserts_replayed": false,
+  "existing_orders_reused": true,
+  "final_rows": [
+    "1|1|101|Alice|1000.00",
+    "3|1|102|Bob|1000.00",
+    "6|1|103|Chen|1000.00",
+    "2|1|104|Deng|1000.00"
+  ],
+  "final_orders": [
+    "1|1|1001|101",
+    "3|1|1002|102",
+    "6|1|1003|103",
+    "2|1|1004|104"
+  ],
+  "health": {
+    "1": {
+      "prepared": 0,
+      "pending": 0,
+      "coordinator": 0,
+      "branches": 0
+    },
+    "2": {
+      "prepared": 0,
+      "pending": 0,
+      "coordinator": 0,
+      "branches": 0
+    },
+    "3": {
+      "prepared": 0,
+      "pending": 0,
+      "coordinator": 0,
+      "branches": 0
+    },
+    "4": {
+      "prepared": 0,
+      "pending": 0,
+      "coordinator": 0,
+      "branches": 0
+    }
+  },
+  "completed": 1794160629.3463113
+}

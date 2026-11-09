@@ -1,0 +1,280 @@
+{
+  "baseline_commit": "fa23c79f8c197b53d112074b4294305fc0a34035",
+  "started": 1794160842.1032622,
+  "nodes": {
+    "1": {
+      "host": "10.77.110.144",
+      "port": 35432,
+      "container": "yyt-fa23c79-20261108-n1",
+      "health": {
+        "prepared": 0,
+        "pending": 0,
+        "coordinator": 0,
+        "branches": 0,
+        "routes": 0
+      },
+      "settings": {
+        "first_shard": "on",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on",
+        "socket": "/work/data, /tmp"
+      },
+      "sha256": {
+        "bin/postgres": "97ad81168fe06386c390b228b16b506d418cec5a81a519917ae7e308f3537ab3",
+        "lib/postgresql/citus.so": "42c327f35f4de650b421c278d491bfcd05fdc41dea6be06e00b892ce3be9782a",
+        "lib/postgresql/pg_partdist.so": "fbfb5a91d0b8b5a3c94ca2f2d09ac1df4bd1d3960a536de651a44deda7f865be",
+        "lib/postgresql/pg_raft.so": "baeb710c0b3dd1bea879e947cb35ff55aff44b8c5299be9433b46292057eba1e",
+        "share/postgresql/extension/first_shard_coordinator.sql": "b16f01f42d804090117ab65e399ca2e18d8172b689b819cc17c46c95360198e2",
+        "share/postgresql/extension/pg_partdist--1.0.sql": "9ed2db2e4efb2c2ea4eaa0f434c5933c531fe9aaccd146b42648c66700ad2fba"
+      }
+    },
+    "2": {
+      "host": "10.77.110.145",
+      "port": 35433,
+      "container": "yyt-fa23c79-20261108-n2",
+      "health": {
+        "prepared": 0,
+        "pending": 0,
+        "coordinator": 0,
+        "branches": 0,
+        "routes": 0
+      },
+      "settings": {
+        "first_shard": "on",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on",
+        "socket": "/work/data, /tmp"
+      },
+      "sha256": {
+        "bin/postgres": "97ad81168fe06386c390b228b16b506d418cec5a81a519917ae7e308f3537ab3",
+        "lib/postgresql/citus.so": "42c327f35f4de650b421c278d491bfcd05fdc41dea6be06e00b892ce3be9782a",
+        "lib/postgresql/pg_partdist.so": "fbfb5a91d0b8b5a3c94ca2f2d09ac1df4bd1d3960a536de651a44deda7f865be",
+        "lib/postgresql/pg_raft.so": "baeb710c0b3dd1bea879e947cb35ff55aff44b8c5299be9433b46292057eba1e",
+        "share/postgresql/extension/first_shard_coordinator.sql": "b16f01f42d804090117ab65e399ca2e18d8172b689b819cc17c46c95360198e2",
+        "share/postgresql/extension/pg_partdist--1.0.sql": "9ed2db2e4efb2c2ea4eaa0f434c5933c531fe9aaccd146b42648c66700ad2fba"
+      }
+    },
+    "3": {
+      "host": "10.77.110.147",
+      "port": 35434,
+      "container": "yyt-fa23c79-20261108-n3",
+      "health": {
+        "prepared": 0,
+        "pending": 0,
+        "coordinator": 0,
+        "branches": 0,
+        "routes": 0
+      },
+      "settings": {
+        "first_shard": "on",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on",
+        "socket": "/work/data, /tmp"
+      },
+      "sha256": {
+        "bin/postgres": "97ad81168fe06386c390b228b16b506d418cec5a81a519917ae7e308f3537ab3",
+        "lib/postgresql/citus.so": "42c327f35f4de650b421c278d491bfcd05fdc41dea6be06e00b892ce3be9782a",
+        "lib/postgresql/pg_partdist.so": "fbfb5a91d0b8b5a3c94ca2f2d09ac1df4bd1d3960a536de651a44deda7f865be",
+        "lib/postgresql/pg_raft.so": "baeb710c0b3dd1bea879e947cb35ff55aff44b8c5299be9433b46292057eba1e",
+        "share/postgresql/extension/first_shard_coordinator.sql": "b16f01f42d804090117ab65e399ca2e18d8172b689b819cc17c46c95360198e2",
+        "share/postgresql/extension/pg_partdist--1.0.sql": "9ed2db2e4efb2c2ea4eaa0f434c5933c531fe9aaccd146b42648c66700ad2fba"
+      }
+    },
+    "4": {
+      "host": "10.77.110.148",
+      "port": 35435,
+      "container": "yyt-fa23c79-20261108-n4",
+      "health": {
+        "prepared": 0,
+        "pending": 0,
+        "coordinator": 0,
+        "branches": 0,
+        "routes": 0
+      },
+      "settings": {
+        "first_shard": "on",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on",
+        "socket": "/work/data, /tmp"
+      },
+      "sha256": {
+        "bin/postgres": "97ad81168fe06386c390b228b16b506d418cec5a81a519917ae7e308f3537ab3",
+        "lib/postgresql/citus.so": "42c327f35f4de650b421c278d491bfcd05fdc41dea6be06e00b892ce3be9782a",
+        "lib/postgresql/pg_partdist.so": "fbfb5a91d0b8b5a3c94ca2f2d09ac1df4bd1d3960a536de651a44deda7f865be",
+        "lib/postgresql/pg_raft.so": "baeb710c0b3dd1bea879e947cb35ff55aff44b8c5299be9433b46292057eba1e",
+        "share/postgresql/extension/first_shard_coordinator.sql": "b16f01f42d804090117ab65e399ca2e18d8172b689b819cc17c46c95360198e2",
+        "share/postgresql/extension/pg_partdist--1.0.sql": "9ed2db2e4efb2c2ea4eaa0f434c5933c531fe9aaccd146b42648c66700ad2fba"
+      }
+    }
+  },
+  "runs": {
+    "business-r4-result.json": {
+      "status": "PASS_ALL_REQUESTED_FUNCTIONAL_CHECKS",
+      "cases": {
+        "four_customers_in_four_distinct_shards": "PASS",
+        "one_order_each_and_balances_1000": "PASS",
+        "cross_worker_cross_table_commit": "PASS",
+        "cross_shard_rollback_and_read_own_writes": "PASS",
+        "snapshot_isolation_dirty_reads_repeatable_reads_and_phantoms": "PASS",
+        "write_write_conflict_40001_and_atomic_loser_rollback": "PASS",
+        "committed_delete_and_reinsert": "PASS",
+        "all_four_nodes_quiescent": "PASS"
+      },
+      "started": 1794160491.001243,
+      "completed": 1794160529.708692,
+      "transaction_pair": [
+        {
+          "warehouse": 1,
+          "shard_id": 102008,
+          "primary_node": 2,
+          "id": 101,
+          "order": 1001,
+          "name": "Alice"
+        },
+        {
+          "warehouse": 3,
+          "shard_id": 102009,
+          "primary_node": 3,
+          "id": 102,
+          "order": 1002,
+          "name": "Bob"
+        }
+      ]
+    },
+    "business-confirmation-result.json": {
+      "status": "PASS_ALL_REQUESTED_FUNCTIONAL_CHECKS",
+      "cases": {
+        "four_customers_in_four_distinct_shards": "PASS",
+        "one_order_each_and_balances_1000": "PASS",
+        "cross_worker_cross_table_commit": "PASS",
+        "cross_shard_rollback_and_read_own_writes": "PASS",
+        "snapshot_isolation_dirty_reads_repeatable_reads_and_phantoms": "PASS",
+        "write_write_conflict_40001_and_atomic_loser_rollback": "PASS",
+        "committed_delete_and_reinsert": "PASS",
+        "all_four_nodes_quiescent": "PASS"
+      },
+      "started": 1794160593.5321484,
+      "completed": 1794160629.3463113,
+      "transaction_pair": [
+        {
+          "warehouse": 1,
+          "shard_id": 102008,
+          "primary_node": 2,
+          "id": 101,
+          "order": 1001,
+          "name": "Alice"
+        },
+        {
+          "warehouse": 3,
+          "shard_id": 102009,
+          "primary_node": 3,
+          "id": 102,
+          "order": 1002,
+          "name": "Bob"
+        }
+      ]
+    }
+  },
+  "schema": [
+    {
+      "relname": "customer",
+      "partmethod": "h"
+    },
+    {
+      "relname": "district",
+      "partmethod": null
+    },
+    {
+      "relname": "history",
+      "partmethod": null
+    },
+    {
+      "relname": "item",
+      "partmethod": null
+    },
+    {
+      "relname": "new_order",
+      "partmethod": null
+    },
+    {
+      "relname": "order_line",
+      "partmethod": null
+    },
+    {
+      "relname": "orders",
+      "partmethod": "h"
+    },
+    {
+      "relname": "stock",
+      "partmethod": null
+    },
+    {
+      "relname": "warehouse",
+      "partmethod": null
+    }
+  ],
+  "customers": [
+    {
+      "c_w_id": 6,
+      "c_d_id": 1,
+      "c_id": 103,
+      "c_first": "Chen",
+      "c_balance": 1000.0
+    },
+    {
+      "c_w_id": 1,
+      "c_d_id": 1,
+      "c_id": 101,
+      "c_first": "Alice",
+      "c_balance": 1000.0
+    },
+    {
+      "c_w_id": 3,
+      "c_d_id": 1,
+      "c_id": 102,
+      "c_first": "Bob",
+      "c_balance": 1000.0
+    },
+    {
+      "c_w_id": 2,
+      "c_d_id": 1,
+      "c_id": 104,
+      "c_first": "Deng",
+      "c_balance": 1000.0
+    }
+  ],
+  "orders": [
+    {
+      "o_w_id": 6,
+      "o_d_id": 1,
+      "o_id": 1003,
+      "o_c_id": 103
+    },
+    {
+      "o_w_id": 3,
+      "o_d_id": 1,
+      "o_id": 1002,
+      "o_c_id": 102
+    },
+    {
+      "o_w_id": 1,
+      "o_d_id": 1,
+      "o_id": 1001,
+      "o_c_id": 101
+    },
+    {
+      "o_w_id": 2,
+      "o_d_id": 1,
+      "o_id": 1004,
+      "o_c_id": 104
+    }
+  ],
+  "status": "PASS_FINAL_FOUR_NODE_VERIFICATION",
+  "completed": 1794160859.7764914,
+  "performance_tested": false,
+  "failover_fault_injection_tested": false
+}

@@ -891,6 +891,13 @@ CREATE OR REPLACE FUNCTION shard_verdict_apply(
 ) RETURNS boolean LANGUAGE c STRICT VOLATILE
     AS 'MODULE_PATHNAME', 'pg_partdist_shard_verdict_apply';
 
+-- DTX identity is separate from the stream's native node/local transaction ID.
+CREATE OR REPLACE FUNCTION shard_verdict_apply(
+    p_partition_id OID, p_sxid BIGINT, p_hdr_gxid BIGINT,
+    p_committed BOOLEAN, p_commit_ts BIGINT, p_dtxid BIGINT
+) RETURNS boolean LANGUAGE c STRICT VOLATILE
+    AS 'MODULE_PATHNAME', 'pg_partdist_shard_verdict_apply';
+
 COMMENT ON FUNCTION shard_verdict_apply(OID, BIGINT, BIGINT, BOOLEAN, BIGINT) IS
     '把一笔 in-doubt 判决落进本地分片 clog（start_ts 取 PREPARED 槽），并追加带分片 xid 的判决 MARKER 复制给副本（与 leader 侧 dtx_replicate_verdict 同构）。本地已落账即返回，复制失败返回 false。';
 
@@ -3890,6 +3897,51 @@ DECLARE d record; n record; delivered integer:=0; result text; complete boolean;
         cursor_id bigint;
 BEGIN
     IF NOT pg_try_advisory_xact_lock(1936745540,1) THEN RETURN 0; END IF;
+    -- A client ROLLBACK never invokes dtx_coordinate. Once EVERY enrolled
+    -- backend has reported its top-level abort, no branch can vote PREPARE.
+    -- Record ABORT at the current shard leader through the existing quorum
+    -- decision gate; it refuses to overwrite any irrevocable COMMIT. This also
+    -- reaps registrations left on an old leader, without inventing a timeout
+    -- verdict or deleting an unresolved participant.
+    FOR d IN SELECT t.dtxid,t.coord_gsid,a.hostname,a.port,
+                    array_agg(DISTINCT g.gsid ORDER BY g.gsid) AS shards
+             FROM partdist.dtx_coord_tx t
+             JOIN partdist.dtx_coord_branch b USING(dtxid)
+             CROSS JOIN LATERAL unnest(b.gsids) AS g(gsid)
+             JOIN partdist.partition_map m ON m.partition_id::bigint=t.coord_gsid
+             JOIN partdist.node_map a ON a.node_id=m.primary_node
+             GROUP BY t.dtxid,t.coord_gsid,a.hostname,a.port
+             HAVING bool_and(b.vote IS FALSE)
+             ORDER BY t.dtxid LIMIT 32
+    LOOP
+        BEGIN
+            result:=partdist.dtx_rpc(d.hostname,d.port,
+                format('SELECT partdist.dtx_decide(%s,%s,2,%L::bigint[],0)',
+                       d.coord_gsid,d.dtxid,d.shards));
+            IF result IS DISTINCT FROM '2' THEN CONTINUE; END IF;
+            complete:=true;
+            FOR n IN SELECT DISTINCT hostname,port FROM partdist.node_map
+            LOOP
+                BEGIN
+                    result:=partdist.dtx_rpc(n.hostname,n.port,
+                        format('SELECT partdist.dtx_finish_decision(%s,%s,2,0)',
+                               d.dtxid,d.coord_gsid));
+                    IF result IS DISTINCT FROM 't' THEN complete:=false; END IF;
+                EXCEPTION WHEN OTHERS THEN complete:=false;
+                END;
+            END LOOP;
+            IF complete THEN
+                DELETE FROM partdist.dtx_coord_branch WHERE dtxid=d.dtxid;
+                DELETE FROM partdist.dtx_coord_tx WHERE dtxid=d.dtxid;
+                PERFORM partdist.dtx_tso_rpc(format(
+                    'WITH removed AS (DELETE FROM partdist.dtx_route WHERE gxid=%s AND coord_gsid=%s RETURNING 1) SELECT true',
+                    d.dtxid,d.coord_gsid));
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            -- Keep registration and durable decision for the next dispatch.
+            NULL;
+        END;
+    END LOOP;
     -- Autonomous refresh releases its index locks before timestamp completion
     -- makes another local RPC. It also repairs indexes lost after quorum commit.
     FOR d IN SELECT group_id FROM partdist.pg_raft_group_status()

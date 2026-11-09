@@ -1,0 +1,100 @@
+VACU fa23c79 部署与分布式事务功能验收
+
+交付结论
+已在实验室 144/145/147/148 的独立 yyt 目录部署 1 协调者 + 3 worker。
+基线为 fa23c79f8c197b53d112074b4294305fc0a34035，未部署其后的提交。
+为满足“失败项自行修复、最终全部通过”，另外应用了本轮自行编写的最小修复，
+因此最终环境应称为“fa23c79 + 本轮验收修复”，不能称为未经修改的 fa23c79。
+无推送、无合并，无 TPC-C 装载、压测或性能测试；其他用户及旧部署未清理。
+
+表和最终数据
+项目现有 9 张核心表：warehouse、district、history、new_order、order_line、
+stock、item 为协调者本地普通表；customer、orders 为哈希分布式表。
+customer 有 4 个哈希分片、REPLICAS 2；orders 与 customer 共置，有自己的 4 个分片。
+REPLICAS 2 是分片的数据副本配置，本环境没有另建 PostgreSQL 物理备库容器。
+空表 DDL 使用 fa23 文档中的 first_shard_coordinator=off 引导路径；所有业务验收
+连接均显式确认 first_shard_coordinator=on，未用关闭协议规避事务正确性检查。
+客户及订单：
+warehouse  customer  name   balance  customer shard  order
+1          101       Alice  1000.00  102008          1001
+3          102       Bob    1000.00  102009          1002
+6          103       Chen   1000.00  102010          1003
+2          104       Deng   1000.00  102011          1004
+客户位于四个不同哈希分片。最后两轮使用 Alice 与 Bob，两者的主节点分别为 worker2
+和 worker3（节点 ID；容器名为 n2、n3），确实跨服务器、跨分片。
+
+验收结果
+修复后两轮完整真实 psql 会话回归均为 PASS_ALL_REQUESTED_FUNCTIONAL_CHECKS：
+acceptance/business-r4-result.json
+acceptance/business-confirmation-result.json
+每轮 8 项均通过：
+1. 四位客户位于四个不同分片，插入后可读。
+2. 每位客户一个订单，UPDATE 后余额均为 1000。
+3. 跨 worker、跨 customer/orders 的事务 COMMIT，其他会话读到完整结果。
+4. ROLLBACK 撤销两个分片的金额更新及订单删除，事务内能读取自身修改。
+5. REPEATABLE READ 下无脏读，其他事务提交后原快照不变，无幻读；新快照看到提交。
+6. 写写冲突返回 SQLSTATE 40001；失败事务在另一个分片上先前的 +200 同时回滚。
+7. DELETE 提交后可见，并成功重新 INSERT，最终仍为四位客户和四个订单。
+8. 四节点 pg_prepared_xacts、DTX pending、协调登记、分支登记全部为 0。
+原生身份围栏验收 PASS_NATIVE_IDENTITY_FENCE：错误身份被拒，正确 TSO 身份
+幂等应用同一已提交判决；clog 的状态、start_ts、commit_ts 前后不变。
+SQL 状态机回归 3/3 通过，包括：服务不可达保留登记、已有 COMMIT 不允许被回收、
+待补时间戳的 COMMIT 保留、参与者未确认时保留、活跃分支不推定回滚、确认后回收。
+这些 SQL 用例对 RPC/Raft 使用显式替身；上面的四节点业务验收使用真实原生引擎。
+
+发现并解决的问题
+A. 本次部署 socket 路径与 fa23 硬编码 /tmp 不符。
+   在专用容器内配置 unix_socket_directories='/work/data, /tmp'，权限 0700。
+   第一次 ALTER SYSTEM 将目录列表整体引用成单路径，导致启动失败；已修正，日志保留。
+B. 客户端 ROLLBACK 没有进入协调提交驱动，留下 OPEN 协调登记。
+   后台仅在所有已登记分支都报告顶层中止时，通过当前分片主节点的既有共识决议门
+   请求 ABORT；该门拒绝覆盖 COMMIT。所有节点确认收尾后才回收登记和路由。
+C. 同一 gxid 的多个本地 PREPARE 合并后，旧快照和单个分支的回调能提前注销整笔登记。
+   OPEN/合并与 CLOSE/删除通过专用 LWLock 串行；注销时检查当前完整并集的持久化
+   终局，任何分片仍未决都保留登记；补齐 shardpg_fc 原生 prepared 的保护检查。
+D. in-doubt 闭合用物理日志的 node/local-xid 标识校验 TSO 槽位，正确判决被拒绝。
+   分开传递日志头身份和 DTX 身份；DTX 身份必须精确匹配当前槽位后才能使用，保留
+   分片 xid 回收围栏；日志标记继续使用原始物理日志头身份。
+第一次更新复现的旧事务：TSO 4137，日志头 gxid 281474976722514，分片 xid 4108。
+原先四次 INSERT 的成功应答和首次读取失败均保留；没有盲目重复插入或删表重建。
+失败只读探针 4097 的路由在核对四节点均无关联事务后单独回收，SQL、08006 与
+回收依据保存在 retired-readonly-probe-route.json；没有凭超时猜测业务事务结局。
+
+修改的源文件（工作区 /home/zhanhao/shardpg-fa23-acceptance-work）
+pg-partdist-src/include/dtx_pending.h
+pg-partdist-src/src/dtx_pending.c
+pg-partdist-src/src/raft_boundary.c
+pg-partdist-src/sql/first_shard_coordinator.sql
+pg-partdist-src/sql/pg_partdist--1.0.sql
+pg-partdist-src/tests/local/test_first_shard_coordinator.py
+pg-raft-src/src/raft_consensus.c
+部署/验收脚本和日志另存本报告所在目录；完整源差异为 own-fa23-acceptance.patch，
+逐文件前后 SHA 为 OWN_SOURCE_SHA256.json。改动未提交、未推送、未合并。
+
+构建和部署证据
+Citus 固定于 fa23 的 gitlink ad266a2c0a3c9bdab1426ed33d1bc2d9a7d74f45，
+仅应用该提交包含的 citus-0002、0003、0004 补丁，构建参数导出所需原有符号。
+PostgreSQL 使用 fa23 跟踪的 16.14 二进制；首次构建 Citus、pg_partdist、pg_raft，
+修复后增量构建 pg_partdist 与 pg_raft。未在运行中的共享库文件上执行 make install；
+四节点停库后备份原库并部署同一产物，逐节点核对 SHA。
+最终配置/数据/文件核对结果见 acceptance/final-verification.json；基线和 Citus
+输入清单、构建输出、原始失败和后续成功日志均保留，参见证据归档。
+
+连接方法（在 145 上以 yyt 用户执行）
+docker exec -it --user postgres \
+  -e PGPASSFILE=/work/secrets/pgpass \
+  -e PGOPTIONS='-c client_min_messages=warning' \
+  yyt-fa23c79-20261108-n2 \
+  /work/pg-install/bin/psql \
+  -h 10.77.110.144 -p 35432 -U postgres -d postgres
+对应完整 docker create/start 命令在 145 的 create-n2.sh。
+四台主机的实际创建命令同时保留在 evidence-deployment/。
+
+验证边界与剩余风险
+本轮结论限于上述小数据集、真实并发会话和 REPEATABLE READ 的功能正确性。
+没有做 TPC-C 性能测试、长时间压力测试、网络分区/宕机的系统故障注入，
+没有验收 SERIALIZABLE、SAVEPOINT 或客户/订单与其他七张本地表混合写入的原子性。
+不把重启和选主过程中保留下来的数据读回等同于完整高可用验收。
+本轮新增 journal 串行保护的吞吐影响尚未测量。第一分支登记失败等更广的故障路径
+未做系统覆盖，不能由这组用例推导所有恢复路径均正确。
+其他七张本地表保持空表；customer/orders 及四位客户、四个订单保留供继续操作。

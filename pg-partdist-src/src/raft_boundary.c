@@ -390,6 +390,7 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 	bool			committed = PG_GETARG_BOOL(3);
 	int64			cts = PG_GETARG_INT64(4);
 	ShardClogSlot	slot;
+    uint64 decision_gxid = hdr_gxid;
 	int64			sts = 0;
 	char *volatile	payload = NULL;
 	uint32			payload_len = 0;
@@ -400,11 +401,18 @@ pg_partdist_shard_verdict_apply(PG_FUNCTION_ARGS)
 	if (!OidIsValid(partition_id) || !TransactionIdIsNormal(sxid))
 		PG_RETURN_BOOL(false);
 
-	if (!ShardXidDecisionBegin(partition_id, sxid, hdr_gxid))
+    /* Native stream headers use node/local-xid IDs; first-shard clog uses
+     * TSO transaction IDs. The optional DTX identity must match this exact
+     * slot before it may replace the native header as the recycle fence. */
+    if (PG_NARGS() > 5 && !PG_ARGISNULL(5) &&
+        ShardClogReadSlot(partition_id, sxid, &slot) &&
+        slot.global_xid == (uint64) PG_GETARG_INT64(5))
+        decision_gxid = slot.global_xid;
+	if (!ShardXidDecisionBegin(partition_id, sxid, decision_gxid))
 		PG_RETURN_BOOL(false);
 	PG_TRY();
 	{
-		if (ShardXidDecisionWrite(partition_id, sxid, hdr_gxid,
+		if (ShardXidDecisionWrite(partition_id, sxid, decision_gxid,
 								  committed, committed ? cts : 0))
 		{
 			ShardClogReadSlot(partition_id, sxid, &slot);

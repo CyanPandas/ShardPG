@@ -1,0 +1,41 @@
+本机 SQL 状态机回归（不连接实验室）
+cd /home/zhanhao/shardpg-fa23-acceptance-work
+python3 pg-partdist-src/tests/local/test_first_shard_coordinator.py
+期望：Ran 3 tests / OK。结果保存在 sql-regression-final.log。
+
+git diff --check
+期望：退出 0，无输出。
+
+实验室重复功能验收（会修改并恢复本轮专用四位客户/订单，不是只读命令）
+先 SSH 到实验室 145，使用 yyt 账户：
+cd /data1/yyt/shardpg-vacu-fa23c79-20261108T165000Z
+python3 repeat-acceptance.py --run-id check-20261108-unique
+每次使用新的 run-id；不覆盖已有结果，不在失败/中断后盲目重发原事务。
+期望：8 个 CASE_PASS，随后 PASS_ALL_REQUESTED_FUNCTIONAL_CHECKS。
+结果：acceptance/business-check-20261108-unique-result.json
+逐条 SQL、SQLSTATE、返回行和时间：同前缀 events.jsonl。
+已经实际完成的确认命令：python3 repeat-acceptance.py --run-id confirmation
+该命令的原始日志为 business-confirmation.log，结果为
+acceptance/business-confirmation-result.json。
+
+原生身份围栏回归（幂等重放本轮已确认提交的旧判决）
+cd /data1/yyt/shardpg-vacu-fa23c79-20261108T165000Z
+python3 verify-native-identity.py
+期望：PASS_NATIVE_IDENTITY_FENCE，错误身份返回 false，正确身份返回 true，
+clog 前后同为 st=2 sts=100087 cts=100088。
+该命令依赖保留的原始事务 4137；不要用于其他数据库或猜测事务结局。
+
+最终核验（会回收已证实无业务写入且无人持有的指定诊断路由4097，其余为核对）
+python3 final-verification.py
+期望：PASS_FINAL_FOUR_NODE_VERIFICATION，各节点 5 项收尾计数均为0。
+
+实际构建命令（147 的本轮专用 builder；产物先留在源码目录）
+make -C /work/pg-partdist-src -j4 PG_CONFIG=/work/pg-install/bin/pg_config
+make -C /work/pg-raft-src -j4 PG_CONFIG=/work/pg-install/bin/pg_config
+执行上下文和原始输出：build-own-fixes.py、evidence-build/own-fixes-build.log。
+构建不会自动部署。原始部署完整脚本为 deploy-fa23.py，增量安全部署脚本为
+rollout-own-fixes.py；它们有目录/容器归属和已执行阶段保护，不能无检查重复执行。
+保留的原始 fa23 native 库备份在各主机本轮目录的 baseline-native-backup/。
+
+不要再次运行 customer/orders 的原始建表和插入命令；环境及验收数据已经保留。
+没有运行任何 TPC-C loader、benchmark、终端数/仓库数压测命令。
