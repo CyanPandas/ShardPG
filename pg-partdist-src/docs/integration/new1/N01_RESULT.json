@@ -1,0 +1,20 @@
+{
+  "base": "00214ff",
+  "source_commit": "3b95245a807abc699b70acc8cb4f27fed4cd9969",
+  "mmp_snapshot": "bbee3e1cb7f9e0e49b7a246153fce078c173bee0",
+  "status": "adapted_static_review_only_runtime_tests_deferred",
+  "build": "pg_raft make clean / make -j2 / make install succeeded in private container; install target was a private copy of fa23 pg-install",
+  "runtime_tests_run": false,
+  "database_started": false,
+  "container_stopped": true,
+  "source_sha256": {
+    "pg-raft-src/include/pg_raft.h": "14747199ec0ab805600037b10fabfc2ce19b083b971283994d306f52adf4a5a3",
+    "pg-raft-src/src/pg_raft.c": "cb9736b1d3868c103d02986085a72ab44c4e3128d13e9ce9c650410e9d1d3592",
+    "pg-raft-src/src/raft_consensus.c": "e74e999f37841e4d1389ab266b608a92dc273819d4d0c73835461089e9711df0",
+    "pg-raft-src/src/raft_leader.c": "54c07d03aa7315c2a7621c57475842a63dd4fd7d1d470de57d14d1740e168bc9"
+  },
+  "pg_raft_so_sha256": "d0d2ec19824d96778055e80c0a752d2747de773743e993d81fe9a1726aefb5f6",
+  "build_log_sha256": "c56c37d6d25b00174b204ab4a1dd05db71b399e38856fdc3fbd367adec38073c",
+  "build_artifacts": "/home/zhanhao/new1-n01-validation-20261110",
+  "deferred_test_drafts": "/home/zhanhao/new1-n01-validation-20261110/deferred-tests"
+}

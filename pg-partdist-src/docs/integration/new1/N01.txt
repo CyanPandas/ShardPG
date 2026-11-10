@@ -1,0 +1,64 @@
+N01 多机连接参数适配
+
+基础：new1 00214ff（fa23 基础44a3e2d）。
+来源：mmp继承的3b95245；同时核对mmp bbee3e1的最终连接格式化实现。
+状态：已接入、静态审查完成；运行测试按用户指示留到全部合并后。
+
+改动
+
+1. pg_raft.loopback_node_names
+   默认on，PGC_POSTMASTER（需要重启）。
+   on时保留fa23的coordinator/master/worker1..3到127.0.0.1映射，
+   未给有效端口时沿用5432..5435的原有后备端口。
+   off时这些名称原样交给libpq解析，不再套本机映射及约定端口，部署须明确给出端口。
+   该开关作用于pg_raft_format_conninfo，不是全项目所有连接的统一地址重写开关。
+   缓存Raft peer连接原本就直接使用pg_raft.peers中写明的host/port，此行为保留。
+
+2. pg_raft.peer_connect_timeout_s
+   默认1秒，允许1–60秒，PGC_SIGHUP（配置重载生效）。
+   接到通用连接格式化的非自连分支，以及peer_conn_get新建缓存RPC连接的路径。
+   已建立连接继续复用，调参不强制断开；新建连接使用重载后的值。
+
+3. 自连保持原规则
+   格式化后的地址为127.0.0.1或localhost，且端口等于PostPortNumber，才认作自连；
+   自连仍使用pg_raft.self_connect_timeout_s，默认10秒。
+   未新增主机名DNS解析来判断“是否自己”。因此关闭映射后的worker1名称即使解析到本机，
+   也按对端参数处理；这是与mmp一致的明确判定规则。
+
+4. 修改文件
+   pg-raft-src/include/pg_raft.h：变量声明。
+   pg-raft-src/src/raft_leader.c：变量定义与默认值。
+   pg-raft-src/src/pg_raft.c：映射开关、格式化超时选择、GUC注册。
+   pg-raft-src/src/raft_consensus.c：缓存peer的PQconnectdb超时参数。
+
+静态审查结论
+
+- 原有映射、后备端口、自连超时在默认配置下保持一致。
+- 新变量均有声明、定义和GUC注册；类型、默认值及范围一致。
+- loopback开关须重启，不会因SIGHUP在同一进程中改变已有目标映射。
+- 同步连接两处原来写死的1秒均接入参数，保留fa23的连接缓存、失败重置和退避机制。
+- 没有改动成员集、共识决议、DDL记录、分片迁移、VACU或业务事务协议。
+- fa23原有异步PQconnectStart/PQconnectPoll路径由自己的30秒握手上限控制；
+  libpq异步轮询不会替调用者执行connect_timeout期限，N01没有改变该30秒上限。
+  同步RPC执行期限、选举期限也没有随新建连参数变化，不能将它当作所有RPC的总超时。
+- 这是源码层面一致性判断，不替代网络、配置重载及集群运行验证。
+
+已执行工作与保留证据
+
+用户要求推迟测试之前，已经启动独立pg_raft构建；make clean、make -j2和make install
+已完成。使用私有fa23 pg-install拷贝的PG16.14头文件/PGXS，容器只提供编译工具链。
+没有覆盖仓库内pg-install，也没有替换任何运行中服务的库。
+构建目录：/home/zhanhao/new1-n01-validation-20261110。
+输入源码/产物hash见N01_RESULT.json。容器已停止；没有启动任何测试数据库。
+尚未运行的测试草稿保存在上述目录的deferred-tests，不作为已通过测试或已交付套件。
+
+统一测试时应覆盖
+
+- 默认on时所有既有节点别名、显式端口及后备端口行为。
+- off时真实主机名解析到目标机器，不会误连本机；普通IP地址行为保持一致。
+- 1/60秒边界、非法值拒绝、SIGHUP生效及POSTMASTER参数重启生效。
+- 自连与对端分别使用对应超时；缓存RPC重连确实使用新值。
+- TCP已接受但PostgreSQL握手不应答的场景按期失败，并给出错误诊断。
+- fa23正常demo和跨机器建连回归；异步升主/登记仍按自己的期限推进。
+
+本项完成后不自动接入N02或其他项目。
