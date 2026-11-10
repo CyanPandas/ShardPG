@@ -1,0 +1,32 @@
+{
+  "status": "normal_demo_core_flow_pass_with_retained_route",
+  "baseline": "fa23c79 -> 8e471bb + existing DDL R4 changes + metadata-only add/remove compatibility fixes",
+  "completed_beijing": "2026-11-10 12:17:16 +0800",
+  "scope": "147 laboratory host; five real PostgreSQL instances in a new dedicated container; no changes to original demo deployment; no 47195c5 or descendants imported",
+  "passed": [
+    "direct creation of two colocated distributed tables; four shards each, three shard replicas",
+    "cross-worker commit and explicit rollback",
+    "online add-node and same-parameter repeat",
+    "nonempty colocated replica migration node3->node5 and source cleanup",
+    "six concurrent cross-shard writer transactions, all successful",
+    "both colocated shard primaries transferred to node5; join/commit/rollback verified",
+    "replicas moved node5->node3; node5 emptied",
+    "Citus removal, four-node controlled restart and reduced control membership",
+    "customer and order hashes match across shrink/restart; new commit/rollback verified",
+    "DROP TABLE removes all eight business groups, physical tables and partition map entries"
+  ],
+  "open_items": [
+    "coordinator dtx_route retains gxid=4097,coord_gsid=102012; no prepared/pending/coord_tx/coord_branch in final pre-drop checks; not manually deleted; full metadata cleanup is not a pass",
+    "first read immediately after restart failed before data-group leadership/routing settled; later read-only retry and business checks passed"
+  ],
+  "fixes": [
+    "shardpg.add_node performs only citus_add_node in a separate metadata transaction via dtx_self; first_shard_coordinator off is transaction-local on that independent connection; caller/business remains on",
+    "legacy demo removal uses the same isolated metadata transaction for citus_remove_node"
+  ],
+  "important_limits": [
+    "five real nodes were on one lab host, not a repeat of the former multi-host network layout",
+    "old lab CLI container/address wrappers were adapted into test scripts; SQL operations and stop/restart steps executed for real; shell syntax of modified wrappers checked",
+    "no fault injection, performance benchmark or new scaling protocol work; installation into original user containers was not performed"
+  ],
+  "evidence": "evidence/events.jsonl and step logs; original failures preserved; sha256.json covers archived evidence"
+}

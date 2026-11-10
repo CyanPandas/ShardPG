@@ -173,7 +173,8 @@ cmd_remove_node() {
     [[ "$n" == 0 ]] || { echo "$name 上还有 $n 个分片的副本：先删表，或用 move-replica 迁走" >&2; exit 1; }
     others=$(rows | awk -v n="$name" '$1 != n {print $1}')
     echo "[1/5] ShardPG 移除 worker，各节点节点表删掉 $name"
-    sql -At -c "SELECT citus_remove_node(nodename, nodeport) FROM pg_dist_node WHERE nodeport = $port" >/dev/null
+    # Citus catalog-only operation: isolate it from VACU business enlistment.
+    sql -At -c "SELECT partdist.dtx_self(format('SET LOCAL shardpg.first_shard_coordinator=off; SELECT pg_catalog.citus_remove_node(%L,%s)', nodename, nodeport)) FROM pg_dist_node WHERE nodeport = $port" >/dev/null
     for o in $others; do
         h=$(field "$o" 3)
         on_host "$h" "bash $(host_dir "$h")/demo_node.sh sql $o -q -c 'DELETE FROM partdist.node_map WHERE node_id = $id'" </dev/null
@@ -236,7 +237,8 @@ container_remove_node() {
     # Guard against deleting a different container that happens to use this name.
     [[ "$(on_host 10.77.110.147 "docker inspect -f '{{index .Config.Labels \"io.shardpg.container-demo\"}}' shardpg-ddl-worker4")" == ba76941 ]] || return 1
     before=$(sql -At -c 'SELECT partdist.partdist_tso_client_start_ts()') || return 1
-    sql -c "SELECT citus_remove_node(nodename,nodeport) FROM pg_dist_node WHERE nodeport=32436" || return 1
+    # Citus catalog-only operation: isolate it from VACU business enlistment.
+    sql -c "SELECT partdist.dtx_self(format('SET LOCAL shardpg.first_shard_coordinator=off; SELECT pg_catalog.citus_remove_node(%L,%s)', nodename, nodeport)) FROM pg_dist_node WHERE nodeport=32436" || return 1
     cmd_stop worker4 fast || return 1
     for n in worker1 worker2 worker3 master; do cmd_stop "$n" fast || return 1; done
     while read -r n _ ip port; do

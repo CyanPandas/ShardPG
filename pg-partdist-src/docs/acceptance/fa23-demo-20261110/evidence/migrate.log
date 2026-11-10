@@ -1,0 +1,40 @@
+pick_source_replica 1 0 3
+ 
+bucket_before 1 0 {"colocationid":1,"minv":-2147483648,"sids":[102011,102015],"names":["fa23_demo_customer_102011","fa23_demo_orders_102015"]}
+ 
+demo_move_replica 1 0 check|2 colocated shards of one hash range (fa23_demo_customer_102011, fa23_demo_orders_102015): move a replica from worker2 (:28444) to worker4 (:28446)|0
+add member|2 Raft groups each add member worker4 (membership changes go through the Raft log, one at a time; now 4 members per group, quorum 3)|1
+provision, catch up|the new replica got a physical baseline plus the log after it, and was warmed up by replay: ready to take over|8
+remove member|2 Raft groups remove member worker2; the control plane now lists the replicas as worker3,worker4|1
+clean up source|Raft groups, replica tables and replay registrations of these 2 shards removed from worker2|4
+done|fa23_demo_customer_102011 primary worker1, replicas worker3,worker4; fa23_demo_orders_102015 primary worker1, replicas worker3,worker4|14
+ 
+migration_membership_102011 1 0 t
+ 
+source_group_removed_102011 3 0 0
+ 
+source_table_removed_102011 3 0 t
+ 
+migration_membership_102015 1 0 t
+ 
+source_group_removed_102015 3 0 0
+ 
+source_table_removed_102015 3 0 t
+ 
+balance_after_migration 1 0 16|16000
+ 
+orders_after_migration 1 0 28|1612
+ 
+demo_move_primary 1 0 fa23_demo_customer_102011, fa23_demo_orders_102015: primary of 2 shard(s) now on worker4 (13 s)
+ 
+new_primary_102011 1 0 5
+ 
+new_primary_102015 1 0 5
+ 
+join_on_new_primary 1 0 7
+ 
+commit_on_new_primary 1 0  
+rollback_on_new_primary 1 0  
+post_primary_balances 1 0 16|16000
+ 
+FA23_DEMO_MIGRATION_WRITES_AND_TRANSFER_PASS

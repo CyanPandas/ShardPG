@@ -1,0 +1,150 @@
+{
+  "id": "07aae075a56d62735625aa0b0b4ae5138e8fb1e2ae1dbdbc2620b40d4abd443b",
+  "name": "yyt-fa23-demo-validation-20261110",
+  "uid": 1028,
+  "gid": 1028,
+  "initialized": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "wired": true,
+  "baseline": "8e471bb+DDL-R4",
+  "sha256": {
+    "citus.so": "1263f3d5915d10e57c51ff17eb14c4e43196c60e15dd9d8cc20153612af50578",
+    "pg_partdist.so": "99b8d69653fb175d14564bf1280efebe2071b2bea1ffb3670481b48a48af01e9",
+    "pg_raft.so": "ff285ff162541d89c3838e8785d5c2c1c4f9dc4c3230a4f208ee3786eceed858"
+  },
+  "business": {
+    "customer": "fa23_demo_customer",
+    "orders": "fa23_demo_orders",
+    "key_a": 1,
+    "key_b": 3,
+    "shard": 102011,
+    "source": 3,
+    "routes": [
+      [
+        1,
+        102011,
+        2
+      ],
+      [
+        2,
+        102014,
+        2
+      ],
+      [
+        3,
+        102012,
+        3
+      ],
+      [
+        4,
+        102012,
+        3
+      ],
+      [
+        5,
+        102011,
+        2
+      ],
+      [
+        6,
+        102013,
+        4
+      ],
+      [
+        7,
+        102012,
+        3
+      ],
+      [
+        8,
+        102011,
+        2
+      ],
+      [
+        9,
+        102014,
+        2
+      ],
+      [
+        10,
+        102011,
+        2
+      ],
+      [
+        11,
+        102014,
+        2
+      ],
+      [
+        12,
+        102014,
+        2
+      ],
+      [
+        13,
+        102013,
+        4
+      ],
+      [
+        14,
+        102012,
+        3
+      ],
+      [
+        15,
+        102011,
+        2
+      ],
+      [
+        16,
+        102012,
+        3
+      ]
+    ]
+  },
+  "seeded": true,
+  "added": true,
+  "bucket": {
+    "colocationid": 1,
+    "minv": -2147483648,
+    "sids": [
+      102011,
+      102015
+    ],
+    "names": [
+      "fa23_demo_customer_102011",
+      "fa23_demo_orders_102015"
+    ]
+  },
+  "writer_pid": 4022758,
+  "migration_returned": true,
+  "migrated": true,
+  "moved_back": true,
+  "before_shrink_data": "8276c699a4d132eaa586ed864b553916\n82bd17a064029f6901a22501b30ac5fa",
+  "shrink_stopped": true,
+  "shrunk": true,
+  "all_business_shards": [
+    102011,
+    102012,
+    102013,
+    102014,
+    102015,
+    102016,
+    102017,
+    102018
+  ],
+  "core_flow_pass": true,
+  "complete_cleanup_pass": false,
+  "retained_route_counts": {
+    "1": 1,
+    "2": 0,
+    "3": 0,
+    "4": 0
+  },
+  "completed_utc": "2026-11-10T04:17:16Z"
+}

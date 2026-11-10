@@ -1,0 +1,15 @@
+after_shrink_data 1 0 8276c699a4d132eaa586ed864b553916
+82bd17a064029f6901a22501b30ac5fa
+ 
+commit_after_shrink 1 0  
+rollback_after_shrink 1 0  
+final_balance 1 0 16|16000
+ 
+final_no_prepared 1 0 0
+ 
+final_no_prepared 2 0 3
+ 
+Traceback (most recent call last):
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/shrink_business_resume.py", line 8, in <module>
+    for i in range(1,5):assert sql(i,'final_no_prepared','SELECT count(*) FROM pg_prepared_xacts')=='0'
+AssertionError

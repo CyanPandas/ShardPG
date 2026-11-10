@@ -1,0 +1,37 @@
+路由 4097 → 102012 残留原因（时间均为北京时间）
+
+结论：缩容重启后的只读校验触发业务事务首次登记失败，留下已独立提交的路由。
+记录在 DROP TABLE 前已经存在，DROP 后仍保留；本次只诊断，未手工删除或修改数据库实现。
+
+已核实的时间线：
+2026-11-10 12:12:13.794：客户表摘要 SELECT 的事务 4097 向 node3 登记协调分片 102012。
+node3 返回 this node is not the coordinator shard leader；四个分支的 dtx_enlist 都失败。
+12:12:13.813–13.844：四个分支向 node3 发送 dtx_vote(...,false)，均报 query returned no rows。
+12:12:14.789：node2 才当选分片 102012 的 leader。
+12:12:25：主节点登记及路由切换到 node2。
+12:15:34：删表前查询确认 dtx_route 中有 4097|102012。
+12:18:44：删表后最终查询仍有同一条路由。
+12:28:22–23：本次四节点复查，协调节点仍有该路由（xmin=913）。
+四节点均无 4097 的 coord_tx、coord_branch、participant、decision、commit_decided、first_attempt；
+pending=false，全部 prepared=0，业务表及 102012 的 partition_map 登记为0。
+
+代码原因：
+1. src/dtx/dtx_coordinator.c enlist_business 先经独立 TSO 连接执行 dtx_route_claim，
+   路由提交后，才向分片 leader 调用 dtx_enlist。客户端回滚不撤销该独立事务。
+2. sql/first_shard_coordinator.sql dtx_enlist 在插入 dtx_coord_tx/branch 前检查 leader。
+   本次 leader 检查失败，故没有形成协调事务登记。
+3. branch_callback 在 abort 时发送 dtx_vote(false)，但 dtx_vote 的 SELECT INTO STRICT
+   找不到协调事务，抛出日志中的 query returned no rows，回调捕获后清空本地状态。
+4. dtx_dispatch 从协调事务/分支和持久决议寻找清理对象；这条只有路由、没有登记的记录
+   不会进入这些循环。DDL first_attempt 恢复路径也不覆盖本次业务分支登记。
+5. shardpg_cleanup_dropped 清理分片组、物理表、分片映射及回放登记，不回收 dtx_route。
+   因而删表清理完成也不会带走该孤立路由。
+
+这是失败登记路径的路由回收缺口；该记录不是未删掉的业务表，也不是本次写事务卡在 prepared。
+后续修复需要覆盖首次登记的持久意图和失败恢复，不能仅凭没有登记就普遍直接删除路由，
+因为其他情形可能存在远端登记成功但回复丢失。本次日志明确显示四个分支均登记失败。
+
+证据：route-4097-evidence.json 保存服务器日志片段、四节点实时查询和在线函数定义。
+在线 dtx_enlist/dtx_vote/dtx_dispatch/dtx_route_claim/dtx_route_release/shardpg_cleanup_dropped
+函数体均与本地 fa23 安装 SQL 一致。
+历史 SQL 和返回值见 ../evidence/events.jsonl。

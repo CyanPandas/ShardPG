@@ -1,0 +1,35 @@
+extension_citus 1 0  
+extension_pg_partdist 1 0  
+extension_pg_raft 1 0  
+bootstrap_node_map 1 0  
+extension_citus 2 0  
+extension_pg_partdist 2 0  
+extension_pg_raft 2 0  
+bootstrap_node_map 2 0  
+extension_citus 3 0  
+extension_pg_partdist 3 0  
+extension_pg_raft 3 0  
+bootstrap_node_map 3 0  
+extension_citus 4 0  
+extension_pg_partdist 4 0  
+extension_pg_raft 4 0  
+bootstrap_node_map 4 0  
+coordinator_address 1 0 
+ 
+ddl_metadata 1 0 t
+ 
+bootstrap_worker 1 0 2
+ 
+bootstrap_worker 1 0 3
+ 
+bootstrap_worker 1 0 4
+ 
+default_protocol 1 0 on
+ 
+default_protocol 2 0 on
+ 
+default_protocol 3 0 on
+ 
+default_protocol 4 0 on
+ 
+FA23_DEMO_FOUR_NODE_READY

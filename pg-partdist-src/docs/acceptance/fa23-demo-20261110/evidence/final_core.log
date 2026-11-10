@@ -1,0 +1,79 @@
+all_business_shards 1 0 102011
+102012
+102013
+102014
+102015
+102016
+102017
+102018
+ 
+final_protocol 1 0 on
+ 
+final_control_size 1 0 4
+ 
+final_removed_node_absent 1 0 0
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_protocol 2 0 on
+ 
+final_control_size 2 0 4
+ 
+final_removed_node_absent 2 0 0
+ 
+final_transaction_health 2 0 0|0|0|0|0
+ 
+final_protocol 3 0 on
+ 
+final_control_size 3 0 4
+ 
+final_removed_node_absent 3 0 0
+ 
+final_transaction_health 3 0 0|0|0|0|0
+ 
+final_protocol 4 0 on
+ 
+final_control_size 4 0 4
+ 
+final_removed_node_absent 4 0 0
+ 
+final_transaction_health 4 0 0|0|0|0|0
+ 
+demo_drop_tables 1 0  NOTICE:  清理：已拆除 8 个分片的 Raft 组
+NOTICE:  清理：已删除各节点上的副本表
+NOTICE:  清理：已删除主从登记，回收残留
+
+drop_business_group_cleanup 1 0 0
+ 
+drop_partition_map_cleanup 1 0 0
+ 
+drop_physical_tables_cleanup 1 0 0
+ 
+drop_no_prepared 1 0 0
+ 
+drop_business_group_cleanup 2 0 0
+ 
+drop_partition_map_cleanup 2 0 0
+ 
+drop_physical_tables_cleanup 2 0 0
+ 
+drop_no_prepared 2 0 0
+ 
+drop_business_group_cleanup 3 0 0
+ 
+drop_partition_map_cleanup 3 0 0
+ 
+drop_physical_tables_cleanup 3 0 0
+ 
+drop_no_prepared 3 0 0
+ 
+drop_business_group_cleanup 4 0 0
+ 
+drop_partition_map_cleanup 4 0 0
+ 
+drop_physical_tables_cleanup 4 0 0
+ 
+drop_no_prepared 4 0 0
+ 
+FA23_NORMAL_DEMO_CORE_FLOW_PASS
+RETAINED_ROUTE_COUNTS {"1": 1, "2": 0, "3": 0, "4": 0}

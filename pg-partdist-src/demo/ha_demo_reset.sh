@@ -33,8 +33,8 @@ DATA=$(q "$PORT" "SHOW data_directory" 2>/dev/null || true)
 
 say "Citus 移除 worker"
 if [[ "$(q 5432 "SELECT count(*) FROM pg_dist_node WHERE nodeport = $PORT")" != 0 ]]; then
-  host=$(q 5432 "SELECT nodename FROM pg_dist_node WHERE nodeport = $PORT")
-  q 5432 "SELECT citus_remove_node('$host', $PORT)" >/dev/null
+  # Administrative catalog change in a separate connection; business VACU stays on.
+  q 5432 "SELECT partdist.dtx_self(format('SET LOCAL shardpg.first_shard_coordinator=off; SELECT pg_catalog.citus_remove_node(%L,%s)', nodename, nodeport)) FROM pg_dist_node WHERE nodeport = $PORT" >/dev/null
 fi
 echo "ok"
 

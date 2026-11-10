@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/init.py", line 26, in <module>
+    dex([BIN+'/pg_ctl','-D',directory+'/pgdata','-l',directory+'/startup.log','-w','-t','45','start'])
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/fixture.py", line 23, in dex
+    s=inspect();return command(['docker','exec','-i','--user',str(s['uid'])+':'+str(s['gid']),s['id']]+args,data,timeout)
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/fixture.py", line 10, in command
+    if r.returncode:raise RuntimeError('command failed '+str(args[:5])+': '+r.stderr.decode(errors='replace')[-4000:])
+RuntimeError: command failed ['docker', 'exec', '-i', '--user', '1028:1028']: pg_ctl: could not start server
+Examine the log output.
+

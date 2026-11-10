@@ -1,0 +1,47 @@
+resume_no_prepared 1 0 0
+ 
+resume_no_prepared 2 0 0
+ 
+resume_no_prepared 3 0 0
+ 
+resume_no_prepared 4 0 0
+ 
+resume_no_prepared 5 0 0
+ 
+resume_not_in_citus 1 0 0
+ 
+install_add_node_metadata_fix 1 0  
+protocol_before_add 1 0 on
+ 
+demo_add_node_resumed 1 0 new node ready|worker4 (node id 5, 127.0.0.1:28446): extensions installed, pg_raft.peers = the 4 existing nodes + itself|0
+append pg_raft.peers|reloaded on 4 nodes (4 of them already appended by an earlier run); control-plane group 0 members 4 -> 5, quorum 3|0
+join control plane|127.0.0.1:28446 registered at group 0 log index 11, the new node has caught up|1
+shardpg add worker|127.0.0.1:28446 added as a ShardPG worker, table metadata synced; no shards on the new node yet, use shardpg.move_replica to move replicas over|0
+done|worker4 (127.0.0.1:28446) joined the cluster, no node was restarted|2
+on
+ 
+five_peers 1 0 1@127.0.0.1:28442,2@127.0.0.1:28443,3@127.0.0.1:28444,4@127.0.0.1:28445,5@127.0.0.1:28446
+ 
+control_status 1 0 0|leader|1|1|11|11
+ 
+five_peers 2 0 1@127.0.0.1:28442,2@127.0.0.1:28443,3@127.0.0.1:28444,4@127.0.0.1:28445,5@127.0.0.1:28446
+ 
+control_status 2 0 0|follower|1|1|11|11
+ 
+five_peers 3 0 1@127.0.0.1:28442,2@127.0.0.1:28443,3@127.0.0.1:28444,4@127.0.0.1:28445,5@127.0.0.1:28446
+ 
+control_status 3 0 0|follower|1|1|11|11
+ 
+five_peers 4 0 1@127.0.0.1:28442,2@127.0.0.1:28443,3@127.0.0.1:28444,4@127.0.0.1:28445,5@127.0.0.1:28446
+ 
+control_status 4 0 0|follower|1|1|11|11
+ 
+five_peers 5 0 1@127.0.0.1:28442,2@127.0.0.1:28443,3@127.0.0.1:28444,4@127.0.0.1:28445,5@127.0.0.1:28446
+ 
+control_status 5 0 0|follower|1|1|11|11
+ 
+new_worker_registered 1 0 1
+ 
+repeat_add_node 1 0 done|worker4 (127.0.0.1:28446) is already in the cluster, nothing to do|0
+ 
+FA23_DEMO_ADD_NODE_PASS

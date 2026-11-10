@@ -1,0 +1,33 @@
+move_back_to_original_worker 1 0 check|2 colocated shards of one hash range (fa23_demo_customer_102011, fa23_demo_orders_102015): move a replica from worker4 (:28446) to worker2 (:28444)|0
+add member|2 Raft groups each add member worker2 (membership changes go through the Raft log, one at a time; now 4 members per group, quorum 3)|0
+provision, catch up|the new replica got a physical baseline plus the log after it, and was warmed up by replay: ready to take over|19
+move primary|the source node was the primary, moved the primary to worker1 first: primary of 2 shard(s) now on worker1 (6 s)|6
+remove member|2 Raft groups remove member worker4; the control plane now lists the replicas as worker2,worker3|1
+clean up source|Raft groups, replica tables and replay registrations of these 2 shards removed from worker4|3
+done|fa23_demo_customer_102011 primary worker1, replicas worker2,worker3; fa23_demo_orders_102015 primary worker1, replicas worker2,worker3|30
+ 
+removed_worker_empty 1 0 0
+ 
+before_shrink_no_prepared 1 0 0
+ 
+before_shrink_no_prepared 2 0 0
+ 
+before_shrink_no_prepared 3 0 0
+ 
+before_shrink_no_prepared 4 0 0
+ 
+before_shrink_no_prepared 5 0 0
+ 
+before_shrink_data 1 0 8276c699a4d132eaa586ed864b553916
+82bd17a064029f6901a22501b30ac5fa
+ 
+demo_citus_remove_node 1 3  ERROR:  a distributed branch could not register with its coordinator
+DETAIL:  ERROR:  first-shard coordination requires a managed shard on every branch
+
+
+Traceback (most recent call last):
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/shrink.py", line 11, in <module>
+    sql(1,'demo_citus_remove_node',"SELECT citus_remove_node('127.0.0.1',%d)"%PORTS[4])
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/fixture.py", line 34, in sql
+    if r.returncode and not allow_error:raise RuntimeError(label+' failed; inspect events.jsonl; do not blindly repeat writes')
+RuntimeError: demo_citus_remove_node failed; inspect events.jsonl; do not blindly repeat writes

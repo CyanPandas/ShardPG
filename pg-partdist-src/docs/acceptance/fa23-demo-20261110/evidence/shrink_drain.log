@@ -1,0 +1,59 @@
+wait_async_phase_two 1 0 0
+ 
+wait_async_phase_two 2 0 0
+ 
+wait_async_phase_two 3 0 0
+ 
+wait_async_phase_two 4 0 0
+ 
+FA23_DEMO_SHRINK_AND_BUSINESS_PASS
+all_business_shards 1 0 102011
+102012
+102013
+102014
+102015
+102016
+102017
+102018
+ 
+final_protocol 1 0 on
+ 
+final_control_size 1 0 4
+ 
+final_removed_node_absent 1 0 0
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+final_transaction_health 1 0 0|0|0|0|1
+ 
+Traceback (most recent call last):
+  File "/home/yyt/yyt/fa23-demo-validation-20261110/shrink_drain.py", line 13, in <module>
+    exec((ROOT/'final_check.py').read_text())
+  File "<string>", line 14, in <module>
+RuntimeError: transaction state not drained at node1

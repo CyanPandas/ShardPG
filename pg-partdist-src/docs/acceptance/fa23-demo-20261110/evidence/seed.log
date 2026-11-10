@@ -1,0 +1,38 @@
+test_names_unused 1 0 t
+ 
+create_customer 1 0  NOTICE:  分布：按 w 哈希切成 4 个分片
+NOTICE:  建组：每个分片 1 主 2 从，选主、供副本完成（20 s）
+NOTICE:  打标：4 个分片已接入分布式事务
+
+create_orders 1 0  NOTICE:  分布：按 w 哈希切成 4 个分片，与 fa23_demo_customer 共置
+NOTICE:  建组：每个分片 1 主 2 从，选主、供副本完成（18 s）
+NOTICE:  打标：4 个分片已接入分布式事务
+
+seed_customer 1 0  
+seed_orders 1 0  
+initial_join 1 0 16|16000|1600
+ 
+routing 1 0 1|102011|2
+2|102014|2
+3|102012|3
+4|102012|3
+5|102011|2
+6|102013|4
+7|102012|3
+8|102011|2
+9|102014|2
+10|102011|2
+11|102014|2
+12|102014|2
+13|102013|4
+14|102012|3
+15|102011|2
+16|102012|3
+ 
+cross_worker_commit 1 0  
+commit_visible 1 0 16000
+ 
+cross_worker_rollback 1 0  
+rollback_visible 1 0 16|16000|1600
+ 
+FA23_DEMO_SEED_AND_TRANSACTIONS_PASS

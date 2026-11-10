@@ -3372,7 +3372,13 @@ BEGIN
 
     -- ④ ShardPG 加 worker：同步元数据，各分布表的外壳建到新节点上
     ts := clock_timestamp();
-    PERFORM pg_catalog.citus_add_node(p_host, p_port);
+    -- Node registration only changes Citus catalogs; it has no business shard
+    -- to enlist in first-shard coordination. Use a separate metadata-only
+    -- transaction, as the peer/address steps above already do. Never change
+    -- the caller's protocol setting or include caller business writes here.
+    PERFORM partdist.dtx_self(format(
+        'SET LOCAL shardpg.first_shard_coordinator=off; '
+        'SELECT pg_catalog.citus_add_node(%L,%s)', p_host, p_port));
     PERFORM partdist.addr_exec(p_host, p_port, 'SELECT partdist.rebuild_shard_identity()');
     step := 'shardpg add worker'; secs := round(extract(epoch FROM clock_timestamp() - ts));
     detail := format('%s:%s added as a ShardPG worker, table metadata synced; no shards on the new node yet, use shardpg.move_replica to move replicas over', p_host, p_port);

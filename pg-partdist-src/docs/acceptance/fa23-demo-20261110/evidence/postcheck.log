@@ -1,0 +1,10 @@
+post_drop_final_health 1 0 0|0|0|0|1
+4097|102012
+ 
+post_drop_final_health 2 0 0|0|0|0|0
+ 
+post_drop_final_health 3 0 0|0|0|0|0
+ 
+post_drop_final_health 4 0 0|0|0|0|0
+ 
+POSTCHECK_COMPLETE
