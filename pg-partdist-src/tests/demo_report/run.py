@@ -44,9 +44,12 @@ def now():
     return datetime.now(timezone(timedelta(hours=8))).isoformat()
 
 
-def validate_config(cfg, full):
-    require(set(cfg["nodes"]) == {"master", "worker1", "worker2", "worker3", "worker4"},
-            "nodes必须配置master和worker1–4；worker4为待加入的独立测试节点")
+def validate_config(cfg, scope):
+    expected = {"master", "worker1", "worker2", "worker3"}
+    if scope == "full":
+        expected.add("worker4")
+    require(set(cfg["nodes"]) == expected,
+            "nodes配置须匹配范围：full为五节点，core/four-node为四节点")
     ports, ids = [], []
     for name, node in cfg["nodes"].items():
         require(isinstance(node["port"], int) and 0 < node["port"] < 65536, "invalid port: " + name)
@@ -56,14 +59,14 @@ def validate_config(cfg, full):
         for key in ("probe_command", "psql_command"):
             require(isinstance(node.get(key), list) and node[key] and all(isinstance(x, str) for x in node[key]),
                     name + " requires argv array: " + key)
-        if full and name != "master":
+        if scope != "core" and name != "master":
             for key in ("stop_command", "start_command"):
                 require(isinstance(node.get(key), list) and node[key], name + " requires " + key)
-    require(len(set(ports)) == 5, "fa23的move_primary/move_replica按端口定位，五节点端口须不同")
-    require(len(set(ids)) == 5, "node_id must be distinct")
+    require(len(set(ports)) == len(expected), "fa23管理接口按端口定位，各节点端口须不同")
+    require(len(set(ids)) == len(expected), "node_id must be distinct")
     require(cfg.get("dedicated_test_cluster") is True, "配置须明确指向专用空测试集群")
     require(isinstance(cfg.get("artifact_manifest"), str), "artifact_manifest is required")
-    if full:
+    if scope == "full":
         require(isinstance(cfg.get("prepare_worker4_command"), list),
                 "prepare_worker4_command须为argv数组；worker4已就绪时可为空数组")
 
@@ -588,7 +591,7 @@ class Runner:
                 require(self.scalar("SELECT to_regclass(%s) IS NULL", (physical,), name), name + ": dropped physical table remains")
         for table in self.tables:
             require(self.scalar("SELECT to_regclass(%s) IS NULL", (table,)), "logical table remains")
-        if self.args.scope == "full":
+        if self.args.scope != "core":
             self.q(f"DROP FUNCTION public.{self.prefix}raft_log(regclass,integer,integer)")
 
     def drain(self):
@@ -643,6 +646,8 @@ class Runner:
                     status, detail = "SKIP", "性能阶段未请求；功能结果不代表性能验收"
                 elif self.args.scope == "core" and name in ("failover", "rejoin_transfer", "add_migrate", "raft_logs"):
                     status, detail = "SKIP", "--scope core未执行高可用/迁移"
+                elif self.args.scope == "four-node" and name == "add_migrate":
+                    status, detail = "SKIP", "按用户要求不启动第五实例，未执行加节点和向新节点迁移"
                 elif failed:
                     status, detail = "BLOCKED", "前序失败，未执行"
                 else:
@@ -691,12 +696,12 @@ def main():
     parser.add_argument("--run", action="store_true", help="执行；缺省仅列计划，不连接数据库")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output", type=Path, default=Path("new1-demo-results-" + datetime.now().strftime("%Y%m%d-%H%M%S")))
-    parser.add_argument("--scope", choices=("core", "full"), default="full")
+    parser.add_argument("--scope", choices=("core", "four-node", "full"), default="full")
     parser.add_argument("--benchmark", action="store_true", help="另运行报告第4节的外部TPC-C驱动")
     args = parser.parse_args()
     if args.config:
         cfg = json.loads(args.config.read_text())
-        validate_config(cfg, args.scope == "full")
+        validate_config(cfg, args.scope)
     elif args.run:
         parser.error("--run requires --config")
     if not args.run:
