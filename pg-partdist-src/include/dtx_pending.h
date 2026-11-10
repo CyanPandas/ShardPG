@@ -21,7 +21,7 @@
 
 #include "postgres.h"
 
-#define DTX_PENDING_MAX			128
+#define DTX_PENDING_MAX			1024	/* 节点级未决登记容量 */
 #define DTX_PENDING_MAX_PAIRS	256	/* = SHARD_XID_MAX_PER_XACT（2026-10-03：16 → 256） */
 
 typedef struct DtxPendingEntry

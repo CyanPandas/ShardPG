@@ -51,7 +51,7 @@ ShardXidFromSql(int64 value)
  * 128 分区组时一笔跨分区事务在每台 worker 上就要碰 ~32 个分片（实测
  * "单事务触达的分片数超过上限 16"，演示二灌数据整笔失败）。一个节点承载的
  * 数据组不会超过 pg_raft.max_groups（演示集群 192），256 足够；DTX 未决登记表
- * （DTX_PENDING_MAX × 2 × 本值 × 4 字节 ≈ 256 KB 共享内存）随之放大。
+ * （DTX_PENDING_MAX × 2 × 本值 × 4 字节 ≈ 2 MiB 共享内存）随之放大。
  */
 #define SHARD_XID_MAX_PER_XACT	256
 

@@ -213,7 +213,7 @@ pending_insert_locked(const DtxPendingEntry *ent)
 static void
 pending_insert_warn(int rc, int64 gxid)
 {
-	/* 128 槽 × 节点级在测试与常规负载下到不了；到了先解决泄漏源 */
+	/* 容量耗尽仍报警；增加槽位不替代未决事务收敛。 */
 	if (rc == PENDING_INS_FULL)
 		elog(WARNING,
 			 "pg_partdist: 未决 2PC 登记表已满（%d），gxid=" INT64_FORMAT
@@ -992,7 +992,7 @@ dtx_pending_apply_verdict(const DtxPendingEntry *ent, int verdict, int64 cts)
 int
 DtxPendingSweep(void)
 {
-	DtxPendingEntry snap[DTX_PENDING_MAX];
+	DtxPendingEntry *snap;
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;
@@ -1000,6 +1000,8 @@ DtxPendingSweep(void)
 	if (PendingCtl == NULL)
 		return 0;
 
+	/* 1024 项约 2 MiB：在持自旋锁前分配，避免耗尽 backend 栈。 */
+	snap = palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
 	SpinLockAcquire(&PendingCtl->mutex);
 	for (i = 0; i < DTX_PENDING_MAX; i++)
 		if (PendingCtl->e[i].gxid != 0)
@@ -1110,6 +1112,7 @@ DtxPendingSweep(void)
 			}
 		}
 	}
+	pfree(snap);
 	return ndone;
 }
 
@@ -1464,7 +1467,7 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 int
 DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 {
-	DtxPendingEntry snap[DTX_PENDING_MAX];
+	DtxPendingEntry *snap;
 	int			nsnap = 0;
 	int			ndone = 0;
 	int			i;
@@ -1472,6 +1475,8 @@ DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 	if (PendingCtl == NULL || dtxid == 0 || (verdict != 1 && verdict != 2))
 		return 0;
 
+	/* 1024 项约 2 MiB：在持自旋锁前分配，避免耗尽 backend 栈。 */
+	snap = palloc(sizeof(DtxPendingEntry) * DTX_PENDING_MAX);
 	SpinLockAcquire(&PendingCtl->mutex);
 	for (i = 0; i < DTX_PENDING_MAX; i++)
 		if (PendingCtl->e[i].gxid != 0 && PendingCtl->e[i].dtxid == dtxid)
@@ -1483,6 +1488,7 @@ DtxApplyDecisionByDtxid(int64 dtxid, int verdict, int64 commit_ts)
 		(void) dtx_pending_apply_verdict(&snap[i], verdict, commit_ts);	/* 落账即算送达；复制失败由清扫接手 */
 		ndone++;
 	}
+	pfree(snap);
 	return ndone;
 }
 
