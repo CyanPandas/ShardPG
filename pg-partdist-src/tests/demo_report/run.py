@@ -23,7 +23,7 @@ CASES = [
     ("transactions", "2.3", "跨worker提交、回滚、错误回滚、快照隔离、并发写冲突"),
     ("failover", "3.1–3.2", "停实际分片主、自动选主、读写与跨分片事务"),
     ("rejoin_transfer", "3.3–3.4", "节点重启、追平、作为从返回、手动切主后读写"),
-    ("add_migrate", "3.4 增加节点与副本迁移", "加入worker4、带持续写入迁移两个共置分片"),
+    ("add_migrate", "3.4 增加节点与副本迁移", "加入worker4、带写入及空分片迁移、迁移后切主与首次写入"),
     ("raft_logs", "3.5", "报告日志查看函数、主从角色与日志追平"),
     ("drop", "1.7", "删除九表、清理业务物理表/分片登记/Raft组"),
     ("drain", "补充收尾", "prepared、pending、协调登记和路由归零；K1如实失败"),
@@ -582,6 +582,81 @@ class Runner:
         self.expect_balances()
         self.transfer(10)
         self.transfer(10, "ROLLBACK")
+        self.empty_replica_migration()
+
+    def empty_replica_migration(self):
+        # Provisioning an untouched shard has no allocation watermark to send.
+        # Exercise it before the first write, then serve that write on the new
+        # replica and migrate the now-populated replica back off its primary.
+        candidate = None
+        for row in self.shards():
+            if row[0] != self.c or self.nodes["worker4"]["node_id"] in [row[5]] + row[6]:
+                continue
+            bucket = self.q("SELECT sids,names FROM partdist.colocated_bucket(%s)", (row[2],))[0]
+            if all(self.scalar("SELECT partdist.shard_xid_next(%s::regclass::oid)", (physical,),
+                               self.node_name(member)) == 0
+                   for physical in bucket[1] for member in [row[5]] + row[6]):
+                candidate = (row, bucket)
+                break
+        require(candidate is not None, "no untouched colocated bucket for zero-watermark migration")
+        row, bucket = candidate
+        source = self.node_name(row[6][0])
+        original_primary = self.node_name(row[5])
+        key = self.scalar("SELECT k FROM generate_series(1,256) k WHERE "
+                          "get_shard_id_for_distribution_column(%s,k)=%s LIMIT 1", (self.c,row[1]))
+        require(key is not None, "no key for untouched bucket")
+        for physical in bucket[1]:
+            require(self.scalar("SELECT count(*) FROM " + physical, node=original_primary) == 0,
+                    "zero-watermark regression requires physically empty shards")
+        # Keep corruption validation strict; the provisioner must omit the
+        # absent bound, not make replicated zero an accepted transaction ID.
+        try:
+            self.q("SELECT partdist.shard_xid_raise_watermark(%s::regclass::oid,0)",
+                   (row[2],), original_primary)
+        except Exception as error:
+            require(getattr(error,"pgcode",None) == "XX001", "zero watermark validation changed")
+        else:
+            raise CheckFailed("receiver accepted an invalid replicated zero watermark")
+        before = self.data_digest()
+        self.q("SELECT * FROM shardpg.move_replica(%s,%s,%s)",
+               (row[2],self.nodes[source]["port"],self.nodes["worker4"]["port"]), timeout_ms=900000)
+        self.catchup()
+        for physical in bucket[1]:
+            require(self.scalar("SELECT partdist.shard_xid_next(%s::regclass::oid)",
+                                (physical,), "worker4") == 0, "empty migration manufactured allocation state")
+        self.q("SELECT shardpg.move_primary(%s,%s)", (row[2],self.nodes["worker4"]["port"]), timeout_ms=900000)
+        for sid in bucket[0]:
+            self.wait("empty replica promoted", lambda sid=sid:self.primary(sid),
+                      lambda node:node==self.nodes["worker4"]["node_id"])
+        with self.session() as conn:
+            self.execute(conn,"BEGIN")
+            self.execute(conn,f"INSERT INTO {self.c}(c_w_id,c_d_id,c_id,c_first,c_balance) VALUES(%s,8,880001,'EmptyFirst',23)",(key,))
+            self.execute(conn,f"INSERT INTO {self.o}(o_w_id,o_d_id,o_id,o_c_id) VALUES(%s,8,880001,880001)",(key,))
+            self.execute(conn,"COMMIT")
+            self.execute(conn,"BEGIN")
+            self.execute(conn,f"INSERT INTO {self.c}(c_w_id,c_d_id,c_id,c_first,c_balance) VALUES(%s,8,880002,'Rollback',99)",(key,))
+            self.execute(conn,"ROLLBACK")
+        require(self.scalar(f"SELECT count(*) FROM {self.c} WHERE c_w_id=%s AND c_d_id=8 AND c_id=880002",(key,))==0,
+                "first-write regression rollback became visible")
+        populated = self.data_digest()
+        for physical in bucket[1]:
+            require(self.scalar("SELECT partdist.shard_xid_next(%s::regclass::oid)", (physical,), "worker4") > 0,
+                    "first committed write did not establish allocation state")
+        # worker4 is now primary; moving its replica must transfer leadership
+        # before removal, while preserving both newly committed rows.
+        self.q("SELECT * FROM shardpg.move_replica(%s,%s,%s)",
+               (row[2],self.nodes["worker4"]["port"],self.nodes[source]["port"]), timeout_ms=900000)
+        self.catchup()
+        require(self.data_digest() == populated, "populated reverse migration changed data")
+        self.q("SELECT shardpg.move_primary(%s,%s)", (row[2],self.nodes[original_primary]["port"]), timeout_ms=900000)
+        with self.session() as conn:
+            self.execute(conn,"BEGIN")
+            self.execute(conn,f"DELETE FROM {self.o} WHERE o_w_id=%s AND o_d_id=8 AND o_id=880001",(key,))
+            self.execute(conn,f"DELETE FROM {self.c} WHERE c_w_id=%s AND c_d_id=8 AND c_id=880001",(key,))
+            self.execute(conn,"COMMIT")
+        require(self.data_digest() == before, "empty migration regression changed pre-existing data")
+        self.event("empty_replica_migration_pass", bucket=bucket, key=key, source=source,
+                   target="worker4", reverse_from_primary=True)
 
     def raft_logs(self):
         self.q((HERE / "raft_log.sql").read_text().replace("{{prefix}}", self.prefix))

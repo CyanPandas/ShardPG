@@ -59,5 +59,5 @@ worker4 需事先用同版产物完成容器、initdb、扩展、地址和口令
 ha.raft_log 仅安装在入口节点，从各 worker 的 Raft 视图读取数据。
 重装观察函数可执行：./shardpg_ctl sql < install_raft_log.sql
 安装脚本仅在创建辅助函数的事务中关闭 Citus DDL 传播；业务事务协议保持开启。
-原始产物清单保留为 release.json，追加 SQL 修复后的清单为 release-with-dispatch-fix.json。
+原始产物清单保留为 release.json；当前安装产物清单由 CURRENT_STATUS.json 的 release_manifest 指定。
 当前状态和通过范围以 CURRENT_STATUS.json、ACCEPTANCE_RESULT.txt 及对应验收日志为准。

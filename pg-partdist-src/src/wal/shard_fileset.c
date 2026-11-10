@@ -2124,17 +2124,23 @@ partdist_provision_shard_replica(PG_FUNCTION_ARGS)
                      "SET citus.enable_ddl_propagation=off; "
                      "SELECT partdist.replay_set_locmap('%s', ARRAY[%s], ARRAY[%s], "
                      "ARRAY[%s]::oid[], ARRAY[%s]::oid[], ARRAY[%s]::oid[], %llu::bigint); "
-                     "SELECT partdist.replay_enable('%s'); "
-                     "SELECT partdist.shard_xid_raise_watermark('%s'::regclass::oid, %llu); "
-                     /*
-                      * ★ P7-N72：起效游标已指向这条定向基线，旧堆注定被截断重建 ——
-                      * 本地分叉标记在此刻作废（不等惰性回放真跑到那条基线；否则修复日志
-                      * 每轮都列它、以后每次换主自动归队还会再重供一遍）。
-                      */
-                     "SELECT partdist.shard_clear_divergence('%s'::regclass::oid);",
+                     "SELECT partdist.replay_enable('%s'); ",
                      shard_tbl, roles, ords, spcs, dbs, rels,
-                     (unsigned long long) base, shard_tbl,
-                     shard_tbl, (unsigned long long) lead_wm, shard_tbl);
+                     (unsigned long long) base, shard_tbl);
+    /* Zero denotes an allocator that has never issued a shard xid (including
+     * a newly created empty shard). There is no allocation bound to transfer.
+     * Do not manufacture one or relax the receiver's validation of real
+     * replicated watermarks. The first write/marker will establish the bound.
+     */
+    if (lead_wm != InvalidTransactionId)
+        appendStringInfo(&remote,
+                         "SELECT partdist.shard_xid_raise_watermark('%s'::regclass::oid, %llu); ",
+                         shard_tbl, (unsigned long long) lead_wm);
+    /* P7-N72: the directed baseline supersedes the target's old physical
+     * lineage, so clear its divergence flag after configuring replay. */
+    appendStringInfo(&remote,
+                     "SELECT partdist.shard_clear_divergence('%s'::regclass::oid);",
+                     shard_tbl);
     resetStringInfo(&q);
     appendStringInfo(&q,
                      "shard=%lld target_node=%d table=%s base=%llu xid_wm=%llu members=%s",
