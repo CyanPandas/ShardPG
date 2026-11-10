@@ -12164,24 +12164,9 @@ pg_raft_dtx_recover_prepared(PG_FUNCTION_ARGS)
         raft_persist_spi_end(spi_owned);
     }
 
-    /*
-     * pg_dist_transaction 的 GC（§9.4 残留边界 → §9.7）：只在 Citus 协调节点、
-     * 每 6 轮（约 1 分钟）一次。Citus 的恢复本来兼任这张表的 GC，被 §9.4 关掉
-     * 后行只增不减；而它是 citus 规则的真相源，删错一行 = 把仍在等收尾的事务
-     * 错判成 ABORT，所以删除条件是"发起 backend 已死 && 所有节点都已无该 gid
-     * 的 prepared 事务"，任一节点不可达即整轮放弃。
-     */
-    if (pg_raft_coordinator_node_id > 0 &&
-        pg_raft_node_id == pg_raft_coordinator_node_id)
-    {
-        static int gc_tick = 0;
-
-        if (++gc_tick >= 6)
-        {
-            gc_tick = 0;
-            (void) dtx_gc_dist_transaction();
-        }
-    }
+    /* Each recovery call uses a fresh backend, so a backend-local tick cannot
+     * schedule GC. Workers can also own native Citus 2PC commit records. */
+    (void) dtx_gc_dist_transaction();
 
     PG_RETURN_INT32(handled);
 }
@@ -12567,152 +12552,283 @@ dtx_forget_sweep(void)
     }
 }
 
-/*
- * pg_dist_transaction 的 GC（§9.7）。返回删除行数；-1 = 本轮放弃
- * （有节点不可达，保守不删）。删除条件（缺一不可）：
- *   1) 发起 backend 已死（gid 里编的 pid 不在本机 pg_stat_activity）——
- *      活着说明 master 可能还没走完提交，行随时会被用到；
- *   2) 每个 peer 节点都确认无该 gid 的 prepared 事务 —— 有 prepared 在，
- *      这行就是它按 citus 规则收尾的真相源，删了会被错判成 ABORT。
- */
-static int
-dtx_gc_dist_transaction(void)
+/* Mark candidates still PREPARED on one node. An incomplete observation must
+ * never count as evidence of completion. pg_prepared_xacts is cluster-wide,
+ * so checking all databases is conservative even though RPCs use postgres. */
+static bool
+dtx_gc_check_node(const char *host, int port, char **gids, bool *keep, int n)
 {
-    StringInfoData sql;
-    bool           spi_owned;
-    int            n = 0;
-    int            i, j;
-    char         **gids = NULL;
-    bool          *keep = NULL;
-    int            deleted = 0;
+    char        conninfo[256];
+    PGconn     *conn;
+    PGresult *volatile res = NULL;
+    volatile bool ok = false;
 
-    if (!raft_persist_spi_begin(&spi_owned))
-        return -1;
-
-    /* 表不存在（非 Citus 库）直接返回 */
-    initStringInfo(&sql);
-    appendStringInfoString(&sql,
-        "SELECT to_regclass('pg_catalog.pg_dist_transaction') IS NOT NULL");
+    pg_raft_format_conninfo(host, port, conninfo, sizeof(conninfo));
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK)
     {
-        bool present = false;
-
-        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            bool  isnull;
-            Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
-                                    1, &isnull);
-
-            present = !isnull && DatumGetBool(d);
-        }
-        pfree(sql.data);
-        if (!present)
-        {
-            raft_persist_spi_end(spi_owned);
-            return 0;
-        }
+        PQfinish(conn);
+        return false;
     }
-
-    /*
-     * 候选 = 发起 backend 已死的行。存活栅栏在同一条 SQL 里做（都在本机）：
-     * gid 第二段是发起 backend 的 pid。
-     */
-    initStringInfo(&sql);
-    appendStringInfoString(&sql,
-        "SELECT DISTINCT t.gid FROM pg_catalog.pg_dist_transaction t "
-        " WHERE (split_part(t.gid, '_', 3) ~ '^[0-9]+$') "
-        "   AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a "
-        "                    WHERE a.pid = split_part(t.gid, '_', 3)::int) "
-        " LIMIT 128");
-    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    PG_TRY();
     {
-        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
-
-        n = (int) SPI_processed;
-        gids = (char **) palloc(sizeof(char *) * n);
-        keep = (bool *) palloc0(sizeof(bool) * n);
-        for (i = 0; i < n; i++)
-            gids[i] = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-        MemoryContextSwitchTo(old);
-    }
-    pfree(sql.data);
-    raft_persist_spi_end(spi_owned);
-
-    if (n == 0)
-        return 0;
-
-    /* 逐节点确认无 prepared；任一节点不可达 ⇒ 整轮放弃 */
-    parse_peers();
-    for (j = 0; j < n_peers; j++)
-    {
-        char      conninfo[256];
-        PGconn   *conn;
-        PGresult *res;
         StringInfoData qry;
-        int       r;
-
-        pg_raft_format_conninfo(peers[j].host, peers[j].port,
-                                conninfo, sizeof(conninfo));
-        conn = PQconnectdb(conninfo);
-        if (PQstatus(conn) != CONNECTION_OK)
-        {
-            elog(DEBUG1, "pg_raft: dist_transaction GC：节点 %d 不可达，本轮放弃",
-                 peers[j].node_id);
-            PQfinish(conn);
-            return -1;
-        }
+        bool escaped = true;
+        int i, r;
 
         initStringInfo(&qry);
+        /* The sentinel also rejects a standby even if its prepared list is empty. */
         appendStringInfoString(&qry,
-            "SELECT gid FROM pg_prepared_xacts WHERE gid = ANY(ARRAY[");
+            "SELECT NULL::text AS gid, pg_is_in_recovery() AS recovering "
+            "UNION ALL SELECT gid, false FROM pg_prepared_xacts "
+            "WHERE gid = ANY(ARRAY[");
         for (i = 0; i < n; i++)
         {
             char *esc = PQescapeLiteral(conn, gids[i], strlen(gids[i]));
 
             if (esc == NULL)
-                continue;
-            appendStringInfo(&qry, "%s%s", (i == 0) ? "" : ",", esc);
+            {
+                escaped = false;
+                break;
+            }
+            appendStringInfo(&qry, "%s%s", i == 0 ? "" : ",", esc);
             PQfreemem(esc);
         }
         appendStringInfoString(&qry, "]::text[])");
-
-        res = PQexec(conn, qry.data);
-        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        if (escaped)
         {
-            PQclear(res);
-            PQfinish(conn);
-            pfree(qry.data);
-            return -1;
+            res = PQexec(conn, qry.data);
+            if (res != NULL && PQresultStatus(res) == PGRES_TUPLES_OK &&
+                PQnfields(res) == 2 && PQntuples(res) > 0)
+            {
+                ok = true;
+                for (r = 0; r < PQntuples(res); r++)
+                {
+                    if (PQgetisnull(res, r, 1) ||
+                        strcmp(PQgetvalue(res, r, 1), "f") != 0)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    if (PQgetisnull(res, r, 0))
+                        continue;   /* sentinel */
+                    for (i = 0; i < n; i++)
+                        if (strcmp(gids[i], PQgetvalue(res, r, 0)) == 0)
+                            keep[i] = true;
+                }
+            }
         }
-        for (r = 0; r < PQntuples(res); r++)
-        {
-            const char *g = PQgetvalue(res, r, 0);
-
-            for (i = 0; i < n; i++)
-                if (strcmp(gids[i], g) == 0)
-                    keep[i] = true;
-        }
-        PQclear(res);
-        PQfinish(conn);
         pfree(qry.data);
     }
+    PG_FINALLY();
+    {
+        if (res != NULL)
+            PQclear(res);
+        PQfinish(conn);
+    }
+    PG_END_TRY();
+    return ok;
+}
 
-    /* 删除全网确认已闭合的行 */
+/*
+ * GC only visible, already-committed native Citus records, after checking
+ * Citus primaries, configured Raft peers and this instance. A pooled initiator
+ * may remain alive indefinitely; its PID is not a completion criterion.
+ * Keep the original xmin in the DELETE so a new version of a gid cannot be
+ * removed on the strength of an observation of an older record.
+ * Returns -1 on an incomplete observation; no rows are deleted in that case.
+ */
+static int
+dtx_gc_dist_transaction(void)
+{
+    typedef struct DtxGcNode
+    {
+        char host[NAMEDATALEN];
+        int port;
+    } DtxGcNode;
+    StringInfoData sql;
+    bool           spi_owned;
+    int            n = 0;
+    int            i, j;
+    char         **gids = NULL;
+    TransactionId *xmins = NULL;
+    int32         *groupids = NULL;
+    bool          *keep = NULL;
+    DtxGcNode     *nodes = NULL;
+    int            nnodes = 0;
+    int            deleted = -1;
+
     if (!raft_persist_spi_begin(&spi_owned))
         return -1;
-    for (i = 0; i < n; i++)
+
+    /* Non-Citus databases do not have records to collect. */
+    if (SPI_execute("SELECT to_regclass('pg_catalog.pg_dist_transaction') IS NOT NULL "
+                    "AND to_regclass('pg_catalog.pg_dist_node') IS NOT NULL",
+                    true, 1) == SPI_OK_SELECT && SPI_processed == 1)
     {
-        if (keep[i] || gids[i] == NULL)
-            continue;
+        bool isnull;
+        Datum present = SPI_getbinval(SPI_tuptable->vals[0],
+                                       SPI_tuptable->tupdesc, 1, &isnull);
+        if (isnull || !DatumGetBool(present))
+        {
+            raft_persist_spi_end(spi_owned);
+            return 0;
+        }
+    }
+    else
+    {
+        raft_persist_spi_end(spi_owned);
+        return -1;
+    }
+
+    /* Include inactive primaries too: inactivity is not proof of no PREPARED.
+     * Do not rely on the Raft peer list being the complete Citus topology. */
+    if (SPI_execute("SELECT DISTINCT nodename, nodeport FROM pg_catalog.pg_dist_node "
+                    "WHERE noderole = 'primary'", true, 0) != SPI_OK_SELECT ||
+        SPI_processed > INT_MAX - RAFT_MAX_PEERS - 1)
+    {
+        raft_persist_spi_end(spi_owned);
+        return -1;
+    }
+    nodes = MemoryContextAlloc(CurTransactionContext,
+        sizeof(DtxGcNode) * (SPI_processed + RAFT_MAX_PEERS + 1));
+    for (i = 0; i < (int) SPI_processed; i++)
+    {
+        bool isnull;
+        char *host = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+        Datum port = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
+
+        if (host == NULL || host[0] == '\0' || strlen(host) >= NAMEDATALEN ||
+            isnull || DatumGetInt32(port) <= 0 || DatumGetInt32(port) > 65535)
+        {
+            raft_persist_spi_end(spi_owned);
+            goto cleanup;
+        }
+        strlcpy(nodes[nnodes].host, host, NAMEDATALEN);
+        nodes[nnodes++].port = DatumGetInt32(port);
+        pfree(host);
+    }
+
+    /* The MVCC snapshot excludes other transactions' uncommitted rows. Also
+     * exclude our own xids: the manual SQL entry can run inside a user xact.
+     * An unmapped participant group is incomplete evidence, never garbage. */
+    if (SPI_execute(
+            "SELECT t.gid, t.xmin, EXISTS (SELECT 1 FROM pg_catalog.pg_dist_node n "
+            "WHERE n.groupid = t.groupid AND n.noderole = 'primary'), t.groupid "
+            "FROM pg_catalog.pg_dist_transaction t ORDER BY t.gid LIMIT 5000",
+            true, 0) != SPI_OK_SELECT)
+    {
+        raft_persist_spi_end(spi_owned);
+        goto cleanup;
+    }
+    {
+        MemoryContext old = MemoryContextSwitchTo(CurTransactionContext);
+        int rows = (int) SPI_processed;
+
+        gids = palloc(sizeof(char *) * rows);
+        xmins = palloc(sizeof(TransactionId) * rows);
+        groupids = palloc(sizeof(int32) * rows);
+        keep = palloc0(sizeof(bool) * rows);
+        for (i = 0; i < rows; i++)
+        {
+            bool isnull;
+            Datum value;
+            TransactionId xmin;
+            char *gid;
+
+            value = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
+            if (isnull)
+                continue;
+            xmin = DatumGetTransactionId(value);
+            if (TransactionIdIsCurrentTransactionId(xmin))
+                continue;
+            value = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3, &isnull);
+            if (isnull || !DatumGetBool(value))
+                continue;
+            value = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4, &isnull);
+            if (isnull)
+                continue;
+            groupids[n] = DatumGetInt32(value);
+            gid = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            if (gid == NULL)
+                continue;
+            gids[n] = gid;
+            xmins[n++] = xmin;
+        }
+        MemoryContextSwitchTo(old);
+    }
+    raft_persist_spi_end(spi_owned);
+    if (n == 0)
+    {
+        deleted = 0;
+        goto cleanup;
+    }
+
+    parse_peers();
+    for (j = 0; j < n_peers; j++)
+    {
+        for (i = 0; i < nnodes; i++)
+            if (nodes[i].port == peers[j].port &&
+                strcmp(nodes[i].host, peers[j].host) == 0)
+                break;
+        if (i == nnodes)
+        {
+            strlcpy(nodes[nnodes].host, peers[j].host, NAMEDATALEN);
+            nodes[nnodes++].port = peers[j].port;
+        }
+    }
+    strlcpy(nodes[nnodes].host, "127.0.0.1", NAMEDATALEN);
+    nodes[nnodes++].port = PostPortNumber;
+    for (j = 0; j < nnodes; j++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        if (!dtx_gc_check_node(nodes[j].host, nodes[j].port, gids, keep, n))
+        {
+            elog(DEBUG1, "pg_raft: dist_transaction GC: incomplete check at %s:%d, skipping",
+                 nodes[j].host, nodes[j].port);
+            goto cleanup;
+        }
+    }
+
+    if (!raft_persist_spi_begin(&spi_owned))
+        goto cleanup;
+    {
+        bool any = false;
+
         initStringInfo(&sql);
-        appendStringInfo(&sql,
-                         "DELETE FROM pg_catalog.pg_dist_transaction WHERE gid = %s",
-                         quote_literal_cstr(gids[i]));
-        if (SPI_execute(sql.data, false, 0) == SPI_OK_DELETE)
-            deleted += (int) SPI_processed;
+        appendStringInfoString(&sql,
+            "DELETE FROM pg_catalog.pg_dist_transaction t USING (VALUES ");
+        for (i = 0; i < n; i++)
+        {
+            char *quoted;
+
+            if (keep[i])
+                continue;
+            quoted = quote_literal_cstr(gids[i]);
+            appendStringInfo(&sql, "%s(%s::text,'%u'::xid,%d::integer)",
+                             any ? "," : "", quoted, xmins[i], groupids[i]);
+            pfree(quoted);
+            any = true;
+        }
+        appendStringInfoString(&sql,
+            ") AS done(gid, xmin, groupid) WHERE t.gid = done.gid "
+            "AND t.xmin = done.xmin AND t.groupid = done.groupid");
+        if (!any)
+            deleted = 0;
+        else if (SPI_execute(sql.data, false, 0) == SPI_OK_DELETE)
+            deleted = (int) SPI_processed;
         pfree(sql.data);
     }
     raft_persist_spi_end(spi_owned);
 
+cleanup:
+    for (i = 0; i < n; i++)
+        pfree(gids[i]);
+    if (gids != NULL) pfree(gids);
+    if (xmins != NULL) pfree(xmins);
+    if (groupids != NULL) pfree(groupids);
+    if (keep != NULL) pfree(keep);
+    if (nodes != NULL) pfree(nodes);
     if (deleted > 0)
         elog(LOG, "pg_raft: dist_transaction GC：清理 %d 行（全网确认已闭合）", deleted);
     return deleted;

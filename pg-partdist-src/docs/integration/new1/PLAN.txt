@@ -95,6 +95,10 @@ fa23的广播hook实际绑定DtxScheduleDecision，后台dtx_dispatch负责收�
 N07 未决登记容量、提交探针和 Citus 事务记录清理
 来源：2fff610、85b8b6a；include/dtx_pending.h、src/dtx_pending.c、pg-raft-src/src/raft_consensus.c。
 处理：容量提升、栈改堆、探针优化、pg_dist_transaction GC 分开审查和提交。
+接入补充：容量与两处快照、保守pgstat探针、每节点每轮GC已分项适配到new1。
+探针同时接入2fff610的citus_internal驱动者识别修复；未知统计状态回退原xmin查询。
+GC只处理已提交候选，核查Citus primary、Raft peers及本机，按gid/groupid/xmin批删；
+未替换fa23终局和恢复规则。详见N07.txt；编译与运行验收待统一进行。
 依赖：P1，建议 N05/N06 完成后接入；原生 Citus 元数据事务需保留。
 验收：超过128个待决分支不丢登记；同gxid多次PREPARE并集完整；活跃事务不被GC。
 
