@@ -26,6 +26,7 @@
 
 #include "access/xact.h"             /* 内核补丁 0004：pre_record_commit_hook */
 #include "access/transam.h"          /* P7-N115：prepared 事务的结局（TransactionIdDidCommit） */
+#include "access/table.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq-fe.h"
@@ -39,6 +40,11 @@
 #include "storage/spin.h"
 #include "lib/stringinfo.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_namespace.h"
+#include "pgstat.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/guc_tables.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "access/xact.h"
@@ -13584,6 +13590,52 @@ done:
     PG_END_TRY();
 }
 
+/*
+ * A zero per-transaction insert count can avoid the xmin scan, but only when
+ * collection is known to be enabled. Keep the original probe if track_counts
+ * was changed in this transaction (including off -> on), or this relcache
+ * entry was opened while collection was disabled. Never cache the table OID.
+ */
+static bool
+dtx_maybe_wrote_dist_transaction(void)
+{
+    Oid         relid;
+    Relation    rel;
+    struct config_generic *track_counts;
+    PgStat_TableStatus *tab;
+    PgStat_TableXactStatus *trans;
+    bool        maybe = false;
+
+    if (!pgstat_track_counts)
+        return true;
+    track_counts = find_option("track_counts", false, true, WARNING);
+    if (track_counts == NULL || track_counts->stack != NULL)
+        return true;
+    relid = get_relname_relid("pg_dist_transaction", PG_CATALOG_NAMESPACE);
+    if (!OidIsValid(relid))
+        return true;
+
+    rel = table_open(relid, AccessShareLock);
+    if (!rel->pgstat_enabled)
+        maybe = true;
+    else
+    {
+        tab = find_tabstat_entry(relid);
+        for (trans = tab != NULL ? tab->trans : NULL;
+             trans != NULL; trans = trans->upper)
+        {
+            /* Do not let truncate/drop counters or a sum overflow hide work. */
+            if (trans->tuples_inserted != 0 || trans->truncdropped)
+            {
+                maybe = true;
+                break;
+            }
+        }
+    }
+    table_close(rel, AccessShareLock);
+    return maybe;
+}
+
 static void
 dtx_master_pre_record_commit(void)
 {
@@ -13617,16 +13669,14 @@ dtx_master_pre_record_commit(void)
      * 哪个节点成立**（本地 pg_dist_transaction 就是驱动者自己写的），协调
      * 节点身份判据随之撤除 —— MX worker 驱动的 2PC 同样在此做决议。
      *
-     * 性能闸门的替补：① Citus 内部任务连接（application_name 前缀
-     * "citus_internal"）只当参与者、永远不是驱动者，先行退出 —— 参与侧
-     * 每条任务提交零开销；② 其余本地提交靠下面 pg_dist_transaction 的
-     * xmin 探针过滤 —— 该表平时为空（GC 及时），探针是一次只读小查询
-     * （代价挂 R-P4-3 风险单持续观察）。
+     * 下推后的 citus_internal 连接也可能驱动 2PC，不能仅凭连接名跳过。
+     * 先用本事务插入计数过滤；不能排除时继续执行原有 xmin 探针，
+     * 决议与写集规则保持 fa23 实现（包括原生 Citus 元数据事务）。
      */
-    if (application_name != NULL &&
-        strncmp(application_name, "citus_internal", 14) == 0)
-        return;
     if (!IsTransactionState() || GetTopTransactionIdIfAny() == InvalidTransactionId)
+        return;
+
+    if (!dtx_maybe_wrote_dist_transaction())
         return;
 
     /* ---- 1) 本事务刚写进 pg_dist_transaction 的行 = 已 prepare 的参与节点 ---- */
