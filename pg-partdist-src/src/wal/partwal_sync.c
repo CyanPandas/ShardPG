@@ -1593,6 +1593,17 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
     if (write_marker && partwal_my_ntouched > 0 && TransactionIdIsValid(my_xid))
         marker_payload = PartWALBuildTxnMarker(true, &marker_len);
 
+    /*
+     * N16 (2fff610): prepare pg_wal before taking the partition-ring lock.
+     * XLogFlush has its own group-commit synchronization; waiting for WAL
+     * insertion/write/fsync must not serialize every partition's ring access.
+     * Keep the durable flush: fa23 reads peer records up to GetFlushRecPtr(),
+     * and its persistent partition stream must not outlive missing pg_wal.
+     * A concurrent drainer can finish while we wait; recheck flushed_upto
+     * under the exclusive lock below.  Markers and replication still run.
+     */
+    XLogFlush(upto_lsn);
+
     LWLockAcquire(PartWALCtl->lock, LW_EXCLUSIVE);
 
     /*
@@ -1607,15 +1618,12 @@ PartWALFlushImpl(XLogRecPtr upto_lsn, bool write_marker, bool replicate)
         drain_needed = false;
 
     /*
-     * 先把 pg_wal 刷到 upto_lsn：group-commit 场景下我们会消费 peer backend
+     * 加锁前已把 pg_wal 刷到 upto_lsn：group-commit 场景下我们会消费 peer backend
      * 的槽位，其记录字节不在本 backend 的 pending 数组里，只能按 start_lsn
      * 从 pg_wal 回读 —— 回读的前提是字节已落盘。时序不变式不受影响：
      * 这里刷的只是数据记录（[B] 是本事务提交记录的 XLogFlush，尚未发生），
      * [A] parwal fsync 仍然先于 [B]。
      */
-    if (drain_needed)
-        XLogFlush(upto_lsn);
-
     PG_TRY();
     {
         /*

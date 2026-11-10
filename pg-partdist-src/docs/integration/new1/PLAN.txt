@@ -155,6 +155,8 @@ N15 单参与节点快路径与异步登记
 验收：同节点多片与跨节点事务、业务/DDL分支、PREPARE后崩溃、丢失回复；无提前成功或登记丢失。
 
 N16 单副本快速提交与 pg_wal write-only 优化
+当前：部分接入。已将 pg_wal 刷盘移出分区环锁；0013 仅作为 pending 补丁归档。
+快速模式与 write-only 调用尚未启用，原因和依赖见 N16.txt。
 来源：2fff610、4ce18da；patches/0013-xlog-write-upto.patch、src/wal/*、src/raft_boundary.c。
 处理：明确哪些分区流可由pg_wal重建、何时必须刷盘；只在满足配置条件时启用。
 依赖：N00/N04，P1/P3/P5；不得自动继承 mmp 模板开关。

@@ -1,0 +1,37 @@
+{
+  "item": "N16",
+  "status": "PARTIALLY_ADAPTED_NOT_RUNTIME_VALIDATED",
+  "base_commit": "47545e3a9c5d2b933363eec63448c96a9182d0b7",
+  "source_commits": [
+    "2fff61081e36ebbd3ef301dc26c99672beee626b",
+    "4ce18da8d6e255ed58e87d185c55dafaa676d28a"
+  ],
+  "implemented": [
+    "Move durable XLogFlush before acquiring partition-ring exclusive lock; retain locked flushed_upto recheck and original replication/marker ordering"
+  ],
+  "staged_only": [
+    "patches/pending/0013-xlog-write-upto.patch; byte-identical to source commit; no active caller or installed binary change"
+  ],
+  "deferred": [
+    "Write-only replacement of the durable WAL barrier",
+    "Omission of partition DATA capture and Raft proposals",
+    "Unsynced partition WAL/checkpoints/hardstate and delayed clog fsync",
+    "Automatic fast-mode configuration"
+  ],
+  "reason": "mmp relaxed persistence assumptions do not establish correctness for fa23 recovery, first-shard/DDL decisions, wraparound/reclaim metadata, and mixed or changing replica topology",
+  "static_checks": {
+    "git_diff_check": "PASS for C source and documentation; preserved upstream .patch context has standard blank-at-eol/space-before-tab warnings",
+    "patch_dry_run_no_fuzz": "PASS",
+    "reference_source": "/home/zhanhao/shardpg-demo-source-staging/shardpg-ddl-demo-source/postgres-src",
+    "kernel_patch_applied": false,
+    "compiled": false,
+    "runtime_tests": false,
+    "deployed": false,
+    "pending_patch_source_sha256": "166d956ea4224d9958e724ccb631a0d891386960b60e35dd224c6deebd3814d1"
+  },
+  "existing_uncommitted_work_excluded": [
+    "pg-partdist-src/tests/demo_report/README.txt",
+    "pg-partdist-src/docs/acceptance/new1-local-demo-20261110/",
+    "pg-partdist-src/docs/integration/new1/系统功能演示报告.docx"
+  ]
+}

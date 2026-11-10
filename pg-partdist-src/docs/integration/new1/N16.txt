@@ -1,0 +1,69 @@
+N16 单副本快速提交与 pg_wal write-only：部分适配
+
+基础：new1 47545e3；保留已接入的 N01、N05、N06、N07。
+来源：mmp 2fff61081e36ebbd3ef301dc26c99672beee626b、
+4ce18da8d6e255ed58e87d185c55dafaa676d28a。
+执行约定：源码适配、静态审查、单独提交；本轮不编译、不运行测试、不部署。
+N16 尚未完整接入，以下完成项不能代替单副本快速模式验收。
+
+已适配：pg_wal 刷盘移到分区环锁外
+
+PartWALFlushImpl 在确认 upto_lsn 有效、组装提交标记之后，先调用
+XLogFlush(upto_lsn)，再获取 PartWALCtl 的排他锁。来源是 2fff610 的独立改动。
+等待 pg_wal 的插入完成、write 和 fsync 不再占用全节点分区环锁；
+PG 自己的 WALWriteLock 和组提交负责 WAL 的同步。
+
+拿到分区环锁后仍重新检查 flushed_upto：等待期间其他后端已经排空时，
+本轮跳过数据排空，但继续原有复制和提交标记流程，不能提前返回。
+XLogFlush 的目标仍是原来的 upto_lsn；不为缩短等待缩小刷盘范围。
+即使已有后端完成排空，XLogFlush 也只检查已经达到的 WAL 持久水位。
+错误发生在取得分区环锁之前，不会把该锁留在 WAL 刷盘错误路径上。
+
+保留的顺序：pg_wal 数据刷盘 → 分区 DATA fsync → 原有 Raft 复制 →
+提交标记 fsync/复制 → 原生 COMMIT/PREPARE WAL 刷盘。
+中止排空复用同一函数，仍先持久化 pg_wal、不调用复制挂钩。
+分区日志格式、32位 xid、clog、DTX 登记/终局、DDL、VACU 和副本管理逻辑未改。
+该优化没有新的开关，也没有取消任何 fsync；收益需在统一验收时测量。
+
+已准备、未启用：内核补丁 0013
+
+原样保留 4ce18da 中的补丁，存放在：
+pg-partdist-src/patches/pending/0013-xlog-write-upto.patch。
+它提供 XLogWriteUpTo，但只保证字节可读，不保证持久化。
+静态 dry-run 使用 --fuzz=0，对本机已有 PG16 参考源码的 xlog.c/xlog.h
+均可直接匹配；这不代表目标内核已应用、已编译或已经通过运行验证。
+
+pending 目录不在补丁应用列表中。当前扩展不引用新符号，不依赖此补丁；
+pg-install 的二进制和头文件没有更新，避免把“源码归档”冒充内核已部署。
+后续真正启用时必须重建并同步内核、头文件和安装产物。
+
+尚未适配的快速模式及原因
+
+1. 4ce18da 用 XLogWriteUpTo 替代 XLogFlush 的前提是 mmp 同时关闭分区
+   日志 fsync；不能把这一替换单独套在 fa23 的持久分区流上。
+   fa23 的 PartWALReadPage 还按 GetFlushRecPtr 限制可读范围，单换调用
+   会让未刷盘但已 write 的记录读不到；中止/崩溃时分区流领先原生 WAL
+   也会违反现有恢复约束。需要同时设计可读水位、持久水位和恢复闭合。
+2. 2fff610 还省略数据入分区流、只缓存分区 checkpoint、延迟 clog fsync、
+   跳过单成员 Raft 提议和 hardstate fsync。这不是上述锁位置调整的一部分。
+   原提交明确承认掉电及检查点后的恢复缺口；fa23 的回绕/回收凭据、
+   首分片协调和 DDL 元数据组不能直接继承该持久性假设。
+3. 单副本不等于单参与者或单分片；pg_partdist 的进程级开关不能证明
+   所有数据组、DDL 组、混合本地写、在途扩容及迁移都满足快速路径条件。
+   需先接入/核实 N04，并结合 N00 的构建基线，以及 N20 中所需的账本
+   WAL/检查点恢复机制逐项证明。N20 本身不是自动获得正确性的保证。
+4. 本轮没有添加或启用 single_replica_fast_commit、single_member_fast_commit，
+   没有继承 mmp 的 REPLICAS=0 自动开关，没有修改部署模板。
+
+统一验收待办（本轮均未执行）
+
+- 并发提交与分区环排空：共享水位重查、peer 记录完整性、环背压。
+- 普通提交、PREPARE/COMMIT PREPARED、回滚以及 WAL 写入/刷盘错误。
+- WAL 刷盘完成前后、分区 fsync 前后、原生提交前后的进程崩溃与重启。
+- 单成员、多成员、混合本地写、DDL，以及扩缩容/迁移切主。
+- 后续启用 write-only 前，另验检查点前后恢复、掉电持久性、可读水位、
+  32位 xid 回绕和回收凭据，不能仅以性能提高或正常 COMMIT 成功验收。
+
+原有本地 demo 测试的 README 修改和验收证据仍是独立的未提交改动；
+演示报告 docx 不纳入本项。此次没有启动、停止或访问任何数据库实例。
+已知 K1 未修复；此前 demo 未通过的结果不能作为本项运行验收。
