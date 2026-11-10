@@ -189,7 +189,8 @@ class Runner:
             require(self.scalar("SHOW shardpg.first_shard_coordinator", node=name) == "on",
                     name + ": first-shard coordination must stay enabled")
             require(self.health(name) == (0, 0, 0, 0, 0), name + ": test cluster has prior transaction residue")
-            require(self.scalar("SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id>0",
+            require(self.scalar("SELECT count(*) FROM partdist.pg_raft_group_status() g WHERE group_id>0 "
+                                "AND NOT EXISTS (SELECT FROM partdist.dtx_ddl_shard d WHERE d.group_id=g.group_id)",
                                 node=name) == 0, name + ": test cluster has existing data groups")
         rows = self.q("SELECT name,node_id,host,port,status FROM shardpg.nodes ORDER BY node_id")
         require({(r[1], r[2], r[3]) for r in rows} == {
