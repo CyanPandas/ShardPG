@@ -1,0 +1,50 @@
+{
+  "base": "961d9e9a49ff4dcac5db8959eba23b51a7470c34",
+  "source_snapshot": "bbee3e1cb7f9e0e49b7a246153fce078c173bee0",
+  "source_commits": [
+    "87e9903733741bf9d228dd7cdf88e4b59e391e9e",
+    "30751ea2562245bc865bf8a7f12a6f531494c3c2",
+    "e3d391934c39b21c2758f1557a285af74fe8de28"
+  ],
+  "status": "adapted_static_review_complete_build_and_runtime_tests_deferred",
+  "build_run": false,
+  "runtime_tests_run": false,
+  "deployed": false,
+  "review_time_beijing": "2026-11-10T15:00:27.506784+08:00",
+  "modified_source": {
+    "pg-partdist-src/include/shard_vacuum.h": {
+      "before_sha256": "2817874ad9611dfecad6d267dc2496e482e261c4c36bc43576c3b1963a277463",
+      "after_sha256": "5e605aa839538ee11b3a037f56a82eb0a29fb53c8e621082cff3dd39b47823ff"
+    },
+    "pg-partdist-src/src/shard_vacuum.c": {
+      "before_sha256": "91aadc630863b4ba81feb6a16939e481daac03f37e10fba3588fd5b46bb9fef2",
+      "after_sha256": "fbd5fdbdafa1d5844c1b8d8d8ebee2c9d2e29fd1d2c55bd442a197e06bca4582"
+    },
+    "pg-partdist-src/src/tso_client.c": {
+      "before_sha256": "3262d6819f1a682a5421f00481f4b1f603ad66e2a1d600c55ea9906ee1a78d7d",
+      "after_sha256": "49c39658455311ae7b238bcf4a7ab50af8921fd7a28f0d996de31ff0e89bde26"
+    }
+  },
+  "protected_files_unchanged": {
+    "pg-partdist-src/src/dtx_pending.c": "187bf8ca62374a1437e2d0ed61c2d50785864c9e1d75a1879f6093fb3a77f617",
+    "pg-partdist-src/include/dtx_pending.h": "dccd8a6fc133e7982c691cfc1c972781726af8ca7eb9ddfff99e8d56d37a27d0",
+    "pg-partdist-src/src/dtx/dtx_coordinator.c": "d0983ab37d191fbcfda0ac2a5e3c65b18a9f1bfcff8303ed3cf7ff76f2aa21ce",
+    "pg-partdist-src/sql/first_shard_coordinator.sql": "bb6fa28da92a095f899262fae4f11228cc69c6b6f902024e3f2ef43889584f17",
+    "pg-partdist-src/sql/ddl_metadata.sql": "f790207b4cfcfe643876e15131224b48bde65ac86068074a6547556e0cf91ecb",
+    "pg-partdist-src/src/shard_xid.c": "e0f11f0b89d7e3ec3f6d1ad5ea8c900b08fee2e87fad7abd7636645ff7bf2449",
+    "pg-partdist-src/src/shard_clog.c": "e1315988afcf4b598fe484f7dba9081a39e3d292c54200a118d8701bc0643412",
+    "pg-partdist-src/src/raft_boundary.c": "a5e79d350f58f8baa28d66601fdec44e9d2859b7b52800996f2735a41ae91bd1",
+    "pg-partdist-src/src/shard_visibility.c": "0d5e2b1e652041e6faf49e2f4a8868bb354cb5278a1972c7793ded7655dcb8a6",
+    "pg-raft-src/src/pg_raft.c": "cb9736b1d3868c103d02986085a72ab44c4e3128d13e9ce9c650410e9d1d3592",
+    "pg-raft-src/src/raft_consensus.c": "e74e999f37841e4d1389ab266b608a92dc273819d4d0c73835461089e9711df0"
+  },
+  "vacuum_algorithm_prefix_unchanged": true,
+  "self_call_helpers_match_mmp": true,
+  "scope_notes": [
+    "87e9903 prerequisite includes only asynchronous self-call scheduling, not row locks/HOT/vacuum algorithms",
+    "Heartbeat error diagnostics adapted to distinguish skipped initialization from RPC failure",
+    "Lease read protected by existing shared-state lock",
+    "3 seconds bounds idle sleep only; synchronous heartbeat and local connection setup remain",
+    "Known isolated route 4097 cleanup issue remains unresolved"
+  ]
+}

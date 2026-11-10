@@ -74,6 +74,9 @@ N04 单成员 Raft 组模式
 
 N05 非阻塞未决清扫与 TSO 续租
 来源：30751ea、e3d3919；src/dtx_pending.c、src/tso_client.c。
+接入补充：需要87e9903中三路框架的前身（vacuum/分叉修复异步自连调度）；
+实际本轮修改include/shard_vacuum.h、src/shard_vacuum.c的自连尾部、src/tso_client.c。
+src/dtx_pending.c保持fa23原实现；没有接入87e9903的行锁、HOT链或回收算法。
 现状：fa23 心跳循环会触发清扫；mmp 有异步自连轮询和续租间隔上限。
 处理：移植调度/连接管理，保留 fa23 的终局判断、并集登记及 prepared 保护。
 依赖：保留 P1/P3；不依赖快速提交。

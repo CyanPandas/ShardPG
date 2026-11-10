@@ -638,8 +638,8 @@ partdist_tso_client_commit_ts(PG_FUNCTION_ARGS)
 /* ================= T3.5 心跳 bgworker ================= */
 
 /*
- * 发一次心跳（worker 进程调用；失败静默返回 false——worker 不能死，
- * 由栅栏负责把失联转化为读侧 ERROR）。
+ * 发一次心跳。失败返回 false，由调用者记录诊断，栅栏负责读侧 ERROR。
+ * 节点身份/共享状态尚未就绪时跳过，保持 tso_last_err 为空，不误报续租失败。
  */
 static bool
 TsoHeartbeatOnce(void)
@@ -650,6 +650,7 @@ TsoHeartbeatOnce(void)
 
 	int32		node;
 
+	tso_last_err[0] = '\0';
 	if (!tso_configured() || TsoClientCtl == NULL)
 		return false;
 
@@ -672,9 +673,15 @@ TsoHeartbeatOnce(void)
 	lease = tso_rpc_once(sql);
 	if (lease < 0)
 	{
+		tso_last_err[0] = '\0';
 		lease = tso_rpc_once(sql);	/* 重连重试一次 */
 		if (lease < 0)
+		{
+			if (tso_last_err[0] == '\0')
+				strlcpy(tso_last_err, "heartbeat returned an invalid lease",
+						sizeof(tso_last_err));
 			return false;
+		}
 	}
 	tso_note_lease_renewal((int32) lease);
 	return true;
@@ -690,6 +697,12 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 	for (;;)
 	{
 		int			wait_ms = 5000;
+		int32		lease_ms = 0;
+		TimestampTz iter_start;
+		TimestampTz t_beat;
+		TimestampTz t_side;
+		long		ms_beat;
+		long		ms_side;
 
 		CHECK_FOR_INTERRUPTS();
 		if (ShutdownRequestPending)
@@ -700,12 +713,26 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
+		iter_start = GetCurrentTimestamp();
 		if (tso_configured())
 		{
-			(void) TsoHeartbeatOnce();
-			if (TsoClientCtl != NULL && TsoClientCtl->lease_ms > 0)
-				wait_ms = Max(1000, TsoClientCtl->lease_ms / 3);
+			if (!TsoHeartbeatOnce() && tso_last_err[0] != '\0')
+				ereport(LOG,
+						(errmsg("pg_partdist: TSO 心跳续租失败：%s", tso_last_err)));
+			/*
+			 * 空闲等待封顶3秒，避免长租约下续租过疏。
+			 * 这是两轮之间的等待时间，不包含同步心跳RPC及自连建连耗时。
+			 */
+			if (TsoClientCtl != NULL)
+			{
+				LWLockAcquire(TsoClientCtl->lock, LW_SHARED);
+				lease_ms = TsoClientCtl->lease_ms;
+				LWLockRelease(TsoClientCtl->lock);
+			}
+			if (lease_ms > 0)
+				wait_ms = Max(1000, Min(3000, lease_ms / 3));
 		}
+		t_beat = GetCurrentTimestamp();
 
 		/*
 		 * T4.5：未决 2PC 清扫兜底（读者问询之外的收敛通道）。本工作者无
@@ -713,7 +740,7 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * 里做 SPI 寻址 + 远程 peek。登记表空则零开销。
 		 */
 		if (DtxPendingCount() > 0)
-			DtxPendingSelfTriggerSweep();
+			ShardDtxSweepSelfTrigger();	/* TPC-C 分支：异步，不拖住续租 */
 
 		/*
 		 * T7.17（P7-V1）：分片 vacuum 自动启动器。
@@ -723,6 +750,8 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * 要的节奏完全一致；另起一个只是多一份要维护的生命周期。
 		 * 零到龄分片时代价 = 一次 LW_SHARED + 64 槽线性扫描，不自连。
 		 */
+		/* TPC-C 分支：自连调用异步化后，每轮先推进在途的那几路 */
+		ShardSelfCallsPoll();
 		if (shard_vacuum_auto_enabled && ShardXidOverdueCount() > 0)
 			ShardVacuumSelfTriggerAuto();
 
@@ -730,7 +759,7 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 		 * T7.27（P7-W2）：分叉标记自动修复。无待修标记时只是一次布尔读；
 		 * 有标记也按 auto_repair_interval_s 节点级限流（基线是重活）。
 		 */
-		if (shard_auto_repair_diverged &&
+		if (shard_auto_repair_diverged && !ShardDivergedRepairInFlight() &&
 			PartWALDivergedRepairDue(shard_auto_repair_interval_s * 1000))
 			ShardDivergedSelfTriggerRepair();
 
@@ -746,6 +775,15 @@ TsoHeartbeatWorkerMain(Datum main_arg)
 			if (PartWALReprovQueuePop(&qg, &qt))
 				PartDistLaunchReprovision(qg, qt);
 		}
+
+		/* 一轮（不含等待）超过 2 s 就记下各段耗时：心跳被拖住时据此定位 */
+		t_side = GetCurrentTimestamp();
+		ms_beat = (long) ((t_beat - iter_start) / 1000);
+		ms_side = (long) ((t_side - t_beat) / 1000);
+		if (ms_beat + ms_side > 2000)
+			ereport(LOG,
+					(errmsg("pg_partdist: TSO 心跳循环一轮耗时 %ld ms（续租 %ld ms，附带任务 %ld ms）",
+							ms_beat + ms_side, ms_beat, ms_side)));
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

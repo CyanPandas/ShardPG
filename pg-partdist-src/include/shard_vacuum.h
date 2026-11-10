@@ -160,5 +160,9 @@ extern void ShardVacuumSelfTriggerAuto(void);
 extern bool shard_auto_repair_diverged;
 extern int  shard_auto_repair_interval_s;
 extern void ShardDivergedSelfTriggerRepair(void);
+/* N05：vacuum、分叉修复和DTX清扫三路自连结果，由心跳每轮轮询推进。 */
+extern void ShardSelfCallsPoll(void);
+extern bool ShardDivergedRepairInFlight(void);
+extern void ShardDtxSweepSelfTrigger(void);
 
 #endif							/* SHARD_VACUUM_H */

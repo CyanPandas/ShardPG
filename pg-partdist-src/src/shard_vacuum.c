@@ -1738,38 +1738,109 @@ partdist_shard_vacuum_auto(PG_FUNCTION_ARGS)
  * ★ 为什么不在 bgworker 里直接干：页面趟要开关系、拿锁、跑索引 AM，这些都
  *   需要 catalog 与一个正经的事务环境，而心跳 worker 是 `dbname=NULL` 起来的
  *   （只走完 BaseInit，不连任何库）。自连出一个干净 backend 是既有做法，
- *   也顺带把"一次调用占住多久"限制在那个 backend 里，不拖住心跳。
- */
-/*
- * T7.27（P7-W2 闭环）：分叉标记的自动修复。
- *
- * 标记由三处写下：复制挂钩失败、副本收到与已提交记录不一致的重传（R-P4-13）、
- * 捕获环溢出（P7-W2）。此前修复全靠人手调 repair_diverged_shards()，或者等下一次
- * 升主顺带跑一次 —— 标记写下之后可能几天没人看。这里由心跳按节点级限流周期性
- * 自连调用；本节点不是组 leader 的分片会被 skipped（发不出基线），留待下一轮。
+ *   也顺带把"一次调用占住多久"限制在那个 backend 里。
+ *   ★ 但原先用的是同步 PQexec，心跳照样被拖住 —— 见下面"改为异步"的注释。
  */
 bool		shard_auto_repair_diverged = true;	/* GUC，见 pg_partdist.c */
 int			shard_auto_repair_interval_s = 60;
 
-void
-ShardDivergedSelfTriggerRepair(void)
+/*
+ * TPC-C 分支：自连调用改为**异步**。
+ *
+ * 心跳工作者的同一个循环还负责向 TSO 续租（TsoHeartbeatOnce）。原先两路自连
+ * 都是 PQexec —— 一趟 sweep（大表整表扫）或一次重做基线跑多久，续租就被推迟
+ * 多久；超过 lease − lease/4（默认 7.5 s）本节点所有持有分片快照的事务都被
+ * 栅栏作废（"分片快照被栅栏作废：本节点已 7500 ms 未能向 TSO 续租"）。
+ * 沙箱实测：按回收触发打开后，装载期间 stock 表的 sweep 让 3 个装载事务被作废。
+ *
+ * 现在：用PQsendQuery发出短查询，不在这里等查询完成；之后每轮心跳推进结果
+ * （PQconsumeInput + PQisBusy），结果到了再记日志、收连接。同一路调用在途时
+ * 不再发起第二个。建连和短查询发送仍沿用同步socket模式，建连带connect_timeout=2；
+ * 这是查询结果等待的异步化，不是整个心跳循环所有IO均无阻塞。
+ */
+typedef void (*SelfCallDone) (PGresult *res, bool ok, const char *errmsg);
+
+static PGconn *vac_auto_conn = NULL;
+static PGconn *repair_conn = NULL;
+static PGconn *dtx_sweep_conn = NULL;	/* 第三路：未决 2PC 清扫（见 ShardDtxSweepSelfTrigger） */
+static PGresult *vac_auto_last = NULL;	/* 各路已收到、尚未交给回调的结果 */
+static PGresult *repair_last = NULL;
+static PGresult *dtx_sweep_last = NULL;
+
+static bool
+self_call_start_opts(PGconn **connp, const char *sql, const char *options)
 {
-	char		conninfo[256];
+	char		conninfo[320];
 	PGconn	   *conn;
-	PGresult   *res;
 
 	snprintf(conninfo, sizeof(conninfo),
-			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
-			 PostPortNumber);
+			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2%s%s%s",
+			 PostPortNumber,
+			 options ? " options='" : "", options ? options : "", options ? "'" : "");
 	conn = PQconnectdb(conninfo);
-	if (PQstatus(conn) != CONNECTION_OK)
+	if (PQstatus(conn) != CONNECTION_OK || !PQsendQuery(conn, sql))
 	{
 		PQfinish(conn);
-		PartWALNoteDivergedPending();	/* 连不上：下一轮再试 */
-		return;
+		return false;
 	}
-	res = PQexec(conn, "SELECT partdist.repair_diverged_shards()");
-	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0)
+	*connp = conn;
+	return true;
+}
+
+static bool
+self_call_start(PGconn **connp, const char *sql)
+{
+	return self_call_start_opts(connp, sql, NULL);
+}
+
+/*
+ * 在途则轮询一次；结束了就回调并收连接。返回 true = 仍在途。
+ * 只在 !PQisBusy 时取结果——PQgetResult 在忙时会阻塞，而这是心跳 worker，
+ * 一阻塞就续不上 TSO 租约。
+ */
+static bool
+self_call_poll(PGconn **connp, PGresult **lastp, SelfCallDone done)
+{
+	PGconn	   *conn = *connp;
+	PGresult   *res;
+
+	if (conn == NULL)
+		return false;
+	if (!PQconsumeInput(conn))
+	{
+		done(NULL, false, PQerrorMessage(conn));
+		if (*lastp)
+			PQclear(*lastp);
+		*lastp = NULL;
+		PQfinish(conn);
+		*connp = NULL;
+		return false;
+	}
+	for (;;)
+	{
+		if (PQisBusy(conn))
+			return true;		/* 已收到的结果留在 *lastp，下一轮接着取 */
+		res = PQgetResult(conn);
+		if (res == NULL)
+			break;
+		if (*lastp)
+			PQclear(*lastp);
+		*lastp = res;
+	}
+	done(*lastp, *lastp != NULL && PQresultStatus(*lastp) == PGRES_TUPLES_OK &&
+		 PQntuples(*lastp) > 0, PQerrorMessage(conn));
+	if (*lastp)
+		PQclear(*lastp);
+	*lastp = NULL;
+	PQfinish(conn);
+	*connp = NULL;
+	return false;
+}
+
+static void
+repair_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok)
 	{
 		const char *out = PQgetvalue(res, 0, 0);
 
@@ -1780,40 +1851,91 @@ ShardDivergedSelfTriggerRepair(void)
 	else
 	{
 		ereport(LOG,
-				(errmsg("pg_partdist: 分叉标记自动修复调用失败：%s",
-						PQerrorMessage(conn))));
+				(errmsg("pg_partdist: 分叉标记自动修复调用失败：%s", err)));
 		PartWALNoteDivergedPending();
 	}
-	PQclear(res);
-	PQfinish(conn);
+}
+
+static void
+vac_auto_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok)
+	{
+		if (strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+			ereport(LOG,
+					(errmsg("pg_partdist: 分片 vacuum 自动启动器处理 %s 个到龄分片，"
+							"截断 %s 个：%s",
+							PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
+							PQgetvalue(res, 0, 2))));
+	}
+	else
+		ereport(LOG,
+				(errmsg("pg_partdist: 分片 vacuum 自动启动器调用失败：%s", err)));
+}
+
+static void
+dtx_sweep_done(PGresult *res, bool ok, const char *err)
+{
+	if (ok && strcmp(PQgetvalue(res, 0, 0), "0") != 0)
+		elog(LOG, "pg_partdist: 未决 2PC 清扫收敛 %s 笔", PQgetvalue(res, 0, 0));
+	else if (!ok)
+		elog(LOG, "pg_partdist: 未决 2PC 清扫调用失败：%s", err);
+}
+
+/* 心跳每轮调一次：推进在途的自连调用 */
+void
+ShardSelfCallsPoll(void)
+{
+	(void) self_call_poll(&vac_auto_conn, &vac_auto_last, vac_auto_done);
+	(void) self_call_poll(&repair_conn, &repair_last, repair_done);
+	(void) self_call_poll(&dtx_sweep_conn, &dtx_sweep_last, dtx_sweep_done);
+}
+
+/*
+ * TPC-C 分支：未决 2PC 清扫的异步版（取代心跳里同步的 DtxPendingSelfTriggerSweep）。
+ * 清扫要远程问询协调组 leader；单副本迷你集群装载期间实测心跳因此 45 s 没续上租，
+ * coordinator 与 worker 同一秒被栅栏作废。
+ */
+void
+ShardDtxSweepSelfTrigger(void)
+{
+	if (dtx_sweep_conn != NULL)
+		return;					/* 上一次还在跑 */
+	/* 服务端语句超时在可处理中断点生效；不把超时解释成任何事务的ABORT判决。 */
+	(void) self_call_start_opts(&dtx_sweep_conn,
+								"SELECT partdist.dtx_pending_sweep()",
+								"-c statement_timeout=60000");
+}
+
+bool
+ShardDivergedRepairInFlight(void)
+{
+	return repair_conn != NULL;
+}
+
+/*
+ * T7.27（P7-W2 闭环）：分叉标记的自动修复。
+ *
+ * 标记由三处写下：复制挂钩失败、副本收到与已提交记录不一致的重传（R-P4-13）、
+ * 捕获环溢出（P7-W2）。此前修复全靠人手调 repair_diverged_shards()，或者等下一次
+ * 升主顺带跑一次 —— 标记写下之后可能几天没人看。这里由心跳按节点级限流周期性
+ * 自连调用；本节点不是组 leader 的分片会被 skipped（发不出基线），留待下一轮。
+ */
+void
+ShardDivergedSelfTriggerRepair(void)
+{
+	if (repair_conn != NULL)
+		return;					/* 上一次还在跑 */
+	if (!self_call_start(&repair_conn, "SELECT partdist.repair_diverged_shards()"))
+		PartWALNoteDivergedPending();	/* 连不上：下一轮再试 */
 }
 
 void
 ShardVacuumSelfTriggerAuto(void)
 {
-	char		conninfo[256];
-	PGconn	   *conn;
-	PGresult   *res;
-
-	snprintf(conninfo, sizeof(conninfo),
-			 "host=/tmp port=%d dbname=postgres user=postgres connect_timeout=2",
-			 PostPortNumber);
-	conn = PQconnectdb(conninfo);
-	if (PQstatus(conn) != CONNECTION_OK)
-	{
-		PQfinish(conn);
-		return;
-	}
-	res = PQexec(conn,
-				 "SELECT shards_considered, shards_truncated, detail "
-				 "FROM partdist.shard_vacuum_auto(" CppAsString2(SHARD_VACUUM_AUTO_BATCH) ")");
-	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
-		strcmp(PQgetvalue(res, 0, 0), "0") != 0)
-		ereport(LOG,
-				(errmsg("pg_partdist: 分片 vacuum 自动启动器处理 %s 个到龄分片，"
-						"截断 %s 个：%s",
-						PQgetvalue(res, 0, 0), PQgetvalue(res, 0, 1),
-						PQgetvalue(res, 0, 2))));
-	PQclear(res);
-	PQfinish(conn);
+	if (vac_auto_conn != NULL)
+		return;					/* 上一趟还在跑 */
+	(void) self_call_start(&vac_auto_conn,
+						   "SELECT shards_considered, shards_truncated, detail "
+						   "FROM partdist.shard_vacuum_auto(" CppAsString2(SHARD_VACUUM_AUTO_BATCH) ")");
 }
