@@ -1,0 +1,49 @@
+N06 决议广播查询截断修复
+
+基础：new1 505dcdd；N01、N05已接入。
+来源：mmp中的836043b1fe840ac662bc5fd124e6deaf609e551b。
+状态：源码接入和静态审查完成；按用户要求，未编译、未运行测试、未部署。
+
+修复范围
+
+仅将src/dtx_pending.c:DtxBroadcastDecision的SQL缓冲区从256扩至1024，
+沿用mmp的容量修复，并更正旧函数的调用路径及异常处理注释。
+按当前fa23查询字符串计算，参与者查询固定部分300字节，
+即使一位事务号也需302字节（含结束符），已经超过旧缓冲区。
+int64最长文本20字节，查询最多321字节（含结束符）；
+远端dtx_apply_decision命令的两个int64及有效verdict最多82字节（含结束符）。
+二者均可完整放入1024字节缓冲区。以上是源码长度核算，不是数据库执行结果。
+未来更改查询模板时须重新核对容量。
+
+fa23适配结论
+
+- pg_raft的dtx_write_decision在决议多数派持久化后调用广播rendezvous。
+- pg_partdist初始化将此hook绑定到DtxScheduleDecision，而非DtxBroadcastDecision。
+- DtxScheduleDecision本身不发RPC；持久决议由后台worker调用dtx_dispatch轮询。
+- first_shard_coordinator.sql中的dtx_dispatch通过format生成dtx_finish_decision调用，
+  不使用旧函数的sql[256]。安装SQL中的对应路径也保持不变。
+- 在两个扩展当前C/头文件/SQL源码中，DtxBroadcastDecision只有声明和定义，
+  未发现直接调用或hook绑定。因此本项修复的是保留的旧入口，
+  不能把mmp来源提交的“广播全部失败”现象直接归因到fa23当前主路径。
+- 旧函数PG_FINALLY负责SPI_finish，SPI异常仍会向调用方传播；
+  原pg_raft决议hook调用方的PG_CATCH才负责忽略广播异常。
+
+静态保留检查
+
+除上述缓冲区声明和相邻注释外，dtx_pending.c逐字保持本轮基础版本。
+DtxPendingFinalized、登记并集、journal持久性、prepared保护、清扫恢复均未改动。
+未引入来源提交中的连接缓存、先发后收、本地直接落账、gxid/dtxid紧凑镜像、
+快速提交下OPEN日志不fsync等其他优化。
+fa23首分片协调、DDL、pg_raft以及N01/N05实现保持不变。
+已执行git diff --check；未执行构建或数据库测试。
+fa23首次业务登记失败路由残留K1不属于本项，仍未修复。
+
+统一测试待办（本轮均未执行）
+
+- 编译最终整合版本，验证大事务号的查询构造与SQL执行。
+- 通过隔离的测试入口实际调用保留的旧广播函数，覆盖参与者收到决议、
+  连接失败及后续清扫恢复；不要为了覆盖旧函数而修改生产hook。
+- 通过真实事务验证当前fa23后台调度的COMMIT、ROLLBACK、跨分片收尾和故障重试。
+- 完整建表、删表、VACU及demo扩缩容、副本迁移随最终产物统一回归。
+
+本项提交后不自动接入其他编号。

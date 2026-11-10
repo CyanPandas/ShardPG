@@ -86,6 +86,9 @@ N06 决议广播查询截断修复
 来源：836043b；src/dtx_pending.c:DtxBroadcastDecision。
 现状：fa23 仍使用 sql[256]，mmp 使用 sql[1024]；这是源码确认的差异，未在本轮复现。
 处理：独立修复SQL构造，核对该广播在首分片协调和遗留路径中的调用点。
+接入补充：new1已将保留的DtxBroadcastDecision缓冲区扩至1024；当前SQL含结束符最多321字节。
+fa23的广播hook实际绑定DtxScheduleDecision，后台dtx_dispatch负责收尾；本轮未恢复旧同步广播。
+当前源码中旧函数只有声明和定义，未发现调用点；本项不能据此宣称改善当前主路径的运行表现。
 依赖：P1；不移植 mmp 的整套 DtxPendingFinalized。
 验收：大事务号生成的查询完整；实际触发广播并确认参与者收尾；失败仍可后台恢复。
 

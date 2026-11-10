@@ -1357,17 +1357,19 @@ DtxReaderCloseOrphan(Oid shard, bool *search_complete)
  *
  * 语义（§3.3）：广播是**纯优化**——允许丢失、允许部分失败、绝不阻塞提交
  * 路径的正确性。收不到的分片由读者问询/清扫拉取收敛（那条路已实测 1s 级）。
- * 因此这里所有错误都吞掉：宁可少推一次，绝不让广播失败影响已提交事务。
+ * 旧调用方负责捕获广播异常；本函数保证 SPI 清理，不自行吞掉 SPI 错误。
  *
  * 收件人来自本节点的 partdist.dtx_participant（参与者自治登记的权威表）
  * →节点地址经 node_map 解析；对每个节点调一次 dtx_apply_decision，
  * 对端按 dtxid 找自己的未决登记、幂等落分片 clog（与清扫同一落账函数）。
- * 由 pg_raft 决议点经 rendezvous "partdist_dtx_broadcast_fn" 调用。
+ * 保留的旧广播入口。fa23 的 "partdist_dtx_broadcast_fn" 已绑定到
+ * DtxScheduleDecision，由后台 dtx_dispatch 轮询持久决议，不调用本函数。
  */
 void
 DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 {
-	char		sql[256];
+	/* 参与者查询含最长 int64 和结束符需 321 字节；远端命令需 82 字节。 */
+	char		sql[1024];
 	char		hosts[16][NAMEDATALEN];
 	int			ports[16];
 	int			nnodes = 0;
@@ -1377,8 +1379,8 @@ DtxBroadcastDecision(int64 dtxid, int verdict, int64 commit_ts)
 		return;
 
 	/*
-	 * ★ SPI 必须在**任何**出口关闭：本函数跑在 dtx_write_decision 的提交
-	 * 路径上，SPI 泄漏会让宿主事务收尾时报 "transaction left non-empty SPI
+	 * ★ SPI 必须在**任何**出口关闭：旧路径从 dtx_write_decision 调用本函数，
+	 * SPI 泄漏会让宿主事务收尾时报 "transaction left non-empty SPI
 	 * stack"（实测目击）。SPI_execute 抛错时 SPI_finish 走不到——用
 	 * PG_TRY/PG_FINALLY 兜住；广播失败本就允许（拉取通道兜底）。
 	 */

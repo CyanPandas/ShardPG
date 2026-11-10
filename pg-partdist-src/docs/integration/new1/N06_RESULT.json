@@ -1,0 +1,58 @@
+{
+  "base": "505dcdd6683310b4f8c065749353b3e8ec509c1f",
+  "source_snapshot": "bbee3e1cb7f9e0e49b7a246153fce078c173bee0",
+  "source_commits": [
+    "836043b1fe840ac662bc5fd124e6deaf609e551b"
+  ],
+  "status": "adapted_static_review_complete_build_and_runtime_tests_deferred",
+  "build_run": false,
+  "runtime_tests_run": false,
+  "deployed": false,
+  "review_time_beijing": "2026-11-10T15:06:01.546545+08:00",
+  "modified_source": {
+    "pg-partdist-src/src/dtx_pending.c": {
+      "before_sha256": "187bf8ca62374a1437e2d0ed61c2d50785864c9e1d75a1879f6093fb3a77f617",
+      "after_sha256": "a03d0323a409f8248383484297ace2fea234d203d18c5f67c20f2255bf2f6d0b"
+    }
+  },
+  "only_executable_change": "DtxBroadcastDecision sql buffer 256 -> 1024",
+  "static_query_length_bounds": [
+    {
+      "format": "SELECT DISTINCT n.hostname, n.port   FROM partdist.dtx_participant dp   JOIN partdist.shard_identity si     ON si.global_shard_id = ANY (dp.gsids)   JOIN partdist.partition_map pm     ON pm.partition_id = si.global_shard_id   JOIN partdist.node_map n ON n.node_id = pm.primary_node  WHERE dp.dtxid = %lld",
+      "max_bytes_including_nul": 321
+    },
+    {
+      "format": "SELECT partdist.dtx_apply_decision(%lld, %d, %lld)",
+      "max_bytes_including_nul": 82
+    }
+  ],
+  "protected_files_unchanged": {
+    "pg-partdist-src/include/dtx_pending.h": "dccd8a6fc133e7982c691cfc1c972781726af8ca7eb9ddfff99e8d56d37a27d0",
+    "pg-partdist-src/include/shard_vacuum.h": "5e605aa839538ee11b3a037f56a82eb0a29fb53c8e621082cff3dd39b47823ff",
+    "pg-partdist-src/sql/ddl_metadata.sql": "f790207b4cfcfe643876e15131224b48bde65ac86068074a6547556e0cf91ecb",
+    "pg-partdist-src/sql/first_shard_coordinator.sql": "bb6fa28da92a095f899262fae4f11228cc69c6b6f902024e3f2ef43889584f17",
+    "pg-partdist-src/sql/pg_partdist--1.0.sql": "651a72bed320cef4b0f63d9af0485d3f8f7581817c91a1d600dfd7d943751054",
+    "pg-partdist-src/src/dtx/dtx_coordinator.c": "d0983ab37d191fbcfda0ac2a5e3c65b18a9f1bfcff8303ed3cf7ff76f2aa21ce",
+    "pg-partdist-src/src/pg_partdist.c": "d33e25c75bc0f63fe8689bb8230bbe70e175a541e4678b2eb31df46e40da07ec",
+    "pg-partdist-src/src/raft_boundary.c": "a5e79d350f58f8baa28d66601fdec44e9d2859b7b52800996f2735a41ae91bd1",
+    "pg-partdist-src/src/shard_clog.c": "e1315988afcf4b598fe484f7dba9081a39e3d292c54200a118d8701bc0643412",
+    "pg-partdist-src/src/shard_vacuum.c": "fbd5fdbdafa1d5844c1b8d8d8ebee2c9d2e29fd1d2c55bd442a197e06bca4582",
+    "pg-partdist-src/src/shard_visibility.c": "0d5e2b1e652041e6faf49e2f4a8868bb354cb5278a1972c7793ded7655dcb8a6",
+    "pg-partdist-src/src/shard_xid.c": "e0f11f0b89d7e3ec3f6d1ad5ea8c900b08fee2e87fad7abd7636645ff7bf2449",
+    "pg-partdist-src/src/tso_client.c": "49c39658455311ae7b238bcf4a7ab50af8921fd7a28f0d996de31ff0e89bde26",
+    "pg-raft-src/src/pg_raft.c": "cb9736b1d3868c103d02986085a72ab44c4e3128d13e9ce9c650410e9d1d3592",
+    "pg-raft-src/src/raft_consensus.c": "e74e999f37841e4d1389ab266b608a92dc273819d4d0c73835461089e9711df0"
+  },
+  "protected_branch_tips": {
+    "vacu-fa23-acceptance": "44a3e2d83a20bf7d32d8004a218dd7c5591bb602",
+    "origin/mmp": "bbee3e1cb7f9e0e49b7a246153fce078c173bee0"
+  },
+  "diff_check_passed": true,
+  "scope_notes": [
+    "Current fa23 hook binds DtxScheduleDecision, whose body performs no RPC; background dtx_dispatch polls durable decisions",
+    "No caller or hook binding to DtxBroadcastDecision found in current extension C/header/SQL sources",
+    "Legacy helper fixed; current dispatcher and recovery semantics preserved",
+    "Source commit connection caching, local apply, compact mirrors and journal fsync relaxation excluded",
+    "Known isolated route 4097 issue K1 remains unresolved"
+  ]
+}
