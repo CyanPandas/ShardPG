@@ -1,0 +1,49 @@
+fa23 与 mmp 分叉对比（北京时间 2026-11-10）
+
+fa23 代码提交：284079089c88f2f984ef5b4ab9d38c006bbf2608（vacu-fa23-acceptance）。
+mmp：bbee3e1cb7f9e0e49b7a246153fce078c173bee0，与 GitHub origin 的 refs/heads/mmp 一致。
+本地 mmp 工作区：/home/zhanhao/shardpg-tpcc-work；该工作区未修改。
+共同祖先：e123f0e9541472de98b012d1e0f7cc0df587f417。
+祖先提交时间：北京时间 2026-10-14 02:45:05。
+祖先主题：demo: 演示二教程按 2026-10-13 十万行实跑重生成 + 灌数核对等待放宽到 5 分钟。
+
+截至上述代码提交，fa23 独有31个提交，mmp独有5个提交；两边均不是对方祖先。
+本对比归档提交本身还会给 fa23 增加1个文档提交，最终为32对5。
+共同祖先不是 fa23c79；fa23c79 已位于分叉后的 VACU 开发线上。
+
+fa23 方向：
+- SHARD KEY 建表和 DROP 清理、共置与旧 demo 在线加节点/迁移/切主能力。
+- VACU 安全冻结、回收凭据、32位分片 xid 回绕。
+- fa23c79 的首分片协调事务，以及 8e471bb 的参与者终局和事务回归修复。
+- 本轮提交 DDL R4 元数据协调、Citus DDL 分支参与，以及 demo 节点管理兼容。
+- 未引入 47195c5 及其后 VACU 扩缩容增强；4097业务首次登记失败路由残留仍未修复。
+
+mmp 方向（5个提交）：
+3b95245 feat(tpcc/C4): pg_raft 多机部署 —— 节点名回环映射可关 + 对端建连超时可调
+87e9903 feat(tpcc): 分片表行锁 + vacuum LP_REDIRECT + 回收触发；修三处沙箱压测暴露的既有缺陷
+07e90b3 feat(tpcc): 三机 TPC-C 套件（部署配置、建库、五类事务、压测、监控、一致性检查）
+01e5635 feat(tpcc/C8): 单副本模式 —— 单成员 Raft 组 + 套件接入全局事务
+bbee3e1 chore: align mmp with tested lab ShardPG image 876db7e5468b
+
+mmp 最后一个提交 bbee3e1 是实验室镜像 876db7e5468b 的源码/运行时快照同步，
+不是一个小补丁，也不代表把 fa23 历史合并了。LAB_TESTED_VERSION.json 记录其输入镜像、
+组件、源文件清单以及二进制校验值。树中包含 TPC-C 套件、RC/行锁与 vacuum 改动、
+WAL 写入/同步及 Raft 故障恢复实现；其 first_shard_coordinator.sql、ddl_metadata.sql、
+dtx_coordinator.c 和 shardpg_ddl.c 均不存在，不能视为已含当前 fa23 的这些实现。
+
+核心源码差异（方向 mmp → fa23，仅两个扩展的 src/include/sql）：
+54 files changed, 10160 insertions(+), 12848 deletions(-)
+两边同时改动 shard_xid、shard_vacuum、shard_visibility、raft_boundary、dtx_pending、
+TSO、WAL、raft_consensus 等核心路径。mmp 另有 partwal_recent 和 raft_failover 实现。
+这是源码差异对比，不是 mmp 功能正确性或两线可直接合并的验收。
+另有构建布局差别：fa23 的 citus-src 是 gitlink ad266a2；mmp 是镜像导入的普通源码树，
+且同步了 postgres-src 和 pg-install，不能用整个仓库的行数差替代业务改动量。
+
+本次验证与提交：
+- 五项 SQL 状态机测试通过；demo shell 语法及 add_node 独立SQL/安装SQL一致性通过。
+- DDL提交的15个源文件逐一与实验室R4构建清单匹配。
+- 原始日志和JSON按原字节归档并记录SHA；补丁上下文及原始证据中的空白不做改写。
+- 路由缺口仅定位和记录，未修改数据库或伪装成已修复。
+- 仅本地提交，未推送、未合并任何分支。
+
+双方完整提交列表和核心文件差异见 MMP_COMPARISON.json。
