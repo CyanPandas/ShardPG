@@ -1,0 +1,9 @@
+{
+  "report_path": "pg-partdist-src/docs/integration/new1/系统功能演示报告.docx",
+  "report_sha256": "af21c914a715d9a29ed16dd0ce7d5ce3b463af63dc07b3b2528c97b58ebeb195",
+  "business_base_commit": "fd784bd",
+  "schema_comparison": "all nine CREATE TABLE statements match report after table-name prefix substitution",
+  "runtime_tests_run": false,
+  "build_run": false,
+  "deployed": false
+}

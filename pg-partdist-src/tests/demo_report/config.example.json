@@ -1,0 +1,243 @@
+{
+  "dedicated_test_cluster": true,
+  "artifact_manifest": "/srv/new1-demo/release.json",
+  "converge_seconds": 180,
+  "writer_interval": 0.2,
+  "nodes": {
+    "master": {
+      "node_id": 1,
+      "host": "127.0.0.1",
+      "port": 28442,
+      "user": "postgres",
+      "database": "postgres",
+      "probe_command": [
+        "python3",
+        "/srv/new1-demo/artifacts.py",
+        "probe",
+        "--prefix",
+        "/srv/new1-demo/pg-install",
+        "--manifest",
+        "/srv/new1-demo/release.json"
+      ],
+      "psql_command": [
+        "/srv/new1-demo/pg-install/bin/psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "28442",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ]
+    },
+    "worker1": {
+      "node_id": 2,
+      "host": "127.0.0.1",
+      "port": 28443,
+      "user": "postgres",
+      "database": "postgres",
+      "probe_command": [
+        "python3",
+        "/srv/new1-demo/artifacts.py",
+        "probe",
+        "--prefix",
+        "/srv/new1-demo/pg-install",
+        "--manifest",
+        "/srv/new1-demo/release.json"
+      ],
+      "psql_command": [
+        "/srv/new1-demo/pg-install/bin/psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "28443",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "stop_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "stop",
+        "-D",
+        "/srv/new1-demo/data/worker1",
+        "-m",
+        "immediate",
+        "-w",
+        "-t",
+        "60"
+      ],
+      "start_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "start",
+        "-D",
+        "/srv/new1-demo/data/worker1",
+        "-l",
+        "/srv/new1-demo/data/worker1/postgres.log",
+        "-w",
+        "-t",
+        "60"
+      ]
+    },
+    "worker2": {
+      "node_id": 3,
+      "host": "127.0.0.1",
+      "port": 28444,
+      "user": "postgres",
+      "database": "postgres",
+      "probe_command": [
+        "python3",
+        "/srv/new1-demo/artifacts.py",
+        "probe",
+        "--prefix",
+        "/srv/new1-demo/pg-install",
+        "--manifest",
+        "/srv/new1-demo/release.json"
+      ],
+      "psql_command": [
+        "/srv/new1-demo/pg-install/bin/psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "28444",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "stop_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "stop",
+        "-D",
+        "/srv/new1-demo/data/worker2",
+        "-m",
+        "immediate",
+        "-w",
+        "-t",
+        "60"
+      ],
+      "start_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "start",
+        "-D",
+        "/srv/new1-demo/data/worker2",
+        "-l",
+        "/srv/new1-demo/data/worker2/postgres.log",
+        "-w",
+        "-t",
+        "60"
+      ]
+    },
+    "worker3": {
+      "node_id": 4,
+      "host": "127.0.0.1",
+      "port": 28445,
+      "user": "postgres",
+      "database": "postgres",
+      "probe_command": [
+        "python3",
+        "/srv/new1-demo/artifacts.py",
+        "probe",
+        "--prefix",
+        "/srv/new1-demo/pg-install",
+        "--manifest",
+        "/srv/new1-demo/release.json"
+      ],
+      "psql_command": [
+        "/srv/new1-demo/pg-install/bin/psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "28445",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "stop_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "stop",
+        "-D",
+        "/srv/new1-demo/data/worker3",
+        "-m",
+        "immediate",
+        "-w",
+        "-t",
+        "60"
+      ],
+      "start_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "start",
+        "-D",
+        "/srv/new1-demo/data/worker3",
+        "-l",
+        "/srv/new1-demo/data/worker3/postgres.log",
+        "-w",
+        "-t",
+        "60"
+      ]
+    },
+    "worker4": {
+      "node_id": 5,
+      "host": "127.0.0.1",
+      "port": 28446,
+      "user": "postgres",
+      "database": "postgres",
+      "probe_command": [
+        "python3",
+        "/srv/new1-demo/artifacts.py",
+        "probe",
+        "--prefix",
+        "/srv/new1-demo/pg-install",
+        "--manifest",
+        "/srv/new1-demo/release.json"
+      ],
+      "psql_command": [
+        "/srv/new1-demo/pg-install/bin/psql",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "28446",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres"
+      ],
+      "stop_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "stop",
+        "-D",
+        "/srv/new1-demo/data/worker4",
+        "-m",
+        "immediate",
+        "-w",
+        "-t",
+        "60"
+      ],
+      "start_command": [
+        "/srv/new1-demo/pg-install/bin/pg_ctl",
+        "start",
+        "-D",
+        "/srv/new1-demo/data/worker4",
+        "-l",
+        "/srv/new1-demo/data/worker4/postgres.log",
+        "-w",
+        "-t",
+        "60"
+      ]
+    }
+  },
+  "benchmark": null,
+  "prepare_worker4_command": [
+    "/srv/new1-demo/pg-install/bin/pg_ctl",
+    "start",
+    "-D",
+    "/srv/new1-demo/data/worker4",
+    "-l",
+    "/srv/new1-demo/data/worker4/postgres.log",
+    "-w",
+    "-t",
+    "60"
+  ]
+}
