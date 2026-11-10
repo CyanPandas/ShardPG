@@ -141,8 +141,7 @@ local_oid_for_shard(Oid global_shard_id)
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT local_oid FROM partdist.shard_identity "
-					 "WHERE global_shard_id = %u", global_shard_id);
+					 "SELECT partdist.local_partition_for_shard(%u)::oid", global_shard_id);
 	ret = SPI_execute(sql.data, true, 1);
 	pfree(sql.data);
 
@@ -1449,7 +1448,9 @@ AppendDtxRecord(Oid partition_id, int kind, int64 dtxid, int64 coord_gsid,
 	uint64				assigned;
 
 	/* 两种协调者决议记录携带参与者清单 */
-	if (kind != DTX_DECISION && kind != DTX_COMMIT_DECISION)
+	if (kind != DTX_DECISION && kind != DTX_COMMIT_DECISION &&
+        kind != DTX_DDL_ENLIST && kind != DTX_DDL_VOTE && kind != DTX_DDL_SEAL &&
+        kind != DTX_DDL_ADMISSION_REJECT)
 		nparts = 0;
 
 	paylen = DtxPayloadSize(nparts);
@@ -1551,7 +1552,7 @@ pg_partdist_partwal_append_dtx_record(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("partwal_append_dtx_record: 非法的记录子类型 %d", kind),
-				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET 6=COMMIT_DECISION。")));
+				 errdetail("合法值：1=PREPARE 2=DECISION 3=COMMIT 4=ABORT 5=FORGET 6=COMMIT_DECISION 7=DDL_ENLIST 8=DDL_VOTE 9=DDL_SEAL 10=DDL_ADMISSION_REJECT。")));
 
 	if (kind == DTX_COMMIT_DECISION &&
 		(verdict != DTX_VERDICT_COMMIT || commit_ts != 0 || parts == NULL))

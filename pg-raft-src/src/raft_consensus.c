@@ -1500,6 +1500,17 @@ data_apply_dtx_one(RaftGroupCtx *ctx, int64 local_oid, int64 plsn, int info)
 {
     StringInfoData sql;
 
+    if (info == 5 || (info >= 7 && info <= 10))
+    {
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+            "SELECT partdist.dtx_reindex_committed(%lld,%u::oid,%lld)",
+            (long long) ctx->group_id, (unsigned) local_oid, (long long) plsn);
+        if (SPI_execute(sql.data, false, 0) != SPI_OK_SELECT)
+            elog(ERROR, "could not apply DDL coordinator control record");
+        pfree(sql.data);
+        return;
+    }
     if (info == 5)
     {
         initStringInfo(&sql);
@@ -1693,7 +1704,7 @@ data_entry_apply(RaftGroupCtx *ctx, const RaftLogEntry *e)
     int          info = entry_record_info(e->payload);
 
     if ((entry_record_flags(e->payload) & PARTWAL_FLAG_DTX) != 0 &&
-        (info == 2 || info == 5 || info == 6))
+        (info == 2 || info == 5 || info == 6 || (info >= 7 && info <= 10)))
     {
         it.plsn = plsn;
         it.info = info;
@@ -3602,7 +3613,7 @@ group_apply_pending(RaftGroupCtx *ctx)
                 {
                     int inf = entry_record_info(e.payload);
 
-                    if (inf == 2 || inf == 5 || inf == 6)
+                    if (inf == 2 || inf == 5 || inf == 6 || (inf >= 7 && inf <= 10))
                     {
                         dtx_items[ndtx].plsn = batch_plsn;
                         dtx_items[ndtx].info = inf;
@@ -3623,7 +3634,7 @@ group_apply_pending(RaftGroupCtx *ctx)
                     {
                         int inf = entry_record_info(be.payload);
 
-                        if ((inf == 2 || inf == 5 || inf == 6) && ndtx < RAFT_LOG_CAPACITY)
+                        if ((inf == 2 || inf == 5 || inf == 6 || (inf >= 7 && inf <= 10)) && ndtx < RAFT_LOG_CAPACITY)
                         {
                             dtx_items[ndtx].plsn = pl;
                             dtx_items[ndtx].info = inf;
@@ -11024,6 +11035,75 @@ dtx_participants_sql(ArrayType *arr)
     }
     appendStringInfoString(&buf, "]::bigint[]");
     return buf.data;
+}
+
+/* DDL participant admission, votes and sealing use the same quorum stream
+ * as the final decision. SQL indexes may roll back; the committed control
+ * prefix is replayed before validating any next event. Probe kind zero forces
+ * a new quorum round so a negative admission result is linearizable. */
+PG_FUNCTION_INFO_V1(pg_raft_dtx_metadata_event);
+Datum
+pg_raft_dtx_metadata_event(PG_FUNCTION_ARGS)
+{
+    int64 coord = PG_GETARG_INT64(0);
+    int64 id = PG_GETARG_INT64(1);
+    int kind = PG_GETARG_INT32(2);
+    int write_kind = kind;
+    ArrayType *details = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    RaftGroupCtx ctx;
+    int64 oid = 0, plsn = 0;
+    char *vector;
+    StringInfoData q;
+    bool owned, isnull;
+    volatile bool append = false;
+    if (coord <= 0 || id <= 0 || (kind != 0 && kind != 5 && kind != 7 && kind != 8 && kind != 9 && kind != 10))
+        elog(ERROR, "invalid DDL control event");
+    if (!dtx_coord_ctx(coord, &ctx, &oid))
+        elog(ERROR, "DDL coordinator is not the metadata shard leader");
+    dtx_lock_transaction(id);
+    vector = dtx_participants_sql(details);
+    replicate_claim(&ctx);
+    in_txn_replication = true;
+    PG_TRY();
+    {
+        if (kind == 0 && group_propose(&ctx, "OP_NOOP", "{}") <= 0)
+            elog(ERROR, "DDL admission probe could not establish a quorum");
+        dtx_decision_barrier(&ctx);
+        if (!raft_persist_spi_begin(&owned)) elog(ERROR, "DDL control requires SPI");
+        initStringInfo(&q);
+        appendStringInfo(&q,"SELECT partdist.dtx_meta_validate(%lld,%lld,%d,%s)",
+                         (long long) coord,(long long) id,kind,vector);
+        if (SPI_execute(q.data,true,1) != SPI_OK_SELECT || SPI_processed != 1)
+            elog(ERROR,"could not validate DDL control event");
+        append = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,1,&isnull));
+        if (isnull) elog(ERROR,"DDL control validation returned NULL");
+        pfree(q.data);raft_persist_spi_end(owned);
+        /* A negative resolution is a quorum rejection fence, preventing an
+         * older in-flight admission from succeeding after another candidate
+         * is selected. It is not a global ABORT decision. */
+        if (kind == 0 && !append) write_kind = 10;
+        if ((kind != 0 && append) || (kind == 0 && !append))
+        {
+            if (!raft_persist_spi_begin(&owned)) elog(ERROR,"DDL control requires SPI");
+            initStringInfo(&q);
+            appendStringInfo(&q,"SELECT partdist.partwal_append_dtx_record(%u::oid,%d,%lld,%lld,0,0,%s)",
+                             (unsigned) oid,write_kind,(long long) id,(long long) coord,vector);
+            if (SPI_execute(q.data,false,1) != SPI_OK_SELECT || SPI_processed != 1)
+                elog(ERROR,"could not append DDL control event");
+            plsn=DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],SPI_tuptable->tupdesc,1,&isnull));
+            if (isnull || plsn<=0) elog(ERROR,"invalid DDL control log position");
+            pfree(q.data);raft_persist_spi_end(owned);
+            replicate_group_upto(&ctx,plsn,(Oid)oid);
+            if (!raft_persist_spi_begin(&owned)) elog(ERROR,"DDL control requires SPI");
+            data_apply_dtx_one(&ctx,oid,plsn,write_kind);
+            raft_persist_spi_end(owned);
+        }
+    }
+    PG_FINALLY();
+    { in_txn_replication=false;replicate_release(&ctx); }
+    PG_END_TRY();
+    pfree(vector);
+    PG_RETURN_BOOL(kind==0 ? append : true);
 }
 
 /*

@@ -2236,6 +2236,20 @@ reprovision_check_one(int64 gsid, int32 target, MemoryContext caller_cxt)
     if (SPI_connect() != SPI_OK_CONNECT)
         return MemoryContextStrdup(caller_cxt, "retry: SPI_connect 失败");
 
+    /* DDL groups replicate control records, never heap files. Their anchors
+     * deliberately have no armed physical replay slots. */
+    if (prov_query_text("SELECT to_regclass('partdist.dtx_ddl_shard')::text") != NULL)
+    {
+        snprintf(sql, sizeof(sql),
+                 "SELECT 'metadata' FROM partdist.dtx_ddl_shard WHERE group_id = %lld",
+                 (long long) gsid);
+        if (prov_query_text(sql) != NULL)
+        {
+            SPI_finish();
+            return MemoryContextStrdup(caller_cxt, "not_needed(DDL metadata group)");
+        }
+    }
+
     /*
      * ★ P7-N102：目标必须还是本组的 Raft 成员。副本迁移把源节点移出组（成员变更已提交、
      * 本节点 raft_group.members 已不含它）之后，排在队里的重供请求不能再给它发基线 ——
@@ -2517,6 +2531,7 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
     int             launched = 0;
     int             i;
     const char     *hold_filter;
+    const char     *metadata_filter;
     StringInfoData  sweep_sql;
 
     if (!superuser())
@@ -2535,6 +2550,9 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
         ? "   AND NOT EXISTS (SELECT 1 FROM partdist.reprovision_hold h "
           "                    WHERE h.group_id = s.group_id AND h.until > now()) "
         : "";
+    metadata_filter = (prov_query_text("SELECT to_regclass('partdist.dtx_ddl_shard')::text") != NULL)
+        ? " AND NOT EXISTS (SELECT FROM partdist.dtx_ddl_shard d WHERE d.group_id = s.group_id) "
+        : "";
     initStringInfo(&sweep_sql);
     appendStringInfo(&sweep_sql,
             "SELECT s.group_id, m.node_id, n.hostname, n.port::text, "
@@ -2546,8 +2564,8 @@ partdist_reprovision_sweep(PG_FUNCTION_ARGS)
             "  JOIN partdist.node_map n ON n.node_id = m.node_id "
             " WHERE s.group_id <> 0 AND s.state = 'leader' "
             "   AND m.node_id <> current_setting('pg_raft.node_id')::int "
-            "%s"
-            " ORDER BY m.node_id, s.group_id", hold_filter);
+            "%s%s"
+            " ORDER BY m.node_id, s.group_id", hold_filter, metadata_filter);
     if (SPI_execute(sweep_sql.data, true, 0) == SPI_OK_SELECT &&
         SPI_processed > 0)
     {

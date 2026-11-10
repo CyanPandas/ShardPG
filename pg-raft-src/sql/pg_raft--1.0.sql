@@ -512,6 +512,16 @@ DECLARE
     noop_idx  BIGINT;
     cplsn     BIGINT;            -- P7-N35：raft 里已提交的最大数据位点
 BEGIN
+    -- DDL anchors contain decision records only. Their Raft log already
+    -- applies those records on every replica; no business heap replay or
+    -- physical fileset promotion is applicable to these permanent anchors.
+    IF to_regclass('partdist.dtx_ddl_shard') IS NOT NULL THEN
+        IF EXISTS (SELECT FROM partdist.dtx_ddl_shard WHERE group_id=p_group_id) THEN
+            PERFORM partdist.dtx_refresh(p_group_id);
+            RETURN 1;
+        END IF;
+    END IF;
+
     -- 返回值三态：1 = 可以上报；0 = 还没好，稍后重试；**-1 = 分叉，永不上报**。
     -- 三态而不是布尔，是因为"还没追平"可以被 deadline 兜底放行（可用性优先），
     -- 而"检测到分叉"绝不能放行 —— 放行等于让一个已知与组分叉的副本当上主库。

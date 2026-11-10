@@ -43,7 +43,11 @@ typedef enum DtxRecordKind
     /* First-shard protocol: irrevocable COMMIT decision BEFORE asking TSO.
      * Carries participants, verdict=COMMIT, commit_ts=0. It is not a visibility
      * marker. A later DTX_DECISION record durably attaches commit_ts. */
-    DTX_COMMIT_DECISION = 6
+    DTX_COMMIT_DECISION = 6,
+    DTX_DDL_ENLIST = 7,
+    DTX_DDL_VOTE = 8,
+    DTX_DDL_SEAL = 9,
+    DTX_DDL_ADMISSION_REJECT = 10
 } DtxRecordKind;
 
 #define DTX_VERDICT_COMMIT  UINT32_C(1)
@@ -73,7 +77,7 @@ typedef struct DtxRecordPayload
 static inline bool
 DtxRecordKindIsValid(int kind)
 {
-    return kind >= DTX_PREPARE && kind <= DTX_COMMIT_DECISION;
+    return kind >= DTX_PREPARE && kind <= DTX_DDL_ADMISSION_REJECT;
 }
 
 /*

@@ -57,6 +57,7 @@
 #include "utils/snapmgr.h"
 
 #include "shardpg_ddl.h"
+#include "dtx_coordinator.h"
 #include "tso.h"
 
 int			shardpg_shard_count = 0;		/* 0 = 等于 worker 数 */
@@ -131,6 +132,7 @@ spi_value(const char *sql, MemoryContext cxt)
 static void
 commit_and_restart(MemoryContext back_to)
 {
+    if (DtxCommitDdlCatalog(back_to)) return;
 	while (ActiveSnapshotSet())
 		PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -419,6 +421,15 @@ shardpg_create(PlannedStmt *pstmt, const char *queryString,
 	appendStringInfoChar(&sql, ')');
 	if (SPI_execute(sql.data, false, 0) < 0)
 		elog(ERROR, "shardpg: create_distributed_table 执行失败");
+	/* Apply catalog options in the same native prepared transaction as CREATE.
+	 * The later provisioning phase uses local temporary scratch tables and must
+	 * not open a second catalog transaction solely for this ALTER. */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "ALTER TABLE %s SET (autovacuum_enabled = off, toast.autovacuum_enabled = off)",
+					 relname);
+	if (SPI_execute(sql.data, false, 0) < 0)
+		elog(ERROR, "shardpg: 设置分片 autovacuum 选项失败");
 	SPI_finish();
 
 	initStringInfo(&sql);

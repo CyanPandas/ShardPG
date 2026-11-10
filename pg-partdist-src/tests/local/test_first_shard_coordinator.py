@@ -17,6 +17,11 @@ SQL = ROOT / "pg-partdist-src/sql/first_shard_coordinator.sql"
 
 STUBS = r"""
 CREATE SCHEMA partdist;
+SELECT set_config('pg_raft.node_id','1',false);
+SELECT set_config('pg_raft.coordinator_node_id','1',false);
+CREATE FUNCTION partdist.dtx_branch_set_ddl() RETURNS void LANGUAGE sql AS $$ SELECT $$;
+CREATE FUNCTION partdist.dtx_branch_probe(text,bigint) RETURNS text LANGUAGE sql AS $$ SELECT 'UNKNOWN'::text $$;
+CREATE FUNCTION partdist.dtx_meta_event(bigint,bigint,integer,bigint[]) RETURNS boolean LANGUAGE sql AS $$ SELECT $3<>0 $$;
 CREATE FUNCTION partdist.shard_clog_status(oid,bigint) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
 CREATE TABLE partdist.events(seq bigserial, event text);
 CREATE TABLE partdist.rpc_gate(fail boolean);
@@ -28,6 +33,7 @@ CREATE TABLE partdist.dtx_participant(dtxid bigint,gid text,gsids bigint[],coord
 CREATE TABLE partdist.dtx_decision(dtxid bigint PRIMARY KEY,coord_gsid bigint,verdict integer,commit_ts bigint,participants bigint[],decided_plsn bigserial);
 CREATE TABLE partdist.node_map(hostname text,port integer,node_id serial);
 CREATE TABLE partdist.partition_map(partition_id oid,primary_node integer);
+CREATE TABLE partdist.shard_identity(global_shard_id bigint,local_oid oid);
 INSERT INTO partdist.node_map(hostname,port) VALUES('worker1',5433),('worker2',5434);
 CREATE TABLE partdist.mock_parwal(oid oid,plsn bigint,kind integer,dtxid bigint,coord_gsid bigint,commit_ts bigint,verdict integer,participants bigint[]);
 CREATE FUNCTION partdist.partwal_read_dtx_record(p_oid oid,p_plsn bigint) RETURNS TABLE(kind integer,dtxid bigint,coord_gsid bigint,commit_ts bigint,verdict integer,participants bigint[]) LANGUAGE sql AS $$ SELECT kind,dtxid,coord_gsid,commit_ts,verdict,participants FROM partdist.mock_parwal WHERE oid=p_oid AND plsn=p_plsn $$;
@@ -281,6 +287,134 @@ SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
 """
 
 
+REGISTRATION_CASES = r"""
+INSERT INTO partdist.partition_map VALUES(10,1),(20,2),(30,1);
+CREATE OR REPLACE FUNCTION partdist.dtx_rpc(h text,p integer,q text)
+RETURNS text LANGUAGE plpgsql AS $$ DECLARE answer text; BEGIN
+  IF (SELECT fail FROM partdist.rpc_gate) THEN RAISE EXCEPTION 'unavailable'; END IF;
+  EXECUTE q INTO answer;
+  RETURN CASE WHEN answer='true' THEN 't' ELSE answer END;
+END $$;
+UPDATE partdist.rpc_gate SET fail=true;
+DO $$ BEGIN
+  BEGIN
+    PERFORM partdist.dtx_register_first(300,10,1,'worker1',5433,ARRAY[10]::bigint[]);
+    RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='unavailable admission accepted';
+  EXCEPTION WHEN raise_exception THEN NULL;
+  END;
+  IF EXISTS(SELECT FROM partdist.dtx_route WHERE gxid=300) THEN
+    RAISE EXCEPTION 'failed admission published a coordinator'; END IF;
+END $$;
+UPDATE partdist.rpc_gate SET fail=false;
+DO $$ BEGIN
+  BEGIN
+    PERFORM partdist.dtx_register_first(300,30,1,'worker1',5433,ARRAY[30]::bigint[]);
+    RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='follower admission accepted';
+  EXCEPTION WHEN raise_exception THEN NULL;
+  END;
+  IF EXISTS(SELECT FROM partdist.dtx_route WHERE gxid=300) THEN
+    RAISE EXCEPTION 'rejected candidate won first registration'; END IF;
+  IF partdist.dtx_register_first(300,20,2,'worker2',5434,ARRAY[20]::bigint[])<>20 THEN
+    RAISE EXCEPTION 'first successful candidate was not chosen'; END IF;
+  IF partdist.dtx_register_first(300,10,3,'worker1',5433,ARRAY[10]::bigint[])<>20 THEN
+    RAISE EXCEPTION 'later candidate replaced coordinator'; END IF;
+  IF (SELECT count(*) FROM partdist.dtx_coord_branch WHERE dtxid=300)<>2 THEN
+    RAISE EXCEPTION 'participant connection registrations were lost'; END IF;
+  IF EXISTS(SELECT FROM partdist.dtx_coord_branch WHERE dtxid=300
+            AND gid NOT LIKE 'shardpg_fc_300_20_%') THEN
+    RAISE EXCEPTION 'participants disagree on coordinator'; END IF;
+END $$;
+SELECT partdist.dtx_seal(300);
+DO $$ BEGIN
+  BEGIN
+    PERFORM partdist.dtx_register_first(300,10,4,'worker1',5433,ARRAY[10]::bigint[]);
+    RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='late admission accepted';
+  EXCEPTION WHEN raise_exception THEN NULL;
+  END;
+  IF (SELECT coord_gsid FROM partdist.dtx_route WHERE gxid=300)<>20 THEN
+    RAISE EXCEPTION 'rejected late admission changed route'; END IF;
+END $$;
+SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
+"""
+
+
+METADATA_CASES = r"""
+INSERT INTO partdist.partition_map VALUES(20,2);
+INSERT INTO partdist.dtx_ddl_shard(owner_node,group_id,anchor_oid) VALUES(2,20,900);
+CREATE OR REPLACE FUNCTION partdist.dtx_meta_event(c bigint,x bigint,k integer,v bigint[])
+RETURNS boolean LANGUAGE plpgsql AS $$ DECLARE p bigint; needed boolean; BEGIN
+ needed:=partdist.dtx_meta_validate(c,x,k,v);
+ IF k=0 AND needed THEN RETURN true; END IF;
+ IF k=0 AND NOT needed THEN
+   SELECT coalesce(max(plsn),0)+1 INTO p FROM partdist.mock_parwal WHERE oid=900;
+   INSERT INTO partdist.mock_parwal VALUES(900,p,10,x,c,0,0,v);
+   PERFORM partdist.dtx_reindex_committed(c,900::oid,p);
+   RETURN false;
+ END IF;
+ IF needed THEN
+   SELECT coalesce(max(plsn),0)+1 INTO p FROM partdist.mock_parwal WHERE oid=900;
+   INSERT INTO partdist.mock_parwal VALUES(900,p,k,x,c,0,0,v);
+   PERFORM partdist.dtx_reindex_committed(c,900::oid,p);
+ END IF;
+ RETURN true;
+END $$;
+CREATE OR REPLACE FUNCTION partdist.dtx_rpc(h text,p integer,q text)
+RETURNS text LANGUAGE plpgsql AS $$ DECLARE a text; BEGIN
+ EXECUTE q INTO a; RETURN CASE WHEN a='true' THEN 't' ELSE a END;
+END $$;
+SELECT partdist.dtx_register_first_native(400,20,1,'worker2',5434,ARRAY[20]::bigint[],500);
+SELECT partdist.dtx_enlist_native(400,20,'shardpg_fc_400_20_2','worker1',5433,ARRAY[20]::bigint[],600);
+SELECT partdist.dtx_seal(400);
+DELETE FROM partdist.dtx_coord_branch;
+DELETE FROM partdist.dtx_coord_tx;
+DELETE FROM partdist.dtx_decision_replay;
+SELECT partdist.dtx_reindex_committed(20,900::oid,(SELECT max(plsn) FROM partdist.mock_parwal));
+DO $$ BEGIN
+ IF (SELECT count(*) FROM partdist.dtx_coord_branch WHERE dtxid=400)<>2 OR
+    (SELECT phase FROM partdist.dtx_coord_tx WHERE dtxid=400)<>'PREPARE' OR
+    (SELECT native_fullxid FROM partdist.dtx_coord_branch WHERE gid='shardpg_fc_400_20_2')<>600 THEN
+   RAISE EXCEPTION 'DDL participant or seal state was not recovered from quorum records'; END IF;
+END $$;
+SELECT partdist.dtx_vote(400,'shardpg_fc_400_20_1',true);
+SELECT partdist.dtx_vote(400,'shardpg_fc_400_20_2',true);
+DO $$ BEGIN
+ IF partdist.dtx_votes(400)<>'READY' THEN RAISE EXCEPTION 'replicated votes were lost'; END IF;
+ BEGIN
+   PERFORM partdist.dtx_vote(400,'shardpg_fc_400_20_1',false);
+   RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='conflicting durable vote accepted';
+ EXCEPTION WHEN raise_exception THEN NULL;
+ END;
+END $$;
+INSERT INTO partdist.mock_parwal SELECT 900,max(plsn)+1,2,400,20,700,1,ARRAY[20]::bigint[] FROM partdist.mock_parwal;
+SELECT partdist.dtx_reindex_committed(20,900::oid,(SELECT max(plsn) FROM partdist.mock_parwal));
+SELECT partdist.dtx_meta_event(20,400,5,NULL);
+SELECT partdist.dtx_route_release(400,20);
+DELETE FROM partdist.dtx_decision_replay;
+SELECT partdist.dtx_reindex_committed(20,900::oid,(SELECT max(plsn) FROM partdist.mock_parwal));
+DO $$ BEGIN
+ IF EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=400) OR
+    EXISTS(SELECT FROM partdist.dtx_coord_branch WHERE dtxid=400) OR
+    EXISTS(SELECT FROM partdist.dtx_decision WHERE dtxid=400) OR
+    (SELECT commit_ts FROM partdist.dtx_ddl_outcome WHERE dtxid=400)<>700 OR
+    partdist.dtx_ddl_finish(20,400)<>1 THEN
+    RAISE EXCEPTION 'DDL completion or retained outcome was not replayable'; END IF;
+ BEGIN
+   PERFORM partdist.dtx_register_first_native(400,20,9,'worker2',5434,ARRAY[20]::bigint[],900);
+   RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='completed DDL registration reopened';
+ EXCEPTION WHEN raise_exception THEN NULL;
+ END;
+ IF partdist.dtx_meta_event(20,401,0,ARRAY[9,901]::bigint[]) IS DISTINCT FROM false THEN
+   RAISE EXCEPTION 'missing admission incorrectly confirmed'; END IF;
+ BEGIN
+   PERFORM partdist.dtx_enlist_native(401,20,'shardpg_fc_401_20_9','worker2',5434,ARRAY[20]::bigint[],901);
+   RAISE EXCEPTION USING ERRCODE='XX999',MESSAGE='late admission bypassed rejection fence';
+ EXCEPTION WHEN raise_exception THEN NULL;
+ END;
+END $$;
+SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
+"""
+
+
 class CoordinatorSQLTests(unittest.TestCase):
     def run_sql_case(self, case_sql):
         env = dict(os.environ)
@@ -312,7 +446,16 @@ class CoordinatorSQLTests(unittest.TestCase):
     def test_aborted_registration_recovery(self):
         self.run_sql_case(RECOVERY_CASES)
 
+    def test_first_successful_registration(self):
+        self.run_sql_case(REGISTRATION_CASES)
+
+    def test_ddl_metadata_quorum_replay(self):
+        self.run_sql_case(METADATA_CASES)
+
     def test_install_script_matches_upgrade(self):
+        marker = "-- BEGIN ddl_metadata.sql (keep in sync with standalone upgrade)\n"
+        self.assertEqual(SQL.read_text().split(marker)[1],
+                         (ROOT / "pg-partdist-src/sql/ddl_metadata.sql").read_text())
         install = (ROOT / "pg-partdist-src/sql/pg_partdist--1.0.sql").read_text()
         marker = "-- BEGIN first_shard_coordinator.sql (keep in sync with standalone upgrade)\n"
         self.assertEqual(install.split(marker)[1], SQL.read_text())

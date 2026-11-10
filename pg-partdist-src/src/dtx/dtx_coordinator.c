@@ -20,8 +20,11 @@
 
 #include <dlfcn.h>
 #include "access/xact.h"
+#include "access/transam.h"
+#include "storage/procarray.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
 #include "distributed/connection_management.h"
 #include "distributed/remote_commands.h"
 #include "distributed/transaction_management.h"
@@ -45,6 +48,11 @@
 bool shardpg_first_shard_coordinator = true;
 static bool hooks_installed = false;
 static bool router_started = false;
+static bool router_transaction_ddl = false;
+static void (*prepare_local_catalog)(void) = NULL;
+static uint64 branch_native_fullxid = 0;
+static int router_ddl_depth = 0;
+static bool branch_is_ddl = false;
 static bool inside_enlist = false;
 static bool handing_off = false;
 static int prepare_timeout_ms = 30000;
@@ -106,7 +114,7 @@ rpc(const char *host, int port, const char *base, const char *sql)
     if (PQstatus(conn) != CONNECTION_OK)
     {
         PQfinish(conn);
-        ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+        ereport(ERROR, (errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
                         errmsg("DTX control connection failed")));
     }
     res = PQexec(conn, sql);
@@ -116,9 +124,12 @@ rpc(const char *host, int port, const char *base, const char *sql)
           PQnfields(res) != 1 || PQgetisnull(res, 0, 0))))
     {
         char *detail = pstrdup(res ? PQresultErrorMessage(res) : "no result");
+        const char *state = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : NULL;
+        int code = state && strlen(state) == 5 ?
+            MAKE_SQLSTATE(state[0],state[1],state[2],state[3],state[4]) : ERRCODE_CONNECTION_FAILURE;
         if (res) PQclear(res);
         PQfinish(conn);
-        ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+        ereport(ERROR, (errcode(code),
                         errmsg("DTX control request failed"), errdetail_internal("%s", detail)));
     }
     answer = pstrdup(PQresultStatus(res) == PGRES_COMMAND_OK ? "t" : PQgetvalue(res, 0, 0));
@@ -158,7 +169,7 @@ coordinator_address(int64 gsid, char *host, int *port)
 }
 
 static void
-enlist(void)
+enlist_business(void)
 {
     StringInfoData q;
     char *result;
@@ -214,6 +225,55 @@ enlist(void)
     pfree(q.data);
 }
 
+
+static void
+enlist(void)
+{
+    StringInfoData q;
+    char *result;
+    char self_host[NAMEDATALEN];
+    int self_port;
+    int i;
+    const char *node;
+    char *sql;
+    bool isnull;
+
+    if (!branch_is_ddl) { enlist_business(); return; }
+    if (!branch_gid[0] || !branch_nshards) return;
+    node = GetConfigOption("pg_raft.node_id", false, false);
+    sql = psprintf("SELECT hostname,port FROM partdist.node_map WHERE node_id=%d", atoi(node));
+    SPI_connect();
+    PushActiveSnapshot(GetTransactionSnapshot());
+    if (SPI_execute(sql, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+        elog(ERROR, "DTX participant has no node address");
+    strlcpy(self_host, SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1), NAMEDATALEN);
+    self_port = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+    if (isnull) elog(ERROR, "DTX participant has no port");
+    PopActiveSnapshot();
+    SPI_finish();
+    pfree(sql);
+
+    /* The route is published only AFTER the candidate has admitted this
+     * participant. A failed admission must never win the first-arrival race.
+     * The TSO serializes publication; the chosen shard owns participants/votes. */
+    initStringInfo(&q);
+    appendStringInfo(&q, "SELECT partdist.dtx_register_first_native(" INT64_FORMAT "," INT64_FORMAT "," UINT64_FORMAT ",%s,%d,ARRAY[",
+                     branch_xid, branch_shards[0], branch_connection,
+                     quote_literal_cstr(self_host), self_port);
+    for (i = 0; i < branch_nshards; i++)
+        appendStringInfo(&q, "%s" INT64_FORMAT, i ? "," : "", branch_shards[i]);
+    appendStringInfo(&q, "]::bigint[]," UINT64_FORMAT ")", branch_native_fullxid);
+    result = tso_control(q.data);
+    coordinator = pg_strtoint64(result);
+    pfree(result);
+    pfree(q.data);
+    if (coordinator <= 0) elog(ERROR, "DTX registration returned no coordinator");
+    TsoSetCoordinator(coordinator);
+    snprintf(branch_gid, sizeof(branch_gid), "shardpg_fc_" INT64_FORMAT "_" INT64_FORMAT "_" UINT64_FORMAT,
+             branch_xid, coordinator, branch_connection);
+    coordinator_address(coordinator, coord_host, &coord_port);
+}
+
 static void
 enlist_relation(Oid oid)
 {
@@ -245,7 +305,13 @@ void
 DtxEnlistPlan(PlannedStmt *plan)
 {
     ListCell *lc;
-    if (!branch_gid[0] || inside_enlist || plan == NULL) return;
+    if (!branch_gid[0] && router_transaction_ddl && router_ddl_depth == 0 && plan != NULL &&
+        (plan->commandType == CMD_INSERT || plan->commandType == CMD_UPDATE ||
+         plan->commandType == CMD_DELETE || plan->commandType == CMD_MERGE))
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                       errmsg("business writes cannot join a distributed DDL transaction"),
+                       errhint("Commit or roll back the DDL transaction before writing business rows.")));
+    if (!branch_gid[0] || branch_is_ddl || inside_enlist || plan == NULL) return;
     inside_enlist = true;
     PG_TRY();
     {
@@ -264,7 +330,9 @@ int
 DtxBranchPartitions(const Oid **partitions)
 {
     *partitions = branch_partitions;
-    return branch_gid[0] ? branch_nshards : 0;
+    /* DDL votes protect native catalog PREPARE; the anchor replicates the
+     * coordinator decision, not a synthetic business-row PREPARE marker. */
+    return branch_gid[0] && !branch_is_ddl ? branch_nshards : 0;
 }
 
 PG_FUNCTION_INFO_V1(partdist_dtx_branch_begin);
@@ -282,7 +350,81 @@ partdist_dtx_branch_begin(PG_FUNCTION_ARGS)
     strlcpy(branch_gid, gid, sizeof(branch_gid));
     branch_xid = id;
     branch_connection = (uint64) connection;
+    branch_native_fullxid = U64FromFullTransactionId(GetTopFullTransactionId());
     PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(partdist_dtx_branch_set_ddl);
+Datum
+partdist_dtx_branch_set_ddl(PG_FUNCTION_ARGS)
+{
+    const char *node = GetConfigOption("pg_raft.node_id", false, false);
+    char *q;
+    bool isnull;
+    if (!branch_gid[0] || branch_nshards || coordinator)
+        elog(ERROR, "DDL context must precede participant registration");
+    q = psprintf("SELECT group_id FROM partdist.dtx_ddl_shard WHERE owner_node=%d AND anchor_oid IS NOT NULL", atoi(node));
+    SPI_connect();
+    if (SPI_execute(q, true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+        elog(ERROR, "DDL metadata shard is not initialized on this worker");
+    branch_shards[0] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    if (isnull || branch_shards[0] <= 0) elog(ERROR, "invalid DDL metadata shard");
+    SPI_finish();
+    pfree(q);
+    branch_nshards = 1;
+    branch_is_ddl = true;
+    inside_enlist = true;
+    PG_TRY(); { enlist(); }
+    PG_FINALLY(); { inside_enlist = false; }
+    PG_END_TRY();
+    PG_RETURN_VOID();
+}
+
+/* DDL context is lexical, surviving shardpg_create's internal transaction
+ * boundaries without changing a session GUC or affecting unrelated sessions. */
+bool
+DtxUtilityEnter(Node *stmt)
+{
+    int node_id;
+    int router_id;
+    Oid ns;
+    char *r;
+    if (!shardpg_first_shard_coordinator || branch_gid[0] || creating_extension ||
+        stmt == NULL || !(IsA(stmt, CreateStmt) || IsA(stmt, DropStmt) ||
+                          IsA(stmt, CreateSchemaStmt) || IsA(stmt, IndexStmt)))
+        return false;
+    node_id = atoi(GetConfigOption("pg_raft.node_id", false, false));
+    router_id = atoi(GetConfigOption("pg_raft.coordinator_node_id", false, false));
+    if (node_id != router_id) return false;
+    /* Extension upgrade scripts create their own local service tables. They
+     * must not recursively bootstrap a service whose SQL is being installed. */
+    if (IsA(stmt, CreateStmt))
+    {
+        const char *schema = ((CreateStmt *) stmt)->relation->schemaname;
+        if (schema && strcmp(schema, "partdist") == 0) return false;
+    }
+    if (router_started && !router_transaction_ddl)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                       errmsg("distributed DDL cannot join an existing business transaction"),
+                       errhint("Commit or roll back the business transaction before running DDL.")));
+    ns = get_namespace_oid("partdist", true);
+    if (!OidIsValid(ns) || !OidIsValid(get_relname_relid("dtx_ddl_shard", ns)))
+        return false; /* extension installation itself has no DDL service yet */
+    if (router_ddl_depth == 0)
+    {
+        r = rpc("127.0.0.1", PostPortNumber, NULL, "SELECT partdist.dtx_ddl_ensure()");
+        if (strcmp(r, "t") != 0) elog(ERROR, "DDL metadata shards are not ready");
+        pfree(r);
+    }
+    router_ddl_depth++;
+    return true;
+}
+
+void
+DtxUtilityLeave(void)
+{
+    Assert(router_ddl_depth > 0);
+    router_ddl_depth--;
 }
 
 PG_FUNCTION_INFO_V1(partdist_dtx_branch_ready);
@@ -296,9 +438,9 @@ partdist_dtx_branch_ready(PG_FUNCTION_ARGS)
     inside_enlist = true;
     PG_TRY();
     {
-        n = PartWALTouchedCount();
+        n = branch_is_ddl ? 0 : PartWALTouchedCount();
         oids = palloc(sizeof(Oid) * Max(n, 1));
-        n = PartWALCopyTouched(oids, n);
+        if (!branch_is_ddl) n = PartWALCopyTouched(oids, n);
         for (i = 0; i < n; i++) enlist_relation(oids[i]);
         pfree(oids);
         if (!branch_nshards)
@@ -320,6 +462,18 @@ DtxHandoffUtility(Node *stmt, ProcessUtilityContext context, QueryCompletion *qc
     CallStmt *call;
     TimestampTz started;
     char *sql;
+    if (IsA(stmt, TransactionStmt) &&
+        ((TransactionStmt *) stmt)->kind == TRANS_STMT_COMMIT &&
+        router_transaction_ddl && router_started)
+    {
+        if (context != PROCESS_UTILITY_TOPLEVEL)
+            elog(ERROR, "distributed DDL COMMIT requires a top-level command");
+        if (DtxCommitDdlCatalog(CurrentMemoryContext))
+        {
+            if (qc) SetQueryCompletion(qc, CMDTAG_COMMIT, 0);
+            return true;
+        }
+    }
     if (!IsA(stmt, CallStmt)) return false;
     call = (CallStmt *) stmt;
     if (!call->funcexpr ||
@@ -381,7 +535,8 @@ branch_callback(XactEvent event, void *arg)
     branch_gid[0] = '\0';
     branch_xid = coordinator = 0;
     branch_nshards = 0;
-    handing_off = inside_enlist = router_started = false;
+    handing_off = inside_enlist = router_started = branch_is_ddl = router_transaction_ddl = false;
+    branch_native_fullxid = 0;
 }
 
 void
@@ -396,13 +551,47 @@ router_begin(MultiConnection *connection, StringInfo command)
 {
     int64 gxid = TsoCurrentGxid();
     if (!shardpg_first_shard_coordinator || MyBackendType != B_BACKEND) return;
+    /* Citus creates shared dependencies (schemas/roles) in independent
+     * transactions before starting the coordinated table transaction. Those
+     * sockets are committed and closed by Citus itself. Enrolling them in the
+     * table transaction would leave votes that can never arrive. */
+    if (router_ddl_depth > 0 && !InCoordinatedTransaction()) return;
     if (gxid <= 0)
         elog(ERROR, "router must allocate gxid and start_ts before opening a shard branch");
     snprintf(connection->remoteTransaction.preparedName, NAMEDATALEN,
              "shardpg_fc_" INT64_FORMAT "_0_" UINT64_FORMAT, gxid, connection->connectionId);
     appendStringInfo(command, "SELECT partdist.dtx_branch_begin(%s);",
                      quote_literal_cstr(connection->remoteTransaction.preparedName));
+    if (router_ddl_depth > 0)
+    {
+        appendStringInfoString(command, "SELECT partdist.dtx_branch_set_ddl();");
+        router_transaction_ddl = true;
+    }
     router_started = true;
+}
+
+static void
+router_ready_branches(void)
+{
+    dlist_iter it;
+    /* Quiesce task sockets and finish enrolment, including COPY/empty branches.
+     * These are execution acknowledgements, not PREPARE votes. */
+    dlist_foreach(it, &InProgressTransactions)
+    {
+        MultiConnection *c = dlist_container(MultiConnection, transactionNode, it.cur);
+        PGresult *r;
+        if (c->remoteTransaction.transactionFailed)
+            elog(ERROR, "a distributed task failed before handoff");
+        r = PQexec(c->pgConn, "SELECT partdist.dtx_branch_ready()");
+        if (!r || PQresultStatus(r) != PGRES_TUPLES_OK)
+        {
+            char *detail = pstrdup(r ? PQresultErrorMessage(r) : PQerrorMessage(c->pgConn));
+            if (r) PQclear(r);
+            ereport(ERROR, (errmsg("a distributed branch could not register with its coordinator"),
+                            errdetail_internal("%s", detail)));
+        }
+        PQclear(r);
+    }
 }
 
 static bool
@@ -415,22 +604,7 @@ router_commit(void)
     char *result;
     int64 gsid;
     if (!router_started) return false;
-    /* Quiesce task sockets and finish enrolment, including COPY/empty branches.
-     * These are execution acknowledgements, not PREPARE votes. */
-    dlist_foreach(it, &InProgressTransactions)
-    {
-        MultiConnection *c = dlist_container(MultiConnection, transactionNode, it.cur);
-        PGresult *r;
-        if (c->remoteTransaction.transactionFailed)
-            elog(ERROR, "a distributed task failed before handoff");
-        r = PQexec(c->pgConn, "SELECT partdist.dtx_branch_ready()");
-        if (!r || PQresultStatus(r) != PGRES_TUPLES_OK)
-        {
-            if (r) PQclear(r);
-            elog(ERROR, "a distributed branch could not register with its coordinator");
-        }
-        PQclear(r);
-    }
+    router_ready_branches();
     sql = psprintf("SELECT coord_gsid FROM partdist.dtx_route WHERE gxid=" INT64_FORMAT,
                    TsoCurrentGxid());
     result = tso_control(sql);
@@ -487,7 +661,145 @@ router_commit(void)
     return true;
 }
 
+/* Commit the router catalog as a genuine native PREPARED participant.
+ * This runs at shardpg_create/drop's explicit transaction boundary, or when
+ * intercepting a user COMMIT for a DDL-only transaction. */
+bool
+DtxCommitDdlCatalog(MemoryContext back_to)
+{
+    int64 id, coord;
+    char host[NAMEDATALEN];
+    int port;
+    char gid[NAMEDATALEN];
+    char self_host[NAMEDATALEN];
+    int self_port;
+    List *connections = NIL;
+    ListCell *lc;
+    dlist_iter it;
+    char *q, *answer;
+    TimestampTz started;
+    bool isnull;
+
+    if (!router_started || !router_transaction_ddl) return false;
+    if (prepare_local_catalog == NULL)
+        elog(ERROR, "distributed DDL requires Citus patch citus-0005-ddl-catalog-participant");
+    MemoryContextSwitchTo(back_to);
+    id = TsoCurrentGxid();
+    router_ready_branches();
+    q = psprintf("SELECT coord_gsid FROM partdist.dtx_route WHERE gxid=" INT64_FORMAT, id);
+    answer = tso_control(q);
+    coord = pg_strtoint64(answer);
+    pfree(q); pfree(answer);
+    coordinator_address(coord, host, &port);
+    SPI_connect();
+    if (SPI_execute("SELECT hostname,port FROM partdist.node_map WHERE node_id=current_setting('pg_raft.node_id')::integer", true, 1) != SPI_OK_SELECT || SPI_processed != 1)
+        elog(ERROR, "DDL router has no participant address");
+    strlcpy(self_host, SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1), NAMEDATALEN);
+    self_port = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+    if (isnull) elog(ERROR, "DDL router has no participant port");
+    SPI_finish();
+    MemoryContextSwitchTo(back_to);
+    snprintf(gid, sizeof(gid), "shardpg_fc_" INT64_FORMAT "_" INT64_FORMAT "_" INT64_FORMAT,
+             id, coord, PG_INT64_MAX);
+    q = psprintf("SELECT partdist.dtx_enlist_native(" INT64_FORMAT "," INT64_FORMAT ",%s,%s,%d,ARRAY[" INT64_FORMAT "]::bigint[]," UINT64_FORMAT ")",
+                 id, coord, quote_literal_cstr(gid), quote_literal_cstr(self_host), self_port, coord,
+                 U64FromFullTransactionId(GetTopFullTransactionId()));
+    answer = rpc(host, port, NULL, q);
+    if (strcmp(answer, "t") != 0) elog(ERROR, "DDL catalog participant admission failed");
+    pfree(q); pfree(answer);
+    q = psprintf("SELECT partdist.dtx_seal(" INT64_FORMAT ")", id);
+    answer = rpc(host, port, NULL, q); pfree(q); pfree(answer);
+    dlist_foreach(it, &InProgressTransactions)
+    {
+        MultiConnection *c = dlist_container(MultiConnection, transactionNode, it.cur);
+        int flushed;
+        connections = lappend(connections, c);
+        c->remoteTransaction.transactionState = REMOTE_TRANS_COMMITTED;
+        if (!SendRemoteCommand(c, "CALL partdist.dtx_handoff()"))
+            elog(ERROR, "DDL branch handoff failed");
+        started = GetCurrentTimestamp();
+        while ((flushed = PQflush(c->pgConn)) == 1)
+        {
+            CHECK_FOR_INTERRUPTS();
+            if (TimestampDifferenceExceeds(started, GetCurrentTimestamp(), prepare_timeout_ms))
+                elog(ERROR, "DDL branch handoff send timed out");
+            pg_usleep(1000L);
+        }
+        if (flushed < 0) elog(ERROR, "DDL branch handoff socket failed");
+    }
+    prepare_local_catalog();
+    strlcpy(branch_gid, gid, sizeof(branch_gid));
+    branch_xid = id; coordinator = coord;
+    strlcpy(coord_host, host, sizeof(coord_host)); coord_port = port;
+    branch_connection = (uint64) PG_INT64_MAX;
+    branch_native_fullxid = U64FromFullTransactionId(GetTopFullTransactionId());
+    branch_is_ddl = handing_off = true;
+    branch_nshards = 1; branch_shards[0] = coord;
+    TsoSetCoordinator(coord);
+    PartDistDtxNotePrepareGid(gid);
+    while (ActiveSnapshotSet()) PopActiveSnapshot();
+    if (!IsTransactionBlock())
+    {
+        BeginTransactionBlock();
+        CommitTransactionCommand(); /* enter block, without committing work */
+    }
+    if (!PrepareTransactionBlock(gid)) elog(ERROR, "DDL catalog could not enter native PREPARE");
+    CommitTransactionCommand();
+    StartTransactionCommand();
+    MemoryContextSwitchTo(back_to);
+    q = psprintf("SELECT partdist.dtx_ddl_finish(" INT64_FORMAT "," INT64_FORMAT ")", coord, id);
+    answer = rpc(host, port, NULL, q);
+    if (strcmp(answer, "2") == 0)
+        ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                       errmsg("distributed DDL was aborted by its shard coordinator")));
+    if (strcmp(answer, "1") != 0) elog(ERROR, "DDL coordinator returned no durable COMMIT");
+    pfree(q); pfree(answer);
+    started = GetCurrentTimestamp();
+    for (;;)
+    {
+        q = psprintf("SELECT NOT EXISTS(SELECT FROM partdist.dtx_route WHERE gxid=" INT64_FORMAT ")", id);
+        answer = tso_control(q); pfree(q);
+        if (strcmp(answer, "t") == 0) { pfree(answer); break; }
+        pfree(answer);
+        CHECK_FOR_INTERRUPTS();
+        if (TimestampDifferenceExceeds(started, GetCurrentTimestamp(), prepare_timeout_ms))
+            ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+                errmsg("DDL COMMIT is durable but phase two completion is not yet confirmed"),
+                errdetail("Retain transaction " INT64_FORMAT " and inspect its durable decision; do not replay the DDL.", id)));
+        pg_usleep(10000L);
+    }
+    foreach(lc, connections) CloseConnection((MultiConnection *) lfirst(lc));
+    return true;
+}
+
 /* SQL control-plane helpers are restricted to the extension's administrator. */
+/* A native xid stays in ProcArray while active OR prepared. Test that
+ * before inspecting prepared state so the active->prepared transition can
+ * never be mistaken for an abort. Full xid age fences recycled native IDs. */
+PG_FUNCTION_INFO_V1(partdist_dtx_branch_probe);
+Datum
+partdist_dtx_branch_probe(PG_FUNCTION_ARGS)
+{
+    char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    uint64 full = (uint64) PG_GETARG_INT64(1);
+    uint64 next = U64FromFullTransactionId(ReadNextFullTransactionId());
+    TransactionId xid = (TransactionId) full;
+    char *q;
+    bool prepared = false;
+    bool isnull;
+    if (full == 0 || full >= next || next-full >= UINT64CONST(0x80000000))
+        PG_RETURN_TEXT_P(cstring_to_text("UNKNOWN"));
+    if (!TransactionIdIsInProgress(xid))
+        PG_RETURN_TEXT_P(cstring_to_text(TransactionIdDidCommit(xid) ? "COMMITTED" : "ABORTED"));
+    q = psprintf("SELECT EXISTS(SELECT FROM pg_prepared_xacts WHERE gid=%s AND database=current_database() AND transaction::text::bigint=%u)",
+                 quote_literal_cstr(gid), xid);
+    SPI_connect();
+    if (SPI_execute(q, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        prepared = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    SPI_finish(); pfree(q);
+    PG_RETURN_TEXT_P(cstring_to_text(prepared ? "PREPARED" : "ACTIVE"));
+}
+
 PG_FUNCTION_INFO_V1(partdist_dtx_rpc);
 Datum partdist_dtx_rpc(PG_FUNCTION_ARGS)
 {
@@ -647,6 +959,7 @@ DtxCoordinatorInit(void)
     BranchHook *begin = (BranchHook *) dlsym(RTLD_DEFAULT, "remote_transaction_branch_hook");
     DelegateHook *delegate = (DelegateHook *) dlsym(RTLD_DEFAULT, "remote_transaction_delegate_hook");
     BackgroundWorker worker;
+    prepare_local_catalog = (void (*)(void)) dlsym(RTLD_DEFAULT, "ShardpgPrepareLocalCatalog");
     DefineCustomBoolVariable("shardpg.first_shard_coordinator",
         "First-arrival shard drives prepare and asynchronous commit.", NULL,
         &shardpg_first_shard_coordinator, true, PGC_SUSET, 0, NULL, NULL, NULL);

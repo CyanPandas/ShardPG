@@ -31,7 +31,7 @@ OBJS = \
 
 EXTENSION = pg_partdist
 DATA = sql/pg_partdist--1.0.sql
-DATA += sql/first_shard_coordinator.sql
+DATA += sql/first_shard_coordinator.sql sql/ddl_metadata.sql
 
 PG_CPPFLAGS = -I$(CURDIR)/include -I$(shell $(PG_CONFIG) --includedir)
 ifdef SHARD_XID_RING_BITS

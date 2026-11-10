@@ -1,0 +1,38 @@
+--- a/src/backend/distributed/transaction/transaction_management.c
++++ b/src/backend/distributed/transaction/transaction_management.c
+@@ -163,6 +163,7 @@
+ static void PushSubXact(SubTransactionId subId);
+ static void PopSubXact(SubTransactionId subId, bool commit);
+ static void ResetGlobalVariables(void);
++PGDLLEXPORT void ShardpgPrepareLocalCatalog(void);
+ static bool SwallowErrors(void (*func)(void));
+ static void ForceAllInProgressConnectionsToClose(void);
+ static void EnsurePrepareTransactionIsAllowed(void);
+@@ -680,6 +681,27 @@
+ 		   sizeof(AllowedDistributionColumn));
+ }
+ 
++
++/* ShardPG owns these parked task sockets until the distributed DDL ends.
++ * Clear Citus transaction-local bookkeeping BEFORE native PREPARE destroys
++ * TopTransactionContext, without closing or reusing a participant connection.
++ * The caller later closes the retained MultiConnections after phase two. */
++void
++ShardpgPrepareLocalCatalog(void)
++{
++    dlist_mutable_iter iter;
++    ResetPlacementConnectionManagement();
++    dlist_foreach_modify(iter, &InProgressTransactions)
++    {
++        MultiConnection *connection = dlist_container(MultiConnection, transactionNode, iter.cur);
++        ResetRemoteTransaction(connection);
++        UnclaimConnection(connection);
++        connection->forceCloseAtTransactionEnd = true;
++    }
++    ResetGlobalVariables();
++    ResetRelationAccessHash();
++    ResetPropagatedObjects();
++}
+ 
+ /*
+  * CoordinatedSubTransactionCallback is the callback used to implement

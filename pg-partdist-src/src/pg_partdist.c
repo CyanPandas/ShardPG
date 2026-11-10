@@ -523,10 +523,22 @@ partdist_process_utility(PlannedStmt *pstmt,
      * P7-N87/N88：SHARD KEY 建表、分片表 DROP 由 shardpg_ddl.c 接手（它会在语句内
      * 提交事务，执行语句仍走 partdist_run_chain）；其余语句照常执行。
      */
-    if (!ShardpgDdlIntercept(pstmt, queryString, readOnlyTree, context, params,
-                             queryEnv, dest, qc, partdist_run_chain))
-        partdist_run_chain(pstmt, queryString, readOnlyTree, context, params,
-                           queryEnv, dest, qc);
+    {
+        MemoryContext ddl_caller = CurrentMemoryContext;
+        bool ddl_entered = DtxUtilityEnter(pstmt->utilityStmt);
+        PG_TRY();
+        {
+        if (!ShardpgDdlIntercept(pstmt, queryString, readOnlyTree, context, params,
+                                 queryEnv, dest, qc, partdist_run_chain))
+            partdist_run_chain(pstmt, queryString, readOnlyTree, context, params,
+                               queryEnv, dest, qc);
+        if (ddl_entered && context == PROCESS_UTILITY_TOPLEVEL && !IsTransactionBlock())
+            (void) DtxCommitDdlCatalog(ddl_caller);
+        }
+        PG_FINALLY();
+        { if (ddl_entered) DtxUtilityLeave(); }
+        PG_END_TRY();
+    }
 
     /*
      * ★ T7.8（P7-D1）：`COMMIT PREPARED` **执行完之后**补一遍 DROP 通知。

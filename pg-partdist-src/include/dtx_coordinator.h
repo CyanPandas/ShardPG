@@ -8,6 +8,9 @@
 extern bool shardpg_first_shard_coordinator;
 extern void DtxCoordinatorInit(void);
 extern void DtxRequireRouterHooks(void);
+extern bool DtxUtilityEnter(Node *stmt);
+extern void DtxUtilityLeave(void);
+extern bool DtxCommitDdlCatalog(MemoryContext back_to);
 extern void DtxEnlistPlan(PlannedStmt *plan);
 extern int DtxBranchPartitions(const Oid **partitions);
 extern bool DtxHandoffUtility(Node *stmt, ProcessUtilityContext context,
