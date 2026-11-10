@@ -1,0 +1,2896 @@
+{
+  "fa23": "44a3e2d83a20bf7d32d8004a218dd7c5591bb602",
+  "mmp": "bbee3e1cb7f9e0e49b7a246153fce078c173bee0",
+  "test": "b149622efddb29032f2932cc6f5e7b2e2de642c8",
+  "test_mmp_base": "01e5635a2ca6010c929130ed26281d34838b8686",
+  "fa23_mmp_base": "e123f0e9541472de98b012d1e0f7cc0df587f417",
+  "scope": [
+    "pg-partdist-src",
+    "pg-raft-src",
+    "tpcc"
+  ],
+  "method": "Compare final test and mmp blobs for paths changed by the 20 test commits. Identical files do not prove all earlier behavior survived; different files do not prove a fix is missing. No runtime tests performed.",
+  "file_counts": {
+    "different": 19,
+    "identical": 45
+  },
+  "files": [
+    {
+      "path": "pg-partdist-src/include/dtx_pending.h",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e10012f9391496aa16c7a195540cfafc0a7e0f58"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5dd1f5168c50b62e310c0c90a69095bfc0d168a2"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/partition_wal_writer.h",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "887b77ffbaeaafd0f391637afb446c2233c4d527"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "ca28ca1e9c61971ab5c028c61d37596a79d52a40"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/partwal_sync.h",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "7c99689f25107b7b0cb0b6d3c97a7f152d2ec15d"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e3edb35bbd2c0041a7065cc49c4f229653c3f60e"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/shard_clog.h",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/shard_vacuum.h",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/shard_visibility.h",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5da425c7699672b8293165c6f74079158ba60882"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5da425c7699672b8293165c6f74079158ba60882"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/shard_xid.h",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+      }
+    },
+    {
+      "path": "pg-partdist-src/include/tso.h",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "cc14ea459adb5b5815f1b7fa43366a3f436b6bee"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "7b854f78e83ba64f74309de21d960fa7ae198bd9"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/0012-shard-rc-follow-updates.patch",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e6eb0a6532d697f89836e6cf3d050dbf1ddbe947"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e6eb0a6532d697f89836e6cf3d050dbf1ddbe947"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/0013-xlog-write-upto.patch",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "9cd365fc3d1160a3791f0cbe53d6dac84fc8d90f"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "9cd365fc3d1160a3791f0cbe53d6dac84fc8d90f"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/0014-early-lock-release.patch",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f2c6238b9d9bdca7a779b7acc908e439c51560ec"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f2c6238b9d9bdca7a779b7acc908e439c51560ec"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/0015-checkpoint-hook.patch",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "cb183eb5216f52c52bd4bb458c3022942ff0a2dc"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "cb183eb5216f52c52bd4bb458c3022942ff0a2dc"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/README.md",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+      }
+    },
+    {
+      "path": "pg-partdist-src/patches/citus-0001-cache-conns-in-internal-backends.patch",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0342a5b5bbfb8f5f68b2ea337562ad56b3fc9d22"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0342a5b5bbfb8f5f68b2ea337562ad56b3fc9d22"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/dtx_pending.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e30106cf714300488c45fd580ae12bc591f7f98c"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f72a6b9508ccf92eab6c6bd00eead88df0af8bd4"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/pg_partdist.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "ba0c117fe0ca5311bdf3d5f0e6e8d1aa4146dfe9"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "dea04a322d79d4ccc026992431a2a8839ca4eb3e"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/shard_clog.c",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/shard_vacuum.c",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/shard_visibility.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f415c699273cf8a546cbb8efc23a32c55a6285fc"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "da2f645c7d72205c1ae7dfc95c13f9dbc9c4f517"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/shard_xid.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/tso_client.c",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/wal/partition_wal.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "c2f1a20967e31d3e65c013336c460c4398b9d7af"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6ce114d9c6743da29e2fd3efac8fdbc5dad6f700"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/wal/partition_wal_writer.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0fb5e426ecd520b9a21d23cfd3c80fa4741083bc"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "16935d873048f588ce68b2e574f8e6feac11bac8"
+      }
+    },
+    {
+      "path": "pg-partdist-src/src/wal/partwal_sync.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "72e7e47d60ccd4b0448a6617865427b54cc36a13"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "d687df9ee3ade2531774bb53a9362f4278f55fcc"
+      }
+    },
+    {
+      "path": "pg-raft-src/include/pg_raft.h",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b140c536b0debe18c561865c954fd69ad7ae481e"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "fd9535442ad5f390f17dc08eec0f4d6d9b423765"
+      }
+    },
+    {
+      "path": "pg-raft-src/sql/pg_raft--1.0.sql",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "31b3a13c70a094d3f3d992d4c02c1da97325599e"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b445bd3a290cb192a4b52161074907f4b8a28d4b"
+      }
+    },
+    {
+      "path": "pg-raft-src/src/pg_raft.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "3c25f818e9150f0181b6182ea48316c237b9c604"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "be3bdd110f42a545202d67b4afe414209729b6bd"
+      }
+    },
+    {
+      "path": "pg-raft-src/src/raft_consensus.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "bcfd45b865f0b94cec1e5f8709304e0ec8c28892"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "d3610dbffd50e1aee89aa2a0ae091594bf38547d"
+      }
+    },
+    {
+      "path": "pg-raft-src/src/raft_leader.c",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "50fa263cb6617e72498fda57194344d49183aeb8"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0f6026d7488f6b449be31f383789f6020c89c1c7"
+      }
+    },
+    {
+      "path": "tpcc/conf/node.conf.tmpl",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+      }
+    },
+    {
+      "path": "tpcc/lab/Dockerfile.prof",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "250cf5bdc78d44ab7a59d2dbfcd2cc8c3b15fb2c"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "4efeb8ea4ce6a7ed7bd32a98c70a77afe89ce04b"
+      }
+    },
+    {
+      "path": "tpcc/lab/README.md",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "a23bcffdd7ab0d9003b869c06b9a94e6dbd6f838"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "a23bcffdd7ab0d9003b869c06b9a94e6dbd6f838"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/cpuattr.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0eed9970486256932d81144a4aa7d9bcf2205f98"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0eed9970486256932d81144a4aa7d9bcf2205f98"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/hoststat.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "49906895e01df46af1bc1aa87caaeaecde4c2f0f"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "49906895e01df46af1bc1aa87caaeaecde4c2f0f"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/hot.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f1ba03fa940c0c60fe4b0bf28f4018881baa2163"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "f1ba03fa940c0c60fe4b0bf28f4018881baa2163"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/idxcheck.sql",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "a0419972a617e06d93078372fe7eaf015bb2c133"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "a0419972a617e06d93078372fe7eaf015bb2c133"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/iostat.sql",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "636b532230c880eec59389a10b9e24a14b127491"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "636b532230c880eec59389a10b9e24a14b127491"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/lk.sql",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "fab7182aa268c3437d183834cd402ffa86ae9c76"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "fab7182aa268c3437d183834cd402ffa86ae9c76"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/pendmon.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "35b972ac8baa85ae71e058e6902b8f628e495143"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "35b972ac8baa85ae71e058e6902b8f628e495143"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/perfcallers.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "97bb7b209bc4c761194e75034e66117b4cff4d99"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "97bb7b209bc4c761194e75034e66117b4cff4d99"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/perfcg.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "90064a16fb390c2f5ee42a6d5c545f921201165e"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "90064a16fb390c2f5ee42a6d5c545f921201165e"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/perfincl.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "034862c8382cf1ba5b2900d68ce3339c0b17cbf9"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "034862c8382cf1ba5b2900d68ce3339c0b17cbf9"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/perfrec.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "69bc1f1938503ab316a0602d6f8a081568fca953"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "69bc1f1938503ab316a0602d6f8a081568fca953"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/rctest.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "1a6862814bd6018db2ddf11fca7a5ff891b70bc9"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "1a6862814bd6018db2ddf11fca7a5ff891b70bc9"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/waitev.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b9cb8b0e1623abf4e816567a84e40a8a35db78ad"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b9cb8b0e1623abf4e816567a84e40a8a35db78ad"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/walstat.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6e581b2d71aedc86a7783f8bef924e2e46baf07a"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6e581b2d71aedc86a7783f8bef924e2e46baf07a"
+      }
+    },
+    {
+      "path": "tpcc/lab/diag/wbytes.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b10b808761fa37dd1279ebe5840a4101e98afa79"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "b10b808761fa37dd1279ebe5840a4101e98afa79"
+      }
+    },
+    {
+      "path": "tpcc/lab/localonly.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "15f730162a6f4993998ecba114a1d2c93a9b2ea3"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "15f730162a6f4993998ecba114a1d2c93a9b2ea3"
+      }
+    },
+    {
+      "path": "tpcc/lab/logsum.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0a0fde5b85c46800a911db38a0a64e23ca8774d3"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "0a0fde5b85c46800a911db38a0a64e23ca8774d3"
+      }
+    },
+    {
+      "path": "tpcc/lab/node.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "c68935633ea9d7dfa609b5e8c9583e7fa7b7c7b4"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "c68935633ea9d7dfa609b5e8c9583e7fa7b7c7b4"
+      }
+    },
+    {
+      "path": "tpcc/lab/nseqruns.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6437060a8b7b11759713db6867f41fdd1d63ff41"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "6437060a8b7b11759713db6867f41fdd1d63ff41"
+      }
+    },
+    {
+      "path": "tpcc/lab/redeploy.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "2960f8963995008256e8e4c71af42cd6e829d1de"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "2960f8963995008256e8e4c71af42cd6e829d1de"
+      }
+    },
+    {
+      "path": "tpcc/lab/redeploy4.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5fea315593a1e0ae491ce1f12f6604093e472f01"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5fea315593a1e0ae491ce1f12f6604093e472f01"
+      }
+    },
+    {
+      "path": "tpcc/lab/scale.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "9dacef03c949c72f7eeec25248b0897b8198c32d"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "9dacef03c949c72f7eeec25248b0897b8198c32d"
+      }
+    },
+    {
+      "path": "tpcc/lab/seqruns.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "050c7e635ad3ae74236306713a1d4f44ab1e9368"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "050c7e635ad3ae74236306713a1d4f44ab1e9368"
+      }
+    },
+    {
+      "path": "tpcc/lab/small.conf",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5df5df32b3f3ec5eeb77fef9b50532ab1a96d4cf"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "5df5df32b3f3ec5eeb77fef9b50532ab1a96d4cf"
+      }
+    },
+    {
+      "path": "tpcc/scripts/build_db.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+      }
+    },
+    {
+      "path": "tpcc/scripts/gen_node_conf.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+      }
+    },
+    {
+      "path": "tpcc/scripts/load.sh",
+      "status": "different",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "99ce0f790c76a61f1a04c6150dd65ad814882e38"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "5a8eafeac21fcf5a15d3b6f20a79e90c6674cb9d"
+      }
+    },
+    {
+      "path": "tpcc/scripts/make_mini.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+      }
+    },
+    {
+      "path": "tpcc/scripts/reorder_txn.py",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "16afa20d68e7037de7b39b617bdfbb3151b9be94"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "16afa20d68e7037de7b39b617bdfbb3151b9be94"
+      }
+    },
+    {
+      "path": "tpcc/scripts/run.sh",
+      "status": "identical",
+      "test": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "cd4c4b286d461a889c35237e8ea764653130ec9f"
+      },
+      "mmp": {
+        "mode": "100755",
+        "type": "blob",
+        "oid": "cd4c4b286d461a889c35237e8ea764653130ec9f"
+      }
+    },
+    {
+      "path": "tpcc/sql/05_txn_funcs.sql",
+      "status": "identical",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "80008045139f5d015bb68f349275ada5bf5dcc74"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "80008045139f5d015bb68f349275ada5bf5dcc74"
+      }
+    },
+    {
+      "path": "tpcc/sql/06_delegate.sql",
+      "status": "different",
+      "test": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "1a6128e4af2aaf57125d3c90ceae3484c7eb4835"
+      },
+      "mmp": {
+        "mode": "100644",
+        "type": "blob",
+        "oid": "e68019d2f02278f900d5cdd17253ceb7b9c93bb5"
+      }
+    }
+  ],
+  "commits": [
+    {
+      "commit": "30751ea2562245bc865bf8a7f12a6f531494c3c2",
+      "subject": "fix(tso): 未决 2PC 清扫改为异步自连，不再阻塞 TSO 续租心跳",
+      "final_tree_file_counts": {
+        "identical": 3
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/shard_vacuum.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_vacuum.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "0f77b218e3cc65712ba607e1a2d6817b81591065",
+      "subject": "fix(tpcc): 单副本关分叉自动修复；装载失败块串行重试",
+      "final_tree_file_counts": {
+        "identical": 1,
+        "different": 1
+      },
+      "files": [
+        {
+          "path": "tpcc/scripts/gen_node_conf.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+          }
+        },
+        {
+          "path": "tpcc/scripts/load.sh",
+          "status": "different",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "99ce0f790c76a61f1a04c6150dd65ad814882e38"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "5a8eafeac21fcf5a15d3b6f20a79e90c6674cb9d"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "62bcffa3487c038e952fb5e0c48e0c1b051ee642",
+      "subject": "fix(tpcc): order_line 行数核对改写成 Citus 可下推的形式；新增迷你规模脚本",
+      "final_tree_file_counts": {
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "tpcc/scripts/build_db.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+          }
+        },
+        {
+          "path": "tpcc/scripts/make_mini.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "e3d391934c39b21c2758f1557a285af74fe8de28",
+      "subject": "fix(tso): 自连轮询彻底非阻塞；续租间隔封顶 3 s；心跳慢/失败落日志",
+      "final_tree_file_counts": {
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/src/shard_vacuum.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "5f8f4d9364d348720463e3cc9f81061b33bcecce",
+      "subject": "fix(tpcc): make_mini.sh 可重复执行，不再因 SQL 已改而整体跳过",
+      "final_tree_file_counts": {
+        "identical": 1
+      },
+      "files": [
+        {
+          "path": "tpcc/scripts/make_mini.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "066afbae6288f96ef79691654b900d6cbf6310d8"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "2fff61081e36ebbd3ef301dc26c99672beee626b",
+      "subject": "perf+fix: 单副本快速提交模式、DTX 正确性修复、raft_log 写路径修复（TPC-C 64 仓 128 终端 1 min：295 → 40748 tpmC）",
+      "final_tree_file_counts": {
+        "different": 14,
+        "identical": 3
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/dtx_pending.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e10012f9391496aa16c7a195540cfafc0a7e0f58"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5dd1f5168c50b62e310c0c90a69095bfc0d168a2"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/partition_wal_writer.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "887b77ffbaeaafd0f391637afb446c2233c4d527"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "ca28ca1e9c61971ab5c028c61d37596a79d52a40"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/partwal_sync.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "7c99689f25107b7b0cb0b6d3c97a7f152d2ec15d"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e3edb35bbd2c0041a7065cc49c4f229653c3f60e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/shard_clog.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/dtx_pending.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e30106cf714300488c45fd580ae12bc591f7f98c"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f72a6b9508ccf92eab6c6bd00eead88df0af8bd4"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/pg_partdist.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "ba0c117fe0ca5311bdf3d5f0e6e8d1aa4146dfe9"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "dea04a322d79d4ccc026992431a2a8839ca4eb3e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_clog.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_visibility.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f415c699273cf8a546cbb8efc23a32c55a6285fc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "da2f645c7d72205c1ae7dfc95c13f9dbc9c4f517"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/wal/partition_wal.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "c2f1a20967e31d3e65c013336c460c4398b9d7af"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6ce114d9c6743da29e2fd3efac8fdbc5dad6f700"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/wal/partition_wal_writer.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0fb5e426ecd520b9a21d23cfd3c80fa4741083bc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "16935d873048f588ce68b2e574f8e6feac11bac8"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/wal/partwal_sync.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72e7e47d60ccd4b0448a6617865427b54cc36a13"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d687df9ee3ade2531774bb53a9362f4278f55fcc"
+          }
+        },
+        {
+          "path": "pg-raft-src/include/pg_raft.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b140c536b0debe18c561865c954fd69ad7ae481e"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fd9535442ad5f390f17dc08eec0f4d6d9b423765"
+          }
+        },
+        {
+          "path": "pg-raft-src/src/pg_raft.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "3c25f818e9150f0181b6182ea48316c237b9c604"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "be3bdd110f42a545202d67b4afe414209729b6bd"
+          }
+        },
+        {
+          "path": "pg-raft-src/src/raft_consensus.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "bcfd45b865f0b94cec1e5f8709304e0ec8c28892"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d3610dbffd50e1aee89aa2a0ae091594bf38547d"
+          }
+        },
+        {
+          "path": "pg-raft-src/src/raft_leader.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50fa263cb6617e72498fda57194344d49183aeb8"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0f6026d7488f6b449be31f383789f6020c89c1c7"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "e58fa586e7b3f29147e1f5dee35c9b7acece86da",
+      "subject": "feat(tpcc): 事务函数下推、快速提交配置、run.sh 取数重试",
+      "final_tree_file_counts": {
+        "identical": 4,
+        "different": 1
+      },
+      "files": [
+        {
+          "path": "tpcc/conf/node.conf.tmpl",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          }
+        },
+        {
+          "path": "tpcc/scripts/build_db.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "66789cf50b36fbcc22d300a9d48f1ce2e5eeca6c"
+          }
+        },
+        {
+          "path": "tpcc/scripts/gen_node_conf.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c9dbffaef480639fa734cce99445cc91784fc8bf"
+          }
+        },
+        {
+          "path": "tpcc/scripts/run.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "cd4c4b286d461a889c35237e8ea764653130ec9f"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "cd4c4b286d461a889c35237e8ea764653130ec9f"
+          }
+        },
+        {
+          "path": "tpcc/sql/06_delegate.sql",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "1a6128e4af2aaf57125d3c90ceae3484c7eb4835"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e68019d2f02278f900d5cdd17253ceb7b9c93bb5"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "bbba459a7161520808e05ccd671e7c274a8a4da4",
+      "subject": "fix(vacuum): 死 TID 名单清索引前排序 —— 修复索引项悬空 / 指向复用槽位；clog 描述符与打标集合缓存",
+      "final_tree_file_counts": {
+        "different": 3,
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/partwal_sync.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "7c99689f25107b7b0cb0b6d3c97a7f152d2ec15d"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e3edb35bbd2c0041a7065cc49c4f229653c3f60e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_clog.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_vacuum.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/wal/partwal_sync.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72e7e47d60ccd4b0448a6617865427b54cc36a13"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d687df9ee3ade2531774bb53a9362f4278f55fcc"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "25885db63b02853a49b1ec4a9d0ab56da2b44daa",
+      "subject": "perf(citus): 补丁 citus-0001 —— 内部后端缓存连接、事务中止后保留健康连接",
+      "final_tree_file_counts": {
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/patches/citus-0001-cache-conns-in-internal-backends.patch",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0342a5b5bbfb8f5f68b2ea337562ad56b3fc9d22"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0342a5b5bbfb8f5f68b2ea337562ad56b3fc9d22"
+          }
+        },
+        {
+          "path": "tpcc/conf/node.conf.tmpl",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "e2460a17e40d9d92bb68a9cd317929d686139c98",
+      "subject": "fix(vacuum): cleanup lock 短重试；模板改为勤回收（龄 1000 / 间隔 5 s / 截尾关）",
+      "final_tree_file_counts": {
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/src/shard_vacuum.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          }
+        },
+        {
+          "path": "tpcc/conf/node.conf.tmpl",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "836043b1fe840ac662bc5fd124e6deaf609e551b",
+      "subject": "fix(dtx): 决议广播查询被 256 字节缓冲截断 —— 广播全部失败，未决登记表靠清扫收敛",
+      "final_tree_file_counts": {
+        "different": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/src/dtx_pending.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e30106cf714300488c45fd580ae12bc591f7f98c"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f72a6b9508ccf92eab6c6bd00eead88df0af8bd4"
+          }
+        },
+        {
+          "path": "pg-raft-src/src/raft_consensus.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "bcfd45b865f0b94cec1e5f8709304e0ec8c28892"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d3610dbffd50e1aee89aa2a0ae091594bf38547d"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "55a9fb4c97ecd1955095e0b920ff1a253624750e",
+      "subject": "feat(mvcc): READ COMMITTED 写冲突按原生 EPQ 重评（pg_partdist.rc_update_recheck，内核补丁 0012）",
+      "final_tree_file_counts": {
+        "different": 3,
+        "identical": 4
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/tso.h",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "cc14ea459adb5b5815f1b7fa43366a3f436b6bee"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "7b854f78e83ba64f74309de21d960fa7ae198bd9"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/0012-shard-rc-follow-updates.patch",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e6eb0a6532d697f89836e6cf3d050dbf1ddbe947"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "e6eb0a6532d697f89836e6cf3d050dbf1ddbe947"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/README.md",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_visibility.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f415c699273cf8a546cbb8efc23a32c55a6285fc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "da2f645c7d72205c1ae7dfc95c13f9dbc9c4f517"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        },
+        {
+          "path": "tpcc/conf/node.conf.tmpl",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "85b8b6a2fa801d342286ba688e7af06aea0a0e38",
+      "subject": "perf(dtx): 提交探针改走 pgstat 计数；pg_dist_transaction GC 修复并下放到每个节点",
+      "final_tree_file_counts": {
+        "different": 1
+      },
+      "files": [
+        {
+          "path": "pg-raft-src/src/raft_consensus.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "bcfd45b865f0b94cec1e5f8709304e0ec8c28892"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d3610dbffd50e1aee89aa2a0ae091594bf38547d"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "4ce18da8d6e255ed58e87d185c55dafaa676d28a",
+      "subject": "perf(partwal): 单副本快速提交下提交前的 pg_wal 只写不刷（内核补丁 0013 XLogWriteUpTo）",
+      "final_tree_file_counts": {
+        "identical": 2,
+        "different": 1
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/patches/0013-xlog-write-upto.patch",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "9cd365fc3d1160a3791f0cbe53d6dac84fc8d90f"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "9cd365fc3d1160a3791f0cbe53d6dac84fc8d90f"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/README.md",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/wal/partwal_sync.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72e7e47d60ccd4b0448a6617865427b54cc36a13"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d687df9ee3ade2531774bb53a9362f4278f55fcc"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "3f72a3da657cca06e2d28958d9c425abb1386899",
+      "subject": "perf(shard): 可见性热路径去锁；发号器 IO 挪出全局排他锁",
+      "final_tree_file_counts": {
+        "identical": 4,
+        "different": 2
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/shard_clog.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "c40b31c2040687eb17a2c176f5ab86496c6ac41a"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/shard_xid.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_clog.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_visibility.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f415c699273cf8a546cbb8efc23a32c55a6285fc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "da2f645c7d72205c1ae7dfc95c13f9dbc9c4f517"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "f8412aec085271dfa69e30a7afa20a5648a7fe4b",
+      "subject": "perf(vacuum): 自动启动器按分片大小放宽间隔、批量 4 → 16",
+      "final_tree_file_counts": {
+        "identical": 3,
+        "different": 1
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/shard_vacuum.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "8f88ef309e4d3aafdfcabe8e07bed49f49b19759"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/shard_xid.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_vacuum.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80165675ef02180b0e293c3f63d261db1b36ca23"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "caecfc0c7f9020e8074f3d217a6b1733b6f45e34",
+      "subject": "perf(tpcc): NewOrder / Payment 缩短热行锁持有窗口（原生对照套件同步改）",
+      "final_tree_file_counts": {
+        "identical": 2
+      },
+      "files": [
+        {
+          "path": "tpcc/scripts/reorder_txn.py",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "16afa20d68e7037de7b39b617bdfbb3151b9be94"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "16afa20d68e7037de7b39b617bdfbb3151b9be94"
+          }
+        },
+        {
+          "path": "tpcc/sql/05_txn_funcs.sql",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80008045139f5d015bb68f349275ada5bf5dcc74"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "80008045139f5d015bb68f349275ada5bf5dcc74"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "6905492e757244ce554e78a1bb1808e7de95703f",
+      "subject": "perf(dtx): 单参与节点 2PC 快路径；参与登记异步提交",
+      "final_tree_file_counts": {
+        "different": 2
+      },
+      "files": [
+        {
+          "path": "pg-raft-src/sql/pg_raft--1.0.sql",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "31b3a13c70a094d3f3d992d4c02c1da97325599e"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b445bd3a290cb192a4b52161074907f4b8a28d4b"
+          }
+        },
+        {
+          "path": "pg-raft-src/src/raft_consensus.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "bcfd45b865f0b94cec1e5f8709304e0ec8c28892"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "d3610dbffd50e1aee89aa2a0ae091594bf38547d"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "88c5b158fb81c332f546f548d85eb65926e0e423",
+      "subject": "perf(commit): 提前放锁（内核补丁 0014）、检查点落盘分片 clog（补丁 0015）、可见性去锁",
+      "final_tree_file_counts": {
+        "identical": 8,
+        "different": 3
+      },
+      "files": [
+        {
+          "path": "pg-partdist-src/include/shard_visibility.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5da425c7699672b8293165c6f74079158ba60882"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5da425c7699672b8293165c6f74079158ba60882"
+          }
+        },
+        {
+          "path": "pg-partdist-src/include/shard_xid.h",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "26f1c876e6ffa86839c1c3475af3f2af338bf0cb"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/0014-early-lock-release.patch",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f2c6238b9d9bdca7a779b7acc908e439c51560ec"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f2c6238b9d9bdca7a779b7acc908e439c51560ec"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/0015-checkpoint-hook.patch",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "cb183eb5216f52c52bd4bb458c3022942ff0a2dc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "cb183eb5216f52c52bd4bb458c3022942ff0a2dc"
+          }
+        },
+        {
+          "path": "pg-partdist-src/patches/README.md",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fdf03d9d9e26c1116d0fb4768a959a312d4f8db3"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/pg_partdist.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "ba0c117fe0ca5311bdf3d5f0e6e8d1aa4146dfe9"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "dea04a322d79d4ccc026992431a2a8839ca4eb3e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_clog.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "72ba02e05e30b576736250c627406b902a1dccf7"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_visibility.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f415c699273cf8a546cbb8efc23a32c55a6285fc"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "da2f645c7d72205c1ae7dfc95c13f9dbc9c4f517"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/shard_xid.c",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90145078b944fc6419f7dd425350e8b51d664383"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "23ce468955e6ff7c8eb0789975296d98ec02434e"
+          }
+        },
+        {
+          "path": "pg-partdist-src/src/tso_client.c",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6afc89923e34c23dd52eb4db7bf4edf737b1171b"
+          }
+        },
+        {
+          "path": "tpcc/conf/node.conf.tmpl",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "50437a69f9224250326ec58a48b3b0effb908e43"
+          }
+        }
+      ]
+    },
+    {
+      "commit": "b149622efddb29032f2932cc6f5e7b2e2de642c8",
+      "subject": "chore(tpcc): 收录多机实验的部署 / 压测 / 诊断脚本（tpcc/lab）",
+      "final_tree_file_counts": {
+        "different": 1,
+        "identical": 25
+      },
+      "files": [
+        {
+          "path": "tpcc/lab/Dockerfile.prof",
+          "status": "different",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "250cf5bdc78d44ab7a59d2dbfcd2cc8c3b15fb2c"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "4efeb8ea4ce6a7ed7bd32a98c70a77afe89ce04b"
+          }
+        },
+        {
+          "path": "tpcc/lab/README.md",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "a23bcffdd7ab0d9003b869c06b9a94e6dbd6f838"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "a23bcffdd7ab0d9003b869c06b9a94e6dbd6f838"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/cpuattr.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0eed9970486256932d81144a4aa7d9bcf2205f98"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0eed9970486256932d81144a4aa7d9bcf2205f98"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/hoststat.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "49906895e01df46af1bc1aa87caaeaecde4c2f0f"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "49906895e01df46af1bc1aa87caaeaecde4c2f0f"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/hot.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f1ba03fa940c0c60fe4b0bf28f4018881baa2163"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "f1ba03fa940c0c60fe4b0bf28f4018881baa2163"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/idxcheck.sql",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "a0419972a617e06d93078372fe7eaf015bb2c133"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "a0419972a617e06d93078372fe7eaf015bb2c133"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/iostat.sql",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "636b532230c880eec59389a10b9e24a14b127491"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "636b532230c880eec59389a10b9e24a14b127491"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/lk.sql",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fab7182aa268c3437d183834cd402ffa86ae9c76"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "fab7182aa268c3437d183834cd402ffa86ae9c76"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/pendmon.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "35b972ac8baa85ae71e058e6902b8f628e495143"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "35b972ac8baa85ae71e058e6902b8f628e495143"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/perfcallers.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "97bb7b209bc4c761194e75034e66117b4cff4d99"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "97bb7b209bc4c761194e75034e66117b4cff4d99"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/perfcg.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90064a16fb390c2f5ee42a6d5c545f921201165e"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "90064a16fb390c2f5ee42a6d5c545f921201165e"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/perfincl.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "034862c8382cf1ba5b2900d68ce3339c0b17cbf9"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "034862c8382cf1ba5b2900d68ce3339c0b17cbf9"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/perfrec.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "69bc1f1938503ab316a0602d6f8a081568fca953"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "69bc1f1938503ab316a0602d6f8a081568fca953"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/rctest.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "1a6862814bd6018db2ddf11fca7a5ff891b70bc9"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "1a6862814bd6018db2ddf11fca7a5ff891b70bc9"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/waitev.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b9cb8b0e1623abf4e816567a84e40a8a35db78ad"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b9cb8b0e1623abf4e816567a84e40a8a35db78ad"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/walstat.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6e581b2d71aedc86a7783f8bef924e2e46baf07a"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6e581b2d71aedc86a7783f8bef924e2e46baf07a"
+          }
+        },
+        {
+          "path": "tpcc/lab/diag/wbytes.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b10b808761fa37dd1279ebe5840a4101e98afa79"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "b10b808761fa37dd1279ebe5840a4101e98afa79"
+          }
+        },
+        {
+          "path": "tpcc/lab/localonly.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "15f730162a6f4993998ecba114a1d2c93a9b2ea3"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "15f730162a6f4993998ecba114a1d2c93a9b2ea3"
+          }
+        },
+        {
+          "path": "tpcc/lab/logsum.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0a0fde5b85c46800a911db38a0a64e23ca8774d3"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "0a0fde5b85c46800a911db38a0a64e23ca8774d3"
+          }
+        },
+        {
+          "path": "tpcc/lab/node.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c68935633ea9d7dfa609b5e8c9583e7fa7b7c7b4"
+          },
+          "mmp": {
+            "mode": "100755",
+            "type": "blob",
+            "oid": "c68935633ea9d7dfa609b5e8c9583e7fa7b7c7b4"
+          }
+        },
+        {
+          "path": "tpcc/lab/nseqruns.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6437060a8b7b11759713db6867f41fdd1d63ff41"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "6437060a8b7b11759713db6867f41fdd1d63ff41"
+          }
+        },
+        {
+          "path": "tpcc/lab/redeploy.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "2960f8963995008256e8e4c71af42cd6e829d1de"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "2960f8963995008256e8e4c71af42cd6e829d1de"
+          }
+        },
+        {
+          "path": "tpcc/lab/redeploy4.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5fea315593a1e0ae491ce1f12f6604093e472f01"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5fea315593a1e0ae491ce1f12f6604093e472f01"
+          }
+        },
+        {
+          "path": "tpcc/lab/scale.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "9dacef03c949c72f7eeec25248b0897b8198c32d"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "9dacef03c949c72f7eeec25248b0897b8198c32d"
+          }
+        },
+        {
+          "path": "tpcc/lab/seqruns.sh",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "050c7e635ad3ae74236306713a1d4f44ab1e9368"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "050c7e635ad3ae74236306713a1d4f44ab1e9368"
+          }
+        },
+        {
+          "path": "tpcc/lab/small.conf",
+          "status": "identical",
+          "test": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5df5df32b3f3ec5eeb77fef9b50532ab1a96d4cf"
+          },
+          "mmp": {
+            "mode": "100644",
+            "type": "blob",
+            "oid": "5df5df32b3f3ec5eeb77fef9b50532ab1a96d4cf"
+          }
+        }
+      ]
+    }
+  ],
+  "mmp_changes_after_test": [
+    "M\tpg-partdist-src/Makefile",
+    "M\tpg-partdist-src/include/dtx_pending.h",
+    "M\tpg-partdist-src/include/partition_wal_writer.h",
+    "A\tpg-partdist-src/include/partwal_recent.h",
+    "M\tpg-partdist-src/include/partwal_sync.h",
+    "A\tpg-partdist-src/include/shard_wal.h",
+    "M\tpg-partdist-src/include/tso.h",
+    "A\tpg-partdist-src/patches/0016-elr-syncrep.patch",
+    "A\tpg-partdist-src/patches/0017-diag-shard-chain.patch",
+    "M\tpg-partdist-src/src/dtx_pending.c",
+    "M\tpg-partdist-src/src/metadata_cache.c",
+    "M\tpg-partdist-src/src/pg_partdist.c",
+    "M\tpg-partdist-src/src/raft_boundary.c",
+    "M\tpg-partdist-src/src/replay/replay_worker.c",
+    "M\tpg-partdist-src/src/shard_visibility.c",
+    "A\tpg-partdist-src/src/shard_wal.c",
+    "M\tpg-partdist-src/src/shard_xid.c",
+    "M\tpg-partdist-src/src/tso.c",
+    "M\tpg-partdist-src/src/wal/partition_wal.c",
+    "M\tpg-partdist-src/src/wal/partition_wal_writer.c",
+    "A\tpg-partdist-src/src/wal/partwal_recent.c",
+    "M\tpg-partdist-src/src/wal/partwal_sync.c",
+    "M\tpg-raft-src/Makefile",
+    "M\tpg-raft-src/include/pg_raft.h",
+    "M\tpg-raft-src/sql/pg_raft--1.0.sql",
+    "M\tpg-raft-src/src/pg_raft.c",
+    "M\tpg-raft-src/src/raft_apply.c",
+    "M\tpg-raft-src/src/raft_consensus.c",
+    "A\tpg-raft-src/src/raft_failover.c",
+    "M\tpg-raft-src/src/raft_leader.c",
+    "M\tpg-raft-src/src/topology_monitor.c",
+    "M\ttpcc/lab/Dockerfile.prof",
+    "A\ttpcc/lab/autofailover_check.sh",
+    "A\ttpcc/lab/commits_rejoin_check.sh",
+    "A\ttpcc/lab/coordfailover_check.sh",
+    "A\ttpcc/lab/diag/cmp.sh",
+    "A\ttpcc/lab/diag/health2.sh",
+    "A\ttpcc/lab/diag/markercheck.sql",
+    "A\ttpcc/lab/diag/pmp_fs.sh",
+    "A\ttpcc/lab/diag/pmp_mgr.sh",
+    "A\ttpcc/lab/diag/pmp_one.sh",
+    "A\ttpcc/lab/diag/pmp_tx.sh",
+    "A\ttpcc/lab/diag/st.sh",
+    "A\ttpcc/lab/diag/waitsync.sh",
+    "A\ttpcc/lab/diag_round.sh",
+    "A\ttpcc/lab/failover_check.sh",
+    "A\ttpcc/lab/failover_n3.sh",
+    "A\ttpcc/lab/killload_check.sh",
+    "A\ttpcc/lab/perf_round.sh",
+    "A\ttpcc/lab/probe_run.sh",
+    "A\ttpcc/lab/restore_routea.sh",
+    "A\ttpcc/lab/routea_autofailover_round.sh",
+    "A\ttpcc/lab/routea_coordfailover_round.sh",
+    "A\ttpcc/lab/routea_failover_round.sh",
+    "A\ttpcc/lab/routea_ha_rounds.sh",
+    "A\ttpcc/lab/routea_killload_round.sh",
+    "A\ttpcc/lab/shardpg_rep.sh",
+    "M\ttpcc/scripts/load.sh",
+    "M\ttpcc/scripts/wire_cluster.sh",
+    "M\ttpcc/sql/06_delegate.sql"
+  ],
+  "fa23_to_mmp_changes": [
+    "M\tpg-partdist-src/Makefile",
+    "D\tpg-partdist-src/demo/ha_demo_reset.sh",
+    "D\tpg-partdist-src/demo/lab/demo_node.sh",
+    "D\tpg-partdist-src/demo/lab/deploy_release.py",
+    "D\tpg-partdist-src/demo/lab/isolated_node.sh",
+    "D\tpg-partdist-src/demo/lab/nodes.conf",
+    "D\tpg-partdist-src/demo/lab/package_release.py",
+    "D\tpg-partdist-src/demo/lab/shardpg_ctl",
+    "D\tpg-partdist-src/demo/lab/shardpg_ctl_host",
+    "D\tpg-partdist-src/demo/lab/txn_demo_writer.sh",
+    "D\tpg-partdist-src/demo/lab/txn_demo_writer_current.sh",
+    "D\tpg-partdist-src/demo/lab/verify_release.py",
+    "D\tpg-partdist-src/demo/lab/wire_node.sql",
+    "D\tpg-partdist-src/demo/tpcc_demo.sql",
+    "D\tpg-partdist-src/demo/tpcc_ha_demo.sql",
+    "D\tpg-partdist-src/demo/txn_demo_writer.sh",
+    "D\tpg-partdist-src/docs/FIRST_SHARD_COORDINATOR.md",
+    "D\tpg-partdist-src/docs/LAB_DEMO_VERIFICATION_20261023.md",
+    "M\tpg-partdist-src/docs/P7_REMEDIATION_PLAN.md",
+    "D\tpg-partdist-src/docs/VACU_DESIGN.md",
+    "D\tpg-partdist-src/docs/XID_WRAP32_IMPLEMENTATION.md",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/OWN_SOURCE_SHA256.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/REPORT.txt",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/REPRODUCE.txt",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/business-confirmation-result.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/business-r4-result.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/final-verification.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-20261109/native-identity-fence-result.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/ARCHIVE_SHA256.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/MMP_COMPARISON.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/MMP_COMPARISON.txt",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/RESULTS.txt",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/RUN_STATUS.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/diagnosis/route-4097-cause.txt",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/diagnosis/route-4097-evidence.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/add_check.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/add_node.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/add_node.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/add_resume.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/add_resume.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/build-proof.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/demo_node_registration.sql",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/events.jsonl",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/final_check.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/final_core.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/final_core.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/fixture.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/init.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/init.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/init_resume.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/init_resume.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/migrate.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/migrate.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/postcheck-result.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/postcheck.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/postcheck.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/seed.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/seed.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/sha256.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_business_resume.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_business_resume.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_drain.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_drain.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_resume.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/shrink_resume.py",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/state.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/writer-result.json",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/writer.log",
+    "D\tpg-partdist-src/docs/acceptance/fa23-demo-20261110/evidence/writer.py",
+    "D\tpg-partdist-src/include/dtx_coordinator.h",
+    "M\tpg-partdist-src/include/dtx_participant.h",
+    "M\tpg-partdist-src/include/dtx_pending.h",
+    "M\tpg-partdist-src/include/dtx_record.h",
+    "M\tpg-partdist-src/include/partition_wal_header.h",
+    "M\tpg-partdist-src/include/partition_wal_writer.h",
+    "A\tpg-partdist-src/include/partwal_recent.h",
+    "M\tpg-partdist-src/include/partwal_sync.h",
+    "M\tpg-partdist-src/include/shard_clog.h",
+    "M\tpg-partdist-src/include/shard_fileset.h",
+    "M\tpg-partdist-src/include/shard_replay.h",
+    "D\tpg-partdist-src/include/shard_twophase.h",
+    "M\tpg-partdist-src/include/shard_vacuum.h",
+    "M\tpg-partdist-src/include/shard_visibility.h",
+    "A\tpg-partdist-src/include/shard_wal.h",
+    "M\tpg-partdist-src/include/shard_xid.h",
+    "D\tpg-partdist-src/include/shard_xid_math.h",
+    "D\tpg-partdist-src/include/shardpg_ddl.h",
+    "M\tpg-partdist-src/include/tso.h",
+    "A\tpg-partdist-src/patches/0011-shard-row-locks.patch",
+    "A\tpg-partdist-src/patches/0012-shard-rc-follow-updates.patch",
+    "A\tpg-partdist-src/patches/0013-xlog-write-upto.patch",
+    "A\tpg-partdist-src/patches/0014-early-lock-release.patch",
+    "A\tpg-partdist-src/patches/0015-checkpoint-hook.patch",
+    "A\tpg-partdist-src/patches/0016-elr-syncrep.patch",
+    "D\tpg-partdist-src/patches/0016-shard-key-grammar.patch",
+    "A\tpg-partdist-src/patches/0017-diag-shard-chain.patch",
+    "D\tpg-partdist-src/patches/0017-psql-dt-shards.patch",
+    "M\tpg-partdist-src/patches/README.md",
+    "A\tpg-partdist-src/patches/citus-0001-cache-conns-in-internal-backends.patch",
+    "D\tpg-partdist-src/patches/citus-0002-remote-transaction-begin-hook.patch",
+    "D\tpg-partdist-src/patches/citus-0003-multi-shard-read-blocks.patch",
+    "D\tpg-partdist-src/patches/citus-0004-first-shard-coordinator.patch",
+    "D\tpg-partdist-src/patches/citus-0005-ddl-catalog-participant.patch",
+    "M\tpg-partdist-src/scripts/check_pg_install_patched.sh",
+    "D\tpg-partdist-src/scripts/new_worker_node.sh",
+    "D\tpg-partdist-src/sql/ddl_metadata.sql",
+    "D\tpg-partdist-src/sql/demo_node_registration.sql",
+    "D\tpg-partdist-src/sql/first_shard_coordinator.sql",
+    "M\tpg-partdist-src/sql/pg_partdist--1.0.sql",
+    "D\tpg-partdist-src/src/dtx/dtx_coordinator.c",
+    "M\tpg-partdist-src/src/dtx/dtx_participant.c",
+    "D\tpg-partdist-src/src/dtx/shard_twophase.c",
+    "M\tpg-partdist-src/src/dtx_pending.c",
+    "M\tpg-partdist-src/src/metadata_cache.c",
+    "M\tpg-partdist-src/src/pg_partdist.c",
+    "M\tpg-partdist-src/src/raft_boundary.c",
+    "M\tpg-partdist-src/src/replay/replay_worker.c",
+    "M\tpg-partdist-src/src/replay/shard_replay.c",
+    "M\tpg-partdist-src/src/shard_clog.c",
+    "M\tpg-partdist-src/src/shard_vacuum.c",
+    "M\tpg-partdist-src/src/shard_visibility.c",
+    "A\tpg-partdist-src/src/shard_wal.c",
+    "M\tpg-partdist-src/src/shard_xid.c",
+    "D\tpg-partdist-src/src/shardpg_ddl.c",
+    "M\tpg-partdist-src/src/tso.c",
+    "M\tpg-partdist-src/src/tso_client.c",
+    "M\tpg-partdist-src/src/wal/partition_wal.c",
+    "M\tpg-partdist-src/src/wal/partition_wal_writer.c",
+    "A\tpg-partdist-src/src/wal/partwal_recent.c",
+    "M\tpg-partdist-src/src/wal/partwal_sync.c",
+    "M\tpg-partdist-src/src/wal/shard_fileset.c",
+    "M\tpg-partdist-src/tests/lib_node_health.sh",
+    "D\tpg-partdist-src/tests/local/test_first_shard_coordinator.py",
+    "D\tpg-partdist-src/tests/local/test_shard_prepare_clog.sql",
+    "D\tpg-partdist-src/tests/local/test_shard_xid_math.c",
+    "D\tpg-partdist-src/tests/local/test_vacu_contract.py",
+    "D\tpg-partdist-src/tests/local/test_xid_wrap_contract.py",
+    "D\tpg-partdist-src/tests/test_add_node_resume_p7n105.sh",
+    "D\tpg-partdist-src/tests/test_colocate_replicas_p7n106.sh",
+    "D\tpg-partdist-src/tests/test_drop_residue_p7n110_n112.sh",
+    "M\tpg-partdist-src/tests/test_failover_read_gate_p7n31.sh",
+    "M\tpg-partdist-src/tests/test_failover_verdict_p7n12.sh",
+    "M\tpg-partdist-src/tests/test_full_mixed_multiprimary_p7.sh",
+    "D\tpg-partdist-src/tests/test_ha_ops_p7n102.sh",
+    "M\tpg-partdist-src/tests/test_negative_p6.sh",
+    "D\tpg-partdist-src/tests/test_node_names_p7n107.sh",
+    "D\tpg-partdist-src/tests/test_partition_unregister_batch_p7n117.sh",
+    "M\tpg-partdist-src/tests/test_promote_p6.sh",
+    "D\tpg-partdist-src/tests/test_quorum_log_holes_p7n114.sh",
+    "M\tpg-partdist-src/tests/test_shard_vacuum_auto_p7.sh",
+    "M\tpg-partdist-src/tests/test_shard_vacuum_p5.sh",
+    "M\tpg-partdist-src/tests/test_shard_vacuum_replay_p5.sh",
+    "M\tpg-partdist-src/tests/test_shard_xid_p1.sh",
+    "D\tpg-partdist-src/tests/test_shardpg_ddl_p7n87.sh",
+    "A\tpg-partdist-src/tests/test_si_committing_window_tpcc.sh",
+    "D\tpg-partdist-src/tests/test_snapshot_commit_wait_p7n92.sh",
+    "M\tpg-raft-src/Makefile",
+    "M\tpg-raft-src/include/pg_raft.h",
+    "D\tpg-raft-src/sql/first_shard_decision.sql",
+    "M\tpg-raft-src/sql/pg_raft--1.0.sql",
+    "M\tpg-raft-src/src/pg_raft.c",
+    "M\tpg-raft-src/src/raft_apply.c",
+    "M\tpg-raft-src/src/raft_consensus.c",
+    "A\tpg-raft-src/src/raft_failover.c",
+    "M\tpg-raft-src/src/raft_leader.c",
+    "M\tpg-raft-src/src/topology_monitor.c",
+    "A\ttpcc/README.md",
+    "A\ttpcc/cluster.env.example",
+    "A\ttpcc/conf/node.conf.tmpl",
+    "A\ttpcc/lab/Dockerfile.prof",
+    "A\ttpcc/lab/README.md",
+    "A\ttpcc/lab/autofailover_check.sh",
+    "A\ttpcc/lab/commits_rejoin_check.sh",
+    "A\ttpcc/lab/coordfailover_check.sh",
+    "A\ttpcc/lab/diag/cmp.sh",
+    "A\ttpcc/lab/diag/cpuattr.sh",
+    "A\ttpcc/lab/diag/health2.sh",
+    "A\ttpcc/lab/diag/hoststat.sh",
+    "A\ttpcc/lab/diag/hot.sh",
+    "A\ttpcc/lab/diag/idxcheck.sql",
+    "A\ttpcc/lab/diag/iostat.sql",
+    "A\ttpcc/lab/diag/lk.sql",
+    "A\ttpcc/lab/diag/markercheck.sql",
+    "A\ttpcc/lab/diag/pendmon.sh",
+    "A\ttpcc/lab/diag/perfcallers.sh",
+    "A\ttpcc/lab/diag/perfcg.sh",
+    "A\ttpcc/lab/diag/perfincl.sh",
+    "A\ttpcc/lab/diag/perfrec.sh",
+    "A\ttpcc/lab/diag/pmp_fs.sh",
+    "A\ttpcc/lab/diag/pmp_mgr.sh",
+    "A\ttpcc/lab/diag/pmp_one.sh",
+    "A\ttpcc/lab/diag/pmp_tx.sh",
+    "A\ttpcc/lab/diag/rctest.sh",
+    "A\ttpcc/lab/diag/st.sh",
+    "A\ttpcc/lab/diag/waitev.sh",
+    "A\ttpcc/lab/diag/waitsync.sh",
+    "A\ttpcc/lab/diag/walstat.sh",
+    "A\ttpcc/lab/diag/wbytes.sh",
+    "A\ttpcc/lab/diag_round.sh",
+    "A\ttpcc/lab/failover_check.sh",
+    "A\ttpcc/lab/failover_n3.sh",
+    "A\ttpcc/lab/killload_check.sh",
+    "A\ttpcc/lab/localonly.sh",
+    "A\ttpcc/lab/logsum.sh",
+    "A\ttpcc/lab/node.sh",
+    "A\ttpcc/lab/nseqruns.sh",
+    "A\ttpcc/lab/perf_round.sh",
+    "A\ttpcc/lab/probe_run.sh",
+    "A\ttpcc/lab/redeploy.sh",
+    "A\ttpcc/lab/redeploy4.sh",
+    "A\ttpcc/lab/restore_routea.sh",
+    "A\ttpcc/lab/routea_autofailover_round.sh",
+    "A\ttpcc/lab/routea_coordfailover_round.sh",
+    "A\ttpcc/lab/routea_failover_round.sh",
+    "A\ttpcc/lab/routea_ha_rounds.sh",
+    "A\ttpcc/lab/routea_killload_round.sh",
+    "A\ttpcc/lab/scale.sh",
+    "A\ttpcc/lab/seqruns.sh",
+    "A\ttpcc/lab/shardpg_rep.sh",
+    "A\ttpcc/lab/small.conf",
+    "A\ttpcc/pgbench/delivery.sql",
+    "A\ttpcc/pgbench/new_order.sql",
+    "A\ttpcc/pgbench/order_status.sql",
+    "A\ttpcc/pgbench/payment.sql",
+    "A\ttpcc/pgbench/stock_level.sql",
+    "A\ttpcc/scripts/build_db.sh",
+    "A\ttpcc/scripts/gen_node_conf.sh",
+    "A\ttpcc/scripts/lib.sh",
+    "A\ttpcc/scripts/load.sh",
+    "A\ttpcc/scripts/make_mini.sh",
+    "A\ttpcc/scripts/monitor.sh",
+    "A\ttpcc/scripts/reorder_txn.py",
+    "A\ttpcc/scripts/run.sh",
+    "A\ttpcc/scripts/wire_cluster.sh",
+    "A\ttpcc/sql/01_schema.sql",
+    "A\ttpcc/sql/02_gen_funcs.sql",
+    "A\ttpcc/sql/03_distribute.sql",
+    "A\ttpcc/sql/04_load_funcs.sql",
+    "A\ttpcc/sql/05_txn_funcs.sql",
+    "A\ttpcc/sql/06_delegate.sql",
+    "A\ttpcc/sql/90_consistency.sql"
+  ],
+  "build_layout": {
+    "44a3e2d83a20bf7d32d8004a218dd7c5591bb602": [
+      "160000 commit ad266a2c0a3c9bdab1426ed33d1bc2d9a7d74f45\tcitus-src",
+      "040000 tree 7edf54c48fbfd76f95b539e511d87b8764a34630\tpg-install",
+      "160000 commit e9067809ee722ed18152baed2191eaf92d770b29\tpostgres-src"
+    ],
+    "bbee3e1cb7f9e0e49b7a246153fce078c173bee0": [
+      "040000 tree ef13a6963a1a5630760c2a79b6c9287f2ebebb04\tcitus-src",
+      "040000 tree 592399f18af0273f75f2c0a52769f11a8365a8c8\tpg-install",
+      "040000 tree dcffbce94ffc26a2ea58ff45b9f03fb2b865a412\tpostgres-src"
+    ]
+  }
+}

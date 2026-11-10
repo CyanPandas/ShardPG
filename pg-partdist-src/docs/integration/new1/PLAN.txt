@@ -1,0 +1,265 @@
+new1：mmp 逐项适配到 fa23 的接入清单
+登记日期：北京时间 2026-11-10
+
+本轮完成的是第3步：源码盘点、接入划分、依赖和验收清单。
+没有合并源码、部署、启用新配置或运行数据库验收。
+第2步按用户指示跳过，没有把“未执行”记成“通过”。
+
+一、固定比较对象
+
+目标基础：fa23 / vacu-fa23-acceptance，44a3e2d83a20bf7d32d8004a218dd7c5591bb602。
+工作分支：new1，从上述提交建立。
+来源：mmp，bbee3e1cb7f9e0e49b7a246153fce078c173bee0。
+辅助追溯：shardpg-test，b149622efddb29032f2932cc6f5e7b2e2de642c8。
+fa23 与 mmp 共同祖先：e123f0e9541472de98b012d1e0f7cc0df587f417。
+test 与 mmp 共同祖先：01e5635a2ca6010c929130ed26281d34838b8686。
+
+原则：在 fa23 实现上修改，按功能拆分 mmp 改动；不整文件覆盖核心实现，
+不把 test 的20个提交与 mmp 镜像同步提交重复套用。
+47195c5 及其后的 VACU 扩缩容增强仍不作为输入。
+
+二、fa23 已有内容：作为保留要求，不从 mmp 替换
+
+P1 首分片事务协调、跨分片提交/回滚与参与者终局检查。
+   文件：src/dtx/dtx_coordinator.c、src/dtx_pending.c、sql/first_shard_coordinator.sql。
+P2 DDL 元数据协调、直接 SHARD KEY 建表、DROP 分片清理。
+   文件：src/shardpg_ddl.c、sql/ddl_metadata.sql、Citus 补丁0002–0005。
+P3 VACU 安全冻结、回收凭据、32位分片 xid 回绕、旧日志/旧身份重放围栏。
+   文件：src/shard_xid.c、src/shard_vacuum.c、src/shard_clog.c、src/raft_boundary.c。
+P4 现有分片副本入组、迁移、切主、缩容和共置关系。
+   文件：sql/pg_partdist--1.0.sql、src/wal/shard_fileset.c、pg-raft-src/src/raft_consensus.c。
+P5 物理分片基线中的 xid 分配/回收水位和 prepared 成员信息。
+   文件：include/partition_wal_header.h、src/replay/shard_replay.c、src/wal/shard_fileset.c。
+
+“保留要求”不等于完整正确性认证。已有验证边界见
+../../acceptance/fa23-demo-20261110/RESULTS.txt。
+已知问题 K1：首次业务登记失败后路由可残留，4097→102012 已定位但未修复。
+本次跳过第2步不妨碍列清单；接入后的最终清理验收仍要处理 K1，不能删记录冒充修复。
+
+三、接入项（以下全部状态均为：已盘点，未接入、未验收）
+
+编号代表接入和提交的边界，不代表照编号连续执行；先满足每项列明的依赖。
+除明确标出 pg-raft-src、tpcc 外，源码路径相对 pg-partdist-src。
+每项通过后单独提交；多个功能混在原提交中的，必须拆开。
+
+N01 多机连接参数
+来源：3b95245；pg-raft-src/src/pg_raft.c、raft_consensus.c。
+现状：两边均有多机部署能力；mmp 的地址映射、连接超时需逐项对照现有参数。
+处理：只补缺少的配置能力，保留 fa23 的节点地址/组主关系。
+依赖：无运行时依赖，使用隔离端口和目录。
+验收：跨主机建连、超时退出、错误地址诊断；正常 demo 不受影响。
+
+N02 TPC-C 建库、装载与一致性检查
+来源：07e90b3、0f77b21、62bcffa、5f8f4d9、e58fa58、caecfc0；tpcc/scripts、tpcc/sql。
+现状：fa23 没有 mmp 的 tpcc 目录；脚本携带单副本、下推、性能配置等前提。
+处理：先适配普通执行路径；拆开装载重试、迷你规模、行数检查、事务SQL重排。
+依赖：基础运行依赖 N01；下推能力待 N11/N12 验收后才启用。
+验收：小规模重复建库/装载、五类事务、余额/订单一致性；失败块恢复不得重复写入。
+
+N03 实验和诊断工具
+来源：b149622 及 mmp 后续快照；tpcc/lab、tests/test_si_committing_window_tpcc.sh。
+处理：按当前拓扑适配主机、端口、容器名；明确区分观察脚本与停库/重建脚本。
+依赖：N01/N02；物理备库专用脚本依赖 N24/N25，先只归档。
+验收：帮助/参数和只读诊断输出正确；隔离环境验证部署脚本不操作其他实例。
+
+N04 单成员 Raft 组模式
+来源：01e5635、0f77b21；pg-raft-src/src/raft_consensus.c、tpcc/conf/node.conf.tmpl。
+现状：单副本配置不等同于单副本快速提交，也不等同于 PG 物理备库拓扑。
+处理：单独核对一成员组的选主、提交、恢复和分叉修复开关。
+依赖：N01；验收套件 N02。
+验收：一成员组提交/重启数据一致；同时重跑 fa23 三成员组和迁移流程。
+
+N05 非阻塞未决清扫与 TSO 续租
+来源：30751ea、e3d3919；src/dtx_pending.c、src/tso_client.c。
+现状：fa23 心跳循环会触发清扫；mmp 有异步自连轮询和续租间隔上限。
+处理：移植调度/连接管理，保留 fa23 的终局判断、并集登记及 prepared 保护。
+依赖：保留 P1/P3；不依赖快速提交。
+验收：清扫对端卡住时心跳仍续租；连接断开后恢复；不丢登记、不误回滚已提交事务。
+
+N06 决议广播查询截断修复
+来源：836043b；src/dtx_pending.c:DtxBroadcastDecision。
+现状：fa23 仍使用 sql[256]，mmp 使用 sql[1024]；这是源码确认的差异，未在本轮复现。
+处理：独立修复SQL构造，核对该广播在首分片协调和遗留路径中的调用点。
+依赖：P1；不移植 mmp 的整套 DtxPendingFinalized。
+验收：大事务号生成的查询完整；实际触发广播并确认参与者收尾；失败仍可后台恢复。
+
+N07 未决登记容量、提交探针和 Citus 事务记录清理
+来源：2fff610、85b8b6a；include/dtx_pending.h、src/dtx_pending.c、pg-raft-src/src/raft_consensus.c。
+处理：容量提升、栈改堆、探针优化、pg_dist_transaction GC 分开审查和提交。
+依赖：P1，建议 N05/N06 完成后接入；原生 Citus 元数据事务需保留。
+验收：超过128个待决分支不丢登记；同gxid多次PREPARE并集完整；活跃事务不被GC。
+
+N08 HOT 链/LP_REDIRECT 和索引清理
+来源：87e9903、bbba459；src/shard_vacuum.c、src/shard_visibility.c。
+现状：fa23 对部分需要 LP_REDIRECT 的清理场景拒绝处理；mmp 增加链预扫/重定向，
+并对死TID名单排序。排序修复与 mmp 的预扫算法有关，不能据文件差异断言 fa23 已有同一缺陷。
+处理：将HOT链支持、死TID排序、槽位复用检查作为同一依赖组，分别保留可审查修改。
+依赖：P3/P5；涉及并发写锁时联验 N10。
+验收：保留旧快照时反复更新/删除/vacuum；索引扫描与顺序扫描一致；崩溃重放、回绕后无误删。
+
+N09 vacuum 调度和缓存优化
+来源：bbba459、e2460a1、f8412ae；src/shard_vacuum.c、src/shard_clog.c、src/shard_xid.c。
+处理：cleanup lock短重试、触发间隔/批量、文件描述符/打标缓存逐项接入；不照搬模板阈值。
+依赖：N08 中相关路径明确后接入；保留 P3 的安全线和重放围栏。
+验收：热页长期可回收但不阻塞业务；DROP/重建/OID复用后缓存失效；回绕和副本回放正确。
+
+N10 分片行锁与 RC 写冲突重评
+来源：87e9903、55a9fb4；补丁0011/0012、src/shard_visibility.c、src/pg_partdist.c。
+现状：mmp 的RC行为与 fa23 当前冲突报错路径不同；不能用TPC-C成功率替代隔离性检查。
+处理：先行锁，再适配RC重评；保留RR隔离和跨分片整笔回滚。
+依赖：N00 构建清单；涉及vacuum联验 N08。
+验收：双会话RC更新得到正确累计值；RR冲突语义保持；另一分片先前写入随失败回滚。
+
+N11 Citus 内部连接缓存
+来源：25885db；patches/citus-0001-cache-conns-in-internal-backends.patch。
+处理：与 fa23 的 Citus 0002–0005 hooks 合并；核对事务中止后的连接身份与清理状态。
+依赖：N00；P1/P2。
+验收：反复提交/回滚后复用连接不携带旧gxid、DDL标记或快照；跨节点嵌套连接数稳定。
+
+N12 事务及装载函数下推
+来源：e58fa58、caecfc0 和 mmp 快照；tpcc/sql/05_txn_funcs.sql、06_delegate.sql、scripts/load.sh。
+处理：事务下推、装载下推、任务打散分别验证；不得以工作节点本地执行绕过全局事务登记。
+依赖：N02/N10/N11；N10 可先采用失败后整笔重试的基线，再独立启用RC。
+验收：同仓/跨仓、远程仓事务、嵌套访问提交/回滚；装载中断恢复后无重复及漏行。
+
+N13 提交窗口内的快照可见性
+来源：2fff610 和 mmp 快照；src/shard_visibility.c、src/dtx_pending.c、src/tso_client.c。
+现状：fa23 已有等待“正在提交”的保护；mmp 有未决问询重试、同步备库下读闸门等处理。
+处理：对照双方状态转换，只补不足，不能覆盖 fa23 的终局身份校验和时间戳规则。
+依赖：P1/P3；同步备库部分依赖 N24，提前放锁部分依赖 N21。
+验收：在取commit_ts/决议落盘/收尾之间暂停，固定快照不漏行、不重复、不见半笔事务。
+
+N14 发号器、clog 和可见性热路径
+来源：2fff610、3f72a3d、88c5b15；src/shard_xid.c、src/shard_clog.c、src/shard_visibility.c。
+处理：发号批量、IO移出锁、查找缓存和去锁分拆；使用 fa23 的32位环形运算及持久水位接口。
+依赖：P3；可见性依赖 N13。
+验收：缩小xid环测试、多后端并发发号、耗尽/重启、缓存失效；不能重复发号或误用旧槽位。
+
+N15 单参与节点快路径与异步登记
+来源：6905492、2fff610；src/raft_boundary.c、src/dtx_pending.c。
+处理：区分一个参与节点、一个分片、一个副本三个条件；保留首分片协调的参与者完整性。
+依赖：N07/N13，及拟采用的持久化机制 N16/N20；实施前补齐精确依赖。
+验收：同节点多片与跨节点事务、业务/DDL分支、PREPARE后崩溃、丢失回复；无提前成功或登记丢失。
+
+N16 单副本快速提交与 pg_wal write-only 优化
+来源：2fff610、4ce18da；patches/0013-xlog-write-upto.patch、src/wal/*、src/raft_boundary.c。
+处理：明确哪些分区流可由pg_wal重建、何时必须刷盘；只在满足配置条件时启用。
+依赖：N00/N04，P1/P3/P5；不得自动继承 mmp 模板开关。
+验收：返回COMMIT后立即杀进程/重启、checkpoint前后恢复；多副本和混合本地写不误入快路径。
+
+N17 分区日志组刷盘
+来源：mmp 相对test的新变化；src/wal/partition_wal_writer.c、partwal_sync.c、include/partwal_sync.h。
+处理：接入 written/synced 水位、在途刷盘和跨段欠账管理；保留 fa23 日志截断/回收顺序。
+依赖：P3/P5，N00；与 N18 联验，配置先按 fa23 行为。
+验收：跨段、多写者、刷盘失败和截断并发；副本确认只覆盖持久前缀；重启无缺口。
+
+N18 最近分区日志缓存和 C 层读取
+来源：mmp 相对test的新变化；src/wal/partwal_recent.c、src/raft_boundary.c、src/pg_partdist.c。
+处理：新模块及读hook按 fa23 接口适配；缓存不得成为唯一恢复来源。
+依赖：N17 的水位接口确定；P3/P5。
+验收：缓存开/关、满/淘汰、分区截断、DROP/OID复用、重启后读取同一日志内容。
+
+N19 Raft 写入、批量复制与节点级复制流
+来源：2fff610 和 mmp 快照；pg-raft-src/src/raft_consensus.c、pg_raft.c、sql/pg_raft--1.0.sql。
+处理：先正确性修复，再多组批量，再stream；试验性pipeline单列，不能与stream同时默认启用。
+依赖：N17/N18；保留 P1/P2/P4/P5，尤其 DDL 控制记录7–10的共识回放。
+验收：消息重发/乱序/缺口、少数副本慢、leader切换、DDL/业务混合、迁移与成员变化。
+
+N20 hardstate/checkpoint 持久化优化
+来源：mmp 的data_hardstate_lazy、88c5b15 的补丁0015；raft_consensus.c、src/shard_clog.c。
+处理：hardstate延迟持久与clog checkpoint hook分开；核对重建依据是否在 fa23 仍成立。
+依赖：N00/N17/N19 与 P3；不能套用“重复apply总幂等”的未经验证假设。
+验收：投票/任期、commit/apply水位和checkpoint各边界崩溃；全节点重启不倒退或复活旧事务。
+
+N21 提前释放行锁
+来源：88c5b15、mmp补丁0016-elr-syncrep；src/shard_visibility.c、src/shard_xid.c、内核提交路径。
+处理：分开本地提交与同步备库情形，明确后继读写者是否需要等待前事务持久化。
+依赖：N00/N10/N13/N20；同步备库情形另依赖 N24。
+验收：放锁后刷盘前暂停/崩溃，后继事务提交和只读查询不能确认无法恢复的结果。
+
+N22 TSO 重启/提升后的高水位和安全线
+来源：mmp快照；src/tso.c、include/tso.h。
+现状：fa23 已有发号上界落盘；mmp 另有上界WAL和备库提升后的保护。
+处理：保留 fa23 的单调性，适配第一次服务的safe_ts等待及WAL恢复，不整份替换。
+依赖：P3/N05；备库提升部分依赖 N24。
+验收：协调者重启/提升时长事务仍存活，时间戳不重用，vacuum不越过尚未重新登记的快照。
+
+N23 配置默认值与诊断功能
+来源：mmp快照；src/pg_partdist.c、pg-raft-src/src/pg_raft.c、补丁0017-diag-shard-chain。
+处理：每项开关随所属功能验收后启用；默认256MB日志缓存、stream/group_fsync/lazy等
+不能因导入配置而提前生效；诊断日志限流并核对现有测试依赖的参数名。
+依赖：N00及对应功能项。
+验收：最小内存环境可启动；开关关闭回到基线路径；配置重载/重启语义与说明一致。
+
+N24 PostgreSQL 物理备库所需分片账本 WAL
+来源：mmp新增src/shard_wal.c、include/shard_wal.h及 raft_boundary/dtx_pending/tso 调用。
+现状：这是整库流复制恢复分片PREPARED、终局、TSO上界的机制；不同于 fa23 的分片副本。
+处理：核对自定义rmgr编号、载荷身份、重放顺序及幂等；叠加 fa23 的xid回绕和旧日志围栏。
+依赖：N00/P1/P3/P5；与 N22 联合完成（先WAL接口，后调用集成）。
+验收：主备复制各类记录、备库提升、重复/旧WAL重放；确认提交和prepared状态不丢、不串事务。
+
+N25 物理备库自动提升与地址切换
+来源：mmp新增pg-raft-src/src/raft_failover.c、node_address/node_standby及 tpcc/lab/shardpg_rep.sh。
+处理：单列拓扑能力；节点号保留、地址改变时同步更新TSO/Citus/控制面和旧主隔离。
+依赖：N24/N22/N19；先验收手工提升，再自动提升。
+验收：节点/协调者故障、仅部分备库可达、旧主恢复、时间线变化、切换中丢回复；
+同时验证 fa23 现有分片副本迁移/扩缩容，没有把两套拓扑混作一套。
+
+N00 构建和依赖清单（在首个涉及编译的接入项之前完成）
+现状：fa23 的 postgres-src/citus-src 是gitlink，mmp是镜像导入的源码树；pg-install不同。
+处理：固定内核/Citus版本，核对mmp实际源码修改而非只看补丁目录；逐项映射hook和导出符号。
+fa23补丁0016-shard-key-grammar/0017-psql-dt-shards与mmp的0016-elr-syncrep/
+0017-diag-shard-chain编号重号，必须按内容重新编排并记录已应用状态。
+保留 fa23 Citus0002–0005、dtx_coordinator/shard_twophase/shardpg_ddl 构建及安装SQL。
+不把 mmp 的pg-install二进制当作合并源码的构建结果。
+验收：干净源码完整构建，扩展新建安装/升级SQL同步；产物hash和输入补丁清单可追溯。
+旧PGDATA兼容性另行实测；mmp镜像的历史测试结果不能替代合并产物测试。
+
+四、test 的20个提交逐项追溯
+
+方法：比较这20个提交改动过的路径在“最终test”和“最终mmp”中的Git对象。
+范围仅 pg-partdist-src、pg-raft-src、tpcc：64个路径中45个文件完全一致、19个不同，缺失0。
+这一统计不是“20项功能全部保留”的证明；不同文件需逐段检查，运行行为尚未验证。
+每个提交的完整路径/对象号/统计见 SOURCE_EVIDENCE.json；这里给出功能接入对应项。
+
+30751ea  异步清扫                         → N05
+0f77b21  单副本修复开关/装载重试           → N02、N04
+62bcffa  行数检查/迷你规模                 → N02
+e3d3919  非阻塞轮询/续租/日志              → N05
+5f8f4d9  迷你规模脚本幂等                 → N02
+2fff610  快速提交/正确性/Raft混合改动      → N07、N13、N14、N15、N16、N19
+e58fa58  函数下推/配置/取数重试            → N02、N12、N16、N23
+bbba459  死TID排序/缓存                   → N08、N09
+25885db  Citus内部连接缓存               → N11
+e2460a1  cleanup lock重试/回收参数        → N09、N23
+836043b  决议广播SQL截断                 → N06
+55a9fb4  RC重评                          → N10
+85b8b6a  提交探针/Citus事务记录GC         → N07
+4ce18da  pg_wal只写不刷                  → N16
+3f72a3d  可见性去锁/发号IO                → N14
+f8412ae  vacuum调度                      → N09
+caecfc0  TPC-C热行事务SQL重排             → N02、N12
+6905492  单参与节点快路径/异步登记         → N15
+88c5b15  提前放锁/checkpoint/去锁          → N14、N20、N21
+b149622  实验脚本                        → N03
+
+前置4个提交也在mmp历史中：3b95245→N01；87e9903→N08/N10；07e90b3→N02；01e5635→N04。
+mmp快照还包含test之后的改动，已在N12、N13、N17–N25单列，不能把清单缩成20个提交。
+完整来源文件差异见 SOURCE_EVIDENCE.json 的 mmp_changes_after_test / fa23_to_mmp_changes。
+
+五、后续每项接入的记录格式
+
+编号；具体修改点；依赖是否满足；保留的fa23行为；构建输入；测试命令和证据；
+失败及处理结果；提交号；默认开关状态；遗留问题。
+源码和测试结果支持的范围之外，一律写“未验证”，不按提交标题推定正确。
+
+推荐先做：N01/N02/N03 的环境和套件适配，再N05/N06等独立修复；
+需要编译前先做N00；N08/N10等跨模块项目按依赖推进；N15–N21的提交/复制优化后置。
+本轮到此为止，不自动进入第4步，不执行上述接入项。
+
+六、本轮盘点验证
+
+inventory.py 仅运行只读Git命令，输入均固定到完整提交号。
+检查20个提交计数、64路径计数、对象号及文件缺失状态；不运行数据库测试。
+原始merge-tree文本预检发现14个文件、43处文本冲突，仅作定位，不代表全部语义冲突。
+原fa23和mmp分支保持原指针；new1只增加本盘点文档和可复查的证据脚本。
