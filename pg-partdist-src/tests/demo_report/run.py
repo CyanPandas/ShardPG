@@ -679,6 +679,8 @@ class Runner:
                 "SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id=ANY(%s::bigint[])", (self.sids,), n), lambda x: x == 0)
             require(self.scalar("SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint=ANY(%s::bigint[])", (self.sids,), name) == 0,
                     name + ": dropped partition map remains")
+            require(self.scalar("SELECT count(*) FROM partdist.shard_identity WHERE global_shard_id=ANY(%s::bigint[])", (self.sids,), name) == 0,
+                    name + ": dropped shard identity remains")
             for physical in self.physical:
                 require(self.scalar("SELECT to_regclass(%s) IS NULL", (physical,), name), name + ": dropped physical table remains")
         for table in self.tables:

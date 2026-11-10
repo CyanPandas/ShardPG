@@ -486,18 +486,34 @@ pg_raft_apply_payload_sql(const char *op_type, const char *payload_json)
         return true;
     }
 
-    if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
+    if (strcmp(op_type, PG_RAFT_OP_NODE_REMOVE) == 0)
+    {
+        /* Retirement must be replayable, including after snapshot installation.
+         * The maintenance controller drains replicas and transactions first. */
+        initStringInfo(&sql);
+        appendStringInfo(&sql,
+                         "DELETE FROM partdist.node_map "
+                         "WHERE node_id = (%s::jsonb->>'node_id')::int",
+                         quote_literal_cstr(payload_json));
+        ret = SPI_execute(sql.data, false, 0);
+        ok = (ret == SPI_OK_DELETE);
+        pfree(sql.data);
+    }
+    else if (strcmp(op_type, PG_RAFT_OP_NODE_STATUS) == 0)
     {
         initStringInfo(&sql);
         /*
          * ★ P7-N102：条目可以带 hostname/port（加节点时 shardpg.add_node 登记真实地址，各节点
-         * 按日志序同一时刻学到）；不带的（探测器的状态更新）照旧只改 status，新行用占位地址。
+         * 按日志序同一时刻学到）；不带地址的探测更新只更新已登记节点。
+         * 移除之后迟到的探测结果不能重新插入占位节点；重新加入必须携带地址。
          */
         appendStringInfo(&sql,
                          "INSERT INTO partdist.node_map (node_id, hostname, port, status, last_heartbeat) "
                          "SELECT (j->>'node_id')::int, COALESCE(j->>'hostname', 'node' || (j->>'node_id')), "
                          "       COALESCE((j->>'port')::int, 5432), j->>'status', now() "
                          "FROM (SELECT %s::jsonb AS j) s "
+                         "WHERE j ? 'hostname' OR EXISTS "
+                         "(SELECT FROM partdist.node_map WHERE node_id=(j->>'node_id')::int) "
                          "ON CONFLICT (node_id) DO UPDATE SET "
                          "status = EXCLUDED.status, last_heartbeat = now(), "
                          "hostname = CASE WHEN %s::jsonb ? 'hostname' THEN EXCLUDED.hostname ELSE node_map.hostname END, "

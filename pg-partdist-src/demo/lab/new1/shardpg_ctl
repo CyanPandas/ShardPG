@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Control the explicitly configured new1 lab cluster from host 145 (Python 3.6+)."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 
 BIN = '/work/pg-install/bin/'
 DATA = '/work/node/pgdata'
@@ -19,7 +21,8 @@ def shell_join(args):
 
 class Control:
     def __init__(self, config):
-        self.cfg = json.loads(Path(config).read_text(encoding='utf-8'))
+        self.config_path=Path(config).resolve()
+        self.cfg = json.loads(self.config_path.read_text(encoding='utf-8'))
         self.nodes = self.cfg['nodes']
         self.release = self.cfg['source_commit']
         m = self.nodes['master']
@@ -57,7 +60,7 @@ class Control:
         return self.host_run(node, ['docker', 'exec', '-i', '--user', 'postgres',
                                   node['container']] + args, data, check)
 
-    def sql(self, query, variables=None, name='master', extra=None):
+    def sql(self, query, variables=None, name='master', extra=None, quiet=False):
         node = self.node(name)
         args = ['env', 'PGCLIENTENCODING=UTF8', 'PGAPPNAME=new1_shardpg_ctl',
                 'PGPASSFILE=/work/secrets/pgpass',
@@ -68,7 +71,8 @@ class Control:
             args += ['-v', '{}={}'.format(key, value)]
         args += extra or []
         result = self.docker(name, args, query.encode('utf-8'))
-        sys.stdout.buffer.write(result.stdout)
+        if not quiet:
+            sys.stdout.buffer.write(result.stdout)
         sys.stderr.buffer.write(result.stderr)
         return result
 
@@ -82,6 +86,8 @@ class Control:
                 if result.returncode not in (0, 3):
                     raise RuntimeError(result.stderr.decode('utf-8', errors='replace'))
                 state = 'running' if result.returncode == 0 else 'stopped'
+                if node.get('retired'): state += '/retired'
+                elif node.get('joining'): state += '/joining'
             print('{:10} {:25} {:9} {}'.format(name, node['host']+':'+str(node['port']),state,node['container']))
 
     def service(self, name, action, mode='immediate'):
@@ -98,6 +104,192 @@ class Control:
         sys.stderr.buffer.write(result.stderr)
 
 
+    def scalar(self, query, variables=None, name='master'):
+        return self.sql(query, variables, name, extra=['-qAt'], quiet=True).stdout.decode().strip()
+
+    def save_config(self):
+        tmp = self.config_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.cfg, indent=2)+'\n', encoding='utf-8')
+        os.replace(str(tmp), str(self.config_path))
+
+    def wait_for(self, label, check, seconds=90):
+        deadline = time.monotonic()+seconds
+        while True:
+            if check():
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Timed out: '+label+'; rerun the same remove-node to resume')
+            time.sleep(1)
+
+    def files(self, name):
+        self.sql("""SET citus.override_table_visibility=off;
+SELECT i.global_shard_id,i.local_relname,
+       CASE WHEN c.oid IS NULL THEN 'stale identity' ELSE 'business shard' END AS kind,
+       pg_relation_filepath(c.oid) AS relation_file,
+       CASE WHEN (pg_stat_file('pg_parwal/'||i.local_oid,true)).isdir
+            THEN 'pg_parwal/'||i.local_oid END AS partition_log
+FROM partdist.shard_identity i LEFT JOIN pg_class c ON c.oid=i.local_oid ORDER BY 1;
+SELECT g.group_id,CASE WHEN g.group_id=0 THEN 'cluster control'
+       WHEN d.group_id IS NOT NULL THEN 'internal DDL coordinator' ELSE 'business shard' END AS kind,
+       g.state,g.leader_node_id,g.current_term,g.commit_index,g.last_applied,
+       CASE WHEN (pg_stat_file('pg_raft_hardstate.'||g.group_id,true)).size IS NOT NULL
+            THEN 'pg_raft_hardstate.'||g.group_id END AS hardstate_file
+FROM partdist.pg_raft_group_status() g
+LEFT JOIN partdist.dtx_ddl_shard d USING(group_id) ORDER BY 1;""", name=name)
+
+    def ensure_self_connection(self, name):
+        # Verify the same independent local RPC used by transaction recovery.
+        expected=str(self.node(name)['node_id'])
+        actual=self.scalar("SELECT partdist.dtx_self($q$SELECT current_setting('pg_raft.node_id')$q$);",name=name)
+        if actual!=expected:
+            raise RuntimeError('Local transaction RPC returned a different node identity')
+
+    def remove_node(self, name):
+        """Maintenance retirement; durable journal permits resuming after any phase."""
+        target = self.node(name)
+        if name == 'master':
+            raise RuntimeError('Cannot remove the router')
+        journal = self.config_path.with_name('remove-'+name+'.json')
+        if target.get('retired') and not journal.exists():
+            print(name+' already removed; its stopped data directory is retained')
+            return
+        if journal.exists():
+            job = json.loads(journal.read_text(encoding='utf-8'))
+            if job['container_id'] != target['container_id'] or job['release'] != self.release:
+                raise RuntimeError('Retirement journal belongs to a different container/release')
+        else:
+            names = [n for n in self.nodes if not self.nodes[n].get('retired')]
+            for n in names:
+                self.guard(n)
+            peers = self.scalar('SHOW pg_raft.peers;')
+            parts = peers.split(',')
+            expected = '{}@{}:{}'.format(target['node_id'],target['host'],target['port'])
+            if parts[-1] != expected or len(parts)<5:
+                raise RuntimeError('Maintenance removal supports the last added peer and retains at least three workers')
+            for n in names:
+                if self.scalar('SHOW pg_raft.peers;',name=n) != peers:
+                    raise RuntimeError('Peer configuration differs on '+n)
+            node_id = int(target['node_id'])
+            count = self.scalar("""SELECT count(*) FROM partdist.partition_map m
+WHERE :id=ANY(ARRAY[primary_node]||secondary_nodes)
+AND NOT EXISTS(SELECT FROM partdist.dtx_ddl_shard d WHERE d.group_id=m.partition_id::bigint);""", {'id':node_id})
+            if count != '0':
+                raise RuntimeError(name+' still owns business replicas; move-replica them away or drop the tables first')
+            if self.scalar("""SELECT
+(SELECT count(*) FROM partdist.raft_group g WHERE group_id>0
+ AND NOT EXISTS(SELECT FROM partdist.dtx_ddl_shard d WHERE d.group_id=g.group_id))+
+(SELECT count(*) FROM partdist.shard_identity i JOIN pg_class c ON c.oid=i.local_oid);""",name=name) != '0':
+                raise RuntimeError(name+' still has local business replicas/groups; finish migration or cleanup_dropped first')
+            if self.scalar("""SELECT count(*) FROM pg_dist_placement p JOIN pg_dist_node n USING(groupid)
+WHERE n.nodename=:'host' AND n.nodeport=:port;""", {'host':target['host'],'port':target['port']}) != '0':
+                raise RuntimeError(name+' still has Citus placements')
+            for n in names:
+                self.wait_for('transaction drain '+n, lambda n=n: self.scalar("""SELECT
+(SELECT count(*) FROM pg_prepared_xacts)+
+(SELECT count(*) FROM partdist.dtx_coord_tx)+
+(SELECT count(*) FROM partdist.dtx_coord_branch)+
+partdist.dtx_pending_count()+
+(SELECT count(*) FROM partdist.dtx_route)+
+(SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend'
+ AND pid<>pg_backend_pid() AND state<>'idle' AND application_name<>'new1_shardpg_ctl');""",name=n)=='0')
+            before = int(self.scalar('SELECT partdist.partdist_tso_client_start_ts();'))
+            job = dict(release=self.release,container_id=target['container_id'],phase=0,
+                       names=names,peers=peers,new_peers=','.join(parts[:-1]),tso_before=before)
+            journal.write_text(json.dumps(job,indent=2)+'\n',encoding='utf-8')
+        def stage(phase):
+            job['phase']=phase
+            temp=journal.with_suffix('.tmp')
+            temp.write_text(json.dumps(job,indent=2)+'\n',encoding='utf-8')
+            os.replace(str(temp),str(journal))
+        node_id=int(target['node_id'])
+        remaining=[n for n in job['names'] if n!=name]
+        workers=[n for n in remaining if n!='master']
+        if job['phase']<1:
+            print('[1/5] Retire DDL replicas through committed Raft membership changes',flush=True)
+            groups=json.loads(self.scalar('SELECT coalesce(json_agg(group_id ORDER BY group_id),\'[]\') FROM partdist.dtx_ddl_shard;'))
+            for gid in groups:
+                members=json.loads(self.scalar('SELECT to_json(partdist.group_raft_members(:gid));',{'gid':gid}))
+                if not members:
+                    raise RuntimeError('No leader/members for DDL group '+str(gid))
+                if node_id in members:
+                    leader=int(self.scalar('SELECT partdist.group_leader_now(:gid);',{'gid':gid}))
+                    if leader==node_id:
+                        dest=next(self.nodes[n]['node_id'] for n in workers if self.nodes[n]['node_id'] in members)
+                        self.sql('SELECT partdist.pg_raft_group_transfer_leader(:gid,:dest,15000);',{'gid':gid,'dest':dest},name=name)
+                        self.wait_for('DDL leadership transfer',lambda:self.scalar('SELECT partdist.group_leader_now(:gid)<>:id;',{'gid':gid,'id':node_id})=='t')
+                    self.sql('SELECT partdist.group_change_member(:gid,:id,false);',{'gid':gid,'id':node_id})
+                for n in workers:
+                    if self.nodes[n]['node_id'] in members:
+                        self.wait_for('DDL membership '+n,lambda n=n,gid=gid:self.scalar("""SELECT EXISTS(
+SELECT FROM partdist.raft_group r JOIN partdist.pg_raft_group_status() s USING(group_id)
+WHERE r.group_id=:gid AND NOT :id=ANY(r.members) AND s.last_applied>=s.commit_index);""",{'gid':gid,'id':node_id},n)=='t')
+            self.wait_for('DDL routes exclude retiring peer',lambda:self.scalar('SELECT count(*) FROM partdist.partition_map WHERE :id=ANY(ARRAY[primary_node]||secondary_nodes);',{'id':node_id})=='0')
+            stage(1)
+        if job['phase']<2:
+            print('[2/5] Remove Citus registration and commit control-plane retirement',flush=True)
+            self.sql("""SELECT partdist.dtx_self(format('SET LOCAL shardpg.first_shard_coordinator=off; SELECT pg_catalog.citus_remove_node(%L,%s)',nodename,nodeport))
+FROM pg_dist_node WHERE nodename=:'host' AND nodeport=:port;""",{'host':target['host'],'port':target['port']})
+            leader_id=int(self.scalar('SELECT leader_node_id FROM partdist.pg_raft_group_status() WHERE group_id=0;'))
+            leader=next(n for n in job['names'] if self.nodes[n]['node_id']==leader_id)
+            idx=int(self.scalar("SELECT partdist.pg_raft_group_propose(0,'OP_NODE_REMOVE',json_build_object('node_id',:id)::text);",{'id':node_id},leader))
+            if idx<=0:
+                raise RuntimeError('Control-plane retirement was not proposed')
+            for n in job['names']:
+                self.wait_for('control retirement '+n,lambda n=n:self.scalar("""SELECT
+NOT EXISTS(SELECT FROM partdist.node_map WHERE node_id=:id)
+AND EXISTS(SELECT FROM partdist.pg_raft_group_status() WHERE group_id=0 AND last_applied>=:idx);""",{'id':node_id,'idx':idx},n)=='t')
+            # Remove only the retiring node's local metadata-group replica. Outcomes on
+            # remaining replicas and all permanent DDL identities stay available.
+            for attempt in range(2):
+                self.sql('SELECT partdist.pg_raft_group_drop(group_id) FROM partdist.dtx_ddl_shard;',name=name)
+                time.sleep(1)
+            self.sql('SELECT partdist.pg_raft_hardstate_purge(array_agg(group_id)) FROM partdist.dtx_ddl_shard;',name=name)
+            stage(2)
+        if job['phase']<3:
+            print('[3/5] Stop databases for peer-list contraction',flush=True)
+            for n in [name]+workers+['master']:
+                self.service(n,'stop','fast')
+            stage(3)
+        if job['phase']<4:
+            print('[4/5] Persist reduced peer list; retain retired container and data',flush=True)
+            # Servers are stopped: the runtime check hook intentionally forbids hot shrink.
+            script = r"""set -eu
+p=$1
+peers=$2
+tmp="$p.retire.tmp"
+sed '/^pg_raft\.peers[[:space:]]*=/d' "$p" > "$tmp"
+printf "\npg_raft.peers = '%s'\n" "$peers" >> "$tmp"
+chmod --reference="$p" "$tmp"
+mv "$tmp" "$p"
+"""
+            for n in remaining:
+                self.docker(n,['bash','-c',script,'retire',DATA+'/postgresql.auto.conf',job['new_peers'].replace("'","''")])
+            stage(4)
+        print('[5/5] Start remaining nodes and verify topology, DDL groups and TSO',flush=True)
+        for n in ['master']+workers:
+            self.service(n,'start')
+            self.ensure_self_connection(n)
+        for n in remaining:
+            self.wait_for('healthy reduced topology '+n,lambda n=n:self.scalar("""SELECT
+current_setting('pg_raft.peers')=:'peers'
+AND NOT EXISTS(SELECT FROM partdist.node_map WHERE node_id=:id)
+AND NOT EXISTS(SELECT FROM partdist.raft_group WHERE group_id>0 AND :id=ANY(members))
+AND EXISTS(SELECT FROM partdist.pg_raft_group_status() WHERE group_id=0 AND leader_node_id>0)
+AND NOT EXISTS(SELECT FROM partdist.pg_raft_group_status() WHERE state NOT IN ('leader','follower') OR commit_index<>last_applied)
+AND NOT EXISTS(SELECT FROM partdist.pg_raft_group_status() g LEFT JOIN partdist.partition_map m
+ ON m.partition_id::bigint=g.group_id WHERE g.group_id>0 AND
+ (m.partition_id IS NULL OR m.primary_node<>g.leader_node_id OR m.primary_term<g.current_term));""",{'id':node_id,'peers':job['new_peers']},n)=='t')
+        after=int(self.scalar('SELECT partdist.partdist_tso_client_start_ts();'))
+        if after<=job['tso_before']:
+            raise RuntimeError('TSO did not advance after retirement')
+        target['retired']=True
+        self.save_config()
+        job['phase']=5;job['tso_after']=after
+        journal.with_suffix('.completed.json').write_text(json.dumps(job,indent=2)+'\n',encoding='utf-8')
+        journal.unlink()
+        print('Removed {}; TSO {} -> {}; database stopped, container/data retained'.format(name,job['tso_before'],after))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', default=os.environ.get('SHARDPG_DEMO_CONFIG', str(BASE/'demo-control.json')))
@@ -109,11 +301,14 @@ def main():
     s = sub.add_parser('move-primary'); s.add_argument('shard'); s.add_argument('target')
     s = sub.add_parser('move-replica'); s.add_argument('shard'); s.add_argument('source'); s.add_argument('target')
     s = sub.add_parser('add-node'); s.add_argument('node'); s.add_argument('host'); s.add_argument('port',type=int)
+    s = sub.add_parser('remove-node', help='maintenance retirement of the last added worker; restarts remaining databases'); s.add_argument('node')
     s = sub.add_parser('files'); s.add_argument('node')
     s = sub.add_parser('sql'); s.add_argument('node',nargs='?',default='master')
     a = p.parse_args()
     if not a.command: p.print_help(); return 0
     c = Control(a.config)
+    lock=c.config_path.with_suffix('.lock').open('a')
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     if a.command == 'status': c.status()
     elif a.command in ('start','stop'): c.service(a.node,a.command,getattr(a,'mode','immediate'))
     elif a.command == 'shards':
@@ -128,9 +323,15 @@ def main():
         n=c.guard(a.node)
         if (a.host,a.port)!=(n['host'],n['port']) or a.node!='worker4':
             raise RuntimeError('add-node must match the prepared worker4 in this release config')
+        if n.get('retired'): c.service(a.node,'start')
+        if c.scalar("SELECT count(*) FROM pg_dist_node WHERE nodename=:'host' AND nodeport=:port;",
+                    {'host':a.host,'port':a.port}) == '0':
+            c.ensure_self_connection(a.node)
+        n.pop('retired',None); n['joining']=True; c.save_config()
         c.sql("SELECT * FROM shardpg.add_node(:'host',:port);",{'host':a.host,'port':a.port})
-    elif a.command == 'files':
-        c.sql("SET citus.override_table_visibility=off; SELECT global_shard_id,local_relname,pg_relation_filepath(local_oid) AS relation_file, 'pg_parwal/'||local_oid AS partition_log FROM partdist.shard_identity ORDER BY 1; SELECT group_id,state,leader_node_id,current_term,commit_index,last_applied FROM partdist.pg_raft_group_status() ORDER BY 1;", name=a.node)
+        n.pop('joining',None); c.save_config()
+    elif a.command == 'remove-node': c.remove_node(a.node)
+    elif a.command == 'files': c.files(a.node)
     elif a.command == 'sql': c.sql(sys.stdin.read(),name=a.node)
     return 0
 

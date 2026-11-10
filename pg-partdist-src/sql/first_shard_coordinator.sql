@@ -515,7 +515,9 @@ BEGIN
     INSERT INTO partdist.dtx_ddl_shard(owner_node,group_id,anchor_oid)
       VALUES(p_owner,p_group,anchor)
       ON CONFLICT(owner_node) DO UPDATE SET anchor_oid=EXCLUDED.anchor_oid;
-    PERFORM partdist.pg_raft_group_create(p_group,p_members);
+    IF NOT EXISTS(SELECT FROM partdist.raft_group WHERE group_id=p_group) THEN
+        PERFORM partdist.pg_raft_group_create(p_group,p_members);
+    END IF;
     RETURN true;
 END $$;
 
@@ -558,9 +560,19 @@ BEGIN
             IF answer IS DISTINCT FROM 't' THEN RAISE EXCEPTION 'DDL shard installation failed'; END IF;
         END LOOP;
     END LOOP;
+    FOREACH owner IN ARRAY workers LOOP
+        SELECT group_id INTO gid FROM partdist.dtx_ddl_shard WHERE owner_node=owner;
+        FOR n IN SELECT unnest(workers) AS node_id LOOP
+            IF NOT n.node_id=ANY(partdist.group_raft_members(gid,workers)) THEN
+                PERFORM partdist.group_change_member(gid,n.node_id,true,workers);
+            END IF;
+        END LOOP;
+    END LOOP;
     LOOP
         SELECT bool_and(EXISTS(SELECT FROM partdist.partition_map m
-                  WHERE m.partition_id::bigint=d.group_id AND m.primary_node=ANY(workers)))
+                  WHERE m.partition_id::bigint=d.group_id AND m.primary_node=ANY(workers)
+                    AND partdist.node_group_status(m.primary_node,d.group_id,'state')='leader'
+                    AND m.primary_term>=partdist.node_group_status(m.primary_node,d.group_id,'current_term')::bigint))
           INTO ready FROM partdist.dtx_ddl_shard d WHERE d.owner_node=ANY(workers);
         IF ready THEN RETURN true; END IF;
         IF clock_timestamp()-started>interval '25 seconds' THEN

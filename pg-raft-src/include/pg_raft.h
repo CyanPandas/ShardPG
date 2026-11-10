@@ -35,6 +35,7 @@ pg_raft_spi_end(bool must_finish)
 }
 
 #define PG_RAFT_OP_NODE_STATUS       "OP_NODE_STATUS"
+#define PG_RAFT_OP_NODE_REMOVE       "OP_NODE_REMOVE"
 #define PG_RAFT_OP_PARTITION_PRIMARY "OP_PARTITION_PRIMARY"
 /* ★ P7-N58：多个数据组的新主登记合成一条控制面条目
  * payload = {"pp":[[分区, 新主, 任期, 前任主, [从副本...]], ...]} —— 紧凑格式，环里一条只有 768 字节 */

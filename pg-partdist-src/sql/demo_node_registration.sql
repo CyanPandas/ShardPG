@@ -148,6 +148,12 @@ BEGIN
     detail := format('%s:%s registered at group 0 log index %s, the new node has caught up', p_host, p_port, v_idx);
     RETURN NEXT;
 
+    -- A retired worker retains its DDL identities but has no local Raft groups.
+    -- Restore/join those groups before Citus catalog synchronization can prepare
+    -- a native catalog branch on it. The independent connection sees the
+    -- already-committed control-plane registration above.
+    PERFORM partdist.dtx_self('SELECT partdist.dtx_ddl_ensure()');
+
     -- ④ ShardPG 加 worker：同步元数据，各分布表的外壳建到新节点上
     ts := clock_timestamp();
     -- Node registration only changes Citus catalogs; it has no business shard

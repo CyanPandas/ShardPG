@@ -2589,7 +2589,9 @@ DECLARE
     v_ids  bigint[];
     r      record;
 BEGIN
-    SELECT coalesce(array_agg(shardid), '{}') INTO v_live FROM pg_catalog.pg_dist_shard;
+    SELECT coalesce(array_agg(gid), '{}') INTO v_live FROM (
+        SELECT shardid AS gid FROM pg_catalog.pg_dist_shard
+        UNION SELECT group_id FROM partdist.dtx_ddl_shard) live;
     SELECT array_agg(DISTINCT t.x ORDER BY t.x) INTO v_ids FROM (
         SELECT m.partition_id::bigint AS x FROM partdist.partition_map m
         UNION
@@ -2620,6 +2622,23 @@ END $fn$;
 COMMENT ON FUNCTION partdist.residue_gc() IS
     'P7-N110/N112：清修复之前删表留下的残留 —— 已删分片的主从登记（经控制面日志）和各 worker 上的 hardstate 文件。在 master 上执行。';
 
+-- Only absent local relations with no live Raft/replay registration are orphans.
+-- Do not rebuild from the Citus catalog: a valid follower need not be a placement.
+CREATE OR REPLACE FUNCTION partdist.shard_identity_gc_orphans()
+RETURNS integer LANGUAGE plpgsql SET search_path=pg_catalog,partdist AS $fn$
+DECLARE n integer;
+BEGIN
+    DELETE FROM partdist.shard_identity i
+     WHERE NOT EXISTS (SELECT FROM pg_class c WHERE c.oid=i.local_oid)
+       AND NOT EXISTS (SELECT FROM partdist.raft_group g WHERE g.group_id=i.global_shard_id)
+       AND NOT EXISTS (SELECT FROM partdist.pg_raft_group_status() g WHERE g.group_id=i.global_shard_id)
+       AND NOT EXISTS (SELECT FROM partdist.follower_partition_map f WHERE f.global_shard_id=i.global_shard_id)
+       AND NOT EXISTS (SELECT FROM partdist.partition_map m WHERE m.partition_id::bigint=i.global_shard_id)
+       AND NOT EXISTS (SELECT FROM partdist.dtx_ddl_shard d WHERE d.group_id=i.global_shard_id);
+    GET DIAGNOSTICS n=ROW_COUNT;
+    RETURN n;
+END $fn$;
+
 CREATE OR REPLACE FUNCTION partdist.shardpg_cleanup_dropped()
 RETURNS text LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -2636,6 +2655,12 @@ BEGIN
       INTO v_ids, v_names, v_n
       FROM partdist.shardpg_drop_queue q
      WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_dist_shard s WHERE s.shardid = q.shardid);
+    -- Also repair identities left by releases that already drained the queue.
+    PERFORM partdist.shard_identity_gc_orphans();
+    FOR r IN SELECT * FROM pg_catalog.run_command_on_workers(
+        'SELECT partdist.shard_identity_gc_orphans()') LOOP
+        IF NOT r.success THEN RAISE EXCEPTION 'identity cleanup failed on %: %',r.nodeport,r.result; END IF;
+    END LOOP;
     IF v_n = 0 THEN
         RETURN '没有待清理的分片';
     END IF;
@@ -2686,6 +2711,11 @@ BEGIN
         PERFORM partdist.partition_map_unregister(v_ids);
         PERFORM pg_catalog.run_command_on_workers(format(
             'DELETE FROM partdist.follower_partition_map WHERE global_shard_id IN (%s)', v_list));
+        PERFORM pg_catalog.run_command_on_workers(format(
+            'DELETE FROM partdist.shard_identity i WHERE global_shard_id IN (%s) '
+            'AND NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid=i.local_oid)', v_list));
+        DELETE FROM partdist.shard_identity i WHERE global_shard_id=ANY(v_ids)
+          AND NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid=i.local_oid);
         PERFORM pg_catalog.run_command_on_workers('SELECT partdist.follower_map_gc_orphans()');
         PERFORM pg_catalog.run_command_on_workers('SELECT partdist.shard_mvcc_gc_orphans()');
         PERFORM pg_catalog.run_command_on_workers('SELECT slots_freed FROM partdist.replay_reclaim_stale(0)');
@@ -2693,7 +2723,7 @@ BEGIN
             RAISE NOTICE '清理：已删除主从登记，回收残留';
         END IF;
 
-        -- ④ 核对：每台 worker 上 Raft 组 / 物理表 / 登记 / 副本回放登记都应为 0
+        -- ④ 核对：每台 worker 上组 / 表 / 路由 / 副本登记 / hardstate / 身份登记都应为 0
         v_left := '';
         FOR r IN SELECT nodeport, success, result FROM pg_catalog.run_command_on_workers(format(
             $q$SELECT (SELECT count(*) FROM partdist.pg_raft_group_status() WHERE group_id IN (%1$s)) || '|' ||
@@ -2701,12 +2731,13 @@ BEGIN
                       (SELECT count(*) FROM partdist.partition_map WHERE partition_id::bigint IN (%1$s)) || '|' ||
                       (SELECT count(*) FROM partdist.follower_partition_map WHERE global_shard_id IN (%1$s)) || '|' ||
                       (SELECT count(*) FROM pg_catalog.pg_ls_dir('.') f
-                        WHERE f IN (SELECT 'pg_raft_hardstate.' || x FROM unnest(ARRAY[%1$s]) x))$q$,
+                        WHERE f IN (SELECT 'pg_raft_hardstate.' || x FROM unnest(ARRAY[%1$s]) x)) || '|' ||
+                      (SELECT count(*) FROM partdist.shard_identity WHERE global_shard_id IN (%1$s))$q$,
             v_list, v_names)) ORDER BY 1
         LOOP
-            IF NOT r.success OR r.result <> '0|0|0|0|0' THEN
+            IF NOT r.success OR r.result <> '0|0|0|0|0|0' THEN
                 v_left := v_left || format(' :%s(%s)', r.nodeport,
-                                           CASE WHEN r.success THEN '组|表|登记|副本登记|hardstate=' || r.result ELSE '连不上' END);
+                                           CASE WHEN r.success THEN '组|表|登记|副本登记|hardstate|身份登记=' || r.result ELSE '连不上' END);
             END IF;
         END LOOP;
         EXIT WHEN v_left = '';
@@ -3369,6 +3400,12 @@ BEGIN
     step := 'join control plane'; secs := round(extract(epoch FROM clock_timestamp() - ts));
     detail := format('%s:%s registered at group 0 log index %s, the new node has caught up', p_host, p_port, v_idx);
     RETURN NEXT;
+
+    -- A retired worker retains its DDL identities but has no local Raft groups.
+    -- Restore/join those groups before Citus catalog synchronization can prepare
+    -- a native catalog branch on it. The independent connection sees the
+    -- already-committed control-plane registration above.
+    PERFORM partdist.dtx_self('SELECT partdist.dtx_ddl_ensure()');
 
     -- ④ ShardPG 加 worker：同步元数据，各分布表的外壳建到新节点上
     ts := clock_timestamp();
@@ -4127,7 +4164,9 @@ BEGIN
     INSERT INTO partdist.dtx_ddl_shard(owner_node,group_id,anchor_oid)
       VALUES(p_owner,p_group,anchor)
       ON CONFLICT(owner_node) DO UPDATE SET anchor_oid=EXCLUDED.anchor_oid;
-    PERFORM partdist.pg_raft_group_create(p_group,p_members);
+    IF NOT EXISTS(SELECT FROM partdist.raft_group WHERE group_id=p_group) THEN
+        PERFORM partdist.pg_raft_group_create(p_group,p_members);
+    END IF;
     RETURN true;
 END $$;
 
@@ -4170,9 +4209,19 @@ BEGIN
             IF answer IS DISTINCT FROM 't' THEN RAISE EXCEPTION 'DDL shard installation failed'; END IF;
         END LOOP;
     END LOOP;
+    FOREACH owner IN ARRAY workers LOOP
+        SELECT group_id INTO gid FROM partdist.dtx_ddl_shard WHERE owner_node=owner;
+        FOR n IN SELECT unnest(workers) AS node_id LOOP
+            IF NOT n.node_id=ANY(partdist.group_raft_members(gid,workers)) THEN
+                PERFORM partdist.group_change_member(gid,n.node_id,true,workers);
+            END IF;
+        END LOOP;
+    END LOOP;
     LOOP
         SELECT bool_and(EXISTS(SELECT FROM partdist.partition_map m
-                  WHERE m.partition_id::bigint=d.group_id AND m.primary_node=ANY(workers)))
+                  WHERE m.partition_id::bigint=d.group_id AND m.primary_node=ANY(workers)
+                    AND partdist.node_group_status(m.primary_node,d.group_id,'state')='leader'
+                    AND m.primary_term>=partdist.node_group_status(m.primary_node,d.group_id,'current_term')::bigint))
           INTO ready FROM partdist.dtx_ddl_shard d WHERE d.owner_node=ANY(workers);
         IF ready THEN RETURN true; END IF;
         IF clock_timestamp()-started>interval '25 seconds' THEN

@@ -43,6 +43,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 #include "utils/wait_event.h"
 
 bool shardpg_first_shard_coordinator = true;
@@ -96,6 +97,8 @@ rpc(const char *host, int port, const char *base, const char *sql)
     PGconn *conn;
     PGresult *res;
     char *answer;
+    char *socket_config = NULL;
+    List *socket_dirs = NIL;
 
     snprintf(portstr, sizeof(portstr), "%d", port);
     snprintf(options, sizeof(options), "-c synchronous_commit=on -c statement_timeout=%d",
@@ -104,6 +107,15 @@ rpc(const char *host, int port, const char *base, const char *sql)
         strlcpy(rpc_database, get_database_name(MyDatabaseId), sizeof(rpc_database));
     values[0] = base ? base : (rpc_database[0] ? rpc_database : "postgres");
     values[1] = base ? NULL : rpc_host(host);
+    /* Match pg_raft's local participant registration: a local RPC uses the
+     * configured Unix socket even if loopback TCP could not bind at startup. */
+    if (!base && port == PostPortNumber &&
+        (strcmp(values[1], "127.0.0.1") == 0 || strcmp(values[1], "localhost") == 0))
+    {
+        socket_config = pstrdup(GetConfigOption("unix_socket_directories", false, false));
+        if (SplitDirectoriesString(socket_config, ',', &socket_dirs) && socket_dirs != NIL)
+            values[1] = (char *) linitial(socket_dirs);
+    }
     values[2] = base ? NULL : portstr;
     values[3] = base ? NULL : "postgres";
     values[4] = "shardpg_dtx_internal";
@@ -111,6 +123,8 @@ rpc(const char *host, int port, const char *base, const char *sql)
     values[6] = options;
     values[7] = NULL;
     conn = PQconnectdbParams(keys, values, base != NULL);
+    list_free_deep(socket_dirs);
+    if (socket_config) pfree(socket_config);
     if (PQstatus(conn) != CONNECTION_OK)
     {
         PQfinish(conn);

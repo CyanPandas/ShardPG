@@ -15,6 +15,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 #include "access/xact.h"
 
 #include <ctype.h>
@@ -126,11 +127,36 @@ pg_raft_format_conninfo(const char *hostname, int port, char *conninfo, size_t l
     {
         bool    is_self = (port == PostPortNumber) &&
                           (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0);
+        char   *socket_config = NULL;
+        List   *socket_dirs = NIL;
+        StringInfoData options;
+        const char *p;
 
-        snprintf(conninfo, len,
-                 "host=%s port=%d dbname=postgres user=postgres connect_timeout=%d",
-                 host, port,
-                 is_self ? pg_raft_self_connect_timeout_s : pg_raft_peer_connect_timeout_s);
+        /* A restart can succeed on the external interface even when an
+         * ephemeral client port prevents binding loopback. Local participant
+         * registration must not depend on that optional TCP listener. */
+        if (is_self)
+        {
+            socket_config = pstrdup(GetConfigOption("unix_socket_directories", false, false));
+            if (SplitDirectoriesString(socket_config, ',', &socket_dirs) && socket_dirs != NIL)
+                host = (char *) linitial(socket_dirs);
+        }
+        initStringInfo(&options);
+        appendStringInfoString(&options, "host='");
+        for (p = host; *p; p++)
+        {
+            if (*p == '\'' || *p == '\\') appendStringInfoChar(&options, '\\');
+            appendStringInfoChar(&options, *p);
+        }
+        appendStringInfo(&options,
+                         "' port=%d dbname=postgres user=postgres connect_timeout=%d",
+                         port, is_self ? pg_raft_self_connect_timeout_s : pg_raft_peer_connect_timeout_s);
+        if (options.len >= len)
+            elog(ERROR, "pg_raft connection options exceed destination buffer");
+        strlcpy(conninfo, options.data, len);
+        pfree(options.data);
+        list_free_deep(socket_dirs);
+        if (socket_config) pfree(socket_config);
     }
 }
 
