@@ -4011,8 +4011,19 @@ BEGIN
     FOR d IN SELECT dd.* FROM partdist.dtx_decision dd
              JOIN partdist.pg_raft_group_status() g ON g.group_id=dd.coord_gsid
              WHERE g.state='leader'
+                OR (g.state='follower'
+                    AND NOT EXISTS(SELECT FROM partdist.dtx_ddl_shard s
+                                   WHERE s.group_id=dd.coord_gsid)
+                    AND EXISTS(SELECT FROM partdist.dtx_coord_tx t
+                               WHERE t.dtxid=dd.dtxid AND t.coord_gsid=dd.coord_gsid))
              ORDER BY (dd.dtxid <= cursor_id),dd.dtxid LIMIT 32
     LOOP
+        -- A former business-shard leader can retain local enrollment after
+        -- leadership moves. Its replicated terminal decision is immutable;
+        -- redeliver that decision and use the same all-node completion gate
+        -- before removing its own enrollment. Never infer a verdict from
+        -- missing prepared transactions, a timeout, or a leadership change.
+        -- DDL enrollment is replicated and is removed by leader-issued FORGET.
         complete:=true;
         FOR n IN SELECT DISTINCT hostname,port FROM partdist.node_map
         LOOP

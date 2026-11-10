@@ -283,6 +283,59 @@ DO $$ BEGIN
      OR EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_decide(%') THEN
     RAISE EXCEPTION 'active branch was presumed aborted'; END IF;
 END $$;
+-- Registrations retained by an old leader: terminal ABORT and COMMIT may
+-- converge, but missing decisions and timestamp-pending COMMIT must remain.
+INSERT INTO partdist.dtx_coord_tx(dtxid,coord_gsid,phase)
+SELECT x,30,'PREPARE' FROM generate_series(110,113) x;
+INSERT INTO partdist.dtx_coord_branch(dtxid,gid,hostname,port,gsids,vote)
+SELECT x,'yes_'||x,'worker1',5433,ARRAY[30]::bigint[],true FROM generate_series(110,113) x;
+INSERT INTO partdist.dtx_coord_branch(dtxid,gid,hostname,port,gsids,vote)
+VALUES(110,'no_110','worker2',5434,ARRAY[20]::bigint[],false);
+INSERT INTO partdist.dtx_decision(dtxid,coord_gsid,verdict,commit_ts,participants)
+VALUES(110,30,2,0,ARRAY[20,30]::bigint[]),(111,30,1,700,ARRAY[30]::bigint[]);
+INSERT INTO partdist.dtx_commit_decided VALUES(113,30,ARRAY[30]::bigint[],1);
+UPDATE partdist.rpc_gate SET fail=true;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+ IF (SELECT count(*) FROM partdist.dtx_coord_tx WHERE dtxid BETWEEN 110 AND 113)<>4 THEN
+  RAISE EXCEPTION 'old leader lost registration on unavailable participant'; END IF;
+END $$;
+UPDATE partdist.rpc_gate SET fail=false;
+UPDATE partdist.recovery_gate SET ack=false;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+ IF (SELECT count(*) FROM partdist.dtx_coord_tx WHERE dtxid BETWEEN 110 AND 113)<>4 THEN
+  RAISE EXCEPTION 'old leader lost registration before completion acknowledgement'; END IF;
+END $$;
+UPDATE partdist.recovery_gate SET ack=true;
+TRUNCATE partdist.events;
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+ IF EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid IN (110,111)) OR
+    EXISTS(SELECT FROM partdist.dtx_coord_branch WHERE dtxid IN (110,111)) THEN
+  RAISE EXCEPTION 'old leader did not reclaim completed terminal transactions'; END IF;
+ IF (SELECT count(*) FROM partdist.dtx_coord_tx WHERE dtxid IN (112,113))<>2 OR
+    EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_finish_decision(112,%' OR
+                                                event LIKE '%dtx_finish_decision(113,%') OR
+    EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_decide(%') THEN
+  RAISE EXCEPTION 'follower invented a decision or dispatched timestamp-pending COMMIT'; END IF;
+ IF NOT EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_finish_decision(110,30,2,0)%') OR
+    NOT EXISTS(SELECT FROM partdist.events WHERE event LIKE '%dtx_finish_decision(111,30,1,700)%') THEN
+  RAISE EXCEPTION 'follower did not preserve durable verdict and commit timestamp'; END IF;
+END $$;
+-- Replicated DDL enrollment remains governed by the leader's FORGET record.
+INSERT INTO partdist.dtx_ddl_shard(owner_node,group_id,anchor_oid) VALUES(3,30,900);
+INSERT INTO partdist.dtx_coord_tx(dtxid,coord_gsid,phase) VALUES(114,30,'PREPARE');
+INSERT INTO partdist.dtx_coord_branch(dtxid,gid,hostname,port,gsids,vote)
+VALUES(114,'ddl_yes','worker1',5433,ARRAY[30]::bigint[],true);
+INSERT INTO partdist.dtx_decision(dtxid,coord_gsid,verdict,commit_ts,participants)
+VALUES(114,30,1,800,ARRAY[30]::bigint[]);
+SELECT partdist.dtx_dispatch();
+DO $$ BEGIN
+ IF NOT EXISTS(SELECT FROM partdist.dtx_coord_tx WHERE dtxid=114) THEN
+  RAISE EXCEPTION 'follower bypassed replicated DDL FORGET'; END IF;
+END $$;
+
 SELECT 'FIRST_SHARD_STATE_MACHINE_OK';
 """
 

@@ -1,3 +1,6 @@
+-- Router-only observer: workers expose Raft views, not this helper function.
+BEGIN;
+SET LOCAL citus.enable_ddl_propagation = off;
 -- 报告3.5节；独立函数名；按host+port映射节点，防止不同机器同端口串台。
 CREATE OR REPLACE FUNCTION public.{{prefix}}raft_log(tbl regclass, key int, n int DEFAULT 5)
 RETURNS TABLE (worker text, role text, log_index bigint, term bigint, record text, committed boolean)
@@ -41,3 +44,4 @@ WITH w AS (
 )
 SELECT * FROM x ORDER BY CASE role WHEN 'primary' THEN 0 WHEN 'replica' THEN 1 ELSE 2 END, worker, log_index
 $f$;
+COMMIT;

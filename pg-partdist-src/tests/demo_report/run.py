@@ -486,12 +486,29 @@ class Runner:
         self.failed_node = self.node_name(self.primary())
         require(self.failed_node != "master", "master must not own business shards")
         old_term = self.scalar("SELECT primary_term FROM partdist.partition_map WHERE partition_id=%s", (self.sid,))
+        affected = dict(self.q("SELECT partition_id::bigint,primary_term FROM partdist.partition_map "
+                               "WHERE partition_id::bigint=ANY(%s::bigint[]) AND primary_node=%s",
+                               (self.sids, self.nodes[self.failed_node]["node_id"])))
+        self.event("failover_affected_shards", node=self.failed_node, terms=affected)
         self.down.add(self.failed_node)  # Even a timed-out stop command may have stopped the server.
         self.command("immediate_stop_" + self.failed_node, self.nodes[self.failed_node]["stop_command"])
         self.wait("automatic failover", lambda: self.q("SELECT primary_node,primary_term FROM partdist.partition_map WHERE partition_id=%s", (self.sid,)),
                   lambda r: len(r) == 1 and r[0][0] != self.nodes[self.failed_node]["node_id"] and r[0][1] > old_term)
+        # A table scan reads every shard. One bucket electing a new leader does
+        # not imply that all other buckets and their Citus routes are ready.
+        self.wait("all affected shards elect and publish routes", lambda: self.q(
+            "SELECT m.partition_id::bigint,m.primary_node,m.primary_term,n.nodeport "
+            "FROM partdist.partition_map m JOIN pg_dist_placement p ON p.shardid=m.partition_id::bigint "
+            "JOIN pg_dist_node n ON n.groupid=p.groupid "
+            "WHERE m.partition_id::bigint=ANY(%s::bigint[])", (list(affected),)),
+            lambda rows: len(rows) == len(affected) and all(
+                leader != self.nodes[self.failed_node]["node_id"] and term > affected[sid]
+                and port == self.nodes[self.node_name(leader)]["port"]
+                for sid, leader, term, port in rows))
         self.wait("reads converge after failover", self.balances, lambda x: x == self.expected)
-        require(self.data_digest() == before, "failover changed existing data")
+        after = self.wait("all shard reads ready after failover", self.data_digest,
+                          lambda value: isinstance(value, dict))
+        require(after == before, "failover changed existing data")
         self.rw_after_change(73001)
 
     def catchup(self):
@@ -592,7 +609,8 @@ class Runner:
         for table in self.tables:
             require(self.scalar("SELECT to_regclass(%s) IS NULL", (table,)), "logical table remains")
         if self.args.scope != "core":
-            self.q(f"DROP FUNCTION public.{self.prefix}raft_log(regclass,integer,integer)")
+            self.q("BEGIN; SET LOCAL citus.enable_ddl_propagation=off; "
+                   f"DROP FUNCTION public.{self.prefix}raft_log(regclass,integer,integer); COMMIT")
 
     def drain(self):
         for name in self.active:

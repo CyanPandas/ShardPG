@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Control the explicitly configured new1 lab cluster from host 145 (Python 3.6+)."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+BIN = '/work/pg-install/bin/'
+DATA = '/work/node/pgdata'
+BASE = Path(__file__).resolve().parent
+
+
+def shell_join(args):
+    return ' '.join(shlex.quote(str(x)) for x in args)
+
+
+class Control:
+    def __init__(self, config):
+        self.cfg = json.loads(Path(config).read_text(encoding='utf-8'))
+        self.nodes = self.cfg['nodes']
+        self.release = self.cfg['source_commit']
+        m = self.nodes['master']
+        print('new1 {} master={}:{} container={}'.format(
+            self.release[:7], m['host'], m['port'], m['container']), file=sys.stderr)
+
+    def node(self, name):
+        if name not in self.nodes:
+            raise RuntimeError('Unknown node: ' + name)
+        return self.nodes[name]
+
+    def host_run(self, node, args, data=None, check=True, timeout=960):
+        if node['host'] != self.cfg['control_host']:
+            args = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                    '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=10',
+                    '-o', 'ServerAliveCountMax=3', 'yyt@' + node['host'], shell_join(args)]
+        result = subprocess.run(args, input=data, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=timeout)
+        if check and result.returncode:
+            raise RuntimeError(result.stdout.decode('utf-8', errors='replace') +
+                               result.stderr.decode('utf-8', errors='replace'))
+        return result
+
+    def guard(self, name):
+        node = self.node(name)
+        result = self.host_run(node, ['docker', 'inspect', '--format',
+            '{{.Id}} {{.State.Running}} {{index .Config.Labels "new1.demo.release"}}', node['container']])
+        fields = result.stdout.decode().split()
+        if fields != [node['container_id'], 'true', self.release]:
+            raise RuntimeError('Container identity/release mismatch for ' + name)
+        return node
+
+    def docker(self, name, args, data=None, check=True):
+        node = self.guard(name)
+        return self.host_run(node, ['docker', 'exec', '-i', '--user', 'postgres',
+                                  node['container']] + args, data, check)
+
+    def sql(self, query, variables=None, name='master', extra=None):
+        node = self.node(name)
+        args = ['env', 'PGCLIENTENCODING=UTF8', 'PGAPPNAME=new1_shardpg_ctl',
+                'PGPASSFILE=/work/secrets/pgpass',
+                'PGOPTIONS=-c client_min_messages=warning -c statement_timeout=900000',
+                BIN + 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-P', 'pager=off',
+                '-h', '/tmp', '-p', str(node['port']), '-U', 'postgres', '-d', 'postgres']
+        for key, value in (variables or {}).items():
+            args += ['-v', '{}={}'.format(key, value)]
+        args += extra or []
+        result = self.docker(name, args, query.encode('utf-8'))
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        return result
+
+    def status(self):
+        print('node       host:port                 database  container')
+        for name, node in sorted(self.nodes.items(), key=lambda x: x[1]['node_id']):
+            if not node.get('container_id'):
+                state = 'not-created'
+            else:
+                result = self.docker(name, [BIN+'pg_ctl', '-D', DATA, 'status'], check=False)
+                if result.returncode not in (0, 3):
+                    raise RuntimeError(result.stderr.decode('utf-8', errors='replace'))
+                state = 'running' if result.returncode == 0 else 'stopped'
+            print('{:10} {:25} {:9} {}'.format(name, node['host']+':'+str(node['port']),state,node['container']))
+
+    def service(self, name, action, mode='immediate'):
+        result = self.docker(name, [BIN+'pg_ctl', '-D', DATA, 'status'], check=False)
+        if result.returncode not in (0,3):
+            raise RuntimeError('Unable to determine database state')
+        if (action == 'start' and result.returncode == 0) or (action == 'stop' and result.returncode == 3):
+            print(name + ' already ' + ('running' if action == 'start' else 'stopped'))
+            return
+        args = [BIN+'pg_ctl', '-D', DATA, '-w', '-t', '90']
+        args += ['-m', mode, 'stop'] if action == 'stop' else ['-l','/work/node/startup.log','start']
+        result = self.docker(name,args)
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--config', default=os.environ.get('SHARDPG_DEMO_CONFIG', str(BASE/'demo-control.json')))
+    sub = p.add_subparsers(dest='command')
+    sub.add_parser('status')
+    s = sub.add_parser('shards'); s.add_argument('table',nargs='?')
+    s = sub.add_parser('stop'); s.add_argument('node'); s.add_argument('mode',nargs='?',default='immediate',choices=['immediate','fast'])
+    s = sub.add_parser('start'); s.add_argument('node')
+    s = sub.add_parser('move-primary'); s.add_argument('shard'); s.add_argument('target')
+    s = sub.add_parser('move-replica'); s.add_argument('shard'); s.add_argument('source'); s.add_argument('target')
+    s = sub.add_parser('add-node'); s.add_argument('node'); s.add_argument('host'); s.add_argument('port',type=int)
+    s = sub.add_parser('files'); s.add_argument('node')
+    s = sub.add_parser('sql'); s.add_argument('node',nargs='?',default='master')
+    a = p.parse_args()
+    if not a.command: p.print_help(); return 0
+    c = Control(a.config)
+    if a.command == 'status': c.status()
+    elif a.command in ('start','stop'): c.service(a.node,a.command,getattr(a,'mode','immediate'))
+    elif a.command == 'shards':
+        c.sql('SELECT * FROM shardpg.shards'+(" WHERE table_name=:'table'::regclass" if a.table else '')+';', {'table':a.table} if a.table else {})
+    elif a.command == 'move-primary':
+        c.guard(a.target)
+        c.sql("SELECT shardpg.move_primary(:'shard',:port);", {'shard':a.shard,'port':c.node(a.target)['port']})
+    elif a.command == 'move-replica':
+        c.guard(a.source); c.guard(a.target)
+        c.sql("SELECT * FROM shardpg.move_replica(:'shard',:source,:target);", {'shard':a.shard,'source':c.node(a.source)['port'],'target':c.node(a.target)['port']})
+    elif a.command == 'add-node':
+        n=c.guard(a.node)
+        if (a.host,a.port)!=(n['host'],n['port']) or a.node!='worker4':
+            raise RuntimeError('add-node must match the prepared worker4 in this release config')
+        c.sql("SELECT * FROM shardpg.add_node(:'host',:port);",{'host':a.host,'port':a.port})
+    elif a.command == 'files':
+        c.sql("SET citus.override_table_visibility=off; SELECT global_shard_id,local_relname,pg_relation_filepath(local_oid) AS relation_file, 'pg_parwal/'||local_oid AS partition_log FROM partdist.shard_identity ORDER BY 1; SELECT group_id,state,leader_node_id,current_term,commit_index,last_applied FROM partdist.pg_raft_group_status() ORDER BY 1;", name=a.node)
+    elif a.command == 'sql': c.sql(sys.stdin.read(),name=a.node)
+    return 0
+
+if __name__ == '__main__':
+    try: sys.exit(main())
+    except (RuntimeError,subprocess.TimeoutExpired) as error:
+        print('ERROR: '+str(error),file=sys.stderr);sys.exit(1)
