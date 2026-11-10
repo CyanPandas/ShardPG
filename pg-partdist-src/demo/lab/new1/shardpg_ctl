@@ -144,6 +144,45 @@ LEFT JOIN partdist.dtx_ddl_shard d USING(group_id) ORDER BY 1;""", name=name)
         if actual!=expected:
             raise RuntimeError('Local transaction RPC returned a different node identity')
 
+    def sync_ddl_route(self, gid, retired_id, names):
+        # CONFIG changes membership without changing the leader's term. A
+        # primary announcement in that same term is deduplicated, so explicitly
+        # publish the committed secondaries through group 0 (as move-replica does).
+        # Run on resume too: CONFIG may already be committed while the route is old.
+        def reconcile():
+            leader_id=self.scalar('SELECT partdist.group_leader_now(:gid);',{'gid':gid})
+            if not leader_id: return False
+            leader=next(n for n in names if self.nodes[n]['node_id']==int(leader_id))
+            state=json.loads(self.scalar("""SELECT row_to_json(t) FROM (
+SELECT s.state,s.current_term,s.commit_index,s.last_applied,r.members
+FROM partdist.pg_raft_group_status() s JOIN partdist.raft_group r USING(group_id)
+WHERE s.group_id=:gid) t;""",{'gid':gid},leader))
+            if (state['state']!='leader' or state['commit_index']!=state['last_applied']
+                    or retired_id in state['members']):
+                return False
+            route=json.loads(self.scalar("""SELECT row_to_json(m) FROM partdist.partition_map m
+WHERE partition_id=:gid::oid;""",{'gid':gid}))
+            # Wait for promotion to publish a changed leader/term. Never invent it.
+            if (route['primary_node']!=int(leader_id)
+                    or route['primary_term']!=state['current_term']):
+                return False
+            secondaries=sorted(n for n in state['members'] if n!=int(leader_id))
+            if sorted(route['secondary_nodes'])!=secondaries:
+                control_id=int(self.scalar('SELECT leader_node_id FROM partdist.pg_raft_group_status() WHERE group_id=0;'))
+                control=next(n for n in names if self.nodes[n]['node_id']==control_id)
+                payload=json.dumps(dict(partition_id=gid,primary_term=state['current_term'],secondary_nodes=secondaries))
+                idx=int(self.scalar("SELECT partdist.pg_raft_group_propose(0,'OP_PARTITION_SECONDARIES',:'payload');",{'payload':payload},control))
+                if idx<=0: return False
+            for n in names:
+                if self.scalar("""SELECT EXISTS(SELECT FROM partdist.partition_map
+WHERE partition_id=:gid::oid AND primary_node=:leader AND primary_term=:term
+AND ARRAY(SELECT x FROM unnest(secondary_nodes) x ORDER BY x)=:'members'::int[]);""",
+                    {'gid':gid,'leader':int(leader_id),'term':state['current_term'],
+                     'members':'{'+','.join(str(x) for x in secondaries)+'}'},n)!='t':
+                    return False
+            return True
+        self.wait_for('committed DDL route for group '+str(gid),reconcile)
+
     def remove_node(self, name):
         """Maintenance retirement; durable journal permits resuming after any phase."""
         target = self.node(name)
@@ -223,6 +262,8 @@ partdist.dtx_pending_count()+
                         self.wait_for('DDL membership '+n,lambda n=n,gid=gid:self.scalar("""SELECT EXISTS(
 SELECT FROM partdist.raft_group r JOIN partdist.pg_raft_group_status() s USING(group_id)
 WHERE r.group_id=:gid AND NOT :id=ANY(r.members) AND s.last_applied>=s.commit_index);""",{'gid':gid,'id':node_id},n)=='t')
+            for gid in groups:
+                self.sync_ddl_route(gid,node_id,job['names'])
             self.wait_for('DDL routes exclude retiring peer',lambda:self.scalar('SELECT count(*) FROM partdist.partition_map WHERE :id=ANY(ARRAY[primary_node]||secondary_nodes);',{'id':node_id})=='0')
             stage(1)
         if job['phase']<2:

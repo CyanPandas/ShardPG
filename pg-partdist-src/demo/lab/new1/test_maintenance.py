@@ -30,6 +30,25 @@ DO $$ BEGIN IF NOT EXISTS(SELECT FROM partdist.node_map WHERE node_id=90001) THE
 ROLLBACK;""",name=n)
 
 
+def prepare_follower_retirement(c):
+    # Exercise removal without relying on a new primary/term to republish routes.
+    groups=json.loads(c.scalar('SELECT json_agg(group_id) FROM partdist.dtx_ddl_shard;'))
+    target=c.nodes['worker4']['node_id']
+    for gid in groups:
+        leader=int(c.scalar('SELECT partdist.group_leader_now(:gid);',{'gid':gid}))
+        if leader==target:
+            members=json.loads(c.scalar('SELECT to_json(partdist.group_raft_members(:gid));',{'gid':gid}))
+            dest=next(n for n in members if n!=target)
+            c.sql('SELECT partdist.pg_raft_group_transfer_leader(:gid,:dest,15000);',
+                  {'gid':gid,'dest':dest},name='worker4')
+        c.wait_for('published leader before follower retirement',lambda gid=gid:c.scalar("""SELECT EXISTS(
+SELECT FROM partdist.partition_map m WHERE partition_id=:gid::oid AND primary_node<>:target
+AND :target=ANY(secondary_nodes)
+AND partdist.node_group_status(primary_node,:gid,'state')='leader'
+AND primary_term=partdist.node_group_status(primary_node,:gid,'current_term')::bigint);""",
+            {'gid':gid,'target':target})=='t')
+
+
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -87,6 +106,7 @@ def main():
     if not a.resume_after_retirement:
         probe(list(c.nodes),True)
         passed('five-node create cross-shard commit rollback drop and identity cleanup')
+        prepare_follower_retirement(c)
         command('remove-node','worker4')
     command('remove-node','worker4')
     c=Control(a.config)
@@ -95,6 +115,7 @@ def main():
     for n in active:
         assert c.scalar('SELECT count(*) FROM partdist.node_map WHERE node_id=5;',name=n)=='0'
         assert c.scalar('SELECT count(*) FROM partdist.raft_group WHERE group_id>0 AND 5=ANY(members);',name=n)=='0'
+        assert c.scalar('SELECT count(*) FROM partdist.partition_map WHERE 5=ANY(ARRAY[primary_node]||secondary_nodes);',name=n)=='0'
     passed('worker4 removed with DDL groups retained and repeat removal idempotent')
     probe(active)
     passed('four-node create commit rollback drop after retirement')
